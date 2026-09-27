@@ -13,7 +13,6 @@ use crate::native_accessibility::{
     project_native_accessibility_for_view_in_container, route_accessibility_action,
 };
 use crate::native_app::{ActionInvocation, AppEvent};
-use crate::native_ui::CompiledUi;
 use crate::tab_model::{View, ViewId};
 use crate::{App, WindowId};
 
@@ -23,7 +22,6 @@ impl App {
         &mut self,
         wid: WindowId,
         view: ViewId,
-        _compiled: &CompiledUi,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         if self
@@ -484,7 +482,7 @@ mod tests {
         );
         let plan = single.active_visible_leaf_plan(wid).unwrap();
         set_a11y_active(&mut single, wid, true);
-        single.stage_native_accessibility(wid, view, &compiled, &plan);
+        single.stage_native_accessibility(wid, view, &plan);
         assert_eq!(
             single.windows[&wid]
                 .native_a11y_staged
@@ -495,7 +493,7 @@ mod tests {
             1
         );
         set_a11y_active(&mut single, wid, false);
-        single.stage_native_accessibility(wid, view, &compiled, &plan);
+        single.stage_native_accessibility(wid, view, &plan);
         assert!(
             single.windows[&wid].native_a11y_staged.is_none(),
             "deactivation clears an older stage"
@@ -669,7 +667,7 @@ mod tests {
         .into_update();
 
         let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
-        app.stage_native_accessibility(wid, view, &compiled, &plan);
+        app.stage_native_accessibility(wid, view, &plan);
         let (actual, published) = app
             .take_native_accessibility_update(wid)
             .expect("active native view")
@@ -801,14 +799,8 @@ mod tests {
             .expect("editor document");
         let snapshot = app.document_store.snapshot(document).unwrap();
         assert!(app.prepare_native_input_scratch(wid));
-        let compiled = app.windows[&wid].leaf_render_cache[&view]
-            .native
-            .as_ref()
-            .unwrap()
-            .compiled
-            .clone();
         let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
-        app.stage_native_accessibility(wid, view, &compiled, &plan);
+        app.stage_native_accessibility(wid, view, &plan);
         let (update, published) = app
             .take_native_accessibility_update(wid)
             .expect("native update")

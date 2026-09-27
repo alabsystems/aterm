@@ -16,11 +16,6 @@
 # in Metal); `rgb(One Zero Add) a(One Zero Add)` is the same fixed-function state
 # spelled as `wgpu::BlendState::REPLACE`.
 #
-# `load=` is the row's pass load-op convention (`PassLoad`): `Clear`/`Load`
-# where every production pass the row draws in opens the same way (blit /
-# bloom / shimmer / tray), `dyn` where the frame plan or another row's pass
-# decides. Declarative metadata for W4's encoder port; nothing consumes it yet.
-#
 # `binds=` is the row's Metal binding map (`BindSpec`): `vu` the vertex-stage
 # uniform `[[buffer(n)]]` slot, `ft`/`fsamp`/`fb` the fragment-stage
 # `[[texture]]`/`[[sampler]]`/`[[buffer]]` slots, `-` for none. The MSL scan in
@@ -28,21 +23,21 @@
 # the instance stream is not listed because it always binds at
 # `INSTANCE_STREAM_SLOT` through the vertex descriptor.
 
-bg lib=cell vs=vs_bg fs=fs_bg target=OffscreenSrgb blend=rgb(One Zero Add) a(One Zero Add) mask=ALL vertex=BgInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-glyph lib=cell vs=vs_glyph fs=fs_glyph target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(0) load=dyn
-color_glyph lib=cell vs=vs_glyph fs=fs_glyph_color target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-) load=dyn
-cursor_blend lib=cell vs=vs_bg fs=fs_bg target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=BgInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-glow_add lib=cell vs=vs_glow fs=fs_glow target=OffscreenUnorm blend=rgb(One OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=COLOR vertex=GlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-rain_glow lib=cell vs=vs_rain_glow fs=fs_rain_glow target=OffscreenUnorm blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=RainGlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-rain_glow_over lib=cell vs=vs_rain_glow fs=fs_rain_glow_over target=OffscreenUnorm blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=COLOR vertex=RainGlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-fire_add lib=cell vs=vs_fire fs=fs_fire_add target=OffscreenUnorm blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=FireInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-fire_over lib=cell vs=vs_fire fs=fs_fire_over target=OffscreenUnorm blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=COLOR vertex=FireInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-) load=dyn
-deco_over lib=cell vs=vs_glyph fs=fs_deco_over target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-) load=dyn
-deco_add lib=cell vs=vs_glyph fs=fs_deco_add target=OffscreenUnorm blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-) load=dyn
-sprite_over lib=cell vs=vs_glyph fs=fs_sprite_over target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-) load=dyn
-bloom lib=bloom vs=vs_fs fs=fs_bloom target=OffscreenUnorm blend=rgb(One OneMinusSrc Add) a(One OneMinusSrc Add) mask=COLOR vertex=- topology=TriangleList binds=vu(-) ft(0) fsamp(0) fb(2) load=Load
-shimmer lib=shimmer vs=vs_fs fs=fs_shimmer target=OffscreenUnorm blend=none mask=ALL vertex=- topology=TriangleList binds=vu(-) ft(0) fsamp(0) fb(2) load=Load
-hdr_glow lib=hdr_glow vs=vs_hdr_glow fs=fs_hdr_glow target=Edr blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=GlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(0) load=dyn
-sdr_glow lib=hdr_glow vs=vs_hdr_glow fs=fs_sdr_glow target=Present blend=rgb(One OneMinusSrc Add) a(One OneMinusSrc Add) mask=COLOR vertex=GlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(0) load=dyn
-blit lib=blit vs=vs_blit fs=fs_blit target=Present blend=rgb(One Zero Add) a(One Zero Add) mask=ALL vertex=- topology=TriangleList binds=vu(-) ft(0) fsamp(0) fb(2) load=Clear
-tray lib=tray vs=vs_tray fs=fs_tray target=Present blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=- topology=TriangleStrip binds=vu(2) ft(0) fsamp(0) fb(-) load=Load
+bg lib=cell vs=vs_bg fs=fs_bg target=OffscreenSrgb blend=rgb(One Zero Add) a(One Zero Add) mask=ALL vertex=BgInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+glyph lib=cell vs=vs_glyph fs=fs_glyph target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(0)
+color_glyph lib=cell vs=vs_glyph fs=fs_glyph_color target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-)
+cursor_blend lib=cell vs=vs_bg fs=fs_bg target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=BgInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+glow_add lib=cell vs=vs_glow fs=fs_glow target=OffscreenUnorm blend=rgb(One OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=COLOR vertex=GlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+rain_glow lib=cell vs=vs_rain_glow fs=fs_rain_glow target=OffscreenUnorm blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=RainGlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+rain_glow_over lib=cell vs=vs_rain_glow fs=fs_rain_glow_over target=OffscreenUnorm blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=COLOR vertex=RainGlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+fire_add lib=cell vs=vs_fire fs=fs_fire_add target=OffscreenUnorm blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=FireInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+fire_over lib=cell vs=vs_fire fs=fs_fire_over target=OffscreenUnorm blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=COLOR vertex=FireInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(-)
+deco_over lib=cell vs=vs_glyph fs=fs_deco_over target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-)
+deco_add lib=cell vs=vs_glyph fs=fs_deco_add target=OffscreenUnorm blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-)
+sprite_over lib=cell vs=vs_glyph fs=fs_sprite_over target=OffscreenSrgb blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=GlyphInstance topology=TriangleList binds=vu(0) ft(0) fsamp(0) fb(-)
+bloom lib=bloom vs=vs_fs fs=fs_bloom target=OffscreenUnorm blend=rgb(One OneMinusSrc Add) a(One OneMinusSrc Add) mask=COLOR vertex=- topology=TriangleList binds=vu(-) ft(0) fsamp(0) fb(2)
+shimmer lib=shimmer vs=vs_fs fs=fs_shimmer target=OffscreenUnorm blend=none mask=ALL vertex=- topology=TriangleList binds=vu(-) ft(0) fsamp(0) fb(2)
+hdr_glow lib=hdr_glow vs=vs_hdr_glow fs=fs_hdr_glow target=Edr blend=rgb(One One Add) a(One One Add) mask=COLOR vertex=GlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(0)
+sdr_glow lib=hdr_glow vs=vs_hdr_glow fs=fs_sdr_glow target=Present blend=rgb(One OneMinusSrc Add) a(One OneMinusSrc Add) mask=COLOR vertex=GlowInstance topology=TriangleList binds=vu(0) ft(-) fsamp(-) fb(0)
+blit lib=blit vs=vs_blit fs=fs_blit target=Present blend=rgb(One Zero Add) a(One Zero Add) mask=ALL vertex=- topology=TriangleList binds=vu(-) ft(0) fsamp(0) fb(2)
+tray lib=tray vs=vs_tray fs=fs_tray target=Present blend=rgb(SrcAlpha OneMinusSrcAlpha Add) a(One OneMinusSrcAlpha Add) mask=ALL vertex=- topology=TriangleStrip binds=vu(2) ft(0) fsamp(0) fb(-)

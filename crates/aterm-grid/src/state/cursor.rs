@@ -242,6 +242,7 @@ impl GridCursorState {
 
     /// Save cursor state for DECSC/DECRC.
     #[inline]
+    #[cfg(any(test, kani))]
     pub(crate) fn save_cursor(&mut self) {
         self.saved_cursor = SavedCursor {
             cursor: self.cursor,
@@ -253,12 +254,14 @@ impl GridCursorState {
     /// Return the currently saved cursor snapshot.
     #[must_use]
     #[inline]
+    #[cfg(any(test, kani))]
     pub(crate) fn saved_cursor(&self) -> SavedCursor {
         self.saved_cursor
     }
 
     /// Restore the cursor position from a previously prepared DECRC target.
     #[inline]
+    #[cfg(any(test, kani))]
     pub(crate) fn restore_saved_cursor(&mut self, cursor: Cursor) {
         self.cursor = cursor;
         self.pending_wrap = self.saved_cursor.pending_wrap;
@@ -363,7 +366,7 @@ impl GridCursorState {
         self.tab_stops = Self::default_tab_stops(cols);
     }
 
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[inline]
     #[must_use]
     pub(crate) fn is_tab_stop(&self, col: u16) -> bool {

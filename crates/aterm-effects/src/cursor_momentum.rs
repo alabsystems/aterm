@@ -81,7 +81,7 @@ pub const MOMENTUM_GLOW_TAU_S: f32 = 1.2;
 /// match the rainbow twinkle's settled-energy floor.
 ///
 /// WHICH VALUE IS COMPARED MATTERS, and two published readings get it wrong on
-/// purpose: [`TypingRate::hot`] and [`TypingRate::cold_at`] test the RAW decayed
+/// purpose: `TypingRate::hot` and `TypingRate::cold_at` test the RAW decayed
 /// rate, while the gate that decides the glass ([`MomentumGlow::tick`]) tests
 /// the raw rate SCALED BY `intensity`. Those part company for any intensity
 /// below ~1, so `hot` answers a question about the typing rate, not about
@@ -134,21 +134,11 @@ impl TypingRate {
         self.at = Some(now);
     }
 
-    /// Back to rest.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    /// HOT at `now`: at or above [`MOMENTUM_GLOW_HOT`].
-    #[must_use]
-    pub fn hot(&self, now: Instant, tau: f32) -> bool {
-        self.value(now, tau) >= MOMENTUM_GLOW_HOT
-    }
-
     /// The analytic instant the decaying value crosses the HOT floor —
     /// `stamp + τ·ln(v/floor)` — or `None` while unstamped / already cold.
     /// Lets a frame-rate-independent host schedule the exact release.
     #[must_use]
+    #[cfg(test)]
     pub fn cold_at(&self, tau: f32) -> Option<Instant> {
         let at = self.at?;
         if !tau.is_finite() || tau <= 0.0 || self.value <= MOMENTUM_GLOW_HOT {
@@ -177,21 +167,6 @@ pub struct MomentumGlowConfig {
     /// Whether the cursor is a BLOCK (the body tint applies) — bar/underline
     /// get the halo only.
     pub block: bool,
-}
-
-impl MomentumGlowConfig {
-    #[must_use]
-    pub const fn off() -> Self {
-        Self {
-            enabled: false,
-            intensity: 0.0,
-            tau_s: MOMENTUM_GLOW_TAU_S,
-            radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
-            base: 0x00FF_FFFF,
-            dark_theme: true,
-            block: true,
-        }
-    }
 }
 
 /// One tick's outputs.
@@ -257,6 +232,7 @@ impl MomentumGlow {
     /// It takes the config now rather than a bare `tau_s` so it cannot read a
     /// different number than the gate again.
     #[must_use]
+    #[cfg(test)]
     pub fn next_change_deadline(&self, now: Instant, cfg: &MomentumGlowConfig) -> Option<Instant> {
         let raw = self.rate.value(now, cfg.tau_s);
         let a = if cfg.intensity.is_finite() {

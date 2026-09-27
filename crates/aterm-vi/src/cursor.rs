@@ -126,6 +126,7 @@ impl ViModeCursor {
     /// Positive = content scrolls up (cursor line increases),
     /// negative = content scrolls down (cursor line decreases).
     #[must_use]
+    #[cfg(test)]
     pub fn scroll(mut self, topmost_line: i32, bottommost_line: i32, delta: i32) -> Self {
         // saturating_add: identical for every real grid (line and delta are
         // bounded by grid/scrollback sizes, nowhere near i32 limits); on the

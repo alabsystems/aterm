@@ -877,8 +877,8 @@ impl crate::flow::Fetcher for DirFetcher {
 }
 
 /// Tier-1 of `AtpkgIndexPublishWalk`: the real tag walk and `tools/atpkg-index.sh` against
-/// the derived model of the index channel.
-#[cfg(test)]
+/// the derived model of the index channel. Unix-only: it drives bash stubs of `gh` and `curl`.
+#[cfg(all(test, unix))]
 mod index_publish_conformance;
 
 #[cfg(test)]

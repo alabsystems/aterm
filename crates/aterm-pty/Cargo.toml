@@ -16,6 +16,11 @@ default = []
 # seam, no `aterm-spec`/`inventory`); the workspace `spec_xref_closure` gate
 # (aterm-gui's test build) enables it to COLLECT the anchors cross-crate.
 spec-anchors = ["dep:aterm-spec"]
+# Development seams in an optimized build (`aterm_types::dev_seam!`: the
+# `ATERM_PTY_IDLE_POLL_US` sweep, Windows' `ATERM_TRACE_BOOST`). Debug builds compile
+# them anyway; the release cutter never enables this — aterm-release's buildplan
+# pins it.
+dev-seams = []
 
 [dependencies]
 aterm-cap = { workspace = true }

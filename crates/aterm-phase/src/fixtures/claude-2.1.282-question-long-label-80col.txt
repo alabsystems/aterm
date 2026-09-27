@@ -1,0 +1,42 @@
+# claude-code 2.1.282 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm 0.93.0 (80x50) · S5 one question, option 1 label 93 chars ending `(Recommended)`, wrapped at 80 columns, as first drawn · user and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /…/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /clear
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this
+  input (copy every string verbatim, change nothing, add nothing):
+  {"questions": [{"question": "How should the primary button look on a row that
+  carries a live progress meter while a paste is running?", "header":
+  "Button", "multiSelect": false, "options": [{"label": "Keep the outlined
+  accent button on every row that carries a live progress meter (Recommended)",
+  "description": "An accent ring with no solid fill, so the meter is the only
+  solid accent on the row and 0-100% reads cleanly."}, {"label": "Solid
+  everywhere", "description": "Keep today's solid accent button on every row,
+  including over a progress bar."}, {"label": "Hide the button", "description":
+  "Show no button while the meter runs."}]}]}  After the tool returns, reply
+  with only the word DONE.
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Button
+
+│ How should the primary button look on a row that carries a live progress meter
+│ while a paste is running?
+
+❯ 1. Keep the outlined accent button on every row that carries a live progress
+     meter (Recommended)
+     An accent ring with no solid fill, so the meter is the only solid accent on
+     the row and 0-100% reads cleanly.
+  2. Solid everywhere
+     Keep today's solid accent button on every row, including over a progress
+     bar.
+  3. Hide the button
+     Show no button while the meter runs.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

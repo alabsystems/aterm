@@ -9,18 +9,12 @@
 //! [`DocumentStore::transact`], are OCC-guarded by [`Seq`], and publish exactly one new
 //! sequence for an atomic multi-selection edit.
 
-#![allow(
-    dead_code,
-    reason = "native tab-app integration lands in staged consumers"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
 
-use aterm_buffer::{Edit as SurfaceEdit, LineId, Seq, Surface, SurfaceId, TxnOutcome, WriteCap};
+use aterm_buffer::{Edit as SurfaceEdit, LineId, Seq, Surface, TxnOutcome, WriteCap};
 
 /// Stable process-local identity shared by every presentation of one canonical document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,19 +31,12 @@ impl DocumentId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DocumentViewId(pub(crate) u64);
 
-/// File identity observed when the projection was loaded/saved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FileVersion {
-    pub(crate) content_fingerprint: u64,
-}
-
 /// Immutable read projection. `text` is derived from the canonical Surface at `seq` and
 /// shared by every reader until the next commit.
 #[derive(Clone, Debug)]
 pub(crate) struct DocumentSnapshot {
     pub(crate) id: DocumentId,
     pub(crate) seq: Seq,
-    pub(crate) file_version: FileVersion,
     pub(crate) text: Arc<str>,
 }
 
@@ -93,7 +80,6 @@ pub(crate) struct EditDelta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DocumentError {
     UnknownDocument,
-    DuplicateCanonicalUri,
     UnknownView,
     Closing,
     InvalidRange,
@@ -126,7 +112,6 @@ struct Document {
     /// Derived cache only; Surface is the mutation authority.
     projection: Arc<str>,
     revision: u64,
-    file_version: FileVersion,
     checkpoint_seq: Seq,
     /// Every attached controller's published document sequence. Publication happens in
     /// the same synchronous mutation lane as the canonical Surface commit, before the
@@ -148,7 +133,6 @@ impl Document {
         DocumentSnapshot {
             id: self.id,
             seq: self.head(),
-            file_version: self.file_version,
             text: self.projection.clone(),
         }
     }
@@ -181,14 +165,13 @@ impl DocumentStore {
         self.next_id = raw.saturating_add(1);
         let nonzero = NonZeroU64::new(raw).expect("document ids start at one");
         let id = DocumentId(nonzero);
-        let mut surface = Surface::new(SurfaceId(nonzero));
+        let mut surface = Surface::new();
         // Surface owns the original String allocation; the flat Arc projection
         // is the separate immutable cache shared by every document snapshot.
         let projection: Arc<str> = Arc::from(text.as_str());
         surface.apply(&WriteCap, SurfaceEdit::AppendLine(text));
         let head = surface.seq();
         let text_rope = crate::native_text::TextRope::from(projection.as_ref());
-        let content_fingerprint = fingerprint(&projection);
         let document = Document {
             id,
             canonical_uri: canonical_uri.clone(),
@@ -196,9 +179,6 @@ impl DocumentStore {
             text: text_rope,
             projection,
             revision: 1,
-            file_version: FileVersion {
-                content_fingerprint,
-            },
             checkpoint_seq: head,
             views: BTreeMap::new(),
             phase: DocumentPhase::Suspended,
@@ -270,6 +250,7 @@ impl DocumentStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn view_count(&self, id: DocumentId) -> Option<usize> {
         self.documents.get(&id).map(|d| d.views.len())
     }
@@ -289,6 +270,7 @@ impl DocumentStore {
             .map(|document| document.views.keys().copied().collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn observed_seq(&self, id: DocumentId, view: DocumentViewId) -> Option<Seq> {
         self.documents
             .get(&id)
@@ -381,9 +363,6 @@ impl DocumentStore {
         document.text = next_text;
         document.projection = next_projection;
         document.revision = document.revision.saturating_add(1);
-        document.file_version = FileVersion {
-            content_fingerprint: fingerprint(&document.projection),
-        };
         for observed in document.views.values_mut() {
             *observed = committed;
         }
@@ -619,12 +598,6 @@ impl DocumentStore {
             )
         })
     }
-}
-
-fn fingerprint(text: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Rebase one byte position through committed edits. Positions inside a replaced range
@@ -865,6 +838,21 @@ mod tests {
         ));
         store.checkpoint_ack(id, seq).unwrap();
         store.commit_detach(id, &[view]).unwrap();
+    }
+
+    /// A durable acknowledgement never names a sequence the document has not
+    /// reached: the refusal `NativeSaveIntentLatch` relies on instead of stating
+    /// `durable <= head` as a law of its own.
+    #[test]
+    fn checkpoint_ack_past_head_is_refused_without_moving_the_checkpoint() {
+        let (mut store, id) = open();
+        let head = store.snapshot(id).unwrap().seq;
+        let before = store.checkpoint_seq(id);
+        assert_eq!(
+            store.checkpoint_ack(id, Seq(head.0 + 1)),
+            Err(DocumentError::CheckpointAheadOfHead)
+        );
+        assert_eq!(store.checkpoint_seq(id), before);
     }
 
     #[test]

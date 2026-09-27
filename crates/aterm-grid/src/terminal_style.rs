@@ -12,6 +12,7 @@
 use crate::cell::{CellFlags, PackedColor};
 use crate::cell_colors::PackedColors;
 use crate::cursor::Cursor;
+#[cfg(test)]
 use crate::style::{ExtendedStyle, Style};
 use aterm_types::charset::CharacterSetState;
 
@@ -183,6 +184,7 @@ impl CurrentStyle {
     /// design would build on), so it must stay correct, not fast.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn build_style(&self) -> Style {
         self.build_extended_style().style
     }
@@ -195,6 +197,7 @@ impl CurrentStyle {
     /// anyone would read it.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn build_extended_style(&self) -> ExtendedStyle {
         ExtendedStyle::from_packed_colors_separate(self.fg, self.bg, self.flags)
     }
@@ -208,6 +211,7 @@ impl CurrentStyle {
     /// `update_cached_colors`.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn build_extended_style_fg_changed(&mut self) -> ExtendedStyle {
         self.update_cached_colors();
         self.build_extended_style()
@@ -217,6 +221,7 @@ impl CurrentStyle {
     /// the resulting `ExtendedStyle`.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn build_extended_style_bg_changed(&mut self) -> ExtendedStyle {
         self.update_cached_colors();
         self.build_extended_style()
@@ -226,6 +231,7 @@ impl CurrentStyle {
     /// resulting `ExtendedStyle`.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn build_extended_style_both_changed(&mut self) -> ExtendedStyle {
         self.update_cached_colors();
         self.build_extended_style()

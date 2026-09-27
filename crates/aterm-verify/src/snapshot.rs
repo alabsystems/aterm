@@ -11,7 +11,7 @@
 //!
 //! So a run (everything but `--selftest`, unless `--in-place`) happens in a git
 //! WORKTREE of the caller's repository at `<caller-root>-verify.noindex` (or
-//! `$ATERM_VERIFY_SNAPSHOT`). The `.noindex` suffix keeps Spotlight out of the
+//! `--snapshot <dir>`). The `.noindex` suffix keeps Spotlight out of the
 //! sources and every target dir without touching macOS defaults. Before
 //! anything is planned, the worktree is synced to exactly what the caller has:
 //!
@@ -76,7 +76,9 @@
 //! and of the build-relevant environment. A new compiler makes a lane's
 //! artifacts unreusable, so the lane is moved to `.aterm-verify/trash` and
 //! deleted at background priority while the run proceeds; any other change is
-//! named, so a cold lane is explained instead of guessed at.
+//! named, so a cold lane is explained instead of guessed at. Lanes that hold
+//! more than the disk preflight's cap are moved the same way and deleted
+//! before the run starts ([`remove_lanes`], [`crate::disk::LANE_CAP_BYTES`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -86,8 +88,9 @@ use std::process::{Child, Command, Stdio};
 
 use crate::identity::{self, GATE_STATE_DIR, PathState, TreeState, git};
 
-/// Where the snapshot lives, when not `<caller-root>-verify.noindex`.
-pub const SNAPSHOT_ENV: &str = "ATERM_VERIFY_SNAPSHOT";
+/// The flag that says where the snapshot lives, when not
+/// `<caller-root>-verify.noindex` — named in the refusals below.
+pub const SNAPSHOT_FLAG: &str = "--snapshot";
 
 /// The per-lane stamp, at the top of each lane's target dir.
 pub const STAMP_FILE: &str = ".aterm-verify-stamp";
@@ -298,14 +301,14 @@ impl Drop for MachineHold {
 ///
 /// # Errors
 /// A holder still running after the bound, or a lock that cannot be taken.
-pub fn hold_machine(caller: &Path) -> Result<MachineHold, String> {
-    let Some(dir) = machine_lock_dir() else {
+pub fn hold_machine(caller: &Path, lock_dir: Option<&Path>) -> Result<MachineHold, String> {
+    let Some(dir) = lock_dir else {
         // No home to anchor a machine-wide lock: unserialized, which is exactly
         // the pre-lock behaviour — and nothing is left behind in `$TMPDIR`.
         return Ok(MachineHold { file: None });
     };
     acquire_machine_in(
-        &dir,
+        dir,
         caller,
         MACHINE_WAIT_MAX,
         std::time::Duration::from_secs(5),
@@ -318,24 +321,23 @@ pub fn hold_machine(caller: &Path) -> Result<MachineHold, String> {
 /// named in the refusal.
 pub const MACHINE_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
-/// Moves [`machine_lock_dir`] when set and non-empty. It exists for the gate's
-/// own fixture tests, which drive this binary against throwaway repos. On the
-/// real lock every fixture gate queued behind any other gate on the machine,
-/// and, run by a real gate's test stage, behind THAT gate — its own ancestor,
-/// which holds the lock until the stage waiting on the fixture returns: a
-/// wait that only the bound or the stage ceiling ends. A fixture ladder
-/// poisons nothing, so it has no reason to share the machine's lock.
-pub const MACHINE_LOCK_DIR_ENV: &str = "ATERM_VERIFY_MACHINE_LOCK_DIR";
-
-/// Where the one-gate-per-machine lock lives: a fixed per-user path under
-/// `$HOME`, never `$TMPDIR`, which a session is free to point elsewhere, unless
-/// [`MACHINE_LOCK_DIR_ENV`] moves it. `None` without either — the gate then
+/// Where the one-gate-per-machine lock lives: `moved` (`--machine-lock-dir`)
+/// when given, else a fixed per-user path under `$HOME`, never `$TMPDIR`, which
+/// a session is free to point elsewhere. `None` without either — the gate then
 /// runs unserialized, as before.
+///
+/// `--machine-lock-dir` exists for the gate's own fixture tests, which drive
+/// this binary against throwaway repos. On the real lock every fixture gate
+/// queued behind any other gate on the machine, and, run by a real gate's test
+/// stage, behind THAT gate — its own ancestor, which holds the lock until the
+/// stage waiting on the fixture returns: a wait that only the bound or the stage
+/// ceiling ends. A fixture ladder poisons nothing, so it has no reason to share
+/// the machine's lock. (It was the `ATERM_VERIFY_MACHINE_LOCK_DIR` export until
+/// 2026-09-24: the gate reads no knob from the environment.)
 #[must_use]
-pub fn machine_lock_dir() -> Option<PathBuf> {
-    let moved = std::env::var_os(MACHINE_LOCK_DIR_ENV);
-    if let Some(dir) = moved.filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
+pub fn machine_lock_dir(moved: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = moved {
+        return Some(dir.to_path_buf());
     }
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
     let base = if cfg!(target_os = "macos") {
@@ -442,7 +444,8 @@ pub fn machine_could_not_run_text(why: &str) -> String {
 /// gate's pid. A gate started INSIDE the running one is part of that run:
 /// waiting for the holder would be waiting for its own ancestor, which cannot
 /// finish until the child does. The fixture tests also move their lock
-/// ([`MACHINE_LOCK_DIR_ENV`]); this covers any other gate a stage starts.
+/// (`--machine-lock-dir`); this covers any other gate a stage starts. Internal
+/// protocol: the holding gate is the only writer.
 pub const MACHINE_HOLDER_ENV: &str = "ATERM_VERIFY_MACHINE_HOLDER";
 
 /// Is this process running under the gate that holds the machine lock? Only
@@ -450,10 +453,9 @@ pub const MACHINE_HOLDER_ENV: &str = "ATERM_VERIFY_MACHINE_HOLDER";
 /// alive, and it is not this process — a value inherited from a finished gate
 /// serializes as before.
 #[must_use]
-pub fn inside_machine_holder() -> bool {
-    machine_lock_dir().is_some_and(|dir| {
-        inside_holder_in(&dir, std::env::var(MACHINE_HOLDER_ENV).ok().as_deref())
-    })
+pub fn inside_machine_holder(lock_dir: Option<&Path>) -> bool {
+    lock_dir
+        .is_some_and(|dir| inside_holder_in(dir, std::env::var(MACHINE_HOLDER_ENV).ok().as_deref()))
 }
 
 /// [`inside_machine_holder`] against the lock in `dir` and the inherited
@@ -644,7 +646,7 @@ fn refuse_other_checkouts(caller: &Path, snap: &Path, path_env: &OsStr) -> Resul
             return Err(format!(
                 "the snapshot path {} {} the checkout {}, which the gate did not create \
                  (no {GATE_STATE_DIR}/{MARKER_FILE}) — refusing to touch it: a sync would \
-                 wipe its uncommitted work; point {SNAPSHOT_ENV} at a path of its own",
+                 wipe its uncommitted work; point {SNAPSHOT_FLAG} at a path of its own",
                 snap.display(),
                 if listed == snap {
                     "is"
@@ -692,7 +694,7 @@ fn ensure_worktree(caller: &Path, snap: &Path, path_env: &OsStr) -> Result<(), S
     }
     let refusal = |what: &str| {
         Err(format!(
-            "{} exists and {what} — refusing to touch it; remove it or point {SNAPSHOT_ENV} \
+            "{} exists and {what} — refusing to touch it; remove it or point {SNAPSHOT_FLAG} \
              elsewhere",
             snap.display()
         ))
@@ -1428,35 +1430,24 @@ fn pid_alive(pid: u32) -> bool {
             .is_ok_and(|s| s.success())
 }
 
-/// The lane target dirs that exist in the snapshot: `target`, every
-/// top-level `target-*`, and the nested workspaces' own.
+/// The lane target dirs that exist in the snapshot, as absolute paths:
+/// `target`, every top-level `target-*`, and the nested workspaces' own.
+///
+/// ONE DEFINITION, read from where the disk preflight keeps it
+/// ([`crate::disk::lane_dirs`]): these are the dirs it measures, the dirs its
+/// cap removes ([`remove_lanes`]) and the dirs [`crate::disk::remedy`] tells a
+/// refused operator to delete. Two lists drifted twice: `libc-oracle/
+/// target-symgate` was stamped as a lane and left out of the remedy
+/// (2026-09-21), and the cap as first written (2026-09-23, before it was
+/// committed) would have removed every root dir named `target*` while only
+/// `target` and `target-*` are stamped. A lane beneath a link is a directory
+/// outside the snapshot: never stamped, never pruned, never removed.
 fn lane_dirs(snap: &Path) -> Vec<PathBuf> {
-    let mut dirs = BTreeSet::new();
-    if let Ok(rd) = std::fs::read_dir(snap) {
-        for e in rd.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-            if is_dir && (name == "target" || name.starts_with("target-")) {
-                dirs.insert(e.path());
-            }
-        }
-    }
-    // ONE LIST, read from where the disk preflight keeps it: these are the same
-    // dirs [`crate::disk::remedy`] tells a refused operator to delete, and a
-    // second copy here drifted once already (`libc-oracle/target-symgate` was
-    // stamped as a lane and left out of the remedy, 2026-09-21).
-    for rel in crate::disk::NESTED_LANE_DIRS {
-        let p = snap.join(rel);
-        // A lane beneath a link is a directory outside the snapshot: never
-        // stamped, never pruned.
-        if refuse_symlinked_dir(snap, &p).is_ok()
-            && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir())
-        {
-            dirs.insert(p);
-        }
-    }
-    dirs.into_iter().collect()
+    crate::disk::lane_dirs(snap)
+        .into_iter()
+        .map(|rel| snap.join(rel))
+        .filter(|p| refuse_symlinked_dir(snap, p).is_ok())
+        .collect()
 }
 
 /// FNV-1a: a stamp names THAT a value changed, and must not store the value.
@@ -1600,6 +1591,73 @@ fn stamp_lanes(
     (notes, deleting)
 }
 
+/// Remove every lane of the snapshot at `snap` NOW, and give the bytes back
+/// before returning — the disk preflight's cap ([`crate::disk::LANE_CAP_BYTES`]).
+///
+/// The lanes are [`lane_dirs`] — the dirs the stamps name and the preflight
+/// measured ([`crate::disk::lane_dirs`]) — so what it removes is what it
+/// counted, and a root dir that merely starts with `target` (`targets/`,
+/// `target_x/`, a `target.noindex/`) is left alone. Each moves into the trash
+/// exactly as `stamp_lanes` prunes a lane for a new compiler — one rename, so
+/// a lane is whole or gone and no build ever meets half of one — and is
+/// recreated empty with its stamp put back. Unlike that prune, the entries this
+/// makes are deleted with `std::fs::remove_dir_all` BEFORE it returns, at
+/// normal priority: the cap exists for the free space, and the preflight reads
+/// it next. MEASURED 2026-09-23 on this machine: `std::fs::remove_dir_all` of
+/// a synthetic 40,201-entry tree (200 dirs of 200 files of 1 KiB) took 1.23,
+/// 1.26 and 1.24 s in three runs, and the snapshot's lanes held 38,427 entries
+/// after a cold run. Their files are larger, and what freeing larger files
+/// adds was not measured. An entry a killed run leaves in the trash is deleted
+/// by the next [`prepare`], which empties the trash.
+///
+/// Returns one sentence per lane that was not removed and deleted; empty means
+/// every one was.
+#[must_use]
+pub fn remove_lanes(snap: &Path) -> Vec<String> {
+    let trash = snap.join(GATE_STATE_DIR).join("trash");
+    if let Err(e) =
+        refuse_symlinked_dir(snap, &trash).and_then(|()| std::fs::create_dir_all(&trash))
+    {
+        return vec![format!(
+            "not removed: the trash {} cannot be used ({e})",
+            trash.display()
+        )];
+    }
+    let mut failed = Vec::new();
+    for (n, dir) in lane_dirs(snap).into_iter().enumerate() {
+        let shown = dir.strip_prefix(snap).unwrap_or(&dir).display().to_string();
+        // `lane_dirs` already leaves out a lane beneath a link; asked again,
+        // because this is the call that deletes.
+        if let Err(e) = refuse_symlinked_dir(snap, &dir) {
+            failed.push(format!("{shown} not removed: {e}"));
+            continue;
+        }
+        let stamp = std::fs::read_to_string(dir.join(STAMP_FILE)).ok();
+        let dest = trash.join(format!(
+            "{}.{}.cap{n}",
+            shown.replace('/', "_"),
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::rename(&dir, &dest) {
+            failed.push(format!(
+                "{shown} not removed: cannot move it to the trash ({e})"
+            ));
+            continue;
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        if let Some(stamp) = stamp {
+            let _ = std::fs::write(dir.join(STAMP_FILE), stamp);
+        }
+        if let Err(e) = std::fs::remove_dir_all(&dest) {
+            failed.push(format!(
+                "{shown} moved to {} but not deleted ({e})",
+                dest.display()
+            ));
+        }
+    }
+    failed
+}
+
 /// `taskpolicy -b rm -rf` every entry of `trash` (plain `rm -rf` where there is
 /// no taskpolicy): background QoS, so a pruned lane's gigabytes never compete
 /// with the stages for the disk.
@@ -1712,10 +1770,22 @@ mod tests {
         // hold's drop unlocks (`LOCK_UN`) rather than only closing, which frees
         // the lock for every copy — a close-only release made this retake read
         // the child's copy as a live holder in a gate run (2026-09-24).
+        // Pinned on every run, not left to a concurrent fork: a duplicate of
+        // the held descriptor (`try_clone`, the SAME open file description,
+        // exactly the copy a child mid-fork holds) stays open across the
+        // drop. A close-only release leaves the lock held through it, and the
+        // instant retake below refuses.
+        let copy = held
+            .file
+            .as_ref()
+            .expect("a taken hold carries its file")
+            .try_clone()
+            .expect("dup the held descriptor");
         drop(held);
         let again = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-            .expect("a released machine is taken");
+            .expect("a released machine is taken, whatever copies of its descriptor live on");
         drop(again);
+        drop(copy);
         // Left behind by a gate that died without destructors: free, whatever
         // pid its note names — a dead one, or a reused one (here, our own).
         for pid in [999_999_999, std::process::id()] {
@@ -1869,6 +1939,118 @@ mod tests {
             0
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE CAP'S REMOVAL: every lane the preflight measured is emptied and its
+    /// bytes deleted before the call returns, each keeps its stamp, and
+    /// nothing beneath a link — a lane-shaped symlink, a nested lane under a
+    /// linked parent — is followed or touched.
+    #[cfg(unix)]
+    #[test]
+    fn removing_the_lanes_empties_every_one_keeps_its_stamp_and_follows_no_link() {
+        let base = crate::mktemp_dir("atv-snap-remove").expect("mktemp");
+        let snap = base.join("snap");
+        let outside = base.join("outside");
+        for d in [
+            "target/debug/deps",
+            "target-tippy/debug",
+            "libc-oracle/target/release",
+            ".aterm-verify",
+        ] {
+            std::fs::create_dir_all(snap.join(d)).expect("mkdir");
+        }
+        std::fs::create_dir_all(outside.join("freeze-safety-gate/target")).expect("mkdir");
+        std::fs::write(snap.join("target/debug/deps/libx.rlib"), vec![0u8; 4096]).expect("w");
+        std::fs::write(snap.join("target-tippy/debug/y.rmeta"), b"y").expect("w");
+        std::fs::write(snap.join("libc-oracle/target/release/z"), b"z").expect("w");
+        std::fs::write(snap.join("target").join(STAMP_FILE), "trustc-commit c1\n").expect("w");
+        std::fs::write(outside.join("keep"), b"keep").expect("w");
+        std::fs::write(outside.join("freeze-safety-gate/target/keep"), b"k").expect("w");
+        std::os::unix::fs::symlink(&outside, snap.join("target-linked")).expect("link");
+        std::os::unix::fs::symlink(&outside, snap.join("tools")).expect("link");
+
+        assert_eq!(remove_lanes(&snap), Vec::<String>::new());
+
+        for lane in ["target", "target-tippy", "libc-oracle/target"] {
+            let left: Vec<String> = std::fs::read_dir(snap.join(lane))
+                .expect("the lane is recreated")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let want: &[&str] = if lane == "target" { &[STAMP_FILE] } else { &[] };
+            assert_eq!(left, want, "{lane}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(snap.join("target").join(STAMP_FILE)).expect("stamp"),
+            "trustc-commit c1\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(snap.join(".aterm-verify/trash"))
+                .expect("trash")
+                .count(),
+            0,
+            "the removed bytes were deleted, not parked"
+        );
+        assert!(
+            outside.join("keep").exists(),
+            "a lane-shaped link was followed"
+        );
+        assert!(
+            outside.join("freeze-safety-gate/target/keep").exists(),
+            "a nested lane under a linked parent was removed"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE CAP REMOVES THE GATE'S LANES AND NOTHING ELSE. The lanes are what
+    /// `lane_dirs` stamps: `target`, every root `target-*` and the nested
+    /// workspaces' own. A root directory whose name only STARTS with `target`
+    /// — `targets/`, `target_x/`, a dev `target.noindex/` — is not one: no run
+    /// stamps it, so the cap neither measures nor deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_removes_the_stamped_lanes_and_no_directory_that_only_starts_with_target() {
+        let snap = crate::mktemp_dir("atv-snap-cap-only").expect("mktemp");
+        let lanes = ["target/debug/a", "target-tippy/b", "libc-oracle/target/c"];
+        let others = [
+            "targets/keep",
+            "target_x/keep",
+            "target.noindex/debug/keep",
+            "crates/x/target/keep",
+        ];
+        for f in lanes.iter().chain(&others) {
+            let p = snap.join(f);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&p, b"x").expect("write");
+        }
+
+        assert_eq!(remove_lanes(&snap), Vec::<String>::new());
+        for f in lanes {
+            assert!(!snap.join(f).exists(), "{f} is a lane and was not removed");
+        }
+        for f in others {
+            assert!(snap.join(f).exists(), "{f} is not a lane and was removed");
+        }
+
+        // What the preflight measures is what the stamps name.
+        let stamped: Vec<PathBuf> = lane_dirs(&snap)
+            .iter()
+            .map(|d| d.strip_prefix(&snap).expect("inside").to_path_buf())
+            .collect();
+        let crate::disk::Lanes::Measured(measured) = crate::disk::measure_lanes(&snap) else {
+            panic!("du -sk did not measure {}", snap.display());
+        };
+        let measured: Vec<PathBuf> = measured.into_iter().map(|(d, _)| d).collect();
+        assert_eq!(measured, stamped);
+        assert_eq!(
+            stamped,
+            [
+                PathBuf::from("libc-oracle/target"),
+                PathBuf::from("target"),
+                PathBuf::from("target-tippy")
+            ]
+        );
+        std::fs::remove_dir_all(&snap).ok();
     }
 
     #[test]

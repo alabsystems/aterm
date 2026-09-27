@@ -1948,6 +1948,7 @@ pub(crate) struct KittyBookRow {
     /// Rarity tier: `legendary` / `rare` / `traits` / `common`.
     pub(crate) tier: &'static str,
     /// The registry `config_key` (or the trait key) of this cell.
+    #[cfg(test)]
     pub(crate) key: &'static str,
     /// The human label ([`KittyType::label`] / [`KittyMagic::label`] / trait).
     pub(crate) label: &'static str,
@@ -2004,6 +2005,7 @@ fn collectible_row(log: &KittyLog, index: usize, tier: &'static str) -> KittyBoo
     let found = log.collectibles.iter().find(|item| item.key == def.id);
     KittyBookRow {
         tier,
+        #[cfg(test)]
         key: def.id,
         label: glyph_label(def.id),
         seen: found.is_some(),
@@ -2055,6 +2057,7 @@ pub(crate) fn kitty_book(log: &KittyLog) -> KittyBook {
         .collect();
     let mut head_row = KittyBookRow {
         tier: "heads",
+        #[cfg(test)]
         key: "heads",
         label: "Head variants",
         seen: !head_items.is_empty(),
@@ -2093,6 +2096,7 @@ pub(crate) fn kitty_book(log: &KittyLog) -> KittyBook {
 /// Serialize the retired Settings-card book as `kittylog …` introspection lines for
 /// legacy model tests. Production `controls settings` compiles the native route's
 /// semantic tree and does not append an off-screen Kitty Log catalog.
+#[cfg(test)]
 pub(crate) fn book_lines(log: &KittyLog) -> Vec<String> {
     let book = kitty_book(log);
     let mut out = Vec::with_capacity(book.rows.len() + 1);
@@ -2126,7 +2130,8 @@ mod tests {
     use super::*;
     use aterm_effects::cat_glyphs_gen::CatGlyphId;
     use aterm_spec::derive::{
-        kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
+        Model, kitty_collectibles_model, kitty_flush_worker_model, kitty_pin_merge_model,
+        kitty_sidecar_durability_model,
     };
     use aterm_spec::verify;
     use std::collections::BTreeMap;
@@ -3383,6 +3388,177 @@ mod tests {
         // on-disk total, so a wear that carried a count would inflate it every
         // time the user changed their cat.
         assert_eq!(carried.count, 0, "a wear is not an observation");
+    }
+
+    /// The logical-clock tick `n` as the RFC3339 stamp a wear writes. Fixed
+    /// width, so lexicographic order is the clock's order — exactly the
+    /// property `max_ts` rests on.
+    fn pin_stamp(n: i64) -> String {
+        format!("2026-09-25T00:00:{n:02}Z")
+    }
+
+    /// The tick a replica's row for `key` is pinned at (`0` = never pinned).
+    fn pin_tick(log: &KittyLog, key: &str) -> i64 {
+        let row = log
+            .roster()
+            .iter()
+            .find(|row| row.key == key)
+            .expect("both cats are collected on both replicas");
+        if row.favourite.is_empty() {
+            return 0;
+        }
+        row.favourite
+            .strip_prefix("2026-09-25T00:00:")
+            .and_then(|rest| rest.strip_suffix('Z'))
+            .and_then(|tick| tick.parse().ok())
+            .unwrap_or_else(|| panic!("a stamp this test did not write: {}", row.favourite))
+    }
+
+    /// One replica merging another's ledger in: the real pure read-merge core
+    /// (`merge_from`, which `flush_merge` runs), or a fault injected after it.
+    type PinFlush = fn(&mut KittyLog, &KittyLog);
+
+    fn join_flush(dst: &mut KittyLog, src: &KittyLog) {
+        dst.merge_from(src);
+    }
+
+    /// The model's `Buggy = 1` merge, as its net effect on the real ledger: the
+    /// real merge, then every favourite stamp TAKEN from the incoming copy —
+    /// last-writer-by-arrival.
+    fn take_flush(dst: &mut KittyLog, src: &KittyLog) {
+        dst.merge_from(src);
+        for row in &mut dst.collectibles {
+            row.favourite = src
+                .collectibles
+                .iter()
+                .find(|incoming| incoming.key == row.key)
+                .map(|incoming| incoming.favourite.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    /// Walk `model`'s whole reachable space on two REAL replicas of the ledger.
+    ///
+    /// A wear is the real [`KittyLog::wear`] at the next clock stamp; a flush is
+    /// `flush` of one replica into the other. `a1`/`a2`/`b1`/`b2` are read back
+    /// out of the replicas' rows every step. `clock`, `steps` and `ab` are the
+    /// harness's own bookkeeping, and `b*_hi` is the history the model states
+    /// its law over — the greatest stamp B held before the step — computed from
+    /// the PRE-step projection, exactly as the model's simultaneous update does.
+    fn pin_merge_walk(model: &Model, flush: PinFlush) -> Result<(usize, usize), String> {
+        let lex = Lexicon::builtin();
+        let mut replica = KittyLog::default();
+        for (ident, look) in [
+            (11, coated(CatGlyphId::S100, 3)),
+            (12, coated(CatGlyphId::S101, 7)),
+        ] {
+            replica.record(&look_sighting(ident, look), lex, "2026-09-24T00:00:00Z");
+        }
+        let keys: Vec<String> = replica.roster().iter().map(|row| row.key.clone()).collect();
+        assert_eq!(keys.len(), 2, "fixture: two cats collected");
+        let (one, two) = (keys[0].as_str(), keys[1].as_str());
+        let project = |a: &KittyLog, b: &KittyLog, book: &aterm_spec::interp::State| {
+            let mut state = book.clone();
+            state.insert("a1", pin_tick(a, one));
+            state.insert("a2", pin_tick(a, two));
+            state.insert("b1", pin_tick(b, one));
+            state.insert("b2", pin_tick(b, two));
+            state
+        };
+
+        let init = model.init_state();
+        if project(&replica, &replica, &init) != init {
+            return Err(format!("the fixture does not project to {init:?}"));
+        }
+        let mut seen = std::collections::BTreeSet::from([init.clone()]);
+        let mut queue = std::collections::VecDeque::from([(init, replica.clone(), replica)]);
+        let (mut states, mut edges) = (0usize, 0usize);
+        while let Some((state, a, b)) = queue.pop_front() {
+            states += 1;
+            for action in ["WearOneOnA", "WearTwoOnB", "FlushAToB", "FlushBToA"] {
+                let expected = model.successors(action, &state);
+                if expected.is_empty() {
+                    continue;
+                }
+                let (mut a, mut b, mut book) = (a.clone(), b.clone(), state.clone());
+                *book.get_mut("steps").expect("steps") += 1;
+                let hi = |book: &mut aterm_spec::interp::State, hi: &'static str, pre: &str| {
+                    let now = book[hi].max(state[pre]);
+                    book.insert(hi, now);
+                };
+                match action {
+                    "WearOneOnA" | "WearTwoOnB" => {
+                        let stamp = pin_stamp(state["clock"] + 1);
+                        let worn = if action == "WearOneOnA" {
+                            a.wear(one, &stamp)
+                        } else {
+                            hi(&mut book, "b2_hi", "b2");
+                            b.wear(two, &stamp)
+                        };
+                        worn.expect("a collected cat can be worn");
+                        *book.get_mut("clock").expect("clock") += 1;
+                        book.insert("ab", 0);
+                    }
+                    "FlushAToB" => {
+                        hi(&mut book, "b1_hi", "b1");
+                        hi(&mut book, "b2_hi", "b2");
+                        flush(&mut b, &a);
+                        book.insert("ab", 1);
+                    }
+                    _ => flush(&mut a, &b),
+                }
+                let after = project(&a, &b, &book);
+                if expected != vec![after.clone()] {
+                    return Err(format!(
+                        "{}: real {action} took {state:?} to {after:?}, the model's {action} \
+                         to {expected:?}",
+                        model.name
+                    ));
+                }
+                edges += 1;
+                if seen.insert(after.clone()) {
+                    queue.push_back((after, a, b));
+                }
+            }
+        }
+        Ok((states, edges))
+    }
+
+    /// Tier-1 conformance for `KittyPinMerge`
+    /// (`aterm_spec::derive::kitty_pin_merge_model`): wearing a cat and folding
+    /// one replica's ledger into another, on two REAL `KittyLog`s, is exactly
+    /// the model's join — over the model's whole reachable space, both flush
+    /// directions in every order.
+    ///
+    /// NEGATIVE CONTROL: the model's own `Buggy = 1` merge (take the incoming
+    /// stamp) injected after the same real merge is rejected by the healthy
+    /// model at a flush, and is exactly what the buggy model describes; the
+    /// shipped merge is in turn rejected by the buggy model. So the bind tells
+    /// the join from the assignment in both directions.
+    #[test]
+    fn wear_and_merge_conform_to_the_kitty_pin_merge_model() {
+        let model = kitty_pin_merge_model();
+        let (states, edges) =
+            pin_merge_walk(&model, join_flush).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(
+            Ok(states),
+            aterm_spec::interp::bmc(&model),
+            "the real replicas must reach every state the model can"
+        );
+        assert!(edges > states, "every state is left more than one way");
+
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let rejected = pin_merge_walk(&model, take_flush)
+            .expect_err("the healthy model must reject an assignment merge");
+        assert!(
+            rejected.contains("the model's FlushAToB")
+                || rejected.contains("the model's FlushBToA"),
+            "the assignment merge must be rejected at a flush: {rejected}"
+        );
+        pin_merge_walk(&buggy, take_flush)
+            .unwrap_or_else(|why| panic!("the buggy model must describe the take: {why}"));
+        pin_merge_walk(&buggy, join_flush)
+            .expect_err("the shipped join must not conform to the assignment merge");
     }
 
     /// THE HEADLINE TRAP. `KittyLog::record` reports "new" only for an unseen

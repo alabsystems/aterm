@@ -22,10 +22,14 @@
 //!   metadata or the release cutter sets. Not read at run time at all.
 //! * [`DEV_SEAMS`] — read ONLY through `aterm_types::dev_seam!`; a plain `env::var` of
 //!   one of these names is a failure, because that read would ship.
-//! * [`OUT_OF_SCOPE`] — modes and presentation/diagnostic knobs outside the update
-//!   system (`ATERM_HEADLESS`, `ATERM_LOG`, the renderer and font seams, …), listed so
-//!   the ratchet holds: a NEW name read anywhere in shipped code fails here until
-//!   somebody decides, in this file, which of the four it is.
+//!
+//! There is no fourth list. Until 2026-09-24 an `OUT_OF_SCOPE` list held the modes and
+//! the renderer/font/GPU, launch, control-socket, fabric and verify-gate knobs outside
+//! the update system, so the ratchet could hold while each waited for its own audit.
+//! The three audits emptied it (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
+//! §4.1.2–§4.1.4) and it is gone: a NEW name read anywhere in shipped code fails here
+//! until somebody decides, in this file, which of the three it is — or makes it a
+//! flag or an `aterm.toml` key and lists the old name in [`RETIRED`].
 //!
 //! [`RETIRED`] names the deleted knobs. None may be read by any first-party source — the
 //! doctor's presence-only detector ([`RETIRED_DETECTOR`]), which tells a person that an
@@ -74,10 +78,7 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_SESSION_ID",
     "ATERM_PARENT_SESSION_ID",
     "ATERM_LAUNCH_NONCE",
-    "ATERM_EDGE_READ",
-    "ATERM_EDGE_SIGNAL",
     "ATERM_EDGE_TOKENS",
-    "ATERM_EDGE_WRITE",
     // The updater's re-exec and the seamless handoff's fd/nonce protocol.
     "ATERM_UPDATE_REEXEC",
     "ATERM_UPDATED_FROM",
@@ -98,11 +99,12 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_HANDOFF_RENDEZVOUS",
     "ATERM_HANDOFF_CONTROL_SOCKET_IDENTITY",
     // The window/session → the shell integration it injects (its directory, the
-    // zsh ZDOTDIR hand-back, the per-shell nonce, the loaded guard, WSL's cwd), and the
-    // controller-spawn observation hint.
+    // zsh ZDOTDIR hand-back, the per-shell nonce and the file a re-key of it lands in,
+    // the loaded guard, WSL's cwd), and the controller-spawn observation hint.
     "ATERM_SHELL_INTEGRATION_DIR",
     "ATERM_SHELL_INTEGRATION_INSTALLED",
     "ATERM_SHELL_NONCE",
+    "ATERM_REKEY_PATH",
     "ATERM_ORIGINAL_ZDOTDIR",
     "ATERM_UNSET_ZDOTDIR",
     "ATERM_WSL_CWD",
@@ -114,7 +116,10 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_MUX_BASE",
     "ATERM_MUX_NOTICE",
     "ATERM_MUX_OUTER_SESSION_ID",
-    "ATERM_FABRIC_COMMAND",
+    // The verify gate holding this machine's lock → every child it runs, so a gate a
+    // stage starts runs inside that hold instead of queueing on its own ancestor
+    // (`snapshot::MACHINE_HOLDER_ENV`; nothing but the holding gate sets it).
+    "ATERM_VERIFY_MACHINE_HOLDER",
 ];
 
 /// Compile-time values (`env!` / `option_env!`) the build derives or the cutter sets.
@@ -151,11 +156,17 @@ const DEV_SEAMS: &[&str] = &[
     "ATPKG_STAGE_DISK_REVERIFY",
     "ATERM_UPDATE_ROOT",
     "ATERM_DEBUG_SEAMLESS_REEXEC",
+    // A fresh shell spawned as a lost-nonce adopted one (spawn.rs
+    // `debug_lost_shell_nonce`), for live checks of the typed re-key.
+    "ATERM_DEBUG_LOST_SHELL_NONCE",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_DEBUG_STATUS_BARS",
     // The strain row's fake saturated reading (strain_host.rs `debug_load`), for
     // captures and demos.
     "ATERM_DEBUG_STRAIN",
+    // The Paste gesture's file-fed clipboard (lib.rs `debug_paste_text`), for live
+    // checks of a large paste without touching the owner's clipboard.
+    "ATERM_DEBUG_PASTE_FILE",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
     "ATERM_SESSION_MODEL",
@@ -163,103 +174,55 @@ const DEV_SEAMS: &[&str] = &[
     // test in aterm-link parks the lane between adoption and drain to force the
     // interleaving deterministically.
     "ATERM_TEST_PUSH_HOLD",
-];
-
-/// Outside Phase 4's scope — not the update system. Modes (`ATERM_HEADLESS`), the log
-/// filter (`ATERM_LOG`), launch geometry and renderer/font/GPU seams, the control-socket
-/// selectors, the fabric and link fault seams, and the verify gate's own knobs (it is
-/// linked for `aterm help rust`). Each is its own audit's to keep or delete; listing
-/// them here is what makes a NEW name fail instead of slipping in beside them.
-const OUT_OF_SCOPE: &[&str] = &[
-    "ATERM_HEADLESS",
-    "ATERM_LOG",
-    "ATERM_VERBOSE",
-    "ATERM_CONTAINMENT_MODE",
-    "ATERM_CONTROL_SOCK",
-    "ATERM_NO_CONTROL_SOCK",
-    "ATERM_CONTROL_TOKEN",
-    "ATERM_CTL",
-    "ATERM_STATE_HOME",
-    "ATERM_SHELL",
-    "ATERM_EXEC",
-    "ATERM_TERM_PROGRAM",
-    "ATERM_AI_HINT",
-    "ATERM_ALT_ARCHIVE",
-    "ATERM_BIN",
-    "ATERM_COLUMNS",
-    "ATERM_LINES",
-    "ATERM_CPU",
-    "ATERM_GPU",
+    // The render audit (2026-09-24, docs/DESIGN-atpkg-vendor-direct-updates §4.1.2):
+    // GPU device selection and present-pacing experiments, the Metal loss drill,
+    // the golden/parity suites' portable-raster pin, the procedural-glyph A/B, the
+    // headless titlebar band, the chrome A/B levers, the latency and cursor traces,
+    // and the stall watchdog's off/abort/tight-bar lever (the watchdog itself stays
+    // ON in a shipped binary, at the release bar).
     "ATERM_GPU_ADAPTER",
-    "ATERM_GPU_BACKEND",
     "ATERM_GPU_FRAME_LATENCY",
     "ATERM_GPU_MEMBLOCK",
     "ATERM_GPU_POWER",
     "ATERM_GPU_PRESENT_MODE",
-    "ATERM_METAL",
     "ATERM_METAL_INJECT_LOSS",
-    "ATERM_FONT",
-    "ATERM_FONT_HINTING",
-    "ATERM_FONT_PX",
-    "ATERM_FONT_SUBPIXEL",
-    "ATERM_EMOJI_FONT",
-    "ATERM_FALLBACK_FONT",
-    "ATERM_SYMBOL_FONT",
     "ATERM_RASTERIZER",
-    "ATERM_STEM_GAMMA",
     "ATERM_NO_PROCEDURAL_GLYPHS",
     "ATERM_FORCE_HC_CHROME",
-    "ATERM_FORCE_SCALE",
     "ATERM_HEADROOM_PX",
-    "ATERM_TAB_STRIP_ROWS",
-    "ATERM_WINDOWING_BEHAVIOR",
     "ATERM_NO_COLORSPACE_MATCH",
-    "ATERM_NO_DARK_CHROME",
     "ATERM_NO_FULLSIZE_CONTENT",
-    "ATERM_NO_PATH_REFRESH",
-    "ATERM_NO_SHELL_INTEGRATION",
-    "ATERM_LATENCY_TRACE",
-    "ATERM_TRACE_BOOST",
     "ATERM_TRACE_LATENCY",
     "ATERM_TRACE_SPAWN",
-    "ATERM_PTY_IDLE_POLL_US",
-    "ATERM_SNAPSHOT_PATH",
     "ATERM_WATCHDOG",
-    "ATERM_OPERATOR",
-    "ATERM_NO_OPERATOR",
-    "ATERM_OPERATOR_PROFILE",
-    "ATERM_NET_CERT",
-    "ATERM_NET_KEY",
-    "ATERM_NET_LISTEN",
-    "ATERM_FABRIC_FAIL_MINT_AT",
-    "ATERM_FABRIC_FLEET",
-    "ATERM_FABRIC_HOME",
-    "ATERM_FABRIC_TRACE",
+    // The session group's audit (2026-09-24): test isolation of the state root (a
+    // release launch isolates with a scratch `$HOME`), the binary `fabric on`
+    // installs (the aterm-link tests point it at the build under test), the log
+    // level, and two PTY diagnostics/perf sweeps.
+    "ATERM_STATE_HOME",
+    "ATERM_BIN",
+    "ATERM_LOG",
+    "ATERM_PTY_IDLE_POLL_US",
+    "ATERM_TRACE_BOOST",
+    // The fabric's test seams (2026-09-24): the bridge's and the notifier's crash
+    // switches, `aterm fabric on`'s effect trace and mint fault, and the redirected
+    // root every fabric test runs under (a shipped binary has the one root).
     "ATERM_LINK_FAULT",
     "ATERM_LINK_NOTIFY_FAULT",
-    "ATERM_SKIP_GUI_SMOKE",
-    "ATERM_VERIFY_BASE",
-    "ATERM_VERIFY_ROOT",
-    "ATERM_VERIFY_STAGE_TIMEOUT",
-    "ATERM_VERIFY_TEST_THREADS",
-    // Read through `aterm-verify`'s `var_path` helper, which the first version of this
-    // gate could not see (it knew readers by name); the presumed-read scan found them.
-    "ATERM_VERIFY_LOG",
-    "ATERM_VERIFY_SNAPSHOT",
-    "ATERM_VERIFY_TIMINGS",
-    // The gate's own fixture tests move its machine lock off the per-user one
-    // (`snapshot::MACHINE_LOCK_DIR_ENV`), so a gate never waits on its own test stage.
-    "ATERM_VERIFY_MACHINE_LOCK_DIR",
-    // A gate started by the one holding the machine runs inside its hold
-    // (`snapshot::MACHINE_HOLDER_ENV`) instead of waiting on its own ancestor.
-    "ATERM_VERIFY_MACHINE_HOLDER",
-    // The verify gate → the build it runs (its own provenance stamps).
-    "ATERM_BUILD_GIT_COMMIT",
-    "ATERM_BUILD_GIT_COMMIT_FULL",
-    "ATERM_BUILD_DEV_COMMITS",
+    "ATERM_FABRIC_TRACE",
+    "ATERM_FABRIC_FAIL_MINT_AT",
+    "ATERM_FABRIC_HOME",
+    // The landing's review (2026-09-24): the e2e harness's bridge command for the
+    // debug instances it launches. It sat on INTERNAL_PROTOCOL, but nothing in aterm
+    // sets it for a child (the child-environment deny list strips it); it was a
+    // person's override of `[fabric] command`, which is the one spelling now.
+    "ATERM_FABRIC_COMMAND",
 ];
 
-/// The knobs Phase 4 deleted (2026-09-23). Read by nothing, allow-listed nowhere.
+/// The deleted knobs: Phase 4's (2026-09-23), and the env audit's (2026-09-24: the
+/// render, session and devtools groups, `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
+/// §4.1's decision tables) — each replaced by a setting or a flag, or by nothing. Read
+/// by nothing, allow-listed nowhere.
 const RETIRED: &[&str] = &[
     "ATPKG_DISABLE",
     "ATPKG_TOKEN",
@@ -283,6 +246,65 @@ const RETIRED: &[&str] = &[
     "ATERM_NO_HARNESS",
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    // The render audit (2026-09-24): each has a launch flag or an aterm.toml key, or
+    // nothing left to choose between (`ATERM_METAL`, `ATERM_GPU_BACKEND`), or was folded
+    // into a seam (`ATERM_LATENCY_TRACE` → `ATERM_TRACE_LATENCY`).
+    "ATERM_CPU",
+    "ATERM_GPU",
+    "ATERM_GPU_BACKEND",
+    "ATERM_METAL",
+    "ATERM_FONT",
+    "ATERM_FONT_PX",
+    "ATERM_FONT_HINTING",
+    "ATERM_FONT_SUBPIXEL",
+    "ATERM_FALLBACK_FONT",
+    "ATERM_SYMBOL_FONT",
+    "ATERM_EMOJI_FONT",
+    "ATERM_STEM_GAMMA",
+    "ATERM_FORCE_SCALE",
+    "ATERM_TAB_STRIP_ROWS",
+    "ATERM_NO_DARK_CHROME",
+    "ATERM_WINDOWING_BEHAVIOR",
+    "ATERM_LATENCY_TRACE",
+    "ATERM_SNAPSHOT_PATH",
+    // The session group (2026-09-24): each is a launch flag, an aterm.toml key, or
+    // gone with the feature (docs/DESIGN-env-audit-session-2026-09-24.md).
+    "ATERM_HEADLESS",
+    "ATERM_COLUMNS",
+    "ATERM_LINES",
+    "ATERM_CONTROL_SOCK",
+    "ATERM_NO_CONTROL_SOCK",
+    "ATERM_CONTROL_TOKEN",
+    "ATERM_CTL",
+    "ATERM_SHELL",
+    "ATERM_EXEC",
+    "ATERM_TERM_PROGRAM",
+    "ATERM_AI_HINT",
+    "ATERM_ALT_ARCHIVE",
+    "ATERM_CONTAINMENT_MODE",
+    "ATERM_NO_PATH_REFRESH",
+    "ATERM_NO_SHELL_INTEGRATION",
+    "ATERM_OPERATOR",
+    "ATERM_NO_OPERATOR",
+    "ATERM_OPERATOR_PROFILE",
+    "ATERM_NET_LISTEN",
+    "ATERM_NET_CERT",
+    "ATERM_NET_KEY",
+    "ATERM_VERBOSE",
+    // 2026-09-24, the fabric: `aterm fabric on|mint-for --fleet` is the fleet.
+    "ATERM_FABRIC_FLEET",
+    // 2026-09-24, the verify gate: `--root` and `--base` already existed; the rest
+    // are its flags (`--stage-timeout`, `--test-threads`, `--log`/`--no-log`,
+    // `--snapshot`, `--timings`, `--skip-gui-smoke`, `--machine-lock-dir`).
+    "ATERM_VERIFY_ROOT",
+    "ATERM_VERIFY_BASE",
+    "ATERM_VERIFY_STAGE_TIMEOUT",
+    "ATERM_VERIFY_TEST_THREADS",
+    "ATERM_VERIFY_LOG",
+    "ATERM_VERIFY_SNAPSHOT",
+    "ATERM_VERIFY_TIMINGS",
+    "ATERM_SKIP_GUI_SMOKE",
+    "ATERM_VERIFY_MACHINE_LOCK_DIR",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -711,9 +733,11 @@ fn call_role(code: &[u8], open: usize) -> CallRole {
     }
 }
 
-/// Tables whose `&str` elements are names STRIPPED from a child's environment, never
-/// read: a family name listed in one is not a read of it.
-const WRITE_TABLES: &[&str] = &["ENV_DENY_VARS"];
+/// Tables whose `&str` elements are names a parent STRIPS from, or SETS in, a child's
+/// environment, never reads: a family name listed in one is not a read of it. The
+/// child-env deny list, and the verify gate's git stamp — the `aterm-gui` build
+/// script's inputs, handed to the gate's own child builds (`aterm_verify::GIT_STAMP_ENV`).
+const WRITE_TABLES: &[&str] = &["ENV_DENY_VARS", "GIT_STAMP_ENV"];
 
 /// The one place a RETIRED name may be named in shipped code: the doctor's detector,
 /// which reads PRESENCE only (`var_os(name).is_some()`), never acts on it, and tells a
@@ -723,7 +747,8 @@ const RETIRED_DETECTOR: (&str, &str) = ("crates/atpkg/src/doctor.rs", "RETIRED_O
 
 /// Mentions the scanner would presume to be reads that are not — each named, file and
 /// name, with the reason. A new one is a decision made HERE, and one no longer found
-/// fails as stale.
+/// fails as stale. An entry excuses only a PRESUMED read ([`Context::Presumed`]): a
+/// reader call of the same name in the same file (`env::var(NAME)`) is still a read.
 const MENTIONS: &[(&str, &str, &str)] = &[
     (
         "crates/aterm-gui/src/app_update_screen.rs",
@@ -735,13 +760,27 @@ const MENTIONS: &[(&str, &str, &str)] = &[
         "ATERM_CLIPBOARD_RECV",
         "an X11 atom name, not an environment variable",
     ),
+    (
+        "crates/aterm-link/src/enable.rs",
+        "ATERM_BIN",
+        "the undo line's LABEL for the seam; the read beside it is `dev_seam!`",
+    ),
+    (
+        "crates/aterm-link/src/enable.rs",
+        "ATERM_FABRIC_HOME",
+        "the undo line's LABEL for the root seam (`NAME=value off`); the read is \
+         `dev_seam!` in `root_seam`",
+    ),
 ];
 
 /// Where a name at `at` sits, as far as reading it goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Context {
-    /// Read, by a reader call or by presumption.
+    /// Read, by a reader call around it.
     Read(ReadKind),
+    /// A run-time read by PRESUMPTION alone: no reader and no writer encloses it. The
+    /// only kind a [`MENTIONS`] entry can excuse.
+    Presumed,
     /// Set or cleared for a child, listed in a [`WRITE_TABLES`] table, or imported.
     NotRead,
     /// The value of `const NAME: &str = "…"` (its uses are scanned instead).
@@ -823,7 +862,7 @@ fn classify(code: &[u8], at: usize) -> Context {
             return Context::InTable(name);
         }
     }
-    Context::Read(ReadKind::Runtime)
+    Context::Presumed
 }
 
 #[derive(Default)]
@@ -914,14 +953,14 @@ fn scan_file(
     let shown = |at: usize| format!("{rel}:{}", src[..at].matches('\n').count() + 1);
     let record = |scan: &mut Scan, name: &str, at: usize| {
         let context = classify(&lexed.code, at);
-        if MENTIONS.iter().any(|(f, n, _)| *n == name && rel == *f)
-            && context == Context::Read(ReadKind::Runtime)
+        if MENTIONS.iter().any(|(f, n, _)| *n == name && rel == *f) && context == Context::Presumed
         {
             scan.mentions.insert((rel.clone(), name.to_string()));
             return;
         }
         let kind = match context {
             Context::Read(kind) => kind,
+            Context::Presumed => ReadKind::Runtime,
             Context::NotRead | Context::Declaration => return,
             Context::InTable(table) => {
                 if (rel.as_str(), table.as_str()) == RETIRED_DETECTOR && RETIRED.contains(&name) {
@@ -1110,7 +1149,6 @@ fn the_allow_lists_are_disjoint_family_names_and_retire_nothing_twice() {
         ("INTERNAL_PROTOCOL", INTERNAL_PROTOCOL),
         ("BUILD_STAMPS", BUILD_STAMPS),
         ("DEV_SEAMS", DEV_SEAMS),
-        ("OUT_OF_SCOPE", OUT_OF_SCOPE),
     ] {
         for name in names {
             assert!(
@@ -1155,7 +1193,7 @@ fn shipped_code_reads_no_environment_name_outside_the_allow_list() {
             .get(name)
             .is_some_and(|reads| reads.iter().any(|(k, _)| *k == kind))
     };
-    assert!(has("ATERM_HEADLESS", ReadKind::Runtime));
+    assert!(has("ATERM_CHILD", ReadKind::Runtime));
     assert!(
         has("__ATERM_REROUTE_PASSTHROUGH", ReadKind::Runtime),
         "a const read"
@@ -1174,10 +1212,7 @@ fn shipped_code_reads_no_environment_name_outside_the_allow_list() {
             let ok = match kind {
                 ReadKind::Seam => DEV_SEAMS.contains(&name.as_str()),
                 ReadKind::Build => BUILD_STAMPS.contains(&name.as_str()),
-                ReadKind::Runtime => {
-                    INTERNAL_PROTOCOL.contains(&name.as_str())
-                        || OUT_OF_SCOPE.contains(&name.as_str())
-                }
+                ReadKind::Runtime => INTERNAL_PROTOCOL.contains(&name.as_str()),
             };
             if !ok {
                 let why = if RETIRED.contains(&name.as_str()) {
@@ -1186,8 +1221,8 @@ fn shipped_code_reads_no_environment_name_outside_the_allow_list() {
                     "a development seam is read outside `aterm_types::dev_seam!` — that read ships"
                 } else {
                     "not on an allow-list: decide here whether it is internal protocol, a \
-                     build stamp, a dev seam (then read it through `dev_seam!`) or out of \
-                     scope"
+                     build stamp or a dev seam (then read it through `dev_seam!`) — or make \
+                     it a flag or an aterm.toml key and retire the name"
                 };
                 violations.push(format!("{at}: {kind:?} read of ${name} — {why}"));
             }
@@ -1210,7 +1245,7 @@ fn shipped_code_reads_no_environment_name_outside_the_allow_list() {
             }
         }
     }
-    for name in INTERNAL_PROTOCOL.iter().chain(OUT_OF_SCOPE) {
+    for name in INTERNAL_PROTOCOL {
         if !has(name, ReadKind::Runtime) {
             stale.push(format!("{name} (Runtime)"));
         }
@@ -1293,6 +1328,49 @@ fn no_first_party_source_reads_a_retired_knob() {
         "a knob deleted on 2026-09-23 is read again:\n{}",
         revived.join("\n")
     );
+}
+
+/// A [`MENTIONS`] entry excuses the LABEL it names and nothing else: the same name read
+/// through a reader call in the same file is still a read. (Until 2026-09-24 an entry
+/// excused every mention of its name in its file, so a later `env::var_os(NAME)` beside
+/// the label would have shipped unseen.) Run against a real entry's file and name.
+#[test]
+fn a_mention_entry_never_excuses_a_reader_call() {
+    let (file_rel, name, _) = MENTIONS
+        .iter()
+        .find(|(_, n, _)| *n == "ATERM_FABRIC_HOME")
+        .expect("the fabric root seam's label entry");
+    let dir = std::env::temp_dir().join(format!("aterm-env-mentions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let file = dir.join(file_rel);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "const ROOT_SEAM: &str = \"{name}\";\n\
+             fn f() {{\n\
+             \x20   let scope = [(ROOT_SEAM, 1)];\n\
+             \x20   let _ = std::env::var_os(ROOT_SEAM);\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    let mut consts = BTreeMap::new();
+    family_consts(&std::fs::read_to_string(&file).unwrap(), &mut consts);
+    let mut scan = Scan::default();
+    scan_file(&dir, &file, &consts, &BTreeSet::new(), &mut scan);
+    assert!(
+        scan.mentions
+            .contains(&((*file_rel).to_string(), (*name).to_string())),
+        "the label is the excused mention"
+    );
+    let reads: Vec<&(ReadKind, String)> = scan.reads.get(*name).into_iter().flatten().collect();
+    assert_eq!(
+        reads,
+        [&(ReadKind::Runtime, format!("{file_rel}:4"))],
+        "the reader call beside the label is still a read"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The scanner's own contract, pinned on a fixture. A name in a comment, in a writer

@@ -9,17 +9,23 @@
 //!
 //! ```text
 //! {"ts":<unix ms>,"sid":"<sid>"|null,"rule_id":"<rule>|-",
-//!  "decision":"approved|skipped|escalated|refused",
+//!  "decision":"approved|declined|typed|skipped|escalated|deferred",
 //!  "cmd_sha256":"<hex of the whole command>","command":"<the command, cut at 4 KiB>",
 //!  "reason":"<the rule's reason or the classifier's>","box_seq":<n>}
 //! ```
 //!
-//! `approved` is a press the server wrote; `typed` an act of the turn-end
+//! `approved` is a press the server wrote; `declined` a box refused with a
+//! reason the worker reads (a decline carried out to its Enter,
+//! [`super::policy::approval::Decision::Decline`]; its `reason` is the text
+//! typed); `typed` an act of the turn-end
 //! policy the server took (its rule id is the policy's, its command the text
 //! typed, `box_seq` the point's read); `skipped` a press it did not (the
 //! guard matched no row, or the fenced screen moved); `escalated` a box no
-//! rule approved; `refused` a press the server turned away (`ERR halted`,
-//! `ERR busy …`, `ERR rate`). The hash is of the full command, so a command
+//! rule approved; `deferred` a press the server turned away FOR NOW (`ERR
+//! halted`, `ERR busy …` — another writer's turn — `ERR rate`), which the
+//! loop tries again once the hold lifts or its back-off passes: a delivery
+//! retry, never a policy's refusal (the live E2E of 2026-09-25 read two
+//! `ERR busy turn=1` rows as `refused` boxes). The hash is of the full command, so a command
 //! cut at 4 KiB is still identified. The file is opened through
 //! [`super::journal::Journal`] (append-only, `0600`, one warning and the loop
 //! goes on when it cannot be written).
@@ -36,21 +42,25 @@ pub const COMMAND_BYTES: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Approved,
+    /// A box refused with a reason: the decline's Enter landed.
+    Declined,
     /// The turn-end policy typed its act (a continuation, a command).
     Typed,
     Skipped,
     Escalated,
-    Refused,
+    /// The server turned the press away for now; it is tried again.
+    Deferred,
 }
 
 impl Outcome {
     pub fn word(self) -> &'static str {
         match self {
             Outcome::Approved => "approved",
+            Outcome::Declined => "declined",
             Outcome::Typed => "typed",
             Outcome::Skipped => "skipped",
             Outcome::Escalated => "escalated",
-            Outcome::Refused => "refused",
+            Outcome::Deferred => "deferred",
         }
     }
 }
@@ -212,7 +222,8 @@ pub fn typed_at(path: &Path, sid: Option<&str>) -> Vec<i64> {
     out
 }
 
-/// The reason a `/model <fallback>` row of the turn-end policy carries: the
+/// The reason a model fallback's row of the turn-end policy carries (`relaunch
+/// --model <fallback>`; a `/model <fallback>` row before D7): the
 /// switch as it must be undone — the bucket's model and its reset (unix
 /// seconds), `-` for what is not known — so a loop that starts after it
 /// ([`open_model_switch`]) switches back at the reset, as the loop that
@@ -231,8 +242,8 @@ pub fn model_switch_reason(from: Option<&str>, back_at_unix: Option<i64>) -> Str
 }
 
 /// A model switch a loop on the session made and no loop has undone: the
-/// last `typed` `/model …` row of `model-fallback@v1` with no
-/// `model-restore@v1` row after it.
+/// last `typed` `relaunch --model …` (or, from before D7, `/model …`) row of
+/// `model-fallback@v1` with no `model-restore@v1` row after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSwitch {
     /// The bucket's model (`None`: none `/model` knows).
@@ -266,7 +277,10 @@ pub fn open_model_switch(path: &Path, sid: Option<&str>) -> Option<OpenSwitch> {
         match text("rule_id") {
             Some(RULE_MODEL_RESTORE) => open = None,
             Some(RULE_MODEL_FALLBACK) => {
-                let Some(to) = text("command").and_then(|c| c.strip_prefix("/model ")) else {
+                let Some(to) = text("command").and_then(|c| {
+                    c.strip_prefix("relaunch --model ")
+                        .or_else(|| c.strip_prefix("/model "))
+                }) else {
                     continue;
                 };
                 let reason = text("reason").unwrap_or("");

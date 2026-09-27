@@ -13,8 +13,6 @@ use super::super::GenerationTracker;
 use super::super::LineSize;
 use super::super::ScrolledRowExtras;
 use super::super::scroll_convert::LazyBuffer;
-#[cfg(feature = "disk-tier")]
-use super::super::scrollback_budget::BudgetEnforcer;
 use super::super::{CellCoord, CellExtra};
 use super::super::{HorizontalMargins, PageStore, Row, ScrollRegion};
 use super::GridCursorState;
@@ -43,6 +41,27 @@ pub(crate) struct PendingScrollbackSettings {
     pub(crate) memory_budget: usize,
     pub(crate) line_limit_changed: bool,
     pub(crate) memory_budget_changed: bool,
+}
+
+/// Where the READER asked the viewport to go while the history was away for an
+/// off-thread reflow, past what the attached rows could show (design ruling 238
+/// of the unified-messages design). See `Grid::note_detached_reader_motion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachedReaderAim {
+    /// `rows` above the live bottom — more than the attached history holds —
+    /// as of `absolute_row_counter == at_counter`. Lines that scroll into
+    /// history afterwards push the aim up with them (the SCR-1 repin's rule),
+    /// so it grows by the counter's rise before it is applied.
+    Above { rows: usize, at_counter: u64 },
+    /// `rows` below the top of the whole history (a `Top` gesture, then any
+    /// motion from there).
+    FromTop { rows: usize },
+    /// Exactly `rows` above the live bottom (as of `at_counter`, grown the same
+    /// way): where the reader came back to INSIDE the attached rows after
+    /// aiming past them — `rows == 0` for the End press, a keystroke's snap,
+    /// or scrolling all the way back down. Having aimed, the reader has said
+    /// where they are, so the restore no longer speaks for them.
+    At { rows: usize, at_counter: u64 },
 }
 
 #[doc(hidden)]
@@ -93,6 +112,15 @@ pub struct GridStorage {
     /// target instead. `None` outside a detach window; consumed by the first
     /// width-matched re-attach, cleared by erase/replacement/abort.
     pub(crate) pending_fill_target: Option<usize>,
+    /// THE READER'S AIM WHILE THE HISTORY IS AWAY (design ruling 238). `None`
+    /// while every gesture inside a detach window fits the attached rows —
+    /// then the re-attach's restore rule stands untouched. `Some` once the
+    /// reader asks for more than is attached (a scroll up over a history that
+    /// is out with the worker), so the re-attach can land them where they
+    /// asked. Recorded only by the reader-facing primitives (`scroll_display`,
+    /// `scroll_to_top`, `scroll_to_bottom`); cleared at every detach,
+    /// re-attach and abort.
+    pub(crate) detached_reader_aim: Option<DetachedReaderAim>,
     /// THRU-5: true when an off-thread compression worker is attached to this
     /// session (set once at session setup). While true, the reader-thread ingest
     /// path does NOT drain the lazy buffer inline on `should_drain` — it lets the
@@ -156,6 +184,20 @@ pub struct GridStorage {
     /// closing the one retained-window mutation that is invisible to the
     /// `(content_gen, absolute_row_revision, geometry)` key set.
     pub(crate) history_renumber_epoch: u64,
+    /// Monotonic count of rows-grow REVEALS that handed history lines back to
+    /// the live screen (`Grid::resize`, via `adjust_row_count`), 2026-09-26.
+    ///
+    /// A reveal is a pure relabel — every line keeps its absolute key, which
+    /// is why `history_renumber_epoch` rightly does not move — but a revealed
+    /// line is LIVE again: it can be rewritten on screen and pushed back into
+    /// history under the SAME key with other text. So a reader that read
+    /// history by absolute row before a reveal cannot trust those rows after
+    /// one, whatever the retained-line total says: the self-update's history
+    /// export fences on this (`HistoryFence::reveal_gen`). Measured before it
+    /// existed: grow 5 rows, rewrite the revealed rows, 20 lines of output —
+    /// the export's fence still held while rows 31 to 35 named `NEW1..NEW5`
+    /// where the export had read `old31..old35`.
+    pub(crate) history_reveal_gen: u64,
     /// Preserved extras for ring buffer scrollback rows.
     ///
     /// When rows scroll from the visible area into ring buffer scrollback,
@@ -252,12 +294,6 @@ pub struct GridStorage {
     pub any_double_width: bool,
     /// Fast-path flag: set when horizontal margins are non-full-width (DECLRMM active).
     pub has_horizontal_margins: bool,
-    /// Memory budget enforcer for scrollback disk spill.
-    /// Tracks in-memory scrollback usage and evicts to a temp mmap file
-    /// when the budget is exceeded. `None` until explicitly enabled.
-    /// Disk cold-tier only; absent on wasm (no libc/zstd-sys).
-    #[cfg(feature = "disk-tier")]
-    pub(crate) budget_enforcer: Option<BudgetEnforcer>,
     /// Cursor- and region-oriented state layered under storage state.
     pub cursor_state: GridCursorState,
 }
@@ -301,11 +337,13 @@ impl GridStorage {
             scrollback_detached_for_reflow: false,
             pending_scrollback_settings: None,
             pending_fill_target: None,
+            detached_reader_aim: None,
             compress_offload_active: false,
             flood_truncated_lines: 0,
             ring_byte_watermark: None,
             scrollback_clear_gen: 0,
             history_renumber_epoch: 0,
+            history_reveal_gen: 0,
             ring_extras: VecDeque::new(),
             generations: GenerationTracker::new(),
             absolute_row_counter: u64::from(visible_rows),
@@ -315,8 +353,6 @@ impl GridStorage {
             wrap_serial: 0,
             any_double_width: false,
             has_horizontal_margins: false,
-            #[cfg(feature = "disk-tier")]
-            budget_enforcer: None,
             cursor_state: GridCursorState::kani_stub(visible_rows, cols),
         }
     }
@@ -498,40 +534,24 @@ impl GridStorage {
 
     #[must_use]
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn visible_rows(&self) -> u16 {
         self.visible_rows
     }
 
     #[must_use]
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn cols(&self) -> u16 {
         self.cols
     }
 
     #[must_use]
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn total_lines(&self) -> usize {
         self.total_lines
     }
 
     #[must_use]
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn display_offset(&self) -> usize {
         self.display_offset
     }
@@ -663,10 +683,6 @@ impl GridStorage {
     }
 
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn cell_extra_mut(&mut self, row: u16, col: u16) -> &mut CellExtra {
         self.set_cell_has_extras_flag(row, col, true);
         self.extras_mut().get_or_create(CellCoord::new(row, col))
@@ -678,19 +694,11 @@ impl GridStorage {
     /// MUST have already set the HAS_EXTRAS bit in the cell's PackedColors
     /// (e.g., via `colors.with_extras_flag()` during the write step).
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn cell_extra_mut_preflagged(&mut self, row: u16, col: u16) -> &mut CellExtra {
         self.extras_mut().get_or_create(CellCoord::new(row, col))
     }
 
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
     pub(crate) fn remove_cell_extra(&mut self, row: u16, col: u16) -> bool {
         let removed = self.extras_mut().remove(CellCoord::new(row, col));
         if removed {
@@ -699,10 +707,7 @@ impl GridStorage {
         removed
     }
 
-    #[allow(
-        dead_code,
-        reason = "called via Grid wrapper; lint cannot see through Deref delegation"
-    )]
+    #[cfg(test)]
     pub(crate) fn sync_extras_flags_for_row(&mut self, row: u16, cols: u16) {
         let Some(idx) = self.row_index(row) else {
             return;
@@ -758,10 +763,6 @@ impl GridStorage {
     }
 
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "called by cell_extra_mut and remove_cell_extra above"
-    )]
     fn set_cell_has_extras_flag(&mut self, row: u16, col: u16, has_extras: bool) {
         if let Some(idx) = self.row_index(row)
             && let Some(cell) = self.rows.get_mut(idx).and_then(|r| r.get_mut(col))

@@ -52,10 +52,6 @@ const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 /// `struct proc_bsdshortinfo`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "the kernel's layout, field for field; the sweep reads ppid, uid and comm"
-)]
 struct ProcBsdShortInfo {
     pbsi_pid: u32,
     pbsi_ppid: u32,
@@ -71,6 +67,34 @@ struct ProcBsdShortInfo {
     pbsi_svgid: u32,
     pbsi_rfu: u32,
 }
+
+/// `PROC_PIDVNODEPATHINFO` (`sys/proc_info.h`): a process's current and
+/// root directory vnodes with their paths. Declared here for the same reason
+/// as [`PROC_PIDT_SHORTBSDINFO`]; the layout is pinned by the size
+/// assertion below (2352 bytes: two `vnode_info_path`s of a 152-byte
+/// `vnode_info` and a `MAXPATHLEN` path) and by the live test that reads
+/// this process's own directory back.
+const PROC_PIDVNODEPATHINFO: c_int = 9;
+
+/// `struct vnode_info_path`: the vnode's `vnode_info` (read as opaque bytes
+/// — only the path is used) and its `MAXPATHLEN` path.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VnodeInfoPath {
+    vip_vi: [u8; 152],
+    vip_path: [u8; 1024],
+}
+
+/// `struct proc_vnodepathinfo`: the current directory, then the root.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcVnodePathInfo {
+    pvi_cdir: VnodeInfoPath,
+    pvi_rdir: VnodeInfoPath,
+}
+
+const VNODE_PATH_INFO_SIZE: usize = 2352;
+const _: () = assert!(std::mem::size_of::<ProcVnodePathInfo>() == VNODE_PATH_INFO_SIZE);
 
 const SHORT_INFO_SIZE: usize = 64;
 const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == SHORT_INFO_SIZE);
@@ -164,6 +188,33 @@ fn ident(pid: i32) -> Option<Ident> {
         uid: info.pbsi_uid,
         comm: c_text(&info.pbsi_comm),
     })
+}
+
+/// One process's working directory (`PROC_PIDVNODEPATHINFO`'s current
+/// directory vnode path); `None` when the call is refused or short.
+pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: plain byte arrays; all-zero is valid.
+    let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable for `VNODE_PATH_INFO_SIZE` bytes, the size
+    // passed.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast::<c_void>(),
+            VNODE_PATH_INFO_SIZE as c_int,
+        )
+    };
+    if usize::try_from(n).ok() != Some(VNODE_PATH_INFO_SIZE) {
+        return None;
+    }
+    let bytes = &info.pvi_cdir.vip_path;
+    let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..len]));
+    path.is_absolute().then(|| path.to_path_buf())
 }
 
 /// One process's executable path, read into a [`PATH_CAP`] buffer.

@@ -16,11 +16,12 @@ fn ring_via_macro() -> Model {
         Ring {
             const MaxSeq = 6;
             const Cap = 3;
+            const Buggy = 0;
             var seq = 0;
             var lo = 1;
             action Push when (seq <= MaxSeq - 1) {
                 seq = seq + 1;
-                lo = if (seq + 1) - lo + 1 > Cap { lo + 1 } else { lo };
+                lo = if (seq + 1) - lo + 1 > Cap + Buggy { lo + 1 } else { lo };
             }
             invariant LenBounded: seq - lo + 1 <= Cap;
         }

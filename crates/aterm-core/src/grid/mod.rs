@@ -79,6 +79,13 @@ pub use aterm_grid::grid::{MaterializedRow, materialize_from_line};
 // type. Re-exported here so that doesn't force a direct aterm-grid dependency.
 pub use aterm_grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 
+// The seamless update's history carry (`Terminal::history_fence` and the
+// import). The fence and the built history cross threads and crates in the
+// host (`aterm-gui`'s handoff), which names them from here.
+pub use aterm_grid::{
+    HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
+};
+
 // ============================================================================
 // Modules that remain in aterm-core
 // ============================================================================
@@ -96,11 +103,6 @@ pub use damage::{Damage, DamagedRowIterator, LineDamageBounds, RowDamageBounds};
 pub use extra::{CellCoord, CellExtra, CellExtras, KittyPlaceholderData, UniformExtras};
 // `crate::grid::PAGE_SIZE` is a flat re-export; in-crate code reaches it via
 // `grid::page::PAGE_SIZE`.
-#[allow(
-    unused_imports,
-    reason = "flat re-export consumed by the FFI/verification layer"
-)]
-pub(crate) use page::PAGE_SIZE;
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};
 pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};

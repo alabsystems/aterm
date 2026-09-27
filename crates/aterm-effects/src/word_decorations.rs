@@ -1017,7 +1017,7 @@ struct Episode {
     burst_roll: bool,
     /// WHICH of the three detonation degrees this episode drew, decoded from
     /// the HIGH half of the same birth draw that set [`Self::burst_roll`] (see
-    /// [`supernova::tier_of`]). Stored, like the roll itself, so the decision
+    /// `supernova::tier_of`). Stored, like the roll itself, so the decision
     /// transfers with row alignment instead of being re-drawn on every scan.
     /// Meaningless unless `burst_roll` and a `SuperNova` burst kind.
     burst_tier: supernova::SuperTier,
@@ -2860,11 +2860,12 @@ impl WordDecorations {
     /// one-shot started is marked under its current ident), then drops all
     /// per-occurrence state while KEEPING the `done_marks` set, so the next
     /// rescan re-enters finished words as born-done instead of replaying.
+    #[cfg(test)]
     pub fn reset(&mut self) {
         self.with_each_pane(Self::reset_bound);
     }
 
-    /// [`reset`](Self::reset) for the state currently in the LIVE fields alone —
+    /// `reset` for the state currently in the LIVE fields alone —
     /// the bound pane, or the whole window when nothing is bound. Parked
     /// siblings are untouched.
     ///
@@ -3211,7 +3212,7 @@ impl WordDecorations {
         });
     }
 
-    /// The shared body of [`reset`](Self::reset) / [`hard_reset`](Self::hard_reset):
+    /// The shared body of `reset` / [`hard_reset`](Self::hard_reset):
     /// everything except the `done_marks` policy.
     fn reset_transient_state(&mut self) {
         self.reset_word_transient_state();
@@ -11839,11 +11840,9 @@ mod tests {
             &mut free,
             &mut nova,
         );
-        assert_eq!(
-            wd.drain_curse_cues().count(),
-            0,
-            "`fuc` emitted a curse cue"
-        );
+        let prefix_cues = wd.drain_curse_cues().count();
+        assert_eq!(prefix_cues, 0, "`fuc` emitted a curse cue");
+        assert_eq!(state["episode"], prefix_cues as i64);
 
         term.process(b"k");
         assert!(model.fire("TypeK", &mut state));
@@ -11867,11 +11866,23 @@ mod tests {
             &mut free,
             &mut nova,
         );
-        assert_eq!(
-            wd.drain_curse_cues().count(),
-            1,
-            "complete `fuck` must cue once"
-        );
+        let completion_cues = wd.drain_curse_cues().count();
+        assert_eq!(completion_cues, 1, "complete `fuck` must cue once");
+        assert_eq!(state["episode"], completion_cues as i64);
+
+        // Negative control: the real cue counts separate the healthy model from
+        // the `Buggy=1` early activation, whose `fuc` already holds an episode
+        // and whose `k` restarts a second one instead of continuing it. The
+        // real scan drained no cue at `fuc` and exactly one at `k`.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mut early = buggy.init_state();
+        for action in ["TypeF", "TypeU", "TypeC"] {
+            assert!(buggy.fire(action, &mut early), "{action}");
+        }
+        assert_ne!(early["episode"], prefix_cues as i64);
+        assert!(buggy.fire("TypeK", &mut early));
+        assert_ne!(early["episode"], completion_cues as i64);
+        assert!(!model.check_invariant("CompletionCreatesExactlyOneEpisode", &early));
     }
 
     /// The shipping renderer scans an already-resolved cell snapshot rather
@@ -25619,3 +25630,11 @@ mod trick_flash_hook_tests {
         assert_eq!(ink.len(), 3);
     }
 }
+
+// Tier-1 bind for `NovaPhase` on the host engine (the grant, the spent mark,
+// `hard_reset`, the thaw shift): a child of this module so it can read the
+// episode the host keeps for a word. The `_tests.rs` name keeps its engine out
+// of the shipped-code census (it builds a `WordDecorations` of its own).
+#[cfg(test)]
+#[path = "nova_host_conformance_tests.rs"]
+mod nova_host_conformance;

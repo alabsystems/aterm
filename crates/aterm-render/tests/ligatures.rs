@@ -20,8 +20,8 @@ use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 // suite.
 //
 // THE OVERRIDE IS A DEDICATED VAR, NOT $ATERM_FONT. This helper used to read
-// $ATERM_FONT, which is not a test knob at all: it is a PRODUCTION setting that
-// outranks `font_family` in config (see `effective_font_family`). So a developer
+// $ATERM_FONT, which was not a test knob at all: it was a PRODUCTION setting that
+// outranked `font_family` in config (deleted 2026-09-24). So a developer
 // who simply names their preferred terminal font in their shell profile silently
 // displaced the committed fixture, and six tests in this file — which hard-assert
 // that `=>` ligates, that `zero` is present, that a fixture-specific shape
@@ -71,7 +71,9 @@ fn render(mode: LigatureMode, text: &[u8]) -> Option<aterm_render::Frame> {
 #[test]
 fn rustybuzz_shapes_arrow_ligature() {
     let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let features = aterm_render::ligature_shaping::build_feature_list(&[], true);
@@ -117,7 +119,9 @@ fn ligated_render_differs_from_unligated() {
         render(LigatureMode::Enabled, text),
         render(LigatureMode::Disabled, text),
     ) else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     assert_eq!(
@@ -142,7 +146,9 @@ fn spaced_operators_render_identically() {
         render(LigatureMode::Enabled, text),
         render(LigatureMode::Disabled, text),
     ) else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     assert_eq!(
@@ -205,7 +211,9 @@ fn ligature_breaks_on_selection_boundary() {
         render_with_selection(LigatureMode::Enabled, text, 1, 1),
         render_with_selection(LigatureMode::Disabled, text, 1, 1),
     ) else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     assert_eq!(
@@ -253,7 +261,9 @@ fn ligature_breaks_on_style_change() {
         render(LigatureMode::Enabled, b"a\x1b[1m=>\x1b[0m"),
         render(LigatureMode::Enabled, b"a\x1b[0m=\x1b[1m>\x1b[0m"),
     ) else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     // Bold weight differs from plain (synthetic embolden widens strokes).
@@ -289,7 +299,9 @@ fn italic_ligature_differs_from_regular() {
         render(LigatureMode::Enabled, b"a\x1b[0m=>"),
         render(LigatureMode::Enabled, b"a\x1b[3m=>\x1b[0m"),
     ) else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     assert_eq!(
@@ -318,7 +330,9 @@ fn ligature_breaks_on_wide_cell() {
         render(LigatureMode::Enabled, text),
         render(LigatureMode::Disabled, text),
     ) else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     // The leading '=>' still ligates (wide emoji breaks the run after it, not the
@@ -397,7 +411,9 @@ fn strip_gsub(bytes: &[u8]) -> Option<Vec<u8>> {
 #[test]
 fn no_ligature_font_skips_shaping_and_is_identical() {
     let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let Some(stripped) = strip_gsub(&bytes) else {
@@ -444,7 +460,9 @@ fn no_ligature_font_skips_shaping_and_is_identical() {
 #[test]
 fn fixture_font_has_ligature_features_and_still_ligates() {
     let Some(bytes) = ligature_test_font() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).unwrap();

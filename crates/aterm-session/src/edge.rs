@@ -15,9 +15,9 @@ use crate::id::{LaunchNonce, SessionId};
 use crate::{from_hex, hex};
 
 /// The operation an edge authorizes. Split so a `WriteInput` edge cannot signal and
-/// a `ReadScreen` edge cannot write (design §7.2). Mirrors
-/// `aterm_cap::effects::{ReadScreen, WriteInput, SignalEdge}` (the coarse class
-/// gate); this is the fine, object-scoped identity.
+/// a `ReadScreen` edge cannot write (design §7.2). This is the fine, object-scoped
+/// identity; the coarse compile-time class markers the design paired it with were
+/// never required by a seam and were deleted from `aterm_cap::effects` (2026-09-25).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Op {
     /// Read the rendered surface (screen/cells/blocks/scrollback/search/image/

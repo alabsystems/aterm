@@ -1,0 +1,50 @@
+# claude-code 2.1.280 · MEASURED 2026-09-24 in aterm 0.92.0: a workflow subagent's Bash box in a --dangerously-skip-permissions session, the rm breaker's `statically-unresolvable` note (49x130 text capture; the home directory and one address anonymized at their own widths)
+  generator, and test-runner hookup in order, before running Verus's unmodified basic.rs and having two reviewers check for false
+  passes.
+
+⏺ Workflow(Milestone 1 of the Trust front end: a rustc_private reader on the installed Trust sysroot runs upstream Verus basic.rs,
+          unmodified, through the trust-vc engine on ay, with zero false passes)
+  ⎿  Running in background · /workflows to monitor and save · medium size (/config)
+
+⏺ Three streams are running in parallel, each in its own worktree:
+
+  ┌───────────────────┬────────────────────────────────────────────────────────┬──────────────────────────────────────────────┐
+  │      Stream       │                          Goal                          │                  Done when                   │
+  ├───────────────────┼────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ 1. ay fixes       │ the trigger-ignoring pass, the session-exit bug, a     │ measured on all 4,114 Verus tests; soundness │
+  │                   │ model after "unknown"                                  │  reviewed; stays on an ay branch             │
+  ├───────────────────┼────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ 2. trust-vc merge │ take in the other session's newest commits; fix the 19 │ reviewed, then main lands and is pushed      │
+  │                   │  tests with precise rules                              │                                              │
+  ├───────────────────┼────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ 3. Front end,     │ Verus's basic.rs, unmodified, runs through a trust-vc  │ zero false passes                            │
+  │ milestone 1       │ reader built on the Trust compiler                     │                                              │
+  └───────────────────┴────────────────────────────────────────────────────────┴──────────────────────────────────────────────┘
+
+  Two things are yours:
+  - The other Claude session (user@example.local) is still pushing to trust-vc. Stopping it or pointing it here will keep the
+    merge from chasing a moving target.
+  - Pushing the merged ay (upstream plus the two certificate features) to ay's remote. It's ready locally; say the word.
+
+  I'll report when each stream lands.
+
+✻ Waiting for 3 dynamic workflows to finish
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command · from the "trust-vc-front-end-m1" workflow
+
+   │ cd /Users//user00/trust-vc-m1-notes/reader &&
+   │ TI=/Users//user00/trust-vc-m1-notes/runs/day1-refuse-all/stage/source/target.noindex/debug/test_inputs
+   │ rm -f dumps/*; for d in $TI/basic-*; do n=$(basename $d); extra=""; case $n in *no_cheating) extra="--no-cheating";; esac;
+   │ echo "== $n"; TRUST_VC_DUMP_VCIR=dumps/$n.txt ./run-one.sh $d/test.rs $extra; done > pass2.txt 2>&1; grep -h "outcome"
+   │ pass2.txt | awk '{print $2}' | sort | uniq -c; for t in test_short_circuit test_short_circuit1 test_compound_assign
+   │ test_compound_assign_fail; do echo "######## $t"; cat dumps/basic-$t.txt; done
+   Rerun all inputs and print VcIR for four cases
+
+ │ Dangerous rm operation on statically-unresolvable target: /Users//user00/trust-vc/dumps/*
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

@@ -53,6 +53,37 @@ description = "Inline-optimized collections for aterm: SmallVec + ArrayVec with 
 # toml/toml_edit; it is invisible to the shipped graph, which is what
 # `cargo forge survey` measures.
 arrayvec_upstream = { package = "arrayvec", version = "=0.7.7" }
+# THE SHIM ITSELF, on the same package, and this edge is what lets
+# `targo test -p aterm-alloc -p <anything that reaches wgpu or naga>` resolve
+# (2026-09-25). Without it that selection died with "failed to select a
+# version for `arrayvec` … all possible versions conflict with previously
+# selected packages", while `--workspace` resolved fine. The root cause is
+# cargo's resolver, read in targo's copy of it
+# (core/resolver/context.rs `flag_activated`) and reproduced in a four-crate
+# probe with stock cargo 1.95 too:
+#
+#   * when a package is FIRST activated through a dependency whose source
+#     differs from its own — a crates-io `arrayvec ^0.7` answered by the
+#     `[patch.crates-io]` path shim — cargo also claims the (arrayvec, 0.7,
+#     crates-io) activation slot for it, so that a patch cannot smuggle a
+#     second semver-compatible "crates.io" copy into the graph;
+#   * the oracle's registry `=0.7.7` sits in exactly that slot, so whichever
+#     comes second is refused as a semver duplicate;
+#   * a package already activated through its OWN source takes the early
+#     "already active" path and never claims the alias slot. `--workspace`
+#     makes the shim a ROOT, activated before any crates-io edge reaches it;
+#     a narrowed `-p` set without the shim reaches it first through naga or
+#     wgpu, and conflicts.
+#
+# This path edge makes every selection that holds the oracle activate the shim
+# through its own source first: a root's dependencies are resolved before any
+# deeper frame's (the resolver drains frames oldest-first among equally
+# constrained ones, and both edges here have one candidate). It is load-bearing
+# in the test too — `tests/arrayvec_differential.rs` checks that the shim's
+# `ArrayVec` IS this crate's, the type-level half of "the patch row points at
+# our code". A dev-dependency cycle (the shim depends on this crate) is one
+# cargo permits; it adds nothing to the shipped graph.
+arrayvec_shim = { package = "arrayvec", path = "../aterm-arrayvec" }
 
 [lints]
 workspace = true

@@ -3,28 +3,37 @@
 
 //! **ROUND 26 — AN OPT-IN READ BEFORE ITS SESSION WAS WATCHED IS READ AGAIN.**
 //!
-//! The bridge learns a session's broadcast opt-ins two ways: once, off
-//! `topic ls`, when it first learns of the session, and from then on PUSHED,
-//! as the `EVENT <local> topic …` its `@*` push lane drains off the session's
-//! timeline. The push lane only watches a session from the wake that ADOPTS it
-//! — up to the 250 ms tick after the session registered — and it starts that
+//! The bridge learns a session's broadcast opt-ins two ways: read, off `topic
+//! ls`, and PUSHED, as the `EVENT <local> topic …` its `@*` push lane drains
+//! off the session's timeline. The push lane only watches a session from the
+//! wake that ADOPTS it — up to the 250 ms tick after the session registered,
+//! or, at aterm's 256-watch cap, only when a slot frees — and it starts that
 //! watch at the timeline's high at that moment. A `topic add` recorded after
-//! the bridge's read and before the adoption is in neither: the read was too
-//! early to see it and the watch starts past it. Nothing re-reads a session's
-//! topics on a timer, so the opt-in was lost for the life of the bridge.
+//! a read and before the adoption is in neither: the read was too early to
+//! see it and the watch starts past it. When this round was written nothing
+//! re-read a session's topics on a timer, so such an opt-in was lost for the
+//! life of the bridge.
 //!
-//! The bridge can read before the adoption in two ways: an attach or a `GAP`
-//! re-reads every session the store lists, adopted or not; and the endpoint
-//! announces a session (`session-created`) and adopts it with two separate
-//! store reads, so a spawn landing between them is announced one wake before
-//! it is adopted. This test forces the second through the endpoint's
-//! debug-only `$ATERM_TEST_PUSH_HOLD`, which holds either read open for as long
-//! as a marker file exists. Nothing here sleeps: every step waits for an
-//! observation.
+//! The bridge reads before the adoption whenever something other than the
+//! session's own watch prompts the read: an attach, a `GAP` or a roster round
+//! reads every session the store lists, and a `session-created` reads the one
+//! it announces. The endpoint used to announce and adopt in two separate
+//! store reads, so a spawn landing between them was announced one wake before
+//! it was adopted; it now takes both under one guard, and announces a session
+//! it could not adopt as `session-created <sid> watch=deferred`. This test
+//! reaches that state through the endpoint's debug-only
+//! `$ATERM_TEST_PUSH_HOLD`, which holds either decision open for as long as a
+//! marker file exists: with the adoption held, the announcement is the
+//! deferred one. Nothing here sleeps: every step waits for an observation.
 //!
-//! The fix it pins: the adoption's own `sub <local> <sid>` line is written
-//! only after the watch has recorded where it starts, so a bridge that has
-//! already read that session's topics reads them again on it.
+//! The fix it pins: every `sub <local> <sid>` line — the adoption's here — is
+//! written only after its watch has recorded where it starts, and the bridge
+//! reads that session's topics again on it. The bridge ALSO reads every
+//! listed session it holds no `sub` for on each 2 s roster round, so the
+//! opt-in would be learned without the ack's read too, a round later; the
+//! bridge's unit tests (`bridge.rs`,
+//! `a_session_read_before_its_watch_is_read_again_on_the_watch_ack`) pin the
+//! ack's read on its own, and this round pins the end-to-end path.
 
 mod harness;
 
@@ -65,20 +74,21 @@ fn topic_add(w: &World, sid: &str, topic: &str) {
 /// **A `topic add` MADE BETWEEN THE BRIDGE'S FIRST READ AND THE ADOPTION IS
 /// LEARNED.**
 ///
-/// A session is spawned with both of the push lane's reads held. It opts into
-/// [`WARM`], and only then is the announcement released, so the bridge's
+/// A session is spawned with both of the push lane's decisions held. It opts
+/// into [`WARM`], and only then is the announcement released — marked
+/// `watch=deferred`, since the adoption is still held — so the bridge's
 /// first-sighting read is seen to happen (it learns [`WARM`]) while the
-/// session is still unwatched. The session opts into [`LATE`] — no watcher, so
-/// nothing can push it — and the adoption is released. A `topic add` on the
-/// boot session, which IS watched, wakes the push lane: that wake adopts the
-/// new session first, then drains the boot session's timeline, and the bridge
-/// reads both off one ordered lane. So once it holds the boot session's topic
-/// it has handled the adoption, and it must already hold [`LATE`]. Then a
-/// record published on [`LATE`] must be delivered.
+/// session is still unwatched. The session opts into [`LATE`] — no watcher,
+/// so nothing can push it — and the adoption is released. A `topic add` on
+/// the boot session, which IS watched, wakes the push lane: that wake adopts
+/// the new session first, then drains the boot session's timeline, and the
+/// bridge reads both off one ordered lane. So once it holds the boot
+/// session's topic it has handled the adoption's `sub`, and it must already
+/// hold [`LATE`]. Then a record published on [`LATE`] must be delivered.
 ///
-/// Without the re-read on `sub`, the last two assertions fail at once and for
-/// good: no attach, no `GAP` and no later `session-created` happens in this
-/// world, and nothing else reads the session's topics again.
+/// A roster round falling between the [`LATE`] add and the release would
+/// learn [`LATE`] too — the session holds no `sub` yet, so every round reads
+/// it — which can only make this pass early, never fail it.
 #[test]
 fn a_topic_added_before_the_adoption_is_learned_after_it() {
     const WARM: &str = "r26.warm";
@@ -100,8 +110,8 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
         (watchers(&w, &s0) >= 1).then_some(())
     });
 
-    // HOLD BOTH READS, then spawn: the session registers in the store and the
-    // push lane neither announces nor adopts it.
+    // HOLD BOTH DECISIONS, then spawn: the session registers in the store and
+    // the push lane neither announces nor adopts it.
     std::fs::write(hold.join("adopt"), b"").expect("hold the adoption");
     std::fs::write(hold.join("sessions"), b"").expect("hold the announcement");
     let reply = w.verb("spawn");
@@ -114,8 +124,10 @@ fn a_topic_added_before_the_adoption_is_learned_after_it() {
         .to_string();
     topic_add(&w, &s, WARM);
 
-    // RELEASE THE ANNOUNCEMENT ONLY. The bridge's `session-created` arm reads
-    // the new session's topics; learning WARM is the observation that it has.
+    // RELEASE THE ANNOUNCEMENT ONLY: `session-created <sid> watch=deferred`.
+    // The bridge's `session-created` arm reads the new session's topics (or a
+    // roster round does); learning WARM is the observation that a read after
+    // the add has happened.
     std::fs::remove_file(hold.join("sessions")).expect("release the announcement");
     until("the bridge to read the new session's opt-ins", || {
         bridge_holds(&w, &s, WARM)

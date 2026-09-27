@@ -3,7 +3,8 @@
 //  handlers take `aterm_objc::MainThread` instead of objc2's
 //  `MainThreadMarker`, and the queued-closure block is `aterm_objc::RcBlock`
 //  instead of a `block2::RcBlock`; no third-party Objective-C name remains
-//  in the file.)
+//  in the file. `EventLoopWaker` wraps `aterm_objc::WakeTimer` instead of a
+//  0.1 µs `CFRunLoopTimer` of its own — see its LOCAL PATCH note.)
 //! Utilities for working with `CFRunLoop`.
 //!
 //! See Apple's documentation on Run Loops for details:
@@ -15,14 +16,12 @@ use std::ptr;
 use std::rc::Weak;
 use std::time::Instant;
 
-use core_foundation::base::{CFIndex, CFOptionFlags, CFRelease, CFTypeRef};
-use core_foundation::date::CFAbsoluteTimeGetCurrent;
+use core_foundation::base::{CFIndex, CFOptionFlags, CFTypeRef};
 use core_foundation::runloop::{
     kCFRunLoopAfterWaiting, kCFRunLoopBeforeWaiting, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
-    kCFRunLoopExit, CFRunLoopActivity, CFRunLoopAddObserver, CFRunLoopAddTimer, CFRunLoopGetMain,
+    kCFRunLoopExit, CFRunLoopActivity, CFRunLoopAddObserver, CFRunLoopGetMain,
     CFRunLoopObserverCallBack, CFRunLoopObserverContext, CFRunLoopObserverCreate,
-    CFRunLoopObserverRef, CFRunLoopRef, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate,
-    CFRunLoopTimerRef, CFRunLoopTimerSetNextFireDate, CFRunLoopWakeUp,
+    CFRunLoopObserverRef, CFRunLoopRef, CFRunLoopWakeUp,
 };
 use tracing::error;
 
@@ -33,7 +32,7 @@ use tracing::error;
 // a framework binding and the file needed no `seam::marker` crossing at all.
 // That is what makes this file, and `window_delegate.rs`, the two the
 // substitution actually frees.
-use aterm_objc::{MainThread, RcBlock};
+use aterm_objc::{MainThread, RcBlock, WakeTimer};
 
 use super::app_state::ApplicationDelegate;
 use super::event_loop::{stop_app_on_panic, PanicInfo};
@@ -306,86 +305,38 @@ pub fn setup_control_flow_observers(mtm: MainThread, panic_info: Weak<PanicInfo>
     }
 }
 
+// LOCAL PATCH (aterm): the waker is `aterm_objc::WakeTimer`, not a
+// `CFRunLoopTimer` created here with a 0.1 µs repeat interval "to mimic
+// polling". CoreFoundation advances a LATE repeating timer one interval at a
+// time with the run-loop lock held, so that interval priced every second the
+// process was not scheduled at ~10⁷ loop iterations: on 2026-09-26 aterm 0.93.0
+// came back from a 26.6 h stop and spent minutes inside
+// `__CFRunLoopDoTimer` with every thread that touches the main run loop parked
+// behind it (`crates/aterm-objc/src/wake_timer.rs` has the evidence). The
+// shared timer repeats once a year and is re-armed on every request it has not
+// already got pending, so polling still polls and a late fire costs one step.
+// It also retires the nested-loop half of `stop_waker_in_nested_loop`'s
+// problem at its source: a fired timer is spent until `cleared` re-arms it.
 #[derive(Debug)]
 pub struct EventLoopWaker {
-    timer: CFRunLoopTimerRef,
-
-    /// An arbitrary instant in the past, that will trigger an immediate wake
-    /// We save this as the `next_fire_date` for consistency so we can
-    /// easily check if the next_fire_date needs updating.
-    start_instant: Instant,
-
-    /// This is what the `NextFireDate` has been set to.
-    /// `None` corresponds to `waker.stop()` and `start_instant` is used
-    /// for `waker.start()`
-    next_fire_date: Option<Instant>,
-}
-
-impl Drop for EventLoopWaker {
-    fn drop(&mut self) {
-        unsafe {
-            CFRunLoopTimerInvalidate(self.timer);
-            CFRelease(self.timer as _);
-        }
-    }
+    timer: WakeTimer,
 }
 
 impl EventLoopWaker {
-    pub(crate) fn new() -> Self {
-        extern "C" fn wakeup_main_loop(_timer: CFRunLoopTimerRef, _info: *mut c_void) {}
-        unsafe {
-            // Create a timer with a 0.1µs interval (1ns does not work) to mimic polling.
-            // It is initially setup with a first fire time really far into the
-            // future, but that gets changed to fire immediately in did_finish_launching
-            let timer = CFRunLoopTimerCreate(
-                ptr::null_mut(),
-                f64::MAX,
-                0.000_000_1,
-                0,
-                0,
-                wakeup_main_loop,
-                ptr::null_mut(),
-            );
-            CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
-            Self { timer, start_instant: Instant::now(), next_fire_date: None }
-        }
+    pub(crate) fn new(mtm: MainThread) -> Self {
+        // Disarmed until `did_finish_launching` starts it.
+        Self { timer: WakeTimer::main(mtm) }
     }
 
     pub fn stop(&mut self) {
-        if self.next_fire_date.is_some() {
-            self.next_fire_date = None;
-            unsafe { CFRunLoopTimerSetNextFireDate(self.timer, f64::MAX) }
-        }
+        self.timer.stop();
     }
 
     pub fn start(&mut self) {
-        if self.next_fire_date != Some(self.start_instant) {
-            self.next_fire_date = Some(self.start_instant);
-            unsafe { CFRunLoopTimerSetNextFireDate(self.timer, f64::MIN) }
-        }
+        self.timer.start();
     }
 
     pub fn start_at(&mut self, instant: Option<Instant>) {
-        let now = Instant::now();
-        match instant {
-            Some(instant) if now >= instant => {
-                self.start();
-            },
-            Some(instant) => {
-                if self.next_fire_date != Some(instant) {
-                    self.next_fire_date = Some(instant);
-                    unsafe {
-                        let current = CFAbsoluteTimeGetCurrent();
-                        let duration = instant - now;
-                        let fsecs = duration.subsec_nanos() as f64 / 1_000_000_000.0
-                            + duration.as_secs() as f64;
-                        CFRunLoopTimerSetNextFireDate(self.timer, current + fsecs)
-                    }
-                }
-            },
-            None => {
-                self.stop();
-            },
-        }
+        self.timer.start_at(Instant::now(), instant);
     }
 }

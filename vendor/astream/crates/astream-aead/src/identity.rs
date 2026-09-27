@@ -40,7 +40,10 @@
 //! HKDF/HMAC and X25519 glue; the only delegated primitive here is the raw
 //! Ed25519 sign/verify, to the vetted `ed25519-dalek`.
 
-use crate::handshake::{ephemeral, hkdf_sha256_32, read_hs_msg, write_hs_msg, x25519_shared};
+use crate::handshake::{
+    ephemeral, hkdf_sha256_32, read_hs_msg, transcript as record_binding, write_hs_msg,
+    x25519_shared,
+};
 use crate::{SealedStream, KEY_LEN};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::io::{self, Read, Write};
@@ -162,15 +165,6 @@ fn verify_auth(
 
 /// Run the CLIENT side of the mutual identity handshake over `stream`. Verifies
 /// the server is exactly `expected_server` (a pinned host key), proves our own
-/// The record layer's binding for an identity session: the ephemeral public keys
-/// in a fixed order (client, then server) — the same bytes both peers sign.
-fn id_transcript(ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> [u8; 64] {
-    let mut t = [0u8; 64];
-    t[..32].copy_from_slice(ec_pub);
-    t[32..].copy_from_slice(es_pub);
-    t
-}
-
 /// identity `me`, and returns the forward-secret [`SealedStream`].
 ///
 /// # Errors
@@ -191,8 +185,8 @@ pub fn client_identity_handshake<S: Read + Write>(
     // into any other session or direction.
     let mut sealed = SealedStream::with_transcript(
         stream,
-        session_key(&dh, &ec_pub, &es_pub),
-        &id_transcript(&ec_pub, &es_pub),
+        session_key(dh.as_bytes(), &ec_pub, &es_pub),
+        &record_binding(&ec_pub, &es_pub),
         true,
     );
 
@@ -235,8 +229,8 @@ pub fn server_identity_handshake<S: Read + Write>(
     let dh = x25519_shared(&secret, &ec_pub)?;
     let mut sealed = SealedStream::with_transcript(
         stream,
-        session_key(&dh, &ec_pub, &es_pub),
-        &id_transcript(&ec_pub, &es_pub),
+        session_key(dh.as_bytes(), &ec_pub, &es_pub),
+        &record_binding(&ec_pub, &es_pub),
         false,
     );
 
@@ -338,12 +332,8 @@ mod tests {
 
     #[test]
     fn a_forged_client_signature_is_rejected() {
-        // A client that presents a victim's public key but cannot sign for it: use
-        // the real client's keypair but pin/allow the victim so identities line up,
-        // then corrupt — simplest: an authorized id whose signature won't verify is
-        // covered by the wrong-key paths above; here assert verify_auth rejects a
-        // tampered signature directly.
-        let (server, client) = keys();
+        // verify_auth, directly: a tampered signature under a genuine id fails.
+        let (_, client) = keys();
         let ec = [1u8; 32];
         let es = [2u8; 32];
         let mut msg = auth_message(client, SIG_CTX_CLIENT, &ec, &es);
@@ -354,6 +344,5 @@ mod tests {
         let good = auth_message(client, SIG_CTX_CLIENT, &ec, &es);
         let (id2, sig2) = split_auth(&good);
         assert!(verify_auth(&id2, &sig2, SIG_CTX_SERVER, &ec, &es).is_err());
-        let _ = server;
     }
 }

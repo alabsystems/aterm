@@ -26,7 +26,6 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Instant;
 
 use aterm_render::font::{Font, FontSettings};
 
@@ -73,17 +72,95 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// Live-heap delta and wall time for one parse, with the parsed value dropped
-/// INSIDE the measurement of neither: the value is handed back so the caller
-/// reads the delta while it is still alive, which is the number that matters
-/// (what a resident face costs), not the transient peak.
+/// Live-heap delta and the parse's TIME for one parse, with the parsed value
+/// dropped INSIDE the measurement of neither: the value is handed back so the
+/// caller reads the delta while it is still alive, which is the number that
+/// matters (what a resident face costs), not the transient peak.
+///
+/// THE TIME IS THIS THREAD'S CPU TIME ([`parse_clock_ms`]), not the wall clock.
+/// The parse runs on this one thread, so its CPU time IS its cost; the wall
+/// clock adds every moment the thread sat descheduled, which is the machine's
+/// load and not either parser's shape. Measured 2026-09-26 on the owner's
+/// machine, the full verify gate beside a peer's test run: `Apple Symbols.ttf`
+/// read 50.372 ms (first-party) against 62.529 ms (fontdue) on the wall clock
+/// — 1.24x, under [`TIME_MARGIN`], on a face that reads 1.7x-2.3x quiet — and
+/// the guard went red on an unrelated change; the same test alone passed three
+/// runs of three. The minimum of [`TIME_REPS`] rounds cannot help when the
+/// load outlasts all of them.
 fn cost<T>(build: impl FnOnce() -> T) -> (T, i64, f64) {
     let before = LIVE.load(Ordering::Relaxed);
-    let t0 = Instant::now();
+    let t0 = parse_clock_ms();
     let value = build();
-    let elapsed = t0.elapsed().as_secs_f64() * 1e3;
+    let elapsed = parse_clock_ms() - t0;
     let after = LIVE.load(Ordering::Relaxed);
     (value, after - before, elapsed)
+}
+
+/// Milliseconds of CPU time the calling thread has run
+/// (`CLOCK_THREAD_CPUTIME_ID`), for [`cost`]: time spent descheduled does not
+/// count.
+#[cfg(unix)]
+fn parse_clock_ms() -> f64 {
+    let mut stamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `stamp` is initialized and writable for this one call.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut stamp) };
+    assert_eq!(rc, 0, "the thread CPU clock is readable");
+    std::time::Duration::new(
+        u64::try_from(stamp.tv_sec).expect("a non-negative CPU time"),
+        u32::try_from(stamp.tv_nsec).expect("nanoseconds under a second"),
+    )
+    .as_secs_f64()
+        * 1e3
+}
+
+/// Off unix there is no thread CPU clock in `libc`: the wall clock since the
+/// first reading, with the load-sensitivity [`cost`] describes.
+#[cfg(not(unix))]
+fn parse_clock_ms() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1e3
+}
+
+/// THE GUARD'S CLOCK DOES NOT COUNT TIME THE THREAD IS OFF THE CPU — the
+/// failure [`cost`] records. Measured on the owner's machine with the real
+/// parses: this test process STOPPED for 400 ms (`kill -STOP` / `-CONT`) inside
+/// the first-party parse of `STHeiti Light.ttc` read 0.961x fontdue on the wall
+/// clock — the guard would fail on an unchanged tree — and 1.343x on this
+/// clock, its quiet value. The property is pinned here without stopping the
+/// process (a helper lost between the stop and the resume would leave the whole
+/// test binary stopped): a thread asleep is off the CPU exactly as a preempted
+/// one is, so work, a 300 ms sleep, and work again must advance
+/// [`parse_clock_ms`] by the work alone. NEGATIVE CONTROL: with the wall clock
+/// in [`parse_clock_ms`] this fails ("the time off the CPU was counted").
+#[cfg(unix)]
+#[test]
+fn the_parse_clock_does_not_count_time_the_thread_is_off_the_cpu() {
+    const OFF_MS: u64 = 300;
+    let work = |n: u64| {
+        let mut x: u64 = 1;
+        for i in 0..n {
+            x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
+        }
+        x
+    };
+    let wall = std::time::Instant::now();
+    let cpu = parse_clock_ms();
+    work(2_000_000);
+    std::thread::sleep(std::time::Duration::from_millis(OFF_MS));
+    work(2_000_000);
+    let (cpu_ms, wall_ms) = (parse_clock_ms() - cpu, wall.elapsed().as_secs_f64() * 1e3);
+    assert!(
+        wall_ms - cpu_ms >= OFF_MS as f64 * 0.8,
+        "the time off the CPU was counted: {cpu_ms:.1} ms on the parse clock across \
+         {wall_ms:.1} ms of wall time with a {OFF_MS} ms sleep inside it"
+    );
 }
 
 /// Faces to weigh: the two embedded ones always, plus whatever broad system
@@ -141,6 +218,23 @@ const TIME_REPS: usize = 3;
 /// profile shows the real shape at 3.1x-5.6x — and the test cannot see which
 /// profile it is in.
 ///
+/// RE-MEASURED 2026-09-27 on main (7a93e792a), five rounds each, both clocks
+/// agreeing to 0.1%: `STHeiti Light.ttc` 1.327x-1.341x, `Apple Symbols.ttf`
+/// 1.54x, `Arial Unicode.ttf` 2.04x. The widest face's operating point has
+/// fallen from ~1.50x to ~1.33x-1.38x since this margin was set, so its
+/// headroom over `1.25` is ~7-10%, not 20%.
+///
+/// ATTRIBUTED the same day, not by reading history but by an interleaved A/B
+/// on ONE machine and one font file, quiet (load 2-5 on 18 cores), three or
+/// more rounds per build: `8a968d21e`, where the 1.50 above was derived,
+/// reads 1.43x-1.44x on this box (the 1.50 was another machine's reading);
+/// the same tree rebuilt with only main's `[profile.dev] debug =
+/// "line-tables-only"` (01ac0f37a, 2026-09-25) reads 1.37x, as main does.
+/// Full DWARF made both parses slower at the test profile — fontdue's more,
+/// so dropping it narrowed the ratio — and the parse body, the hasher and
+/// both crates' versions are unchanged since. So none of the fall is the
+/// parse; the next one would be, and is what this guard exists to notice.
+///
 /// `1.25` is set BELOW the worst reading at the worst profile with 20% of room,
 /// and it still catches the regression this exists for: if the first-party face
 /// ever started converting outlines at parse time, its time would converge on
@@ -174,7 +268,10 @@ const TIME_MARGIN: f64 = 1.25;
 /// pressure and a neighbouring compile only ever ADD time, so the minimum of
 /// several rounds is the closest available reading of the true cost and it is
 /// the one that does not move with what else is running. The 1.5x claim is
-/// unchanged; only the noise under it is.
+/// unchanged; only the noise under it is. Since 2026-09-27 the CLOCK takes out
+/// preemption itself (thread CPU time, [`cost`]) — three rounds could not when
+/// the load outlasted all three — and the minimum is left the cache and memory
+/// traffic a neighbour adds to the parse's own time.
 ///
 /// The rounds also ALTERNATE which implementation goes first, which the comment
 /// below has always promised and the code did not do: the allocator's arena

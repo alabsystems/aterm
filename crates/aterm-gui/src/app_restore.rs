@@ -64,6 +64,19 @@ enum FillingShell<'a> {
     Unregistered(&'a Session),
 }
 
+/// The headless test harness's stand-in for adopting a handed-off shell: a stub
+/// session whose sink takes the handed master over through the SAME
+/// [`crate::spawn::HandedMaster::into_sink`] a real adoption (`spawn_session`)
+/// uses, so the session owns it and closes it when it drops. The `-1` sentinel
+/// the fixtures carry is no descriptor, so that stub owns none.
+#[cfg(test)]
+fn stub_adopted_session(id: u64, master: crate::spawn::HandedMaster) -> crate::Session {
+    if master.raw() < 3 {
+        return crate::stub_session(id);
+    }
+    crate::stub_session_with_sink(id, master.into_sink())
+}
+
 /// Remove and return the handed-off shell the outgoing process knew as
 /// `local_id`, when it is still waiting to be placed. Every adopt site matches
 /// through this — `main_entry` for session 0, `apply_restore_manifest` for each
@@ -150,13 +163,24 @@ impl App {
     /// projection. Bounded source-addressed selections and viewport anchors do: they
     /// are view state, validated and clamped against the reopened document on apply.
     /// Windows serialize in `WindowId` order (BTreeMap iteration): stable and
-    /// deterministic; the frontmost-window choice is not persisted (current scope —
-    /// the last restored window ends frontmost, matching a plain multi-window open).
+    /// deterministic. Which window was in front and key is carried separately,
+    /// as each window's macOS show state (`restore::WindowShow`, gap #29), and
+    /// restored as a stack after the windows exist (`crate::window_show`) —
+    /// never by reordering the windows, which the layout digest and the Commit
+    /// comparison are taken over.
     pub(crate) fn capture_restore_manifest(&self) -> restore::RestoreManifest {
+        // The stack, from the focus MRU the App already keeps — no AppKit query
+        // (`window_show::stacking_ranks`). Used by the macOS capture only.
+        #[cfg(target_os = "macos")]
+        let stack_ranks = {
+            let live: Vec<WindowId> = self.windows.keys().copied().collect();
+            crate::window_show::stacking_ranks(&live, &self.focus_order)
+        };
         let windows = self
             .windows
-            .values()
-            .map(|ws| {
+            .iter()
+            .enumerate()
+            .map(|(index, (&wid, ws))| {
                 // W3 (Windows): show state + frame origin, read TOGETHER from
                 // `GetWindowPlacement` when the window is maximized. winit's
                 // `outer_position()` reports the MAXIMIZED frame's origin (the
@@ -195,6 +219,36 @@ impl App {
                     ws.os_window.as_ref().and_then(|w| w.outer_position().ok()),
                     None::<bool>,
                 );
+                // THE macOS SHOW STATE (gap #29): full screen and minimized off
+                // the window itself — winit's full-screen state, and
+                // `isMiniaturized` through this window's own handle, reached
+                // only when an OS window exists (never headless) — and its place
+                // in the stack and whether it is the key window off the App's
+                // own focus bookkeeping. A window whose carried full-screen
+                // re-entry is still waiting (aterm has not been in front since
+                // the last update) is recorded as full screen, so a second
+                // update carries it on. Normalized out of the Commit
+                // comparison like the position (`commit_layout_topology`).
+                #[cfg(target_os = "macos")]
+                let show = crate::window_show::captured_show(
+                    ws.os_window
+                        .as_ref()
+                        .map(|w| crate::window_show::ShowProbe {
+                            fullscreen: w.fullscreen().is_some(),
+                            minimized: w.is_minimized(),
+                        }),
+                    stack_ranks.get(index).copied().unwrap_or(u32::MAX),
+                    self.frontmost_window == Some(wid),
+                    self.carried_fullscreen_pending(wid),
+                );
+                // Everywhere else: not captured, so a restore changes nothing.
+                // (Windows carries its maximized state above; its minimized and
+                // full-screen state, and Linux's, are a follow-up.)
+                #[cfg(not(target_os = "macos"))]
+                let show = {
+                    let _ = (index, wid);
+                    restore::WindowShow::UNKNOWN
+                };
                 let terminal_tabs = ws
                     .layouts
                     .iter()
@@ -249,6 +303,7 @@ impl App {
                     outer_x: pos.map(|p| p.x),
                     outer_y: pos.map(|p| p.y),
                     maximized,
+                    show,
                     tabs: terminal_tabs,
                     native_tabs,
                     tab_order,
@@ -409,6 +464,7 @@ impl App {
                         icon: user_meta.icon,
                         role: user_meta.role,
                         attention: user_meta.attention,
+                        questions: user_meta.questions,
                         // The spawn-time identity, so the respawn is under it.
                         identity: self
                             .pool
@@ -721,6 +777,12 @@ impl App {
     /// runs on every path, including a seamless adopt whose manifest was absent.
     fn apply_restore_manifest(&mut self, el: &ActiveEventLoop, manifest: restore::RestoreManifest) {
         let mut windows = manifest.windows.into_iter();
+        // THE SHOW STATE each manifest window carried, keyed by the live window
+        // it became — applied as a stack once every one of them is on glass
+        // (`crate::window_show`, gap #29). A window that is skipped or fails to
+        // create is simply absent.
+        let mut shown: Vec<(WindowId, restore::WindowShow)> = Vec::new();
+        let mut bootstrap = None;
         // The first persisted window maps onto the bootstrap window: session 0 already
         // runs in the persisted first-leaf cwd (seeded in `main`), so its layout is
         // rebuilt in place around that live session. Its GEOMETRY is deliberately not
@@ -732,6 +794,8 @@ impl App {
             && let Some(front) = self.frontmost_window
         {
             self.frontmost_window = Some(front);
+            shown.push((front, wl.show));
+            bootstrap = Some(front);
             self.restore_into_window(front, wl);
         }
         // Every further persisted window: a full window create — its first session
@@ -753,6 +817,7 @@ impl App {
                 let previous_front = self.frontmost_window;
                 let outer = (wl.outer_x, wl.outer_y);
                 let maximized = wl.maximized;
+                let show = wl.show;
                 let wid = self.create_native_restore_window(wl.rows, wl.cols);
                 self.restore_into_window(wid, wl);
                 let restored = self
@@ -768,6 +833,7 @@ impl App {
                     self.close_window_logical(wid);
                     continue;
                 }
+                shown.push((wid, show));
                 // W4: validated against the LIVE monitor set first — same
                 // contract as the terminal-window arm below.
                 if let (Some(x), Some(y)) = outer
@@ -813,6 +879,7 @@ impl App {
             };
             let outer = (wl.outer_x, wl.outer_y);
             let maximized = wl.maximized;
+            let show = wl.show;
             let Some(wid) = self.create_window_internal_connected(
                 el,
                 cwd0.as_deref(),
@@ -870,6 +937,7 @@ impl App {
             {
                 w.set_maximized(true);
             }
+            shown.push((wid, show));
             self.restore_into_window(wid, wl);
             // OVERLAP HANDOFF: this extra window was created HIDDEN
             // (reveal-at-first-present) and a hidden macOS window is not
@@ -884,6 +952,7 @@ impl App {
                 self.redraw_window(wid);
             }
         }
+        self.record_carried_window_show(&shown, bootstrap);
     }
 
     /// Install an empty logical host for a native-only restored window. No
@@ -928,7 +997,9 @@ impl App {
         let can_spawn = self.proxy.is_some() || (cfg!(test) && self.headless);
         let Some(wid) = self.frontmost_window.filter(|_| can_spawn) else {
             // No window/proxy to place them in (should not happen post-restore): drop the
-            // Adopted holders — their raw fds close with the process, ending the shells.
+            // Adopted holders, which closes each handed master now rather than leaving it
+            // open and readerless for this process's lifetime. The adoption proof no
+            // longer covers them, so the outgoing process keeps its own copies.
             crate::logging::stderr_line!(
                 "aterm-gui: seamless: no front window to adopt {} orphan shell(s) into",
                 orphans.len()
@@ -1001,10 +1072,12 @@ impl App {
         #[cfg(test)]
         if self.proxy.is_none() && self.headless {
             // The adoption `spawn_session` performs below, as far as a stub can:
+            // the session's sink takes the handed master over through the same
+            // `HandedMaster::into_sink` (so it closes it when the session drops),
             // the id it records from the `Adopted` handle, and whether the shell's
             // PATH is frozen (2026-09-16) — what `register_session` marks on the
             // registry, so a test can pin that adoption reaches the count.
-            let mut session = crate::stub_session(id);
+            let mut session = stub_adopted_session(id, adopted.master);
             session.handoff_local_id = Some(adopted.local_id);
             session.frozen_path = adopted.frozen_path;
             session.identity = adopted.identity;
@@ -1033,7 +1106,7 @@ impl App {
     /// Fill window `wid` from a validated mixed-tab restore record. Terminal trees keep
     /// their RESTORE-1 compatibility projection; native descriptors mint fresh runtime
     /// identities and are interleaved afterward by stable kind/URI order.
-    fn restore_into_window(&mut self, wid: WindowId, wl: restore::WindowLayout) {
+    pub(crate) fn restore_into_window(&mut self, wid: WindowId, wl: restore::WindowLayout) {
         if !wl.restored_tabs.is_empty() {
             self.restore_recursive_into_window(wid, wl);
             return;
@@ -1052,6 +1125,9 @@ impl App {
             // Applied by the caller (`apply_restore_manifest`) before the fill,
             // like the outer position above — window STATE, not tab topology.
             maximized: _,
+            // Recorded by the caller before the fill and applied once every
+            // carried window is on glass (`crate::window_show`).
+            show: _,
             rows: _,
             cols: _,
             tabs: terminal_layouts,
@@ -1810,6 +1886,7 @@ impl App {
             && leaf.icon.is_none()
             && leaf.role.is_none()
             && leaf.attention.is_none()
+            && leaf.questions.is_none()
         {
             return;
         }
@@ -1819,9 +1896,10 @@ impl App {
         let _ = meta.set("icon", leaf.icon.clone());
         let _ = meta.set("role", leaf.role.clone());
         let _ = meta.set("attention", leaf.attention.clone());
+        let _ = meta.set("questions", leaf.questions.clone());
     }
 
-    /// Put `leaf`'s USER identity (its five `meta set` fields) on the shell
+    /// Put `leaf`'s USER identity (its six `meta set` fields) on the shell
     /// the leaf NAMES — on a handoff, not necessarily the session `filling` its
     /// pane. A peer reads a session's identity before typing into it: the
     /// `role=` it checks, the `attention=` it answers, and `role=operator`,
@@ -2125,6 +2203,14 @@ impl App {
         self.restore_recovery_leaf_with_capability(wid, placeholder, None)
     }
 
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "RestoreFails",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
     fn restore_recovery_leaf_with_capability(
         &mut self,
         wid: WindowId,
@@ -2579,8 +2665,13 @@ mod tests {
         assert_eq!(super::recovery_capability(&unsafe_uri), None);
     }
 
+    /// Address a temp-dir file the way the SHIPPING seams do. The hand-rolled
+    /// `format!("file://{}")` this replaced is malformed on Windows — `C:\…`
+    /// lands where the authority goes, so the document host refuses it with
+    /// "malformed file URI" before a byte is read (a fixture defect, not a
+    /// product one: `app_tabs::mixed_tab_tests::file_uri` has the account).
     fn file_uri(path: &std::path::Path) -> String {
-        format!("file://{}", path.to_string_lossy().replace(' ', "%20"))
+        crate::native_document_host::path_to_file_uri(path).unwrap()
     }
 
     /// Install a stub session `id` in the pool + registry (the headless analogue of a
@@ -2727,6 +2818,13 @@ mod tests {
     /// form — byte-matching what the zsh integration's precmd puts in OSC 0
     /// titles (`~` for home itself, `~/sub` below it) — so the no-integration
     /// default label is indistinguishable from the integrated one.
+    ///
+    /// Unix-only: the OSC 7 fed here is `file://localhost<$HOME>/…`, a Unix
+    /// cwd spelling (`$HOME` is `C:\Users\…` on Windows, and
+    /// `home_relative_suffix` reads a `/`-rooted remainder), so what the
+    /// Windows integration reports, and how it abbreviates, is a separate
+    /// question this fixture cannot ask.
+    #[cfg(unix)]
     #[test]
     fn tab_title_abbreviates_a_home_cwd_like_the_shell_integration() {
         let Some(home) = crate::app_tabs::cached_home() else {
@@ -2919,11 +3017,13 @@ mod tests {
             icon: Some("🚀".to_string()),
             role: Some("operator".to_string()),
             attention: Some("⚠ waiting on approval".to_string()),
+            questions: Some("recommended".to_string()),
             identity: None,
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
         let meta = session.ctx.meta.lock().unwrap().clone();
+        assert_eq!(meta.questions.as_deref(), Some("recommended"));
         assert_eq!(meta.user_title.as_deref(), Some("release builder"));
         assert_eq!(meta.description.as_deref(), Some("cuts the v0.56 release"));
         assert_eq!(meta.icon.as_deref(), Some("🚀"));
@@ -2941,6 +3041,7 @@ mod tests {
             icon: None,
             role: None,
             attention: None,
+            questions: None,
             identity: None,
         };
         App::seed_restored_user_meta(&session, &bare);
@@ -2964,6 +3065,8 @@ mod tests {
             icon: Some(format!("\u{2066}{family}\u{2069}")),
             role: Some("operator\u{200b}".to_string()),
             attention: Some("  needs\u{2028}human  ".to_string()),
+            // A hand-edited policy outside the four words is dropped.
+            questions: Some("whatever claude thinks".to_string()),
             identity: None,
         };
         let session = crate::stub_session(9);
@@ -2993,6 +3096,10 @@ mod tests {
             }),
             "restore fields are bounded and single-line: {:?}",
             meta.description
+        );
+        assert_eq!(
+            meta.questions, None,
+            "a policy outside the closed set is dropped, never stored"
         );
 
         // Defense at the presentation seam also covers an old/internal caller
@@ -3166,6 +3273,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Settings {
                 route: "/updates".to_string(),
@@ -3266,6 +3374,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: restore::WindowShow::UNKNOWN,
             tabs: vec![restore::PaneLayout::leaf(
                 Some("/tmp".to_string()),
                 "shell title is not native identity".to_string(),
@@ -3334,6 +3443,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Settings {
                 route: "/updates".to_string(),
@@ -3378,6 +3488,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Settings {
                 route: "/updates".to_string(),
@@ -3416,6 +3527,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Markdown {
                 uri: "file:///definitely/missing/aterm-restore-document.md".to_string(),
@@ -3456,6 +3568,7 @@ mod tests {
                         icon: None,
                         role: None,
                         attention: None,
+                        questions: None,
                         identity: None,
                     }),
                 )),
@@ -3478,6 +3591,7 @@ mod tests {
                 outer_x: None,
                 outer_y: None,
                 maximized: None,
+                show: restore::WindowShow::UNKNOWN,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -3547,6 +3661,7 @@ mod tests {
                 icon: None,
                 role: None,
                 attention: None,
+                questions: None,
                 identity: None,
             },
         ))
@@ -3575,6 +3690,7 @@ mod tests {
                 outer_x: None,
                 outer_y: None,
                 maximized: None,
+                show: restore::WindowShow::UNKNOWN,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -3709,6 +3825,7 @@ mod tests {
                 outer_x: None,
                 outer_y: None,
                 maximized: None,
+                show: restore::WindowShow::UNKNOWN,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -3810,6 +3927,7 @@ mod tests {
                 outer_x: None,
                 outer_y: None,
                 maximized: None,
+                show: restore::WindowShow::UNKNOWN,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -3901,6 +4019,7 @@ mod tests {
                 outer_x: None,
                 outer_y: None,
                 maximized: None,
+                show: restore::WindowShow::UNKNOWN,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -4023,6 +4142,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
@@ -4046,6 +4166,7 @@ mod tests {
             icon: None,
             role: None,
             attention: None,
+            questions: None,
             identity: None,
         }
     }
@@ -4126,6 +4247,9 @@ mod tests {
             MetaField::Attention,
             "SAT-COMP campaign docs handoff",
         );
+        // The worker's questions are answered with their recommended option
+        // (2026-09-24): the sixth field rides the same capture, wire and graft.
+        stamp(&old, 1, MetaField::Questions, "recommended");
         let driver = SessionMeta {
             user_title: Some("fable driver".to_string()),
             description: Some("drives the satcomp worker".to_string()),
@@ -4137,6 +4261,7 @@ mod tests {
         let worker = SessionMeta {
             role: Some("worker:claude-satcomp".to_string()),
             attention: Some("SAT-COMP campaign docs handoff".to_string()),
+            questions: Some("recommended".to_string()),
             ..SessionMeta::default()
         };
         assert_eq!(registry_meta(&old, 0), driver, "PRECONDITION: stamped");
@@ -4154,6 +4279,7 @@ mod tests {
             "role = \"agent:claude-driver-fable\"",
             "role = \"worker:claude-satcomp\"",
             "attention = \"SAT-COMP campaign docs handoff\"",
+            "questions = \"recommended\"",
         ] {
             assert!(
                 wire.contains(spelled),
@@ -4946,14 +5072,142 @@ mod tests {
         assert_eq!(new.frozen_path_tabs(), 1, "registered now, counted once");
     }
 
+    /// CONFORMANCE (Tier-1) of the REAL incoming side to
+    /// `aterm_spec::derive::fd_handoff_no_leak_model` (`FdHandoffNoLeak`,
+    /// proof-carrying DSU Rung 1b): every PTY master handed across a seamless
+    /// re-exec ends ADOPTED — owned by a session — or CLOSED, never dropped while
+    /// still open (a live, readerless channel whose shell never sees its hangup).
+    ///
+    /// Driven through the orphan net, `App::adopt_orphan_shells_as_tabs` — the
+    /// placement every shell no restored leaf claimed goes through — once with a
+    /// front window to adopt into and once with none. The headless harness has
+    /// no event loop for `spawn_session`, so its stand-in builds the session, but
+    /// the master reaches that session's sink through the shipping
+    /// `HandedMaster::into_sink`, the one adoption both share. Each handed master
+    /// is one end of a socketpair and its peer is the witness: EOF there means
+    /// every copy of the master is closed; a pooled session carrying the shell's
+    /// `local_id` whose sink owns a master means it was adopted. Per master that
+    /// is the model's `Adopt`, its `CloseFallback`, or — neither — its
+    /// `BuggyDrop`, and every step is validated against the committed model
+    /// after the `Prepare`s that hand the masters across.
+    ///
+    /// The other ways a handed master can end: a refused handoff —
+    /// `seamless::tests::a_refused_handoff_closes_every_master_it_was_handed` —
+    /// and a spawn that fails after taking the `Adopted`, which needs the event
+    /// loop no headless test has and is closed by ownership instead: the error
+    /// drops either the `HandedMaster` not yet adopted or the sink that adopted
+    /// it, and both close the master.
+    ///
+    /// NEGATIVE CONTROLS: a master left open with no owner is the `BuggyDrop`
+    /// step, which only `Buggy = 1` admits. Until `spawn::HandedMaster` owned the
+    /// descriptor that is exactly what the windowless branch did ("their raw fds
+    /// close with the process"); make `HandedMaster`'s `Drop` a no-op again and
+    /// this test fails there. And a master the adoption closes as it hands it on
+    /// is a pooled session over a closed master, which this test refuses: let
+    /// `into_sink` drop its handle (`self.0` for the `ManuallyDrop`) and the
+    /// front-window case fails — in a debug build as an abort ("IO Safety
+    /// violation"), when that session's sink closes the descriptor a second time.
+    #[test]
+    #[cfg(unix)]
+    fn handed_off_masters_are_adopted_or_closed_never_leaked() {
+        use aterm_spec::verify::validate_transition_tiered;
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let model = aterm_spec::derive::fd_handoff_no_leak_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let closed = |peer: &UnixStream| {
+            let mut byte = [0u8; 1];
+            match (&*peer).read(&mut byte) {
+                Ok(0) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                other => panic!("unexpected witness read: {other:?}"),
+            }
+        };
+        for (what, window) in [("a front window", true), ("no window", false)] {
+            let mut app = App::headless_for_test();
+            app.handoff_successor = true;
+            if !window {
+                app.frontmost_window = None;
+            }
+            let mut peers = Vec::new();
+            for local_id in 1..=2 {
+                let (master, peer) = UnixStream::pair().expect("socketpair");
+                peer.set_nonblocking(true).expect("non-blocking witness");
+                let mut shell = handed_off_shell(local_id);
+                shell.master = crate::spawn::HandedMaster::new(master.into_raw_fd());
+                app.seamless_adopt.push(shell);
+                peers.push((local_id, peer));
+            }
+
+            app.adopt_orphan_shells_as_tabs(&[]);
+            assert!(
+                app.seamless_adopt.is_empty(),
+                "{what}: the net took every shell"
+            );
+
+            let label = "FdHandoffNoLeak(adopt_orphan_shells_as_tabs)";
+            let advance = |state: &mut std::collections::BTreeMap<&'static str, i64>,
+                           action: &str,
+                           var: &'static str,
+                           value: i64| {
+                let mut next = state.clone();
+                next.insert(var, value);
+                let (ok, why) =
+                    validate_transition_tiered(&model, &[], state, &next, Some(action), label);
+                assert!(
+                    ok,
+                    "{what}: the real handoff took `{action}` to {next:?}, which the \
+                     committed model does not admit — {why}"
+                );
+                *state = next;
+            };
+            let mut state = model.init_state();
+            for handed in 1..=2 {
+                advance(&mut state, "Prepare", "prepared", handed);
+            }
+            // A leak from here is a step only the mutant can take.
+            assert!(!model.action_enabled("BuggyDrop", &state));
+            assert!(buggy.action_enabled("BuggyDrop", &state));
+            let (mut adopted, mut closed_count) = (0, 0);
+            for (local_id, peer) in &peers {
+                // Adopted = a pooled session carries the shell AND its sink owns
+                // a master, as a real adoption's does.
+                let in_pool = app.pool.iter().any(|session| {
+                    session.handoff_local_id == Some(*local_id) && session.ctx.sink.master() >= 3
+                });
+                match (in_pool, closed(peer)) {
+                    (true, false) => {
+                        adopted += 1;
+                        advance(&mut state, "Adopt", "adopted", adopted);
+                    }
+                    (false, true) => {
+                        closed_count += 1;
+                        advance(&mut state, "CloseFallback", "closed", closed_count);
+                    }
+                    (false, false) => advance(&mut state, "BuggyDrop", "leaked", 1),
+                    (true, true) => panic!("{what}: shell {local_id} adopted onto a closed master"),
+                }
+            }
+            assert!(model.check_invariant("NoLeak", &state), "{what}: {state:?}");
+            assert_eq!(
+                (adopted, closed_count),
+                if window { (2, 0) } else { (0, 2) },
+                "{what}: where the shells went"
+            );
+        }
+    }
+
     /// A shell the outgoing process handed across as `local_id`, the way
     /// `seamless::take_incoming` gives it to `main_entry`. A headless restore
-    /// reads only the id: the stub spawn never touches the fd or the pid.
+    /// reads only the id: the `-1` sentinel master is no descriptor, so the stub
+    /// spawn owns none, and the pid is never signalled.
     fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         crate::spawn::Adopted {
             repaint: false,
             local_id,
-            master: -1,
+            master: crate::spawn::HandedMaster::new(-1),
             pid: -1,
             sid: aterm_session::SessionId::generate(),
             nonce: aterm_session::LaunchNonce::generate(),
@@ -4962,19 +5216,27 @@ mod tests {
             frozen_path: false,
             identity: None,
             topics: Vec::new(),
+            fg_holder: 0,
+            rekey: false,
+            loader: false,
+            history: crate::handoff_history::AdoptedHistory::default(),
         }
     }
 
-    /// The five USER fields handed-off shell `shell` wore in the predecessor.
-    /// Every value names its shell, so a value on the wrong session says whose
-    /// it was.
+    /// The six USER fields handed-off shell `shell` wore in the predecessor.
+    /// Every free-text value names its shell, so a value on the wrong session
+    /// says whose it was; `questions` is a closed set of words, so it cycles
+    /// with the shell id and the other five carry the name.
     fn identity_of(shell: u64) -> crate::session_timeline::SessionMeta {
+        let words = crate::session_timeline::QUESTIONS_POLICY_WORDS;
+        let word = words[usize::try_from(shell).expect("a small index") % words.len()];
         crate::session_timeline::SessionMeta {
             user_title: Some(format!("shell {shell}")),
             description: Some(format!("the work shell {shell} was doing")),
             icon: Some(format!("🐚{shell}")),
             role: Some(format!("worker:shell-{shell}")),
             attention: Some(format!("shell {shell} waits on a review")),
+            questions: Some(word.to_string()),
             ..crate::session_timeline::SessionMeta::default()
         }
     }
@@ -4994,6 +5256,7 @@ mod tests {
                 icon: identity.icon,
                 role: identity.role,
                 attention: identity.attention,
+                questions: identity.questions,
                 identity: None,
             },
         ))

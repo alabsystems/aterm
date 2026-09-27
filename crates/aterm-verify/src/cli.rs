@@ -3,15 +3,20 @@
 
 //! The flag surface, which is FROZEN.
 //!
-//! `--fast` / `--full` / `--scope <crate>` / `--selftest` are spelled into
-//! docs/PROCESS.md, into the pre-push hook's advice, and into every standing
-//! agent instruction in this repo. They keep working unedited, including
-//! `--scope=<crate>` and `-h`/`--help`.
+//! `--fast` / `--full` / `--scope <crate>` / `--selftest` keep working
+//! unedited, including `--scope=<crate>` and `-h`/`--help`.
 //!
-//! Two additions, both for the bash shim that execs this driver: `--root <dir>`
-//! (the shim already resolved the repo root from its own path, and a compiled
-//! binary cannot) and the `ATERM_VERIFY_ROOT` environment variable behind it.
-//! Neither changes any stage's decision.
+//! **THE GATE NEEDS NO FLAG** (2026-09-23, the owner, reading
+//! `tools/verify.sh --fast` in a report: *"why fucking --fast? I always want
+//! 'fast'"*). Fast has always been [`Mode`]'s default — a bare
+//! `tools/verify.sh` IS the merge contract — but every instruction in the repo
+//! spelled the flag, which read as if something slower ran without it. The
+//! docs and the usage below now spell the bare command; `--fast` stays
+//! accepted, a no-op, so a script that types it keeps working.
+//!
+//! One addition for the bash shim that execs this driver: `--root <dir>` (the
+//! shim already resolved the repo root from its own path, and a compiled binary
+//! cannot). It changes no stage's decision.
 //!
 //! And one opt-out, `--in-place` (2026-09-13): a run in a git checkout verifies
 //! a pinned SNAPSHOT of the caller's HEAD and uncommitted change by default
@@ -19,11 +24,26 @@
 //! every run did before. `--selftest`, and a root that is not a git checkout,
 //! run in place.
 //! It changes where the stages run, never which stages run.
+//!
+//! THE GATE READS NO ENVIRONMENT KNOB OF ITS OWN (2026-09-24). Every setting a
+//! person gives the gate is a flag here — `--stage-timeout`, `--test-threads`,
+//! `--snapshot`, `--timings`, `--log`/`--no-log`, `--skip-gui-smoke`,
+//! `--machine-lock-dir` — because
+//! this crate links into the shipped `aterm` (`aterm help rust`), where the
+//! owner's rule admits no environment variable that changes what it does
+//! (`aterm-update-core`'s `env_reads` gate). Each used to be an `ATERM_VERIFY_*`
+//! / `ATERM_SKIP_GUI_SMOKE` export; `ATERM_VERIFY_ROOT` and `ATERM_VERIFY_BASE`
+//! duplicated `--root` and `--base` and are gone outright. The one variable the
+//! gate still reads, `ATERM_VERIFY_MACHINE_HOLDER`, is protocol: the gate that
+//! holds the machine sets it for its own children, and nothing else does.
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// `--fast` (the per-commit merge contract) or `--full` (+ differential oracle
-/// and the trust-mc / Kani floor).
+/// The per-commit merge contract — the DEFAULT, what a bare `tools/verify.sh`
+/// runs (`--fast` spells it and changes nothing) — or `--full` (+ differential
+/// oracle and the trust-mc / Kani floor).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
     #[default]
@@ -57,25 +77,45 @@ pub struct Args {
     pub root: Option<PathBuf>,
     /// `--in-place`: run in the caller's checkout instead of the snapshot.
     pub in_place: bool,
-    /// `--disk-floor <GiB>`: the disk preflight's floor for this run, in whole
-    /// GiB. `None` keeps [`crate::disk::FLOOR_BYTES`]. The gate's own
-    /// integration tests pass `0`: a fixture with a fake toolchain builds
-    /// nothing, and a fixed floor made the gate's tests refuse whenever the host
-    /// volume held less than it (measured 2026-09-23 at 17.6 GiB free: 23 tests).
+    /// `--disk-floor <GiB>`: the free space this run requires, in whole GiB,
+    /// in place of the disk preflight's estimate. `None` keeps the estimate
+    /// ([`crate::disk::Budget::need`]). The gate's own integration tests pass
+    /// `0`: a fixture with a fake toolchain builds nothing, and a fixed floor
+    /// made the gate's tests refuse whenever the host volume held less than it
+    /// (measured 2026-09-23 at 17.6 GiB free: 23 tests).
     pub disk_floor_gib: Option<u64>,
+    /// `--stage-timeout <seconds|off>`: the wall-clock ceiling on one stage
+    /// child. `None` keeps [`crate::exec::DEFAULT_CHILD_CEILING`]; `Some(None)` is
+    /// `off`, the unbounded wait ([`crate::exec::parse_ceiling`]).
+    pub stage_timeout: Option<Option<Duration>>,
+    /// `--test-threads <n>`: the `RUST_TEST_THREADS` every child is pinned to.
+    /// `None` pins the machine's parallelism ([`crate::Ctx::with_pinned_child_facts`]).
+    pub test_threads: Option<NonZeroU32>,
+    /// `--snapshot <dir>`: where the snapshot lives, in place of
+    /// `<root>-verify.noindex` ([`crate::snapshot`]).
+    pub snapshot: Option<PathBuf>,
+    /// `--timings <file>`: the per-child timing TSV ([`crate::exec::Timings`]).
+    pub timings: Option<PathBuf>,
+    /// `--log <path>`: where the gate writes its own copy of the ladder, in
+    /// place of `<root>/.aterm-verify/logs/verify-<pid>.log`.
+    pub log: Option<PathBuf>,
+    /// `--no-log`: the gate keeps no copy of the ladder.
+    pub no_log: bool,
+    /// `--skip-gui-smoke`: the GUI smoke SKIPS — a named skip, so the run is
+    /// refused the merge-contract verdict and its receipt vouches for nothing.
+    pub skip_gui_smoke: bool,
+    /// `--machine-lock-dir <dir>`: where the one-gate-per-machine lock lives, in
+    /// place of the per-user one ([`crate::snapshot::machine_lock_dir`]). The
+    /// gate's own fixture tests give every throwaway repo its own.
+    pub machine_lock_dir: Option<PathBuf>,
     pub help: bool,
 }
 
 impl Args {
-    /// The ref the diff is taken against: `--base`, then `ATERM_VERIFY_BASE`,
-    /// then `main`. Kept a pure function of the two inputs so the default is
-    /// testable without touching the process environment.
+    /// The ref the diff is taken against: `--base`, else `main`.
     #[must_use]
-    pub fn base_ref(&self, from_env: Option<&str>) -> String {
-        self.base
-            .clone()
-            .or_else(|| from_env.map(str::to_string))
-            .unwrap_or_else(|| "main".to_string())
+    pub fn base_ref(&self) -> String {
+        self.base.clone().unwrap_or_else(|| "main".to_string())
     }
 }
 
@@ -90,6 +130,15 @@ pub enum ParseError {
     BaseWithoutChanged,
     /// `--disk-floor` with no value, or one that is not a whole number of GiB.
     DiskFloorNeedsGib,
+    /// `--stage-timeout` with no value, or one that is neither seconds nor `off`.
+    StageTimeoutNeedsSeconds,
+    /// `--test-threads` with no value, or one that is not a positive count.
+    TestThreadsNeedsCount,
+    /// A path flag (`--snapshot`, `--timings`, `--log`, `--machine-lock-dir`)
+    /// with no value.
+    NeedsPath(String),
+    /// `--log <path>` and `--no-log` together.
+    LogAndNoLog,
     Unknown(String),
 }
 
@@ -109,6 +158,16 @@ impl ParseError {
             }
             ParseError::DiskFloorNeedsGib => {
                 "verify: --disk-floor needs a whole number of GiB".to_string()
+            }
+            ParseError::StageTimeoutNeedsSeconds => {
+                "verify: --stage-timeout needs a number of seconds, or off".to_string()
+            }
+            ParseError::TestThreadsNeedsCount => {
+                "verify: --test-threads needs a positive whole number".to_string()
+            }
+            ParseError::NeedsPath(flag) => format!("verify: {flag} needs a path"),
+            ParseError::LogAndNoLog => {
+                "verify: --log <path> and --no-log contradict each other; pick one".to_string()
             }
             ParseError::Unknown(a) => format!("verify: unknown argument: {a}"),
         }
@@ -133,6 +192,8 @@ where
             "--selftest" => out.selftest = true,
             "--changed" => out.changed = true,
             "--in-place" => out.in_place = true,
+            "--no-log" => out.no_log = true,
+            "--skip-gui-smoke" => out.skip_gui_smoke = true,
             "-h" | "--help" => out.help = true,
             "--scope" => {
                 let v = it.next().unwrap_or_default();
@@ -157,6 +218,16 @@ where
             }
             "--disk-floor" => {
                 out.disk_floor_gib = Some(parse_gib(&it.next().unwrap_or_default())?);
+            }
+            "--stage-timeout" => {
+                out.stage_timeout = Some(parse_stage_timeout(&it.next().unwrap_or_default())?);
+            }
+            "--test-threads" => {
+                out.test_threads = Some(parse_threads(&it.next().unwrap_or_default())?);
+            }
+            "--snapshot" | "--timings" | "--log" | "--machine-lock-dir" => {
+                let v = path_value(&a, it.next().unwrap_or_default())?;
+                *out.path_slot(&a) = Some(v);
             }
             _ => {
                 if let Some(v) = a.strip_prefix("--scope=") {
@@ -185,6 +256,15 @@ where
                     out.root = Some(PathBuf::from(v));
                 } else if let Some(v) = a.strip_prefix("--disk-floor=") {
                     out.disk_floor_gib = Some(parse_gib(v)?);
+                } else if let Some(v) = a.strip_prefix("--stage-timeout=") {
+                    out.stage_timeout = Some(parse_stage_timeout(v)?);
+                } else if let Some(v) = a.strip_prefix("--test-threads=") {
+                    out.test_threads = Some(parse_threads(v)?);
+                } else if let Some((flag, v)) =
+                    a.split_once('=').filter(|(f, _)| PATH_FLAGS.contains(f))
+                {
+                    let v = path_value(flag, v.to_string())?;
+                    *out.path_slot(flag) = Some(v);
                 } else {
                     return Err(ParseError::Unknown(a));
                 }
@@ -199,14 +279,57 @@ where
     if out.base.is_some() && !out.changed {
         return Err(ParseError::BaseWithoutChanged);
     }
+    if out.log.is_some() && out.no_log {
+        return Err(ParseError::LogAndNoLog);
+    }
     Ok(out)
+}
+
+/// The flags whose value is a path ([`path_value`]).
+const PATH_FLAGS: [&str; 4] = ["--snapshot", "--timings", "--log", "--machine-lock-dir"];
+
+impl Args {
+    /// The field a path flag ([`PATH_FLAGS`]) sets.
+    fn path_slot(&mut self, flag: &str) -> &mut Option<PathBuf> {
+        match flag {
+            "--snapshot" => &mut self.snapshot,
+            "--timings" => &mut self.timings,
+            "--machine-lock-dir" => &mut self.machine_lock_dir,
+            _ => &mut self.log,
+        }
+    }
+}
+
+/// A path flag's value: an empty one is a usage error, never read as "unset" — and so
+/// is a FLAG. `tools/verify.sh` appends `--root <dir>` after the caller's words, so a
+/// trailing `--log` with its path forgotten would otherwise take `--root` as the path.
+fn path_value(flag: &str, v: String) -> Result<PathBuf, ParseError> {
+    if v.is_empty() || v.starts_with("--") {
+        return Err(ParseError::NeedsPath(flag.to_string()));
+    }
+    Ok(PathBuf::from(v))
+}
+
+/// A `--stage-timeout` value ([`crate::exec::parse_ceiling`]); anything it cannot
+/// read is a usage error — never the unbounded wait, which has to be TYPED.
+fn parse_stage_timeout(v: &str) -> Result<Option<Duration>, ParseError> {
+    crate::exec::parse_ceiling(v).ok_or(ParseError::StageTimeoutNeedsSeconds)
+}
+
+/// A `--test-threads` value: a positive whole number.
+fn parse_threads(v: &str) -> Result<NonZeroU32, ParseError> {
+    v.trim()
+        .parse::<NonZeroU32>()
+        .map_err(|_| ParseError::TestThreadsNeedsCount)
 }
 
 /// The `--help` text: the script's own header, kept as the contract it
 /// documents. `{CEILING}` is substituted by [`usage`] from
 /// [`crate::exec::DEFAULT_CHILD_CEILING`] — print [`usage`], never this. The
 /// ceiling was a hand-typed "45-minute" here through two raises of that
-/// constant (45 → 90 min, 90 min → 3 h) and was wrong for both.
+/// constant (45 → 90 min, 90 min → 3 h) and was wrong for both, so the disk
+/// preflight's two numbers, `{DISK_COLD_NEED}` and `{DISK_LANE_CAP}`, are
+/// substituted from [`crate::disk::Budget::MEASURED`] the same way.
 pub const USAGE_TEMPLATE: &str = "\
 verify — the single local gate entrypoint for aterm.
 
@@ -215,39 +338,47 @@ contract is *this gate passing locally* before a slice enters the ff-only
 main merge-queue. There is exactly one way to verify, so there is exactly one
 way for a reviewer (human or AI) to be wrong about it: run this.
 
-  tools/verify.sh --fast            # the per-commit gate (the merge contract)
-  tools/verify.sh --full            # --fast + differential oracle + trust-mc + cross-cells
+  tools/verify.sh                   # the per-commit gate (the merge contract)
+  tools/verify.sh --full            # the gate + differential oracle + trust-mc
+                                    #   + cross-cells + the Codex live upgrade
   tools/verify.sh --changed         # change-scoped tier (NOT the merge contract)
   tools/verify.sh --scope <crate>   # narrow build/test to one crate (+ guards)
-  tools/verify.sh --fast --scope aterm-grid
-  tools/verify.sh --fast --in-place # run in this checkout, not the snapshot
+  tools/verify.sh --scope aterm-grid
+  tools/verify.sh --in-place        # run in this checkout, not the snapshot
 
---fast    : targo build + targo test --workspace + the zero-tolerance grep
-            guards + the release-tooling suites (installer update channel,
-            export policy, release preflight) + a headless control-socket
-            smoke (the AI-first spine must never regress, so every gate run
-            proves the socket still answers).
---full    : everything in --fast, PLUS the aterm-vs-alacritty differential
+(no flag) : THE GATE, and the merge contract: targo build + targo test
+            --workspace + the zero-tolerance grep guards + the delivery-tooling
+            suites (installer, cargo pin, export policy, release preflight,
+            site sync, dev signing identity) + a headless control-socket smoke
+            (the AI-first spine must never regress, so every gate run proves
+            the socket still answers) + the foreground handback lane, which
+            drives a private headless aterm.
+--fast    : the default, spelled out. It changes nothing and nothing needs it;
+            it is accepted so a script that types it keeps working.
+--full    : everything the default runs, PLUS the aterm-vs-alacritty differential
             oracle and the trust-mc / Kani BMC harnesses *when those tools are
             installed* (skipped-not-failed when absent — see docs/PROCESS.md),
             PLUS the cross-cell type-check (forge's five cells, each for its
-            own triple; ~19 s warm, ~106 s cold).
+            own triple; ~19 s warm, ~106 s cold), PLUS — last, run alone, ~10
+            min — the Codex live upgrade, which reads THIS machine's managed
+            store and the vendor's current Codex, so it is not in the per-commit
+            contract (a named skip when the store holds no older Codex).
 --scope   : restrict the targo build/test to `-p <crate>`; the guards and the
             socket smoke always run whole-tree (they are cheap and global).
 --changed : a change-scoped PRE-FLIGHT. Restricts build/test/doctest/lint to
             the crates this branch touches PLUS every workspace crate that
             depends on one of them (the reverse-dependency cone, read from the
             SAME dependency graph the build uses). `--base <ref>` (default
-            `main`, or $ATERM_VERIFY_BASE) picks the merge-base the diff is
-            taken against. Every whole-tree stage still runs. The run never
-            claims the merge contract and its receipt admits no push: other
+            `main`) picks the merge-base the diff is taken against. Every
+            whole-tree stage still runs. The run never
+            claims the merge contract and its receipt vouches for nothing: other
             crates' tests read files no dependency edge names. If the scope
             cannot be computed honestly the run WIDENS to the whole workspace,
             because a broken narrower must do MORE work, never less.
 
 --in-place: in a git checkout every run except --selftest verifies a
             SNAPSHOT — a git worktree at <root>-verify.noindex (or
-            $ATERM_VERIFY_SNAPSHOT) synced to this checkout's HEAD,
+            --snapshot <dir>) synced to this checkout's HEAD,
             uncommitted diff and untracked files — so a pull, an edit or
             another build in this checkout cannot change what the run is
             verifying. --in-place runs here instead, as a root that is not a
@@ -255,17 +386,40 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             source tree) that moves mid-run stops every stage not yet started
             and adds a source identity COULD NOT RUN row, so a run with nothing
             failed ends COULD NOT RUN (exit 3) and a stage that already FAILED
-            keeps FAIL (exit 1). $ATERM_VERIFY_TIMINGS=<file> rewrites that
-            file each run with a TSV row per child and per stage, without
-            changing a byte of the ladder.
+            keeps FAIL (exit 1). --timings <file> rewrites that file each
+            run with a TSV row per child and per stage, without changing a
+            byte of the ladder.
 
---disk-floor <GiB>: before anything is built the run reads the free space on
-            the volume holding its root and answers COULD NOT RUN (exit 3), with
-            no receipt, below the floor — 40 GiB unless this moves it. The
-            ladder's `verify: disk …` line always prints the floor in force, so
-            a moved floor is on the record. Lowering it can never make a
-            receipt lie: a run that does run out of space is COULD NOT RUN,
-            never a verdict about the tree. The gate's own tests pass 0.
+--disk-floor <GiB>: before anything is built the run budgets what it will
+            write and answers COULD NOT RUN (exit 3), with no receipt, when the
+            volume holding its root has less free than max(cold footprint -
+            what a snapshot's lanes already hold, warm growth) + a reserve —
+            {DISK_COLD_NEED} from empty lanes. A snapshot's lanes over
+            {DISK_LANE_CAP} are removed first and the run is budgeted cold. The
+            ladder's `verify: disk …` line prints the free space, the lanes and
+            the requirement with its terms. --disk-floor replaces the estimate
+            with exactly this many GiB free, and the line says so. Lowering it
+            can never make a receipt lie: a run that does run out of space is
+            COULD NOT RUN, never a verdict about the tree. The gate's own tests
+            pass 0.
+
+--test-threads <n>: the RUST_TEST_THREADS every child is pinned to — the
+            machine's parallelism unless this names another count, never the
+            invoking shell's, so the contract measures the same thing whoever
+            typed the command. The run's notes say which.
+
+--log <path> | --no-log: the gate keeps its own copy of the ladder under
+            <root>/.aterm-verify/logs (the newest 20); --log moves it and
+            --no-log keeps none.
+
+--skip-gui-smoke: skip the windowed latency smoke. A NAMED skip: the run is
+            refused the merge-contract verdict and its receipt vouches for nothing.
+
+--machine-lock-dir <dir>: one gate runs per machine — a second waits (up to
+            three hours) on a per-user lock under ~/Library/Caches/aterm-verify
+            (macOS) or the XDG cache directory. This moves the lock; the gate's
+            own tests give each throwaway repo its own, so a fixture gate never
+            queues behind the gate that is running it.
 
 A skip is an honest \"tool absent\", never a silent pass: skips are counted and
 NAMED, and any run that skipped a stage or narrowed its scope is refused the
@@ -273,8 +427,9 @@ merge-contract verdict.
 
 A stage child that never exits is a FAILURE, not a hang: every child runs under
 a {CEILING} wall-clock ceiling and is killed and reported past it, because a
-gate that hangs has decided nothing and says nothing. $ATERM_VERIFY_STAGE_TIMEOUT
-moves that ceiling (seconds); =off removes it and restores the unbounded wait.
+gate that hangs has decided nothing and says nothing. --stage-timeout <seconds>
+moves that ceiling; --stage-timeout off removes it and restores the unbounded
+wait.
 
 exit 0  everything that ran was green (the verdict says which green)
 exit 1  a gate FAILED — a real finding about the tree
@@ -292,13 +447,18 @@ fn parse_gib(v: &str) -> Result<u64, ParseError> {
 }
 
 /// The `--help` text as a reader sees it: [`USAGE_TEMPLATE`] with the child
-/// ceiling read from the constant that enforces it.
+/// ceiling and the disk preflight's numbers read from the constants that
+/// enforce them.
 #[must_use]
 pub fn usage() -> String {
-    USAGE_TEMPLATE.replace(
-        "{CEILING}",
-        &ceiling_text(crate::exec::DEFAULT_CHILD_CEILING),
-    )
+    let disk = crate::disk::Budget::MEASURED;
+    USAGE_TEMPLATE
+        .replace(
+            "{CEILING}",
+            &ceiling_text(crate::exec::DEFAULT_CHILD_CEILING),
+        )
+        .replace("{DISK_COLD_NEED}", &crate::disk::gib(disk.need(0)))
+        .replace("{DISK_LANE_CAP}", &crate::disk::gib(disk.lane_cap))
 }
 
 /// A whole-unit English rendering of the child ceiling ("3-hour", "90-minute"),
@@ -418,12 +578,98 @@ mod tests {
     }
 
     #[test]
-    fn the_base_defaults_to_main_and_the_environment_can_move_it() {
+    fn the_base_defaults_to_main_and_only_the_flag_moves_it() {
         let given = ok(&["--changed", "--base", "HEAD~1"]);
-        assert_eq!(given.base_ref(Some("release")), "HEAD~1", "the flag wins");
-        let not_given = ok(&["--changed"]);
-        assert_eq!(not_given.base_ref(Some("release")), "release");
-        assert_eq!(not_given.base_ref(None), "main");
+        assert_eq!(given.base_ref(), "HEAD~1");
+        assert_eq!(ok(&["--changed"]).base_ref(), "main");
+    }
+
+    /// The knobs that were environment variables until 2026-09-24 are flags, in
+    /// both spellings, and a missing or malformed value is a usage error naming
+    /// the flag — never read as "unset", and never as the unbounded wait.
+    #[test]
+    fn the_former_environment_knobs_are_flags_that_fail_closed() {
+        let a = ok(&[
+            "--stage-timeout",
+            "120",
+            "--test-threads=4",
+            "--snapshot",
+            "/s",
+            "--timings=/t.tsv",
+            "--log",
+            "/l.log",
+            "--skip-gui-smoke",
+            "--machine-lock-dir=/m",
+        ]);
+        assert_eq!(a.machine_lock_dir, Some(PathBuf::from("/m")));
+        assert_eq!(a.stage_timeout, Some(Some(Duration::from_secs(120))));
+        assert_eq!(a.test_threads, NonZeroU32::new(4));
+        assert_eq!(a.snapshot, Some(PathBuf::from("/s")));
+        assert_eq!(a.timings, Some(PathBuf::from("/t.tsv")));
+        assert_eq!(a.log, Some(PathBuf::from("/l.log")));
+        assert!(a.skip_gui_smoke && !a.no_log);
+        assert_eq!(ok(&["--stage-timeout=off"]).stage_timeout, Some(None));
+        assert_eq!(ok(&[]).stage_timeout, None, "not given keeps the default");
+        assert!(ok(&["--no-log"]).no_log);
+        for (bad, err) in [
+            (
+                vec!["--stage-timeout"],
+                ParseError::StageTimeoutNeedsSeconds,
+            ),
+            (
+                vec!["--stage-timeout", "45m"],
+                ParseError::StageTimeoutNeedsSeconds,
+            ),
+            (
+                vec!["--stage-timeout=-1"],
+                ParseError::StageTimeoutNeedsSeconds,
+            ),
+            (
+                vec!["--test-threads", "0"],
+                ParseError::TestThreadsNeedsCount,
+            ),
+            (vec!["--test-threads=x"], ParseError::TestThreadsNeedsCount),
+            (
+                vec!["--snapshot"],
+                ParseError::NeedsPath("--snapshot".into()),
+            ),
+            (
+                vec!["--timings="],
+                ParseError::NeedsPath("--timings".into()),
+            ),
+            (vec!["--log", "/l", "--no-log"], ParseError::LogAndNoLog),
+            // The shim's own `--root` after a forgotten path is not the path.
+            (
+                vec!["--fast", "--log", "--root", "/repo"],
+                ParseError::NeedsPath("--log".into()),
+            ),
+            (
+                vec!["--snapshot", "--in-place"],
+                ParseError::NeedsPath("--snapshot".into()),
+            ),
+            (
+                vec!["--machine-lock-dir", "--fast"],
+                ParseError::NeedsPath("--machine-lock-dir".into()),
+            ),
+        ] {
+            assert_eq!(parse(bad.iter().copied()), Err(err), "{bad:?}");
+        }
+        let text = usage();
+        for flag in [
+            "--stage-timeout",
+            "--test-threads",
+            "--snapshot",
+            "--timings",
+            "--no-log",
+            "--skip-gui-smoke",
+            "--machine-lock-dir",
+        ] {
+            assert!(text.contains(flag), "usage must document {flag}");
+        }
+        assert!(
+            !text.contains("ATERM_"),
+            "usage names no environment knob: {text}"
+        );
     }
 
     #[test]
@@ -537,6 +783,23 @@ mod tests {
         }
     }
 
+    /// The merge contract is spelled BARE (2026-09-23): the usage names
+    /// `tools/verify.sh` with no flag as the gate, never prescribes the
+    /// no-op `--fast`, and a bare run parses to the gate's own mode.
+    #[test]
+    fn the_gate_is_the_bare_command() {
+        let text = usage();
+        assert!(
+            text.contains("tools/verify.sh                   # the per-commit gate"),
+            "the bare command is the gate: {text}"
+        );
+        assert!(
+            !text.contains("verify.sh --fast"),
+            "no invocation prescribes the no-op --fast: {text}"
+        );
+        assert_eq!(ok(&[]), ok(&["--fast"]), "--fast changes nothing");
+    }
+
     /// The ceiling the help NAMES is the ceiling the code ENFORCES. It was a
     /// hand-typed "45-minute" across two raises of the constant; deriving it is
     /// the only thing that keeps them equal.
@@ -553,6 +816,26 @@ mod tests {
                 ceiling_text(crate::exec::DEFAULT_CHILD_CEILING)
             )),
             "usage must name DEFAULT_CHILD_CEILING: {text}"
+        );
+        // The disk preflight's numbers are the constants', never typed here.
+        assert!(
+            !text.contains("{DISK_"),
+            "a disk placeholder reached a reader: {text}"
+        );
+        let disk = crate::disk::Budget::MEASURED;
+        assert!(
+            text.contains(&format!(
+                "{} from empty lanes",
+                crate::disk::gib(disk.need(0))
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "lanes over\n            {} are removed",
+                crate::disk::gib(disk.lane_cap)
+            )),
+            "{text}"
         );
         assert_eq!(ceiling_text(Duration::from_secs(3 * 60 * 60)), "3-hour");
         assert_eq!(ceiling_text(Duration::from_secs(90 * 60)), "90-minute");

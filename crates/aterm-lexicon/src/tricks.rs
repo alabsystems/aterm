@@ -338,9 +338,9 @@ struct RawTrickRow {
     gated: bool,
     #[serde(default)]
     cjk: bool,
-    #[serde(default)]
-    #[allow(dead_code, reason = "documentation field for human reviewers")]
-    notes: String,
+    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
+    #[serde(default, rename = "notes")]
+    _notes: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -353,9 +353,9 @@ struct RawWordRow {
     gated: bool,
     #[serde(default)]
     cjk: bool,
-    #[serde(default)]
-    #[allow(dead_code, reason = "documentation field for human reviewers")]
-    notes: String,
+    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
+    #[serde(default, rename = "notes")]
+    _notes: String,
 }
 
 /// Compiled value behind one key.

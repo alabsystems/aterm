@@ -14,15 +14,12 @@
 //! tone-map used by capture, so the semantic preview remains portable and
 //! truthful on hosts without an HDR panel.
 
-#![allow(
-    dead_code,
-    reason = "public-to-crate Settings workbench API; route integrations land independently"
-)]
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aterm_grapheme::{GraphemeClusters, grapheme_display_width};
+use aterm_grapheme::GraphemeClusters;
+#[cfg(test)]
+use aterm_grapheme::grapheme_display_width;
 use aterm_render::{FirePatch, GlowQuad, RainHalo, Theme, TrailCell};
 
 use crate::cursor_glow::{CursorGlow, Geom, GlowStyle, TrailParams};
@@ -96,7 +93,6 @@ pub(crate) enum PreviewCursorStyle {
     #[default]
     Block,
     Bar,
-    Underline,
     Hidden,
 }
 
@@ -105,7 +101,6 @@ impl PreviewCursorStyle {
         match self {
             Self::Block => "block",
             Self::Bar => "bar",
-            Self::Underline => "underline",
             Self::Hidden => "hidden",
         }
     }
@@ -152,6 +147,7 @@ pub(crate) enum PreviewTrailCompanion {
 }
 
 impl PreviewTrailStyle {
+    #[cfg(test)]
     pub(crate) fn parse(value: &str) -> Self {
         let empty = crate::app_config::TrailPackCatalog::default();
         Self::from_resolution(value, crate::app_config::resolve_trail_style(value, &empty))
@@ -280,8 +276,7 @@ impl CursorPreviewSpec {
     /// token must not accidentally retain the default rainbow-pet semantics.
     ///
     /// AUTHORED, not resolved: this is the text the badge shows and the cache
-    /// keys on, so it keeps the user's spelling and case. Ask
-    /// [`Self::effective_trail_style_token`] for what the trail actually draws.
+    /// keys on, so it keeps the user's spelling and case.
     pub(crate) fn effective_trail_style_raw(&self) -> &str {
         let raw = self.trail_style_raw.trim();
         let empty = crate::app_config::TrailPackCatalog::default();
@@ -297,6 +292,7 @@ impl CursorPreviewSpec {
     /// spelling the host's raw-token predicates would be asked about, so an
     /// unrecognized value previews the default's companion and ribbon instead
     /// of the geometry of a look nothing renders.
+    #[cfg(test)]
     fn effective_trail_style_token(&self) -> &str {
         crate::app_config::effective_trail_style_token(self.effective_trail_style_raw())
     }
@@ -1507,6 +1503,7 @@ impl SettingsPreviewSpec {
     /// answering for the pixels, exposed so a fixture that needs a candidate on
     /// the OPPOSITE side can ask instead of restating the platform rule and
     /// silently rotting when the rule moves.
+    #[cfg(test)]
     pub(crate) fn window_sample_is_light(&self, host: Theme) -> bool {
         let spec = self.normalized();
         let terminal_theme = spec
@@ -1534,7 +1531,6 @@ impl SettingsPreviewSpec {
             h: rect.height,
             radius: 11.0,
             fill: rgba(roles.elevated, 255),
-            blur: false,
         });
         prims.push(DrawPrim::Stroke {
             x: rect.x + 0.5,
@@ -1637,7 +1633,6 @@ impl SettingsPreviewSpec {
             h: terminal.height,
             radius: 8.0,
             fill: rgba(background, 255),
-            blur: false,
         });
         prims.push(DrawPrim::ClipPush {
             x: terminal.x,
@@ -1650,7 +1645,6 @@ impl SettingsPreviewSpec {
             terminal,
             spec.font_px,
             spec.line_height,
-            spec.baseline_adjust,
             &spec.font_candidate,
         );
         if spec.scene == PreviewScene::WindowTabs {
@@ -1884,7 +1878,6 @@ fn paint_font_candidate_pill_at_scale(
         h: pill_h,
         radius: 6.0,
         fill: rgba(roles.elevated, 248),
-        blur: false,
     });
     prims.push(DrawPrim::Stroke {
         x: x + 0.5,
@@ -1929,7 +1922,6 @@ fn paint_platform_window_controls(
                 cy: y + title_h * 0.5,
                 r: 3.0,
                 color: rgba(color, 255),
-                breathe: false,
             });
         }
         43.0
@@ -2036,7 +2028,6 @@ fn paint_window_theme_sample(
         h: 19.0,
         radius: 0.0,
         fill: rgba(fill, 255),
-        blur: false,
     });
     let title_inset = paint_platform_window_controls(prims, x, terminal.y, 19.0, light);
     prims.push(DrawPrim::Line {
@@ -2091,7 +2082,6 @@ fn paint_window_theme_sample(
             h: APPEARANCE_SWATCH_HEIGHT,
             radius: 2.0,
             fill: rgba(crate::settings::u32_rgb(color), 255),
-            blur: false,
         });
     }
 }
@@ -2204,7 +2194,6 @@ fn build_terminal_specimen_input(
         // settings pane said the cursor blinks.
         cursor_style: match spec.cursor.style {
             PreviewCursorStyle::Bar => CursorStyle::SteadyBar,
-            PreviewCursorStyle::Underline => CursorStyle::SteadyUnderline,
             PreviewCursorStyle::Hidden | PreviewCursorStyle::Block => CursorStyle::SteadyBlock,
         }
         .with_blink(spec.cursor.blink),
@@ -2546,7 +2535,6 @@ fn paint_window_tabs(
         h: title_h,
         radius: 0.0,
         fill: rgba(title_fill, 255),
-        blur: false,
     });
     let title_inset = paint_platform_window_controls(prims, rect.x, rect.y, title_h, light);
     let caption = TypeStep::Caption.px(13.75);
@@ -2567,7 +2555,6 @@ fn paint_window_tabs(
             h: 11.0,
             radius: 5.5,
             fill: rgba(roles.accent, 210),
-            blur: false,
         });
     }
     let strip_rows = spec.window_tabs.tab_strip_rows.min(4);
@@ -2581,7 +2568,6 @@ fn paint_window_tabs(
             h: strip_h,
             radius: 0.0,
             fill: rgba(roles.elevated, 245),
-            blur: false,
         });
         // Authored Description and generated Activity occupy separate examples,
         // both composed through the selected tab format.
@@ -2600,7 +2586,6 @@ fn paint_window_tabs(
             cy: y + strip_h * 0.5,
             r: 2.0,
             color: rgba(roles.accent, 255),
-            breathe: false,
         });
         prims.push(text_prim(
             settings_x + 8.0,
@@ -2696,21 +2681,19 @@ pub(crate) fn preview_node(
 #[derive(Clone, Copy, Debug)]
 struct PreviewGrid {
     rect: LogicalRect,
-    font_px: f32,
     cell_w: usize,
     cell_h: usize,
-    baseline: i32,
     rows: usize,
     cols: usize,
 }
 
 impl PreviewGrid {
-    fn new(terminal: LogicalRect, font_px: f32, line_height: f32, baseline_adjust: i32) -> Self {
+    #[cfg(test)]
+    fn new(terminal: LogicalRect, font_px: f32, line_height: f32) -> Self {
         Self::new_for_candidate(
             terminal,
             font_px,
             line_height,
-            baseline_adjust,
             &SemanticFontCandidate::default(),
         )
     }
@@ -2719,7 +2702,6 @@ impl PreviewGrid {
         terminal: LogicalRect,
         font_px: f32,
         line_height: f32,
-        baseline_adjust: i32,
         _candidate: &SemanticFontCandidate,
     ) -> Self {
         let pad_x = 10.0;
@@ -2732,16 +2714,12 @@ impl PreviewGrid {
         );
         let cell_w = (font_px * 0.62).round().clamp(4.0, 48.0) as usize;
         let cell_h = (font_px * 1.42 * line_height).round().clamp(11.0, 72.0) as usize;
-        let baseline =
-            ((cell_h as f32 - font_px) * 0.5 + font_px * 0.8).round() as i32 + baseline_adjust;
         let rows = ((rect.height / cell_h as f32).floor() as usize).clamp(1, 8);
         let cols = ((rect.width / cell_w as f32).floor() as usize).clamp(1, 96);
         Self {
             rect,
-            font_px,
             cell_w,
             cell_h,
-            baseline,
             rows,
             cols,
         }
@@ -2779,21 +2757,6 @@ fn scripted_cursor(grid: PreviewGrid, step: usize) -> (u16, u16) {
     )
 }
 
-fn paint_selection(prims: &mut Vec<DrawPrim>, grid: PreviewGrid, theme: Theme) {
-    if grid.rows < 2 || grid.cols < 8 {
-        return;
-    }
-    prims.push(DrawPrim::Panel {
-        x: grid.rect.x + 7.0 * grid.cell_w as f32,
-        y: grid.rect.y + grid.cell_h as f32,
-        w: (grid.cols.saturating_sub(9).min(12) * grid.cell_w) as f32,
-        h: grid.cell_h as f32,
-        radius: 2.0,
-        fill: rgba(crate::settings::u32_rgb(theme.selection), 255),
-        blur: false,
-    });
-}
-
 fn paint_trail(
     prims: &mut Vec<DrawPrim>,
     grid: PreviewGrid,
@@ -2813,7 +2776,6 @@ fn paint_trail(
             h: grid.cell_h as f32,
             radius: 0.0,
             fill: rgba(crate::settings::u32_rgb(color), 255),
-            blur: false,
         });
     }
 }
@@ -2885,13 +2847,6 @@ fn paint_cursor(
             2.0,
         ),
         PreviewCursorStyle::Bar => (x, y + 1.0, 2.0, grid.cell_h as f32 - 2.0, 1.0),
-        PreviewCursorStyle::Underline => (
-            x,
-            y + grid.cell_h.saturating_sub(3) as f32,
-            grid.cell_w as f32,
-            2.0,
-            1.0,
-        ),
         PreviewCursorStyle::Hidden => return,
     };
     prims.push(DrawPrim::Panel {
@@ -2901,47 +2856,13 @@ fn paint_cursor(
         h: height.max(1.0),
         radius,
         fill: color,
-        blur: false,
     });
-}
-
-#[derive(Clone, Copy)]
-enum SampleTone {
-    Primary,
-    Muted,
-    Accent,
-    Success,
-}
-
-fn sample_lines(scene: PreviewScene) -> &'static [(&'static str, SampleTone)] {
-    match scene {
-        PreviewScene::Appearance => &[
-            ("~/aterm  main", SampleTone::Muted),
-            ("$ cargo test -p aterm-gui", SampleTone::Primary),
-            ("running semantic renderer checks", SampleTone::Accent),
-            ("1391 passed; 0 failed", SampleTone::Success),
-            ("$ ", SampleTone::Primary),
-        ],
-        PreviewScene::Typography => &[
-            ("Aa Bb 012345  λ π √2 ✓  → aterm", SampleTone::Primary),
-            ("你好世界 · 日本語 · 한글 · 🚀 😀 🐈‍⬛", SampleTone::Accent),
-            ("Ligatures: != == => ->  ⌘ ⇧", SampleTone::Primary),
-            ("Combining: cafe\u{301}  naïve  résumé", SampleTone::Success),
-        ],
-        PreviewScene::CursorMotion => &[
-            ("aterm effects are real renderer output", SampleTone::Muted),
-            ("$ cargo test --workspace", SampleTone::Primary),
-            ("motion stays readable beneath the wake", SampleTone::Accent),
-            ("type here: semantic cursor runway", SampleTone::Primary),
-            ("ready", SampleTone::Success),
-        ],
-        PreviewScene::WindowTabs => &[],
-    }
 }
 
 /// Return the longest complete-grapheme prefix that fits a terminal row.
 /// Wide CJK/emoji clusters consume two columns and ZWJ/combining sequences are
 /// never split at the preview clip edge.
+#[cfg(test)]
 fn terminal_prefix(value: &str, columns: usize) -> &str {
     if columns == 0 {
         return "";
@@ -2959,6 +2880,7 @@ fn terminal_prefix(value: &str, columns: usize) -> &str {
     &value[..end]
 }
 
+#[cfg(test)]
 fn grapheme_at_terminal_column(value: &str, column: usize) -> Option<&str> {
     let mut left = 0_usize;
     for grapheme in value.graphemes() {
@@ -4009,7 +3931,6 @@ mod tests {
             LogicalRect::new(0.0, 0.0, 420.0, 150.0),
             spec.font_px,
             spec.line_height,
-            spec.baseline_adjust,
         );
         let output = spec.effects(grid, Theme::default());
         assert!(output.glow.is_empty());
@@ -4168,7 +4089,6 @@ mod tests {
             LogicalRect::new(0.0, 0.0, 420.0, 150.0),
             synthwave_spec.font_px,
             synthwave_spec.line_height,
-            synthwave_spec.baseline_adjust,
         );
         let output = synthwave_spec.effects(grid, Theme::default());
         assert!(
@@ -4265,7 +4185,6 @@ mod tests {
             LogicalRect::new(0.0, 0.0, 420.0, 150.0),
             unavailable.font_px,
             unavailable.line_height,
-            unavailable.baseline_adjust,
         );
         let output = unavailable.effects(grid, Theme::default());
         assert!(output.trail.is_empty());
@@ -4308,7 +4227,6 @@ mod tests {
             LogicalRect::new(0.0, 0.0, 420.0, 150.0),
             spec.font_px,
             spec.line_height,
-            spec.baseline_adjust,
         );
         assert!(!spec.effects(grid, Theme::default()).glow.is_empty());
     }
@@ -4330,7 +4248,6 @@ mod tests {
                 LogicalRect::new(0.0, 0.0, 420.0, 150.0),
                 spec.font_px,
                 spec.line_height,
-                spec.baseline_adjust,
             );
             let output = spec.effects(grid, Theme::default());
             assert!(output.glow.is_empty(), "{raw}");
@@ -4500,10 +4417,7 @@ mod tests {
         };
         let block = shape(PreviewCursorStyle::Block);
         let bar = shape(PreviewCursorStyle::Bar);
-        let underline = shape(PreviewCursorStyle::Underline);
         assert!(differences(&block, &bar) > 40);
-        assert!(differences(&bar, &underline) > 20);
-        assert!(differences(&block, &underline) > 40);
     }
 
     /// Pins the fixture invariant behind every pixel-identity assertion in

@@ -11,7 +11,7 @@
 //! signed pass's walk also steps over (`net::newest_index`), so a number missing anyway (a
 //! first publish numbered by hand, a release deleted and never re-cut) blinds neither. A hit
 //! wakes the ordinary update pass — the window's package lane is told the moment the first
-//! HEAD answers ([`successor_reporting_near`]), before the second returns; only that pass
+//! HEAD answers ([`successor_reporting_near_with`]), before the second returns; only that pass
 //! downloads and verifies the roster, index, manifests and artifacts, and it walks to the
 //! newest index itself, however far ahead that is. The machine-wide six-hour walk
 //! (`aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS`) remains the fallback.
@@ -39,7 +39,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use aterm_update_core::{HeadAnswer, HttpError};
@@ -50,7 +49,9 @@ use crate::store::Layout;
 /// is the cooldown after a probe that found the next tags missing — and after one that found
 /// one published, so an index a pass has not landed yet is offered again promptly.
 pub const INTERVAL: Duration = Duration::from_secs(30);
-const RETRY_AFTER_ERROR: Duration = Duration::from_secs(5 * 60);
+// An inconclusive near HEAD must not hide a newly published index for five
+// minutes. Even a persistent error spends fewer HEADs than the healthy probe.
+const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
 const MAX_STAMP_BYTES: u64 = 64;
 /// The store-scoped lock and stamp file every probing process shares.
 pub(crate) const NEAR_LOCK: &str = "index-probe.lock";
@@ -84,22 +85,11 @@ pub enum Probe {
     Deferred,
 }
 
-/// Probe the shipped public index source, if this store has a real directory, its
-/// registry has not been overridden, and an `update` pass would have work to do. Other
-/// sources retain the ordinary full update cadence; the public browser-download URL cannot
-/// speak for a private or local registry.
-pub fn successor(layout: &Layout) -> Probe {
-    successor_with_near_hint(layout, &mut |_| {})
-}
-
-/// The same probe, with an early untrusted hint: the moment one HEAD finds a published
-/// index, `near_build` is raised to it, before the other HEAD returns — so a GUI package
-/// lane can start its signed update during that wait. The final answer is still the
-/// highest of both.
-pub fn successor_reporting_near(layout: &Layout, near_build: &AtomicU64) -> Probe {
-    successor_with_near_hint(layout, &mut |build| {
-        near_build.fetch_max(build, Ordering::Release);
-    })
+/// Probe for the store's next index build, calling `on_near` on the probe worker as
+/// soon as the near range finds one. The owner can publish the hint and
+/// wake its parked package lane while the far HEAD and listing helpers run.
+pub fn successor_reporting_near_with(layout: &Layout, on_near: &mut dyn FnMut(u64)) -> Probe {
+    successor_with_near_hint(layout, on_near)
 }
 
 fn successor_with_near_hint(layout: &Layout, on_near: &mut dyn FnMut(u64)) -> Probe {
@@ -129,9 +119,9 @@ fn standard_public_source(owner: &str, repo: &str) -> bool {
     owner == aterm_update_core::ATPKG_INDEX_OWNER && repo == aterm_update_core::DEFAULT_REPO
 }
 
-/// Whether [`successor`] probes this store's index source at all — the manager armed, no
-/// registry seam, the shipped public source. For any other source there is no probe and so
-/// nothing cached to report.
+/// Whether [`successor_reporting_near_with`] probes this store's index source at all —
+/// the manager armed, no registry seam, the shipped public source. For any other source
+/// there is no probe and so nothing cached to report.
 #[must_use]
 pub fn probes_this_source() -> bool {
     if !crate::enabled() || crate::cli::registry_seam().is_some() {
@@ -326,9 +316,9 @@ pub enum RangeAnswer {
 }
 
 /// The probe's last answer for the store's CURRENT floor — what the window's
-/// thirty-second cadence (or any process that ran [`successor`]) already learned, read back
-/// without a request, a lock or a write. `near` is `(answer, when it was written)` for the
-/// next two tags, and is `None` when there is no stamp for this floor — never probed, or
+/// thirty-second cadence (or any process that ran [`successor_reporting_near_with`])
+/// already learned, read back without a request, a lock or a write. `near` is
+/// `(answer, when it was written)` for the next two tags, and is `None` when there is no stamp for this floor — never probed, or
 /// probed before the floor last moved (a stamp recorded under an older floor answers a
 /// question nobody is asking now).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,8 +351,8 @@ pub fn cached_answer(layout: &Layout) -> CachedProbe {
 }
 
 /// The index builds of the signed candidates the last pass that REACHED the channel
-/// downloaded for the source [`successor`] watches — the labels of
-/// `<prefix>/index-cache.toml` ([`crate::cache::IndexCache::labels`]), newest first. A build
+/// downloaded for the source [`successor_reporting_near_with`] watches — the labels
+/// of `<prefix>/index-cache.toml` ([`crate::cache::IndexCache::labels`]), newest first. A build
 /// here above the floor was downloaded and not landed. `None` when there is no readable
 /// cache for this source. Read-only, offline; diagnostics, never an input to any trust
 /// decision.
@@ -564,17 +554,17 @@ mod tests {
                 code: 503,
                 location: None,
                 marker: 'E',
-                cooldown_ticks: 10,
+                cooldown_ticks: 2,
                 answer: Probe::Deferred,
             },
-            // The download host's rate limit is an ordinary error: five minutes, like a 503.
+            // The download host's rate limit is an ordinary inconclusive HEAD.
             ModeledCase {
                 label: "rate-limited",
                 action: "ProbeError",
                 code: 429,
                 location: None,
                 marker: 'E',
-                cooldown_ticks: 10,
+                cooldown_ticks: 2,
                 answer: Probe::Deferred,
             },
             // Both tags answer as published here; the higher is the answer.

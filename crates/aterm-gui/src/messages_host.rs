@@ -73,7 +73,7 @@ use crate::{App, WindowId};
 /// reporter vocabulary is here (`tags_chips_cover_the_vocabulary` pins it); a
 /// tag this build does not know — a line another build wrote into the same
 /// log — follows them in first-seen order rather than vanishing.
-pub(crate) const TAG_ORDER: [&str; 13] = [
+pub(crate) const TAG_ORDER: [&str; 14] = [
     "crash",
     "config",
     "update",
@@ -87,6 +87,7 @@ pub(crate) const TAG_ORDER: [&str; 13] = [
     "fabric",
     "harness",
     "system",
+    "script",
 ];
 
 /// THE SHARED PROJECTION behind Settings ▸ Messages (design §4.2): built
@@ -115,6 +116,10 @@ pub(crate) struct MessagesState {
     /// over an in-memory ring only (a read-only log dir, a full disk) says so:
     /// the person must not believe the record survives a quit.
     pub(crate) saved: bool,
+    /// The reader's local clock's offset from UTC, in seconds — what an
+    /// expanded entry's meta line reads its time on (`Today 12:53:49 PM`,
+    /// design ruling 262); 0 where the host cannot say. Copy keeps UTC.
+    pub(crate) utc_offset_s: i64,
 }
 
 impl MessagesState {
@@ -128,6 +133,7 @@ impl MessagesState {
             tags: Vec::new(),
             log_folder: None,
             saved: true,
+            utc_offset_s: 0,
         }
     }
 
@@ -196,7 +202,7 @@ pub(crate) struct MessageActionView {
 }
 
 impl MessageView {
-    /// Warn or Error: the "Warnings & errors" chip's set.
+    /// Warn or Error: the "Problems" chip's set (ruling 264).
     pub(crate) fn alarm(&self) -> bool {
         matches!(self.severity, "warn" | "error")
     }
@@ -206,8 +212,9 @@ impl MessageView {
     /// row is doing, and — once it has left — how long it stood: `showing
     /// now`, `waiting to show`, `shown for 2 min`, `recorded` (never on the
     /// band), `replaced by a newer
-    /// message after 40 s`, `answered: Not now`, `cleared with a warning after
-    /// 3 h`. The wire keeps its own words ([`MessageView::state`], `copy_text`).
+    /// message after 40 s`, `answered: Not now`, `took 40 s` (delivered
+    /// or fixed), `lasted 40 s` (ended with no outcome), `ended with a problem
+    /// after 3 h`. The wire keeps its own words ([`MessageView::state`], `copy_text`).
     pub(crate) fn state_words(&self) -> String {
         let span = self
             .retired_unix_ms
@@ -224,16 +231,37 @@ impl MessageView {
             // A record (`Hold::LogOnly`) retires at the instant it is posted:
             // it was written down, never shown. A row that folded stood on the
             // band for its hold, never zero.
-            "folded" if self.retired_unix_ms == Some(self.at_unix_ms) => "recorded".to_string(),
+            "folded" if self.retired_unix_ms == Some(self.at_unix_ms) => self.record_words(),
             "folded" => match &span {
                 Some(span) => format!("shown for {span}"),
                 None => "shown".to_string(),
             },
+            // A row THIS process retired for going silent blames its
+            // reporter; a record replayed open from a process that is gone
+            // (killed or crashed — it wrote no ending, and a replayed record
+            // carries no retirement time) does not (ruling 267).
+            "stale" if self.retired_unix_ms.is_none() => {
+                "still open when aterm stopped".to_string()
+            }
             "stale" => after("stopped reporting"),
+            // Cut off by a graceful quit (ruling 267): the reporter did not
+            // end it, aterm did.
+            "quit" => after("still open when aterm quit"),
             "unseen" => "not shown \u{2014} too many at once".to_string(),
-            "superseded" => after("replaced by a newer message"),
-            "resolved-ok" => after("cleared"),
-            "resolved-warn" => after("cleared with a warning"),
+            "superseded" => "replaced".to_string(),
+            // The outcome the echo showed, never "cleared" over a failure
+            // (ruling 93: `resolve(Warn)` is failed or refused; audit
+            // 2026-09-24). Work that was delivered or a problem that was
+            // fixed (its record now reads ✓ Success, ruling 265) TOOK its
+            // span; anything else withdrawn LASTED it — never the wire's
+            // `withdrawn`, nor `done` under a fixed warning.
+            "resolved-ok" | "withdrawn" => match (&span, self.severity) {
+                (Some(span), "success") => format!("took {span}"),
+                (Some(span), _) => format!("lasted {span}"),
+                (None, "success") => "finished".to_string(),
+                (None, _) => "ended".to_string(),
+            },
+            "resolved-warn" => after("ended with a problem"),
             "dismissed" => "dismissed".to_string(),
             "answered" => match &self.answer {
                 Some(label) => format!("answered: {label}"),
@@ -242,12 +270,29 @@ impl MessageView {
             // A record (`Retired::Recorded`, the log's `how=folded rec=1`) was
             // never on the band: "shown for 0 s" would say it had been (design
             // §10.11, ruling 149 — one word, main's).
-            "recorded" => "recorded".to_string(),
+            "recorded" => self.record_words(),
             "evicted" => "dropped \u{2014} too many at once".to_string(),
             "carried" => "carried over to the updated aterm".to_string(),
-            "withdrawn" => after("withdrawn"),
             other => after(other),
         }
+    }
+
+    /// A RECORD's state words (design ruling 262, keeping ruling 149): a record
+    /// that stands for something that WAS on the band — the strain episode's,
+    /// whose own row stood on the glass — says how long it was shown (`shown for
+    /// 41 s`, the line its reporter wrote); every other record was written
+    /// down and never shown: `recorded`.
+    pub(crate) fn record_words(&self) -> String {
+        self.shown_line()
+            .map_or_else(|| "recorded".to_string(), str::to_string)
+    }
+
+    /// The `shown for …` line a record carries, when it has one.
+    pub(crate) fn shown_line(&self) -> Option<&str> {
+        self.detail
+            .iter()
+            .map(String::as_str)
+            .find(|line| line.starts_with("shown for "))
     }
 
     /// The severity in plain words for the meta line: `Error`, `Warning`,
@@ -290,17 +335,36 @@ pub(crate) fn tag_words(tag: &str) -> std::borrow::Cow<'_, str> {
         "config" => "Config",
         "update" => "Updates",
         "toolchain" => "ALab tools",
-        "packages" => "Packages",
+        // One chip for the ALab lane's two tags, one for the agents' two
+        // (design ruling 262): the wire keeps each tag.
+        "packages" => "ALab tools",
         "privacy" => "Privacy",
         "session" => "Sessions",
         "window" => "Windows",
         "render" => "Display",
         "a11y" => "Accessibility",
-        "fabric" => "Fabric",
+        "fabric" => "Agents",
         "harness" => "Agents",
         "system" => "System",
-        other => return std::borrow::Cow::Borrowed(other),
+        // A script's row that named no tag (ruling 265).
+        "script" => "Scripts",
+        other => return script_tag_words(other),
     })
+}
+
+/// A script's own tag as a chip's words (design ruling 265): capitalized like
+/// every chip beside it — `search` → `Search`, `deploy` → `Deploy` — and a
+/// two-letter tag is an initialism, `ci` → `CI`. The wire and Copy keep the
+/// tag as the script wrote it.
+fn script_tag_words(tag: &str) -> std::borrow::Cow<'_, str> {
+    let mut chars = tag.chars();
+    match chars.next() {
+        _ if tag.chars().count() <= 2 => std::borrow::Cow::Owned(tag.to_uppercase()),
+        Some(first) if first.is_lowercase() => {
+            std::borrow::Cow::Owned(first.to_uppercase().chain(chars).collect())
+        }
+        _ => std::borrow::Cow::Borrowed(tag),
+    }
 }
 
 /// A span in words: `40 s`, `2 min`, `3 h`, `2 d`.
@@ -324,9 +388,24 @@ fn span_words(ms: u64) -> String {
 /// symlink planted in the log dir is refused there, so it is not offered
 /// here (the rest of that test needs the log dir, which is a directory
 /// probe per view; the press re-validates the whole rule).
-fn still_actionable(intent: &Intent, live: bool, staged: Option<u64>) -> bool {
+fn still_actionable(
+    intent: &Intent,
+    live: bool,
+    staged: Option<u64>,
+    upgrades: &crate::upgrade_host::UpgradeView,
+) -> bool {
     match intent {
-        Intent::NotNow { .. } => live,
+        // An upgrade's word is for the build its row named: offered while
+        // the tab's upgrade still moves to it and takes that word — from a
+        // retired row or the waiting record too (the owner may change their
+        // mind); the press re-checks under the harness's lock.
+        Intent::AgentUpgrade { tab, to, word } => {
+            upgrades.offers(tab, to, *word, crate::upgrade_host::now_s())
+        }
+        // A stop is for the paste still on its way: its row is live exactly
+        // as long as the paste is watched; a strain row's tab is the one it
+        // named while it was up.
+        Intent::NotNow { .. } | Intent::StopPaste { .. } | Intent::ShowTab { .. } => live,
         Intent::ApplyUpdate { build } => staged == Some(*build),
         Intent::OpenPath { path } => {
             std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
@@ -346,6 +425,7 @@ fn message_view(
     live: Option<&Live>,
     on_glass: Option<u8>,
     staged: Option<u64>,
+    upgrades: &crate::upgrade_host::UpgradeView,
 ) -> MessageView {
     let (severity, glyph, title, detail, actions, repeats) = match live {
         Some(l) => (
@@ -387,11 +467,18 @@ fn message_view(
         actions: actions
             .iter()
             .enumerate()
+            // AN INTENT WHOSE MOMENT HAS PASSED IS NOT OFFERED (design ruling
+            // 265): `Stop paste` on a paste that finished, `Not now` on an
+            // answered ask, `Show tab 2` on a strain episode that folded
+            // could never be pressed again, and a dead Primary drawn in the
+            // accent read as the thing to do. An intent that can come back
+            // (`Install now`, `Open log`) stays, disabled while it cannot.
+            .filter(|(_, intent)| live.is_some() || !intent.ends_with_row())
             .filter_map(|(k, intent)| {
                 Some(MessageActionView {
                     index: u8::try_from(k).ok()?,
                     label: intent.label(),
-                    still_actionable: still_actionable(intent, live.is_some(), staged),
+                    still_actionable: still_actionable(intent, live.is_some(), staged, upgrades),
                 })
             })
             .collect(),
@@ -399,25 +486,43 @@ fn message_view(
 }
 
 /// The page's feedback line for an act the host performed (`performed`) or
-/// refused: what happened, in the words a person would use.
-fn act_feedback(intent: &Intent, performed: bool) -> String {
+/// refused: what happened, in the words a person would use. `applies`: an
+/// `Install now` press that really installs (`update_bar_press_applies`);
+/// otherwise the press opened Software Update, and says so (audit
+/// 2026-09-24: "Installing the update" was said over a page that opened, and
+/// over a press that failed).
+fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
     match (intent, performed) {
         (Intent::Details, true) => "Opened".to_string(),
         (Intent::Details, false) => "Could not open the entry".to_string(),
         (Intent::OpenSettings { .. }, true) => {
             format!("Opened Settings \u{25b8} {}", intent.label())
         }
-        (Intent::OpenSettings { route }, false) => format!("No Settings page at {route}"),
+        (Intent::OpenSettings { .. }, false) => "Could not open Settings".to_string(),
         (Intent::OpenConfigEditor { .. }, true) => "Opened aterm.toml".to_string(),
         (Intent::OpenConfigEditor { .. }, false) => "Could not open aterm.toml".to_string(),
         (Intent::OpenPath { .. }, true) => "Opened crash log".to_string(),
         (Intent::OpenPath { .. }, false) => "Could not open the crash log".to_string(),
         (Intent::OpenSystemPane { .. }, true) => "Opened System Settings".to_string(),
         (Intent::OpenSystemPane { .. }, false) => "System Settings did not open".to_string(),
-        (Intent::ApplyUpdate { .. }, _) => "Installing the update".to_string(),
+        (Intent::ApplyUpdate { .. }, true) if applies => "Installing the update".to_string(),
+        (Intent::ApplyUpdate { .. }, true) => {
+            "Opened Settings \u{25b8} Software Update".to_string()
+        }
+        (Intent::ApplyUpdate { .. }, false) if applies => "Could not start the install".to_string(),
+        (Intent::ApplyUpdate { .. }, false) => "Could not open Settings".to_string(),
         (Intent::NotNow { .. }, _) => "Not now recorded".to_string(),
         (Intent::NewWindow, true) => "Opened a new window".to_string(),
         (Intent::NewWindow, false) => "Could not open a window".to_string(),
+        (Intent::StopPaste { .. }, true) => "Stopped the paste".to_string(),
+        (Intent::StopPaste { .. }, false) => "The paste had already finished".to_string(),
+        (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
+        (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
+        // Written off this thread: what it did lands on the page as a record.
+        (Intent::AgentUpgrade { tab, .. }, true) => {
+            format!("{} asked for tab {tab}", intent.label())
+        }
+        (Intent::AgentUpgrade { .. }, false) => "The upgrade no longer takes that word".to_string(),
     }
 }
 
@@ -704,9 +809,13 @@ impl App {
     ///
     /// * a live row whose family comes back in the same words stands — no
     ///   resolve, no re-post, no re-announcement;
-    /// * a row whose family is gone, or whose words changed, is resolved (the
-    ///   log says the problem was fixed or became another), and a changed
-    ///   family posts its new row;
+    /// * a row whose family is GONE is resolved: the problem was fixed, and
+    ///   its record reads in the words the family declared for the fix
+    ///   (`Misspelled setting fixed`, ✓);
+    /// * a row whose family's words CHANGED is superseded in place by the new
+    ///   row: the problem became another, so its record keeps its title and
+    ///   its ⚠ and stays in Problems (design ruling 266). One that is now a
+    ///   record only comes down with the fix's words cleared first;
     /// * a family whose row already LEFT the glass — its hold ran out, it was
     ///   read, or it was recorded as a repeat before — and that comes back in
     ///   the words THIS process last recorded under its key is a RECORD
@@ -730,22 +839,34 @@ impl App {
         let now = Instant::now();
         let mut resolved = 0usize;
         for key in scope {
-            let Some((id, title, detail)) = self
-                .messages
-                .live_by_key(key)
-                .map(|l| (l.id, l.msg.title.clone(), l.msg.detail.clone()))
-            else {
+            let Some(id) = self.messages.live_by_key(key).map(|l| l.id) else {
                 continue;
             };
-            let stands = msgs.iter().any(|m| {
-                m.key.as_deref() == Some(key.as_str())
-                    && m.hold != Hold::LogOnly
-                    && m.title == title
-                    && m.detail == detail
-            });
-            if !stands {
+            let Some(next) = msgs.iter().find(|m| m.key.as_deref() == Some(key.as_str())) else {
+                // GONE from the reload's set: the problem is fixed, and the
+                // record takes the words its family declared for the fix.
+                resolved += usize::from(self.messages.resolve(id, Outcome::Ok, now));
+                continue;
+            };
+            if next.hold == Hold::LogOnly {
+                // Still a problem, now a record only: the row comes down
+                // WITHOUT the fix's words, so its record keeps its title and
+                // its ⚠ and stays in Problems (design ruling 266).
+                self.messages.restate(
+                    id,
+                    Restatement {
+                        finished: Some(None),
+                        ..Restatement::default()
+                    },
+                    now,
+                );
                 resolved += usize::from(self.messages.resolve(id, Outcome::Ok, now));
             }
+            // Same words: the row stands. CHANGED words: the family's new row
+            // SUPERSEDES it in place when posted below — the problem became
+            // another, it was not fixed, so the record keeps its title and
+            // its mark (ruling 266: `Misspelled setting fixed` was logged for
+            // a typo still there beside a second one).
         }
         self.post_config_set(resolved, msgs);
     }
@@ -946,6 +1067,22 @@ impl App {
         }
     }
 
+    /// THE GRACEFUL EXIT'S LAST WORD (design ruling 267): every row still
+    /// open — live work, a held warning, one still queued — is recorded as
+    /// cut off by aterm quitting (`Retired::Quit`, with the percent a
+    /// determinate row had reached), and the log is flushed, because the
+    /// exit seam `forget`s the App and its writer's drop-time join never
+    /// runs. A successor still frozen before its handoff commit writes
+    /// nothing: those rows are its parent's.
+    pub(crate) fn close_messages_at_exit(&mut self) -> usize {
+        if self.message_persist_frozen() {
+            return 0;
+        }
+        let closed = self.messages.quit(Instant::now());
+        self.flush_messages_log();
+        closed
+    }
+
     /// Whether the persist drain waits right now: only in the SUCCESSOR of a
     /// seamless handoff before Commit, whose lines are about rows the parent
     /// still owns — a refused successor must have written nothing. The
@@ -1041,7 +1178,7 @@ impl App {
     /// that arms it, so the loop can never arm a wake its own settle will
     /// decline to act on.
     pub(crate) fn message_holds_frozen(&self) -> bool {
-        self.pending_update_handoff.is_some() || self.incoming_handoff_pending
+        self.update_handoff_parked() || self.incoming_handoff_pending
     }
 
     /// The next instant the band needs the loop back — what
@@ -1081,6 +1218,20 @@ impl App {
     /// refused (a route this build has no page for, a path that is not a
     /// crash log, a system pane that did not open) — the page words its
     /// feedback from it; the band's press paths have nothing to say back.
+    /// `press_update_bar`'s law for row `id`'s `Install now`: the press
+    /// applies in place where the row still offers this build, the stage is
+    /// really ready and the seamless handoff can run; otherwise it opens the
+    /// details page. ONE reading, for the press and for its feedback words.
+    fn apply_press_applies(&self, id: MessageId, build: u64) -> bool {
+        let offered = self
+            .messages
+            .live(id)
+            .is_some_and(|l| l.msg.actions.contains(&Intent::ApplyUpdate { build }));
+        let staged_ready = self.staged_update_ready();
+        let handoff_available = self.seamless_handoff_unavailable().is_none();
+        Self::update_bar_press_applies(offered, staged_ready, handoff_available)
+    }
+
     pub(crate) fn perform_intent(&mut self, wid: WindowId, id: MessageId, intent: Intent) -> bool {
         let now = Instant::now();
         // A NAVIGATION press (a Settings page, `aterm.toml`, the crash log) that
@@ -1163,11 +1314,9 @@ impl App {
                     aterm_log::warn!("message {id}: no system pane {pane:?}");
                     return false;
                 };
-                let opened = matches!(
-                    crate::native_settings::ConsentGestures::for_instance(self.headless)
-                        .open_settings(pane),
-                    crate::menu::SettingsOpen::Anchored | crate::menu::SettingsOpen::PaneRoot
-                );
+                let opened = crate::native_settings::ConsentGestures::for_instance(self.headless)
+                    .open_settings(pane)
+                    .opened();
                 let route = crate::menu::privacy_settings_path_words(pane);
                 self.restate_message(id, route_words(opened, route));
                 self.note_macos_access_settings_opened(now);
@@ -1177,13 +1326,7 @@ impl App {
             // build applies it in place — where the stage is really ready and
             // the seamless handoff can run — and opens the details otherwise.
             Intent::ApplyUpdate { build } => {
-                let offered = self
-                    .messages
-                    .live(id)
-                    .is_some_and(|l| l.msg.actions.contains(&Intent::ApplyUpdate { build }));
-                let staged_ready = self.staged_update_ready();
-                let handoff_available = self.seamless_handoff_unavailable().is_none();
-                if Self::update_bar_press_applies(offered, staged_ready, handoff_available) {
+                if self.apply_press_applies(id, build) {
                     self.apply_update_or_details();
                     true
                 } else {
@@ -1209,7 +1352,52 @@ impl App {
                 Some(proxy) => proxy.send_event(crate::Wake::CreateWindow).is_ok(),
                 None => false,
             },
+            // `Stop paste` (ruling 231): the rest of the paste is dropped, the
+            // input after it goes through, and the row fades.
+            Intent::StopPaste { session } => self.stop_paste(session),
+            // The strain row's navigation (rulings 243 and 247): the tab the
+            // title names, in the window it is in — the band is app-wide, so
+            // the press may come from another window's band — raised.
+            Intent::ShowTab { tab, window } => self.show_tab(WindowId(window), tab),
+            // THE OWNER'S WORD on a tab's agent upgrade (gap #21): written
+            // where `aterm harness upgrade <tab> --now|--defer|--skip` writes
+            // it, for the build the row named, off this thread; the row says
+            // what it did (`upgrade_host`). Only while the tab's upgrade
+            // still takes that word for that build: Settings ▸ Messages
+            // presses from the model it last drew, and the harness re-checks
+            // only the build — an `Upgrade now` drawn before the owner's
+            // `--now` landed would arm a second round for a hurried move.
+            Intent::AgentUpgrade { tab, to, word } => {
+                self.upgrade_view
+                    .offers(&tab, &to, word, crate::upgrade_host::now_s())
+                    && self.send_upgrade_word(crate::upgrade_host::WordAsk { tab, to, word })
+            }
         }
+    }
+
+    /// `Show tab N` (rulings 243 and 247): tab `tab` (1-based) of window
+    /// `wid` — the window the strain row named, whichever window's band the
+    /// press came from — selected and its window raised (the
+    /// [`Self::focus_session_window`] shape, de-miniaturize included).
+    /// `false` when that window or that tab is gone.
+    pub(crate) fn show_tab(&mut self, wid: WindowId, tab: u16) -> bool {
+        let index = usize::from(tab).saturating_sub(1);
+        let exists = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| tab > 0 && ws.tab_set.tab_at(index).is_some());
+        if !exists {
+            return false;
+        }
+        self.switch_tab_in(wid, index);
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
+            if w.is_minimized().unwrap_or(false) {
+                self.pending_deminiaturize_focus = Some(wid);
+            }
+            w.set_minimized(false);
+            w.focus_window();
+        }
+        true
     }
 
     /// SETTINGS ▸ MESSAGES, AT AN ENTRY, IN THIS WINDOW (design §4.5, D5):
@@ -1277,7 +1465,11 @@ impl App {
         let Some(intent) = intent else {
             return MessageActOutcome::Gone;
         };
-        let feedback = |performed| act_feedback(&intent, performed);
+        let applies = match &intent {
+            Intent::ApplyUpdate { build } => self.apply_press_applies(id, *build),
+            _ => false,
+        };
+        let feedback = |performed| act_feedback(&intent, performed, applies);
         if self.perform_intent(wid, id, intent.clone()) {
             MessageActOutcome::Performed {
                 feedback: feedback(true),
@@ -1387,7 +1579,7 @@ impl App {
                 .iter()
                 .find(|(id, _)| *id == rec.id)
                 .map(|(_, row)| *row);
-            let view = message_view(rec, live, on_glass, staged);
+            let view = message_view(rec, live, on_glass, staged, &self.upgrade_view);
             match counts.iter_mut().find(|(tag, _)| *tag == view.tag) {
                 Some((_, n)) => *n += 1,
                 None => counts.push((view.tag.clone(), 1)),
@@ -1419,6 +1611,7 @@ impl App {
                 .and_then(crate::messages_store::Writer::folder)
                 .map(|dir| dir.display().to_string()),
             saved: self.messages_log.is_some(),
+            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
         }
     }
 }
@@ -1474,11 +1667,18 @@ impl App {
     /// not the retired glass rule of ruling 34 — a new version, or a frozen
     /// tab counted or adopted, is new words and is recorded. `true` when a
     /// record was written; the caller logs INFO then, DEBUG otherwise.
+    ///
+    /// THE TABS ARE COUNTED BY WHAT THEY RUN (gap audit 2026-09-24,
+    /// [`Self::tabs_behind`]): a frozen tab whose foreground is an agent is
+    /// never handed the hook to type, the Claude sessions the live upgrade is
+    /// moving turn the title to "installed", and a change in those counts
+    /// re-derives the words from the text remembered here.
     pub(crate) fn post_managed_current(&mut self, text: &str) -> bool {
-        let frozen_tabs = self.frozen_path_tabs();
+        self.upgrade_view.note_managed_text(text);
+        let tabs = self.tabs_behind();
         let hooked = self.this_tab_hooked();
         let hook = self.hook_dialect();
-        let Some(msg) = toolchain_words::managed_current(text, frozen_tabs, hooked, hook) else {
+        let Some(msg) = toolchain_words::managed_current_for(text, tabs, hooked, hook) else {
             return false;
         };
         let said = (msg.title.clone(), msg.detail.clone());
@@ -1522,6 +1722,22 @@ impl App {
     /// ([`Self::toolchain_pass_ended`]).
     pub(crate) fn announce_toolchain_pass(&mut self, detail: &str, first_run: bool) {
         if !first_run {
+            // A person's verb (ruling 224): its busy row takes the size the
+            // announcement names — how big the wait is — until the plan lands.
+            // While it queues, an announcement is the holder's (the lane's
+            // own child), not the size of the person's wait (ruling 229).
+            if let Some(verb) = self.toolchain_person
+                && !self.toolchain_person_waiting
+            {
+                let sized = toolchain_words::announced(detail);
+                let mut row = crate::message_reporters::packages_verb_row(verb);
+                row.detail.clone_from(&sized.detail);
+                if let (Some(m), Some(said)) = (row.meter.as_mut(), sized.meter.as_ref()) {
+                    m.stats.clone_from(&said.stats);
+                    m.load = said.load;
+                }
+                self.show_person_row(row, true);
+            }
             return;
         }
         self.toolchain_row_latched = true;
@@ -1575,23 +1791,48 @@ impl App {
             && snap.is_some_and(|s| {
                 s.running && s.file.overall.bytes_total >= toolchain_words::HEAVY_PASS_BYTES
             });
-        let paints = first_run || heavy || self.toolchain_row_latched;
+        // WHO WAITS DECIDES (rulings 220, 224; the rule is the engine's): a
+        // first run and a person's Settings verb are waited on and paint
+        // whatever they weigh; a routine pass paints only while very heavy.
+        let person = self.toolchain_person;
+        let waiter = aterm_messages::Waiter::of(first_run || person.is_some());
+        let paints = waiter.takes_row(heavy) || self.toolchain_row_latched;
         // A high-water mark belongs to the live meter it was read from: with
         // no live row up there is none to clamp against.
         let peak = live_id.and(self.toolchain_pass_peak.clone());
-        match toolchain_words::snapshot_words(snap, peak.as_ref(), !first_run) {
-            SnapshotWords::Vanished | SnapshotWords::Over => {
-                if !self.toolchain_row_latched {
-                    self.retire_live_toolchain(None);
+        // A person's Install lays the set down: its title is the install's.
+        let routine = !first_run && person != Some(crate::message_reporters::PackagesVerb::Install);
+        match toolchain_words::snapshot_words(snap, peak.as_ref(), routine) {
+            SnapshotWords::Vanished | SnapshotWords::Over => match person {
+                _ if self.toolchain_row_latched => {}
+                None => self.retire_live_toolchain(None),
+                // The HOLDER the person queued behind is done: its last frame
+                // leaves, and the row says again that they wait (ruling 229).
+                Some(verb) if self.toolchain_person_waiting => {
+                    self.restore_person_row(crate::message_reporters::packages_waiting_row(verb))
                 }
-            }
+                // A person's own row is the worker's to fold, at the child's exit.
+                Some(_) => {}
+            },
             SnapshotWords::Quiet => {}
             SnapshotWords::Live { message, pass_id } => {
-                if !paints {
+                if !paints || self.holder_read_not_the_persons(snap, first_run) {
                     return;
                 }
-                self.toolchain_row_latched = true;
-                self.toolchain_first_run |= first_run;
+                // The lane's latch is the lane's: a person's pass holds its row
+                // by `toolchain_person`, so a later light routine pass is not
+                // left latched behind it.
+                if first_run || person.is_none() {
+                    self.toolchain_row_latched = true;
+                    self.toolchain_first_run |= first_run;
+                }
+                // The person's finished words are for the person's row: a
+                // latched lane row (a first run they queue behind) keeps the
+                // lane's (`Installed ALab tools`).
+                let message = match person.filter(|_| !self.toolchain_row_latched) {
+                    Some(verb) => Box::new((*message).finished_as(verb.finished_work())),
+                    None => message,
+                };
                 self.toolchain_pass_peak = message
                     .meter
                     .as_ref()
@@ -1648,7 +1889,7 @@ impl App {
     /// sub-pass's (the vendor lane's, before the ALab set's; upstream
     /// ac7942234): its child's exit folds it.
     pub(crate) fn record_toolchain_outcome(&mut self, msg: Message) {
-        if !self.toolchain_row_latched {
+        if !self.toolchain_row_latched && self.toolchain_person.is_none() {
             self.retire_live_toolchain(None);
         }
         self.record_message(msg);
@@ -1680,9 +1921,36 @@ impl App {
     /// person to wait for did not arrive, and they have something to do
     /// (review 2026-09-24).
     pub(crate) fn toolchain_pass_ended(&mut self, clean: bool) {
-        self.toolchain_row_latched = false;
+        let latched = std::mem::take(&mut self.toolchain_row_latched);
         let first_run = std::mem::take(&mut self.toolchain_first_run);
         let short = self.toolchain_first_run_short.take();
+        if let Some(verb) = self.toolchain_person {
+            // A person's verb is waiting (queued behind this child, or
+            // running beside its exit): the row is theirs. A latched lane row
+            // ends as the lane's work did, and the person's own row comes back
+            // after the grace if their verb is still running (ruling 224).
+            if latched {
+                self.retire_live_toolchain(Some(if clean {
+                    EchoKind::Complete
+                } else {
+                    EchoKind::Fault
+                }));
+                match short {
+                    // A first run that ended short keeps its failure row.
+                    Some(msg) if !clean && first_run => {
+                        self.post_message(msg);
+                    }
+                    // Still queued (the lock is a moment away): it says so.
+                    _ if self.toolchain_person_waiting => self.show_person_row(
+                        crate::message_reporters::packages_waiting_row(verb),
+                        false,
+                    ),
+                    _ => self
+                        .show_person_row(crate::message_reporters::packages_verb_row(verb), false),
+                }
+            }
+            return;
+        }
         self.retire_live_toolchain(Some(if clean {
             EchoKind::Complete
         } else {
@@ -1695,6 +1963,149 @@ impl App {
             self.post_message(msg);
         }
     }
+
+    /// A PERSON'S SETTINGS ▸ PACKAGES VERB (`Wake::PkgPersonPass`, design
+    /// ruling 224). They pressed it and wait for it, so its pass takes the
+    /// band's row whatever it weighs — the 250 MB bar is for work nobody
+    /// asked for. `Began` puts up the verb's busy row, revealed after the
+    /// progress grace (a 1–4 s no-op Check never reaches the glass);
+    /// `Waiting` says it is queued behind another pass, `Running` that it took
+    /// the lock; the tailer's reads restate it with the fill and the ETA once
+    /// the plan lands (`apply_toolchain_snapshot`); `Ended` folds it with the
+    /// echo the worker names — Complete with the verb's finished words, Fault,
+    /// or a Vanish for a wait that ran out. The outcome stays the markers'
+    /// records (`ALab tools checked`, …) and the page's headline.
+    pub(crate) fn person_pass(&mut self, event: PersonPass) {
+        use crate::message_reporters::{packages_verb_row, packages_waiting_row};
+        match event {
+            PersonPass::Began(verb) => {
+                self.toolchain_person = Some(verb);
+                self.toolchain_person_waiting = false;
+                self.toolchain_holder_pid = None;
+                self.show_person_row(packages_verb_row(verb), false);
+            }
+            PersonPass::Waiting => {
+                if let Some(verb) = self.toolchain_person {
+                    self.toolchain_person_waiting = true;
+                    self.show_person_row(packages_waiting_row(verb), true);
+                }
+            }
+            PersonPass::Running => {
+                // Back to the verb's own busy row, whatever the holder's
+                // reads left on it — its fill, its ETA, its finished words
+                // (ruling 229). A latched lane row is the lane's until its
+                // exit, which puts the person's row back itself.
+                let waited = std::mem::take(&mut self.toolchain_person_waiting);
+                if let Some(verb) = self.toolchain_person
+                    && waited
+                    && !self.toolchain_row_latched
+                {
+                    self.restore_person_row(packages_verb_row(verb));
+                }
+            }
+            PersonPass::Ended(echo) => {
+                self.toolchain_person_waiting = false;
+                self.toolchain_holder_pid = None;
+                if self.toolchain_person.take().is_none() || self.toolchain_row_latched {
+                    // A latched lane row (a first run) is the lane's to fold.
+                    return;
+                }
+                self.retire_live_toolchain(Some(echo));
+            }
+        }
+    }
+
+    /// Put `row` (a person's busy verb or waiting row) on the lane's key: a
+    /// row that is not up yet is posted (its grace from now; it supersedes a
+    /// first run's failure row, as a retry's reads do); a BUSY row already up
+    /// is restated in place — its reveal kept — when `restate`; a row with a
+    /// fill (a plan's meter) or a held one is left alone.
+    fn show_person_row(&mut self, row: Message, restate: bool) {
+        let live = self
+            .messages
+            .live_by_key(toolchain_words::KEY_PASS)
+            .map(|l| {
+                let failure = l.msg.tag == aterm_messages::tags::PACKAGES;
+                let filled = l
+                    .msg
+                    .meter
+                    .as_ref()
+                    .is_some_and(|m| m.fill_permille.is_some());
+                (l.id, l.msg.hold.is_held() && !failure, failure, filled)
+            });
+        match live {
+            None | Some((_, _, true, _)) => {
+                self.toolchain_pass_peak = None;
+                self.post_message(row);
+            }
+            Some((id, false, false, false)) if restate => {
+                self.restate_message(id, restatement_of(&row));
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Put the person's `row` back over whatever the HOLDER'S reads left on
+    /// the lane's key — its fill included, which [`Self::show_person_row`]
+    /// keeps (ruling 229). The holder's high-water mark goes with it. A held
+    /// row is left alone; a failure row, or none, is posted over.
+    fn restore_person_row(&mut self, row: Message) {
+        self.toolchain_pass_peak = None;
+        let live = self
+            .messages
+            .live_by_key(toolchain_words::KEY_PASS)
+            .filter(|l| !l.msg.hold.is_held() && l.msg.tag != aterm_messages::tags::PACKAGES)
+            .map(|l| l.id);
+        match live {
+            Some(id) => {
+                self.restate_message(id, restatement_of(&row));
+            }
+            None => self.show_person_row(row, false),
+        }
+    }
+
+    /// Whether a painting read is the HOLDER'S and must not paint the
+    /// person's row (ruling 229):
+    ///
+    /// * a read tailed while the person queues is the holder's — noted by the
+    ///   pid that wrote it, and painted, as what they wait behind;
+    /// * once the lock is taken, a read of that pid is late (another thread's
+    ///   tailer can land it after `lock-acquired:`) and paints nothing;
+    /// * a LATCHED FIRST RUN is painted by the lane's own tailer: the
+    ///   person's tailer follows the same file (`first_run` false), and its
+    ///   reads would restate the first run's row in the person's words
+    ///   (`Updating`, not `Installing`), turn and turn about with the lane's.
+    fn holder_read_not_the_persons(
+        &mut self,
+        snap: Option<&crate::PkgProgressSnapshot>,
+        first_run: bool,
+    ) -> bool {
+        if self.toolchain_person.is_none() {
+            return false;
+        }
+        let pid = snap.and_then(|s| s.file.pid);
+        if self.toolchain_person_waiting {
+            if pid.is_some() {
+                self.toolchain_holder_pid = pid;
+            }
+            return self.toolchain_row_latched && self.toolchain_first_run && !first_run;
+        }
+        pid.is_some() && pid == self.toolchain_holder_pid
+    }
+}
+
+/// What the packages worker reports about a person's Settings ▸ Packages verb
+/// (`Wake::PkgPersonPass`, design ruling 224; `App::person_pass`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PersonPass {
+    /// The verb's child is about to run.
+    Began(crate::message_reporters::PackagesVerb),
+    /// It queued behind another pass at the store lock (`lock-waiting:`).
+    Waiting,
+    /// It took the lock (`lock-acquired:`).
+    Running,
+    /// Its child exited, and how its row ends.
+    Ended(EchoKind),
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,9 +2305,9 @@ impl App {
     /// echo is the landing's moment, ruling 141), and the good
     /// news is a RECORD in main's words ([`update_words::landed`]: "Updated to
     /// aterm vX") — and, when this process (or the predecessor that handed
-    /// over) downloaded THIS build, how long the update took, on record at the
-    /// landing instant ([`update_words::installed_after`]). Never for a build
-    /// met already on disk, nor for another build's download.
+    /// over) downloaded THIS build, how long the update took, a line of that
+    /// same record. Never for a build met already on disk, nor for another
+    /// build's download.
     ///
     /// `repainted` is how many tabs the seamless successor adopted onto a
     /// blank screen (the 2026-09-22/23 update audit, plan P1-5 —
@@ -1922,10 +2333,7 @@ impl App {
         if let Some(id) = live {
             self.resolve_message(id, Outcome::Ok);
         }
-        self.record_message(update_words::landed(version, build, repainted));
-        if let Some(took) = took {
-            self.record_message(update_words::installed_after(version, took));
-        }
+        self.record_message(update_words::landed(version, build, repainted, took));
         if repainted > 0 {
             aterm_log::info!("update landed: {repainted} tab(s) adopted onto a blank screen");
         }
@@ -2050,11 +2458,24 @@ impl App {
         }
         self.update_switch_recorded_for = Some(target_build);
         self.update_switch_on_record = Some(target.clone());
-        self.record_message(update_words::switch_started(
-            target.as_deref(),
-            crate::build_info::version_display(),
-            build,
-        ));
+        aterm_log::info!(
+            "update switch started: target {:?} (build {target_build}) from build {build}",
+            target
+        );
+        // ONE FACT, ONE ENTRY: an Installing row this attempt POSTED (the
+        // explicit lane with nothing up) is already that line in the log; a
+        // row re-worded in place, or none (the automatic lane), is not
+        // (audit 2026-09-24).
+        let posted_row = self.update_row_before_install.is_none()
+            && self
+                .live_update_flow()
+                .is_some_and(|flow| flow.phase == FlowPhase::Installing);
+        if !posted_row {
+            self.record_message(update_words::switch_started(
+                target.as_deref(),
+                crate::build_info::version_display(),
+            ));
+        }
         self.flush_messages_log();
     }
 
@@ -2365,6 +2786,7 @@ impl App {
 impl App {
     /// The live rows and the undrained log lines for the handoff manifest:
     /// the center's [`Carry`] in the manifest's own plain-data shape.
+    #[cfg(any(unix, test))]
     pub(crate) fn carried_messages(&self) -> crate::session_store::MessagesCarry {
         crate::session_store::MessagesCarry::from(&self.messages.carried())
     }
@@ -2391,6 +2813,23 @@ impl App {
             return;
         }
         self.messages.seed_carried(&carried, wall_stamp_now(), now);
+        // A session's wait (a paste on its way, a rewrap) is the process's
+        // that watches it (rulings 231–234): this one watches nothing it did
+        // not start, so a carried one leaves now rather than going stale.
+        let waits: Vec<MessageId> = self
+            .messages
+            .live_rows()
+            .filter(|l| {
+                l.msg
+                    .key
+                    .as_deref()
+                    .is_some_and(aterm_messages::waits::is_wait_key)
+            })
+            .map(|l| l.id)
+            .collect();
+        for id in waits {
+            self.messages.withdraw(id, now);
+        }
         let Some(version) = finishing else {
             return;
         };
@@ -2488,7 +2927,9 @@ impl HealthProof {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_messages::{HOLD_GESTURE, HOLD_SUCCESS, LogState, Meter, Severity, tags};
+    #[cfg(unix)]
+    use aterm_messages::HOLD_SUCCESS;
+    use aterm_messages::{HOLD_GESTURE, LogState, Meter, Severity, tags};
 
     fn warn(title: &str) -> Message {
         Message::new(tags::CONFIG, Severity::Warn, title).line("why")
@@ -2537,6 +2978,32 @@ mod tests {
         assert!(app.messages_deadline().is_some(), "staleness keeps running");
         app.incoming_handoff_pending = false;
         assert!(!app.message_holds_frozen());
+    }
+
+    /// A shrink pending when a handoff freezes the band is not a wake: only
+    /// `commit_rows` takes it, and the freeze skips `commit_rows`, so an
+    /// armed shrink would come due and stay due for the whole park → proof
+    /// → exec window (the audit's stale-arm finding).
+    #[test]
+    fn a_frozen_band_never_arms_its_pending_shrink() {
+        let mut app = App::headless_for_test();
+        let id = app.post_message(warn("a warning"));
+        assert_eq!(app.message_band_rows, 1);
+        let before = Instant::now();
+        assert!(app.withdraw_message(id));
+        let after = Instant::now();
+        assert_eq!(app.message_band_rows, 1, "the shrink waits out its quiet");
+        let shrink = before + aterm_messages::SHRINK_QUIET..=after + aterm_messages::SHRINK_QUIET;
+        assert!(
+            app.messages.deadline(true).is_some(),
+            "unfrozen, the shrink (or the echo) is armed"
+        );
+        app.incoming_handoff_pending = true;
+        assert!(
+            app.messages_deadline().is_none_or(|d| !shrink.contains(&d)),
+            "frozen, the shrink is not a wake"
+        );
+        app.incoming_handoff_pending = false;
     }
 
     /// Mid-handoff the row count never moves — the successor's layout must
@@ -2872,6 +3339,83 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 2);
     }
 
+    /// A CHANGED PROBLEM IS NOT A FIXED ONE (design ruling 266). Two bad
+    /// chords with one fixed, or one typo joined by a second, change the
+    /// family's words while it is still broken: the old row is SUPERSEDED in
+    /// place, and its record keeps its title and its ⚠ — never `Keybinding
+    /// fixed` / `Misspelled setting fixed` under a ✓ that left Problems. Only
+    /// the reload that takes the family away logs the fix's words.
+    #[test]
+    fn a_config_family_whose_words_changed_is_not_logged_fixed() {
+        use crate::message_reporters::{ConfigFamily, ConfigWarnings};
+        use aterm_messages::Retired;
+        let chords = |names: &[&str]| {
+            let mut warns = ConfigWarnings::default();
+            for name in names {
+                warns.push(
+                    ConfigFamily::Keybindings,
+                    format!("config keybindings: skipping \"{name}\": unknown action \"foo\""),
+                );
+            }
+            warns.into_messages()
+        };
+        let key = ConfigFamily::Keybindings.key();
+        let mut app = App::headless_for_test();
+        app.replace_config_messages(chords(&["ctrl+x", "ctrl+y"]));
+        let two = app.messages.live_by_key(key).map(|l| l.id).expect("a row");
+
+        // One chord fixed, the other still skipped.
+        app.replace_config_messages(chords(&["ctrl+y"]));
+        let one = app
+            .messages
+            .live_by_key(key)
+            .expect("still a problem: a row")
+            .id;
+        assert_ne!(one, two, "the changed words are a new row");
+        let rec = app.messages.log().get(two).expect("logged");
+        assert!(
+            matches!(rec.retired(), Some(Retired::Superseded { .. })),
+            "the problem became another, it was not fixed: {rec:?}"
+        );
+        assert_eq!(rec.title, "2 keybindings skipped", "{rec:?}");
+        assert_eq!(rec.severity, Severity::Warn, "still in Problems: {rec:?}");
+        assert_eq!(
+            app.messages.wanted_rows(),
+            1,
+            "one row, in the old one's place"
+        );
+
+        // The last chord fixed: the family is gone, and now it IS fixed.
+        app.replace_config_messages(Vec::new());
+        assert!(app.messages.live_by_key(key).is_none());
+        let rec = app.messages.log().get(one).expect("logged");
+        assert_eq!(rec.retired(), Some(&Retired::Resolved(Outcome::Ok)));
+        assert_eq!(rec.title, "Keybinding fixed", "{rec:?}");
+        assert_eq!(rec.severity, Severity::Success, "{rec:?}");
+
+        // A typo joined by a second: the first is still misspelled.
+        let typos = |keys: &[&str]| {
+            let mut warns = ConfigWarnings::default();
+            for (line, k) in keys.iter().enumerate() {
+                warns.push(
+                    ConfigFamily::IgnoredKeys,
+                    format!("config line {}: unknown key \"{k}\"", line + 3),
+                );
+            }
+            warns.into_messages()
+        };
+        let key = ConfigFamily::IgnoredKeys.key();
+        app.replace_config_messages(typos(&["windw_padding"]));
+        let first = app.messages.live_by_key(key).map(|l| l.id).expect("a row");
+        app.replace_config_messages(typos(&["windw_padding", "colums"]));
+        let rec = app.messages.log().get(first).expect("logged");
+        assert!(
+            !rec.title.ends_with("fixed") && rec.severity == Severity::Warn,
+            "a typo still there is not logged fixed: {rec:?}"
+        );
+        assert!(app.messages.live_by_key(key).is_some());
+    }
+
     /// A RETIRED SPELLING IS A RECORD ON EVERY PATH (design ruling 42): the
     /// launch's and every reload's `collect_key_notices` puts
     /// `[packages] auto_update = false` in `ConfigFamily::RetiredKeys`, and the
@@ -2917,7 +3461,7 @@ mod tests {
         assert!(records.iter().all(|r| !r.is_live()));
         // Design §10.3: the title names the kind in a few words; the key's
         // own sentence is the detail.
-        assert_eq!(records[0].title, "Retired config key");
+        assert_eq!(records[0].title, "Retired setting");
         assert!(
             records[0]
                 .detail
@@ -3017,6 +3561,43 @@ mod tests {
         assert!(!app.resolve_message(id, Outcome::Ok), "already gone");
     }
 
+    /// `Show tab N` from ANOTHER window's band (ruling 247): the band is
+    /// app-wide, so every window's band shows the strain row and its capsule.
+    /// The press lands on the window the row named — its tab 2 selected —
+    /// and never switches the pressing window to ITS tab 2, a different
+    /// program. A gone tab or window is an honest miss.
+    #[test]
+    fn show_tab_goes_to_the_named_window_not_the_pressing_one() {
+        let mut app = App::headless_for_test();
+        let a = WindowId(0);
+        app.push_stub_tab(a, crate::stub_session(app.next_session_id));
+        app.switch_tab_in(a, 0);
+        let b = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
+        app.push_stub_tab(b, crate::stub_session(app.next_session_id));
+        app.switch_tab_in(b, 0);
+        let active = |app: &App, w: WindowId| app.windows[&w].tab_set.active_index();
+        assert_eq!((active(&app, a), active(&app, b)), (Some(0), Some(0)));
+        let id = app.post_message(warn("Typing slowed by 'yes' (tab 2)"));
+        let show = Intent::ShowTab {
+            tab: 2,
+            window: a.0,
+        };
+        assert!(app.perform_intent(b, id, show));
+        assert_eq!(active(&app, a), Some(1), "the named window shows tab 2");
+        assert_eq!(active(&app, b), Some(0), "the pressing window is untouched");
+        let gone = app.post_message(warn("gone"));
+        assert!(!app.perform_intent(
+            b,
+            gone,
+            Intent::ShowTab {
+                tab: 3,
+                window: a.0,
+            }
+        ));
+        let gone = app.post_message(warn("gone window"));
+        assert!(!app.perform_intent(a, gone, Intent::ShowTab { tab: 1, window: 99 }));
+    }
+
     /// THE DETAILS PRESS (design §3.6): the row is seen — a held row folds,
     /// the config band's "click at a notice you have read" — and Settings ▸
     /// Messages opens in THE PRESSED WINDOW with that entry selected, the
@@ -3086,6 +3667,65 @@ mod tests {
         );
         // A window that does not exist opens nothing.
         assert!(!app.open_messages_entry(WindowId(77), Some(live)));
+    }
+
+    /// ROUND 16, DAY TWO (ruling 267): a row still open when aterm quits is
+    /// recorded as cut off by the quit — its words, its mark, the percent a
+    /// determinate row reached — never `stopped reporting`, which blamed a
+    /// reporter that had done nothing wrong; and a record replayed open from a
+    /// process that died without an ending says aterm stopped, while a row
+    /// THIS process retired for going silent still blames its reporter.
+    #[test]
+    fn a_row_open_at_quit_is_recorded_as_cut_off_and_a_dead_processes_as_open() {
+        let mut app = App::headless_for_test();
+        let render = app.post_message(
+            Message::new(tags::SYSTEM, Severity::Info, "Rendering the video")
+                .hold(Hold::Live {
+                    stale_after: aterm_messages::STALE_TAILED,
+                })
+                .meter(Meter {
+                    fill_permille: Some(283),
+                    ..Meter::default()
+                }),
+        );
+        let warn = app.post_message(
+            Message::new(tags::SYSTEM, Severity::Warn, "Disk nearly full")
+                .line("2 GB free on the startup disk"),
+        );
+        assert_eq!(app.close_messages_at_exit(), 2);
+        assert_eq!(app.messages.live_rows().count(), 0);
+        let state = app.messages_state();
+        let r = state.entry(render.raw()).expect("the render's record");
+        assert_eq!(r.state, "quit");
+        assert_eq!(r.title, "Rendering the video");
+        assert_eq!(r.detail, vec!["28% when aterm quit".to_string()]);
+        assert!(
+            r.state_words().starts_with("still open when aterm quit"),
+            "{}",
+            r.state_words()
+        );
+        let w = state.entry(warn.raw()).expect("the warning's record");
+        assert_eq!(w.state, "quit");
+        assert!(w.alarm(), "the warning stays in Problems");
+        // A dead process's open row, replayed: no retirement time.
+        let dead = LogRecord::from_posted(
+            MessageId::from_raw(900).expect("an id"),
+            WallStamp { unix_ms: 1_000 },
+            &Message::new(tags::SYSTEM, Severity::Info, "Rendering the video"),
+        );
+        let mut log = aterm_messages::MessageLog::empty();
+        log.replay(aterm_messages::LogLine::Posted(dead));
+        let replayed = log.records().next().expect("replayed");
+        let view = message_view(replayed, None, None, None, &Default::default());
+        assert_eq!(view.state, "stale");
+        assert_eq!(view.state_words(), "still open when aterm stopped");
+        // A row this process retired Stale keeps its words.
+        let mut silent = replayed.clone();
+        silent.retired_unix_ms = Some(61_000);
+        assert_eq!(
+            message_view(&silent, None, None, None, &Default::default()).state_words(),
+            "stopped reporting after 1 min"
+        );
     }
 
     /// THE PROJECTION (design §4.2): every record newest first, in the
@@ -3209,9 +3849,42 @@ mod tests {
         assert_eq!(f.state, "resolved-warn");
         assert!(f.retired_unix_ms.is_some());
         assert!(
-            f.state_words().starts_with("cleared with a warning after "),
+            f.state_words().starts_with("ended with a problem after "),
             "{}",
             f.state_words()
+        );
+        // A delivered row says so; neither outcome reads "cleared" (audit
+        // 2026-09-24).
+        let delivered = MessageView {
+            state: "resolved-ok",
+            ..f.clone()
+        };
+        assert!(
+            delivered.state_words().starts_with("lasted "),
+            "{}",
+            delivered.state_words()
+        );
+        // Delivered work (its record's mark is ✓ Success, ruling 265) took
+        // its span; a plain withdraw lasted it — never `withdrawn`.
+        let took = MessageView {
+            state: "withdrawn",
+            severity: "success",
+            ..f.clone()
+        };
+        assert!(
+            took.state_words().starts_with("took "),
+            "{}",
+            took.state_words()
+        );
+        let ended = MessageView {
+            state: "withdrawn",
+            severity: "info",
+            ..f.clone()
+        };
+        assert!(
+            ended.state_words().starts_with("lasted "),
+            "{}",
+            ended.state_words()
         );
         assert!(!f.actions[0].still_actionable, "no file, no press");
         assert_eq!(f.glyph, '\u{2715}');
@@ -3246,9 +3919,16 @@ mod tests {
         assert_eq!(ans.state, "answered");
         assert_eq!(ans.state_words(), "answered: Not now");
         assert!(
-            !ans.actions[0].still_actionable,
-            "a decision is answered once"
+            ans.actions.is_empty(),
+            "a decision is answered once, and not offered again (ruling 265): {:?}",
+            ans.actions
         );
+        // A script's tags read like the chips beside them (ruling 265).
+        assert_eq!(tag_words("script"), "Scripts");
+        assert_eq!(tag_words("search"), "Search");
+        assert_eq!(tag_words("ci"), "CI");
+        assert_eq!(tag_words("Deploy"), "Deploy");
+        assert_eq!(tag_words("crash"), "Crashes");
         assert_eq!(span_words(40_000), "40 s");
         assert_eq!(span_words(150_000), "2 min");
         assert_eq!(span_words(7_200_000), "2 h");
@@ -3346,21 +4026,35 @@ mod tests {
             }
         );
         assert_eq!(
-            act_feedback(&Intent::NewWindow, true),
+            act_feedback(&Intent::NewWindow, true, false),
             "Opened a new window"
         );
+        // An Install now press says what it did: installs only where it
+        // applies, the page it opened otherwise, and a failure as one.
+        let apply = Intent::ApplyUpdate { build: 1 };
+        assert_eq!(act_feedback(&apply, true, true), "Installing the update");
         assert_eq!(
-            act_feedback(&Intent::ApplyUpdate { build: 1 }, false),
-            "Installing the update"
+            act_feedback(&apply, true, false),
+            "Opened Settings \u{25b8} Software Update"
+        );
+        assert_eq!(
+            act_feedback(&apply, false, true),
+            "Could not start the install"
+        );
+        assert_eq!(
+            act_feedback(&apply, false, false),
+            "Could not open Settings"
         );
         assert_eq!(
             act_feedback(
                 &Intent::OpenSettings {
                     route: "/nowhere".into()
                 },
+                false,
                 false
             ),
-            "No Settings page at /nowhere"
+            "Could not open Settings",
+            "no route string on the page"
         );
     }
 
@@ -3373,6 +4067,7 @@ mod tests {
     fn the_projection_is_published_at_two_hertz_and_on_the_minute_tick() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
         app.post_message(warn("before Settings"));
         assert_eq!(app.messages_last_publish, None, "no Settings, no publish");
         assert_eq!(app.messages_publish_due_at(), None);
@@ -3423,6 +4118,82 @@ mod tests {
         assert_ne!(app.messages_last_publish, Some(on_route), "the tick");
     }
 
+    /// ROUND 16 REVIEW (ruling 267): the page's status line (`Copied`) is
+    /// timed by the projections, and on a quiet page those came once a
+    /// minute — so it stood one to two minutes, never about five seconds. The
+    /// host now arms the publish that starts its clock and, five seconds on,
+    /// the one that clears it; then only the minute tick again. Off screen it
+    /// arms nothing.
+    #[test]
+    fn a_transient_status_line_is_cleared_about_five_seconds_on() {
+        use crate::app_native::{
+            MESSAGES_FEEDBACK_WAIT as WAIT, MESSAGES_PUBLISH_MIN_GAP as GAP,
+            MESSAGES_PUBLISH_TICK as TICK,
+        };
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
+        let opened = app
+            .messages_last_publish
+            .expect("opening Settings publishes");
+        assert_eq!(app.messages_publish_due_at(), Some(opened + TICK));
+        fn view_mut(
+            app: &mut App,
+            wid: WindowId,
+        ) -> &mut crate::native_settings::SettingsViewState {
+            let (_, view) = app.active_native_view(wid).expect("Settings fronts it");
+            match app.native_runtime.view_state_mut(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => state,
+                _ => unreachable!(),
+            }
+        }
+        view_mut(&mut app, wid).show_messages_feedback_for_test("Copied");
+        // Off screen: nothing armed but the (gated) tick — nothing at all.
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = false;
+        assert_eq!(
+            app.messages_publish_due_at(),
+            None,
+            "a hidden page arms nothing"
+        );
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        // The publish that starts the clock is due at the 2 Hz gap.
+        assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
+        app.publish_native_messages_state_if_due(opened + GAP);
+        let stamped = app.messages_last_publish.unwrap();
+        assert_ne!(stamped, opened);
+        assert_eq!(
+            settings_view(&app, wid).unwrap().messages_feedback_clock(),
+            Some(true)
+        );
+        assert_eq!(
+            settings_view(&app, wid).unwrap().feedback.as_deref(),
+            Some("Copied")
+        );
+        // The one that clears it, five seconds on — not the minute tick.
+        assert_eq!(app.messages_publish_due_at(), Some(stamped + WAIT));
+        assert!(app.messages_deadline().is_some_and(|d| d <= stamped + WAIT));
+        app.publish_native_messages_state_if_due(
+            stamped + WAIT - std::time::Duration::from_millis(1),
+        );
+        assert_eq!(app.messages_last_publish, Some(stamped), "not yet");
+        // The page times the line by the projections' wall clock, which a test
+        // cannot wait out: age the stamp as five seconds would.
+        view_mut(&mut app, wid)
+            .age_messages_feedback_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS);
+        app.publish_native_messages_state_if_due(stamped + WAIT);
+        let cleared = app.messages_last_publish.unwrap();
+        assert_ne!(cleared, stamped);
+        let view = settings_view(&app, wid).unwrap();
+        assert_eq!(view.feedback, None, "cleared about five seconds on");
+        assert_eq!(view.messages_feedback_clock(), None);
+        assert_eq!(
+            app.messages_publish_due_at(),
+            Some(cleared + TICK),
+            "then only the minute tick"
+        );
+    }
+
     /// THE PUBLISH IS RATE-LIMITED, AND ONLY WHILE SETTINGS EXISTS (design
     /// §4.2): with no Settings controller a publish — asked for outright or
     /// on the sweep — is a no-op and nothing is pending; opening Settings
@@ -3439,6 +4210,7 @@ mod tests {
         use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
         let settings_exists = |app: &App| {
             app.native_runtime
                 .instance_by_kind(crate::native_app::AppKind::Settings)
@@ -3660,6 +4432,7 @@ mod tests {
         use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
         app.post_message(
             Message::new(tags::UPDATE, Severity::Warn, "checks failing").hold(Hold::Standing),
         );
@@ -3679,6 +4452,7 @@ mod tests {
         );
         // The park at the tick publishes — this half holds.
         let mut probe = App::headless_for_test();
+        probe.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
         probe.post_message(
             Message::new(tags::UPDATE, Severity::Warn, "checks failing").hold(Hold::Standing),
         );
@@ -3696,6 +4470,12 @@ mod tests {
             Some(published + TICK),
             "the tick must be armed as a wake while a view is on the route"
         );
+        // A page nobody can see — the window occluded, minimized or headless
+        // — arms no tick (audit 2026-09-24); revealed, it arms again.
+        app.windows.get_mut(&wid).unwrap().occluded = true;
+        assert_eq!(app.messages_deadline(), None, "a hidden page is no wake");
+        app.windows.get_mut(&wid).unwrap().occluded = false;
+        assert_eq!(app.messages_deadline(), Some(published + TICK));
     }
 
     /// The route words after *Open Settings* are the consent card's caption,
@@ -3847,7 +4627,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let refusal = log_did_not_open("/x/y.log");
-        assert_eq!(refusal.title, "Log did not open");
+        assert_eq!(refusal.title, "Couldn't open the log");
         assert_eq!(refusal.detail, vec!["/x/y.log"]);
         assert_eq!(refusal.tag, tags::SYSTEM);
         assert_eq!(
@@ -3866,7 +4646,7 @@ mod tests {
         assert!(
             app.messages
                 .live_rows()
-                .any(|l| l.msg.title == "Log did not open"),
+                .any(|l| l.msg.title == "Couldn't open the log"),
             "the refusal is a row"
         );
     }
@@ -3934,6 +4714,9 @@ mod tests {
     #[test]
     fn appstatus_keeps_the_bars_grammar_in_the_rows_current_words() {
         let mut app = App::headless_for_test();
+        // A person asked (Check for Updates): the download is their wait
+        // and takes the row (design ruling 220).
+        app.note_update_check_asked(true);
         app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
         app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
         app.note_update_progress(&aterm_update::Progress::Downloading {
@@ -4034,6 +4817,7 @@ mod tests {
         ));
         app.record_toolchain_outcome(toolchain_words::ended(
             "the pass finished; 12 ALab program(s) are installed",
+            false,
         ));
         app.post_managed_current(
             "claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)",
@@ -4053,25 +4837,29 @@ mod tests {
         let ledger = [
             ("ALab tools installed", "ty", "ok"),
             (
-                "Package update finished",
+                "ALab tools checked",
                 "the pass finished; 12 ALab program(s) are installed",
                 "ok",
             ),
             (
-                "Claude Code 2.1.280 and Codex 0.156.0 are up to date",
+                "Claude Code 2.1.280 and Codex 0.156.0 are current",
                 "used in every tab",
                 "ok",
             ),
-            ("Spotlight: 73 build dirs moved to .noindex", "", "ok"),
             (
-                "Universal Control disabled",
+                "Spotlight now skips 73 build folders",
+                "73 build folders moved to .noindex, so Spotlight does not index them",
+                "ok",
+            ),
+            (
+                "ALab tools turned off Universal Control",
                 "undo: `aterm pkg machine` prints the revert \u{00b7} \
                  defaults -currentHost delete com.apple.universalcontrol Disable; \
                  defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges",
                 "ok",
             ),
             (
-                "Package update postponed",
+                "ALab tools update postponed",
                 "an earlier toolchain pass is still running",
                 "ok",
             ),
@@ -4162,7 +4950,7 @@ mod tests {
             appstatus(&b)[0].contains("phase=live"),
             "the read claims no outcome"
         );
-        b.record_toolchain_outcome(toolchain_words::ended("the toolchain pass finished"));
+        b.record_toolchain_outcome(toolchain_words::ended("the toolchain pass finished", false));
         assert_eq!(b.messages.live_rows().count(), 1);
         b.toolchain_pass_ended(true);
         assert_eq!(b.messages.live_rows().count(), 0);
@@ -4627,8 +5415,11 @@ mod tests {
         let rows = appstatus(&app);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(
+            // The log states the outcome (ruling 259): the live title is
+            // the record's first detail line.
             rows[0].starts_with(
-                "activity kind=toolchain phase=done progress=- title=Installing%20ALab%20tools "
+                "activity kind=toolchain phase=done progress=- title=Installing%20stopped \
+                 detail=Installing%20ALab%20tools "
             ),
             "the capped row leaves its words on record, as the bars' settle did: {}",
             rows[0]
@@ -4740,6 +5531,9 @@ mod tests {
     #[test]
     fn appstatus_puts_the_live_rows_above_the_finished_ones() {
         let mut app = App::headless_for_test();
+        // A person asked (Check for Updates): the download is their wait
+        // and takes the row (design ruling 220).
+        app.note_update_check_asked(true);
         app.record_toolchain_outcome(toolchain_words::failed("install failed"));
         assert_eq!(
             app.messages.live_rows().count(),
@@ -4774,11 +5568,18 @@ mod tests {
     /// unless a first-run child still runs, whose exit folds it.
     #[test]
     fn a_seed_done_answer_folds_the_live_row_unless_a_first_run_child_runs() {
-        let answer =
-            || toolchain_words::ended("the pass finished; 12 ALab program(s) are installed");
+        let answer = |first_run| {
+            toolchain_words::ended(
+                "the pass finished; 12 ALab program(s) are installed",
+                first_run,
+            )
+        };
         let mut app = App::headless_for_test();
         app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-        app.record_toolchain_outcome(answer());
+        // The `Wake::PkgSeedDone` arm's latch: a first run's answer is an
+        // install (review 2026-09-24).
+        assert!(app.toolchain_row_latched && app.toolchain_first_run);
+        app.record_toolchain_outcome(answer(true));
         assert_eq!(
             app.messages.live_rows().count(),
             1,
@@ -4789,8 +5590,7 @@ mod tests {
         let rows = appstatus(&app);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(
-            rows[0].contains(" outcome=ok ")
-                && rows[0].contains("title=Package%20update%20finished "),
+            rows[0].contains(" outcome=ok ") && rows[0].contains("title=ALab%20tools%20installed "),
             "{}",
             rows[0]
         );
@@ -4798,11 +5598,18 @@ mod tests {
         // handoff) folds at the answer.
         let mut app = App::headless_for_test();
         app.post_message(toolchain_words::announced("installing 2 program(s)"));
-        app.record_toolchain_outcome(answer());
+        app.record_toolchain_outcome(answer(false));
         assert_eq!(app.messages.live_rows().count(), 0, "answered: folded");
-        assert_eq!(appstatus(&app).len(), 1);
+        let rows = appstatus(&app);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].contains("title=ALab%20tools%20checked "),
+            "a routine answer claims no update: {}",
+            rows[0]
+        );
     }
 
+    #[cfg(unix)]
     /// A parked outgoing handoff — the PARENT's half of the freeze predicate
     /// — with nothing live behind it (the `app_update_handoff` tests' own
     /// fixture, `parked_record`).
@@ -4854,6 +5661,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     /// THE PARENT'S RECORD IS ITS OWN TO THE END (design §3.7, revised on
     /// review 2026-09-22), in PRODUCTION ORDER: the manifest captures the
     /// carry, THEN the attempt parks (`app_update_handoff`, both sites). A
@@ -4939,6 +5747,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     /// THE HANDOFF CARRY (design §3.8; the port of status_bars.rs:4775 and
     /// app_restore.rs:4946-4961): the live rows cross the swap as plain words
     /// in glass order and re-seed under the handoff's staleness cap with
@@ -5128,6 +5937,7 @@ mod tests {
         assert_eq!(empty.messages.log().next_id(), MessageId::FIRST);
     }
 
+    #[cfg(unix)]
     /// AFTER COMMIT the carried rows take their own lifetimes back (design
     /// §3.8): a held row on glass anchors its hold at the commit instant and
     /// folds on it — into the ledger, as Folded — a standing row stands, and
@@ -5304,9 +6114,10 @@ mod tests {
             .cloned()
     }
 
-    /// An automatic update's staged build is a RECORD (design §10.5 H2): no
-    /// row, no re-grid, the words in the log — and a fast download that ends
-    /// inside its grace costs nothing on the glass.
+    /// An automatic update is SILENT (design ruling 220, the owner's R3): its
+    /// download takes no row and no re-grid — Settings ▸ Software Update says
+    /// how far it has got — and its staged build is a RECORD (design §10.5
+    /// H2), the words in the log.
     #[test]
     fn an_automatic_staged_build_is_a_record_and_leaves_no_row() {
         let mut app = App::headless_for_test();
@@ -5316,8 +6127,20 @@ mod tests {
             bytes_done: 10_000_000,
             bytes_total: 74_000_000,
         });
-        assert_eq!(app.messages.live_rows().count(), 1, "the download is live");
-        assert_eq!(app.message_band_rows, 0, "…inside its grace, off the glass");
+        assert_eq!(app.messages.live_rows().count(), 0, "no row: nobody waits");
+        let page = app.update_snapshot(false).projection();
+        assert_eq!(page.headline, "Downloading aterm v9.9.9\u{2026}");
+        assert_eq!(page.detail.as_deref(), Some("10 MB / 74 MB downloaded."));
+        app.note_update_progress(&aterm_update::Progress::Verifying {
+            version: "9.9.9".into(),
+        });
+        assert_eq!(app.messages.live_rows().count(), 0, "nor for its check");
+        let page = app.update_snapshot(false).projection();
+        assert_eq!(
+            page.headline, "Downloading aterm v9.9.9\u{2026}",
+            "the download's headline; the detail alone says it is checked"
+        );
+        assert_eq!(page.detail.as_deref(), Some("Checking the download."));
         // The App's own posture — a headless App's is the handoff-off
         // record; the automatic lane's is a record too.
         app.note_update_progress(&aterm_update::Progress::Staged {
@@ -5326,61 +6149,107 @@ mod tests {
         });
         app.settle_messages(Instant::now() + PROGRESS_GRACE * 2);
         assert_eq!(app.messages.live_rows().count(), 0, "no row");
-        assert!(
-            app.messages.echoes().is_empty(),
-            "an unrevealed row leaves no echo"
-        );
+        assert!(app.messages.echoes().is_empty(), "and no echo");
         assert_eq!(app.message_band_rows, 0);
         assert_eq!(
             message_regrids(),
             regrids,
-            "a fast automatic update costs no re-grid"
+            "an automatic update costs no re-grid"
         );
+        assert!(app.update_quiet.is_none(), "the page reads the stage now");
         let rec = recorded(&app, update_words::KEY_PROGRESS).expect("the staged record");
         assert_eq!(rec.title, "aterm v9.9.9 is ready");
     }
 
-    /// AN AUTOMATIC UPDATE COSTS AT MOST TWO RE-GRIDS: a download that
-    /// outlives its grace opens its row once, its end (the staged record)
-    /// resolves it — a Complete echo holds the slot — and the row is given
-    /// back once, after the echo and the D1 quiet.
+    /// WHO STARTED IT DECIDES THE ROW (design ruling 220): the same slow
+    /// download costs NO re-grid when the background loop runs it, and two —
+    /// its row opens once, its end (the staged record) resolves it into a
+    /// Complete echo that holds the slot, and the row is given back once —
+    /// when a person started it (Check for Updates, or `aterm ctl update
+    /// check` while it runs).
     #[test]
-    fn an_automatic_update_costs_at_most_two_regrids_and_a_fast_one_none() {
+    fn an_automatic_update_costs_no_regrid_and_a_persons_at_most_two() {
+        for asked in [false, true] {
+            let mut app = App::headless_for_test();
+            if asked {
+                app.note_update_check_asked(true);
+            }
+            let regrids = message_regrids();
+            let t0 = Instant::now();
+            app.note_update_progress(&aterm_update::Progress::Downloading {
+                version: "9.9.9".into(),
+                bytes_done: 10_000_000,
+                bytes_total: 74_000_000,
+            });
+            let t = t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10);
+            app.settle_messages(t);
+            assert_eq!(app.message_band_rows, u16::from(asked), "asked={asked}");
+            assert_eq!(message_regrids(), regrids + u64::from(asked));
+            if asked {
+                // The check ends while the row is up: it keeps moving to its
+                // end, so its echo and the record stay one story.
+                app.note_update_check_asked(false);
+                app.note_update_progress(&aterm_update::Progress::Downloading {
+                    version: "9.9.9".into(),
+                    bytes_done: 60_000_000,
+                    bytes_total: 74_000_000,
+                });
+                assert_eq!(app.messages.live_rows().count(), 1, "the row keeps moving");
+            }
+            app.note_update_progress(&aterm_update::Progress::Staged {
+                version: "9.9.9".into(),
+                build: 41,
+            });
+            assert_eq!(app.messages.live_rows().count(), 0);
+            assert_eq!(
+                app.messages.echoes().first().map(|e| e.kind),
+                asked.then_some(EchoKind::Complete),
+                "asked={asked}: a person's download ends in its Complete echo"
+            );
+            let mut t = t;
+            for _ in 0..40 {
+                t += std::time::Duration::from_millis(100);
+                app.settle_messages(t);
+            }
+            assert_eq!(app.message_band_rows, 0, "asked={asked}");
+            assert_eq!(
+                message_regrids(),
+                regrids + 2 * u64::from(asked),
+                "asked={asked}: one open, one fold — or nothing"
+            );
+            let rec = recorded(&app, update_words::KEY_PROGRESS).expect("the staged record");
+            assert_eq!(rec.title, "aterm v9.9.9 is ready", "asked={asked}");
+        }
+    }
+
+    /// A download nobody is waiting on that FAILS is a record in the flow's
+    /// words, the version its report did not carry kept from the quiet
+    /// download (design ruling 220): no row came, so no echo goes.
+    #[test]
+    fn an_automatic_download_that_fails_is_a_record_with_its_version() {
         let mut app = App::headless_for_test();
-        let regrids = message_regrids();
-        let t0 = Instant::now();
         app.note_update_progress(&aterm_update::Progress::Downloading {
             version: "9.9.9".into(),
             bytes_done: 10_000_000,
-            bytes_total: 74_000_000,
+            bytes_total: 0,
         });
-        let t = t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10);
-        app.settle_messages(t);
         assert_eq!(
-            app.message_band_rows, 1,
-            "the slow download is on the glass"
+            app.update_snapshot(false).projection().detail.as_deref(),
+            Some("10 MB downloaded.")
         );
-        assert_eq!(message_regrids(), regrids + 1);
-        // The App's own posture — a headless App's is the handoff-off
-        // record; the automatic lane's is a record too.
-        app.note_update_progress(&aterm_update::Progress::Staged {
-            version: "9.9.9".into(),
-            build: 41,
+        app.note_update_progress(&aterm_update::Progress::Failed {
+            detail: "connection reset".into(),
         });
         assert_eq!(app.messages.live_rows().count(), 0);
-        assert_eq!(
-            app.messages.echoes().first().map(|e| e.kind),
-            Some(EchoKind::Complete),
-            "the download ends in its Complete echo"
+        assert!(app.messages.echoes().is_empty());
+        assert!(app.update_quiet.is_none());
+        assert!(
+            app.messages
+                .log()
+                .records()
+                .any(|r| r.title == "Couldn't download aterm v9.9.9"),
+            "the failure's record names the version"
         );
-        assert_eq!(app.message_band_rows, 1, "the echo holds the slot");
-        let mut t = t;
-        for _ in 0..40 {
-            t += std::time::Duration::from_millis(100);
-            app.settle_messages(t);
-        }
-        assert_eq!(app.message_band_rows, 0, "the row is given back");
-        assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
     }
 
     /// A RATE-LIMITED DOWNLOAD DID NOT FAIL (review 2026-09-24): a GitHub
@@ -5405,6 +6274,8 @@ mod tests {
             ),
         ] {
             let mut app = App::headless_for_test();
+            // A person's check: its download has the row (design ruling 220).
+            app.note_update_check_asked(true);
             app.note_update_progress(&aterm_update::Progress::Downloading {
                 version: "9.9.9".into(),
                 bytes_done: 10_000_000,
@@ -5552,6 +6423,285 @@ mod tests {
         assert_eq!(message_regrids(), regrids + 1);
     }
 
+    /// A PERSON'S CHECK TAKES ITS ROW (design ruling 224): they pressed Check
+    /// & Update Now and wait for it, so its pass is theirs whatever it weighs
+    /// — the 250 MB bar is for work nobody asked for. A no-op Check (1–4 s,
+    /// `packages.log`) ends inside the grace and never touches the glass; a
+    /// longer one shows `Checking ALab tools`, busy, becomes the plan's fill
+    /// (`Updating ALab tools`, a light 40 MB pass included), holds across the
+    /// markers' records and the pass's ending read, and folds at the child's
+    /// exit with its Complete echo in its own finished words. Two re-grids.
+    #[test]
+    fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
+        use crate::message_reporters::{Attention, PackagesVerb, attention};
+        let mut quick = App::headless_for_test();
+        let regrids = message_regrids();
+        let t0 = Instant::now();
+        quick.person_pass(PersonPass::Began(PackagesVerb::Check));
+        assert_eq!(quick.messages.live_rows().count(), 1, "posted");
+        quick.settle_messages(t0 + PROGRESS_GRACE - std::time::Duration::from_millis(50));
+        assert_eq!(quick.message_band_rows, 0, "inside its grace");
+        quick.person_pass(PersonPass::Ended(EchoKind::Complete));
+        quick.settle_messages(t0 + PROGRESS_GRACE * 3);
+        assert_eq!(quick.messages.live_rows().count(), 0);
+        assert!(quick.messages.echoes().is_empty(), "never shown, no echo");
+        assert_eq!(message_regrids(), regrids, "a no-op Check never flashes");
+
+        let mut app = App::headless_for_test();
+        let regrids = message_regrids();
+        let t0 = Instant::now();
+        app.person_pass(PersonPass::Began(PackagesVerb::Check));
+        let live = app.messages.live_rows().next().expect("the Check's row");
+        assert_eq!(live.msg.title, "Checking ALab tools");
+        assert!(live.msg.meter.as_ref().is_some_and(|m| m.busy), "busy");
+        assert_eq!(attention(&live.msg), Ok(Attention::Progress));
+        let mut t = t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10);
+        app.settle_messages(t);
+        assert_eq!(app.message_band_rows, 1, "the wait lasted: revealed");
+        // The plan lands: a LIGHT pass paints, because a person waits.
+        app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
+        let live = app.messages.live_rows().next().expect("restated");
+        assert_eq!(app.messages.live_rows().count(), 1, "in place");
+        assert_eq!(live.msg.title, "Updating ALab tools");
+        let meter = live.msg.meter.as_ref().expect("a meter");
+        assert!(meter.fill_permille.is_some_and(|f| f > 0), "a fill");
+        assert!(meter.amount.is_some(), "the ETA's input");
+        assert_eq!(meter.stats, "3 of 10 programs");
+        assert_eq!(live.msg.finished_title(), "ALab tools updated");
+        assert_eq!(attention(&live.msg), Ok(Attention::Progress));
+        // The markers' answer and the ending read fold nothing: the child runs.
+        app.record_toolchain_outcome(toolchain_words::ended(
+            "the pass finished; 12 ALab program(s) are installed",
+            false,
+        ));
+        app.apply_toolchain_snapshot(Some(&light_read(false, 1_700_000_000)), false);
+        app.apply_toolchain_snapshot(None, false);
+        assert_eq!(app.messages.live_rows().count(), 1, "the exit's to fold");
+        assert!(!app.toolchain_row_latched, "the lane's latch is left alone");
+        app.person_pass(PersonPass::Ended(EchoKind::Complete));
+        assert_eq!(app.messages.live_rows().count(), 0, "its exit folds it");
+        let echo = app.messages.echoes().first().expect("the echo");
+        assert_eq!(echo.kind, EchoKind::Complete);
+        assert_eq!(echo.msg.finished_title(), "ALab tools updated");
+        for _ in 0..40 {
+            t += std::time::Duration::from_millis(100);
+            app.settle_messages(t);
+        }
+        assert_eq!(app.message_band_rows, 0);
+        assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
+        // The outcome is the markers' record, as before.
+        assert!(
+            appstatus(&app)
+                .iter()
+                .any(|r| r.contains("title=ALab%20tools%20checked")),
+            "{:?}",
+            appstatus(&app)
+        );
+        // Nothing is left behind: the next light routine pass is silent again.
+        app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_500)), false);
+        assert_eq!(app.messages.live_rows().count(), 0, "nobody waits on it");
+    }
+
+    /// A CHECK QUEUED AT THE STORE LOCK SAYS SO (ruling 224): the wait that
+    /// used to be a log line — up to the 30-minute bound behind the six-hourly
+    /// pass or the head watch — is `Waiting for another ALab update`, busy
+    /// with its elapsed clock, back to `Checking ALab tools` once the lock is
+    /// taken. The LANE's child exiting meanwhile (the holder, unlatched)
+    /// leaves the person's row alone; a wait that runs out with nothing
+    /// claimed vanishes.
+    #[test]
+    fn a_queued_check_says_what_it_waits_for() {
+        use crate::message_reporters::{PackagesVerb, WAITING_FOR_ALAB};
+        let mut app = App::headless_for_test();
+        app.person_pass(PersonPass::Began(PackagesVerb::Check));
+        app.person_pass(PersonPass::Waiting);
+        let title = |app: &App| {
+            app.messages
+                .live_by_key(toolchain_words::KEY_PASS)
+                .map(|l| l.msg.title.clone())
+        };
+        assert_eq!(title(&app).as_deref(), Some(WAITING_FOR_ALAB));
+        assert_eq!(app.messages.live_rows().count(), 1, "one row, restated");
+        app.toolchain_pass_ended(true);
+        assert_eq!(
+            title(&app).as_deref(),
+            Some(WAITING_FOR_ALAB),
+            "the holder's exit is not the person's"
+        );
+        app.person_pass(PersonPass::Running);
+        assert_eq!(title(&app).as_deref(), Some("Checking ALab tools"));
+        app.person_pass(PersonPass::Ended(EchoKind::Vanish));
+        assert_eq!(app.messages.live_rows().count(), 0);
+        // With no verb in flight the wait words are not the lane's to say.
+        app.person_pass(PersonPass::Waiting);
+        assert_eq!(app.messages.live_rows().count(), 0);
+    }
+
+    /// A QUEUED PERSON'S ROW DOES NOT KEEP THE HOLDER'S FRAME (ruling 229).
+    /// While the Check waits at the lock its tailer follows the HOLDER'S
+    /// file, and the row shows that pass — what they wait behind, with its
+    /// fill and ETA. The holder's end puts the waiting row back; the lock
+    /// puts the Check's own busy row back, fill and finished words gone, so a
+    /// no-op Check ends `ALab tools checked`; a late holder read paints
+    /// nothing; the Check's own plan (the same pass name, the same second)
+    /// paints as before.
+    #[test]
+    fn a_queued_check_drops_the_holders_frame_when_the_holder_ends() {
+        use crate::message_reporters::{PackagesVerb, WAITING_FOR_ALAB};
+        let row = |app: &App| {
+            app.messages
+                .live_by_key(toolchain_words::KEY_PASS)
+                .map(|l| {
+                    let fill = l.msg.meter.as_ref().and_then(|m| m.fill_permille);
+                    (l.msg.title.clone(), fill, l.msg.finished_title())
+                })
+                .expect("the person's row")
+        };
+        let run = |app: &mut App, own_pass_plans: bool| {
+            let t0 = Instant::now();
+            app.person_pass(PersonPass::Began(PackagesVerb::Check));
+            app.person_pass(PersonPass::Waiting);
+            // The holder (pid 7) plans a light pass: the queued row shows it.
+            app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
+            let (title, fill, _) = row(app);
+            assert_eq!(title, "Updating ALab tools", "what they wait behind");
+            assert!(fill.is_some(), "with its fill");
+            // The holder ends: its frame leaves, the wait is said again.
+            app.apply_toolchain_snapshot(Some(&light_read(false, 1_700_000_000)), false);
+            assert_eq!(row(app), (WAITING_FOR_ALAB.to_string(), None, row(app).2));
+            app.toolchain_pass_ended(true);
+            assert_eq!(
+                row(app).0,
+                WAITING_FOR_ALAB,
+                "the lane's exit is not theirs"
+            );
+            // A late holder frame lands, then the lock is taken.
+            app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
+            app.person_pass(PersonPass::Running);
+            assert_eq!(
+                row(app),
+                (
+                    "Checking ALab tools".to_string(),
+                    None,
+                    "ALab tools checked".to_string()
+                )
+            );
+            // Another late holder read, after the lock: nothing.
+            app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
+            assert_eq!(row(app).0, "Checking ALab tools", "late: paints nothing");
+            assert_eq!(row(app).1, None);
+            if own_pass_plans {
+                // The Check's own plan: another pid, the same pass and second.
+                let mut own = light_read(true, 1_700_000_000);
+                own.file.pid = Some(9);
+                app.apply_toolchain_snapshot(Some(&own), false);
+                assert_eq!(row(app).0, "Updating ALab tools", "its own plan paints");
+                assert!(row(app).1.is_some());
+            }
+            app.settle_messages(t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10));
+            app.person_pass(PersonPass::Ended(EchoKind::Complete));
+            let echo = app.messages.echoes().first().expect("the echo");
+            assert_eq!(echo.kind, EchoKind::Complete);
+            echo.msg.finished_title()
+        };
+        let mut noop = App::headless_for_test();
+        assert_eq!(run(&mut noop, false), "ALab tools checked");
+        assert_eq!(noop.toolchain_holder_pid, None, "nothing carried");
+        let mut planned = App::headless_for_test();
+        assert_eq!(run(&mut planned, true), "ALab tools updated");
+    }
+
+    /// A PERSON'S INSTALL (ruling 225): the minutes-long ~3 GB wait Settings
+    /// starts shows the size once atpkg announces it (`10 programs · ~3 GB`),
+    /// then the plan's fill under the install's own title, and a failed one
+    /// ends in a Fault echo (the page says why; the Packages badge and the
+    /// record keep it). A Remove is busy with the disk as its load.
+    #[test]
+    fn a_persons_install_and_remove_take_their_rows() {
+        use crate::message_reporters::{Attention, PackagesVerb, attention};
+        let mut app = App::headless_for_test();
+        app.person_pass(PersonPass::Began(PackagesVerb::Install));
+        app.announce_toolchain_pass(
+            "installing 10 ALab program(s) over the network (about 3 GB on disk when finished)",
+            false,
+        );
+        let live = app.messages.live_rows().next().expect("the Install's row");
+        assert_eq!(live.msg.title, "Installing ALab tools");
+        let meter = live.msg.meter.as_ref().expect("busy meter");
+        assert!(meter.busy);
+        assert_eq!(meter.stats, "10 programs \u{b7} ~3 GB");
+        assert_eq!(meter.load, Some(aterm_messages::Load::Network));
+        assert_eq!(attention(&live.msg), Ok(Attention::Progress));
+        app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
+        let live = app.messages.live_rows().next().expect("restated");
+        assert_eq!(live.msg.title, "Installing ALab tools", "not `Updating`");
+        assert_eq!(live.msg.finished_title(), "ALab tools installed");
+        app.person_pass(PersonPass::Ended(EchoKind::Fault));
+        assert_eq!(app.messages.live_rows().count(), 0);
+
+        let mut rm = App::headless_for_test();
+        rm.person_pass(PersonPass::Began(PackagesVerb::Remove));
+        let live = rm.messages.live_rows().next().expect("the Remove's row");
+        assert_eq!(live.msg.title, "Removing ALab tools");
+        assert_eq!(
+            live.msg.meter.as_ref().and_then(|m| m.load),
+            Some(aterm_messages::Load::Disk)
+        );
+        assert_eq!(live.msg.finished_title(), "ALab tools removed");
+        assert_eq!(attention(&live.msg), Ok(Attention::Progress));
+        rm.person_pass(PersonPass::Ended(EchoKind::Complete));
+        assert_eq!(rm.messages.live_rows().count(), 0);
+    }
+
+    /// A person's Check behind a FIRST RUN: the lane's latched row keeps
+    /// showing the install they wait behind, the person's end leaves it to the
+    /// lane, and the lane's exit ends it and puts the person's row back (after
+    /// the grace) if their verb still runs.
+    #[test]
+    fn a_check_behind_a_first_run_leaves_the_first_run_its_row() {
+        use crate::message_reporters::PackagesVerb;
+        let mut app = App::headless_for_test();
+        app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
+        app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
+        app.person_pass(PersonPass::Began(PackagesVerb::Check));
+        app.person_pass(PersonPass::Waiting);
+        let title = |app: &App| {
+            app.messages
+                .live_by_key(toolchain_words::KEY_PASS)
+                .map(|l| l.msg.title.clone())
+        };
+        assert_eq!(title(&app).as_deref(), Some("Installing ALab tools"));
+        // The person's own tailer follows the same file (`first_run` false):
+        // the lane's tailer paints the first run, in the first run's words
+        // (ruling 229) — no turn-about with `Updating`, and its echo is not
+        // the Check's `ALab tools updated`.
+        let mut later = net_read(true, 1_700_000_000);
+        later.file.overall.bytes_done += 1_000_000;
+        app.apply_toolchain_snapshot(Some(&later), true);
+        app.apply_toolchain_snapshot(Some(&later), false);
+        assert_eq!(title(&app).as_deref(), Some("Installing ALab tools"));
+        let live = app.messages.live_by_key(toolchain_words::KEY_PASS).unwrap();
+        assert_eq!(live.msg.finished_title(), "Installed ALab tools");
+        app.toolchain_pass_ended(true);
+        assert_eq!(
+            app.messages.echoes().first().map(|e| e.kind),
+            Some(EchoKind::Complete),
+            "the first run ended as it did"
+        );
+        assert_eq!(
+            title(&app).as_deref(),
+            Some(crate::message_reporters::WAITING_FOR_ALAB),
+            "still queued, a moment from the lock"
+        );
+        app.person_pass(PersonPass::Running);
+        assert_eq!(title(&app).as_deref(), Some("Checking ALab tools"));
+        // A late read of the first run, from the person's tailer, paints nothing.
+        app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
+        assert_eq!(title(&app).as_deref(), Some("Checking ALab tools"));
+        app.person_pass(PersonPass::Ended(EchoKind::Complete));
+        assert_eq!(app.messages.live_rows().count(), 0);
+    }
+
     /// ONE OPEN, ONE FOLD across the child's sub-passes (design §10.2 #6): a
     /// heavy routine row is LATCHED — a sub-pass's answer and its ending read
     /// fold nothing — and the child's exit folds it with its Complete echo.
@@ -5565,7 +6715,7 @@ mod tests {
         app.settle_messages(t);
         assert_eq!(app.message_band_rows, 1);
         // The vendor sub-pass answers and ends; the ALab set's reads follow.
-        app.record_toolchain_outcome(toolchain_words::ended("the vendor pass finished"));
+        app.record_toolchain_outcome(toolchain_words::ended("the vendor pass finished", false));
         app.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), false);
         assert_eq!(
             app.messages.live_rows().count(),
@@ -5642,7 +6792,7 @@ mod tests {
         assert_eq!(
             failure_rows(&app),
             vec![(
-                toolchain_words::PACKAGES_FAILED.to_string(),
+                toolchain_words::ALAB_INSTALL_FAILED.to_string(),
                 Hold::Default,
                 Severity::Error
             )],
@@ -5948,20 +7098,19 @@ mod tests {
             .map(|l| format!("{} \u{2014} {}", l.msg.title, l.msg.detail.join("; ")))
     }
 
-    /// A SPINNER MUST NEVER DELAY THE UPDATE IT ANIMATES (2026-09-23; design
-    /// ruling 56, re-pinned on the engine's motion by ruling 140). The flow
+    /// A BUSY ROW'S MOTION MUST NEVER DELAY THE UPDATE IT ANIMATES
+    /// (2026-09-23; design ruling 56, re-pinned on the engine's motion by
+    /// ruling 140; the spinner that first carried it went with ruling 251). The flow
     /// row is busy while the lane works and the automatic lane waits for quiet
     /// moments, so an animation frame that counted as terminal activity would
-    /// push the very install it is showing. Sixteen spinner steps through the host's
-    /// own frame path (`prepare_band_motion`, one per [`SPIN_FRAMES`] of the
-    /// 33 ms grid) move the painted frame and touch no activity clock — not
+    /// push the very install it is showing. Sixteen comet steps through the
+    /// host's own frame path (`prepare_band_motion`, one per four frames of
+    /// the 33 ms grid) move the painted frame and touch no activity clock — not
     /// the quiet-epoch stamp, not the handoff epoch, not the keystroke clock
     /// — and the lane's quiet verdict at a later instant is the same with or
     /// without them. The negative control: a tolerated event (a pointer move)
     /// DOES move the stamp, so the reading is not vacuous. And with no window
     /// on screen (a headless App) there is no frame and no wake.
-    ///
-    /// [`SPIN_FRAMES`]: aterm_messages::SPIN_FRAMES
     #[test]
     fn the_busy_animation_never_touches_the_update_activity_clocks() {
         let wid = WindowId(0);
@@ -5984,7 +7133,7 @@ mod tests {
         let before = clocks(&app);
         let later = now + std::time::Duration::from_secs(5);
         let quiet_before = app.automatic_update_activity_quiet_with_pending_input(later, false);
-        let step = aterm_messages::ANIM_FRAME * aterm_messages::SPIN_FRAMES;
+        let step = aterm_messages::ANIM_FRAME * 4;
         let mut drawn = std::collections::BTreeSet::new();
         for k in 0..16_u32 {
             drawn.insert(app.prepare_band_motion(wid, now + step * k));
@@ -5998,7 +7147,7 @@ mod tests {
         assert_eq!(
             app.automatic_update_activity_quiet_with_pending_input(later, false),
             quiet_before,
-            "the automatic lane reads the terminal exactly as it would without the spinner"
+            "the automatic lane reads the terminal exactly as it would without the comet"
         );
         // Off screen (a headless window): no frame, and nothing wakes.
         let mut headless = App::headless_for_test();
@@ -6193,6 +7342,9 @@ mod tests {
     fn a_held_update_row_replaced_by_a_newer_one_is_resolved_on_record() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
+        // A person asked (Check for Updates): the download is their wait
+        // and takes the row (design ruling 220).
+        app.note_update_check_asked(true);
         app.note_update_progress(&download("9.9.9"));
         app.note_update_progress(&aterm_update::Progress::Failed {
             detail: "connection reset".into(),
@@ -6215,8 +7367,9 @@ mod tests {
         assert!(done.iter().any(|r| r.contains("title=first ")), "{done:#?}");
         assert!(
             done.iter()
-                .any(|r| r.contains("title=Downloading%20aterm%20v9.9.9")),
-            "the download the failure ended is on record: {done:#?}"
+                .any(|r| r.contains("title=Downloading%20stopped ")
+                    && r.contains("detail=Downloading%20aterm%20v9.9.9")),
+            "the download the failure ended is on record, as its outcome: {done:#?}"
         );
     }
 
@@ -6225,12 +7378,15 @@ mod tests {
     /// met already on disk, nor for another build's download.
     #[test]
     fn the_landing_is_on_record_with_how_long_the_update_took() {
+        // One landing, one entry: the duration is a line of the landing
+        // record, never a second record (audit 2026-09-24).
         let took = |app: &App| {
             app.messages
                 .log()
                 .records()
-                .filter(|r| r.title.contains("after it downloaded"))
-                .map(|r| r.title.clone())
+                .flat_map(|r| r.detail.iter())
+                .filter(|l| l.contains("after the download"))
+                .cloned()
                 .collect::<Vec<_>>()
         };
         // The carry: the parent's instant on the wall clock, the successor's
@@ -6251,6 +7407,15 @@ mod tests {
             None,
             "the landing takes no row (ruling 141)"
         );
+        assert_eq!(
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.title.contains("aterm v9.9.9"))
+                .count(),
+            1,
+            "the landing is ONE entry"
+        );
         assert!(
             app.messages
                 .log()
@@ -6261,8 +7426,8 @@ mod tests {
         let said = took(&app);
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said[0] == "Installed aterm v9.9.9 42 s after it downloaded"
-                || said[0] == "Installed aterm v9.9.9 43 s after it downloaded",
+            said[0] == "installed 42 s after the download"
+                || said[0] == "installed 43 s after the download",
             "{said:?}"
         );
         // Negative controls: met on disk (no instant), another build's instant,
@@ -6312,7 +7477,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rec.detail[0],
-            "it had said: aterm can't download updates \u{2014} since Sep 14"
+            "after \"aterm can't download updates\", since Sep 14"
         );
         assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, ""));
         assert_eq!(healed(&app), 1, "once per episode");
@@ -6526,7 +7691,7 @@ mod tests {
             .collect();
         assert_eq!(
             said,
-            vec!["it had said: aterm can't install updates \u{2014} since Sep 14".to_string()]
+            vec!["after \"aterm can't install updates\", since Sep 14".to_string()]
         );
         // A plain restart carries nothing to heal.
         let mut plain = App::headless_for_test();
@@ -6550,11 +7715,13 @@ mod tests {
     fn every_update_moment_is_a_line_in_the_log() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
+        // A person asked (Check for Updates): the download is their wait
+        // and takes the row (design ruling 220).
+        app.note_update_check_asked(true);
         app.note_update_progress(&download("9.9.9"));
         app.note_update_progress(&aterm_update::Progress::Verifying {
             version: "9.9.9".into(),
         });
-        app.record_message(update_words::downloaded("9.9.9", 7));
         post_ready_staged(&mut app, "9.9.9", 7);
         #[cfg(unix)]
         {
@@ -6578,7 +7745,12 @@ mod tests {
                 .position(|t| t.contains(needle))
                 .unwrap_or_else(|| panic!("{needle:?} is not on record: {titles:#?}"))
         };
-        assert!(pos("Downloaded aterm 9.9.9") < pos("Updated to aterm v9.9.9"));
+        assert!(pos("aterm v9.9.9 is ready") < pos("Updated to aterm v9.9.9"));
+        // ONE SPELLING of the version on every update entry (audit 2026-09-24).
+        for t in &titles {
+            assert!(!t.contains("aterm 9.9"), "a bare version: {t:?}");
+        }
+
         for phase in [
             "Downloading aterm v9.9.9",
             "Checking aterm v9.9.9",
@@ -6601,6 +7773,32 @@ mod tests {
             after_post,
             "a restate is not a line"
         );
+    }
+
+    /// ONE FACT, ONE ENTRY at the switch (design ruling 213): an attempt
+    /// that POSTED its own Installing row has that line in the log already,
+    /// so the switch record is not written beside it; with no row up (the
+    /// automatic lane) the record is the attempt's only line.
+    #[cfg(unix)]
+    #[test]
+    fn the_switch_record_never_doubles_a_posted_installing_row() {
+        let mut quiet = App::headless_for_test();
+        let before = quiet.messages.log().len();
+        quiet.record_update_switch_started(6, false, true);
+        assert_eq!(quiet.messages.log().len(), before + 1, "no row: the record");
+
+        let mut explicit = App::headless_for_test();
+        post_installing(&mut explicit, "9.9.9");
+        let before = explicit.messages.log().len();
+        explicit.record_update_switch_started(6, false, false);
+        assert_eq!(
+            explicit.messages.log().len(),
+            before,
+            "the posted Installing row is the line"
+        );
+        // …and the attempt is still on record for its stop.
+        explicit.record_update_switch_stopped(false, "the proof timed out");
+        assert_eq!(explicit.messages.log().len(), before + 1);
     }
 
     /// A HARNESS NOTE IS RECORDED AND NEVER TAKES A ROW (design ruling 61): on
@@ -6668,7 +7866,7 @@ mod tests {
         assert_eq!(managed(&app), 2, "a moved version is news");
         app.seamless_adopt = vec![crate::spawn::Adopted {
             local_id: 3,
-            master: -1,
+            master: crate::spawn::HandedMaster::new(-1),
             pid: -1,
             sid: aterm_session::SessionId::generate(),
             nonce: aterm_session::LaunchNonce::generate(),
@@ -6677,7 +7875,11 @@ mod tests {
             frozen_path: true,
             identity: None,
             topics: Vec::new(),
+            rekey: false,
+            loader: false,
             repaint: false,
+            fg_holder: 0,
+            history: crate::handoff_history::AdoptedHistory::default(),
         }];
         assert!(
             app.post_managed_current(

@@ -242,12 +242,6 @@ impl Stream {
         Ok(stream)
     }
 
-    /// Whether this stream is under TLS.
-    #[must_use]
-    pub fn is_tls(&self) -> bool {
-        matches!(self.inner, Inner::Tls(_))
-    }
-
     /// Take the raw socket back out of a PLAINTEXT stream.
     ///
     /// Used once, by the proxy path: after `CONNECT` succeeds the same socket

@@ -31,7 +31,7 @@
 //! | `device` | the [`Device`] handed in | `surface.rs:88` | drawable textures come off this device |
 //! | `pixelFormat` | [`SwapchainConfig::format`], the table's Present-role format ([`super::pipelines::metal_format`]) | `surface.rs:89` | `Bgra8Unorm` (SDR) / `Rgba16Float` (EDR) — see the format note below |
 //! | `drawableSize` | explicit `width`x`height` | `surface.rs:79,100` | never derived from bounds; a standalone layer has none |
-//! | `framebufferOnly` | config; `true` in [`SwapchainConfig::aterm_present`] | `surface.rs:73` (`usage == COLOR_TARGET`) | production usage is `RENDER_ATTACHMENT`-only (`renderer.rs:7352-7356`), so wgpu runs `YES`; the video-tap reconcile flips it on demand, and readback tests need `false` |
+//! | `framebufferOnly` | config; `true` in `SwapchainConfig::aterm_present` | `surface.rs:73` (`usage == COLOR_TARGET`) | production usage is `RENDER_ATTACHMENT`-only (`renderer.rs:7352-7356`), so wgpu runs `YES`; the video-tap reconcile flips it on demand, and readback tests need `false` |
 //! | `displaySyncEnabled` | config; `false` in `aterm_present` | `surface.rs:74-78,106` | the shipped present mode on macOS is `Immediate` when offered (`renderer.rs:7446-7451`), which wgpu-hal maps to `NO` |
 //! | `maximumDrawableCount` | config; `3` in `aterm_present` | `surface.rs:99` (`maximum_frame_latency + 1`) | `desired_frame_latency()` is 2 on macOS (`renderer.rs:7460-7469`: at latency 1 a typing-hot repaint storm exhausted the 2-drawable pool and parked the event loop, ~84ms of queued keyDowns measured), so the shipped count is 3. `CAMetalLayer.h:104-108`: legal range is `[2, 3]`, anything else throws — validated in Rust instead |
 //! | `opaque` | config; `true` in `aterm_present` | `surface.rs:81-85` | `PostMultiplied` (the translucent present, `renderer.rs::caps_support_post_multiplied`) maps to `NO` |
@@ -192,6 +192,7 @@ unsafe extern "C" {
     /// +1: the caller owns the result and must `CGColorSpaceRelease` it.
     fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
     /// +0: a borrowed `CFStringRef` owned by the colorspace.
+    #[cfg(test)]
     fn CGColorSpaceGetName(space: *mut c_void) -> *const c_void;
     fn CGColorSpaceRelease(space: *mut c_void);
     /// `kCGColorSpaceExtendedLinearSRGB` — scRGB: linear transfer, sRGB
@@ -244,7 +245,7 @@ struct CgRect {
 }
 
 /// Everything one swapchain configure sets — the module header's table, as
-/// data. Built by [`Self::aterm_present`] for the shipped values; tests build
+/// data. Built by `Self::aterm_present` for the shipped values; tests build
 /// non-default values by hand to prove every setter is live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainConfig {
@@ -275,6 +276,7 @@ impl SwapchainConfig {
     /// The values the SHIPPED wgpu configure produces on macOS, each cited in
     /// the module header's table: `framebufferOnly` on, display sync off
     /// (Immediate), 3 drawables (frame latency 2 + 1), opaque.
+    #[cfg(test)]
     pub(crate) const fn aterm_present(format: PixelFormat, width: usize, height: usize) -> Self {
         Self {
             format,
@@ -348,6 +350,7 @@ impl Swapchain {
     /// A standalone (headless) swapchain: no window, no layer tree. This is
     /// the shape every test here uses — a `CAMetalLayer` with a device and a
     /// `drawableSize` vends drawables and renders offscreen on its own.
+    #[cfg(test)]
     pub(crate) fn standalone(
         device: &Device,
         config: &SwapchainConfig,
@@ -510,6 +513,7 @@ impl Swapchain {
     /// The `contentsScale` this layer currently holds, read back off the live
     /// `CAMetalLayer` — never echoed from [`Self::applied_geometry`]. The gate
     /// asks the layer itself, exactly as [`Self::layer_state`]'s siblings do.
+    #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         let _pool = AutoreleasePool::new();
         // SAFETY: scalar `CGFloat` getter on our live +1 layer.
@@ -774,6 +778,7 @@ impl Swapchain {
     // constants IT spells — never against `configure`'s own mapping.
 
     /// The raw `MTLPixelFormat` off the layer.
+    #[cfg(test)]
     pub(crate) fn raw_pixel_format(&self) -> usize {
         // SAFETY: `NSUInteger` getter on the live layer.
         unsafe {
@@ -782,6 +787,7 @@ impl Swapchain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn drawable_size(&self) -> (f64, f64) {
         // SAFETY: `drawableSize` returns CGSize by value (HFA in v0/v1).
         let s = unsafe {
@@ -823,6 +829,7 @@ impl Swapchain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_next_drawable_timeout(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
@@ -831,6 +838,7 @@ impl Swapchain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_opaque(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
@@ -840,6 +848,7 @@ impl Swapchain {
     }
 
     /// The layer's configured device, for pointer-identity checks.
+    #[cfg(test)]
     pub(crate) fn device_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
         unsafe {
@@ -851,6 +860,7 @@ impl Swapchain {
     /// The layer colorspace's CoreGraphics name — `None` when the colorspace
     /// is nil (never observed after `configure`: `setPixelFormat:` installs
     /// one, see the module header) or unnamed.
+    #[cfg(test)]
     pub(crate) fn colorspace_name(&self) -> Option<String> {
         // SAFETY: `colorspace` returns a +0 CGColorSpaceRef (or NULL);
         // `CGColorSpaceGetName` borrows a CFString off it, which is toll-free
@@ -877,11 +887,13 @@ impl Swapchain {
     }
 
     /// The raw layer pointer (for superlayer/sublayer identity checks).
+    #[cfg(test)]
     pub(crate) fn layer_ptr(&self) -> Id {
         self.layer.id()
     }
 
     /// The layer's parent, or null when standalone.
+    #[cfg(test)]
     pub(crate) fn superlayer_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
         unsafe {
@@ -890,12 +902,9 @@ impl Swapchain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn format(&self) -> PixelFormat {
         self.format
-    }
-
-    pub(crate) const fn extent(&self) -> (usize, usize) {
-        (self.width, self.height)
     }
 
     /// The device-loss latch this swapchain answers to.
@@ -985,6 +994,8 @@ fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     let _pool = AutoreleasePool::new();
     #[cfg(feature = "acquire-conformance")]
     super::acquire_probe::before_acquire();
+    #[cfg(test)]
+    encoder::queue_ffi_census::note();
     // SAFETY: layer is a retained CAMetalLayer. Retain both +0 returns before
     // the pool drains; nil safely refuses acquisition. The caller serializes
     // this call with layer mutations and other acquisitions.
@@ -1039,6 +1050,7 @@ impl Frame<'_> {
     }
 
     /// The swapchain this frame came from (for format/extent queries mid-frame).
+    #[cfg(test)]
     pub(crate) fn swapchain(&self) -> &Swapchain {
         self.swapchain
     }
@@ -1048,6 +1060,7 @@ impl Frame<'_> {
     /// [`Swapchain::layer_ptr`] with a live foreign `CAMetalLayer` on the
     /// same parent, so a mis-wired attach that vends off the wrong layer is
     /// a pointer diff, not a silent misdraw.
+    #[cfg(test)]
     pub(crate) fn drawable_layer_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
         unsafe {
@@ -1124,6 +1137,8 @@ impl Frame<'_> {
                     .to_owned(),
             );
         }
+        #[cfg(test)]
+        encoder::queue_ffi_census::note();
         let _pool = AutoreleasePool::new();
         // SAFETY: `commandBuffer` returns a +0 command buffer owned by the
         // pool; it is retained into the ticket so callers can wait on it after
@@ -1290,7 +1305,7 @@ mod tests {
 
     /// Every test here needs a GPU; a machine without one SKIPs loudly.
     fn device() -> Option<Device> {
-        let d = Device::system_default();
+        let d = Device::preferred();
         if d.is_none() {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }
@@ -2146,7 +2161,7 @@ mod tests {
     /// only: a REAL present's ticket, an injected `PageFault` through
     /// [`PresentTicket::settle`] (the seam that exists because a real `Lost`
     /// cannot be produced on a healthy GPU — `loss`'s honesty note), and
-    /// then the two refusals with wall-clock bounds:
+    /// then the two refusals, each held to touching nothing:
     ///
     /// * RETRYABLE first, and it must NOT latch — the next acquire vends;
     /// * the `Lost` latches, and a frame acquired BEFORE the loss refuses to
@@ -2154,6 +2169,16 @@ mod tests {
     /// * every later acquire refuses in MICROSECONDS, naming the first
     ///   loss's reason, instead of eating a ~1s `nextDrawable` timeout per
     ///   frame against a dead device.
+    ///
+    /// "Touching nothing" is COUNTED ([`encoder::queue_ffi_census`]: the
+    /// `nextDrawable` in `acquire_drawable` and the `commandBuffer` mint in
+    /// `Frame::present`, the FFI these refusals would reach), not timed (the
+    /// load-sensitive test audit of 2026-09-27). The old `< 0.05 s`
+    /// stopwatches failed whenever a loaded gate descheduled the test for
+    /// 50 ms, and on this healthy device could not see the regression they
+    /// named anyway: a refusal that called `nextDrawable` first gets a
+    /// drawable back in microseconds. The census fails on that one call and
+    /// on nothing the scheduler does, so it replaces them.
     #[test]
     fn an_injected_loss_latches_and_every_later_acquire_and_present_refuses_fast() {
         use crate::metal::loss::{
@@ -2176,12 +2201,20 @@ mod tests {
         let mut sc = Swapchain::standalone(&dev, &config, Arc::clone(&latch)).expect("swapchain");
 
         // A healthy frame: wait_outcome feeds the latch ITSELF (Completed is
-        // a no-op on it), no manual record anywhere.
+        // a no-op on it), no manual record anywhere. The census sees its
+        // `nextDrawable` and its `commandBuffer`, so a census that stopped
+        // counting cannot pass the refusals below.
+        let calls = encoder::queue_ffi_census::calls();
         let ticket = sc
             .acquire()
             .expect("healthy acquire")
             .present(&session)
             .expect("healthy present");
+        assert_eq!(
+            encoder::queue_ffi_census::calls(),
+            calls + 2,
+            "a healthy acquire + present is one nextDrawable and one commandBuffer"
+        );
         assert_eq!(ticket.wait_outcome(), CbOutcome::Completed);
         assert!(!latch.is_lost(), "a completed present must not latch");
 
@@ -2223,20 +2256,18 @@ mod tests {
         assert!(latch.is_lost(), "the injected PageFault must latch");
 
         // The mid-flight frame refuses to present, fast, and is discarded.
-        // SAFETY: reading a monotonic clock.
-        let t0 = unsafe { CACurrentMediaTime() };
+        let calls = encoder::queue_ffi_census::calls();
         let err = frame
             .present(&session)
             .expect_err("presenting after the loss must refuse");
-        // SAFETY: as above.
-        let waited = unsafe { CACurrentMediaTime() } - t0;
         assert!(
             err.contains("present refused") && err.contains("PageFault"),
             "the refusal names itself and the first loss: {err}"
         );
-        assert!(
-            waited < 0.05,
-            "present refusal took {waited:.4}s — it must not touch the queue"
+        assert_eq!(
+            encoder::queue_ffi_census::calls(),
+            calls,
+            "the present refusal minted a command buffer — it must not touch the queue"
         );
 
         // Reconfigure refuses the same way — the fourth face of the refusal
@@ -2251,21 +2282,19 @@ mod tests {
 
         // Every later acquire refuses in microseconds, naming the reason.
         for attempt in 0..2 {
-            // SAFETY: reading a monotonic clock.
-            let t0 = unsafe { CACurrentMediaTime() };
+            let calls = encoder::queue_ffi_census::calls();
             let err = sc
                 .acquire()
                 .expect_err("acquire after the loss must refuse");
-            // SAFETY: as above.
-            let waited = unsafe { CACurrentMediaTime() } - t0;
             assert!(
                 err.contains("acquire refused") && err.contains("PageFault"),
                 "attempt {attempt}: the refusal names the first loss: {err}"
             );
-            assert!(
-                waited < 0.05,
-                "attempt {attempt}: refusal took {waited:.4}s — a dead-queue \
-                 nextDrawable would eat ~1s per frame here"
+            assert_eq!(
+                encoder::queue_ffi_census::calls(),
+                calls,
+                "attempt {attempt}: the refusal called nextDrawable — against a \
+                 dead queue that eats ~1s per frame"
             );
         }
     }

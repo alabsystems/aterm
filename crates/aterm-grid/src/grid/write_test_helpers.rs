@@ -13,7 +13,7 @@ use super::{CellFlags, Grid, PackedColor, StyleId};
 impl Grid {
     /// Write a styled character at cursor position and advance cursor.
     ///
-    /// Production code uses `write_split::write_char_at_cursor` + `advance_cursor_*` instead.
+    /// Production code uses `write_split::write_char_at_cursor_packed` + `advance_cursor_*` instead.
     /// Retained for test convenience.
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows

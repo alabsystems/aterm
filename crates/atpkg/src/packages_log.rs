@@ -11,7 +11,7 @@
 //! window's pass children, the terminal session's detached pass (whose stdio is
 //! `/dev/null`), a verb typed in a shell, the `claude update`/`codex update` intercept's
 //! child and the head watch's door all run through [`crate::cli::main_entry`], and every
-//! program row any of them changes goes through [`crate::status::write`]. Two kinds of
+//! program row any of them changes goes through [`crate::status::write`]. Three kinds of
 //! event, one whole line each:
 //!
 //! * a PASS — `pass-start` once the verb holds the store lock, `pass-end` when it returns
@@ -19,7 +19,12 @@
 //!   `pass-end` for a verb the lock refused;
 //! * a PROGRAM TRANSITION — a row whose build moved, or that became (or stopped being) not
 //!   current: program, from → to, source (`Anthropic latest`, `ALab index 44`), a one-word
-//!   result and the row's reason ([`transitions`]).
+//!   result and the row's reason ([`transitions`]);
+//! * a SEAM REPLACED — rustup's `trust` entry re-pointed away from a stale toolchain a
+//!   person had linked there (`crate::seam::Attached::ReplacedStale`, 2026-09-26): what it
+//!   named, what it names now, why, and the command that puts it back. The one change a
+//!   pass makes outside the store that nobody laid there for it, so it is said where the
+//!   silent passes are reviewed.
 //!
 //! THE LINE: `<RFC 3339 UTC>\t<kind>\tpid=<pid>\t<key>=<value>…\n`. A tab can never occur
 //! inside a value — every control character is replaced — so the separator cannot be
@@ -33,7 +38,7 @@
 //! * no secrets: a URL keeps its scheme and host (never its userinfo, query or fragment), a
 //!   credential — a token-shaped word, the value after `Authorization:`/`Bearer`/`token=`
 //!   and their kin — is replaced, and every control, line-separator, zero-width and bidi
-//!   character is stripped ([`sanitize`]); a value is capped;
+//!   character is stripped (`sanitize`); a value is capped;
 //! * bounded: past [`ROTATE_AT_BYTES`] the file is rotated to `packages.log.1` …
 //!   `packages.log.5` ([`KEEP_ROTATED`]), and only by a process that holds the store lock
 //!   ([`crate::lock::held_by_this_process`]) — two rotators would rename each other's
@@ -75,6 +80,8 @@ pub mod kind {
     pub const PASS_END: &str = "pass-end";
     /// A program's row moved.
     pub const PROGRAM: &str = "program";
+    /// A rustup seam's entry replaced a stale foreign link.
+    pub const SEAM: &str = "seam";
 }
 
 /// Where the log lives: `<logs dir>/packages.log`, or `None` when no log directory
@@ -186,6 +193,20 @@ pub enum Event<'a> {
     },
     /// A program's row moved.
     Program(&'a Transition),
+    /// A rustup seam's entry REPLACED a stale foreign link
+    /// (`crate::seam::Attached::ReplacedStale`).
+    Seam {
+        /// The seam, `rustup:<name>`.
+        seam: &'a str,
+        /// What the entry named before, as it was written.
+        from: &'a str,
+        /// What it names now: atpkg's view of the store's build.
+        to: &'a str,
+        /// Why it was stale (`crate::seam::Stale`, in words).
+        why: &'a str,
+        /// The command that puts it back; empty when there is nothing to go back to.
+        undo: &'a str,
+    },
 }
 
 /// Append `event` about `layout`'s store — when that store is the one this log records
@@ -313,6 +334,22 @@ pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
                 ("reason", &t.reason),
             ],
         ),
+        Event::Seam {
+            seam,
+            from,
+            to,
+            why,
+            undo,
+        } => (
+            kind::SEAM,
+            vec![
+                ("seam", seam),
+                ("from", from),
+                ("to", to),
+                ("why", why),
+                ("undo", undo),
+            ],
+        ),
     };
     render_record(unix, kind, pid, &fields, MAX_VALUE_CHARS)
 }
@@ -366,12 +403,13 @@ fn push_field(line: &mut String, key: &str, value: &str, max_chars: usize) {
 /// userinfo, query and fragment ([`redact_urls`]); a credential becomes `[redacted]`
 /// ([`redact_tokens`]); runs of spaces fold; and the whole is capped at
 /// [`MAX_VALUE_CHARS`].
+#[cfg(test)]
 #[must_use]
-pub fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     sanitize_capped(value, MAX_VALUE_CHARS)
 }
 
-/// [`sanitize`], capped at `max_chars` characters instead: a caller that keeps a whole
+/// `sanitize`, capped at `max_chars` characters instead: a caller that keeps a whole
 /// diagnostic in one value.
 #[must_use]
 pub fn sanitize_capped(value: &str, max_chars: usize) -> String {
@@ -724,7 +762,7 @@ impl Entry {
 #[must_use]
 pub fn parse_line(line: &str) -> Option<Entry> {
     parse_record(line).filter(|entry| {
-        [kind::PASS_START, kind::PASS_END, kind::PROGRAM].contains(&entry.kind.as_str())
+        [kind::PASS_START, kind::PASS_END, kind::PROGRAM, kind::SEAM].contains(&entry.kind.as_str())
     })
 }
 
@@ -798,7 +836,8 @@ pub fn tail(max: usize) -> Vec<Entry> {
 ///
 /// # Errors
 /// `path` exists but is not a regular file, or opening, seeking or reading it failed.
-pub fn read_records(path: &Path, read_bytes: u64) -> io::Result<Vec<Entry>> {
+#[cfg(test)]
+pub(crate) fn read_records(path: &Path, read_bytes: u64) -> io::Result<Vec<Entry>> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -903,6 +942,27 @@ mod tests {
             end,
             "2026-09-21T14:13:20Z\tpass-end\tpid=7\tlane=window\tverb=update\texit=69\t\
              secs=12\toutcome=offline\n"
+        );
+        let seam = render(
+            1_790_000_000,
+            7,
+            &Event::Seam {
+                seam: "rustup:trust",
+                from: "/h/trust/build/host/stage2",
+                to: "/p/rustup/trust",
+                why: "a toolchain from 2026-08-20, older than the store's 2026-09-17",
+                undo: "to put it back: ln -sfn '/h/trust/build/host/stage2' '/h/.rustup/toolchains/trust'",
+            },
+        );
+        let read = parse_line(&seam).expect("a seam line is one of the log's own");
+        assert_eq!(read.kind, kind::SEAM);
+        assert_eq!(read.get("from"), Some("/h/trust/build/host/stage2"));
+        assert_eq!(
+            read.get("undo"),
+            Some(
+                "to put it back: ln -sfn '/h/trust/build/host/stage2' '/h/.rustup/toolchains/trust'"
+            ),
+            "a path and its quotes pass the sanitiser whole"
         );
         let start = render(
             i64::MAX,

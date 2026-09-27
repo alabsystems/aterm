@@ -76,7 +76,7 @@ fn roundtrip_auth_handshake_over_a_bound_socket() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `pair()` yields a connected duplex pair (the LoopbackTransport shape).
+/// `pair()` yields a connected duplex pair.
 #[test]
 fn pair_echo() {
     let (a, mut b) = CtlStream::pair().expect("pair");

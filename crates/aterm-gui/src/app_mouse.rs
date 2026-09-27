@@ -1487,7 +1487,7 @@ impl App {
     /// or past the right edge would resolve to a menu row it never touched. A
     /// point outside the grid interior returns `None` and the caller treats it
     /// as "off the card".
-    fn frame_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
+    pub(crate) fn frame_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
         let (cw, ch) = self.win_cell_size(wid);
         let (cw, ch) = (cw.max(1), ch.max(1));
         let pad = self.win_pad(wid);
@@ -1865,6 +1865,8 @@ impl App {
         // click on the cell the pointer WAS over would open, and there is no
         // pointer over that cell any more.
         self.retire_link_target(wid);
+        // So is a hovered Claude Code light's title (`crate::claude_lights`).
+        self.clear_claude_light_hover(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -2640,6 +2642,11 @@ impl App {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return Resolved(None);
         }
+        // A Claude Code light: a press toggles it (`crate::claude_lights`).
+        if self.claude_light_at(wid, px, py).is_some() {
+            self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+            return Resolved(None);
+        }
         // The message band (design §3.4): a hand over a capsule or a row body
         // — a press there does something — and the plain pointer over the
         // rest of it (the presence row, the overflow link Phase 2 connects).
@@ -3038,6 +3045,7 @@ impl App {
         let geom = self.pointer_geometry(wid);
         self.track_strip_hover(wid, geom, x, y);
         self.track_band_hover(wid, x, y);
+        let over_claude_light = self.track_claude_light_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
             self.palette_pointer_motion(wid, x, y);
             return;
@@ -3223,6 +3231,13 @@ impl App {
             .is_some_and(|ws| ws.divider_drag.is_some())
         {
             self.drag_divider(wid);
+            return;
+        }
+        // A CLAUDE CODE LIGHT (`crate::claude_lights`) owns the motion over it:
+        // a hand, its title on the row, and no grid hover, selection drag or
+        // PTY motion report beneath it.
+        if over_claude_light {
+            self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
             return;
         }
         // POINTER PURSUIT (wave 3): the brain is its own motion sensor, but it
@@ -4047,6 +4062,12 @@ impl App {
         // FSM that yields the authoritative `click_count`. These stay in the
         // handler; the seam consumes `click_count`/`side` as DATA.
         let pressed = state == ElementState::Pressed;
+        // A press anywhere lets a keyboard-selected Claude Code light go: the
+        // person has moved on, and a light left selected would swallow their
+        // next Return (`crate::claude_lights`).
+        if pressed {
+            self.clear_claude_light_selection(wid);
+        }
         // INTERACTIVE INPUT PENDING (G17): a button press is a wait on the UI
         // thread (a click, a selection start, a link open) — arm the reader's
         // hint before the acquisitions below. Releases and hover motion are
@@ -4215,6 +4236,19 @@ impl App {
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
+            // A Claude Code light in a terminal pane of this mixed tab is a
+            // light, not a focus click — the first press toggles it, as it
+            // does in a terminal-only tab (`crate::claude_lights`). Not under
+            // the Settings modal, which owns every press below.
+            if self.strip_col_at(wid, px, py).is_none()
+                && self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.settings().is_none())
+                && self.press_claude_light(wid)
+            {
+                return;
+            }
             if self.strip_col_at(wid, px, py).is_none()
                 && (self.begin_divider_drag_with_plan(wid, Some(&plan))
                     || self.focus_pane_under_pointer_from_plan(wid, &plan))
@@ -4435,6 +4469,13 @@ impl App {
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if self.press_band_at(wid, px, py) {
+                return;
+            }
+            // A CLAUDE CODE LIGHT: a press toggles it (`crate::claude_lights`),
+            // in any pane — after the modals above, before pane focus, so a
+            // light in an unfocused pane is a light, not a focus click. Only the
+            // press is swallowed; the orphan guard drops its release.
+            if self.press_claude_light(wid) {
                 return;
             }
         }
@@ -5232,6 +5273,16 @@ impl App {
         else {
             return;
         };
+        // While this session's rewrap has the history out (ruling 240), a
+        // sub-row delta moves nothing: the band would land its rows on the
+        // reader's aim once per event and once more at the settle, while the
+        // same pixels also bank toward the whole rows the ruling-238 route in
+        // `input_wheel` applies. The bank alone carries the finger; a band
+        // left from before the rewrap settles now.
+        if self.rewrap_in_flight(front.session) {
+            self.release_scroll_track(wid);
+            return;
+        }
         let term = front.term;
         let mods = self.mouse_modifiers(wid);
         // Tier 1 honours exactly the lock-free half of the seam's bypass: Shift
@@ -5322,7 +5373,10 @@ impl App {
         ws.scroll_frac_px = 0;
         let scrolled = {
             let mut term = term_lock(&term);
-            if term.grid().display_offset() != 0 {
+            // Also at offset 0 when the reader aimed up while a rewrap held the
+            // history away (ruling 238): typing is them coming back to the live
+            // bottom, and the re-attach must not land them on the old aim.
+            if term.grid().display_offset() != 0 || term.grid().reader_aim_held() {
                 term.scroll_to_bottom();
                 true
             } else {
@@ -5676,9 +5730,7 @@ mod pointer_license_tests {
                                     side: SelectionSide::Left,
                                     px_off: PixelOffset::default(),
                                 },
-                                Source::Controller {
-                                    op: aterm_session::Op::WriteInput
-                                },
+                                Source::Controller,
                             ),
                             InputOutcome::Ok,
                         );
@@ -5766,9 +5818,7 @@ mod pointer_license_tests {
                             side: SelectionSide::Left,
                             px_off: PixelOffset::default(),
                         },
-                        Source::Controller {
-                            op: aterm_session::Op::WriteInput
-                        }
+                        Source::Controller
                     ),
                     InputOutcome::Ok
                 );
@@ -7960,7 +8010,7 @@ mod tests {
             assert_eq!(ws.robi_hit_rect, None, "the rect is spent by the press");
         }
         assert!(
-            app.has_live_message("Robi not dismissed"),
+            app.has_live_message("Couldn't dismiss Robi"),
             "the persist attempt reached the settings lane (headless refusal is surfaced)"
         );
         assert!(
@@ -7999,7 +8049,7 @@ mod tests {
         let ws = app.windows.get(&wid).unwrap();
         assert!(ws.selecting, "the press reached the selection layer");
         assert!(
-            !app.has_live_message("Robi not dismissed"),
+            !app.has_live_message("Couldn't dismiss Robi"),
             "and no dismissal was ever attempted"
         );
     }
@@ -8033,7 +8083,7 @@ mod tests {
             "a failed write releases the latch — Robi returns"
         );
         assert!(
-            app.has_live_message("Robi not dismissed"),
+            app.has_live_message("Couldn't dismiss Robi"),
             "…and the failure is surfaced, never silent"
         );
         let surfaced = app
@@ -8058,7 +8108,7 @@ mod tests {
             "success waits for the generation, not the reply"
         );
         assert!(
-            !app.has_live_message("Robi not dismissed"),
+            !app.has_live_message("Couldn't dismiss Robi"),
             "success needs no message"
         );
         // …and it releases the moment the dismissal IS the live config.
@@ -10716,14 +10766,14 @@ mod tests {
             "two rows shown, three behind the link: {:?}",
             rows[overflow].kind
         );
-        assert_eq!(rows[overflow].capsules.len(), 1, "one link");
-        let link = rows[overflow].capsules[0].clone();
-        assert_eq!(link.full_label, "Messages \u{203a}");
+        // ONE link (ruling 259): the words are the whole row, no capsule.
+        assert!(rows[overflow].capsules.is_empty(), "one link");
+        assert!(rows[overflow].title.1.ends_with('\u{203a}'));
         let at = band_pixel(&app, wid);
         let ch = app.win_cell_size(wid).1 as f64;
         let dy = overflow as f64 * ch;
-        // The words, then the chip: the same press, the same page.
-        for col in [4, link.col + 1] {
+        // The words, then the far end of the row: the same press, the same page.
+        for col in [4, cols - 3] {
             let (x, y) = at(col);
             let target = app.band_hit_at(wid, x, y + dy).expect("on the band");
             assert_eq!(

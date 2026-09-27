@@ -141,19 +141,6 @@ fn scrollback_iterator() {
 }
 
 #[test]
-fn scrollback_rev_iterator() {
-    let mut sb = Scrollback::new(100, 1000, 10_000_000);
-    for i in 0..10 {
-        sb.push_str(&format!("Line {i}"));
-    }
-
-    let lines: Vec<_> = sb.iter_rev().collect();
-    assert_eq!(lines.len(), 10);
-    assert_eq!(lines[0].to_string(), "Line 9");
-    assert_eq!(lines[9].to_string(), "Line 0");
-}
-
-#[test]
 fn scrollback_clear() {
     let mut sb = Scrollback::new(100, 1000, 10_000_000);
     for i in 0..50 {

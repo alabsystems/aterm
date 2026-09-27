@@ -48,23 +48,26 @@ fn table_value(toml: &str, table: &str, key: &str) -> Option<String> {
 }
 
 /// 2026-09-13. Without this pin, host code (build scripts, proc-macros and their
-/// deps) is compiled at debuginfo 0 in a plain dev build but at full debuginfo
+/// deps) is compiled at debuginfo 0 in a plain dev build but at the dev level
 /// when the same crate is also a normal dependency of a test — so `build`,
 /// `test`, `test --doc`, the smokes and the drivers each compiled a DIFFERENT
 /// variant of syn/quote/proc-macro2 and everything downstream of them. Unit
 /// graphs at 18f19eea6 with the pin: the doctest stage needs 0 compile units
 /// beyond `test --workspace --no-run` (was 117); the smoke build 22 (was 49).
-/// The pin changes debuginfo only — no feature, opt-level or assertion moves.
+/// Since 2026-09-25 both levels are line tables (`[profile.dev] debug =
+/// "line-tables-only"`), so this pins the dev level itself and the next test
+/// pins the override EQUAL to it.
 #[test]
-fn the_dev_build_override_pins_host_debuginfo() {
+fn the_dev_profile_builds_line_tables() {
     let manifest = workspace_root().join("Cargo.toml");
     let toml = fs::read_to_string(&manifest).expect("read the root Cargo.toml");
-    let debug = table_value(&toml, "profile.dev.build-override", "debug");
-    assert!(
-        matches!(debug.as_deref(), Some("2" | "true" | "\"full\"")),
-        "{}: [profile.dev.build-override] must set `debug = 2` (full debuginfo, the \
-         level the same crates get as ordinary deps), found {debug:?} — without it every \
-         gate stage recompiles its own proc-macro variants",
+    let dev = table_value(&toml, "profile.dev", "debug");
+    let host = table_value(&toml, "profile.dev.build-override", "debug");
+    assert_eq!(
+        (dev.as_deref(), host.as_deref()),
+        (Some("\"line-tables-only\""), Some("\"line-tables-only\"")),
+        "{}: [profile.dev] and [profile.dev.build-override] must both set \
+         `debug = \"line-tables-only\"` (file:line backtraces, a fraction of full DWARF's size)",
         manifest.display()
     );
 }

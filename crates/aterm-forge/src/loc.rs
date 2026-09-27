@@ -68,15 +68,11 @@ use std::sync::{Mutex, OnceLock};
 /// and the identically-named registry crate is a coincidence of how
 /// `[patch.crates-io]` matches (on package name). So members are resolved by
 /// their manifest's `[package] name`, not by directory, and they win.
-pub fn package_dir(root: &Path, id: &PkgId) -> Option<PathBuf> {
-    package_dir_hinted(root, id, None)
-}
-
-/// [`package_dir`] with the directory `cargo tree` printed as a last resort.
-/// The public signature cannot take it (it is keyed on [`PkgId`] alone), but a
-/// caller holding the resolve output should pass it: it is cargo's own answer,
+///
+/// `printed` is the directory `cargo tree` disclosed, used as a last resort: a
+/// caller holding the resolve output should pass it — it is cargo's own answer,
 /// and it is right even for a workspace laid out differently from this one.
-pub fn package_dir_hinted(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<PathBuf> {
+pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<PathBuf> {
     // NAME AND VERSION, and the version half is the whole safety of this
     // branch. Matching on name alone is FAIL-OPEN on the number this campaign
     // is scored on: `[patch.crates-io]` cannot satisfy every requirement (a
@@ -375,12 +371,8 @@ fn cargo_home() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".cargo"))
 }
 
-/// Facts for every node in one graph.
-pub fn facts(root: &Path, graph: &Graph) -> BTreeMap<PkgId, PkgFacts> {
-    facts_with_paths(root, graph, &BTreeMap::new())
-}
-
-/// [`facts`] with the directories `cargo tree` disclosed.
+/// Facts for every node in one graph, measured at the directories `cargo tree`
+/// disclosed (`printed`).
 pub fn facts_with_paths(
     root: &Path,
     graph: &Graph,
@@ -399,7 +391,7 @@ pub fn facts_with_paths(
 /// Measure one package from scratch — no cache, for callers that need a fresh
 /// read after editing a fork.
 pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
-    let Some(dir) = package_dir_hinted(root, id, printed) else {
+    let Some(dir) = package_dir(root, id, printed) else {
         // Unresolvable means "not in this checkout", which for a graph node can
         // only be a registry package whose source was never unpacked. It is
         // third-party by definition; its LOC is honestly unknown, so it is 0
@@ -649,7 +641,7 @@ mod tests {
         // compiler-resident with zero machine code in the binary, and
         // `docs/THIRD_PARTY_ROAD_TO_ZERO.md` records that neither lane —
         // mirroring nor extraction — retires that class at all.
-        let registry = package_dir(&root, &PkgId::new("syn", "2.0.117"))
+        let registry = package_dir(&root, &PkgId::new("syn", "2.0.117"), None)
             .expect("syn 2.0.117 is unpacked in this checkout's registry");
         assert!(registry.ends_with("syn-2.0.117"), "{}", registry.display());
         assert!(
@@ -661,7 +653,7 @@ mod tests {
         // so the move is recorded rather than merely worked around: `libc` is
         // patched to a workspace member and must resolve there, NOT to the
         // registry copy of upstream libc that also exists on this box.
-        let retired = package_dir(&root, &PkgId::new("libc", "0.2.186"))
+        let retired = package_dir(&root, &PkgId::new("libc", "0.2.186"), None)
             .expect("the patched `libc` resolves");
         assert_eq!(retired, root.join("crates").join("aterm-libc"));
 
@@ -669,7 +661,7 @@ mod tests {
         // on every machine — the assertion the old order could not make, since
         // it read the registry first and reached `vendor/` only when this box
         // happened to lack a pristine checkout of the same version.
-        let forked = package_dir(&root, &PkgId::new("winit", "0.30.13"))
+        let forked = package_dir(&root, &PkgId::new("winit", "0.30.13"), None)
             .expect("the patched winit resolves");
         assert_eq!(forked, root.join("vendor").join("winit"));
 
@@ -680,17 +672,17 @@ mod tests {
         // package, and billing it to the fork's directory would drop a real
         // third-party package out of `third_party_*` altogether.
         assert_ne!(
-            package_dir(&root, &PkgId::new("winit", "0.0.0-not-published")),
+            package_dir(&root, &PkgId::new("winit", "0.0.0-not-published"), None),
             Some(root.join("vendor").join("winit")),
             "the version guard must refuse a name-only match"
         );
 
-        let member = package_dir(&root, &PkgId::new("aterm-core", "0.47.0"))
+        let member = package_dir(&root, &PkgId::new("aterm-core", "0.47.0"), None)
             .expect("workspace members resolve under crates/");
         assert_eq!(member, root.join("crates").join("aterm-core"));
 
         assert_eq!(
-            package_dir(&root, &PkgId::new("no-such-crate-anywhere", "1.0.0")),
+            package_dir(&root, &PkgId::new("no-such-crate-anywhere", "1.0.0"), None),
             None
         );
     }
@@ -704,7 +696,7 @@ mod tests {
     #[test]
     fn a_first_party_patch_target_is_measured_at_the_member_not_the_registry_copy() {
         let root = repo_root();
-        let dir = package_dir(&root, &PkgId::new("tracing", "0.1.44"))
+        let dir = package_dir(&root, &PkgId::new("tracing", "0.1.44"), None)
             .expect("the patched `tracing` resolves");
         assert_eq!(dir, root.join("crates").join("aterm-tracing"));
         assert!(
@@ -750,13 +742,13 @@ mod tests {
     #[test]
     fn a_member_does_not_answer_for_a_different_version_of_its_name() {
         let root = repo_root();
-        let ours = package_dir(&root, &PkgId::new("tracing", "0.1.44"));
+        let ours = package_dir(&root, &PkgId::new("tracing", "0.1.44"), None);
         assert_eq!(
             ours.as_deref(),
             Some(root.join("crates").join("aterm-tracing").as_path()),
             "control: the member DOES answer for its own version"
         );
-        let other = package_dir(&root, &PkgId::new("tracing", "0.1.41"));
+        let other = package_dir(&root, &PkgId::new("tracing", "0.1.41"), None);
         assert_ne!(
             other.as_deref(),
             Some(root.join("crates").join("aterm-tracing").as_path()),
@@ -769,7 +761,7 @@ mod tests {
     fn the_printed_path_is_the_last_resort() {
         let root = repo_root();
         let hint = root.join("vendor").join("indexmap");
-        let got = package_dir_hinted(&root, &PkgId::new("nope-not-real", "0.0.1"), Some(&hint));
+        let got = package_dir(&root, &PkgId::new("nope-not-real", "0.0.1"), Some(&hint));
         assert_eq!(got.as_deref(), Some(hint.as_path()));
     }
 
@@ -786,10 +778,10 @@ mod tests {
     /// These were equality pins until 2026-09-24, so every successful
     /// retirement turned them red until the rows were re-copied. `resolved`
     /// and `workspace` are not held: they are not surface, and a retirement
-    /// that lands as a new first-party crate raises them. (Two mac-arm figures
-    /// are still compared exactly elsewhere: the duplicate-name list below,
-    /// and `survey`'s report and JSON tests, which check the printed totals
-    /// against the row.)
+    /// that lands as a new first-party crate raises them. The mac-arm
+    /// duplicate-name list below remains exact; `survey`'s report and JSON
+    /// tests compare the printed totals with the current gathered facts,
+    /// not these ceilings.
     fn assert_within_baseline(cell_index: usize) -> CellSurvey {
         use crate::measured::ratchet_agreement::{load, ratcheted, tsv_ceilings};
         let row = measured::CELLS[cell_index];

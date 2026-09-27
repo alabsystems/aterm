@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-0 for `ReleaseChannelHead`: the cut owns the public channel's `latest`.
-//! Tier-1 lives in `crates/aterm-release/tests/channel_latest.rs`.
+//! Tier-1 lives in `crates/aterm-release/tests/it/channel_latest.rs`.
 
 use aterm_spec::{derive::release_channel_head_model, interp, verify};
 

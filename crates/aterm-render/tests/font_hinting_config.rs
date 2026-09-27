@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! TYPOGRAPHY R2: the `font_hinting` config key's renderer seam
-//! ([`Renderer::set_font_hinting`]) — the live-settable twin of the
-//! construction-time `ATERM_FONT_HINTING` read (W13).
+//! ([`Renderer::set_font_hinting`]) — the one way to change the hint mode
+//! (W13; the construction-time `ATERM_FONT_HINTING` read was deleted 2026-09-24).
 //!
 //! Laws under test, on the native hint seam (Linux and — since the grid-fit
 //! wave — Windows):
@@ -14,8 +14,7 @@
 //!   vs `off` differ at the desktop 12px) while cell GEOMETRY stays fixed
 //!   (the hinted-seam contract: advances stay linear, so the grid never
 //!   moves);
-//! * an unrecognized spelling resolves to the default (`full`) — the same
-//!   forgiving shape the env always had.
+//! * an unrecognized spelling resolves to the default (`full`).
 //!
 //! On targets without the seam (macOS CoreText, wasm fontdue) the setter is
 //! inert `false` and the getter reports `"off"` — HONESTLY, rather than the
@@ -58,7 +57,7 @@ fn default_is_full_and_spellings_round_trip() {
         ("0", "off"),
         ("false", "off"),
         ("full", "full"),
-        ("anything-else", "full"), // forgiving, like the env read
+        ("anything-else", "full"), // forgiving toward the DEFAULT
     ] {
         r.set_font_hinting(spelling);
         let expect = if HINT_SEAM { canonical } else { "off" };
@@ -80,7 +79,7 @@ fn same_value_is_free_change_reports_true() {
 
 /// A live-set mode RIDES the font-generation handoffs: the semantic-surface
 /// fork (Settings specimens, Markdown) and the sealed rebuild must render with
-/// the parent's `font_hinting`, not resurrect the env-resolved default — a
+/// the parent's `font_hinting`, not resurrect the construction default — a
 /// `font_hinting = "off"` user must not meet re-hinted text in Settings. On
 /// targets without the seam both getters answer `"off"` and the assertions are
 /// the honesty contract itself.

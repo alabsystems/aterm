@@ -3,8 +3,8 @@
 
 //! Compile-fail: same as `forge_host_from_pty` but for `User`. There is no
 //! constructor or conversion that lets `Provenance<_, Pty>` become
-//! `Provenance<_, User>`. User-origin data only enters the system through
-//! `Provenance::<_, User>::from_user` at input-controller boundaries.
+//! `Provenance<_, User>` (and, since 2026-09-25, no `User` constructor at all —
+//! only `from_host` and `from_pty` ship).
 
 use aterm_provenance::{Provenance, Pty, User};
 

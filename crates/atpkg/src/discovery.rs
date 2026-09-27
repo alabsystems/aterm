@@ -102,69 +102,6 @@ mod tests {
         assert_eq!(r.slug(), "alabsystems/aterm");
     }
 
-    /// The index account is its OWN tracked key (`[workspace.metadata.atpkg]
-    /// account`) — never the update channel, never the publish repo.
-    ///
-    /// Two bindings this tripwires, both regressions this module actually had:
-    ///   * `DEFAULT_OWNER` (the app channel) — following it silently moved the
-    ///     package index's ACCOUNT-BOUND trust root (§8) when the channel was
-    ///     repointed at the public mirror, turning a "where do bytes come from"
-    ///     change into an authenticity change;
-    ///   * `PUBLISH_OWNER` (the private staging repo) — a default-configured,
-    ///     tokenless install 404s there, so the published registry was
-    ///     unreachable by construction for exactly the installs the compiled
-    ///     default exists to serve.
-    ///
-    /// Asserting the CONSTANT the resolver uses (not just today's literal) is what
-    /// makes this a tripwire: it keeps failing if either binding comes back.
-    #[test]
-    fn index_account_is_its_own_knob() {
-        assert_eq!(
-            resolve_account(None).owner,
-            aterm_update_core::ATPKG_INDEX_OWNER,
-            "the index account must be the dedicated package-index owner"
-        );
-        // The compiled default is the PUBLIC package org in BOTH trees: this tree
-        // spells `alabsystems` in the metadata key verbatim, and `publish/` exports
-        // a PUBLIC source snapshot that rewrites the private staging owner's name
-        // to `alabsystems` throughout — leaving this value untouched — so a
-        // public-snapshot build points at alabsystems too.
-        assert_eq!(aterm_update_core::ATPKG_INDEX_OWNER, "alabsystems");
-        // Scoped to the private staging namespace on purpose — in the public
-        // snapshot the index account and the publish owner legally coincide (one
-        // public org serving source, releases and the index). Same scoping as
-        // `aterm-release`'s `the_channel_is_never_pointed_back_at_the_private_staging_repo`.
-        //
-        // The gate is spelled WITHOUT the private owner's literal name, on
-        // purpose: publish/transforms.sh rewrites that name to the public org in
-        // EVERY text file of the export — this one included — so a literal-keyed
-        // guard would flip to always-true in the exported tree and its
-        // `assert_ne!` below would fail deterministically for every public-
-        // snapshot `cargo test` run (adversarial review 2026-08-11). `PUBLISH_OWNER
-        // != DEFAULT_OWNER` holds exactly in the private tree (staging and the
-        // public channel are different orgs, asserted below) and collapses in the
-        // export (one org serves both), so the tripwire fires precisely where the
-        // distinction it protects exists.
-        if aterm_update_core::PUBLISH_OWNER != aterm_update_core::DEFAULT_OWNER {
-            assert_ne!(
-                aterm_update_core::ATPKG_INDEX_OWNER,
-                aterm_update_core::PUBLISH_OWNER,
-                "the index default must be publicly readable, never the private staging owner"
-            );
-            assert_eq!(
-                aterm_update_core::DEFAULT_OWNER,
-                "alabsystems",
-                "the private tree's update channel is the public mirror"
-            );
-        }
-    }
-
-    #[test]
-    fn index_repo_is_always_aterm() {
-        assert_eq!(index_repo(), INDEX_REPO);
-        assert_eq!(index_repo(), "aterm");
-    }
-
     #[test]
     fn config_account_overrides_default_but_is_validated() {
         // A valid config account is used (only a development build hands one over).

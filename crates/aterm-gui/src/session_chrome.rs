@@ -95,6 +95,39 @@ pub(crate) struct SessionChromeInput {
     /// sorted for a stable listing. Empty = no CONNECTIONS rows beyond the
     /// always-present spawn presets / picker entries.
     pub connections: Vec<ConnectionFact>,
+    /// The LIVE AGENT UPGRADE of the agent this tab runs, as its menu offers
+    /// the owner's words on it (gap #21), from the window's view of the
+    /// harness host's rows; `None` when none is recorded for the tab or no
+    /// word would do anything.
+    pub upgrade: Option<UpgradeMenu>,
+}
+
+/// One tab's live agent upgrade, as its context menu offers it (gap #21):
+/// the same words, for the same build, as the upgrade's band row
+/// (`message_reporters::agent_upgrade_words`), all of them — a row has room
+/// for two capsules, a menu for every word.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UpgradeMenu {
+    /// The session the upgrade is on (`s-<hex>`): the pane the menu was
+    /// composed for, which its words name ([`TabMenuEntry::Upgrade`]).
+    pub sid: String,
+    /// What it moves, in the band's words (`Claude Code 2.1.281 → 2.1.282`).
+    pub moving: String,
+    /// The target build the words are for.
+    pub to: String,
+    /// The words that do something for it, most useful first.
+    pub words: Vec<aterm_messages::UpgradeWord>,
+}
+
+/// An upgrade word's menu item (title case, the menu's own voice — a menu
+/// item has no capsule's 16-character bound, so "Skip This Version" whole).
+#[must_use]
+pub(crate) fn upgrade_menu_label(word: aterm_messages::UpgradeWord) -> &'static str {
+    match word {
+        aterm_messages::UpgradeWord::Now => "Upgrade Now",
+        aterm_messages::UpgradeWord::NotToday => "Not Today",
+        aterm_messages::UpgradeWord::Skip => "Skip This Version",
+    }
 }
 
 /// Which way the AUTHORITY of a connection points, seen from the session whose
@@ -187,6 +220,24 @@ pub(crate) enum TabMenuEntry {
         verb: ConnVerb,
         enabled: bool,
     },
+    /// The owner's word on this tab's live agent upgrade (gap #21): Upgrade
+    /// Now / Not Today / Skip This Version, for the build `to` the menu
+    /// names. Carries its arguments like a connection row, for the same
+    /// reason: the native item's tag indexes the strip's pop-time snapshot
+    /// and the click posts `Wake::TabMenuUpgrade`, so a click after the
+    /// upgrade moved on names the build the owner SAW — which the harness
+    /// then refuses (`upgrade_drive::ask_for`) rather than applying the word
+    /// to a newer one. And the SESSION it saw: a split tab runs one per
+    /// pane and the menu is composed for the focused one, which can change
+    /// before the choice lands — the word is for `sid`, never for whichever
+    /// pane holds the focus then. Offered only when it does something:
+    /// always enabled.
+    Upgrade {
+        label: String,
+        sid: String,
+        to: String,
+        word: aterm_messages::UpgradeWord,
+    },
 }
 
 /// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row.
@@ -241,6 +292,10 @@ pub(crate) struct CachedChrome {
     /// cleared. Bumped by every authority act — see
     /// `crate::connections::ConnectionTable::bump_revision`.
     pub connections_revision: u64,
+    /// The window's upgrade view's revision at compose time
+    /// (`upgrade_host::UpgradeView::revision`): the harness host's rows move
+    /// none of the other epochs, and the menu's upgrade words are theirs.
+    pub upgrade_revision: u64,
     /// [`crate::turn_ledger::now_ms`] at compose time — bounds staleness of
     /// the coarse relative ages.
     pub composed_ms: u64,
@@ -519,6 +574,21 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         entries.push(TabMenuEntry::Separator);
         entries.extend(timeline.into_iter().map(TabMenuEntry::Header));
     }
+    // The live agent upgrade's words (gap #21), right under the identity the
+    // headers above describe: the owner steers THIS tab's upgrade here.
+    if let Some(upgrade) = input.upgrade.as_ref().filter(|u| !u.words.is_empty()) {
+        entries.push(TabMenuEntry::Separator);
+        entries.push(TabMenuEntry::Header("AGENT UPGRADE".to_string()));
+        entries.push(TabMenuEntry::Header(upgrade.moving.clone()));
+        for word in &upgrade.words {
+            entries.push(TabMenuEntry::Upgrade {
+                label: upgrade_menu_label(*word).to_string(),
+                sid: upgrade.sid.clone(),
+                to: upgrade.to.clone(),
+                word: *word,
+            });
+        }
+    }
     entries.push(TabMenuEntry::Separator);
     entries.push(TabMenuEntry::Header("CONNECTIONS".to_string()));
     for fact in &input.connections {
@@ -637,6 +707,9 @@ pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
             peer_sid.as_str(),
             disabled_suffix(*enabled)
         ),
+        // The build it is for rides the mirror, as a connection row's peer
+        // does: a driving AI reads which target the word would name.
+        TabMenuEntry::Upgrade { label, to, .. } => format!("{label} ({to})"),
     }
 }
 
@@ -650,6 +723,7 @@ mod tests {
             label: "session".to_string(),
             activity_revision: 0,
             connections_revision: 0,
+            upgrade_revision: 0,
             composed_ms,
             ext: TabChromeExt::default(),
         }
@@ -714,6 +788,7 @@ mod tests {
                 },
             ],
             connections: Vec::new(),
+            upgrade: None,
         }
     }
 
@@ -808,7 +883,9 @@ mod tests {
         assert!(compose_tab_menu(&input).iter().all(|entry| match entry {
             TabMenuEntry::Header(label) =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
-            TabMenuEntry::Action { label, .. } | TabMenuEntry::ConnectionAction { label, .. } =>
+            TabMenuEntry::Action { label, .. }
+            | TabMenuEntry::ConnectionAction { label, .. }
+            | TabMenuEntry::Upgrade { label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Separator => true,
         }));
@@ -1288,5 +1365,60 @@ mod tests {
              \"Show Connection Map\", \"---\", \"Rename Session…\", \"Copy Session ID\", \
              \"Copy CWD\", \"Close Tab\"]"
         );
+    }
+
+    /// A TAB WHOSE AGENT HAS AN UPGRADE PENDING OFFERS THE OWNER'S WORDS ON IT
+    /// (gap #21): an `AGENT UPGRADE` section under the identity — what it
+    /// moves, then every word that does something, each carrying the build it
+    /// is for, which the `chrome` mirror prints. NEGATIVE CONTROLS: no
+    /// upgrade, or one no word would move, composes no section at all.
+    #[test]
+    fn a_pending_upgrade_offers_the_owners_words_for_its_build() {
+        use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
+        let mut input = SessionChromeInput {
+            label: "claude".to_string(),
+            has_session: true,
+            ..SessionChromeInput::default()
+        };
+        let plain = compose_tab_menu(&input);
+        input.upgrade = Some(UpgradeMenu {
+            sid: "s-b5cf2faabac5ce5127bd".to_string(),
+            moving: "Claude Code 2.1.281 → 2.1.282".to_string(),
+            to: "2.1.282".to_string(),
+            words: vec![Now, NotToday, Skip],
+        });
+        let menu = compose_tab_menu(&input);
+        let start = menu
+            .iter()
+            .position(|e| *e == TabMenuEntry::Header("AGENT UPGRADE".to_string()))
+            .expect("the section");
+        assert_eq!(menu[start - 1], TabMenuEntry::Separator);
+        assert_eq!(
+            menu[start + 1],
+            TabMenuEntry::Header("Claude Code 2.1.281 → 2.1.282".to_string())
+        );
+        let items: Vec<String> = menu[start + 2..start + 5]
+            .iter()
+            .map(menu_entry_mirror)
+            .collect();
+        assert_eq!(
+            items,
+            [
+                "Upgrade Now (2.1.282)",
+                "Not Today (2.1.282)",
+                "Skip This Version (2.1.282)"
+            ]
+        );
+        assert!(matches!(
+            &menu[start + 4],
+            TabMenuEntry::Upgrade { sid, to, word: Skip, .. }
+                if to == "2.1.282" && sid == "s-b5cf2faabac5ce5127bd"
+        ));
+        assert_eq!(menu.len(), plain.len() + 6, "the section and nothing else");
+        input.upgrade = Some(UpgradeMenu {
+            words: Vec::new(),
+            ..input.upgrade.clone().expect("set")
+        });
+        assert_eq!(compose_tab_menu(&input), plain, "no word: no section");
     }
 }

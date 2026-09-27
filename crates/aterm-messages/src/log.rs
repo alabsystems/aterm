@@ -76,6 +76,13 @@ pub enum Retired {
     /// (design §10.4.7). The line codec spells it `how=folded rec=1`, so an
     /// older build after a rollback reads it as the fold it wrote before.
     Recorded,
+    /// ATERM QUIT while the row was still open (design ruling 267): a live
+    /// row's work, or a held row's hold, was cut off by the process ending,
+    /// not by its reporter. Its record keeps its words and its mark and
+    /// says where the work was. An older build does not know the word and
+    /// skips the line, so the record reads as the dead process's open row
+    /// it did before.
+    Quit,
 }
 
 impl Retired {
@@ -95,6 +102,7 @@ impl Retired {
             Self::Carried => "carried",
             Self::Withdrawn => "withdrawn",
             Self::Recorded => "recorded",
+            Self::Quit => "quit",
         }
     }
 
@@ -131,6 +139,7 @@ impl Retired {
             ("carried", "") => Some(Self::Carried),
             ("withdrawn", "") => Some(Self::Withdrawn),
             ("recorded", "") => Some(Self::Recorded),
+            ("quit", "") => Some(Self::Quit),
             _ => None,
         }
     }
@@ -248,6 +257,12 @@ pub enum LogLine {
         detail: Vec<String>,
         /// Duplicate posts folded in.
         repeats: u32,
+        /// The outcome's MARK when the retirement changed it (design ruling
+        /// 265): the severity and glyph the record reads under from here —
+        /// `✓` Success for delivered work, `⚠` Warn for work that stopped.
+        /// Written as `sev=` and `glyph=`, which an older build ignores (it
+        /// keeps the posted mark); `None` keeps the posted mark.
+        mark: Option<(Severity, Glyph)>,
     },
     /// A capsule was pressed.
     Acted {
@@ -356,6 +371,7 @@ impl LogLine {
                 title,
                 detail,
                 repeats,
+                mark,
             } => {
                 field("kind", "retired");
                 field("id", &id.to_string());
@@ -373,6 +389,10 @@ impl LogLine {
                 field("title", title);
                 field("detail", &join_us(detail));
                 field("rep", &repeats.to_string());
+                if let Some((sev, glyph)) = mark {
+                    field("sev", sev.as_str());
+                    field("glyph", glyph.ch().encode_utf8(&mut [0; 4]));
+                }
             }
             Self::Acted { id, unix_ms, label } => {
                 field("kind", "acted");
@@ -420,6 +440,7 @@ impl LogLine {
                 title: clip(&fields.need("title")?, TITLE_CAP),
                 detail: capped_detail(&fields.get_or("detail")),
                 repeats: fields.num("rep")?,
+                mark: decode_mark(&fields),
             },
             Some("acted") => Self::Acted {
                 id: fields.id()?,
@@ -439,6 +460,13 @@ impl LogLine {
         }
         Ok(decoded)
     }
+}
+
+/// A Retired line's optional mark: both `sev=` and `glyph=`, or none.
+fn decode_mark(fields: &Fields) -> Option<(Severity, Glyph)> {
+    let severity = Severity::parse(fields.get("sev")?)?;
+    let glyph = Glyph::or_fallback(fields.get("glyph")?.chars().next()?);
+    Some((severity, glyph))
 }
 
 fn decode_posted(fields: &Fields) -> Result<LogLine, CodecError> {
@@ -612,6 +640,8 @@ pub(crate) struct FinalWords<'a> {
     pub(crate) detail: &'a [String],
     /// Duplicate posts folded in.
     pub(crate) repeats: u32,
+    /// The outcome's mark, when the retirement changed it (ruling 265).
+    pub(crate) mark: Option<(Severity, Glyph)>,
 }
 
 /// The bounded ring of records plus the lines waiting for the host to
@@ -643,7 +673,18 @@ impl MessageLog {
         }
         match line {
             LogLine::Posted(mut rec) => {
-                if self.get(rec.id).is_some() {
+                // THE SAME ID, ANOTHER RECORD (2026-09-27): a Posted repeated
+                // for a record still open is the same record (deduped, as
+                // ever); one whose id names a record a Retired line already
+                // CLOSED is another process's — a second instance sharing
+                // the file whose counter ran behind (measured on the owner's
+                // Mac: a long-running window minted id 15 after a test
+                // instance had posted and retired its own 15, and the window's
+                // "Claude Code 2.1.283 … up to date" was dropped here while its
+                // Retired line overwrote the other record's words). It is its
+                // own record, and later lines for the id merge into the
+                // newest one ([`Self::get_mut`] reads newest first).
+                if self.get(rec.id).is_some_and(|r| !Self::closed_by_a_line(r)) {
                     return;
                 }
                 rec.state = LogState::Retired(Retired::Stale);
@@ -657,6 +698,7 @@ impl MessageLog {
                 title,
                 detail,
                 repeats,
+                mark,
             } => {
                 if let Some(rec) = self.get_mut(id) {
                     rec.state = LogState::Retired(how);
@@ -665,6 +707,10 @@ impl MessageLog {
                     rec.title = title;
                     rec.detail = detail;
                     rec.repeats = repeats;
+                    if let Some((severity, glyph)) = mark {
+                        rec.severity = severity;
+                        rec.glyph = glyph;
+                    }
                 }
             }
             LogLine::Acted { id, unix_ms, label } => {
@@ -674,6 +720,12 @@ impl MessageLog {
             }
             LogLine::Dropped { .. } => {}
         }
+    }
+
+    /// Whether a replayed record was closed by a `Retired` line: its state
+    /// is a retirement other than the Stale every Posted line loads as.
+    fn closed_by_a_line(rec: &LogRecord) -> bool {
+        matches!(&rec.state, LogState::Retired(how) if *how != Retired::Stale)
     }
 
     /// The records, oldest first.
@@ -698,43 +750,6 @@ impl MessageLog {
         MessageId::from_raw(self.next_id).unwrap_or(MessageId::FIRST)
     }
 
-    /// The ring re-serialised — what the host rewrites the file from when
-    /// it compacts. Every record is a `Posted` line, then its `Retired` and
-    /// `Acted` lines when it has them. A record that only READ as Stale at
-    /// load (no Retired line on disk) gets none here either, so a reload of
-    /// the compacted file is the identity.
-    #[must_use]
-    pub fn compact_lines(&self) -> Vec<LogLine> {
-        let mut out = Vec::with_capacity(self.ring.len() * 2);
-        for rec in &self.ring {
-            let mut posted = rec.clone();
-            posted.state = LogState::Posted;
-            posted.retired_unix_ms = None;
-            posted.retired_at = None;
-            posted.last_action = None;
-            posted.repeats = 1;
-            out.push(LogLine::Posted(posted));
-            if let (LogState::Retired(how), Some(unix_ms)) = (&rec.state, rec.retired_unix_ms) {
-                out.push(LogLine::Retired {
-                    id: rec.id,
-                    how: how.clone(),
-                    unix_ms,
-                    title: rec.title.clone(),
-                    detail: rec.detail.clone(),
-                    repeats: rec.repeats,
-                });
-            }
-            if let Some((label, unix_ms)) = &rec.last_action {
-                out.push(LogLine::Acted {
-                    id: rec.id,
-                    unix_ms: *unix_ms,
-                    label: label.clone(),
-                });
-            }
-        }
-        out
-    }
-
     /// Records in the ring.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -755,24 +770,28 @@ impl MessageLog {
 
     /// The lines waiting for the host, oldest first, left in place (the
     /// handoff carry reads them without draining).
-    pub fn pending_lines(&self) -> impl Iterator<Item = &LogLine> {
+    #[cfg(test)]
+    pub(crate) fn pending_lines(&self) -> impl Iterator<Item = &LogLine> {
         self.pending.iter().map(|(line, _)| line)
     }
 
     /// Take every pending line, oldest first. When lines were dropped past
     /// [`PENDING_PERSIST_CAP`] since the last drain, a trailing
     /// [`LogLine::Dropped`] says how many.
-    pub fn drain_pending(&mut self) -> Vec<LogLine> {
+    #[cfg(test)]
+    pub(crate) fn drain_pending(&mut self) -> Vec<LogLine> {
         self.drain_shelved()
             .into_iter()
             .map(|(line, _)| line)
             .collect()
     }
 
-    /// [`Self::drain_pending`], each line with the file it lands in
-    /// ([`Shelf`], decided when the line was queued). A `Dropped` line is
-    /// the host's: the gap is in aterm's record.
-    pub fn drain_shelved(&mut self) -> Vec<(LogLine, Shelf)> {
+    /// Take every pending line, oldest first, each with the file it lands in
+    /// ([`Shelf`], decided when the line was queued). When lines were dropped
+    /// past [`PENDING_PERSIST_CAP`] since the last drain, a trailing
+    /// [`LogLine::Dropped`] says how many — the host's line: the gap is in
+    /// aterm's record.
+    pub(crate) fn drain_shelved(&mut self) -> Vec<(LogLine, Shelf)> {
         let mut out: Vec<(LogLine, Shelf)> = self.pending.drain(..).collect();
         if self.dropped > 0 {
             out.push((
@@ -898,6 +917,10 @@ impl MessageLog {
             rec.title = words.title.to_string();
             rec.detail = words.detail.to_vec();
             rec.repeats = words.repeats;
+            if let Some((severity, glyph)) = words.mark {
+                rec.severity = severity;
+                rec.glyph = glyph;
+            }
         }
         self.push_pending(LogLine::Retired {
             id,
@@ -906,6 +929,7 @@ impl MessageLog {
             title: words.title.to_string(),
             detail: words.detail.to_vec(),
             repeats: words.repeats,
+            mark: words.mark,
         });
     }
 
@@ -956,6 +980,7 @@ pub(crate) mod tests {
                 title,
                 detail,
                 repeats,
+                mark,
             } => LogLine::Retired {
                 id: *id,
                 how: match how {
@@ -968,6 +993,7 @@ pub(crate) mod tests {
                 title: clip(title, TITLE_CAP),
                 detail: lines(detail),
                 repeats: *repeats,
+                mark: *mark,
             },
             LogLine::Acted { id, unix_ms, label } => LogLine::Acted {
                 id: *id,
@@ -1026,6 +1052,7 @@ pub(crate) mod tests {
                 title: "final\twords \u{1f} us".into(),
                 detail: vec!["a".into(), "b\\c".into()],
                 repeats: 3,
+                mark: None,
             },
             LogLine::Retired {
                 id: MessageId::from_raw(8).unwrap(),
@@ -1036,6 +1063,7 @@ pub(crate) mod tests {
                 title: "t".into(),
                 detail: vec![],
                 repeats: 1,
+                mark: None,
             },
             LogLine::Retired {
                 id: MessageId::from_raw(8).unwrap(),
@@ -1044,6 +1072,7 @@ pub(crate) mod tests {
                 title: "t".into(),
                 detail: vec![],
                 repeats: 1,
+                mark: Some((Severity::Warn, Glyph::or_fallback('\u{26a0}'))),
             },
             LogLine::Acted {
                 id: MessageId::from_raw(7).unwrap(),
@@ -1102,6 +1131,7 @@ pub(crate) mod tests {
             Retired::Evicted,
             Retired::Carried,
             Retired::Withdrawn,
+            Retired::Quit,
             Retired::Resolved(Outcome::Ok),
         ] {
             assert_eq!(Retired::decode(&how.encode()), Some(how));
@@ -1203,17 +1233,51 @@ pub(crate) mod tests {
         assert_eq!(log.next_id().raw(), 41);
         log.replay(LogLine::Posted(posted(40)));
         assert_eq!(log.len(), 2, "deduped by id");
-        // The compaction re-serialises the ring so a reload reads the same.
-        let compact = log.compact_lines();
-        let mut again = MessageLog::empty();
-        for line in compact {
-            again.replay(line);
-        }
+    }
+
+    /// TWO INSTANCES, ONE ID (the owner's `messages.log`, 2026-09-26): a
+    /// test instance posted and retired its id 15; the long-running window,
+    /// whose counter had not seen it, later posted and retired its own 15.
+    /// Both records load, each with its own words. NEGATIVE CONTROL: a Posted
+    /// repeated for a record still open (no Retired line yet) is the same
+    /// record, deduped as before.
+    #[test]
+    fn a_closed_records_id_posted_again_is_another_record() {
+        let id = MessageId::from_raw(15).unwrap();
+        let retired = |title: &str| LogLine::Retired {
+            id,
+            how: Retired::Folded,
+            unix_ms: 9,
+            title: title.into(),
+            detail: vec![],
+            repeats: 1,
+            mark: None,
+        };
+        let mut log = MessageLog::empty();
+        log.replay(LogLine::Posted(LogRecord {
+            title: "2 keys have no effect".into(),
+            ..posted(15)
+        }));
+        log.replay(retired("2 keys have no effect"));
+        log.replay(LogLine::Posted(LogRecord {
+            title: "Claude Code 2.1.283 is up to date".into(),
+            ..posted(15)
+        }));
+        log.replay(retired("Claude Code 2.1.283 is up to date"));
+        let titles: Vec<&str> = log.records().map(|r| r.title.as_str()).collect();
         assert_eq!(
-            again.records().collect::<Vec<_>>(),
-            log.records().collect::<Vec<_>>()
+            titles,
+            ["2 keys have no effect", "Claude Code 2.1.283 is up to date"]
         );
-        assert_eq!(again.next_id(), log.next_id());
+        assert!(
+            log.records()
+                .all(|r| r.state == LogState::Retired(Retired::Folded))
+        );
+
+        let mut open = MessageLog::empty();
+        open.replay(LogLine::Posted(posted(15)));
+        open.replay(LogLine::Posted(posted(15)));
+        assert_eq!(open.len(), 1, "still open: the same record, deduped");
     }
 
     #[test]
@@ -1255,6 +1319,7 @@ pub(crate) mod tests {
                     title: "t",
                     detail: &[],
                     repeats: 1,
+                    mark: None,
                 },
             );
             log.record_acted(id, 3, "Details");
@@ -1304,6 +1369,7 @@ pub(crate) mod tests {
                     title: "t",
                     detail: &[],
                     repeats: 1,
+                    mark: None,
                 },
             );
         };
@@ -1442,6 +1508,7 @@ pub(crate) mod tests {
             title: "t".into(),
             detail: vec![],
             repeats: 12,
+            mark: None,
         };
         let enc = retired.encode();
         let back = LogLine::decode(&enc[..enc.len() - 1]);

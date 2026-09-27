@@ -61,12 +61,11 @@ mod spec_proof_anchors;
 pub use grid::Grid;
 pub use grid::scroll_convert::{scrollback_text_only, set_scrollback_text_only};
 pub use grid::{CellDataView, VisibleRowView};
+pub use grid::{
+    HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
+};
 pub use grid::{MaterializedRow, materialize_from_line};
 pub use grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
-
-// Re-export scrollback budget types. Gated with the disk cold-tier (wasm drops it).
-#[cfg(feature = "disk-tier")]
-pub use grid::scrollback_budget::{BudgetError, ScrollbackBudget, ScrollbackMemoryStats};
 
 // Re-export primary types at crate root for convenience.
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};

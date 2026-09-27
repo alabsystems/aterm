@@ -24,13 +24,12 @@
 //! `commit`'s `<upto>` and `ack`'s `<offset>` must name a record the broker HAS: both
 //! are checked against its visible head first, and an operand at or past it is a usage
 //! error (exit 2, nothing durable done). A consumer group's committed offset is
-//! MONOTONE by construction — no asb verb and no broker request lowers it — so
-//! `asb commit <ep> G 999999` used to exit 0 printing `<offset> committed` and durably
-//! skip G past every record it had not read, with no recovery but a new group name.
-//! That check is why `commit` also requires `<group>` to be subject-shaped: a guarded
-//! broker already does (a group name is a subject the ring must grant), and the head
-//! probe reads under that same name so it is authorized by the same grant the commit
-//! is.
+//! MONOTONE by construction — no asb verb and no broker request lowers it — so an
+//! over-large one would durably skip G past every record it had not read, with no
+//! recovery but a new group name. That check is why `commit` also requires `<group>`
+//! to be subject-shaped: a guarded broker already does (a group name is a subject the
+//! ring must grant), and the head probe reads under that same name so it is authorized
+//! by the same grant the commit is.
 //!
 //! `<endpoint>` is a socket path, or a `host:port` under `--tcp` (serve accepts
 //! `host:0` and prints the OS-chosen port). `sub`'s framing — a header line then
@@ -75,7 +74,7 @@
 //!
 //! AND A SHORT `last` PAGE HAS TWO CAUSES, NOT ONE. Following the resume cursor takes
 //! the broker's row and index-scan limits out of the answer: neither of those can
-//! truncate it silently any more. The head pin has a cost that stays, deliberately.
+//! truncate it silently. The head pin has a cost that stays, deliberately.
 //! The broker decides each subject from its LATEST offset and skips it entirely when
 //! that offset is not below the pinned head, so a subject the walk has not reached yet
 //! whose newest record lands at or above that head is OMITTED from the page rather
@@ -113,17 +112,6 @@
 //! ack retried through the OTHER face — a bridge that shells out here on one path
 //! and links the crate on another — is recognised as the retry it is and dedups.
 //! That agreement is pinned by `broker.ack-key-is-one-wire-contract`.
-//!
-//! HONEST BOUNDARY — AN UPGRADE IS NOT COMPATIBLE ACROSS THIS CHANGE. Before the
-//! two faces were aligned, `astream_broker::ack` keyed on the BARE offset. An ack
-//! that a PRE-ALIGNMENT library caller already put on the log therefore sits under
-//! `(producer_id, offset)`, and a retry of that same logical ack after the upgrade
-//! is keyed `(producer_id, 2^63 | offset)` — a different key, so it appends a
-//! second answer record rather than deduping. The dedup map is durable, so no
-//! protocol version can catch this: the frames are well-formed, it is the stored
-//! key that moved. Drain a log's in-flight acks before upgrading a producer that
-//! used the library helper, or accept one duplicated answer per ack that was
-//! in doubt across the upgrade (the group commit stays monotone either way).
 //!
 //! Plain `--tcp` is plaintext (trusted network only). For the XChaCha20-Poly1305-
 //! sealed transport (asb built `--features aead`) supply the 32-byte pre-shared
@@ -164,7 +152,7 @@
 //! the same secret, and every request is authorized against the grants attached.
 //! Without a secret the broker checks nothing on attach, and a Unix socket's only
 //! boundary is the DIRECTORY it sits in. The secret is held to the same rules
-//! `mint` reads it under — the same trimming, at least [`SECRET_MIN`] bytes, and a
+//! `mint` reads it under — the same bytes (a file exactly, an environment variable trimmed), at least [`SECRET_MIN`] bytes, and a
 //! `--secret-file` readable by its owner alone (mode 0600 or tighter), which
 //! `serve` also demands of its `--key-file`: a daemon that runs for weeks on a
 //! group-readable key has been handing it out the whole time.
@@ -208,7 +196,7 @@ use std::time::Duration;
 
 use astream_broker::{
     AnyClient, AnySubscription, Broker, BrokerHandle, BrokerLog, Closer, Durability, Record,
-    Transport, Walk,
+    Transport, Walk, MAX_RECORD_PAYLOAD,
 };
 
 // The ONE capability-file format and reader, `astream_cap::capfile`: what `mint`
@@ -253,7 +241,8 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
   --secret-env / --secret-file:     the MINT secret, never on argv (a bare --secret is refused): `asb mint` seals
                                     with it, and `asb serve` given one opens a GUARDED broker (needs --features
                                     cap) that refuses an attach whose capability was not minted under it. At
-                                    least 32 bytes once surrounding whitespace is trimmed; a --secret-file (and
+                                    least 32 bytes; a --secret-file is read BYTE FOR BYTE (a trailing newline is
+                                    part of the secret) and --secret-env is trimmed; a --secret-file (and
                                     serve's --key-file) must be readable by its owner alone (0600)
   --unix SOCKET:                    serve with a TCP listener: ALSO serve this Unix socket, from the same broker,
                                     log and guard, so the host's own clients never queue behind the TCP port
@@ -262,6 +251,8 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
   --legacy-unbound:                 mint the read-write UNBOUND god cap -- `/f/F/>` or `rw:/f/F/>`, one authority in
                                     two spellings -- which `mint` otherwise refuses; a grant needs an explicit `ro:`
                                     mode, or `rw,p=<principal>:` to write as exactly that principal
+  --seq M:                          an explicit producer sequence, so a retry of the same (id, seq) is deduped
+                                    (needs a stable --id or one bound grant, like --seq-file)
   --seq-file PATH:                  a write-ahead persisted producer sequence (needs a stable --id or one bound
                                     grant): the file is advanced and fsynced BEFORE the publish, so a crash
                                     between the two BURNS that sequence number -- never a duplicate, but the
@@ -295,19 +286,9 @@ const DEFAULT_PAGE: u32 = 256;
 /// How long `drain` waits with nothing arriving before it stops, by default.
 const DEFAULT_IDLE_MS: u64 = 1000;
 
-/// The producer sequence `asb ack` adds the input offset to: the TOP HALF of the
-/// producer-sequence space is reserved for acks, and `pub` is held below it.
-///
-/// `ack` and `pub` share ONE producer id under a bound grant — the grant permits no
-/// other id — and the broker's dedup key is `(producer_id, producer_seq)`. `ack`'s
-/// sequence must be a function of the input offset (that is what makes a retry
-/// idempotent), and log offsets start at 0, exactly where a `--seq-file` counter
-/// starts. Without a reservation the two spaces overlap precisely where both are
-/// dense, and the loser of a collision is silently deduped away: nothing appended,
-/// no cursor moved, `dup` printed, exit 0. One reserved bit makes them disjoint.
-/// Re-exported from the library so BOTH faces derive an ack's key from ONE constant:
-/// a retry that crosses faces (a bridge that shells out here and links the crate there)
-/// must hit the same dedup key, or it is not a retry at all.
+/// The producer sequence `asb ack` ORs the input offset into: the TOP HALF of the
+/// sequence space is reserved for acks and `pub` is held below it (see the module
+/// doc). Taken from the library so both faces derive an ack's key from ONE constant.
 use astream_broker::ACK_SEQ_BASE;
 
 /// Decode exactly `out.len()` bytes of hex from `hex`. Strict: ASCII hex digits
@@ -349,14 +330,26 @@ enum KeySource {
 /// Read raw secret material from its source, labelled by `flag` (`--key`,
 /// `--secret`) for the error message. An environment variable is REMOVED after
 /// reading, so it is not inherited by anything this process later spawns.
+///
+/// Not `std::env::var`: its `NotUnicode` error renders the variable's VALUE, so a
+/// message built from it would print the secret. The refusal here names the
+/// variable only.
 fn load_bytes(flag: &str, src: &KeySource) -> (String, Vec<u8>) {
     match src {
         KeySource::Env(name) => {
-            let v = std::env::var(name).unwrap_or_else(|e| {
-                warn(&format!("asb: {flag}-env {name}: {e}"));
+            let v = std::env::var_os(name).unwrap_or_else(|| {
+                warn(&format!(
+                    "asb: {flag}-env {name}: environment variable not found"
+                ));
                 exit(2);
             });
             std::env::remove_var(name);
+            let v = v.into_string().unwrap_or_else(|_| {
+                warn(&format!(
+                    "asb: {flag}-env {name}: environment variable is not valid UTF-8"
+                ));
+                exit(2);
+            });
             (format!("{flag}-env {name}"), v.into_bytes())
         }
         KeySource::File(path) => {
@@ -417,35 +410,34 @@ fn check_private(flag: &str, path: &str) {
 fn check_private(_flag: &str, _path: &str) {}
 
 /// Read the MINT secret — arbitrary bytes, not hex, because that is what
-/// `Broker::open_guarded` takes. Surrounding ASCII whitespace is trimmed (a secret
-/// file written by an editor has a trailing newline), so the same secret reaches
-/// the broker whichever way it was stored. `mint` and `serve` read it through this
-/// one function, so the capability a mint seals is the one the guard verifies.
+/// `Broker::open_guarded` takes. `mint` and `serve` read it through this one
+/// function, so the capability a mint seals is the one the guard verifies.
+///
+/// ONE RULE FOR A SECRET FILE, AND IT IS THE AUTHORITY'S: its bytes, exactly. A
+/// mint secret is `head -c 32 /dev/urandom` — raw random bytes, which begin or end
+/// with a whitespace byte about one time in twenty-five — and every other reader of
+/// the same file (the aterm fabric's broker and mint, any embedder calling
+/// `Broker::open_guarded` with `fs::read`) seals with every byte. Trimming here made
+/// `asb mint` seal a DIFFERENT secret from the broker's for those files, silently.
+/// An environment variable is text and cannot hold arbitrary bytes, so `--secret-env`
+/// is trimmed; write a text secret to a file with `printf %s`, not `echo`, and the
+/// two sources agree.
 fn load_secret(src: &KeySource) -> Vec<u8> {
     if let KeySource::File(path) = src {
         check_private("--secret-file", path);
     }
     let (what, raw) = load_bytes("--secret", src);
-    let s = raw.trim_ascii().to_vec();
+    let s = match src {
+        KeySource::File(_) => raw,
+        KeySource::Env(_) => raw.trim_ascii().to_vec(),
+    };
     if s.is_empty() {
         warn(&format!("asb: {what}: the mint secret is empty"));
         exit(2);
     }
     if s.len() < SECRET_MIN {
-        // Say so when it was the TRIM that cut it short: a secret of raw random
-        // bytes (`head -c 32 /dev/urandom`) can begin or end with a whitespace
-        // byte, and a tool that reads the same file byte-for-byte seals with all
-        // 32 of them — the fix is a secret that has no surrounding whitespace.
-        let trimmed = if raw.len() == s.len() {
-            String::new()
-        } else {
-            format!(
-                " after trimming surrounding whitespace ({} bytes before)",
-                raw.len()
-            )
-        };
         warn(&format!(
-            "asb: {what}: the mint secret is {} bytes{trimmed}; it must be at least {SECRET_MIN} (a short key mints capabilities that seal nothing)",
+            "asb: {what}: the mint secret is {} bytes; it must be at least {SECRET_MIN} (a short key mints capabilities that seal nothing)",
             s.len()
         ));
         exit(2);
@@ -599,10 +591,8 @@ struct Cli {
     kv: HashMap<String, String>,
     /// The transport, resolved ONCE per invocation. A key source is SINGLE-USE:
     /// `load_bytes` removes the environment variable it read (so no child inherits
-    /// the secret), so a verb that opens two connections — `drain`, which needs a
-    /// second one to commit on — used to read `--key-env NAME` twice and die on the
-    /// second read with "environment variable not found", after the first
-    /// connection was already up. One resolution serves every connection.
+    /// the secret), and `drain` opens two connections, so one resolution must serve
+    /// every connection.
     transport: std::cell::OnceCell<Transport>,
     /// `--cap-file` is the one REPEATABLE flag: a connection's keyring holds up to
     /// `MAX_KEYRING` grants, and reading one subtree while committing under another
@@ -672,9 +662,9 @@ const ARGV_SECRETS: &[(&str, &str)] = &[
 /// enumerates (0 done, 1 runtime failure, 2 usage), so a supervisor that reads 2 as
 /// "bad config, do not retry" and 1 as "transient, retry" can classify neither, and
 /// for `pub` the retry it guesses at republishes under a fresh default sequence and
-/// puts the record on the bus twice. The read verbs (`sub`, `fetch`, `drain`) have
-/// always surfaced the same failure as a clean exit 1 because they write through
-/// `writeln!` + `?`; this is that path for the verbs that print one line.
+/// puts the record on the bus twice. The record-printing verbs surface the same
+/// failure through `writeln!` + `?`; this is that path for the verbs that print one
+/// line.
 ///
 /// The flush is part of it: a buffered line that fails on the implicit flush at exit
 /// would otherwise be a write error nobody sees at all.
@@ -703,12 +693,11 @@ fn say_durable(line: &str, what: &str) -> io::Result<()> {
 
 /// Every diagnostic `asb` puts on STDERR goes through here.
 ///
-/// `eprintln!` panics on a write error exactly as `println!` does, so a run whose
-/// stderr is ALSO gone (`asb fetch ... 2>&1 | head -0`, a supervisor that closes both
-/// pipes) exited 101 out of the very code path that was reporting a clean exit 1 —
-/// including out of [`usage_error`], which turned a strict-flag refusal into a panic.
-/// A diagnostic that cannot be delivered is DROPPED: the exit status is the part of
-/// the message that always survives, and it is the part a supervisor reads.
+/// Not `eprintln!`, which panics on a write error exactly as `println!` does: a run
+/// whose stderr is ALSO gone (`asb fetch ... 2>&1 | head -0`) would exit 101 out of
+/// the path reporting a clean exit 1. A diagnostic that cannot be delivered is
+/// DROPPED: the exit status is the part of the message that always survives, and it
+/// is the part a supervisor reads.
 fn warn(msg: &str) {
     let mut err = io::stderr().lock();
     let _ = err.write_all(msg.as_bytes());
@@ -781,8 +770,11 @@ fn parse() -> Cli {
         // Anything else that looks like a flag is a mistyped one. It must NOT fall
         // through as a positional: `--psk`, `--Key`, `--form` would otherwise be
         // silently ignored (a plaintext publish where a sealed one was intended).
+        // The message names the flag WITHOUT any `=value`: a mistyped secret flag
+        // (`--psk=<key>`) carries the key there.
         if a.starts_with('-') && a.len() > 1 {
-            usage_error(&format!("unknown flag {a}"));
+            let name = a.split_once('=').map_or(a.as_str(), |(name, _)| name);
+            usage_error(&format!("unknown flag {name}"));
         }
         pos.push(a.clone());
     }
@@ -950,7 +942,7 @@ fn connect_attached(cli: &Cli, ep: &str, caps: &[Cap]) -> io::Result<(AnyClient,
 
 /// The producer id to publish under: an explicit `--id`, else the one a single
 /// bound grant forces, else a per-invocation default. `require_stable` is set by
-/// the verbs whose dedup key must survive a restart (`--seq-file`, `ack`): for
+/// the verbs whose dedup key must survive a restart (`--seq`, `--seq-file`, `ack`): for
 /// those the pid default is not merely unhelpful, it silently breaks the
 /// exactly-once property the caller asked for, so it is an error instead.
 fn producer_id(cli: &Cli, caps: &[Cap], require_stable: Option<&str>) -> u64 {
@@ -978,8 +970,15 @@ fn do_pub(mut c: AnyClient, id: u64, seq: u64, subject: &str, body: &[u8]) -> io
     say_durable(&line, what)
 }
 
+/// Record output goes through a `BufWriter`: stdout is line-buffered, so written
+/// directly every header and every body's trailing newline is a write syscall of its
+/// own. Buffered, a whole page is a handful of writes and a tailed record is one.
+fn stdout_buffered() -> io::BufWriter<io::StdoutLock<'static>> {
+    io::BufWriter::new(io::stdout().lock())
+}
+
 fn do_sub(mut sub: AnySubscription) -> io::Result<()> {
-    let mut out = io::stdout().lock();
+    let mut out = stdout_buffered();
     while let Some((offset, _subject, body)) = sub.recv()? {
         writeln!(out, "{offset} {}", body.len())?;
         out.write_all(&body)?;
@@ -1015,22 +1014,24 @@ fn print_records(out: &mut impl Write, records: &[Record]) -> io::Result<()> {
 /// `last`, bounded by the CALLER's `--max` rather than by the BROKER's own limits.
 ///
 /// One `Last` request returns at most `LAST_PAGE_MAX` rows and visits at most
-/// `LAST_SCAN_MAX` subject-index entries, matched or not — two bounds the operator
-/// never asked for and cannot see on stdout. A page either of them cut short looks
-/// exactly like a complete answer: the same framing, the same closing `MARK`, and
-/// (when the scan bound ran out before anything matched) not even a last subject to
-/// guess a cursor from. `asb last '/f/F/pub/*/*/ack/b7'` over a large `/f/F/pub/`
-/// subtree would print nothing and a `MARK`, and the operator would read that as
-/// "nobody has acknowledged".
+/// `LAST_SCAN_MAX` subject-index entries, matched or not — bounds the operator never
+/// asked for and cannot see on stdout. A page either of them cut short looks exactly
+/// like a complete answer (and when the scan bound ran out before anything matched,
+/// there is not even a last subject to guess a cursor from), so this follows the
+/// broker's resume cursor until it has `max` rows or the cursor says the filter's
+/// range is exhausted.
 ///
-/// So asb follows the broker's resume cursor here instead of handing back a
-/// truncated snapshot: it keeps asking, from the cursor the broker returns, until it
-/// has `max` rows or the cursor says the filter's range is exhausted. What that buys
-/// the shell face is that NEITHER OF THOSE TWO BOUNDS can shorten the answer any
-/// more: `--max` bounds the rows, and a full page continues with `--after <the last
-/// subject printed>`.
+/// The answer is therefore the UNION of several per-request snapshots, each pinned at
+/// its own, later head. `next`/`head` are the FIRST request's — the lowest pin, and the
+/// only one a paired `Subscribe` can start at with no gap — so a row from a later
+/// request may carry an offset at or above the reported `head`. Rows cannot repeat
+/// across requests (the cursor is a strictly increasing subject), but a tailing reader
+/// must fold newest-wins. And a subject whose newest record lands at or above a
+/// request's pin is OMITTED from that page: its displacing record arrives only on the
+/// paired `sub --from <next>`, which is why the completeness contract (module doc) is
+/// `--max` PLUS that `sub`, never `--max` alone.
 ///
-/// THE LOOP IS THE LIBRARY'S: [`Client::last_walk`], the one place that knows how a
+/// THE LOOP IS THE LIBRARY'S: [`Client::last_walk`](astream_broker::Client::last_walk), the one place that knows how a
 /// `Last` answer ends. asb hands it `--after` and `--max` as they came — its `max` is a
 /// bound on the WHOLE walk's rows and each request asks for exactly the rows still
 /// owed, which is the request sequence this function used to make by hand — and prints
@@ -1115,11 +1116,10 @@ fn visible_head(c: &mut AnyClient, filter: &str) -> io::Result<u64> {
 ///
 /// `BrokerLog::commit` appends whatever `upto` it is handed and `group_start` is
 /// `upto + 1`, clamped against nothing; no asb verb and no broker request lowers a
-/// group's cursor. So `asb commit <ep> G 999999` used to exit 0 printing `<offset>
-/// committed` and leave G skipped past every record it had not read — for good, the
-/// only recovery being to abandon the group name, which in this fabric is a
-/// fleet-wide config change. A wrapper interpolating a stale or unset shell variable
-/// is all it took.
+/// group's cursor. An over-large operand — a wrapper interpolating a stale or unset
+/// shell variable — would leave the group skipped past every record it had not read,
+/// for good: the only recovery is abandoning the group name, which in this fabric is
+/// a fleet-wide config change.
 ///
 /// The check is one-sided and cannot go wrong the other way: the head only ever
 /// GROWS, so an `upto` below the head when it was read is still below the head when
@@ -1135,7 +1135,7 @@ fn refuse_past_head(what: &str, value: u64, head: u64) {
 
 /// A bounded read's answer: the page, then where to resume from.
 fn print_page(records: &[Record], next: u64, head: u64) -> io::Result<()> {
-    let mut out = io::stdout().lock();
+    let mut out = stdout_buffered();
     print_records(&mut out, records)?;
     writeln!(out, "MARK next={next} head={head}")?;
     out.flush()
@@ -1168,7 +1168,7 @@ fn print_page(records: &[Record], next: u64, head: u64) -> io::Result<()> {
 /// on the bus — exactly the silent loss `--seq-file` exists to prevent. The staging
 /// file is per-process too (`<path>.<pid>.new`), so even where the lock cannot be
 /// taken two invocations never truncate and rename ONE shared inode out from under
-/// each other (which used to surface as a bare `asb: No such file or directory`).
+/// each other.
 ///
 /// HONEST BOUNDARY: the file advances BEFORE the publish, so a crash in between
 /// BURNS that sequence number — the record is never published and nothing ever
@@ -1207,12 +1207,20 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
                 ),
             )
         })?;
-    // A PER-PROCESS staging name. The old fixed `<path>.new` was one inode every
-    // invocation shared: a peer's `File::create` truncated it mid-write and a peer's
-    // rename moved it away, so this one's rename failed with a bare ENOENT.
+    // A PER-PROCESS staging name: a peer invocation can never truncate it mid-write
+    // or rename it away.
     let tmp = format!("{path}.{}.new", std::process::id());
     let staged = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        // Created FRESH (`create_new`: O_CREAT|O_EXCL), never opened through whatever
+        // already has the name: in a shared directory that may be a planted symlink,
+        // and a plain create truncates and overwrites the link's target. A leftover
+        // from a crashed run under the same pid is unlinked first (unlinking a
+        // symlink never touches its target).
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(next.to_string().as_bytes())?;
         f.sync_all()?;
         drop(f);
@@ -1252,18 +1260,30 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
 /// staging name protects them.
 fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
     let lock_path = format!("{path}.lock");
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("--seq-file {path}: open {lock_path}: {e}"),
-            )
-        })?;
+    // Open the sidecar that is there; CREATE it only when nothing is, and then with
+    // `create_new` (O_EXCL), which refuses a symlink at the name where a plain create
+    // would follow it and make an empty file at the link's target. A concurrent
+    // invocation that created it first is simply opened.
+    let open = |create: bool| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(create)
+            .open(&lock_path)
+    };
+    let f = match open(false) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match open(true) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open(false),
+            other => other,
+        },
+        other => other,
+    }
+    .map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("--seq-file {path}: open {lock_path}: {e}"),
+        )
+    })?;
     match f.lock() {
         Ok(()) => Ok(f),
         Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(f),
@@ -1349,10 +1369,10 @@ fn do_mint(_secret: &[u8], _grant: &str) -> io::Result<()> {
     exit(2);
 }
 
-/// Refuse to take over a Unix socket a live broker is answering on. `Broker::serve`
-/// unlinks whatever is at the path (it cannot tell stale from live), so probe first:
-/// a peer that accepts the connection is a running broker — hijacking its path
-/// would leave two daemons on one log.
+/// Refuse to take over a Unix socket a live broker is answering on: a peer that
+/// accepts the connection is a running broker, and hijacking its path would leave
+/// two daemons on one log. (`Broker::serve` makes the same probe and refuses a path
+/// that is not a socket; checking here names the endpoint in asb's own error.)
 #[cfg(unix)]
 fn refuse_live_socket(ep: &str) {
     if std::fs::metadata(ep).is_ok() && std::os::unix::net::UnixStream::connect(ep).is_ok() {
@@ -1599,16 +1619,24 @@ fn run() -> io::Result<()> {
                 usage_error("--seq and --seq-file both set the producer sequence; pass one");
             }
             let caps = cli.caps();
+            // Parse --seq HERE, not after the connect: a malformed value is a usage
+            // error (exit 2) even when the endpoint is not listening.
+            let explicit_seq = cli.num("--seq");
             // Default to a UNIQUE (id, seq) per invocation, not fixed constants:
             // the broker dedups by (producer_id, producer_seq), so two independent
             // publishers both defaulting to (1, 0) would collide and the second
             // publish would be silently dropped as a dup. A deliberate idempotent
-            // retry passes explicit --id/--seq — which are parsed strictly, so a
-            // mistyped value is an error, never a silently-fresh identity.
-            let id = producer_id(&cli, &caps, seq_file.as_ref().map(|_| "--seq-file"));
-            // Parse --seq HERE, not after the connect: a malformed value is a usage
-            // error (exit 2) even when the endpoint is not listening.
-            let explicit_seq = cli.num("--seq");
+            // retry passes an explicit sequence, and a sequence is only a dedup key
+            // under an id that survives the process: a per-invocation id would make
+            // a retried `--seq` a fresh record, so either sequence flag demands one.
+            let stable_for = if seq_file.is_some() {
+                Some("--seq-file")
+            } else if explicit_seq.is_some() {
+                Some("--seq")
+            } else {
+                None
+            };
+            let id = producer_id(&cli, &caps, stable_for);
             // The top half of the sequence space belongs to `ack` (see ACK_SEQ_BASE),
             // so a publish may not reach into it and collide with one.
             if explicit_seq.is_some_and(|seq| seq >= ACK_SEQ_BASE) {
@@ -1618,6 +1646,14 @@ fn run() -> io::Result<()> {
             }
             let mut body = Vec::new();
             io::stdin().read_to_end(&mut body)?;
+            // A body over the record cap can never be stored, so retrying cannot
+            // help: refuse it as bad input before connecting or burning a sequence.
+            if body.len() > MAX_RECORD_PAYLOAD {
+                usage_error(&format!(
+                    "the body is {} bytes; a record holds at most {MAX_RECORD_PAYLOAD}",
+                    body.len()
+                ));
+            }
             let (c, _) = connect_attached(&cli, &ep, &caps)?;
             // The write-ahead lands here: after the connection is up (so an endpoint
             // that is not there costs no sequence number) and before the Publish.
@@ -1687,13 +1723,10 @@ fn run() -> io::Result<()> {
             cli.only_net("drain", &["--max", "--idle", "--peek"]);
             let max = cli.num("--max").unwrap_or(u64::from(DEFAULT_PAGE)) as usize;
             let idle_ms = cli.num("--idle").unwrap_or(DEFAULT_IDLE_MS);
-            // Range-checked HERE, before anything is connected, the way aspump checks
-            // `--debounce`. `set_read_timeout(Some(Duration::ZERO))` is `InvalidInput`
-            // by std's own contract, and that error used to surface only after both
-            // connections were open, the ring attached and the group subscription
-            // registered on the broker — exit 1 with "cannot set a 0 duration timeout",
-            // naming neither the flag nor the verb, on a wrapper whose arithmetic
-            // (`--idle $((deadline - elapsed))`) had simply reached 0.
+            // Range-checked HERE, before anything is connected:
+            // `set_read_timeout(Some(Duration::ZERO))` is `InvalidInput` by std's
+            // contract, and would otherwise fail only after the group subscription is
+            // registered, as an exit 1 naming neither the flag nor the verb.
             if idle_ms == 0 {
                 usage_error(
                     "--idle expects a positive number of milliseconds: 0 is not a non-blocking take, it is a read timeout the OS refuses",
@@ -1706,7 +1739,14 @@ fn run() -> io::Result<()> {
             let mut committer = if peek {
                 None
             } else {
-                Some(connect_attached(&cli, &ep, &caps)?.0)
+                let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
+                // The committer idles through the whole take, and the broker reaps a
+                // connection that has sent no request within its first-frame timeout:
+                // one round trip now keeps it however long the take runs. (A guarded
+                // broker reaps one with no capability accepted by then; the attach
+                // above is what keeps it there.)
+                c.hello()?;
+                Some(c)
             };
             let mut sub = c.subscribe_group(&group, &filter)?;
             // Bound the wait AFTER the attach round trip, so a short --idle can never
@@ -1720,7 +1760,7 @@ fn run() -> io::Result<()> {
                 Some(committer) => astream_broker::drain(&mut sub, committer, &group, max)?,
                 None => astream_broker::take(&mut sub, max)?,
             };
-            let mut out = io::stdout().lock();
+            let mut out = stdout_buffered();
             print_records(&mut out, &records)?;
             let upto = records
                 .last()
@@ -1776,25 +1816,11 @@ fn run() -> io::Result<()> {
                 let head = visible_head(&mut c, &subject)?;
                 refuse_past_head("offset", offset, head);
             }
-            // The `producer_seq` here is `ACK_SEQ_BASE | offset` — the SAME derivation
-            // `astream_broker::ack` uses (client.rs), from the SAME exported constant.
-            // That agreement is the wire contract `broker.ack-key-is-one-wire-contract`
-            // pins: a bridge that shells out to `asb ack` on one path and links the
-            // crate on another retries across the two faces, and the broker's dedup
-            // recognises it only if both faces key the ack identically. Do not derive
-            // this key a third way — take `ACK_SEQ_BASE` from the library, as here.
-            //
-            // The CLI builds the frame itself rather than calling the helper because it
-            // already holds this connection and its own CLI-shaped `v=1 t=… re=…
-            // state=…` body, and because the operand checks above (the reserved half,
-            // the head) belong to the argv face, not to the library one. The RESERVATION
-            // is why the derivation is what it is: under a bound grant `pub` and `ack`
-            // share one producer id and the broker dedups on `(producer_id,
-            // producer_seq)`, so a `--seq-file` counter and an early input offset would
-            // be the same key and the loser would be swallowed in silence. The top half
-            // is disjoint from every sequence `pub` will accept, and `2^63 | offset` is
-            // still a pure function of the input offset, so a retried ack still appends
-            // nothing.
+            // The `producer_seq` is `ACK_SEQ_BASE | offset` — the SAME derivation, from
+            // the SAME constant, as `astream_broker::ack`, so a retry that crosses the
+            // two faces dedups (`broker.ack-key-is-one-wire-contract`). Do not derive
+            // this key a third way. The frame is built here rather than through the
+            // helper only because the operand checks above belong to the argv face.
             let (at, dup) = c.process_and_produce(
                 id,
                 ACK_SEQ_BASE | offset,
@@ -1859,6 +1885,16 @@ fn main() {
 mod tests {
     use super::{advance_seq_file, decode_hex, print_records};
 
+    /// Removes a test's scratch directory when dropped, so the test leaves nothing
+    /// behind whether it passes or panics.
+    struct Cleanup(std::path::PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn hex_decodes_exact_length_both_cases() {
         let mut out = [0u8; 4];
@@ -1874,8 +1910,8 @@ mod tests {
         assert!(decode_hex(&[b'a'; 64], &mut out).is_ok());
     }
 
-    /// A 64-BYTE key containing a multibyte char used to be sliced by byte index
-    /// inside a `&str` and panic on the char boundary; now it is simply not hex.
+    /// A 64-BYTE key containing a multibyte char is simply not hex — never a
+    /// char-boundary panic.
     #[test]
     fn hex_multibyte_input_is_an_error_not_a_panic() {
         let mut s = String::from("aé"); // 'é' is 2 bytes → 3 bytes so far
@@ -1905,6 +1941,7 @@ mod tests {
     #[test]
     fn seq_file_advances_from_one_and_refuses_a_non_number() {
         let dir = std::env::temp_dir().join(format!("asbseq_{}", std::process::id()));
+        let _tmp = Cleanup(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seq");
         let path = path.to_str().unwrap();
@@ -1923,7 +1960,6 @@ mod tests {
         std::fs::write(path, "not-a-number\n").unwrap();
         let e = advance_seq_file(path).unwrap_err();
         assert!(e.to_string().contains("is not an unsigned integer"), "{e}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An EMPTY or whitespace-only file is not a number either, and it is the shape
@@ -1935,6 +1971,7 @@ mod tests {
     #[test]
     fn seq_file_refuses_an_empty_or_whitespace_only_file() {
         let dir = std::env::temp_dir().join(format!("asbseqempty_{}", std::process::id()));
+        let _tmp = Cleanup(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seq");
         let path = path.to_str().unwrap();
@@ -1957,15 +1994,69 @@ mod tests {
         // ...while a file that is simply not there still starts at 1.
         std::fs::remove_file(path).unwrap();
         assert_eq!(advance_seq_file(path).unwrap(), 1);
+    }
+
+    /// The staging file is created fresh, never opened through whatever already sits
+    /// at its name. In a shared directory anyone can plant `<path>.<pid>.new` as a
+    /// symlink; opening it with a plain create truncated and overwrote the link's
+    /// TARGET, and the rename then left the sequence file itself a symlink to it.
+    #[cfg(unix)]
+    #[test]
+    fn seq_file_staging_never_writes_through_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("asbseqlink_{}", std::process::id()));
+        let _tmp = Cleanup(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seq");
+        let path = path.to_str().unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let staging = format!("{path}.{}.new", std::process::id());
+        std::os::unix::fs::symlink(&victim, &staging).unwrap();
+
+        assert_eq!(advance_seq_file(path).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the sequence file is a plain file"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+    }
+
+    /// The lock sidecar is persistent, so it cannot be created fresh each time — but
+    /// it must not be CREATED through a symlink either: a dangling `<path>.lock`
+    /// pointing anywhere made every invocation create an empty file at the link's
+    /// target, under this process's identity.
+    #[cfg(unix)]
+    #[test]
+    fn seq_file_lock_is_never_created_through_a_dangling_symlink() {
+        let dir = std::env::temp_dir().join(format!("asbseqlock_{}", std::process::id()));
+        let _tmp = Cleanup(dir.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seq");
+        let path = path.to_str().unwrap();
+        let target = dir.join("created-by-a-link");
+        std::os::unix::fs::symlink(&target, format!("{path}.lock")).unwrap();
+
+        let e = advance_seq_file(path).expect_err("a dangling lock link is refused");
+        assert!(e.to_string().contains(".lock"), "{e}");
+        assert!(!target.exists(), "nothing was created at the link's target");
+        assert!(!std::path::Path::new(path).exists(), "nothing was advanced");
+
+        // A lock file that is simply there — the ordinary case — is used as it is.
+        std::fs::remove_file(format!("{path}.lock")).unwrap();
+        assert_eq!(advance_seq_file(path).unwrap(), 1);
+        assert_eq!(advance_seq_file(path).unwrap(), 2);
     }
 
     /// The wildcard-read header cannot be SPOOFED by a subject. `Subject::new`
     /// rejects control bytes but not 0x20, so a publisher holding a legitimate grant
-    /// on a lane may publish to `/f/F/in/n-a1/evil 999`; under the old
+    /// on a lane may publish to `/f/F/in/n-a1/evil 999`; in an
     /// `<offset> <subject> <nbytes>` order a consumer taking the third
-    /// space-separated field as the byte count read 999 and swallowed the framing of
-    /// every record after it. With both numbers first the parse is exact:
+    /// space-separated field as the byte count would read 999 and swallow the framing
+    /// of every record after it. With both numbers first the parse is exact:
     /// `<offset>`, `<nbytes>`, then the subject as the REST of the line — which no
     /// subject can end early, because a subject may not contain a newline.
     #[test]

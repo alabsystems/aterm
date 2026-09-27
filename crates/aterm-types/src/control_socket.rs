@@ -8,20 +8,20 @@
 //! right and exactly shared between the server (`aterm-gui`) and the client
 //! (`aterm-ctl`):
 //!
-//! 1. **Whether to bind at all.** `ATERM_CONTROL_SOCK=0` / `=off` (or
-//!    `ATERM_NO_CONTROL_SOCK=1`) disables the socket entirely.
+//! 1. **Whether to bind at all.** `--control-sock 0` / `off` (or
+//!    `--no-control-sock`) disables the socket entirely.
 //! 2. **Per-socket naming.** Each instance owns `aterm-<pid>.sock` plus a
 //!    matching `aterm-<pid>.token`, so a second instance never hijacks the
 //!    first one's socket; a `aterm.sock` symlink points at the newest
 //!    instance so single-instance usage is unchanged. An instance on an
-//!    explicit `$ATERM_CONTROL_SOCK` path pairs the same way — its token is
+//!    explicit `--control-sock` path pairs the same way — its token is
 //!    named after ITS socket ([`token_name_for_sock`]) — because the two
 //!    private headless instances an agent boots in one scratch directory
 //!    otherwise shared one token file and locked each other's clients out.
 //! 3. **Stale-file tolerance.** A crashed instance leaves its files behind;
 //!    they are removable exactly when their embedded pid is dead.
 //!
-//! Hosts read the environment / directory / `kill(pid, 0)` and pass the
+//! Hosts read their launch flags / directory / `kill(pid, 0)` and pass the
 //! results in; the decisions themselves stay platform-free and testable.
 //!
 //! Platform note: on Windows the `latest` alias ([`LATEST_SOCK_FILE`]) is a
@@ -58,8 +58,8 @@ pub const SIBLING_TOKEN_FILE: &str = "aterm.token";
 /// stops being injective, which is the one property the whole fix rests on.
 const EXPLICIT_TOKEN_PREFIX: &str = "aterm-sock-";
 
-/// What the host should do about the control socket, decided from the
-/// environment by [`socket_directive`].
+/// What the host should do about the control socket, decided from its launch
+/// flags by [`socket_directive`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum SocketDirective {
     /// Bind the per-instance default (`aterm-<pid>.sock` in the per-user dir)
@@ -71,13 +71,13 @@ pub enum SocketDirective {
     Disabled,
 }
 
-/// Decide the socket disposition from the values of `$ATERM_CONTROL_SOCK` and
-/// `$ATERM_NO_CONTROL_SOCK` (`None` = unset).
+/// Decide the socket disposition from the `--control-sock` value and the
+/// `--no-control-sock` switch (`None` = not given; the switch engages by
+/// [`env_flag_engaged`]'s reading).
 ///
-/// `ATERM_CONTROL_SOCK=0` or `=off` (case-insensitive) disables the socket,
-/// as does `ATERM_NO_CONTROL_SOCK` set to anything but `0`/empty. Any other
-/// non-empty `ATERM_CONTROL_SOCK` value is an explicit path override; unset
-/// or empty means the per-instance default.
+/// `--control-sock 0` or `off` (case-insensitive) disables the socket, as does
+/// `--no-control-sock`. Any other non-empty `--control-sock` value is an
+/// explicit path; absent or empty means the per-instance default.
 #[must_use]
 pub fn socket_directive(
     control_sock: Option<&str>,
@@ -93,16 +93,16 @@ pub fn socket_directive(
     }
 }
 
-/// **THE ONE READING of a boolean `ATERM_NO_*` / veto env var** (`None` =
+/// **THE ONE READING of a boolean `ATERM_NO_*` / veto value** (`None` =
 /// unset): engaged only by a value that is non-empty and not `"0"` — the rule
-/// `$ATERM_NO_CONTROL_SOCK` has always used, promoted to a name so every
-/// boolean flag shares it. Unset, EMPTY and `"0"` are "not engaged".
+/// the retired control-socket kill switch always used, promoted to a name so every
+/// boolean switch shares it. Unset, EMPTY and `"0"` are "not engaged".
 ///
 /// WHY THIS EXISTS: `var_os(..).is_some()` treats a present-but-empty variable
 /// as engaged, and empty env vars travel — a shell exporting `ATERM_X=` hands
 /// every descendant an is_some() veto nothing intended. That exact species
 /// disabled the seamless updater on the owner's daily terminal twice over
-/// (an empty `$ATERM_CONTROL_SOCK` on 2026-09-01, and the `ATERM_NO_*` family
+/// (an empty control-socket selector on 2026-09-01, and the `ATERM_NO_*` family
 /// audited the same day). Flag readers go through here, or they re-grow the
 /// bug.
 #[must_use]
@@ -173,7 +173,7 @@ fn sock_name_pid(sock_name: &str) -> Option<u32> {
 ///
 /// * `aterm-<pid>.sock` → `aterm-<pid>.token`: byte for byte the pairing
 ///   every release has shipped, so no default install changes.
-/// * any other name — an explicit `$ATERM_CONTROL_SOCK` path — → that
+/// * any other name — an explicit `--control-sock` path — → that
 ///   socket's OWN filename with `.token` appended (`a.sock` → `a.sock.token`),
 ///   carrying [`EXPLICIT_TOKEN_PREFIX`] when the name does not end in `.sock`.
 ///
@@ -283,7 +283,7 @@ pub fn socket_key(path: &str) -> String {
 
 /// The `pid <n>` line of a discovery graph entry — the pid of the HOSTING
 /// instance that wrote the entry. Written so `aterm-ctl`'s `instances`/`ls`
-/// discovery can report a pid even for an EXPLICIT-`$ATERM_CONTROL_SOCK`
+/// discovery can report a pid even for an EXPLICIT-`--control-sock`
 /// instance whose socket filename does NOT encode one (`instance_pid` only
 /// recovers a pid from the `aterm-<pid>.sock` naming). ONE parser, shared with
 /// the writer, so the two ends can never drift. Additive: an older entry with

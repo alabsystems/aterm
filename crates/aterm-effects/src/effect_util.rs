@@ -56,7 +56,9 @@ pub(crate) fn push_grid_quad(
     premul: u32,
     alpha: u8,
 ) {
-    if w <= 0 || h <= 0 || premul == 0 {
+    // Zero light is skippable only when ADDITIVE: a source-over quad whose
+    // premultiplied colour rounds to black still darkens the cell by `alpha`.
+    if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) {
         return;
     }
     let gw = (geom.cols * geom.cw) as i32;
@@ -811,6 +813,36 @@ mod tests {
             win_h: 96,
             head: 0,
         }
+    }
+
+    /// A SOURCE-OVER quad whose premultiplied colour rounds to black is a
+    /// shadow, not nothing: `src + dst·(1 − a)` with `src == 0` still darkens
+    /// the cell by `a`. PRISM WAKE's light-theme tail pulls its hue toward
+    /// black, so `premul_rgb(shade, a)` reached `0x000000` for one cell and not
+    /// its neighbours, and the zero-colour early-out dropped that one quad —
+    /// a one-frame hole in the shadow (found 2026-09-01). Only ADDITIVE zero
+    /// light (`alpha == 0`) adds nothing and may be skipped.
+    #[test]
+    fn a_source_over_quad_that_rounds_to_black_still_darkens() {
+        let shade = 0x0003_0201;
+        let a = 20;
+        assert_eq!(
+            premul_rgb(shade, a),
+            0,
+            "fixture: the shade must round to black"
+        );
+
+        let mut out = Vec::new();
+        push_grid_quad(&mut out, geom(), 8, 16, 8, 16, premul_rgb(shade, a), a);
+        assert_eq!(out.len(), 1, "a black source-over quad must be pushed");
+        assert_eq!((out[0].color, out[0].alpha), (0, a));
+
+        let mut additive = Vec::new();
+        push_grid_quad(&mut additive, geom(), 8, 16, 8, 16, 0, 0);
+        assert!(
+            additive.is_empty(),
+            "zero ADDITIVE light adds nothing and is skipped"
+        );
     }
 
     /// ONE PULSE LAW, and it is inside the flash bound this crate certifies.

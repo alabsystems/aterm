@@ -11,7 +11,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetApplicationCursorKeys",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_application_cursor_keys(&mut self) {
@@ -23,7 +23,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetApplicationCursorKeys",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_application_cursor_keys(&mut self) {
@@ -35,7 +35,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetOriginMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_origin_mode(&mut self) {
@@ -54,7 +54,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetOriginMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_origin_mode(&mut self) {
@@ -67,7 +67,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetAutoWrap",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_auto_wrap(&mut self) {
@@ -84,7 +84,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetAutoWrap",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_auto_wrap(&mut self) {
@@ -99,7 +99,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetCursorVisible",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn show_cursor(&mut self) {
@@ -130,7 +130,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetCursorVisible",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn hide_cursor(&mut self) {
@@ -146,7 +146,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetFocusReporting",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_focus_reporting(&mut self) {
@@ -158,17 +158,21 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetFocusReporting",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_focus_reporting(&mut self) {
         self.modes.focus_reporting = false;
     }
 
+    // Another encoding REPLACES SGR 1006, so in the model's terms this ends the
+    // SGR encoding (a no-op on the fact when SGR was not in force).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model UTF-8 mouse encoding"
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetSgrMouseEncoding",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_utf8_mouse_encoding(&mut self) {
@@ -178,7 +182,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model UTF-8 mouse encoding"
+            reason = "clears only its own UTF-8 encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
     fn disable_utf8_mouse_encoding(&mut self) {
@@ -187,10 +191,14 @@ impl TerminalHandler<'_> {
         }
     }
 
+    // Another encoding REPLACES SGR 1006, so in the model's terms this ends the
+    // SGR encoding (a no-op on the fact when SGR was not in force).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model URXVT mouse encoding"
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetSgrMouseEncoding",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_urxvt_mouse_encoding(&mut self) {
@@ -200,7 +208,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model URXVT mouse encoding"
+            reason = "clears only its own URXVT encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
     fn disable_urxvt_mouse_encoding(&mut self) {
@@ -209,10 +217,14 @@ impl TerminalHandler<'_> {
         }
     }
 
+    // Another encoding REPLACES SGR 1006, so in the model's terms this ends the
+    // SGR encoding (a no-op on the fact when SGR was not in force).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model SGR pixel mouse encoding"
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetSgrMouseEncoding",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_sgr_pixel_mouse_encoding(&mut self) {
@@ -222,7 +234,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model SGR pixel mouse encoding"
+            reason = "clears only its own SGR pixel encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
     fn disable_sgr_pixel_mouse_encoding(&mut self) {
@@ -236,7 +248,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetSynchronizedOutput",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_synchronized_output(&mut self) {
@@ -258,7 +270,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetSynchronizedOutput",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_synchronized_output(&mut self) {
@@ -277,7 +289,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetInsertMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_insert_mode(&mut self) {
@@ -289,7 +301,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetInsertMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_insert_mode(&mut self) {
@@ -301,7 +313,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetNewLineMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_new_line_mode(&mut self) {
@@ -313,7 +325,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetNewLineMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_new_line_mode(&mut self) {
@@ -325,7 +337,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model VT52 compatibility (DECANM mode 2)"
+            reason = "the TerminalModes model does not model VT52 compatibility (DECANM mode 2)"
         )
     )]
     pub(super) fn set_vt52_mode(&mut self, enabled: bool) {
@@ -341,7 +353,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model 132-column mode (DECCOLM mode 3)"
+            reason = "the TerminalModes model does not model 132-column mode (DECCOLM mode 3)"
         )
     )]
     fn set_column_mode_132(&mut self, enabled: bool) {
@@ -375,7 +387,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model reverse video (DECSCNM mode 5)"
+            reason = "the TerminalModes model does not model reverse video (DECSCNM mode 5)"
         )
     )]
     fn set_reverse_video(&mut self, enabled: bool) {
@@ -387,10 +399,24 @@ impl TerminalHandler<'_> {
         self.grid.damage_mut().mark_full();
     }
 
+    // Mode 12 moves the cursor STYLE (its blink bit, below), so it is a site of
+    // the cursor-shape actions beside DECSCUSR, not an unmodelled mode: the
+    // resulting shape is the host's (`RestoreCursorStyle`) or not
+    // (`SetCursorStyle`).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model cursor blink (mode 12)"
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetCursorStyle",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "RestoreCursorStyle",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn set_cursor_blink(&mut self, enabled: bool) {
@@ -415,16 +441,13 @@ impl TerminalHandler<'_> {
             // swallow a mode-only change, and tell the host its cursor moved
             // class. The cursor cell carries both (see `show_cursor`).
             self.grid.mark_cursor_damage();
-            if let Some(callback) = self.cursor_style_callback {
-                callback(style);
-            }
         }
     }
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model reverse wraparound (DECSET 45)"
+            reason = "the TerminalModes model does not model reverse wraparound (DECSET 45)"
         )
     )]
     fn set_reverse_wraparound(&mut self, enabled: bool) {
@@ -434,7 +457,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model left/right margin mode (DECLRMM mode 69)"
+            reason = "the TerminalModes model does not model left/right margin mode (DECLRMM mode 69)"
         )
     )]
     fn set_left_right_margin_mode(&mut self, enabled: bool) {
@@ -447,7 +470,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model DECSDM (Sixel Display Mode, mode 80)"
+            reason = "the TerminalModes model does not model DECSDM (Sixel Display Mode, mode 80)"
         )
     )]
     fn set_sixel_display_mode(&mut self, enabled: bool) {
@@ -457,7 +480,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model alternate scroll (DECSET 1007)"
+            reason = "the TerminalModes model does not model alternate scroll (DECSET 1007)"
         )
     )]
     fn set_alternate_scroll(&mut self, enabled: bool) {
@@ -467,7 +490,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model grapheme cluster mode (mode 2027)"
+            reason = "the TerminalModes model does not model grapheme cluster mode (mode 2027)"
         )
     )]
     fn set_grapheme_cluster_mode(&mut self, enabled: bool) {
@@ -477,7 +500,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model application keypad (DECKPAM/DECKPNM)"
+            reason = "the TerminalModes model does not model application keypad (DECKPAM/DECKPNM)"
         )
     )]
     pub(super) fn set_application_keypad(&mut self, enabled: bool) {
@@ -490,7 +513,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model BiDi arrow swap (DECSET 1243)"
+            reason = "the TerminalModes model does not model BiDi arrow swap (DECSET 1243)"
         )
     )]
     fn set_bidi_arrow_swap(&mut self, enabled: bool) {
@@ -500,7 +523,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model BiDi box mirroring (DECSET 2500)"
+            reason = "the TerminalModes model does not model BiDi box mirroring (DECSET 2500)"
         )
     )]
     fn set_bidi_box_mirroring(&mut self, enabled: bool) {
@@ -515,7 +538,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model BiDi autodetection (DECSET 2501)"
+            reason = "the TerminalModes model does not model BiDi autodetection (DECSET 2501)"
         )
     )]
     fn set_bidi_autodetection(&mut self, enabled: bool) {
@@ -531,7 +554,7 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "TerminalModes.tla does not model BDSM (ANSI mode 8, Bidirectional Support Mode)"
+            reason = "the TerminalModes model does not model BDSM (ANSI mode 8, Bidirectional Support Mode)"
         )
     )]
     fn set_bidi_support_mode(&mut self, set: bool) {

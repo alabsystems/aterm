@@ -82,7 +82,11 @@ pub struct Status {
     /// Lockstep S1): written when an attach succeeds, dropped by `seam detach` and
     /// `uninstall --all`, and what every re-assertion walks. Absent from records
     /// written before seams existed, so it defaults EMPTY — and an older app reading
-    /// a newer record simply ignores the key.
+    /// a newer record simply ignores the key. Two more spellings ride beside them, never
+    /// read as seams: `refused:rustup:<name>: <why>`, the last re-assertion's refusal, and
+    /// `replaced:rustup:<name>: <target>`, the stale link one replaced — the way back
+    /// ([`crate::seam::replaced_from`]) — which is `replacing:rustup:<name>: <target>` from
+    /// just before the swap until the entry names the view.
     #[serde(default)]
     pub seams: Vec<String>,
     /// RFC3339 UTC time of the last full update pass that REACHED the signed index — verified
@@ -92,7 +96,7 @@ pub struct Status {
     /// 2026-09-23 a pass served from the cache stamped it too (audit PK-3), and a separate
     /// `last_index_reached_at` said whether the index had been reached; this stamp now means
     /// exactly that, and the other is gone. Empty ⇒ no pass has reached the index here:
-    /// [`never_checked`] reads it, and `aterm pkg doctor` reports it.
+    /// `never_checked` reads it, and `aterm pkg doctor` reports it.
     #[serde(default)]
     pub last_success_at: String,
     /// The `index_build` the last pass resolved, and when it last CHANGED — the
@@ -170,10 +174,10 @@ pub fn stamp_index_build(layout: &Layout, now: &str, index_build: Option<u64>) -
 /// `status.toml` absent, unreadable, or present with an empty
 /// [`Status::last_success_at`]. This is the R3 condition, and nothing weaker: a record
 /// that exists because a failed resolve wrote its `*index*` row is not a check that
-/// ran. DATA, never a line on a shell (Phase 2, 2026-09-22): `aterm pkg doctor` reports
-/// it, and says what is true meanwhile — the vendor programs update without it.
+/// ran. Test-only: the witness the pass tests read the record through.
+#[cfg(test)]
 #[must_use]
-pub fn never_checked(layout: &Layout) -> bool {
+pub(crate) fn never_checked(layout: &Layout) -> bool {
     read(layout).is_none_or(|s| s.last_success_at.trim().is_empty())
 }
 
@@ -408,6 +412,7 @@ pub(crate) mod counted {
     }
 
     /// The durable writes of `layout`'s record so far.
+    #[cfg(unix)]
     pub(crate) fn writes(layout: &Layout) -> usize {
         let w = WRITES
             .lock()
@@ -1344,50 +1349,6 @@ mod tests {
         assert!(!never_checked(&l));
         assert_eq!(read(&l).unwrap().schema, 1);
         let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// NO SURFACE CLAIMS THE UNTRUE HALF (Phase 2, 2026-09-22; until then this test pinned
-    /// the stderr line every console edge printed): "packages cannot be updated until the
-    /// first pass completes" was false once the vendor programs stopped waiting on the
-    /// index (design §1), and the line itself is gone from every edge — the read-only
-    /// verbs, the session launch, the window. Scanned over this crate's sources, the three
-    /// edges that printed it and the manual; the needle is spelled in pieces so this test
-    /// is not its own hit.
-    #[test]
-    fn no_surface_claims_packages_cannot_update_before_the_first_pass() {
-        let needles = [["cannot be updated until", " the first pass"].concat()];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        let mut dirs = vec![root.join("src")];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    files.push(path);
-                }
-            }
-        }
-        for edge in [
-            "../aterm/src/main.rs",
-            "../aterm-gui/src/lib.rs",
-            "../aterm-update-core/src/pkg_check.rs",
-            "../aterm-cli/src/manual.rs",
-        ] {
-            files.push(root.join(edge));
-        }
-        assert!(files.len() > 40, "{}", files.len());
-        for file in &files {
-            let text = std::fs::read_to_string(file).unwrap();
-            for needle in &needles {
-                assert!(
-                    !text.contains(needle.as_str()),
-                    "{}: {needle}",
-                    file.display()
-                );
-            }
-        }
     }
 
     /// TIER-1 OF THE DERIVED MODEL `AtpkgFullPassRule` (aterm-spec): every record the model

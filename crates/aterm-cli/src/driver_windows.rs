@@ -450,14 +450,14 @@ pub(crate) fn run(
     let code = aterm_pty::exit_code(shell.pid).unwrap_or(1);
     aterm_pty::close_master(master);
     if verbose {
-        // The unix twin's wording, for the same reason: the old line claimed the
-        // VT core had processed every byte, which is true only when armed.
+        // The unix twin's wording, for the same reason: the VT core clause only
+        // when the dev-only seam armed it.
         let modelled = if engine.is_some() {
-            "and into the armed VT core"
+            " and into the armed VT core"
         } else {
-            "(session model off: nothing modelled)"
+            ""
         };
-        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through {modelled}.");
+        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through{modelled}.");
     }
     code
 }

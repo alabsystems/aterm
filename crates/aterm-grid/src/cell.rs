@@ -147,6 +147,7 @@ impl Cell {
     /// RGB values must be written to `CellExtras` separately at each position.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn bce_blank_from_bg(bg: PackedColor) -> Self {
         if bg.is_default() {
             Self::EMPTY
@@ -186,6 +187,7 @@ impl Cell {
     /// For complex cells, use the overflow table with `char_data()` as key.
     #[must_use]
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn codepoint(&self) -> u32 {
         // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
@@ -265,7 +267,7 @@ impl Cell {
     }
 
     /// Get the StyleId if this cell uses style interning, otherwise None.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     #[inline]
     pub const fn style_id_opt(&self) -> Option<StyleId> {
@@ -431,6 +433,7 @@ impl Cell {
     /// False positive for: unprotected wide-continuation spacers.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn is_protected(&self) -> bool {
         // Copy from packed struct to avoid unaligned access
         let flags = self.flags;

@@ -21,11 +21,8 @@ pub use crate::grid::{CurrentStyle, SavedCursorState};
 pub use aterm_types::TerminalModes;
 pub use aterm_types::mouse::MouseEncoding;
 pub use aterm_types::mouse::MouseMode;
-pub use aterm_types::osc::{Iterm2CellSize, Iterm2SetColor, Iterm2ShellIntegrationVersion};
-pub use aterm_types::{
-    ClipboardOperation, ClipboardSelection, CopyToClipboardOperation, CursorStyle, TerminalSize,
-    TerminalSnapshot,
-};
+pub use aterm_types::osc::Iterm2ShellIntegrationVersion;
+pub use aterm_types::{ClipboardOperation, ClipboardSelection, CursorStyle, TerminalSize};
 
 // ============================================================================
 // Terminal-only State Types
@@ -136,76 +133,11 @@ pub(super) struct SgrStackEntry {
 // Crate-internal re-exports
 // ============================================================================
 
-pub(crate) use aterm_types::osc::{
-    MultipartFileOperation, RemoteHost, SemanticBlock, SemanticBlockEvent, SemanticButton,
-    SemanticButtonEvent, SemanticButtonType,
-};
-
-// ============================================================================
-// Terminal-internal clipboard state
-// ============================================================================
-
-mod clipboard {
-    use super::super::MAX_COPY_TO_CLIPBOARD_CAPTURE_BYTES;
-
-    /// State for tracking CopyToClipboard text capture mode.
-    ///
-    /// When CopyToClipboard=name is received, the terminal enters text capture
-    /// mode. All printed characters are accumulated until EndCopy is received.
-    #[derive(Debug, Clone)]
-    pub struct CopyToClipboardState {
-        /// Named pasteboard to copy to.
-        ///
-        /// Read by the OSC 1337 CopyToClipboard executor in the FFI layer
-        /// (ffi_bridge/); inert in the default lib build.
-        #[allow(
-            dead_code,
-            reason = "copy target read by the OSC 1337 CopyToClipboard FFI executor"
-        )]
-        pub pasteboard: String,
-        /// Accumulated text content.
-        pub content: String,
-        /// True once incoming content exceeds the capture cap.
-        ///
-        /// After overflow, we keep dropping all future chars so captured
-        /// content remains a strict prefix of the stream.
-        capture_truncated: bool,
-    }
-
-    impl CopyToClipboardState {
-        /// Create a new capture state for the given pasteboard name.
-        #[allow(
-            dead_code,
-            reason = "constructor consumed by the OSC 1337 CopyToClipboard FFI layer"
-        )]
-        pub fn new(pasteboard: String) -> Self {
-            Self {
-                pasteboard,
-                content: String::new(),
-                capture_truncated: false,
-            }
-        }
-
-        /// Append a character to the captured content.
-        pub fn push(&mut self, c: char) {
-            if self.capture_truncated {
-                return;
-            }
-
-            let char_len = c.len_utf8();
-            if self.content.len().saturating_add(char_len) <= MAX_COPY_TO_CLIPBOARD_CAPTURE_BYTES {
-                self.content.push(c);
-            } else {
-                self.capture_truncated = true;
-            }
-        }
-    }
-}
+pub(crate) use aterm_types::osc::RemoteHost;
 
 // ============================================================================
 // Terminal-internal re-exports (only used within terminal/)
 // ============================================================================
 
 pub(super) use aterm_types::TerminalCapabilities;
-pub(super) use aterm_types::osc::{Notification, TaskbarProgress, TextSizingOperation};
-pub(super) use clipboard::CopyToClipboardState;
+pub(super) use aterm_types::osc::{Notification, TaskbarProgress};

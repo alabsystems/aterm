@@ -51,13 +51,13 @@
 //!   delete interrupted — the owner's law is that momentum resumes, it does
 //!   not start over. The metric is not touched by the mark, the mark arms
 //!   no timer (it is a value read at the next key and stale by then or not),
-//!   and [`Spine::at_rest`] ignores it.
+//!   and `Spine::at_rest` ignores it.
 //! * **FLOW IS A COUNTER TOO, not a seventh integrator** (§23's addendum
 //!   "Flow state", 2026-09-09). One `u32` — keys typed at
 //!   [`FLOW_KEY_DISP`] or above with no delete since the run began — and its
 //!   high-water mark. It has no clock, no timer and no deadline: [`Flow`] is
 //!   a pure function of that counter, the metric is untouched by it, and an
-//!   idle spine ([`Spine::at_rest`]) drops the run on the tick it snaps to
+//!   idle spine (`Spine::at_rest`) drops the run on the tick it snaps to
 //!   zero, so idle → exactly zero holds for flow as it holds for the light.
 //!   Flow DRAWS NOTHING of its own; it re-prices births that each ride their
 //!   own key.
@@ -165,7 +165,7 @@ pub const DISP_PEAK_FLOOR_SHARE: f32 = 0.8;
 
 /// Below this the follower and the peak memory snap to EXACTLY zero, so an
 /// idle engine disarms on a clean zero instead of chasing denormal residue —
-/// T6, and the reason [`Spine::at_rest`] is an exact comparison and not a
+/// T6, and the reason `Spine::at_rest` is an exact comparison and not a
 /// tolerance. The same threshold ends a slam: a rise within it of its target
 /// is "reached" (see [`Spine::update`]).
 pub const DISP_SNAP_ZERO: f32 = 0.005;
@@ -537,7 +537,7 @@ impl Spine {
     /// slam detector (a rise of the gained target), the peak memory (of the
     /// follower that chased it) and the first-tick latch all read this and
     /// nothing else reads the multiplied value, so the raw metric is
-    /// reported raw everywhere ([`Spine::momentum`], [`Spine::at_rest`]).
+    /// reported raw everywhere ([`Spine::momentum`], `Spine::at_rest`).
     #[inline]
     fn target(&self, now: Instant) -> f32 {
         (self.momentum.value(now) * METRIC_GAIN).clamp(0.0, 1.0)
@@ -638,6 +638,7 @@ impl Spine {
     /// [`Spine::birth_disp`].
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn disp_peak(&self) -> f32 {
         self.disp_peak
     }
@@ -685,6 +686,7 @@ impl Spine {
     /// armed on it.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn verdict_open(&self, now: Instant) -> bool {
         self.verdict
             .is_some_and(|at| now.saturating_duration_since(at).as_secs_f32() <= VERDICT_WINDOW_S)
@@ -695,6 +697,7 @@ impl Spine {
     /// glass, and nothing is armed on it).
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn erase_mark(&self) -> Option<EraseMark> {
         self.mark
     }
@@ -770,6 +773,7 @@ impl Spine {
     /// which one is low.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn momentum(&self, now: Instant) -> f32 {
         self.momentum.value(now)
     }
@@ -785,6 +789,7 @@ impl Spine {
     /// the host awake for a minute of idle. §18's cadence rule is the three
     /// POOLS being non-empty; the spine is a number, not a mark.
     #[must_use]
+    #[cfg(test)]
     pub fn at_rest(&self, now: Instant) -> bool {
         self.disp == 0.0 && self.disp_peak == 0.0 && self.momentum.value(now) == 0.0
     }

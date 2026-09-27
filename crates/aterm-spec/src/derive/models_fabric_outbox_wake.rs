@@ -88,3 +88,59 @@ pub fn fabric_reconnect_backoff_model() -> Model {
         }
     }
 }
+
+/// A discovered session keeps its refill debt across a failed broker Fetch.
+/// The durable group cursor may already be past its old mail. The subscription
+/// can already be live when a new session is discovered, so its newer group
+/// record must wait for refill even if the reader has queued it. `Buggy=1`
+/// allows the former lost-debt path and premature delivery after a live Fetch
+/// failure. Tier-1 drives both timings through the real bridge and broker.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn fabric_refill_retry_model() -> Model {
+    crate::ty_model! {
+        FabricRefillRetry {
+            const Buggy = 0;
+            var discovered = 0;
+            var owed = 0;
+            var connected = 0;
+            var failures = 0;
+            var old_delivered = 0;
+            var live = 0;
+            var new_delivered = 0;
+
+            action Discover when (discovered == 0) {
+                discovered = 1;
+                owed = 1;
+            }
+            action Attach when (connected == 0) {
+                connected = 1;
+            }
+            action FetchFails when (connected == 1 && owed == 1 && failures == 0) {
+                connected = 0;
+                failures = 1;
+                owed = if Buggy == 1 { 0 } else { 1 };
+            }
+            action RefillCompletes when (connected == 1 && owed == 1) {
+                old_delivered = 1;
+                owed = 0;
+            }
+            action Subscribe when (connected == 1 && owed == 0 && live == 0) {
+                live = 1;
+            }
+            action DeliverNew when (live == 1 && discovered == 1 && new_delivered == 0
+                && (Buggy == 1 || (connected == 1 && owed == 0))) {
+                new_delivered = 1;
+            }
+
+            invariant RefillDebtSurvivesFailure:
+                discovered == 0 || old_delivered == 1 || owed == 1;
+            // A reader opened before discovery may stay open while refill is
+            // owed. It may not be treated as ready after that debt disappears
+            // until the old record was actually delivered.
+            invariant OldBeforeLive:
+                live == 0 || discovered == 0 || owed == 1 || old_delivered == 1;
+            invariant OldBeforeNew: new_delivered == 0 || old_delivered == 1;
+        }
+    }
+}

@@ -8,7 +8,7 @@
 //! apply an operator override.
 //!
 //! The three profiles form a refinement chain `Hardened ⊆ Standard ⊆
-//! Permissive` (§4.5). The [`refinement::response_rank`] helper in this module
+//! Permissive` (§4.5). The `refinement::response_rank` helper in this module (test and Kani builds)
 //! provides the numeric ordering used by the tests that assert the chain — the
 //! rank is *not* authoritative policy semantics; it is a scaffold for the
 //! Kani `policy_refinement.rs` harness landing in #7998.
@@ -368,7 +368,8 @@ pub fn hardened() -> Policy {
 /// The real refinement proof lands in #7998 (Kani + TLA+). This module
 /// provides the scalar rank used by the Phase 0 tests to guard against
 /// accidental inversion while the engine is still being built.
-pub mod refinement {
+#[cfg(any(kani, test))]
+pub(crate) mod refinement {
     use crate::Response;
 
     /// Map a response to a numeric "strictness" rank:

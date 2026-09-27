@@ -23,8 +23,9 @@ pub enum Anchor {
 
 impl Anchor {
     /// The spelling a `.vendor` record carries.
+    #[cfg(test)]
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::AnthropicOpenPgp => "anthropic-openpgp",
             Self::OpenAiTwoHost => "openai-two-host",

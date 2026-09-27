@@ -46,6 +46,7 @@ impl Grid {
     /// same lossy-but-bounded posture `checkpoint_snapshot` takes for
     /// scrollback. The common in-memory case never hits this branch.
     #[must_use]
+    #[cfg(test)]
     pub fn checkpoint_lines(&self) -> Vec<Line> {
         let scrollback_count = self.scrollback_lines();
         let mut lines = Vec::with_capacity(scrollback_count + self.rows() as usize);
@@ -67,7 +68,7 @@ impl Grid {
 
     /// Project the visible rows preceded by at most `max_history` lines of the
     /// MOST RECENT scrollback, in the same dense scrollback-then-visible layout
-    /// [`Self::checkpoint_lines`] produces.
+    /// `Self::checkpoint_lines` produces.
     ///
     /// This is the seamless-handoff projection.
     /// [`Self::checkpoint_visible_lines`] bounded the cost by carrying no history
@@ -82,7 +83,7 @@ impl Grid {
     /// trimming from the FRONT is always sound.
     ///
     /// Returns the same thing as [`Self::checkpoint_visible_lines`] when
-    /// `max_history == 0`, and as [`Self::checkpoint_lines`] when `max_history`
+    /// `max_history == 0`, and as `Self::checkpoint_lines` when `max_history`
     /// meets or exceeds [`Self::scrollback_lines`].
     #[must_use]
     pub fn checkpoint_lines_bounded(&self, max_history: usize) -> Vec<Line> {
@@ -146,7 +147,7 @@ impl Grid {
     /// This does **not** touch scrollback; callers reconstruct scrollback at
     /// grid-construction time (e.g. by attaching a populated
     /// `ScrollbackStorage`). It is the inverse of the *visible* half of
-    /// [`checkpoint_lines`](Self::checkpoint_lines).
+    /// `checkpoint_lines`.
     pub fn restore_visible_from_lines(&mut self, visible: &[Line]) {
         let rows = self.rows();
         let cols = self.cols();

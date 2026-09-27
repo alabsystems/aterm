@@ -71,6 +71,9 @@ fn sing_projection(detector: &KittySing, now: Instant, abstract_count: u32) -> S
             },
         ),
         ("drive_live", i64::from(drive_live)),
+        // The shipping detector has one arm; the model's `Buggy=1` fault
+        // selector is always 0 here.
+        ("ramp_fault", 0),
     ])
 }
 
@@ -120,7 +123,12 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
             // Exact historical mutant: SING-ALONG armed on the eighth press.
             // The transition exists only under Buggy=1, and its post-state
             // demonstrably violates the healthy threshold invariant.
-            let early = BTreeMap::from([("phase", 1), ("count", 8), ("drive_live", 1)]);
+            let early = BTreeMap::from([
+                ("phase", 1),
+                ("count", 8),
+                ("drive_live", 1),
+                ("ramp_fault", 0),
+            ]);
             assert!(!model.check_invariant("ArmedRequiresCurrentThreshold", &early));
             let (healthy_ok, _) = verify::validate_transition_tiered(
                 &model,
@@ -158,6 +166,34 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
                 "real FULL-NYAN sixteenth-press arm",
             );
             assert!(detector.is_armed(at));
+            assert_eq!(detector.drive(at), 1.0, "the arm is at full drive at once");
+            // Negative control, at the projection: no shipping function ramps
+            // the drive in, so this is the real sixteenth-press projection with
+            // the one field a ramped-in arm changes. The projection reads
+            // `is_armed` and `drive` independently, so such an arm would
+            // project to exactly this state: the healthy `Repeat` refuses it,
+            // `ArmedRunIsAtFullDrive` names the defect, and it is the `Buggy=1`
+            // successor of the same run once the ramped arm was picked.
+            let mut silent = post.clone();
+            silent.insert("drive_live", 0);
+            let (healthy_ok, _) = verify::validate_transition_tiered(
+                &model,
+                &[],
+                &prev,
+                &silent,
+                Some("Repeat"),
+                "healthy rejection of a FULL-NYAN arm that ramps in from zero",
+            );
+            assert!(!healthy_ok, "the healthy detector admitted a silent arm");
+            assert!(!model.check_invariant("ArmedRunIsAtFullDrive", &silent));
+            assert!(model.check_invariant("ArmedRequiresCurrentThreshold", &silent));
+            let (mut picked, mut ramped) = (prev.clone(), silent);
+            picked.insert("ramp_fault", 1);
+            ramped.insert("ramp_fault", 1);
+            assert_eq!(
+                interp::with_buggy(&model, 1).successors("Repeat", &picked),
+                vec![ramped]
+            );
         } else {
             assert!(!detector.is_armed(at));
         }

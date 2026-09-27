@@ -72,7 +72,7 @@ WHAT IT IS
   active processes / UI restrictions on the child's Job Object), not raw forkpty/execvp.
   This passthrough CLI serves NO control socket of its own; the live, introspectable
   surface an AI reads and drives (via `aterm ctl`) is exposed by the WINDOW mode of the
-  same binary — `aterm --window`, or `aterm --headless` (ATERM_HEADLESS=1).
+  same binary — `aterm --window`, or `aterm --headless`.
   See `aterm help introspection`.
 
 KEY USAGE
@@ -83,9 +83,9 @@ KEY USAGE
   aterm doctor               pre-flight health check; exit 0 = ready, and scriptable.
                              The `tty` row is a `note`, not a verdict: it measures
                              doctor's OWN stdout, so a piped, CI or agent run no longer
-                             exits 1 on a healthy machine. Only `containment` and
-                             `shell` move the code; `tty` and `privacy` never do.
-  aterm show-config | validate-config | explain-config | list-fonts | list-themes
+                             exits 1 on a healthy machine. Only `shell` moves the
+                             code; `tty` and `privacy` never do.
+  aterm show-config | explain-config | list-fonts | list-themes
                              read-only diagnostics; print and exit, no shell spawned
   aterm list-kitty-commands  the words the cursor cat obeys when typed, by language
                              (what they do and when they fire: `aterm help kitty`)
@@ -106,7 +106,7 @@ GOTCHAS
     atpkg linked INTO this one binary, not a sibling executable: nothing to co-locate,
     nothing to be missing, and an unknown pkg verb is a usage error. (Historic note:
     pre-one-binary builds exited 127 when the sibling `atpkg` binary was missing.)
-  * Containment precedence: explicit flag > $ATERM_CONTAINMENT_MODE > default `user`;
+  * Containment: the --containment / --sandbox / --no-sandbox flag, else `user`;
     a malformed mode fails CLOSED to `containment`. The OS sandbox is actuated on macOS
     only; elsewhere it is resource caps (rlimits on Linux, the Job Object on Windows) +
     capability gate, and aterm says so on stderr.
@@ -265,9 +265,9 @@ GOTCHAS
     content outside the markers is never touched (an unterminated marker fails closed).
   * A bare `install` skips undetected agents (no config dir = not in use) — name an
     agent explicitly to force it.
-  * The block is intentionally short — three `##` sections, about forty lines (three more
-    for Codex, whose addendum says its sandbox refuses the control socket and that nothing
-    is configured around it):
+  * The block is intentionally short — three `##` sections, under fifty lines (a test in
+    aterm-primer caps the generic block at 48; Codex gets a four-line paragraph more, saying
+    its sandbox refuses the control socket and nothing is configured around it):
     the aterm brief (detection, `aterm help`, first moves — `aterm ctl windows` / `ls`,
     and read a peer's `status` before typing into it — and env hygiene), the Rust note,
     and the inbox note. Depth lives HERE, behind `aterm help`, not in the agent's
@@ -286,27 +286,78 @@ GOTCHAS
     },
     Topic {
         name: "harness",
-        tagline: "the Claude Code harness — the window's default supervisor, its read views, the live upgrade",
+        tagline: "the agent harness — the window's default supervisor, its read views, the live upgrade",
         body: Some(
-            r#"harness — the Claude Code harness (`aterm harness`): four read views of what a
-Claude Code session is spending, hitting and leaving on disk, and of what the
+            r#"harness — the agent harness (`aterm harness`): four read views of what
+a Claude Code session is spending, hitting and leaving on disk, and of what the
 supervisor decided about it — and `upgrade`, which moves a live Claude Code onto a
-newer build.
+newer build and up a model priority list.
 
-WHAT IT IS
-  A reader, plus the live upgrade (below), which restarts the agent process and is
-  not a supervisor policy. The supervisor that ACTS on a session is the window's own:
-  it supervises every Claude Code session by default, under aterm.toml's [harness]
-  table (`enabled = false` turns it off; a headless instance supervises only with
-  `headless = true`). It presses the approving option only on a box it can prove
-  safe — a read-only Bash box, the rm circuit breaker in a bypass session when every
-  target resolves under a scratch root, a Read box outside the secrets list, the
-  folder-trust dialog for the session's own folder under a trust root — never
-  "don't ask again"; it continues a turn that ended after real work (at most 6 an
-  hour), switches a model-bucket limit to `/model opus` and back at its reset, and
-  escalates everything else to the menu bar with one notification (the session's
-  `attention`, `owner=supervisor`; it posts no mail). An aterm.toml that does not
-  load leaves it escalating only. Codex sessions are not supervised yet.
+WHAT IT IS (as of 2026-09-25)
+  A reader, plus the live upgrade (below). The supervisor that ACTS on a session is
+  the window's own: it supervises every Claude Code session by default, and every
+  Codex session (read by Codex's own reader), under aterm.toml's [harness] table.
+  Unless the table says otherwise it is FULLY AUTOMATIC — nobody is at the
+  keyboard, so nothing waits on a person:
+  * every box gets its answer: a permission box its one-shot allow (any tool, any
+    vendor note, every rm circuit breaker; never "don't ask again", a session grant
+    or a purchase — credits the account turned off stay off — and a box with no yes
+    it may take gets its `No`); the folder-trust dialog its Yes; a plan its yes that
+    grants no standing mode (`Yes, manually approve edits`); `Session paused` its
+    `Switch to <model>`; the confirmation a `/model` or `/effort` you typed raises
+    on a warm conversation its yes (not when your own PreModelSwitch hook asked
+    for it); a setup dialog, a proposed goal or a Computer Use grant its refusal;
+    a box taller than the pane by the options it shows. A press no rule proved is
+    ledgered `unproven: <why>`; a press that did not land is tried again.
+  * a question is no permission, and `approve` does not limit it: the question
+    dialog (AskUserQuestion) gets its recommended option — option 1 when none is
+    marked; every recommended option of a multi-select, then its button; the review
+    tab submitted — by Enter on the focused row, moved there one row at a time, every
+    key fenced on the screen generation, once the session's person stamp says
+    nobody has touched it for `human_grace_s`; never a digit, its free-text row, its
+    chat row or Cancel, and a question a person has begun answering, or one the
+    reader did not read whole, goes to the menu bar (ledgered `answer-recommended@v1`;
+    the Settings row "Answer questions with the recommended option"). ONE SESSION
+    can say otherwise: `aterm ctl @<sid> meta set questions ask|recommended` decides
+    that session's dialogs over `answer_questions` (`ask` is how a controlling
+    session takes a worker's questions: each is raised instead of answered, and the
+    controller types its own choice with `aterm drive answer @<sid> <choice>`), `meta
+    unset questions` hands it back, and a dialog already waiting is answered within
+    2 s of being handed back; a loop's own `--no-answer` gives no session a say. A
+    dialog the supervisor's own keys answered is told once: `CHOSE …
+    policy=recommended <question → answer>` in the journal, and `◆ chose` on the band
+    with a short chime (`choice_sound`) and one rim pulse.
+  * a question or a request for a decision gets `answer_text` — one that names
+    an irreversible act (delete, drop, overwrite, force-push) only "take the
+    option that deletes, overwrites and force-pushes nothing"; a turn that ended
+    gets its continuation — on a back-off that doubles to an hour while turns keep
+    ending short or saying they are done, and never into a session nobody has asked
+    anything yet;
+  * an API error or overload is retried for ever, a usage limit continued past its
+    reset, a model-bucket limit relaunched on the fallback model (`--model`,
+    session-only — never `/model`) and back at its reset, a full context
+    `/compact`ed;
+  * a Claude Code that crashed is relaunched on its conversation, and a newer
+    installed build is taken at an idle point (below).
+  Within `human_grace_s` of a person's keystroke, paste, click, drag, scroll or IME
+  composition in the session through a window (`status` and `ls` say how long ago
+  as `human_ms=`, `text --json` as `"human_ms"`; a control-socket write never sets
+  it), of a draft in the composer
+  last changing, or while another driver holds a lease or a named turn on it
+  (`hand=`), it keeps its hands off the session; a draft left standing after the
+  grace is sent. What the table limited, and what nothing can answer (a lost
+  login's browser step, a box no reader can parse), goes to the menu bar with one
+  notification (the session's `attention`, `owner=supervisor`; it posts no mail).
+  A worker that stopped reading its input (`status input=stalled|stopped`) is held:
+  nothing is pressed or typed into it, its badge is withdrawn, and the server's own
+  "frozen" row is the notice (`aterm help introspection`, `signal`); once its remedy
+  (`signal term`, or `kill`) ends it, it is relaunched on its conversation and carried
+  on. Claude Code's
+  critical-memory banner is answered by its remedy: nothing is typed at it, and at
+  its next idle point the agent is ended and relaunched on its own conversation,
+  then told to carry on (`relaunch = false` limits it to the menu bar, with the
+  remedy: restart it, then `claude --continue`).
+  An aterm.toml that does not load still has its [harness] lines read.
   `aterm drive watch|supervise` runs the same engine from a terminal (see `aterm
   drive --help`); a `watch` started on a session the window already supervises
   watches only — one supervisor per session.
@@ -317,77 +368,232 @@ WHAT IT IS
   `<aterm state>/drive/<sid>.journal.jsonl` beside it every line the loop decided.
 
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
-  enabled [true]           the master switch — Settings ▸ Harness
-  headless [false]         supervise a headless instance's sessions too
-  auto_reads [true]        answer a read-only Bash box
-  read_outside_cwd [true]  answer a Read box outside the secrets list
-  rm_breaker [true]        answer the rm circuit breaker when every target resolves
-                           under a scratch root (bypass sessions only)
-  trust_dialog [true]      answer the folder-trust dialog for the session's own folder
+  Every default is full power, and a key you write can only take power away.
+  enabled [true]           the master switch — in Settings, search "harness"
+  headless [true]          supervise a headless instance's sessions too
+  approve ["all"]          what a permission box is answered with — in Settings,
+                           search "approve": "all" (its one-shot allow, never
+                           "don't ask again"), "safe" (only a box proven safe: a
+                           read-only Bash box, the rm breaker's possibly-empty-
+                           variable kind under a scratch root in a bypass session,
+                           a Read box under a trust root or /usr, /etc,
+                           /opt/homebrew, /private/tmp/claude-<uid> and outside the
+                           secrets list — neither on a box that runs on another
+                           machine — the trust dialog for the session's own folder
+                           under a trust root) or "none"
   trust_roots [["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"]]
+                           the folders whose trust dialog "safe" answers
+  answer_questions [true]  answer the question dialog with its recommended option,
+                           and a question or a request for a decision in prose with
+                           answer_text, instead of waiting for a person — in
+                           Settings, search "question"; independent of approve
+  answer_text ["Nobody is here to answer. Decide for yourself …"]
   dismiss_surveys [true]   dismiss the session survey (`0`, never a rating)
-  continue [true]          continue a turn that ended after 2+ min of work
-  continue_per_hour [6]    at most this many typed acts per session per hour
+  continue [true]          continue a turn that ended; one short turn after another
+                           (under 2 min of work, or one that ends saying it is
+                           done) on a back-off that doubles, 2 min to an hour
   continue_text ["keep going"]   what a continuation types when no suggestion fits
+  continue_per_hour [0]    at most this many typed acts per session per hour; 0 is
+                           no cap
   rules_file [none]        a file whose text is appended to every continuation
-  retry_api_errors [true]  back off 1, 5, 15 min on a 529 or retryable API error
-  resume_limits [true]     continue a minute past a usage limit's reset
-  model_fallback ["opus"]  `/model` on a model-bucket limit, back at its reset;
-                           "" escalates instead
+  retry_api_errors [true]  retry an API error or an overload for ever, 1, 5, 15, 30,
+                           then every 60 min
+  resume_limits [true]     continue a minute past a usage or spend limit's reset
+  model_fallback ["opus"]  on a model-bucket limit, the agent relaunched on this
+                           model (`--model`, session-only), and back at its reset;
+                           "" waits for the reset instead
   compact_on_context_wall [true]   `/compact` on a full context
-  upgrade [true]           the live upgrade sweep below
-  An unknown key is refused by name; a change takes effect without a restart.
+  relaunch [true]          relaunch an agent that crashed (its session record left
+                           behind as it exited), on its own conversation
+  upgrade [true]           the live upgrade below
+  human_grace_s [120]      after a person types, clicks or scrolls in a session, the
+                           supervisor keeps its hands off it this many seconds
+  A value it cannot take is that key's limit, and is named; an unknown key is named
+  and changes nothing; `harness.<key>` written below another table's header still
+  limits. A change takes effect without a restart.
 
-  NOTHING IS INSTALLED INTO THE AGENT (decision "B", 2026-09-22). The hook bridge this
-  command used to carry — `hook`, `statusline`, `install`, `uninstall` — is retired:
-  `install` and `uninstall` refuse (exit 2), and `hook` and `statusline` do nothing and
-  exit 0, because a bridge an older build installed still runs them and a failing hook
-  command blocks the agent's turn. The window removes every hook an older aterm wrote
-  into ~/.claude/settings.json, and gives your own statusLine back, when it starts —
+  NOTHING IS INSTALLED INTO THE AGENT. The hook bridge this command used to carry —
+  `hook`, `statusline`, `install`, `uninstall` — is retired: `install` and `uninstall`
+  refuse (exit 2), and `hook` and `statusline` do nothing and exit 0, because a bridge
+  an older build installed still runs them and a failing hook command blocks the
+  agent's turn. The window removes every hook an older aterm wrote into
+  ~/.claude/settings.json, and gives your own statusLine back, when it starts —
   whatever `agents_auto_prime` says (a headless instance never touches that file).
 
-  DELETED on 2026-09-23: `status`, `mark`, `enable`, `disable`, `align`, `caps`,
-  `accounts`, `liveness`, `recover`, `nudge`, `switch`, `watch` and `config`. They were
-  a second supervisor beside `aterm drive` whose acts never landed; each now answers
-  with that sentence (exit 2) rather than a bare "unknown subcommand".
+  GONE: `status`, `mark`, `enable`, `disable`, `align`, `caps`, `accounts`, `liveness`,
+  `recover`, `nudge`, `switch`, `watch` and `config`. They were a second supervisor
+  beside `aterm drive` whose acts never landed; each now answers with that sentence
+  (exit 2) rather than a bare "unknown subcommand".
 
 KEY USAGE
   aterm harness usage [--json]                 spend per model, folded from this directory's
                                                newest Claude Code transcript
-  aterm harness limits [@<sid>] [--json]       the limit classifier over the session's screen
-                                               (one `text --json` read; exit 1 if none answers)
+  aterm harness limits [@<sid>] [--json]       the wall on the session's screen, as the
+                                               supervisor reads it, and any painted /usage
+                                               windows (one `text --json` read; exit 1 if none
+                                               answers)
   aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
                                                free space and the stale targets; removal
                                                needs `disk.apply = true` AND `--apply`
   aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger for a session
   aterm harness ledger disk [<n>] [--json]     every disk measurement, removal and refusal
-  aterm harness upgrade [<sid>] [--dry-run] [--every <s>]   live sessions onto a newer build
+  aterm harness ledger upgrade [<n>] [--json]  every act of the live upgrade, and the owner's word
+  aterm harness upgrade [<sid>] [--dry-run]    live sessions onto a newer build
+  aterm harness upgrade [<sid>] --status [--json]   how long each is behind, what it waits on
+  aterm harness upgrade <sid> --now | --defer <dur> | --skip   the owner's word on one tab
+  aterm harness upgrade models [set <id>,<id>,...]   the model priority list (show or set)
 
   `upgrade` answers Claude Code's own "Update installed" banner: it restarts a
   live Claude Code IN PLACE and resumes the same conversation on the newer build. It
   types a notice first and waits for the agent's READY answer and for every shell
-  under it to finish — background work is waited for, never killed — then sends
-  SIGTERM, heals the tab's PATH with the atpkg hook, relaunches with the same flags
-  plus `--resume <session>`, and tells the agent to carry on. `--dry-run` prints
-  each session's next step; its state and ledger live under `<state>/upgrade/`.
-  THE MODEL: an explicit `--model` (and `--fallback-model`) on the original
-  command line is kept, and none is added; a session launched without one
-  resumes on the current default (`/model` changes it). The harness reports the
-  model before and after: the carry-on line names the model of the agent's last
-  answer before the restart, and the ledger's `done` row says `claude restarted
-  on <build> · model <m>` from the resumed session's first answer — `model
-  <before> -> <after>` when they differ, with what decided it: the kept
-  `--model`, or the current default. The sweep that types the carry-on does not
+  under it to finish — background work is waited for, never killed. Claude Code's
+  own keep-awake is not work: the `caffeinate` it starts as its own child every turn
+  and stops ~30 s after; one a shell started (a Bash tool's) is. It then sends
+  SIGTERM (`signal term pid=<n>`: that one process, and never under a hold), heals
+  the tab's PATH with the atpkg hook, relaunches with the same flags plus `--resume
+  <session>`, and tells the agent to carry on. A launch `--effort` is NOT carried:
+  the session comes back at your own default effort. `--dry-run` prints each
+  session's next step; its state and ledger live under `<state>/upgrade/`.
+  THE MODEL PRIORITY LIST (`<state>/upgrade/models.json`, best first) is seeded
+  claude-opus-5-5, claude-fable-5-1, claude-opus-5 and grows by itself: a model
+  Claude Code recommends (a launch announcement, or the build's own newest of a
+  family) goes in just above its family's best when that family is on the list, it
+  is strictly newer than every member listed, and the managed build knows it.
+  `upgrade models` prints the list, what this account and build can run (and why
+  not), the target — the best entry that can run — and Claude Code's
+  recommendations, and writes nothing; `upgrade models set <id>,<id>,...` replaces
+  it. THE RULE: a conversation moves UP the list only, from a listed model to the
+  target, never off a model the list does not name; a model you chose yourself (a
+  launch `--model` the harness did not put there, a `/model` you typed — remembered
+  for that conversation — or the default model in your Claude settings) moves only
+  within its family — Opus 5 -> Opus 5.5, never Opus -> Fable; never onto a model
+  the harness already moved that conversation to, and never onto one that did not
+  take (not running 10 minutes after the restart asked for it: `model-failed`,
+  never asked for again). WHEN it moves, every due move lands: at once when the
+  conversation's cache is COLD (an hour without an answer, so the switch's re-read
+  of the whole history costs nothing extra); at once when a newer BUILD restarts it
+  anyway (the model rides that restart); and otherwise after at most an hour of
+  being due, at the next idle point — until then a model-only change waits
+  (`wait:model-cache-warm`). A model-only change is the same restart on the SAME
+  build, relaunched with `--model <id> --resume <session>` — never Claude's
+  `/model`, which also saves the model as your default for new sessions (measured
+  2026-09-24 on Claude Code 2.1.282).
+  THE MODEL AFTER: a launch `--model` (and `--fallback-model`) is kept unless the
+  list moves the conversation, which replaces it; a session launched without one,
+  and not moved, resumes on the current default. The harness reports the model
+  before and after: the carry-on line names the model of the agent's last answer
+  before the restart, and the ledger's `done` row says `claude restarted on <build>
+  · model <m>` from the resumed session's first answer — `model <before> -> <after>`
+  when they differ, with what decided it: the priority list, the kept `--model`,
+  or the current default. The step that types the carry-on does not
   wait for that answer: when it has not come yet the row is `step=continued`,
-  and a later sweep writes the `done` row. When a sweep 2 minutes after the
+  and a later step writes the `done` row. When a step 2 minutes after the
   carry-on still finds no answer (or an older aterm began the restart), the row
   is `step=done:model-unconfirmed`, its model said to be unconfirmed.
-  The window runs the same sweep every minute on its own tabs, by default; turn it
-  off with `upgrade = false` under aterm.toml's [harness].
+  The window does the same by default, with no sweep: when atpkg, or Claude Code's
+  own updater, installs a newer Claude Code, each of its own tabs' supervisors takes
+  these steps at its session's idle points, inside its loop (a push from atpkg's
+  notice or the updater's link; nothing polls), and a model the priority list moves
+  a session to rides the same steps. A turn that ended with the agent's own
+  background work in flight (Claude's `Waiting for N dynamic workflow`, a shell it
+  left running, a Codex background terminal) is a NATURAL BREAK: once it has stood
+  20 s the notice is typed there — it interrupts the agent's orchestration once —
+  and the restart still waits for an idle point with nothing running under the
+  agent (a re-ask waits for one too). Turn it off with `upgrade = false`
+  under aterm.toml's [harness]. The same supervisors relaunch a Claude Code that
+  crashed (its session record left behind) on its own conversation, and tell it to
+  carry on at its first idle point; a person's or a holder's exit, a graceful exit
+  (`/exit` sent by anyone, a `kill`: Claude Code removes its session record), and a
+  launch's own end (`-p`, a subcommand), are left alone. Whether the record was left
+  behind is read as the exit is seen (within a quarter second) and kept for every
+  try: any Claude Code that starts removes dead sessions' records, so a crash's
+  record read after the pause before a relaunch could pass for a graceful exit.
+  `relaunch = false` turns that off, and says so on the tab. A Codex exit is said on
+  its tab: its relaunch is not built yet (no [harness] limit) — resume it with the
+  `codex resume` line it printed.
+  CODEX, by the same workers and the same step (the same lock, ledger, gates and
+  owner's word): a Codex session's worker takes the step's Codex branch at its idle
+  points when atpkg installs a newer Codex. Codex 0.157 runs a shared app-server
+  DAEMON per $CODEX_HOME that holds every conversation, and a TUI in the tab that is
+  its client. THE DAEMON FIRST: one on an older build than the managed Codex, or on
+  the same build with the vendor's own updater armed (`auto-update-version`: it
+  re-runs chatgpt.com's installer outside atpkg), is moved by the vendor's verb
+  `<managed codex> app-server daemon update --from-cli --yes`, with the daemon's own
+  environment — the managed build copied in and PINNED, the updater gone, attached
+  TUIs reconnecting — only while nothing runs in it (every thread it holds, a tab's
+  or a detached one's, idle and settled, and no background terminal left running
+  under it: the restart would end it), nobody is at a Codex tab on that home, the
+  owner's `--skip`/`--defer` on none of them keeps it, and every Codex attached to it
+  is one of this window's Codex tabs (`wait:background-terminal`, `owner-held`,
+  `unseen-client` …); one AHEAD of the managed Codex is never moved back. THEN the
+  tab's own TUI, on an older build: a daemon-mode client at an idle point is ended
+  by a TYPED `/exit` (fenced on the judged screen, its Enter guarded on the
+  composer's row) and relaunched through the same relaunch line Claude Code's
+  restart types, as `<managed codex> resume <same flags> <thread>`, the thread from
+  its own exit hint, read above the new prompt's first row — no notice and no
+  carry-on, its work never stopped, in the daemon; it says what its daemon waits on
+  (`wait:daemon-first:<why>`). An EMBEDDED session (`--no-daemon`, its thread's
+  writer lock in its own hands) gets the notice, its READY answer in the rollout,
+  nothing left running under it (a background terminal included), the same
+  `/exit`, the relaunch, and — handed back to its supervisor, which answers
+  whatever the new Codex opened with — the carry-on at its first idle point. Never
+  a signal: SIGTERM leaves a Codex tab in the alternate screen with kitty keyboard,
+  mouse and bracketed paste on. A TUI that names no thread as it exits is not
+  relaunched (`failed:no-resume-hint`; `codex resume` in the tab takes it back).
+  Text the step types and does not submit is said and cleared from the composer
+  while it alone is there. Its state is per tab: `codex-<sid>` — a move that
+  stopped after its `/exit` is still shown there for a day.
+  WHAT THE OWNER SEES: each tab's `upgrade=` column in `aterm ctl status`/`ls`
+  (`pending/2.1.282/settling/8h22m` — state, target, what it waits on, how long
+  behind; for `done`, how long ago it finished), one Settings ▸ Messages record
+  while sessions wait, and a band row plus the tab's attention mark ONLY when an
+  upgrade is stalled — it gave up, was refused, runs in a multiplexer pane the
+  tab's typing cannot reach, or is six hours behind with no `--now` in the last
+  30 minutes. The window's host keeps the view from its workers' own steps: it
+  looks again when a worker acts, at an activation notice or the owner's word,
+  and at the moment an upgrade turns overdue — no timer. `--status` prints the
+  same from the recorded state. Only a conversation still live and behind in its
+  tab is shown or counted.
+  A PERSON AT THE TAB: a session a person gave input to within `[harness]
+  human_grace_s` (`status human_ms=`, the stamp the supervisor's question
+  answers read) is neither typed into nor signalled on the upgrade's own
+  judgment, busy or idle, by the window or a hand-run upgrade
+  (`wait:attended`, said once as `held-back:attended`); the upgrade owns none of
+  its turn ends meanwhile.
+  THE OWNER'S WORD, on the tab named, taken by that tab's worker at its next
+  idle point: `--now` moves it at its next turn end (the quiet wait and the
+  person's grace waived — nothing else) and re-arms one that GAVE UP (no READY
+  answer after its last notice) — the one place it adds an act (the notice is
+  typed again); a refused or failed upgrade is not re-armed, and one held back in
+  a pane is not reached; `--defer 6h` holds it; `--skip` keeps it on its build
+  until a newer one comes — either ends a notice already typed, so a fresh one,
+  and a fresh READY, follows the hold, and neither owns a turn end meanwhile.
+  Every word arms a new round with a READY marker of its own. Each is written
+  under the upgrade's lock and put on the ledger as `requested:<word>`.
+
+THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
+  In a window, Claude Code's mode row (`⏵⏵ … (shift+tab to cycle)`) is painted as
+  `◆ <model> <effort>   ⌂ <repo>   ⎇ <branch>` and a row of four lights: auto-approve
+  (bypass), auto mode, fast, thinking. It is GLASS ONLY: `ctl text` and
+  every reader keep Claude's real row, `ctl image` shows the footer as the window
+  does. The facts come from files Claude keeps (its `sessions/<pid>.json`, the
+  transcript, `.git/HEAD`), read for THIS process only — a resumed session shows no
+  model until it answers. A light is Claude's own input: shift+tab for modes, a
+  pasted `/effort` or `/fast` plus Return (only while the prompt holds exactly that
+  command and nobody has typed since; taken back with one ctrl+u if it did not go;
+  refused while a `turn` or `lease` holds the session). Thinking is shown, never
+  switched (Claude's Alt+T). A mode row a new Claude Code draws differently makes
+  the footer step aside and is named once in aterm.log. The footer follows
+  `tab_status`.
+  A restart the harness makes (relaunch, stall, memory banner, model move, upgrade)
+  resumes the permission mode the session was in — the pill on its screen, else its
+  transcript's last `permission-mode` row — named on the command line, and never
+  puts a session back into bypass once it left.
 
 WHEN TO REACH FOR IT
-  `ledger` to see which boxes the supervisor approved, skipped, escalated or was
-  refused on, with the rule and the command. `limits` to ask what the session's screen
+  `ledger` to see which boxes the supervisor approved, skipped or escalated, and which
+  presses the server deferred (another writer's turn, a hold), with the rule and the
+  command. `limits` to ask what the session's screen
   says about a limit right now. `disk` before a build that needs room.
 
 GOTCHAS
@@ -457,11 +663,14 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              row naming one is refused
   aterm pkg verify [program] re-attest installed bytes against the signed root (no
                              network) — doctor reads health, verify re-proves bytes
-  aterm pkg which <tool>     ONE line: which copy of a tool runs and why — managed
+  aterm pkg which <tool>     one line: which copy of a tool runs and why — managed
                              (shim → store path, pinned by index N; for claude/codex
                              `managed 2.1.280 — Anthropic latest`), system copy
                              (not managed by aterm), SHADOWED by a copy ahead on
-                             PATH, or a pending stub
+                             PATH, or a pending stub — and a second line only when
+                             PATH holds more: the foreign claude/codex copies the
+                             managed one out-ranks (`foreign copies out-ranked: …`),
+                             or a same-named unrelated binary beside a bundle
   aterm pkg run <tool> [-- args]
                              exec the store binary — what `aterm <tool>` dispatches
                              to — exporting what its build declares, as its shim
@@ -496,11 +705,15 @@ OCCASIONAL (recovery and preference)
                              remove one program, or the WHOLE managed toolset and its
                              disk (the signed on-disk sum — about 4 GiB today) in one
                              step — the way out is as single-step
-                             as the way in. Either form stops atpkg auto-completing the
-                             set; [packages].exclude drops one program while keeping it
+                             as the way in. `--all` records a decline no later pass
+                             overrides; a removed program stays out of every pass
+                             until `aterm pkg install <program>` puts it back, and
+                             the set keeps completing around it ([packages].exclude
+                             does the same from aterm.toml)
   aterm pkg rollback <program>
                              reactivate the kept previous build — the undo for a bad
-                             update (the `superseded (kept for rollback)` rows in list);
+                             update (`list` shows it as `(N older build(s) kept for
+                             rollback)` on the program's row);
                              for claude/codex the kept previous version, never a
                              yanked one, and no index is consulted
   aterm pkg pin | unpin <program>
@@ -595,6 +808,16 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
                              reports instead of failing. The flags were omitted here
                              for a full audit cycle, in the one verb where signing
                              with the wrong identity is the cost (audit D-5)
+  aterm pkg lease <dir> [--who <words>] -- <command> [args…]
+                             hold the store build <dir> belongs to (a `bin/`, a tool in
+                             it, the build, or the rustup view) while <command> runs,
+                             then let it go: gc keeps it, the view is not re-laid under
+                             it, and an unattended trust update waits for it. For a run
+                             of several commands no process shows between them — the
+                             packers re-run themselves under it. Exits with the
+                             command's status; a TERM or HUP sent to it is passed on
+                             to the command, which it waits for; a lease it cannot
+                             take is said, never a reason not to run
 
 WHEN TO REACH FOR IT
   To manage the published CLI toolchain — install / update / pin / verify — or to see
@@ -718,10 +941,11 @@ GOTCHAS (in the order they bite)
     key over the release manifest, OpenAI's two hosts agreeing on the digest, and on
     macOS the vendor's Apple Developer ID team on every executable. The window checks
     both vendors about every minute (shared across aterm processes, and shortly after the
-    Mac wakes), and every update
+    Mac wakes) — and with no window open, one terminal session running aterm does, until
+    a window opens; `aterm pkg doctor` says which — and every update
     pass checks both vendors too; a new version installs at once, and an unchanged head
-    costs a zero-byte answer. `claude update` / `codex update` check now. `aterm pkg status`,
-    `which`, `doctor` and Settings ▸ Packages name them by version and source —
+    costs a zero-byte answer. `claude update` / `codex update` check now. `which` and
+    Settings ▸ Packages name them by version and source —
     `managed 2.1.280 — Anthropic latest`, or why the latest is not what runs (`held by
     local pin`, a yank, a rollback) or is not known (the vendor's release channel not
     reached for a day). The ALab index can only yank a version, never supply one. Claude
@@ -739,18 +963,21 @@ GOTCHAS (in the order they bite)
     (the words you typed are not echoed — they are the line above), then
     the standard `aterm pkg update <program>` runs at once and its stdout line is the
     verdict — `claude 2.1.280 is Anthropic's latest`, `claude 2.1.280 → 2.1.281
-    (Anthropic latest)`, `held by local pin` — a new version can take a minute to land,
-    silently. `claude install stable` and `claude install <version>` are refused, exit
+    (Anthropic latest)`, `held by local pin` — while it downloads, a one-line meter
+    (bytes, rate, time left) draws under the announce line, and the verdict follows
+    it. `claude install stable` and `claude install <version>` are refused, exit
     2, nothing run: aterm updates from the vendor's latest (`aterm pkg rollback <program>`
     returns to the version before, `aterm pkg pin <program>` holds the one you have),
     and the vendor's own installer is not run instead — never through the managed
     name. `--help` prints one
     note and then the vendor's own help. A store another pass holds — the window's own
     update, an install, a typed `aterm pkg` verb — is WAITED FOR, up to the 30 minutes
-    the window's own passes wait, and never silently: the child's own `lock-waiting:`
-    line appears on stdout after 2 s and its `lock-acquired:` line when it gets the
-    store (the wait lane's markers, which a typed `aterm pkg update` never prints), and
-    Ctrl-C stops the wait. Only if the whole 30 minutes run out does the line say that
+    the window's own passes wait, and never silently: after 2 s a spinner on stderr says
+    what it is waiting for (`Waiting for aterm's background update to finish… (Ctrl-C to
+    stop)`) and clears when it gets the store; with stdout piped the child prints
+    `lock-waiting:` after 2 s and `lock-acquired:` when it gets the store instead (the
+    wait lane's markers, which a typed `aterm pkg update` never prints). Ctrl-C stops
+    the wait. Only if the whole 30 minutes run out does the line say that
     pass is the one moving packages, exit 75; a failed check (offline, say) leaves the
     version you have and names `aterm pkg doctor`, exit 1. There is no environment knob
     for any of this: the intercept works by default. Only the FIRST word counts: a flag
@@ -770,11 +997,12 @@ GOTCHAS (in the order they bite)
     launch when due, and a full signed index check every 6h — once for the whole
     machine: the six hours count from the last check any aterm made, on the wall clock,
     so a Mac that slept through them checks 20 s after it wakes. There is no knob for
-    it. While parked, it checks the next public index tag once a minute with one HEAD on
-    the download host, which spends none of GitHub's API rate limit (index builds are
-    published without gaps, so the next one is always the next number); a tag that
-    appears wakes the ordinary signed update pass, which finds the newest index the same
-    way — HEADs on the download host, never an API request. Only GitHub's own redirect to
+    it. While parked, it HEADs the next two public index tags every 30 s on the download
+    host, which spends none of GitHub's API rate limit (index builds are published
+    without gaps, so the next one is always the next number; the second HEAD steps over
+    one missing number); a tag that appears wakes the ordinary signed update pass, which
+    finds the newest index the same way — HEADs on the download host, never an API
+    request. Only GitHub's own redirect to
     its release-asset storage counts as a published index, and an index a pass could not
     land is retried on the failure ladder, not at every probe. A store with nothing to
     update (nothing installed, the set not being completed) is not probed. These probes
@@ -803,9 +1031,9 @@ GOTCHAS (in the order they bite)
     — stdin a pipe, i.e. a test or a driver's child —
     provisions nothing: there, and under `--headless`, the packages move only when you
     run `aterm pkg update` (or a scheduler does). Until an index pass has completed on a
-    machine, `aterm pkg doctor` says so in its report — the programs the ALab index pins
-    wait for one, and each of claude and codex that is installed, not held, not in
-    `[packages] exclude` and updating automatically updates from its vendor without it;
+    machine, `aterm pkg doctor` says so in its report, with the command that runs one,
+    and names each of claude and codex that updates from its vendor without one
+    (installed, not held, not in `[packages] exclude`, and updating automatically);
     nothing prints that on stderr, and a session launch says nothing about updates at all
     (since 2026-09-22). Every update pass, automatic or by hand, also
     re-asserts the seams and the shell.d hooks, so a pass that moved no bytes still
@@ -824,8 +1052,16 @@ GOTCHAS (in the order they bite)
     kept as `status.toml.corrupt-<unix>` and replaced, in one rename, by one rebuilt from
     the store. `[packages] enabled` is Settings ▸ Packages' "Automatic updates" switch,
     and the window reads it LIVE: turned off, its package loop stands down within seconds
-    (no pass, no probe, no head check); turned on, it resumes — no relaunch. Update Now
-    works either way.
+    (no pass, no probe, no head check); turned on, it resumes — no relaunch. Check &
+    Update Now works either way.
+  * THE TOOLCHAIN WAITS FOR QUIET: the window's passes and a session's detached one stage
+    a new Trust compiler at once but switch to it only when nothing is using the one it
+    replaces — no build running from it, no merge-contract run, release cut or pack
+    holding it (each holds a LEASE on the build it resolved, which gc keeps too; any run
+    can hold one with `aterm pkg lease`) — for at most 4 h. The window looks once a minute,
+    and with no window open so does the terminal session watching for updates.
+    A recalled build switches at once, and so does an `aterm pkg update` you type.
+    `aterm pkg doctor` says what waits, on whom, until when, and who is looking.
   * THE PACKAGE LOG: every pass — the window's, a session's detached one, the release
     watch's, `claude update`/`codex update`, a typed `aterm pkg` verb, and one the store
     lock turned away — and every program that moved (installed, updated, rolled back,
@@ -967,12 +1203,10 @@ THE AGENT PROGRAMS (claude, codex — since 2026-09-23)
 
 WHAT YOU SEE — `cargo build --release` in a session prints this on stderr, and then your
 build runs:
-  aterm: 'cargo' is the Rust name; on Trust the tool is 'targo'. Trust will not
-         pick a verification lane for you:
+  aterm: running upstream 'cargo' (no proof claim); on Trust the tool is 'targo':
            targo trust build --release          VERIFIED   — emits a proof claim
            targo --unverified build --release   UNVERIFIED — no proof claim
-         Running upstream 'cargo' now — nothing it produces carries a proof claim.
-         `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.
+         `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
          ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
   A SIGNPOST ANNOUNCES; IT DOES NOT PREVENT. A bare `cargo <verb>` is not substituted —
   you asked for upstream cargo and you get upstream cargo — and the lines above are how
@@ -980,7 +1214,7 @@ build runs:
   own vocabulary, though, and the BRANDED tool runs: `cargo trust build` and
   `cargo --unverified build` exec `targo` after one line, because you already said which
   lane you meant. A DIRECT row is one line and then the tool runs — `rustfmt src/lib.rs`:
-  aterm: 'rustfmt' is the Rust name; on Trust the tool is 'trustfmt' — running trustfmt. (`aterm --no-reroute` restores upstream 'rustfmt'.)
+  aterm: running trustfmt, Trust's 'rustfmt'. (`aterm --no-reroute` restores upstream 'rustfmt'.)
 
 EXIT CODES
   The exec'd tool's own (a DIRECT row, a SIGNPOST row, an escape, a `+toolchain`
@@ -1086,7 +1320,7 @@ WHEN TO REACH FOR IT
 GOTCHAS
   * INSTALL: a prebuilt, self-contained sysroot SHIPS — `aterm pkg install trust`, or the
     whole toolset with `aterm pkg install --default-set` (the same act as Settings ▸
-    Packages ▸ Install ALab Tools). trustc/targo then resolve via `aterm trustc` /
+    Packages ▸ Install ALab Tools Now). trustc/targo then resolve via `aterm trustc` /
     `aterm targo` (store-pinned, never $PATH) and land on PATH inside aterm-integrated
     shells. Building from source is NOT a supported install path: trust is
     coherence-grouped, so atpkg permanently refuses to source-build it (prebuilt-only).
@@ -1442,22 +1676,24 @@ fn overview_page() -> String {
             crate::Verb::Fleet => {
                 "opt-in durable attention queue + guarded turns; legacy federation"
             }
-            crate::Verb::Drive => "the agent drive CLI (prompt / read / await / shot)",
+            crate::Verb::Drive => {
+                "drive an agent (prompt / read / await / shot); supervise it (supervise / watch)"
+            }
             crate::Verb::Link => {
                 "the fabric bridge: carry this instance's inbox/post traffic to the bus"
             }
             crate::Verb::Fabric => {
-                "see the fabric: config, broker, bridges, inboxes, traffic (status | tail)"
+                "mail between sessions and hosts (status | tail | on | off | doctor | mint-for | join)"
             }
             crate::Verb::Ship => {
                 "publish aterm: provision a signing machine, cut a release (source checkout only)"
             }
-            crate::Verb::Update => "check or report auto-update state headlessly (status | check)",
+            crate::Verb::Update => "report or check for an update (status | check | identity)",
             crate::Verb::Agents => {
                 "make coding agents aterm-aware (the primer; aterm also installs it itself)"
             }
             crate::Verb::Harness => {
-                "the Claude Code harness: read views, live upgrade (installs nothing; acts: `aterm drive`)"
+                "Claude Code's spend, limits, disk, approval ledger; `upgrade` (`aterm drive` supervises)"
             }
             crate::Verb::NewTab => "open a terminal tab (where it opens is `windowing_behavior`)",
             crate::Verb::NewWindow => "open a NEW window, always",
@@ -1526,13 +1762,13 @@ THE KEY ROSTER
   `aterm help windowing` / `aterm help agents` — they appear in neither the window
   help's CONFIG block nor the starter file. `[packages]` (enabled, auto_install,
   exclude), `[reroute] announce` and `cursor_trail` / `cursor_trail_style` are in the
-  starter file; `[update] enabled` is on Settings ▸ Terminal ▸ Updates and `auto_apply`
-  on Settings ▸ Software Update.
+  starter file; `[update] enabled` and `auto_apply` are the two switches on
+  Settings ▸ Software Update.
 
 WHAT THE DIAGNOSTIC SUBCOMMANDS COVER
-  aterm show-config | validate-config | explain-config
-  Mostly the RUNTIME resolution — containment mode, the environment variables,
-  shell and terminal size — rather than the file above. ONE exception:
+  aterm show-config | explain-config
+  Mostly the RUNTIME resolution — the containment default and its flags, the
+  shell and the terminal size — rather than the file above. ONE exception:
   `explain-config` also documents aterm.toml's `[privacy]` table, all nine keys,
   each with what it does and what it will never do (`auto_accept` is reserved and
   unimplemented — aterm never answers a macOS consent dialog). Every other key is
@@ -1658,13 +1894,22 @@ WHEN A MACOS COPY REPORTS THAT IT CANNOT UPDATE
       moved first — move aterm into Applications and open it from there. Until then
       it also cannot put `aterm` on a new shell's PATH.
     * nothing is wrong, but "Check for updates automatically" is OFF (Settings ▸
-      Terminal ▸ Updates): no check runs by itself, and `aterm update status` says
+      Software Update): no check runs by itself, and `aterm update status` says
       so. `aterm update check` and Settings ▸ Software Update still check when asked,
       and a downloaded update still installs. Turning it back on takes effect the
       next time aterm opens. It is the one switch: no environment variable turns
       checks off.
-    * a DEV BUILD (a `cargo run` or a `target/` binary) — nothing is wrong and there
-      is nothing to move; the updater never replaces such a copy.
+    * a DEV BUILD (a `cargo run` or a `target/` binary, or an app `tools/dev-app.sh`
+      installed) — nothing is wrong and there is nothing to move; the updater never
+      replaces such a copy, and `aterm update status` says so. A dev-built app still
+      asks the public channel which release is newest — one read-only request when it
+      starts and once a day, while automatic checks are on; nothing is downloaded — and
+      says how far behind it is: `aterm update status` names it ("2 releases behind
+      aterm v0.93.0"), and Settings ▸ Messages records it. A dev build whose app is
+      named aterm.app also writes the setup only the release should (the PATH links,
+      the shell hooks, the agent primer); it says so on the message band when it
+      starts, online or not, with the release's verb that puts each back
+      (`aterm pkg repair`, `aterm agents install`).
 
 LOG
   Settings ▸ Messages lists everything aterm told you, newest first — each update
@@ -1704,9 +1949,9 @@ WHERE new-tab ACTUALLY OPENS
   That is the `windowing_behavior` config key:
     windowing_behavior = "new_window"   a new window (the DEFAULT)
     windowing_behavior = "attach"       a tab in the already-running aterm
-  Windows Terminal's spellings work as aliases (`useNew` / `useExisting`), and
-  $ATERM_WINDOWING_BEHAVIOR overrides the file. `new-window` ignores the key and
-  always opens a window. See `aterm help config` for where to set it.
+  Windows Terminal's spellings work as aliases (`useNew` / `useExisting`).
+  `new-window` ignores the key and always opens a window.
+  See `aterm help config` for where to set it.
 
   aterm --window --help          the full window-mode flag reference
 "#;
@@ -1737,12 +1982,15 @@ COMMANDS
   shot [name.png]    save a pixel-true PNG of the terminal content (bare name, into images/)
 
 SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls`)
-  Every Claude Code session in an aterm window is ALREADY supervised by the
-  window's own host, by default — this engine, under aterm.toml's [harness]
+  Every Claude Code and Codex session in an aterm window is ALREADY supervised
+  by the window's own host, by default — this engine, under aterm.toml's [harness]
   (`aterm help harness`; `enabled = false` turns it off). `status supervisor=`
-  names it (`aterm-harness@<pid>`); what it cannot prove safe goes to the menu
-  bar. These commands are for a manager of its own: a `watch` started on a
-  session the host holds watches only, one started first holds the session.
+  names it (`aterm-harness@<pid>`); it is FULLY AUTOMATIC by default — every box
+  its answer (`approve = "safe"`: only what it proves safe) — and only what the
+  table limited, or nothing can answer, goes to the menu bar. These commands are
+  for a manager of its own:
+  a `watch` started on a session the host holds watches only, one started first
+  holds the session.
   classify [--allow-python GLOB]... <cmd...>
                      is this shell line read-only, the way the supervisor judges
                      it? prints `read-only` (exit 0) or `not-read-only <reason>`
@@ -1796,113 +2044,127 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      exit 124 on the timeout (also when it runs out while a
                      lost connection is ridden out: the last screen read, if
                      any)
-  supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
-            [--reconnect-s S] [--dismiss-surveys] [--context-warn PCT] [--journal FILE]
-                     the loop: await-turn; with --auto-reads the approval policy
-                     answers the boxes it proves safe — a read-only Bash box, a
-                     Read box outside the secrets list, the rm circuit breaker
-                     under a scratch root, the trust dialog for the session's
-                     own folder (the one-shot option, guarded on the judged row:
-                     a skipped guard is not an approval, and the box must leave
-                     before the next look; on a host without the guard,
+  supervise [@sid] [--approve safe|none] [--no-continue] [--no-answer] [--max-s S]
+            [--allow-python GLOB]... [--notes FILE] [--reconnect-s S] [--context-warn PCT]
+            [--journal FILE]
+                     the loop: await-turn; the approval policy answers every box
+                     under the [harness] `approve` level — by default each its
+                     one-shot allow (a usage-credit consent included; never
+                     "don't ask again", never a purchase: a box whose every yes
+                     buys gets the option that waits, else its `No`), the
+                     trust dialog, plan mode's yes that grants no standing
+                     mode, the question
+                     dialog's recommended answer tab by tab (not under
+                     --no-answer);
+                     `--approve safe` only a box it proves safe (a read-only
+                     Bash box, a Read box outside the secrets list, the rm
+                     circuit breaker under a scratch root, the trust dialog for
+                     the session's own folder); `--approve none` nothing — each
+                     press guarded on the judged row and fenced on the read
+                     (a skipped guard is not an approval, and the box must
+                     leave before the next look; on a host without the guard,
                      nothing is pressed when the confirming read shows the
                      session survey open — a `1` there could be a rating — and
-                     the box is yours) and noted; anything else — a write, a
-                     workflow, a question, a limit notice, an idle composer — is
-                     printed and the tool exits 0 for YOUR review; TIMEOUT / exit
-                     124, with the last read, once --max-s is spent (nothing is
-                     pressed after it; spent in an outage, it is the TIMEOUT too).
-                     The session survey is never answered: watch's `EVENT
-                     survey` line goes to stderr, or --dismiss-surveys
-                     dismisses it; watch's `EVENT context` and `EVENT
-                     compacted` lines go there too, for what happens during the
-                     run (see --context-warn)
-  watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
-        [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT] [--journal FILE]
-        [--mail [--inbox @sid] [--report-window S] [--idle-grace S]] [--resume [RULES]]
-                     supervise's loop that never exits at a review point: it
-                     prints ONE line — `EVENT <phase> seq=<n> <summary>` — and
-                     keeps watching, looking again once the screen has moved past
-                     that point, so your turn or key is picked up by itself; a
-                     point that looks like the last one (the same summary, the
-                     same last transcript rows, the same box) is not repeated
-                     unless it saw the worker busy, approved a read, or lost
-                     the connection in between (the point still showing after
-                     an outage is printed once more); each approval prints
-                     `APPROVED seq=<n> <command>`; TIMEOUT / exit 124 once
-                     --max-s (default 1800) is spent, an outage included, `EXIT
-                     <reason>` / exit 1 when the session ends, an outage
-                     outlasts its window (see --reconnect-s), a request or the
-                     notes file fails, or a flag or the host fails before the
-                     loop. Run it under your harness's
-                     background monitor:
-                       aterm drive watch @s-… --auto-reads --notes notes.txt
+                     the box is yours) and noted; anything else — a box it may
+                     not answer, a question, a limit notice, an idle composer —
+                     is printed and the tool exits 0 for YOUR review; TIMEOUT /
+                     exit 124, with the last read, once --max-s is spent
+                     (nothing is pressed after it; spent in an outage, it is the
+                     TIMEOUT too). The session survey is dismissed with a
+                     guarded `0` (never a rating; `DISMISSED survey` on stderr)
+                     unless [harness] `dismiss_surveys = false`, then watch's
+                     `EVENT survey` line goes there; watch's `EVENT context` and
+                     `EVENT compacted` lines go there too, for what happens
+                     during the run (see --context-warn)
+  watch [@sid] [--approve safe|none] [--no-continue] [--no-answer] [--allow-python GLOB]...
+        [--notes FILE] [--max-s S] [--reconnect-s S] [--report] [--context-warn PCT]
+        [--journal FILE] [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
+                     supervise's loop that never exits at a review point, FULLY
+                     AUTOMATIC as the window's host is: it prints ONE line —
+                     `EVENT <phase> seq=<n> <summary>` — and keeps watching,
+                     looking again once the server's verdict (or, on an older
+                     host, the screen) has moved past that point, so your turn
+                     or key is picked up by itself; a point that looks like the
+                     last one (the same summary, the same last transcript rows,
+                     the same box) is not repeated unless it saw the worker
+                     busy, approved a box, or lost the connection in between
+                     (the point still showing after an outage is printed once
+                     more); each approval prints `APPROVED seq=<n> <command>`;
+                     TIMEOUT / exit 124 once a --max-s given is spent (none
+                     by default: it runs as long as the session does),
+                     an outage included, `EXIT <reason>` / exit 1 when the
+                     session ends, an outage outlasts its window (see
+                     --reconnect-s), a request or the notes file fails, or a
+                     flag or the host fails before the loop. Run it under your
+                     harness's background monitor:
+                       aterm drive watch @s-… --notes notes.txt
                      With --report, an idle, question or limited line carries
                      `complete=<0|1> rows=<n>` of `report` before its summary.
-                     When the session survey appears it prints, once, `EVENT
-                     survey seq=<n> dismiss with: aterm ctl @sid key
-                     'if=^●.How.is.Claude.doing' 0` — not while a box is up or
-                     text is typed in the composer, not again while it stays
-                     open, and again when it comes back after any read saw it
-                     gone; with --dismiss-surveys it presses that `0` and,
-                     once the survey has gone, prints `DISMISSED survey
-                     seq=<n>` instead. As the worker's context runs low it
-                     prints `EVENT context seq=<n> <v>% until auto-compact`
-                     once a descent, at the read that sees it (mid-turn too),
-                     and `EVENT compacted seq=<n>` once the worker has
-                     compacted (see --context-warn); with no indicator on the
-                     screen, every line is as before. With --mail the
-                     worker's end-of-turn report comes by mail and its idle
-                     point is ONE line, `EVENT turn seq=<n> report=<id>
-                     rows=<n> <summary>` (see --mail). A usage limit is the
-                     loop's own decision point (measured 2026-09-15 → 09-17:
-                     one account's weekly limit stopped the manager and the
-                     worker at once and the watcher ran out its budget — two
-                     days lost). On `EVENT limited` it sets the worker's
-                     `attention` meta to the notice, posts it as
-                     `kind=control` mail to you (--inbox, else
-                     $ATERM_PARENT_SESSION_ID) and journals `ESCALATED …`,
-                     once an episode; it never exits on a limit — a --max-s
-                     that would end before the reset the notice names plus
-                     10 min is stretched to that, `EXTEND until=<UTC>
-                     reset=<text>` printed once a reset — and clears the
-                     attention when the worker works again: at the first
-                     busy read after Claude Code's auto-continue notice
-                     (`⚠ Usage limit reached · continuing automatically at
-                     1:50pm`, its time the reset; `continuing shortly`, a
-                     minute — the row stays on the screen while the worker
-                     resumes under it; the wall again before it answers is
-                     the same episode, mailed once), when it answers after
-                     a notice naming a reset. With --resume it continues
-                     the worker a minute past the reset (never on an
-                     auto-continue notice: Claude Code goes on by itself),
-                     or as soon as the screen leaves the notice (a
-                     `/login`, a `/model` line): `keep going`, with RULES
-                     `keep going (standing rules: <the file>)`, through the
-                     guarded submit, only at an idle composer with nothing
-                     typed, printed `CONTINUED seq=<n> rule=usage-resume@v1
-                     <text>` — a notice whose reset has passed is continued
-                     at once and raises no badge; the notice again after it
-                     waits 10 min from then, then 30. It invents no work
-                     beyond `keep going`:
-                     the last directive is yours to resend (see --resume)
-                     A box watch does not approve, or a question the worker
-                     asks, is yours: the worker's `attention` meta reads
-                     `claude <kind>: <command, path or question, ≤64 cells;
-                     else the box's own first row> (<why>)` and ONE kind=ask
-                     reaches --mail's manager per review point, only while
-                     fabric=connected (the same box back after the worker
-                     worked is asked again); the badge clears when the box
-                     has left the screen (your `key`/`turn` answering it is
-                     the change watch waits on). --auto-reads is unchanged;
-                     supervise escalates nothing.
+                     When the session survey appears it presses its `0`
+                     (guarded) and, once the survey has gone, prints `DISMISSED
+                     survey seq=<n>`; under `dismiss_surveys = false` it prints,
+                     once, `EVENT survey seq=<n> dismiss with: aterm ctl @sid
+                     key 'if=^●.How.is.Claude.doing' 0` — not while a box is up
+                     or text is typed in the composer, not again while it stays
+                     open (a `0` that did not take is pressed again on a growing
+                     back-off, the session badged from the second miss). As
+                     the worker's context runs low it prints `EVENT context
+                     seq=<n> <v>% until auto-compact` once a descent,
+                     and `EVENT compacted seq=<n>` once the worker has compacted
+                     (see --context-warn). With --mail the worker's end-of-turn
+                     report comes by mail and its idle point is ONE line,
+                     `EVENT turn seq=<n> report=<id> rows=<n> <summary>` (see
+                     --mail). At every point where a turn ended it answers
+                     under the [harness] switches (--no-continue and --no-answer
+                     take them away): a turn is CONTINUED (`keep going`, the
+                     rules file's text with it; the worker's own suggestion when
+                     it is one); a question or a request for a decision is
+                     ANSWERED with `answer_text` (one naming an irreversible
+                     act only with the option that deletes, overwrites and
+                     force-pushes nothing); a worker whose turns keep
+                     ending short, or ending on "done", waits a back-off that
+                     doubles, 2 min to an hour — never escalated as "done"; a
+                     session with no turn yet gets nothing; an API error or an
+                     overload is retried for ever (1, 5, 15, 30, then every 60
+                     min); a usage or spend limit is continued a minute past its
+                     reset, never bought — the --max-s is stretched past it
+                     (`EXTEND until=<UTC> reset=<text>`), and a limit it waits
+                     out raises no badge (Claude Code's own `continuing
+                     automatically` is waited out, continued only 10 min past
+                     its time); a model bucket is waited out to its reset (the
+                     window's host relaunches it on `model_fallback` instead,
+                     `--model`, never `/model`; one asking consent to go on on
+                     credits is continued first); a full context `/compact`; a lost
+                     login `/login`; a continuation the worker never takes is
+                     acted again on the back-off. Nothing is typed under a box
+                     or the survey, within `human_grace_s` of a person's
+                     keystroke or of a draft last changing, while another
+                     driver holds a lease or a named turn on it (`hand=`), or
+                     — for that grace — on a turn a person stopped with Esc
+                     (the survey's `0` waits for it too); a draft left
+                     standing past it is sent in the act's place, a fenced Enter
+                     alone; other text goes through the fenced write (`send
+                     if-gen=`, then a fenced Enter once the composer shows it),
+                     else the guarded submit, printed `CONTINUED seq=<n>
+                     rule=<id> <text>`, each wait journaled `WAITING …`. What it
+                     may not answer — a box beyond the `approve` level, a
+                     question under --no-answer, a limit under `resume_limits =
+                     false`, the browser step of a lost login — is yours: the
+                     worker's `attention` meta reads `claude <kind>: <command,
+                     path or question, ≤64 cells; else the box's own first row>
+                     (<why>)` (a limit's: `limited: <message> reset=<when>`) and
+                     ONE kind=ask reaches --mail's manager per review point, only
+                     while fabric=connected; the badge clears when the point has
+                     left the screen (your `key`/`turn` answering it is the
+                     change watch waits on). supervise escalates nothing.
   task @sid [--deadline S] [--wait] [--inbox @sid] <text...>
                      give the worker its work BY MAIL: `post to=@sid kind=task
                      [dl=<ms>] <text>` from your own session (@self, or
                      --inbox), the body never through the PTY; then one read
                      of the worker's screen and — only when it is idle — the
                      one-line nudge `Inbox: task @<off>` typed as a turn (not
-                     waited on; a busy worker gets the mail alone and reads it
+                     waited on; its Enter guarded on the composer's caret row
+                     holding the nudge, so it never lands in a box; a busy worker gets the mail alone and reads it
                      at its next look at the inbox: nothing wakes a worker for
                      mail, it is typed to). Prints `task @<off>
                      nudged=0|1` once the post landed; one that did not is
@@ -2000,11 +2262,11 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      an `EXIT` line); --max-s or --timeout running out first is
                      the TIMEOUT, exit 124. watch prints both lines on stdout
                      (informational), await-turn and supervise on stderr. A
-                     per-instance socket named with --socket or
-                     $ATERM_CONTROL_SOCK (`aterm-<pid>.sock`) goes with its
-                     instance, so a ride-out through it lapses: leave both
-                     unset (the instance hosting this terminal, else the
-                     newest) or name the `aterm.sock` alias
+                     per-instance socket named with --socket
+                     (`aterm-<pid>.sock`) goes with its instance, so a
+                     ride-out through it lapses: leave --socket off (the
+                     instance hosting this terminal, else the newest) or name
+                     the `aterm.sock` alias
   --mail             supervise and watch park ONE `await inbox since=<id>` on
                      YOUR session (@self, or --inbox @sid) from a thread with
                      a control client of its own — the worker's socket sees
@@ -2018,7 +2280,7 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      printed, the screen read once per 20 s step as the
                      safety net (a prompt or the worker busy again supersedes
                      it) — until the report lands or --idle-grace S (default
-                     180) runs out, then prints as `EVENT turn seq=<n>
+                     5) runs out, then prints as `EVENT turn seq=<n>
                      report=<id> rows=<n> <summary>` when the report is this
                      turn's (it came after the worker was read busy for the
                      turn, or after the point; --report-window S, default
@@ -2048,26 +2310,12 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      or write it is said once on stderr and stops nothing.
                      `aterm drive ledger --journal FILE` replays it; --notes
                      stays what it was (one line per Bash-prompt decision)
-  --resume [RULES]   watch lives through a usage limit's reset and continues the
-                     worker after it (see watch); RULES names the file whose
-                     contents are typed with every continuation (`keep going
-                     (standing rules: …)`) — your standing rules, read when
-                     typed, so edit the file as they change; refused at the
-                     launch when it cannot be read or is empty. The next word
-                     is the file unless it is a flag or the worker's @sid.
-                     Without the flag every line is as before but for `EXTEND`
-  --dismiss-surveys  supervise and watch dismiss Claude Code's session survey
-                     instead of reporting it: when it appears, a GUARDED `0`
-                     (`key if=^●.How.is.Claude.doing 0` — only `0`, never a
-                     rating; `OK skipped` means no row matched, nothing
-                     written); once a fresh read shows it gone, `DISMISSED
-                     survey seq=<n>` (watch: stdout; supervise: stderr) and a
-                     --notes line, none of it for a skipped `0`. Still open
-                     there, it is handed to you (the `EVENT survey` line) and
-                     not pressed again; a `0` that landed in the composer is
-                     backspaced. Nothing is pressed while a box is up or text
-                     is typed in the composer, and a host without `key if=`
-                     gets no `0`: the survey is reported instead
+  --approve safe|none   supervise and watch answer at most what that level
+                     answers (see supervise): a limit on the [harness] `approve`,
+                     never a raise
+  --no-continue      supervise and watch type no continuation at a turn's end
+  --no-answer        supervise and watch answer no question for a person, in
+                     prose or in the question dialog; it is handed to you
   --context-warn PCT supervise and watch follow Claude Code's context indicator
                      (see phase) on every read of a turn, a busy one included:
                      the first reading at or below PCT (default 10; 0 to 100; 0 =
@@ -2202,16 +2450,16 @@ const FLEET_PAGE: &str = r#"fleet — federate many aterm sessions into one fabr
 
   aterm fleet <command>
 
-The embedded operator is EXPERIMENTAL and OFF by default. Launch an instance with
-$ATERM_OPERATOR=1 to opt in. A new profile starts with an empty allowlist, so nothing
-is observed until you `manage` a session; a relaunched profile replays the sids it
-already manages. $ATERM_NO_OPERATOR (set, not empty or 0) overrides the opt-in.
+The embedded operator is EXPERIMENTAL and OFF by default. Set
+`[operator] enabled = true` in aterm.toml to opt in (read at launch). A new profile
+starts with an empty allowlist, so nothing is observed until you `manage` a session;
+a relaunched profile replays the sids it already manages.
 
 STREAMS (no operator needed)
   aterm fleet events         merge the `subscribe events` of every live instance in the
                              default socket dir to stdout as NDJSON, addressed
-                             /fleet/<pid>/events/<sid> (an explicit-$ATERM_CONTROL_SOCK
-                             instance is listed but not federated)
+                             /fleet/<pid>/events/<sid> (an instance on an explicit
+                             --control-sock is listed but not federated)
   aterm fleet exec           read `@<sid> <verb> [args…]` lines on stdin, dispatch each to
                              the fleet, emit one NDJSON result per line
 
@@ -2285,7 +2533,8 @@ NOT IN THE GROUP
 /// "which toolchain the gates pick" to drift from the first.
 ///
 /// DISCOVERY IS NOT WHAT A BARE `targo` RUNS (measured 2026-09-15). Discovery
-/// ranks the rustup `trust` link ahead of the atpkg store; a shell resolves a
+/// ranks the rustup `trust` link ahead of the atpkg store (below it when the link
+/// is OLDER than the store's build — `demoted`, 2026-09-24); a shell resolves a
 /// bare `targo` through PATH. On a machine whose rustup link points into a local
 /// build tree the page printed that tree as "(wins)" while every `targo`/
 /// `trustc`/`tippy` typed in the same shell ran the store's build through
@@ -2328,7 +2577,9 @@ fn rust_page() -> String {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let prefix = atpkg_prefix(&home, xdg.as_deref());
     let gates_pin = gates_pinned_channel();
-    let tools = gates_toolchain(explicit.as_deref(), &home, &prefix, &path_env);
+    let rustup =
+        aterm_verify::toolchain::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), &home);
+    let tools = gates_toolchain(explicit.as_deref(), &rustup, &prefix, &path_env);
     let store_bin = prefix.join("bin");
 
     let mut out = String::new();
@@ -2441,7 +2692,8 @@ fn rust_page() -> String {
     //
     // LABELLED AS THE GATES' PICK, because that is all it is: discovery is what the
     // verify gate and `xtask gate lint` run, and it ranks the rustup link ahead of
-    // the store, while a bare `targo` resolves through PATH. What PATH gives is
+    // the store (unless the link is older: `demoted` below), while a bare `targo`
+    // resolves through PATH. What PATH gives is
     // measured separately below and compared with this.
     //
     // AND ASKED UNDER THE GATES' PIN, not this directory's ([`gates_toolchain`]):
@@ -2472,9 +2724,9 @@ fn rust_page() -> String {
         let _ = writeln!(
             out,
             "  gates' toolchain NO Trust toolchain satisfies aterm's pin ({gates_pin_label}) on this\n\
-             \x20                  machine (looked in $TRUST_STAGE2_BIN, else the rustup `trust` toolchain, the\n\
-             \x20                  atpkg store, then PATH; no build tree is probed) — `aterm pkg doctor`,\n\
-             \x20                  then `aterm pkg install trust`"
+             \x20                  machine (looked in $TRUST_STAGE2_BIN, else the rustup `trust` toolchain — below\n\
+             \x20                  the store when older than it — the atpkg store, then PATH; no build tree is\n\
+             \x20                  probed) — `aterm pkg doctor`, then `aterm pkg install trust`"
         );
     }
     if let Some(r) = &tools.refused {
@@ -2482,6 +2734,26 @@ fn rust_page() -> String {
             out,
             "  refused          {}  (carried a targo but is NOT the pinned toolchain)",
             r.display()
+        );
+    }
+    // A rustup `trust` older than the store's build is ranked below the store — the
+    // rule `aterm pkg doctor` warns by and `aterm pkg repair` fixes by (atpkg's
+    // `stale_against_store`, mirrored in aterm-verify). SAID, because a reader who knows
+    // where `~/.rustup/toolchains/trust` points would otherwise expect it above.
+    // The fix is the discovery's own (`Demoted::remedy`), because it follows the entry's
+    // SHAPE: repair re-points a link and refuses a real directory, so a directory is sent
+    // to the by-hand removal first rather than to a verb that answers "refusing".
+    if let Some(d) = &tools.demoted {
+        let _ = writeln!(
+            out,
+            "  demoted          {}  (rustup `trust`, NOT used by the gates)\n\
+             \x20                  a toolchain from {}, older than the atpkg store's {}: a rustup `trust`\n\
+             \x20                  older than the store ranks BELOW it.\n\
+             \x20                  fix: {}",
+            d.dir.display(),
+            d.its,
+            d.store,
+            d.remedy()
         );
     }
     let _ = writeln!(
@@ -3000,7 +3272,8 @@ enum Refusal {
     Symlink,
     /// `[ -f R ]`: nothing at `R` is a regular file.
     Missing,
-    /// `[ -x R ]`: the root file is not executable.
+    /// `[ -x R ]`: the root file is not executable. Only Unix has an execute bit to ask.
+    #[cfg(unix)]
     NotExecutable,
     /// `[ -f S ]`: the store file the root stands for is gone — a reclaimed build never
     /// runs from a leftover root.
@@ -3248,13 +3521,13 @@ fn gates_pinned_channel() -> Option<String> {
 /// [`gates_pinned_channel`]. Takes no directory, so no caller's pin can reach it.
 fn gates_toolchain(
     explicit: Option<&Path>,
-    home: &Path,
+    rustup_home: &Path,
     prefix: &Path,
     path_env: &std::ffi::OsStr,
 ) -> aterm_verify::Toolchain {
     aterm_verify::Toolchain::discover_with_store(
         explicit,
-        home,
+        rustup_home,
         Some(prefix),
         path_env,
         gates_pinned_channel().as_deref(),
@@ -3278,6 +3551,7 @@ fn refusal_words(why: Refusal) -> &'static str {
     match why {
         Refusal::Symlink => "is a symbolic link",
         Refusal::Missing => "does not resolve",
+        #[cfg(unix)]
         Refusal::NotExecutable => "is not executable",
         Refusal::StoreGone => "stands for a store file that is gone",
         Refusal::Unmarked => {
@@ -3393,10 +3667,10 @@ verb, but they have a page of their own — `aterm help fabric` — for what the
 fields mean, the four answers a wait that does not land can give, and the halt.
 
 WHAT IT IS
-  A window-mode instance — a window, or `aterm --headless` (ATERM_HEADLESS=1) for an
-  engine + socket with no window — exposes a control socket speaking a small newline
-  protocol, unless it was told not to: `--no-control-sock`, ATERM_NO_CONTROL_SOCK=1 or
-  ATERM_CONTROL_SOCK=0|off disable it, and such an instance says so on stderr at launch
+  A window-mode instance — a window, or `aterm --headless` for an engine + socket with
+  no window — exposes a control socket speaking a small newline protocol, unless it was
+  told not to: `--no-control-sock` or `--control-sock 0|off` disable it, and such an
+  instance says so on stderr at launch
   and is invisible to every verb below. (The plain `aterm` passthrough CLI serves NONE:
   it is a transparent shell wrapper, not an introspection host.) The `aterm ctl` client
   talks that socket: read the terminal state (as text/styled cells) or
@@ -3421,7 +3695,7 @@ THE MOVES (an AI's loop is see -> decide -> drive -> observe)
           aterm fleet status | manage <sid> | next   (durable; empty allowlist on a new profile)
           aterm fleet propose < proposal.json        (Owner-only guarded interactive turn)
           aterm fleet events | exec                  (legacy NDJSON federation/dispatch)
-          EXPERIMENTAL and OFF by default; ATERM_OPERATOR=1 opts in (docs/OPERATOR-EMBEDDED.md)
+          EXPERIMENTAL and OFF by default; [operator] enabled = true opts in (docs/OPERATOR-EMBEDDED.md)
   RECALL  aterm ctl @sid history [<n>]      (per-turn record + deterministic screen hash)
 
 HOW TO USE IT
@@ -3430,14 +3704,46 @@ HOW TO USE IT
   drive another as if a human were at the keyboard. `subscribe ... events` is event-driven:
   you pull a full screen/image only when an event says something changed, so watching five
   or fifty sessions costs almost nothing until it matters. Headless works too (pass
-  --headless, or the exactly equivalent ATERM_HEADLESS=1, for an engine + control socket
-  with no window; either way the launch names the mode on stderr). A headless instance
-  never takes the keyboard: on macOS it is a background process with no Dock tile that
-  cannot become the active app, so a harness may boot one while you type elsewhere.
-  Discoverability is OPT-IN: launch the window with ATERM_AI_HINT=1 to inject a single
-  dim line above the first prompt announcing the terminal is AI-introspectable and
-  drivable with aterm-ctl (off by default — a transparent terminal injects nothing into
-  your screen).
+  --headless for an engine + control socket with no window — with --columns/--lines for
+  its grid and --control-sock <path> for a private socket; the launch names the mode on
+  stderr). A headless instance never takes the keyboard: on macOS it is a background
+  process with no Dock tile that cannot become the active app, so a harness may boot one
+  while you type elsewhere. A harness that boots throwaway instances also passes
+  --lifeline-fd <n>, the read end of a pipe it holds the write end of (stdin in the
+  in-tree harnesses), so an instance ends when its launcher does, however that ends; and
+  `aterm doctor`'s `instances:` row names every aterm window or headless instance no
+  control socket reaches (reported, never stopped). A transparent terminal injects
+  nothing into your screen: discoverability is this manual (`aterm help`),
+  `aterm ctl --help` and the verbs.
+
+  A PROGRAM THAT STOPS READING ITS INPUT (macOS; elsewhere `input=-` and nothing refused)
+  A frozen program's screen never moves, so no screen read and no if=/if-gen=/if-fp= fence
+  can tell it from one that is thinking; its tty can. `aterm ctl @sid status` carries
+  `input=` (clear | pending | typeahead | stalled | stopped), `input_bytes=`,
+  `input_wait_ms=` (a lower bound) and, while stalled or stopped, `fg_rss_mb=`. Read it
+  before typing into a peer. Raw-mode input unread for 10 s by a program that has drawn
+  nothing since and is burning CPU reads `stalled` (a sleeping one after 5 min; one that
+  keeps drawing never): aterm raises the session's attention itself
+  (`meta attention_owner=aterm`), an agent's `status` reads `agent=wall:unresponsive`, and
+  the window's supervisor holds its presses. Once raw input
+  has waited a second (or at once, under a stopped job), every input-writing verb writes
+  nothing and answers
+    ERR busy input-unread bytes=<n> wait_ms=<ms> input=<word> (<why and the remedy>)
+  because a key sent now would be read after those bytes, against a screen the program has
+  not drawn. It is `ERR busy`: back off, and never retry it in a loop. A leading `unread=ok`
+  (send and key only) queues anyway. The remedies are signals, which unread input never
+  refuses: `signal int` interrupts, `signal term` restarts a frozen program (then resume it
+  — `claude --continue` for Claude Code), `signal cont` resumes a stopped job. A program
+  can live through `signal term` — a Node program's SIGTERM listener never runs while its
+  JS thread spins — so it stays `stalled` (`input_bytes=0`), every input verb still refused,
+  until it ends or shows it is alive (it draws, reads a key sent since, or stops spinning);
+  after 5 s aterm's line says it is still running and names `signal kill`, which nothing
+  can catch. THE
+  TYPEAHEAD HAZARD: keys the program never read stay queued in the tty after it exits, and
+  the shell that takes the terminal back reads them as its own input — so `signal
+  term|kill|hup|quit` discards a raw-mode job's unread input first (the tty's queue and
+  whatever aterm still held behind it) and says how much (`discarded=<n>`). A program that ends any other way (`signal int`, its own exit) hands
+  them to the shell: read the screen before you type the resume command.
 
 THE FULL, ALWAYS-CURRENT VERB CATALOG (generated from the protocol table):",
     );
@@ -3567,16 +3873,17 @@ fn agent_page(sid: Option<&str>) -> String {
          type into another agent's prompt unless the human named the session AND the message.\n  \
          * Never claim a prover/compiler ran or 'proved' something that didn't — an empty or\n    \
          zero-obligation report is not a proof. Say what actually executed.\n  \
-         * No CI anywhere in this toolchain, by owner mandate. aterm's ONE git hook —\n    \
-         pre-push, pinned by `verify` as core.hooksPath=.githooks — runs nothing: it BLOCKS\n    \
-         a push whose commit carries no passing receipt from `tools/verify.sh`.\n  \
+         * No CI and no git hooks, by owner mandate — never add a hook or set core.hooksPath.\n    \
+         Gates run INLINE: `tools/verify.sh` is aterm's merge contract (land on green);\n    \
+         the release cutter runs the L0 gate and reads verify's receipts itself.\n  \
          * Each tool's own AGENTS.md/CLAUDE.md rules win in its repo (e.g. never a bare\n    \
          `targo --unverified test` in nn; always `--locked` in clean).\n",
     );
     s.push_str(
-        "\nGO DEEPER\n  aterm help                 the command map for the whole toolchain\n",
+        "\nGO DEEPER\n  aterm -h                   the verb map (a bare `aterm help` in a session \
+         is this brief)\n",
     );
-    s.push_str("  aterm help <topic>         a deep dive on any tool\n");
+    s.push_str("  aterm help <topic>         a deep dive on any verb or tool\n");
     s.push_str(
         "  aterm ctl help             the short verb catalog from a running session;\n\
          \x20                            `help <verb>` one full entry, `help --full` everything\n",
@@ -3775,7 +4082,8 @@ IS IT ON HERE?
                                 adds the text.
   aterm ctl @self status        ... fabric=<connected|stale|stalled|disconnected|absent>
                                     fabric_rtt_ms=<n|-> fabric_link_age_ms=<n|->
-  absent        no bridge was ever launched; a post that waits is refused `no-bridge=1`
+  absent        no bridge was ever launched. A plain `post` still QUEUES (`OK <id>`) for
+                the bridge that arrives; only a post that WAITS is refused `no-bridge=1`
   connected     a bridge is attached AND its last exchange with the broker was acked.
                 `fabric=` is the bridge's BROKER LINK, not its process: the bridge tells
                 the instance about that link on every change and after an ack that moved
@@ -3799,7 +4107,8 @@ IS IT ON HERE?
                 queue, no mail arrives, and a post that waits answers `ERR fabric stalled
                 id=<n> queued=1` AT ONCE instead of burning its wait. `aterm ctl fabric
                 status` adds `reason=<no-socket|refused|denied|no-ack|closed|attach|
-                subscribe|read|starting>`; `aterm fabric` warns and `doctor` says the fix.
+                subscribe|read|starting|error>`, `error` being the errno the table does not
+                name; `aterm fabric` warns and `doctor` says the fix.
                 Under `reason=starting` (attached, nothing said yet) the wait parks
                 instead: a bridge from before the link report never says anything,
                 lands the post all the same, and its first delivery moves the state to
@@ -3891,7 +4200,7 @@ TURNING IT ON (the operator does this once)
          [fabric]
          command = """aterm link serve --fleet <F> --broker <sock> --cap-file <cap> \
                       --state <state> --accept-from <N>"""
-     `ATERM_FABRIC_COMMAND` overrides it. The string is split on whitespace, never
+     No environment variable overrides it. The string is split on whitespace, never
      through a shell, so a path with spaces needs a symlink. `--accept-from <N>` is not
      decoration: without it a `task` between two sessions of this same node arrives
      demoted, as `kind=note demoted=task`, which `await inbox` skips by default.
@@ -4049,26 +4358,6 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn linux_update_manual_names_policy_health_and_local_baseline() {
-        let linux = UPDATE_PAGE.split("LINUX\n").nth(1).unwrap();
-        for phrase in [
-            "auto_apply = false",
-            "enabled = false",
-            "immediately before replacement",
-            "Explicit `aterm update apply` re-verifies",
-            "healthy full --headless engine",
-            "--session path and ordinary CLI commands do not confirm",
-            "baseline, not a signed release",
-            "linux_trial=none",
-        ] {
-            assert!(
-                linux.contains(phrase),
-                "Linux update manual lacks {phrase:?}"
-            );
-        }
-    }
-
     /// The overview page must name EVERY front-door verb. It did not: `ship`
     /// and `update` carried usage lines and blurbs in `crate::Verb` — the roster
     /// that documents itself as "the ONE place a verb exists" — while this
@@ -4123,18 +4412,38 @@ mod tests {
         }
     }
 
-    /// The manual told readers to set config keys and never said where the file
-    /// is — the 2026-08-30 audit's one blocker.
+    /// Every diagnostic word a page lists in an `aterm show-config | …` roster is one
+    /// the session dispatches. `validate-config` stayed on two pages after it was
+    /// deleted with `ATERM_CONTAINMENT_MODE` (2026-09-24), where `aterm
+    /// validate-config` answers "unknown command".
     #[test]
-    fn the_manual_says_where_the_config_file_lives() {
-        let (page, code) = render(Some("config"), None);
-        assert_eq!(code, 0);
-        assert!(page.contains(".config/aterm/aterm.toml"), "{page}");
-        assert!(page.contains("XDG_CONFIG_HOME"), "{page}");
-        assert!(page.contains("--write-config"), "{page}");
-        // ...and the keys the rest of the manual names must be findable from it.
-        assert!(page.contains("windowing_behavior"), "{page}");
-        assert!(page.contains("agents_auto_prime"), "{page}");
+    fn a_diagnostic_roster_names_only_dispatched_words() {
+        let mut pages = vec![render(None, None).0];
+        pages.extend(
+            topic_names()
+                .into_iter()
+                .chain(EXTRA_PAGES.iter().copied())
+                .map(|t| render(Some(t), None).0),
+        );
+        let mut rosters = 0;
+        for page in &pages {
+            for line in page.lines() {
+                let Some(roster) = line.trim_start().strip_prefix("aterm show-config") else {
+                    continue;
+                };
+                rosters += 1;
+                let words = roster
+                    .split('|')
+                    .filter_map(|w| w.split_whitespace().next());
+                for word in std::iter::once("show-config").chain(words) {
+                    assert!(
+                        crate::DIAG_COMMANDS.iter().any(|(name, _)| *name == word),
+                        "{word:?} is not a diagnostic the session dispatches: {line}"
+                    );
+                }
+            }
+        }
+        assert!(rosters >= 2, "the rosters this pins went missing");
     }
 
     /// A guessed topic must list the pages that exist — including the ones that
@@ -4145,21 +4454,6 @@ mod tests {
         assert_eq!(code, 2);
         for extra in EXTRA_PAGES {
             assert!(msg.contains(extra), "the listing omits {extra}: {msg}");
-        }
-    }
-
-    /// The retired lane must not be promised anywhere: the sealed offline seed
-    /// went on 2026-08-26, and the manual still described it as how first launch
-    /// fills the store.
-    #[test]
-    fn no_page_still_promises_the_sealed_offline_seed() {
-        for t in TOPICS {
-            let (page, _) = render(Some(t.name), None);
-            assert!(
-                !page.contains("sealed inside the app"),
-                "{} still promises the retired in-app seal",
-                t.name
-            );
         }
     }
 
@@ -4312,6 +4606,7 @@ mod tests {
 
     /// A scratch directory for the PATH-resolution tests, unique per test and
     /// process, removed by the caller.
+    #[cfg(unix)]
     fn path_scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("aterm-cli-help-rust-{tag}-{}", std::process::id()));
@@ -4334,6 +4629,7 @@ mod tests {
     /// seconds under load — measured 2026-09-24) and later execs do not, so paying it
     /// here keeps it out of the page's 2 s probe bounds, which it used to exhaust under
     /// load (`page_speaks_for_the_gates_whatever_this_directory_pins`, a load flake).
+    #[cfg(unix)]
     fn run_once(path: &Path) {
         let _ = std::process::Command::new(path)
             .arg("--version")
@@ -4807,6 +5103,25 @@ mod tests {
     /// is reported running from the root (the shim hop names the store file it is),
     /// and against gates pointed at the store's `bin/` the page says ONE BUILD, TWO
     /// DIRECTORIES and names the PATH side as an atpkg exec root.
+    /// ONE RUSTUP HOME, TWO SPELLINGS, ONE TABLE (2026-09-25). The gates' discovery
+    /// (`aterm_verify::toolchain::rustup_home`, a mirror because aterm-verify has no
+    /// dependencies by charter) and atpkg's (`atpkg::seam::rustup_home_with`, which the
+    /// release cutter resolves through) must name the same directory, or a machine with
+    /// a relocated rustup gets one toolchain from the gate and another from the cut.
+    /// This crate reaches both, so it holds them to one table.
+    #[test]
+    fn the_gates_and_atpkg_resolve_rustups_home_alike() {
+        let home = std::path::Path::new("/h");
+        for env in [None, Some(""), Some("/opt/rustup"), Some("relative/rustup")] {
+            let env = env.map(std::ffi::OsStr::new);
+            assert_eq!(
+                Some(aterm_verify::toolchain::rustup_home(env, home)),
+                atpkg::seam::rustup_home_with(env, Some(home)),
+                "RUSTUP_HOME={env:?}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn page_speaks_for_the_gates_whatever_this_directory_pins() {
@@ -5006,6 +5321,222 @@ mod tests {
             "{p}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE STALE RUSTUP LINK, ON THE PAGE (measured 2026-09-24 on the owner's Mac:
+    /// `gates' toolchain $HOME/trust/build/aarch64-apple-darwin/stage2/bin (wins for aterm's
+    /// gates)`, an Aug-20 stage2 reached through a hand-made rustup link, while PATH ran
+    /// the store's 2026-09-17 build — DIVERGENCE). A rustup `trust` older than the store
+    /// ranks below it: the gates' column names the store, the page says the rustup entry
+    /// was demoted and why, and PATH vs gates AGREE. The negative control: the same link
+    /// to a NEWER tree keeps its rank, is not called demoted, and the page says
+    /// DIVERGENCE as before. Re-executed as a child in a scratch world, like
+    /// [`page_speaks_for_the_gates_whatever_this_directory_pins`].
+    #[cfg(unix)]
+    #[test]
+    fn page_names_a_rustup_trust_older_than_the_store_and_the_gates_skip_it() {
+        const CHILD: &str = "ATERM_TEST_HELP_RUST_DEMOTED_CHILD";
+        if let Some(out) = std::env::var_os(CHILD) {
+            let (page, code) = render(Some("rust"), None);
+            assert_eq!(code, 0);
+            std::fs::write(out, page).expect("write the page");
+            return;
+        }
+        let root = std::fs::canonicalize(path_scratch("demoted")).expect("scratch");
+        let home = root.join("home");
+        let prefix = root.join("prefix");
+        let tree = home.join("trust/build/aarch64-apple-darwin/stage2");
+        let store = prefix.join("store/trust/9999");
+        // ONE script per tool for the whole fixture, HARD-LINKED in as every `trustc` and
+        // every `targo`, and run once here unbounded (`write_exec`): macOS assesses a new
+        // executable file on its first exec — ~20 s measured on a loaded m7, 2026-09-24,
+        // in atpkg's copy of this fixture — which is past aterm-verify's 5 s date bound,
+        // and a link to an assessed file is not new. What a toolchain reports is DATA
+        // beside it (`commit`, `commit-date`), so the newer-date control below rewrites
+        // two plain files, never an executable. (A fresh script per toolchain made the
+        // positive half hinge on that assessment finishing inside the bound: a timed-out
+        // date reads "unknown", which never demotes.)
+        let scripts = root.join("scripts");
+        write_exec(
+            &scripts.join("trustc"),
+            b"#!/bin/sh\nroot=$(cd \"$(dirname \"$0\")/..\" && pwd -P)\n\
+              case \"$1\" in\n  -vV) d=$(cat \"$root/commit-date\"); \
+              echo \"rustc 1.99.0-dev ($(cat \"$root/commit\") $d)\"; \
+              echo \"commit-date: $d\" ;;\n  *) echo \"$root\" ;;\nesac\n",
+        );
+        write_exec(
+            &scripts.join("targo"),
+            b"#!/bin/sh\nroot=$(cd \"$(dirname \"$0\")/..\" && pwd -P)\n\
+              echo \"targo 1.99.0-dev ($(cat \"$root/commit\") $(cat \"$root/commit-date\"))\"\n",
+        );
+        let dated = |dir: &Path, commit: &str, date: &str| {
+            std::fs::create_dir_all(dir.join("lib/rustlib")).expect("sysroot");
+            std::fs::create_dir_all(dir.join("bin")).expect("bin");
+            for tool in ["trustc", "targo"] {
+                let at = dir.join("bin").join(tool);
+                if std::fs::symlink_metadata(&at).is_err() {
+                    std::fs::hard_link(scripts.join(tool), &at).expect("hard-link the script");
+                }
+            }
+            std::fs::write(dir.join("commit"), commit).expect("commit");
+            std::fs::write(dir.join("commit-date"), date).expect("commit-date");
+        };
+        dated(&tree, "aaaaaaaaa", "2026-08-20");
+        dated(&store, "bbbbbbbbb", "2026-09-17");
+        // The property the bound depends on, held: every compiler and driver the child
+        // will probe IS one of the two scripts already run, not a file of its own.
+        let inode = |p: &Path| {
+            use std::os::unix::fs::MetadataExt as _;
+            let m = std::fs::metadata(p).expect("stat");
+            (m.dev(), m.ino())
+        };
+        for tool in ["trustc", "targo"] {
+            for dir in [&tree, &store] {
+                assert_eq!(
+                    inode(&dir.join("bin").join(tool)),
+                    inode(&scripts.join(tool)),
+                    "{} is a new executable, not the script run above",
+                    dir.join("bin").join(tool).display()
+                );
+            }
+        }
+        std::fs::create_dir_all(home.join(".rustup/toolchains")).expect("rustup");
+        std::os::unix::fs::symlink(&tree, home.join(".rustup/toolchains/trust")).expect("link");
+        std::os::unix::fs::symlink(&store, prefix.join("store/trust/current")).expect("current");
+        let shims = prefix.join("bin");
+        for tool in ["targo", "trustc"] {
+            let shim = atpkg::platform::shim_executable_to_env(
+                &shims.join(tool),
+                &store.join("bin").join(tool),
+                &atpkg::shim_env::ShimEnv::NONE,
+            )
+            .expect("renders");
+            write_exec(&shims.join(tool), &shim.body);
+        }
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(xdg.join("aterm")).expect("xdg");
+        std::fs::write(
+            xdg.join("aterm/aterm.toml"),
+            format!("[packages]\nprefix = \"{}\"\n", prefix.display()),
+        )
+        .expect("config");
+        let name = format!(
+            "{}::page_names_a_rustup_trust_older_than_the_store_and_the_gates_skip_it",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let page = |tag: &str| -> String {
+            let out = root.join(format!("{tag}.txt"));
+            let run = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env(CHILD, &out)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("PATH", format!("{}:/usr/bin:/bin", shims.display()))
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("re-exec the test binary");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(run.status.success(), "the {tag} re-exec failed:\n{text}");
+            assert!(
+                text.contains("1 passed"),
+                "the {tag} re-exec ran no test:\n{text}"
+            );
+            std::fs::read_to_string(&out).expect("the child wrote the page")
+        };
+        let store_bin = std::fs::canonicalize(store.join("bin")).expect("store bin");
+        let tree_bin = tree.join("bin");
+
+        let p = page("older");
+        assert!(
+            p.contains(&format!(
+                "  gates' toolchain {}  (wins for aterm's gates)",
+                store_bin.display()
+            )),
+            "an older rustup `trust` must not be the gates' toolchain:\n{p}"
+        );
+        assert!(
+            p.contains(&format!(
+                "  demoted          {}  (rustup `trust`, NOT used by the gates)",
+                tree_bin.display()
+            )),
+            "{p}"
+        );
+        assert!(
+            p.contains("a toolchain from 2026-08-20, older than the atpkg store's 2026-09-17"),
+            "{p}"
+        );
+        assert!(
+            p.contains("fix: `aterm pkg repair` re-points it at the store"),
+            "a demoted LINK is repair's to re-point:\n{p}"
+        );
+        assert!(p.contains("PATH vs gates    AGREE"), "{p}");
+        assert!(!p.contains("DIVERGENCE"), "{p}");
+
+        // The same age as a REAL DIRECTORY at the entry: demoted all the same, and the fix
+        // is the by-hand removal first — `aterm pkg repair` refuses an entry that is not a
+        // link, so naming it alone sent a reader to "refusing to touch it".
+        let entry = home.join(".rustup/toolchains/trust");
+        std::fs::remove_file(&entry).expect("unlink the rustup entry");
+        dated(&entry, "ddddddddd", "2026-08-20");
+        let p = page("directory");
+        assert!(
+            p.contains(&format!(
+                "  gates' toolchain {}  (wins for aterm's gates)",
+                store_bin.display()
+            )),
+            "{p}"
+        );
+        assert!(
+            p.contains(&format!(
+                "  demoted          {}  (rustup `trust`, NOT used by the gates)",
+                entry.join("bin").display()
+            )),
+            "{p}"
+        );
+        assert!(
+            p.contains(&format!(
+                "fix: {}",
+                aterm_verify::toolchain::REMEDY_DIRECTORY
+            )) && !p.contains("re-points it at the store"),
+            "a demoted DIRECTORY is not repair's to replace:\n{p}"
+        );
+        std::fs::remove_dir_all(&entry).expect("remove the directory entry");
+        std::os::unix::fs::symlink(&tree, &entry).expect("link again");
+
+        // Negative control: the same link to a NEWER tree keeps its rank. Only the DATA
+        // beside the tree changes; its `trustc` and `targo` are the links already run.
+        dated(&tree, "ccccccccc", "2026-09-20");
+        let p = page("newer");
+        assert!(
+            p.contains(&format!(
+                "  gates' toolchain {}  (wins for aterm's gates)",
+                tree_bin.display()
+            )),
+            "{p}"
+        );
+        assert!(!p.contains("  demoted  "), "{p}");
+        assert!(p.contains("PATH vs gates    DIVERGENCE"), "{p}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// aterm-verify restates atpkg's one fix for a rustup entry it will not touch
+    /// (`seam::DETACH_FIX`) in the remedy it names for a demoted real DIRECTORY — it has
+    /// no atpkg edge to call — so the two spellings are held together here, where both
+    /// crates are reachable.
+    #[test]
+    fn a_demoted_directorys_remedy_is_atpkgs_detach_fix() {
+        let remedy = aterm_verify::toolchain::REMEDY_DIRECTORY;
+        assert!(
+            remedy.ends_with(atpkg::seam::DETACH_FIX),
+            "aterm-verify's remedy drifted from atpkg's: {remedy:?} vs {:?}",
+            atpkg::seam::DETACH_FIX
+        );
     }
 
     #[test]
@@ -5314,14 +5845,19 @@ mod tests {
 
     /// The honesty posture the owner ruled on: aterm may say the grant removes
     /// this CLASS of interruption for the folders it covers, and may not say it
-    /// ends prompts. No page may promise elimination, and none may ask for a
-    /// fresh launch (grep_guard B12).
+    /// ends prompts (design §7 S4). No page may promise elimination, and none
+    /// may ask for a fresh launch. `aterm --explain-config` is in the list
+    /// because its `[privacy]` and `[machine]` paragraphs make the same two
+    /// kinds of claim and nothing else reads them: grep_guard B12 matches only
+    /// specific restart phrasings ("takes effect on restart" passes it), and no
+    /// guard rule names "no more prompts".
     #[test]
     fn no_permissions_text_overclaims_or_asks_for_a_relaunch() {
         let pages = [
             render(Some("permissions"), None).0,
             render(None, Some("s-abc123")).0,
             render(Some("aterm"), None).0,
+            crate::explain_config_report(),
         ];
         for page in &pages {
             let lower = page.to_ascii_lowercase();
@@ -5360,15 +5896,6 @@ mod tests {
         }
     }
 
-    /// The front-door page's GOTCHAS name it too, and point at the deep dive —
-    /// this is the list a human reads before they ever see a dialog.
-    #[test]
-    fn the_aterm_page_gotchas_name_macos_privacy() {
-        let (page, _) = render(Some("aterm"), None);
-        assert!(page.contains("Operation not permitted"), "{page}");
-        assert!(page.contains("aterm help permissions"), "{page}");
-    }
-
     #[test]
     fn unknown_topic_is_a_usage_error_listing_topics() {
         let (msg, code) = render(Some("nonesuch"), None);
@@ -5383,60 +5910,79 @@ mod tests {
         assert!(page.contains("agent operating brief") && page.contains("HOUSE RULES"));
     }
 
+    /// THE 2026-09-24 INCIDENT, written where a driver looks. A Claude Code
+    /// grew to 38.8 GiB and stopped reading its terminal with an Enter queued;
+    /// its screen still showed a question box, so every screen read and every
+    /// fence passed, and for 2h41m nothing said the program was gone. The
+    /// server now answers that from the tty (`status input=`, and `ERR busy
+    /// input-unread` in place of the key), and this page is where a driver
+    /// that meets the refusal learns what it means and what to do instead of
+    /// retrying it. Each needle is a fact the paragraph owes: the probe, the
+    /// refusal, the override, the three remedies, the typeahead hazard and the
+    /// platform. The refusal's shape is checked against the generated catalog
+    /// on this same page, so the paragraph cannot drift from the `key` row.
     #[test]
-    fn introspection_page_scopes_the_socket_to_gui_or_headless() {
-        // FINDING #5: the control socket is a GUI/headless affordance; the plain
-        // passthrough CLI serves none. The page must say so, not overclaim that
-        // "every aterm session" exposes a socket.
+    fn introspection_page_teaches_the_unread_input_refusal() {
         let (page, code) = render(Some("introspection"), None);
         assert_eq!(code, 0);
-        assert!(
-            page.contains("window"),
-            "must scope the socket to the window mode"
-        );
-        assert!(
-            page.contains("--headless") || page.contains("ATERM_HEADLESS"),
-            "must name the headless socket host"
-        );
-        assert!(
-            page.contains("passthrough CLI serves NONE"),
-            "must disclaim the plain CLI passthrough socket"
-        );
-        // The `aterm` topic body makes the same scoping honest.
-        let (aterm_page, _) = render(Some("aterm"), None);
-        assert!(
-            aterm_page.contains("serves NO control socket"),
-            "the aterm topic must not overclaim the passthrough is introspectable"
-        );
-    }
-
-    /// Session identities: the ENV HYGIENE paragraph names its ONE exception —
-    /// a `spawn identity=<name>` session gets the agents' home variables set
-    /// back, pointed into the identity, AFTER the strip — so an agent that
-    /// finds `CLAUDE_CONFIG_DIR` set under aterm can read here why.
-    #[test]
-    fn agent_brief_names_the_identity_exception_to_env_hygiene() {
-        let (agent, code) = render(None, Some("s-abc123"));
-        assert_eq!(code, 0);
-        let hygiene = agent
-            .split("ENV HYGIENE")
-            .nth(1)
-            .expect("the ENV HYGIENE paragraph");
-        for phrase in [
-            "The one",
-            "`aterm ctl spawn identity=<name>`",
-            "CLAUDE_CONFIG_DIR, CODEX_HOME",
-            "<state>/identities/<name>/",
-            "set AFTER the strip",
+        let (head, catalog) = page
+            .split_once("THE FULL, ALWAYS-CURRENT VERB CATALOG")
+            .expect("the page ends in the generated catalog");
+        // Whitespace folded: the page is wrapped for a terminal, and a needle
+        // must not fail on where a line happens to break.
+        let para = head
+            .split_once("A PROGRAM THAT STOPS READING ITS INPUT")
+            .expect("the HOW TO USE IT block names the stalled program")
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in [
+            "ERR busy input-unread bytes=<n> wait_ms=<ms> input=<word>",
+            "`input=` (clear | pending | typeahead | stalled | stopped)",
+            "`input_bytes=`",
+            "`input_wait_ms=`",
+            "`fg_rss_mb=`",
+            "`agent=wall:unresponsive`",
+            "`meta attention_owner=aterm`",
+            "never retry it in a loop",
+            "`unread=ok` (send and key only)",
+            "`signal int`",
+            "`signal term`",
+            "`claude --continue`",
+            "`signal cont`",
+            // A program can live through the restart (third round,
+            // 2026-09-25): it stays stalled, and the next remedy is named.
+            "can live through `signal term`",
+            "names `signal kill`",
+            "TYPEAHEAD HAZARD",
+            "the shell that takes the terminal back",
+            "macOS; elsewhere `input=-`",
         ] {
-            assert!(hygiene.contains(phrase), "ENV HYGIENE lacks {phrase:?}");
+            assert!(
+                para.contains(needle),
+                "the unread-input paragraph lacks {needle:?}:\n{para}"
+            );
+        }
+        // The same refusal shape and the same five words are the protocol's:
+        // the catalog below is generated from the table the server answers
+        // `help` from (folded the same way).
+        let folded = catalog.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "ERR busy input-unread bytes=<n> wait_ms=<ms> input=<pending|stalled|stopped>",
+            "input=<-|clear|pending|typeahead|stalled|stopped>",
+            "unread=ok",
+        ] {
+            assert!(
+                folded.contains(needle),
+                "the generated catalog no longer says {needle:?}; the paragraph above it does"
+            );
         }
     }
 
     #[test]
-    fn agent_brief_documents_env_hygiene_and_ai_hint() {
-        // FINDING #7: an inner agent that lost its context vars can learn why, and the
-        // opt-in AI hint is discoverable from the manual (not only the README).
+    fn agent_brief_documents_env_hygiene() {
+        // FINDING #7: an inner agent that lost its context vars can learn why.
         let (agent, code) = render(None, Some("s-abc123"));
         assert_eq!(code, 0);
         assert!(
@@ -5456,33 +6002,6 @@ mod tests {
                 "env-hygiene note must name the {token} deny prefix"
             );
         }
-        let (page, _) = render(Some("introspection"), None);
-        assert!(
-            page.contains("ATERM_AI_HINT"),
-            "the opt-in AI hint must be documented in the manual"
-        );
-    }
-
-    #[test]
-    fn trust_topic_steers_to_the_prebuilt_install_never_a_source_build() {
-        // FINDING: a prebuilt self-contained sysroot SHIPS (seed + signed registry) and
-        // source-building trust is permanently refused (coherence-grouped ⇒ prebuilt-only,
-        // atpkg's sourcebuild choke point). The primary "how do I install trust" surface
-        // must name the real path and never steer users into an x.py build.
-        let (page, code) = render(Some("trust"), None);
-        assert_eq!(code, 0);
-        assert!(
-            page.contains("aterm pkg install trust"),
-            "must name the shipped install path"
-        );
-        assert!(
-            !page.contains("x.py"),
-            "must not steer users to the refused source-build path"
-        );
-        assert!(
-            page.contains("prebuilt"),
-            "must say the sysroot ships prebuilt"
-        );
     }
 
     /// The Universal Control revert the atpkg page prints is the WHOLE revert.
@@ -5516,26 +6035,16 @@ mod tests {
         }
     }
 
-    /// THE VENDOR PROGRAMS' MODEL, ON EVERY PAGE (design
-    /// `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` §1.7): claude and codex
-    /// follow their vendors' channels, so no rendered page may still say the index
-    /// re-pins them, that their updates arrive with the index, or that the index pins
-    /// them — and no page names a vendor build by its 19-digit store id. The pkg page
-    /// states the new model: the vendors' channels, the client-side check, the window's
-    /// minute-scale head watch and the update pass as the cadence, and `claude update`
-    /// checking now.
+    /// NO PAGE NAMES A VENDOR BUILD BY ITS 19-DIGIT STORE ID (design
+    /// `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` §1.7): claude and
+    /// codex follow their vendors' channels, so a page speaks of a vendor version,
+    /// never of the index's store id for it. A run of 19+ digits outside a path
+    /// component is that id.
     #[test]
-    fn no_page_carries_the_retired_vendor_wording() {
+    fn no_page_names_a_vendor_build_by_its_store_id() {
         let mut pages = vec![render(None, None).0];
         pages.extend(topic_names().into_iter().map(|t| render(Some(t), None).0));
         for page in &pages {
-            for retired in [
-                "within about an hour",
-                "updates arrive with the ALab index",
-                "pinned by aterm's signed index",
-            ] {
-                assert!(!page.contains(retired), "a page still says {retired:?}");
-            }
             let bytes = page.as_bytes();
             let mut i = 0;
             while i < bytes.len() {
@@ -5552,57 +6061,6 @@ mod tests {
                 i = i.max(start + 1);
             }
         }
-        let (pkg, code) = render(Some("pkg"), None);
-        assert_eq!(code, 0);
-        for said in [
-            "VENDOR PROGRAMS (claude, codex)",
-            "vendor's own release channel",
-            "verified on this",
-            "checks both vendors",
-            "about every minute",
-            "`codex update` check now",
-            "is checking now",
-            "managed 2.1.280 — Anthropic latest",
-        ] {
-            assert!(pkg.contains(said), "the pkg page says {said:?}");
-        }
-    }
-
-    #[test]
-    fn atpkg_topic_states_the_compiled_anchor_and_the_window_scoped_update_loop() {
-        // FINDING (root anchor): the root key is a committed constant
-        // (aterm-update-core::pins) — the stale "a plain targo --unverified build bakes no root key"
-        // claim must be gone — and, since 2026-09-23, the switch documented is the
-        // SETTING (`[packages] enabled`), never an environment kill switch.
-        let (page, code) = render(Some("atpkg"), None);
-        assert_eq!(code, 0);
-        assert!(
-            page.contains("COMPILED IN") && page.contains("`[packages] enabled`"),
-            "must document the committed anchor and the one switch"
-        );
-        for retired in [
-            "ATPKG_DISABLE",
-            "ATPKG_REFUSE_TRACKED_INSTALL",
-            "ATERM_NO_REROUTE",
-            "ATERM_NO_HARNESS",
-            "ATERM_REROUTE_QUIET",
-            "ATERM_Z3_IS_ORACLE",
-        ] {
-            assert!(!page.contains(retired), "the pkg page teaches {retired}");
-        }
-        assert!(
-            !page.contains("bakes no root key"),
-            "the inert-by-default claim is stale"
-        );
-        // FINDING (update scope), rewritten 2026-09-13: the package pass no longer
-        // rides the window alone — an INTERACTIVE session spawns one too (R3/R4,
-        // `aterm::session_lane_is_interactive`). What is still the reader's own job
-        // is the lane that provisions nothing: `--headless`, and any launch whose
-        // stdin is not a terminal. The page must keep naming the manual remedy.
-        assert!(
-            page.contains("aterm pkg update") && page.contains("scheduler"),
-            "must state the headless/non-interactive update obligation"
-        );
     }
 
     /// THE PAGE NEVER ADVISES A RENAME THAT WRITES `enabled` TWICE (review of the Phase 4
@@ -5749,31 +6207,16 @@ mod tests {
         }
     }
 
+    /// The brief is the first thing an agent reads inside aterm, so it carries the
+    /// one rule that keeps an agent out of another agent's prompt — and it must
+    /// STAY a brief: the whole point of `help <verb>` was that the first read is
+    /// cheap. Both forms, inside a session and the generic one.
     #[test]
-    fn fleet_help_exposes_the_opt_in_operator_and_empty_authority_boundary() {
-        let (page, code) = render(Some("fleet"), None);
-        assert_eq!(code, 0);
-        assert!(page.contains("aterm fleet status"), "{page}");
-        assert!(page.contains("empty allowlist"), "{page}");
-        assert!(page.contains("guarded interactive turn"), "{page}");
-        // An experimental resident subsystem is opt-in, and the page has to say
-        // both that it is experimental and how to turn it on — otherwise the
-        // feature is undiscoverable and its status is a source-only claim.
-        assert!(page.contains("EXPERIMENTAL"), "{page}");
-        assert!(page.contains("ATERM_OPERATOR=1"), "{page}");
-    }
-
-    /// The brief is the first thing an agent reads inside aterm, so it must name
-    /// the moves the agent-experience report found missing (docs/AGENT-EXPERIENCE-
-    /// 2026-08-26.md §7): the window listing beside `ls`, the trimmed reads, the
-    /// aimed spawn, the exit ledger, the per-verb help — and the one rule that keeps
-    /// an agent out of another agent's prompt. It must ALSO stay a brief: the whole
-    /// point of `help <verb>` was that the first read is cheap.
-    #[test]
-    fn agent_brief_teaches_windows_trim_exits_help_and_the_peer_rule() {
+    fn the_agent_brief_stays_a_brief_and_carries_the_peer_rule() {
         let (agent, code) = render(None, Some("s-abc123"));
         assert_eq!(code, 0);
         for needle in [
+            "aterm -h",
             "aterm ctl windows",
             "aterm ctl ls",
             "text trim",
@@ -5809,61 +6252,16 @@ mod tests {
             agent.lines().count(),
             agent.len()
         );
-        // The sid-less brief carries the same rule and the same help pointers.
         let (generic, _) = render(Some("agent"), None);
-        assert!(generic.contains("meta role=") && generic.contains("`help <verb>`"));
+        assert!(generic.contains("type into another agent's prompt"));
     }
 
-    /// The `agents` topic no longer tells a human to run the installer once per
-    /// machine: aterm runs it itself, and the topic names the knob that stops it.
+    /// `aterm help fabric` is reachable under the words an agent actually types
+    /// when it has mail, and a guessed topic is offered it. And it offers no way
+    /// around a sandbox or into an agent: no vendor hook (decision "B"), no file
+    /// mirror of the fabric, no socket allowance.
     #[test]
-    fn agents_topic_says_aterm_primes_agents_itself_and_names_the_knob() {
-        let (page, code) = render(Some("agents"), None);
-        assert_eq!(code, 0);
-        assert!(page.contains("aterm runs this installer itself"), "{page}");
-        assert!(page.contains("agents_auto_prime = false"), "{page}");
-        assert!(!page.contains("Once per machine"), "{page}");
-    }
-
-    /// The `agents` topic names every managed doc `aterm agents install` writes,
-    /// per agent, at the path aterm-primer's `skills_for` actually uses. Until
-    /// 2026-09-10 it listed two of Claude's four skills as the whole set and said
-    /// the other agents "receive the primer alone" — false since the fabric doc
-    /// went to Codex, Gemini CLI and OpenCode as a user command in each one's
-    /// own format.
-    #[test]
-    fn agents_topic_names_every_managed_doc_per_agent() {
-        let (page, code) = render(Some("agents"), None);
-        assert_eq!(code, 0);
-        for needle in [
-            "`drive-aterm`",
-            "`supervise-agent`",
-            "`rust-in-aterm`",
-            "`aterm-fabric`",
-            "~/.claude/skills/<name>/SKILL.md",
-            "~/.codex/prompts/aterm-fabric.md",
-            "~/.gemini/commands/aterm-fabric.toml",
-            "~/.config/opencode/command/aterm-fabric.md",
-        ] {
-            assert!(
-                page.contains(needle),
-                "agents page must name {needle}:\n{page}"
-            );
-        }
-        assert!(
-            !page.contains("only `claude` gets one") && !page.contains("primer alone"),
-            "the Claude-only claim is stale: {page}"
-        );
-    }
-
-    /// `aterm help fabric` is the vendor-neutral half of the fabric answer: the
-    /// primer paragraph is one sentence per agent, this is the depth, and it must
-    /// be reachable under the words an agent actually types when it has mail.
-    /// It must also say that nothing wakes an agent for mail — a page that
-    /// implied a wake path would send an operator looking for a hook that does
-    /// not exist.
-    #[test]
-    fn fabric_topic_is_reachable_and_honest_about_wake_paths() {
+    fn fabric_topic_is_reachable_and_offers_no_way_around_a_sandbox() {
         for name in [
             "fabric",
             "inbox",
@@ -5881,111 +6279,9 @@ mod tests {
             );
         }
         let (page, _) = render(Some("fabric"), None);
-        for needle in [
-            "aterm ctl @self inbox",
-            "inbox seen <id> handled",
-            "await inbox since=<id>",
-            "fabric=<connected|stale|stalled|disconnected|absent>",
-            "ERR fabric stalled",
-            "no-bridge=1",
-            "ERR halted",
-            "[fabric]",
-            // TURNING IT ON names the verbs the one shipped binary carries. Until
-            // 2026-09-10 it sent the operator to build `asb`, astream's separate
-            // CLI, which `aterm link broker` / `aterm link mint` replaced.
-            "aterm link broker <sock> [<log>]",
-            "aterm link mint '<grant>' --secret-file <secret>",
-            // The running-instance path. TURNING IT ON used to end with "this
-            // applies next launch", prescribing the relaunch `fabric attach`
-            // exists to remove; the page must name the verb, its status twin,
-            // and the pre-flight refusal that leaves the slot open.
-            "aterm ctl fabric attach",
-            "aterm ctl fabric status",
-            "ERR fabric not executable",
-        ] {
-            assert!(
-                page.contains(needle),
-                "the fabric page must name `{needle}`"
-            );
-        }
-        assert!(
-            !page.contains("asb"),
-            "the fabric page must not send an operator to build astream's `asb`"
-        );
-        assert!(
-            !page.contains("applies next launch"),
-            "the page must not prescribe a relaunch the verb makes unnecessary"
-        );
-        // ALL THREE not-landed answers, and that each means QUEUED. An audit on
-        // 2026-09-12 found `ERR timeout id=<n>` named by no agent-facing surface
-        // at all, and `no-bridge=1` documented as "nothing will ever publish it"
-        // when a later `fabric attach` drains the same outbox — measured. An
-        // agent that believes either re-posts, and `post` has no idempotency
-        // key, so the peer gets the task twice.
-        for needle in [
-            "queued=1",
-            "no-bridge=1",
-            "ERR timeout id=",
-            "fabric attach",
-            // THE FOURTH ANSWER, and the only one that is not queued: a post the
-            // bridge RETIRED. `cmd_post`'s wait loop returns `ERR {reason} id={id}`
-            // for a row it finds `dead`, and `cmd_outbox` filters `!p.dead`, so
-            // nothing drains it again. The page said there were three and that all
-            // of them meant queued; an agent obeying that reported a task nobody
-            // will ever publish as queued.
-            "ERR <reason> id=",
-            "unroutable",
-        ] {
-            assert!(
-                page.contains(needle),
-                "the four not-landed answers: `{needle}`"
-            );
-        }
-        assert!(
-            page.contains("THREE OF THEM MEAN QUEUED"),
-            "the page must say what the queued answers have in common, not only list them"
-        );
-        // `connected` IS a statement about the broker link since round 13 — the
-        // bridge reports that link, and a socket nothing serves or a killed
-        // broker reads `stalled` — and the page must say which, and that there
-        // is no heartbeat behind it.
-        for needle in [
-            "BROKER LINK, not its process",
-            "on a quiet fleet\n                there is no heartbeat",
-            "fabric_link_age_ms=",
-            "ERR fabric stalled",
-            "reason=<no-socket|refused|denied|no-ack|closed|attach|",
-        ] {
-            assert!(
-                page.contains(needle),
-                "the page must say what `connected` and `stalled` mean: `{needle}`"
-            );
-        }
-        assert!(
-            !page.contains("NOT a statement about the"),
-            "the pre-round-13 `connected` caveat must be gone: it is false now"
-        );
-        // Nothing wakes an agent for mail — it is typed to; no vendor hook is
-        // offered to any agent, and the page says so in one sentence.
-        assert!(
-            page.contains("Nothing wakes you for mail"),
-            "the one sentence must be on the page"
-        );
         assert!(
             !page.contains("link hook"),
             "no vendor hook is offered: {page}"
-        );
-        for agent in ["Codex", "Gemini CLI", "OpenCode"] {
-            assert!(
-                page.contains(agent),
-                "{agent} is named with what it does have"
-            );
-        }
-        // A sandbox that refuses the socket is not worked around: no file
-        // mirror, no allowance — the page names the refusal and stops there.
-        assert!(
-            page.contains("nothing to configure"),
-            "the Codex row states the principle"
         );
         for gone in ["mirror", "ndjson", "allow-unix-socket"] {
             assert!(
@@ -6003,59 +6299,14 @@ mod tests {
         );
     }
 
-    /// TURNING IT ON names the SHIPPED commands. Since 38f61d5be the broker and
-    /// the mint are `aterm link broker` / `aterm link mint`, inside the one
-    /// binary the updater replaces; the page used to send an operator off to
-    /// build `asb` out of astream — a CLI no release carries — and named no mint
-    /// command at all. It also pins what turning the fabric on end to end
-    /// measured on 2026-09-10: the node id is PROVISIONED into `<state>/node`
-    /// (written, not minted), eight grants go into the cap file, the mint
-    /// secret travels only as `--secret-file`, `--accept-from` is what keeps
-    /// same-node task/control undemoted, and a broker socket path has to fit
-    /// `sun_path`. And its last step is the running-instance path, in the ARGV
-    /// form: `[fabric] command` is recorded once, at launch
-    /// (`fabric_launch::Supervisor::configured`), so the instance an operator
-    /// has open while following the page — launched before step 4 wrote the
-    /// config — answers a bare `fabric attach` with `ERR fabric no command`;
-    /// the page must hand over the argv, and it must be the config string's
-    /// own words. The test joins the `\`-continued lines the way TOML (the
-    /// config) and the shell (the attach) both do and compares the two.
-    /// ROUND 19 (SPEC19 §9): `aterm help` names the window's FABRIC menu — on
-    /// the fabric page, where every row's wire twin is documented, and on the
-    /// front `aterm` topic's pointer to the window — so an agent reading the
-    /// manual learns the human has a menu-bar face for the same verbs.
-    #[test]
-    fn the_manual_names_the_fabric_menu() {
-        let (page, _) = render(Some("fabric"), None);
-        let window = page
-            .split("IN THE WINDOW")
-            .nth(1)
-            .expect("the fabric page has an IN THE WINDOW section");
-        let window = window.split("TURNING IT ON").next().unwrap();
-        for needle in [
-            "Fabric menu",
-            "Fleet…",
-            "Inbox…",
-            "METADATA ONLY",
-            "Ledger for This Session (⇧⌘L",
-            "Hold This Session / Lift",
-            "Fabric Status…",
-            "Turn\n  Fabric On… / Off…",
-            "File ▸\n  Driving",
-            "Set Role…",
-            "Presence Band / Presence Rim",
-            "[presence] band",
-            "aterm ctl invoke <Name>",
-        ] {
-            assert!(window.contains(needle), "the window block names {needle:?}");
-        }
-        let (front, _) = render(Some("aterm"), None);
-        assert!(
-            front.contains("FABRIC\n  menu"),
-            "the aterm topic points at the Fabric menu"
-        );
-    }
-
+    /// TURNING IT ON hands over the running-instance step in the ARGV form, and
+    /// that argv must be the config string's own words: `[fabric] command` is
+    /// recorded once, at launch, so the instance an operator has open answers a
+    /// bare `fabric attach` with `ERR fabric no command`. The two are joined the
+    /// way TOML (the config) and the shell (the attach) both join `\`-continued
+    /// lines, then compared. The mint secret is only ever `--secret-file` (a
+    /// `--secret <bytes>` would sit in `ps` for the life of the call), and no
+    /// line of the page wraps in a 100-column terminal.
     #[test]
     fn fabric_topic_turns_it_on_with_the_shipped_binary() {
         let (page, _) = render(Some("fabric"), None);
@@ -6064,48 +6315,6 @@ mod tests {
             .nth(1)
             .expect("the fabric page has a TURNING IT ON section");
         let on = on.split("NOTHING WAKES YOU").next().unwrap();
-        for needle in [
-            "aterm link broker <sock>",
-            "aterm link mint '<grant>' --secret-file <secret>",
-            "<state>/node",
-            "provisioned, not minted",
-            "Eight grants",
-            "--accept-from <N>",
-            "demoted=task",
-            "sun_path",
-            "104 bytes",
-            // The one command, in the installed binary; the script is a wrapper.
-            "aterm fabric on",
-            "aterm fabric off",
-            "aterm fabric doctor",
-            "--dry-run",
-            "tools/fabric-enable.sh --enable",
-            "ATERM_FABRIC_COMMAND",
-            // The broker does no peer-uid check; the 0700 directory is the
-            // boundary, and the page must not credit the broker with it.
-            "no peer uid",
-            "aterm ctl fabric attach",
-            "aterm ctl fabric status",
-            // The running-instance step: why bare fails here, and the argv.
-            "recorded once, at launch",
-            "`ERR fabric no command`",
-            "aterm ctl fabric attach aterm link serve --fleet <F> --broker <sock> \\",
-        ] {
-            assert!(
-                on.contains(needle),
-                "TURNING IT ON must name `{needle}`:\n{on}"
-            );
-        }
-        // The hedge that stood here — "on a build with `fabric attach`" — was
-        // wrong on the side where the verb exists: the bare verb does not pick
-        // up a config written after launch.
-        assert!(
-            !on.contains("on a build with"),
-            "no hedging about whether `fabric attach` exists:\n{on}"
-        );
-        // Step 5's argv IS step 4's config string. Join the continued lines the
-        // way both consumers do — the `\`, the newline and the next line's
-        // indent go — then compare the TOML value to the attach's rest-of-line.
         let flat = {
             let mut out = String::new();
             let mut rest = on;
@@ -6136,6 +6345,10 @@ mod tests {
             config.contains("--accept-from <N>") && config.starts_with("aterm link serve "),
             "{config}"
         );
+        assert!(
+            !on.contains("--secret "),
+            "the mint secret is only ever `--secret-file`:\n{on}"
+        );
         // Nothing in the page wraps in a 100-column terminal: the widest line
         // used to be the 116-column config string, which broke copy-paste.
         for line in page.lines() {
@@ -6145,43 +6358,11 @@ mod tests {
                 line.chars().count()
             );
         }
-        // The eight grants `aterm fabric on` mints, each spelled exactly once.
-        for grant in [
-            "rw,p=<N>:/f/<F>/pub/<N>/>",
-            "ro:/f/<F>/pub/>",
-            "ro:/f/<F>/fleet/>",
-            "rw,p=<N>:/f/<F>/in/*/*/<N>/*",
-            "ro:/f/<F>/in/<N>/>",
-            "rw,p=<N>:/f/<F>/cur/<N>/>",
-            "ro:/f/<F>/term/<N>/>",
-            "rw,p=<N>:/f/<F>/term/<N>/*/screen",
-        ] {
-            assert_eq!(
-                on.matches(grant).count(),
-                1,
-                "the grant `{grant}` must appear exactly once:\n{on}"
-            );
-        }
-        // The stale instructions: a separate CLI nobody ships, and a build step.
-        assert!(
-            !page.contains("asb"),
-            "no `asb` anywhere — the broker is `aterm link broker`:\n{page}"
-        );
-        assert!(!page.contains("Build the bridge"), "{page}");
-        // The secret is a FILE. `--secret <bytes>` on argv would be visible in
-        // `ps` for the life of the call, and the verb does not take it.
-        assert!(
-            !on.contains("--secret "),
-            "the mint secret is only ever `--secret-file`:\n{on}"
-        );
     }
 
     /// Decision "B": `aterm help harness` offers no way to install anything
-    /// into the agent — the four retired verbs are named only as retired,
-    /// never as KEY USAGE rows — and it says the supervisor, not a hook,
-    /// answers a permission box. The verbs deleted with the second harness
-    /// stack are not offered either. Negative control: the read verbs are
-    /// still on the page.
+    /// into the agent — the four retired verbs are never offered as usage.
+    /// Negative control: the read verbs are still on the page.
     #[test]
     fn the_harness_page_offers_no_hook_bridge() {
         let (page, code) = render(Some("harness"), None);
@@ -6191,78 +6372,14 @@ mod tests {
             "aterm harness uninstall",
             "aterm harness hook",
             "aterm harness statusline",
-            "never types `y` at an approval",
-            // Deleted with the second harness stack (2026-09-23): named only
-            // in the DELETED paragraph, never as a usage row.
-            "aterm harness status",
-            "aterm harness watch",
-            "aterm harness switch",
-            "aterm harness recover",
-            "aterm harness accounts",
         ] {
             assert!(
                 !page.contains(gone),
                 "the page still offers `{gone}`:\n{page}"
             );
         }
-        for kept in [
-            "aterm harness ledger",
-            "aterm harness limits",
-            "decision \"B\"",
-            "aterm drive",
-            // The window's supervisor is the one that acts, by default, under
-            // [harness] — not "TODAY `drive watch` approves one kind of box"
-            // (the laws review of 2026-09-24: the page described the build
-            // before the host landed).
-            "supervises every Claude Code session by default",
-            "[harness]",
-            "escalating only",
-        ] {
+        for kept in ["aterm harness ledger", "aterm harness limits"] {
             assert!(page.contains(kept), "`{kept}` is missing:\n{page}");
-        }
-        for stale in [
-            "TODAY `drive watch`",
-            "not in\n  this build",
-            "while `agents_auto_prime` is on",
-        ] {
-            assert!(
-                !page.contains(stale),
-                "the page still says `{stale}`:\n{page}"
-            );
-        }
-    }
-
-    /// The agent brief is the page primer v9 sends every agent to first, so it
-    /// must say what v9 says: mail is read on the typed `Inbox: task @<off>`
-    /// line or while the fabric is connected, never "before you stop" every
-    /// turn, and the verb pointer is `aterm ctl help`, not the 114 KB
-    /// introspection page. Both forms — inside a session and the generic one.
-    /// Negative control: the brief still names the inbox verb and `aterm help
-    /// fabric`, so a pass is not a page that dropped the paragraph.
-    #[test]
-    fn the_agent_brief_says_what_primer_v9_says_about_mail_and_verbs() {
-        for session in [Some("s-0123456789abcdef0123"), None] {
-            let (page, code) = render(Some("agent"), session);
-            assert_eq!(code, 0);
-            let flat = page.split_whitespace().collect::<Vec<_>>().join(" ");
-            for gone in ["before you stop", "help introspection"] {
-                assert!(
-                    !flat.contains(gone),
-                    "the brief still says {gone:?}:\n{page}"
-                );
-            }
-            for kept in [
-                "`aterm ctl @self inbox`",
-                "`Inbox: task @<off>`",
-                "`fabric=connected`",
-                "not every turn",
-                "`aterm ctl help`",
-                "`aterm ctl help <verb>`",
-                "`aterm ctl --help` needs no session",
-                "`aterm help fabric`",
-            ] {
-                assert!(flat.contains(kept), "`{kept}` is missing:\n{page}");
-            }
         }
     }
 }

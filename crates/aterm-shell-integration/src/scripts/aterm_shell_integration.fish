@@ -14,6 +14,9 @@
 # - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
 #   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
 #   atpkg lays them — no new tab, no `exec fish` (owner ask 2026-09-16; see "LIVE" below)
+# - A LOADER and a BODY (2026-09-26): the shell that is ALREADY RUNNING takes a newer
+#   build's integration at its next prompt, when the host that owns it points it there
+#   (see "THE LOADER" below)
 #
 # Compatible with: fish 3.1+ (string escape --style=url requires 3.1)
 
@@ -124,6 +127,24 @@ else
     end
 end
 
+# THE IN-PLACE UPGRADE (2026-09-26). The guard below is exported, so a NON-empty
+# value normally proves this shell did not come straight from aterm (a pane — see
+# above). There is one other way to arrive here with it set: THIS VERY SHELL
+# sourcing the file again — the live agent upgrade's relaunch line sources a newer
+# build's loader into a shell spawned before loaders existed (`typed_rekey` in
+# aterm-shell-integration). That shell, and only that shell, already holds
+# `$__aterm_shell_nonce`: a plain global, never exported, so no pane or child
+# shell can have inherited it (`set -q` is right here: it is this script's own
+# variable, not an ATERM_* one). For it the guard is its own, and the load goes on
+# as an upgrade in place: everything below is idempotent, and what must run once
+# per shell (the package blocks, the prompt wrapper's copy of the user's prompt) is
+# skipped where it already ran.
+set -g __aterm_fresh_load 1
+if set -q __aterm_shell_nonce; and test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
+    set -g __aterm_fresh_load 0
+    set -gx ATERM_SHELL_INTEGRATION_INSTALLED ""
+end
+
 if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
     # Skipping as before — but mark the boundary on the way out when the
     # inherited guard means we crossed one.
@@ -151,7 +172,7 @@ if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
                 set -l __aterm_mux_stamp "$__aterm_mux_dir/$__aterm_mux-$__aterm_mux_key"
                 if not test -e "$__aterm_mux_stamp"
                     if mkdir -p "$__aterm_mux_dir" 2>/dev/null; and printf '' >"$__aterm_mux_stamp" 2>/dev/null
-                        printf 'aterm: inside %s — command blocks, exit codes and cwd tracking do not cross the multiplexer,\n       so aterm records none of them for these panes. `aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences this.\n' "$__aterm_mux" >&2
+                        printf 'aterm: inside %s — no command blocks, exit codes or cwd tracking in these panes (`aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences)\n' "$__aterm_mux" >&2
                     end
                 end
             end
@@ -196,19 +217,160 @@ if test -n "$ATERM_MUX_OUTER_SESSION_ID"
     set -e ATERM_MUX_OUTER_SESSION_ID
 end
 
-# Package bin directory
-if test -d "$HOME/.aterm/bin"
+# ─── THE LOADER (2026-09-26) ───
+#
+# Everything from here to the BODY marker, and the wiring after the body's end
+# marker, is the LOADER: what a shell runs once and keeps for its whole life — the
+# nonce and the two host channels captured and scrubbed, the fish_prompt
+# trampoline. Everything between the two markers is the BODY — every mark, every
+# prompt behaviour, the managed-PATH machinery — written a second time, alone, as
+# `aterm_shell_integration_body.fish` in the same content-addressed folder, so a
+# shell that is already running can source a NEWER build's body at its next
+# prompt. The zsh script's "THE LOADER" says why and how; this is its twin.
+
+# Capture the capability nonce into a shell-global so we can immediately
+# drop it from the environment (#8015). Leaving ATERM_SHELL_NONCE in the
+# exported env lets every child process (env, ssh SendEnv, docker, cron,
+# tmux children, ...) read the 64-hex secret that would be used to bypass
+# the #7960 nonce-enforcement defense. Capture first, then `set -e`
+# (unexport) BEFORE any prompt hook fires so subprocesses never inherit
+# it.
+#
+# If the env var is missing or empty at source-time, __aterm_shell_nonce
+# stays empty and __aterm_id_suffix falls through to the unnonced form
+# (pre-nonce compatibility for hosts that have not yet authorized a
+# nonce). This matches the documented fallback: the host's OSC 133/633
+# handler drops sequences missing/with a wrong id= only when
+# `TerminalModes::require_shell_integration_nonce` is enabled.
+#
+# This is the ONE `set -q` on an ATERM_* variable that is deliberate. Both arms
+# leave $__aterm_shell_nonce empty when the env var is empty, so the definedness
+# test cannot change the nonce; taking the arm for an empty-but-defined variable
+# is strictly BETTER, because it also runs the `set -e` scrub on it. Do not
+# "fix" this one to `test -n` — that would leave an empty ATERM_SHELL_NONCE
+# exported into every child process.
+#
+# In an upgrade in place (see above) the environment holds no nonce any more — it
+# was scrubbed at this shell's first load — so the one the shell already signs
+# with is kept.
+if set -q ATERM_SHELL_NONCE
+    set -g __aterm_shell_nonce "$ATERM_SHELL_NONCE"
+    set -e ATERM_SHELL_NONCE
+else if not set -q __aterm_shell_nonce
+    set -g __aterm_shell_nonce ""
+end
+
+# Precomputed capability-nonce suffix for OSC 133/633 emissions — expands to
+# ";id=<64-hex>" when the captured nonce is non-empty, or to the empty string
+# otherwise. Mirrors the zsh script's `$__aterm_id_suffix_str`, and for the
+# same two reasons — plus one that is fish-specific and load-bearing.
+#
+# THE FISH-SPECIFIC REASON (a silent, total mark loss). The emitters below used
+# to spell the suffix as a command substitution glued to a string:
+#
+#     __aterm_osc "133;A"(__aterm_id_suffix)
+#
+# In fish, gluing a string to a command substitution is a CARTESIAN PRODUCT, and
+# a substitution that prints nothing is a ZERO-ELEMENT list — so the product is
+# ZERO arguments, not the string "133;A". Whenever the nonce was empty,
+# `__aterm_osc` was therefore called with NO arguments at all and its
+# `printf '\e]%s\a' $argv[1]` emitted a bare, EMPTY `ESC ] BEL` — every 133;A,
+# 133;B, 133;C, 133;D and 633;E silently replaced by a malformed empty OSC.
+# (bash and zsh interpolate a possibly-empty parameter, so neither shell has
+# this failure mode; it is unique to fish's list semantics.)
+#
+# The empty-nonce path is NOT hypothetical: it is this file's own documented
+# pre-nonce fallback, and it is exactly what the header's manual install
+# (`source ~/.config/aterm/shell_integration.fish` from config.fish) produces,
+# since nothing sets ATERM_SHELL_NONCE there. Measured on fish 4.2.1 before
+# this fix: OSC 7 arrived, and 133;A/B/C/D + 633;E were all absent.
+#
+# A plain variable is immune — `"133;A$__aterm_id_suffix_str"` is ordinary
+# string interpolation, one argument, empty suffix or not. Byte-identical
+# output when the nonce IS set (same ";id=<hex>" spelling), and it drops four
+# to five forkless-but-not-free command substitutions per command cycle.
+# `set -g` (not `-gx`), exactly like $__aterm_shell_nonce itself, so #8015 (no
+# nonce inheritance by subprocesses) is preserved.
+set -g __aterm_id_suffix_str ""
+if test -n "$__aterm_shell_nonce"
+    set -g __aterm_id_suffix_str ";id=$__aterm_shell_nonce"
+end
+
+# THE RE-KEY CHANNEL (2026-09-24) — the zsh script's twin, for the same reason:
+# a seamless update that could not carry this shell's nonce left its marks
+# dropped for good (`status integration=degraded`). The host names a per-session
+# file at spawn ($ATERM_REKEY_PATH, in its 0700 control dir) and, to re-key an
+# adopted shell, writes a fresh 64-hex nonce there (0600, exclusive, never
+# through a symlink) and authorizes it; the next postexec or prompt takes it.
+# Two builtin `test`s per prompt while nothing waits. Captured, then scrubbed
+# UNCONDITIONALLY (an empty value is scrubbed too, with no `set -q` needed —
+# see the loader-guard note at the top); the key never appears in typed text,
+# scrollback or history.
+# An upgrade in place keeps the path the shell already has.
+if test -n "$ATERM_REKEY_PATH"; or not set -q __aterm_rekey_path
+    set -g __aterm_rekey_path "$ATERM_REKEY_PATH"
+end
+set -e ATERM_REKEY_PATH 2>/dev/null
+
+# THE BODY POINTER (the zsh script's "THE LOADER"), captured and scrubbed exactly
+# like the re-key path: no child process learns it. An upgrade in place keeps the
+# one the shell already has, or takes the one its relaunch line hands it.
+if test -n "$ATERM_INTEGRATION_POINTER"; or not set -q __aterm_body_pointer
+    set -g __aterm_body_pointer "$ATERM_INTEGRATION_POINTER"
+end
+set -e ATERM_INTEGRATION_POINTER 2>/dev/null
+
+# Where this file was loaded from — `<root>/<address>/`, the content-addressed
+# folder the host prepared (the vendor conf.d copy sits in its `fish-xdg/`) — and
+# so which body is running: `<address>` when the folder is named by one (16
+# lowercase hex digits), empty for a hand-installed copy, which signs no revision.
+# Each piece is captured whole, never glued (this file's glue rule).
+set -l __aterm_here (status dirname)
+set -g __aterm_si_dir (string replace -r '/fish-xdg/fish/vendor_conf\.d$' '' -- "$__aterm_here")
+set -g __aterm_si_root (string replace -r '/[^/]*$' '' -- "$__aterm_si_dir")
+set -g __aterm_body_rev (string replace -r '^.*/' '' -- "$__aterm_si_dir")
+if not string match -qr '^[0-9a-f]{16}$' -- "$__aterm_body_rev"
+    set -g __aterm_body_rev ""
+end
+
+# Package bin directory — once per shell: an upgrade in place already has it (and
+# the shell.d hooks below already ran; the LIVE block re-sources the atpkg hook
+# whenever it changes).
+if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/bin"
     set -gx PATH "$HOME/.aterm/bin" $PATH
 end
 
 # Source package shell hooks
-if test -d "$HOME/.aterm/shell.d"
+if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/shell.d"
     for f in $HOME/.aterm/shell.d/*.fish $HOME/.aterm/shell.d/*.sh
         if test -f "$f"
             source "$f"
         end
     end
 end
+
+# THE BODY CHECK, first in every fish_prompt (the trampoline at the end of the
+# file): a newer body waits when the host has written the pointer. Two builtin
+# `test`s while nothing waits; the read, the removal (the one fork) and the source
+# happen only when a pointer waits. The revision moves only when the source
+# succeeded: a body that failed to load is still reported as the one before it.
+function __aterm_body_check
+    test -n "$__aterm_body_pointer"; and test -f "$__aterm_body_pointer"; or return 0
+    set -l addr ""
+    read -l addr <"$__aterm_body_pointer" 2>/dev/null
+    command rm -f -- "$__aterm_body_pointer"
+    # Exactly 16 lowercase hex digits — a folder address — or nothing changes.
+    string match -qr '^[0-9a-f]{16}$' -- "$addr"; or return 0
+    test "$addr" != "$__aterm_body_rev"; or return 0
+    set -l file "$__aterm_si_root/$addr/aterm_shell_integration_body.fish"
+    test -f "$file"; and test -O "$file"; or return 0
+    if source "$file"
+        set -g __aterm_body_rev "$addr"
+    end
+    return 0
+end
+
+# @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -350,7 +512,6 @@ end
 # atomically, and the NEXT invocation follows the path — so once agents/ leads
 # $PATH, every later update is live too.
 set -g __aterm_atpkg_hook "$HOME/.aterm/shell.d/00-atpkg.fish"
-set -g __aterm_atpkg_hook_seen ""
 set -g __aterm_managed_live 0
 if test -n "$ATERM_CHILD"; or test -n "$ATERM_SESSION_ID"
     set -g __aterm_managed_live 1
@@ -371,10 +532,15 @@ function __aterm_atpkg_hook_read
 end
 # The copy the shell.d loop above sourced at load is the copy last sourced —
 # whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
-# sourced again until atpkg rewrites it).
-if test "$__aterm_managed_live" = 1
-    __aterm_atpkg_hook_read
-    set -g __aterm_atpkg_hook_seen "$__aterm_atpkg_hook_now"
+# sourced again until atpkg rewrites it). Recorded ONCE per shell: a body
+# re-sourced live keeps the record, so a hook rewritten just before is still
+# sourced at the next prompt.
+if not set -q __aterm_atpkg_hook_seen
+    set -g __aterm_atpkg_hook_seen ""
+    if test "$__aterm_managed_live" = 1
+        __aterm_atpkg_hook_read
+        set -g __aterm_atpkg_hook_seen "$__aterm_atpkg_hook_now"
+    end
 end
 
 # Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
@@ -449,8 +615,11 @@ function __aterm_managed_path_live
     return 0
 end
 
-# State tracking
-set -g __aterm_last_status 0
+# State tracking. KEPT across a live re-source: the body is re-sourced from the
+# prompt trampoline, and the prompt it draws still colours the last status.
+if not set -q __aterm_last_status
+    set -g __aterm_last_status 0
+end
 
 # OSC escape sequences
 function __aterm_osc
@@ -519,68 +688,17 @@ if test -n "$__aterm_host_first_label"
     set -g __aterm_report_host_short "$__aterm_host_first_label"
 end
 
-# Capture the capability nonce into a shell-global so we can immediately
-# drop it from the environment (#8015). Leaving ATERM_SHELL_NONCE in the
-# exported env lets every child process (env, ssh SendEnv, docker, cron,
-# tmux children, ...) read the 64-hex secret that would be used to bypass
-# the #7960 nonce-enforcement defense. Capture first, then `set -e`
-# (unexport) BEFORE any prompt hook fires so subprocesses never inherit
-# it.
-#
-# If the env var is missing or empty at source-time, __aterm_shell_nonce
-# stays empty and __aterm_id_suffix falls through to the unnonced form
-# (pre-nonce compatibility for hosts that have not yet authorized a
-# nonce). This matches the documented fallback: the host's OSC 133/633
-# handler drops sequences missing/with a wrong id= only when
-# `TerminalModes::require_shell_integration_nonce` is enabled.
-#
-# This is the ONE `set -q` on an ATERM_* variable that is deliberate. Both arms
-# leave $__aterm_shell_nonce empty when the env var is empty, so the definedness
-# test cannot change the nonce; taking the arm for an empty-but-defined variable
-# is strictly BETTER, because it also runs the `set -e` scrub on it. Do not
-# "fix" this one to `test -n` — that would leave an empty ATERM_SHELL_NONCE
-# exported into every child process.
-if set -q ATERM_SHELL_NONCE
-    set -g __aterm_shell_nonce "$ATERM_SHELL_NONCE"
-    set -e ATERM_SHELL_NONCE
-else
-    set -g __aterm_shell_nonce ""
-end
-
-# Precomputed capability-nonce suffix for OSC 133/633 emissions — expands to
-# ";id=<64-hex>" when the captured nonce is non-empty, or to the empty string
-# otherwise. Mirrors the zsh script's `$__aterm_id_suffix_str`, and for the
-# same two reasons — plus one that is fish-specific and load-bearing.
-#
-# THE FISH-SPECIFIC REASON (a silent, total mark loss). The emitters below used
-# to spell the suffix as a command substitution glued to a string:
-#
-#     __aterm_osc "133;A"(__aterm_id_suffix)
-#
-# In fish, gluing a string to a command substitution is a CARTESIAN PRODUCT, and
-# a substitution that prints nothing is a ZERO-ELEMENT list — so the product is
-# ZERO arguments, not the string "133;A". Whenever the nonce was empty,
-# `__aterm_osc` was therefore called with NO arguments at all and its
-# `printf '\e]%s\a' $argv[1]` emitted a bare, EMPTY `ESC ] BEL` — every 133;A,
-# 133;B, 133;C, 133;D and 633;E silently replaced by a malformed empty OSC.
-# (bash and zsh interpolate a possibly-empty parameter, so neither shell has
-# this failure mode; it is unique to fish's list semantics.)
-#
-# The empty-nonce path is NOT hypothetical: it is this file's own documented
-# pre-nonce fallback, and it is exactly what the header's manual install
-# (`source ~/.config/aterm/shell_integration.fish` from config.fish) produces,
-# since nothing sets ATERM_SHELL_NONCE there. Measured on fish 4.2.1 before
-# this fix: OSC 7 arrived, and 133;A/B/C/D + 633;E were all absent.
-#
-# A plain variable is immune — `"133;A$__aterm_id_suffix_str"` is ordinary
-# string interpolation, one argument, empty suffix or not. Byte-identical
-# output when the nonce IS set (same ";id=<hex>" spelling), and it drops four
-# to five forkless-but-not-free command substitutions per command cycle.
-# `set -g` (not `-gx`), exactly like $__aterm_shell_nonce itself, so #8015 (no
-# nonce inheritance by subprocesses) is preserved.
-set -g __aterm_id_suffix_str ""
-if test -n "$__aterm_shell_nonce"
-    set -g __aterm_id_suffix_str ";id=$__aterm_shell_nonce"
+# The re-key channel's check (the path is captured by the loader above).
+function __aterm_rekey_check
+    test -n "$__aterm_rekey_path"; and test -f "$__aterm_rekey_path"; or return 0
+    set -l key ""
+    read -l key <"$__aterm_rekey_path" 2>/dev/null
+    command rm -f -- "$__aterm_rekey_path"
+    # Exactly 64 lowercase hex digits, or nothing changes.
+    if string match -qr '^[0-9a-f]{64}$' -- "$key"
+        set -g __aterm_shell_nonce "$key"
+        set -g __aterm_id_suffix_str ";id=$key"
+    end
 end
 
 # Capability-nonce suffix for OSC 133/633 emissions (#7960, #7987, #8015).
@@ -636,6 +754,16 @@ end
 # Mark command completion (OSC 133;D;exitcode)
 function __aterm_mark_exec_finish
     __aterm_osc "133;D;$argv[1]$__aterm_id_suffix_str"
+end
+
+# The body's revision, SIGNED (633;P, the VS Code property mark): the folder
+# address this body was taken from, so the host can tell a shell running its own
+# body from one running an older build's (`status integration_rev=`). Emitted
+# before every 133;A — nothing when the revision is unknown (a hand-installed
+# copy). One quoted argument, never glued.
+function __aterm_mark_integration_rev
+    test -n "$__aterm_body_rev"; or return 0
+    __aterm_osc "633;P;AtermIntegration=$__aterm_body_rev$__aterm_id_suffix_str"
 end
 
 # ─── Prompt Colors ───
@@ -771,15 +899,16 @@ function __aterm_custom_prompt
     end
 end
 
-# fish_prompt hook - wrap existing prompt
-# We need to emit OSC 133;A before the prompt and OSC 133;B after
-functions -c fish_prompt __aterm_original_fish_prompt 2>/dev/null
+# The prompt the loader's fish_prompt trampoline draws (end of file).
+function __aterm_body_prompt
+    # A waiting re-key first, so every mark this prompt emits carries it.
+    __aterm_rekey_check
 
-function fish_prompt
     # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
     __aterm_managed_path_live
 
-    # Mark prompt start
+    # The revision this prompt runs, then the prompt start.
+    __aterm_mark_integration_rev
     __aterm_mark_prompt_start
 
     # Set tab title to abbreviated CWD (OSC 0).
@@ -933,6 +1062,8 @@ end
 # fish_postexec - runs after command execution
 function __aterm_fish_postexec --on-event fish_postexec
     set __aterm_last_status $status
+    # The command's end mark carries a key that arrived while it ran.
+    __aterm_rekey_check
     __aterm_mark_exec_finish $__aterm_last_status
 end
 
@@ -944,22 +1075,73 @@ end
 # ─── Key Bindings ───
 # Bind xterm-style modifier+arrow sequences so they work at the prompt.
 # Without these, sequences like \e[1;3C (Alt+Right) leak as literal text.
-# Alt+Arrow: word navigation
-bind \e\[1\;3C forward-word       # Alt+Right
-bind \e\[1\;3D backward-word      # Alt+Left
-# Ctrl+Arrow: word navigation
-bind \e\[1\;5C forward-word       # Ctrl+Right
-bind \e\[1\;5D backward-word      # Ctrl+Left
-# Home/End
-bind \e\[H beginning-of-line      # Home
-bind \e\[F end-of-line             # End
-bind \e\[1~ beginning-of-line     # Home (alternate)
-bind \e\[4~ end-of-line           # End (alternate)
-# Delete
-bind \e\[3~ delete-char           # Delete/Fn+Backspace
-# Shift+Arrow: history navigation
-bind \e\[1\;2A up-or-search      # Shift+Up
-bind \e\[1\;2B down-or-search    # Shift+Down
+# Called ONCE per shell, by the loader (after the body's end marker): a body
+# re-sourced live leaves the user's bindings alone.
+function __aterm_setup_keybindings
+    # Alt+Arrow: word navigation
+    bind \e\[1\;3C forward-word       # Alt+Right
+    bind \e\[1\;3D backward-word      # Alt+Left
+    # Ctrl+Arrow: word navigation
+    bind \e\[1\;5C forward-word       # Ctrl+Right
+    bind \e\[1\;5D backward-word      # Ctrl+Left
+    # Home/End
+    bind \e\[H beginning-of-line      # Home
+    bind \e\[F end-of-line             # End
+    bind \e\[1~ beginning-of-line     # Home (alternate)
+    bind \e\[4~ end-of-line           # End (alternate)
+    # Delete
+    bind \e\[3~ delete-char           # Delete/Fn+Backspace
+    # Shift+Arrow: history navigation
+    bind \e\[1\;2A up-or-search      # Shift+Up
+    bind \e\[1\;2B down-or-search    # Shift+Down
+end
+
+# The body ends in success: the loader moves its revision only when the source
+# returned 0.
+true
+
+# @@ATERM-INTEGRATION-BODY-END@@
+
+# ─── THE LOADER, continued: the wiring, once per shell ───
+#
+# The trampoline: fish_prompt is the one prompt hook, and the one piece of the
+# prompt path that never changes. A body sourced by the check is the body whose
+# prompt is drawn in the SAME prompt.
+# fish_prompt hook - wrap existing prompt
+# We need to emit OSC 133;A before the prompt and OSC 133;B after
+functions -c fish_prompt __aterm_original_fish_prompt 2>/dev/null
+
+# On a fresh load always; on an upgrade in place only over a prompt that is ours
+# — an older build's wrapper (review finding 2026-09-26). fish reads this file
+# from the vendor conf.d BEFORE config.fish, so a prompt the user defines there
+# (a framework's: `starship init fish | source`) replaced our wrapper for that
+# shell's life; replacing it in turn would draw the prompt copied above, from
+# before config.fish ran, and the user's own would be gone.
+function __aterm_fish_prompt_trampoline
+    __aterm_body_check
+    __aterm_body_prompt
+end
+if test "$__aterm_fresh_load" = 1; or functions fish_prompt | string match -q -- '*__aterm_*'
+    functions -e fish_prompt
+    functions -c __aterm_fish_prompt_trampoline fish_prompt
+end
+
+# The key bindings, ONCE per shell: a fresh load only — the zsh script's twin
+# (review finding 2026-09-26). This file runs from the vendor conf.d, before the
+# user's config.fish, so a binding of theirs for one of these keys wins; a body
+# re-sourced live, binding them again at a prompt, took those keys back from the
+# user in every live tab at every update.
+if test "$__aterm_fresh_load" = 1
+    __aterm_setup_keybindings
+end
 
 # Initial cwd report
 __aterm_report_cwd
+
+# An upgrade in place SIGNS its revision now, not at the next prompt — the zsh
+# script's twin, for the same reason: the typed line that upgrades a shell from
+# before loaders goes on to relaunch its agent, and until the shell's next
+# prompt the host would name it `integration_rev=frozen`.
+if test "$__aterm_fresh_load" = 0
+    __aterm_mark_integration_rev
+end

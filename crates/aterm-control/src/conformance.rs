@@ -25,16 +25,19 @@
 //! be given one. See [`check_screen_witness`] for why that is a property of
 //! reading, not a gap someone forgot to close.
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 
 use aterm_core::selection::TextSelection;
 use aterm_core::terminal::Terminal;
 
-use crate::host::{
-    ChangeWait, HostCapabilities, Selector, SessionEntry, SessionHost, SessionState,
-};
+#[cfg(test)]
+use crate::host::{ChangeWait, SessionEntry, SessionState};
+use crate::host::{HostCapabilities, Selector, SessionHost};
 use crate::selection;
 
 /// One check's verdict. `failure` is `None` on a pass and carries the observed
@@ -765,6 +768,7 @@ fn block_count(reply: &str) -> Option<usize> {
 
 /// Shared change counter + condvar: the producer bumps and broadcasts, a
 /// [`MemoryWait`] parks on a value newer than the one it registered at.
+#[cfg(test)]
 type ChangeSignal = Arc<(Mutex<u64>, Condvar)>;
 
 /// The reference [`SessionHost`]: one `Arc<Mutex<Terminal>>`, a counted redraw
@@ -773,7 +777,9 @@ type ChangeSignal = Arc<(Mutex<u64>, Condvar)>;
 ///
 /// It exists to keep [`run_all`] honest — a suite only ever run against the host
 /// it was written for proves nothing — and to give a new host implementor
-/// something small to read.
+/// something small to read. Test-only: the downstream hosts the `conformance`
+/// feature serves run the suite against THEMSELVES.
+#[cfg(test)]
 pub struct MemoryHost {
     sid: u64,
     /// The stable fabric id this host rosters `sid` under — the `s-<20 hex>` shape
@@ -790,6 +796,7 @@ pub struct MemoryHost {
     redraws: AtomicU64,
 }
 
+#[cfg(test)]
 impl MemoryHost {
     /// A host owning one 24x80 session numbered `sid`, WITH a clipboard, a roster
     /// and an input sink.
@@ -896,11 +903,13 @@ impl MemoryHost {
 
 /// A registration on [`MemoryHost`]'s change counter, holding the value it saw
 /// at registration so a bump in the register→recheck gap is not lost.
+#[cfg(test)]
 struct MemoryWait {
     changed: ChangeSignal,
     registered_at: u64,
 }
 
+#[cfg(test)]
 impl ChangeWait for MemoryWait {
     fn wait(&self, timeout: Duration) -> bool {
         let (lock, cv) = &*self.changed;
@@ -915,6 +924,7 @@ impl ChangeWait for MemoryWait {
     }
 }
 
+#[cfg(test)]
 impl SessionHost for MemoryHost {
     fn capabilities(&self) -> HostCapabilities {
         self.capabilities
@@ -1202,6 +1212,27 @@ mod tests {
         ] {
             assert_eq!(reply, "ERR no such session\n");
         }
+    }
+
+    /// `blocks --json` says where the shell's `133;B` put the input's start —
+    /// the column after the prompt — whatever was typed after it: what tells
+    /// a person's typeahead at a returned prompt from the prompt itself (the
+    /// live agent upgrade's relaunch line). NEGATIVE CONTROL: a prompt with
+    /// no `133;B` yet has `"cmdcol":null`.
+    #[test]
+    fn blocks_json_says_the_column_the_input_starts_at() {
+        let host = MemoryHost::new(7);
+        host.feed(b"\x1b]133;A\x07~/proj % ");
+        let before = selection::cmd_blocks_json(&host, 7, "1");
+        assert!(
+            before.contains("\"state\":\"prompt\"")
+                && before.contains("\"cmd\":null,\"cmdcol\":null,"),
+            "{before}"
+        );
+        host.feed(b"\x1b]133;B\x07rm -rf build");
+        let after = selection::cmd_blocks_json(&host, 7, "1");
+        assert!(after.contains("\"state\":\"entering\""), "{after}");
+        assert!(after.contains("\"cmdcol\":9,\"out\":null"), "{after}");
     }
 
     /// The seam itself refuses the foreign sid — not just the verbs above. The

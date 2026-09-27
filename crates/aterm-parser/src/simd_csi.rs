@@ -92,7 +92,6 @@ pub(crate) fn simd_parse_csi_params(input: &[u8]) -> Option<CsiParamResult> {
 /// Produces identical results to the SIMD paths for all inputs.
 /// Used as fallback when SIMD is not available, and as the oracle
 /// for property tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_csi_params_scalar(input: &[u8]) -> CsiParamResult {
     let mut result = CsiParamResult {
         params: [0u16; SIMD_MAX_PARAMS],

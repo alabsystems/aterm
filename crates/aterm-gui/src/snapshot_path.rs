@@ -6,53 +6,28 @@
 //! The snapshot carries sensitive terminal/window content, so it gets the same
 //! posture as the control socket's `image` verb (see `control_auth`): by default the
 //! PNG/.txt/.done files land in the per-user `0700` control directory under a
-//! per-process name (`aterm_snapshot-<pid>.png`) and are written `0600`.
-//! `$ATERM_SNAPSHOT_PATH` still preserves the exact path for users who
-//! explicitly opt into that single-writer compatibility contract, but an
-//! override whose directory another user
-//! owns or can write into (e.g. `/tmp`, the historical default) is refused —
-//! that user could read the screen contents or swap the target for a symlink
-//! between our check and our write. The owned-and-unshared decision itself is
-//! engine-side ([`aterm_types::fs_restricted::dir_safe_for_private_write`]);
-//! this module only stats and writes.
+//! per-process name (`aterm_snapshot-<pid>.png`) and are written `0600`. That is
+//! the ONE destination: the `$ATERM_SNAPSHOT_PATH` override was deleted
+//! (2026-09-24, no environment variable changes a shipped aterm) — a capture
+//! anywhere else is `aterm ctl image <file>`.
 
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use crate::control_auth;
 
+#[cfg(any(unix, test))]
 fn default_snapshot_file_name(pid: u32) -> String {
     format!("aterm_snapshot-{pid}.png")
 }
 
 /// Resolve the path the snapshot PNG may be written to (`.txt`/`.done` are
-/// siblings), or `None` — with the refusal already logged — when no safe
-/// destination exists.
+/// siblings), or `None` — with the reason already logged — when there is no
+/// per-user control directory.
 #[must_use]
-pub fn resolve() -> Option<String> {
-    if let Some(over) = std::env::var_os("ATERM_SNAPSHOT_PATH") {
-        let requested = PathBuf::from(over);
-        return match validate_override(&requested) {
-            Some(p) => Some(p.to_string_lossy().into_owned()),
-            None => {
-                // Platform-selected refusal text: the Windows validator only
-                // requires an existing directory (no uid/mode semantics there).
-                #[cfg(unix)]
-                crate::logging::stderr_line!(
-                    "aterm-gui: refusing ATERM_SNAPSHOT_PATH {}: its directory must exist, \
-                     be owned by uid {}, and not be group/other-writable; snapshot skipped",
-                    requested.display(),
-                    control_auth::our_uid()
-                );
-                #[cfg(windows)]
-                crate::logging::stderr_line!(
-                    "aterm-gui: refusing ATERM_SNAPSHOT_PATH {}: its directory must exist; \
-                     snapshot skipped",
-                    requested.display()
-                );
-                None
-            }
-        };
-    }
+#[cfg(unix)]
+pub(crate) fn resolve() -> Option<String> {
     match control_auth::socket_dir() {
         Some(dir) => Some(
             dir.join(default_snapshot_file_name(std::process::id()))
@@ -61,57 +36,12 @@ pub fn resolve() -> Option<String> {
         ),
         None => {
             crate::logging::stderr_line!(
-                "aterm-gui: no per-user runtime dir (set XDG_RUNTIME_DIR, HOME, or \
-                 ATERM_SNAPSHOT_PATH); snapshot skipped"
+                "aterm-gui: no per-user runtime dir (set XDG_RUNTIME_DIR or HOME); \
+                 snapshot skipped"
             );
             None
         }
     }
-}
-
-/// Validate an explicit `$ATERM_SNAPSHOT_PATH` override: the parent directory
-/// (symlinks resolved, so the check binds to the real directory) must satisfy
-/// the engine-side private-write predicate for our euid. Returns the
-/// canonical-parent form of the path — the directory checked IS the directory
-/// written to — or `None` when missing/unsafe.
-#[cfg(unix)]
-fn validate_override(requested: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let file_name = requested.file_name()?;
-    let parent = match requested.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let canon = std::fs::canonicalize(parent).ok()?;
-    let meta = std::fs::metadata(&canon).ok()?;
-    let safe = aterm_types::fs_restricted::dir_safe_for_private_write(
-        control_auth::our_uid(),
-        meta.uid(),
-        meta.mode(),
-    );
-    if safe {
-        Some(canon.join(file_name))
-    } else {
-        None
-    }
-}
-
-/// Windows variant: canonicalize the parent and require it to exist (the
-/// checked directory IS the one written to). The uid/mode ownership predicate
-/// and the symlink-swap hardening are POSIX-only — here an override is the
-/// user's explicit opt-in and the per-user profile ACLs are the boundary.
-#[cfg(windows)]
-fn validate_override(requested: &Path) -> Option<PathBuf> {
-    let file_name = requested.file_name()?;
-    let parent = match requested.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let canon = std::fs::canonicalize(parent).ok()?;
-    std::fs::metadata(&canon)
-        .ok()?
-        .is_dir()
-        .then(|| canon.join(file_name))
 }
 
 // The two wrappers below — and the lexical-absolutization helper they share —
@@ -154,7 +84,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
 /// exact final file remain pinned until durable write and identity validation
 /// have both completed.
 #[cfg(test)]
-pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -173,7 +103,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Compatibility wrapper for a single child of an already-authorized
 /// directory. All mutation is relative to a retained directory handle.
 #[cfg(test)]
-pub fn write_private_at(
+pub(crate) fn write_private_at(
     dir: &Path,
     file_name: &std::ffi::OsString,
     bytes: &[u8],
@@ -199,43 +129,6 @@ mod tests {
             "aterm_snapshot-42.png",
             "parallel aterm instances must never share a completion marker"
         );
-    }
-
-    #[test]
-    fn override_into_private_dir_is_allowed() {
-        let dir = std::env::temp_dir().join(format!("aterm-snap-ok-{}", std::process::id()));
-        ensure_private_dir(&dir).unwrap();
-        let ok = validate_override(&dir.join("shot.png")).expect("0700 own dir allowed");
-        assert!(ok.ends_with("shot.png"));
-        // The returned path is canonical-parent based: its parent exists.
-        assert!(ok.parent().unwrap().is_dir());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn override_into_tmp_is_refused() {
-        // /tmp is root-owned and world-writable — the historical leak target.
-        assert!(validate_override(Path::new("/tmp/aterm_snapshot.png")).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn override_into_group_writable_dir_is_refused() {
-        let dir = std::env::temp_dir().join(format!("aterm-snap-gw-{}", std::process::id()));
-        ensure_private_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(validate_override(&dir.join("shot.png")).is_none());
-        // Tightening the dir back to 0700 makes the same override valid.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(validate_override(&dir.join("shot.png")).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn override_with_missing_dir_is_refused() {
-        let dir = std::env::temp_dir().join(format!("aterm-snap-none-{}", std::process::id()));
-        assert!(validate_override(&dir.join("shot.png")).is_none());
     }
 
     #[cfg(unix)]

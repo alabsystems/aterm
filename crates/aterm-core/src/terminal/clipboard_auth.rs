@@ -28,8 +28,8 @@
 //! # The structural fix — mirror of [`super::modal_auth`]
 //!
 //! Clipboard invocation sites no longer take a `&mut ClipboardCallback`
-//! directly. They call [`ClipboardAuth::try_mint_write_capability`] or
-//! [`ClipboardAuth::try_mint_query_capability`], each of which returns
+//! directly. They call `ClipboardAuth::try_mint_write_capability` or
+//! `ClipboardAuth::try_mint_query_capability`, each of which returns
 //! `Option<ClipboardWriteCapability>` / `Option<ClipboardQueryCapability>`.
 //! These types are **zero-sized with a private `_seal: ()`** — no code
 //! outside this module can construct one.
@@ -109,7 +109,7 @@ pub enum ClipboardAccess {
 /// Capability for OSC 52 clipboard *set*.
 ///
 /// Zero-sized. Its constructor is private to this module, so the only
-/// way to obtain one is through [`ClipboardAuth::try_mint_write_capability`],
+/// way to obtain one is through `ClipboardAuth::try_mint_write_capability`,
 /// which requires the host to have previously called
 /// [`ClipboardAuth::authorize_write`].
 ///
@@ -121,58 +121,14 @@ pub(super) struct ClipboardWriteCapability {
     _seal: (),
 }
 
-impl ClipboardWriteCapability {
-    /// Provenance ceremony: lift this clipboard-write capability into a
-    /// [`aterm_provenance::HostAuthorizationToken`] borrowed for the
-    /// capability's lifetime.
-    ///
-    /// Part of the #8001 `authorize_*` wiring (design §6 migration table).
-    /// Holding a `ClipboardWriteCapability` proves that the host
-    /// authorized OSC 52 clipboard *set* access at the dispatch frame;
-    /// the returned token lets downstream `authorize_pty_to_host`
-    /// consumers lift Pty-origin base64-decoded clipboard content into
-    /// `Host`-origin.
-    #[allow(
-        dead_code,
-        reason = "audit-only provenance ceremony retained until production callers consume the host-authorization token directly"
-    )]
-    #[must_use]
-    pub(crate) fn as_host_auth_token(&self) -> aterm_provenance::HostAuthorizationToken<'_> {
-        let _ = self;
-        aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
-    }
-}
-
 /// Capability for OSC 52 clipboard *query*.
 ///
 /// Parallel to [`ClipboardWriteCapability`]. Minted only through
-/// [`ClipboardAuth::try_mint_query_capability`] after a host call to
+/// `ClipboardAuth::try_mint_query_capability` after a host call to
 /// [`ClipboardAuth::authorize_query`].
 #[must_use = "ClipboardQueryCapability has no effect unless passed to invoke_query"]
 pub(super) struct ClipboardQueryCapability {
     _seal: (),
-}
-
-impl ClipboardQueryCapability {
-    /// Provenance ceremony: lift this clipboard-query capability into a
-    /// [`aterm_provenance::HostAuthorizationToken`] borrowed for the
-    /// capability's lifetime.
-    ///
-    /// Part of the #8001 `authorize_*` wiring (design §6 migration table).
-    /// Holding a `ClipboardQueryCapability` proves that the host
-    /// authorized OSC 52 clipboard *query* at the dispatch frame; the
-    /// returned token lets downstream `authorize_pty_to_host` consumers
-    /// lift Pty-origin query selectors into `Host`-origin so the host
-    /// callback can treat them as policy-approved.
-    #[allow(
-        dead_code,
-        reason = "audit-only provenance ceremony retained until production callers consume the host-authorization token directly"
-    )]
-    #[must_use]
-    pub(crate) fn as_host_auth_token(&self) -> aterm_provenance::HostAuthorizationToken<'_> {
-        let _ = self;
-        aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,11 +186,13 @@ impl ClipboardAuth {
     ///
     /// Read-only observer for host APIs / FFI. Does **not** mint a
     /// capability; for that, use [`try_mint_write_capability`].
+    #[cfg(test)]
     pub(crate) const fn is_write_authorized(&self) -> bool {
         self.write_authorized
     }
 
     /// Whether OSC 52 clipboard *query* is currently authorized.
+    #[cfg(test)]
     pub(crate) const fn is_query_authorized(&self) -> bool {
         self.query_authorized
     }
@@ -248,10 +206,7 @@ impl ClipboardAuth {
     /// this and tries to call the callback directly will find the
     /// callback field is not part of its public API surface (it lives
     /// behind [`invoke_set`] / [`invoke_query`] / [`invoke_clear`]).
-    #[allow(
-        dead_code,
-        reason = "#7994: retained as the non-engine fallback API; all OSC 52 set handlers now route through try_mint_write_capability_with_engine per design §6.3 (Release N). Kept for post-migration simplification."
-    )]
+    #[cfg(test)]
     pub(super) fn try_mint_write_capability(&self) -> Option<ClipboardWriteCapability> {
         if self.write_authorized {
             Some(ClipboardWriteCapability { _seal: () })
@@ -262,10 +217,7 @@ impl ClipboardAuth {
 
     /// Attempt to mint a query capability. Returns `Some` iff
     /// [`authorize_query`] has been called and not since revoked.
-    #[allow(
-        dead_code,
-        reason = "#7994: retained as the non-engine fallback API; all OSC 52 query handlers now route through try_mint_query_capability_with_engine per design §6.3 (Release N). Kept for post-migration simplification."
-    )]
+    #[cfg(test)]
     pub(super) fn try_mint_query_capability(&self) -> Option<ClipboardQueryCapability> {
         if self.query_authorized {
             Some(ClipboardQueryCapability { _seal: () })
@@ -274,7 +226,7 @@ impl ClipboardAuth {
         }
     }
 
-    /// Engine-consulting variant of [`Self::try_mint_write_capability`]
+    /// Engine-consulting variant of `Self::try_mint_write_capability`
     /// (#7994). Reads the compiled `OSC 52 set` gate verdict, which
     /// [`super::policy_gates`] resolved from [`probe_osc52_set`] at
     /// [`super::policy_gates::GATE_ORIGIN`] when the policy was installed:
@@ -293,7 +245,7 @@ impl ClipboardAuth {
     ///
     /// With no policy installed, `gates.osc52_set()` is
     /// [`BridgeDecision::Fallback`] and the behavior is identical to
-    /// [`Self::try_mint_write_capability`].
+    /// `Self::try_mint_write_capability`.
     ///
     /// # Why a compiled verdict and not an `evaluate` call
     ///
@@ -315,7 +267,7 @@ impl ClipboardAuth {
         }
     }
 
-    /// Engine-consulting variant of [`Self::try_mint_query_capability`]
+    /// Engine-consulting variant of `Self::try_mint_query_capability`
     /// (#7994). Same bridge semantics as
     /// [`Self::try_mint_write_capability_with_engine`] but against the
     /// `OSC 52 query` selector and the `query_authorized` legacy bool.
@@ -626,39 +578,5 @@ mod tests {
         let token = auth.try_mint_write_capability().expect("write authorized");
         let mut slot: Option<ClipboardCallback> = None;
         invoke_clear(&mut slot, token, &[ClipboardSelection::Clipboard]);
-    }
-
-    /// #8001 ceremony: `ClipboardWriteCapability::as_host_auth_token`
-    /// produces a token that lifts Pty-origin data to Host-origin.
-    #[test]
-    fn write_as_host_auth_token_lifts_pty_to_host() {
-        use aterm_provenance::{OriginTag, Provenance, authorize_pty_to_host};
-
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_write();
-        let cap = auth.try_mint_write_capability().expect("write authorized");
-        let tok = cap.as_host_auth_token();
-        let pty: Provenance<String, aterm_provenance::Pty> =
-            Provenance::from_pty("hello".to_string());
-        let host = authorize_pty_to_host(pty, tok);
-        assert_eq!(host.tag(), OriginTag::Host);
-        assert_eq!(host.as_ref(), "hello");
-    }
-
-    /// #8001 ceremony: `ClipboardQueryCapability::as_host_auth_token`
-    /// produces a token that lifts Pty-origin data to Host-origin.
-    #[test]
-    fn query_as_host_auth_token_lifts_pty_to_host() {
-        use aterm_provenance::{OriginTag, Provenance, authorize_pty_to_host};
-
-        let mut auth = ClipboardAuth::new();
-        auth.authorize_query();
-        let cap = auth.try_mint_query_capability().expect("query authorized");
-        let tok = cap.as_host_auth_token();
-        let pty: Provenance<Vec<ClipboardSelection>, aterm_provenance::Pty> =
-            Provenance::from_pty(vec![ClipboardSelection::Clipboard]);
-        let host = authorize_pty_to_host(pty, tok);
-        assert_eq!(host.tag(), OriginTag::Host);
-        assert_eq!(host.as_ref().len(), 1);
     }
 }

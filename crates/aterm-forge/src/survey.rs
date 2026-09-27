@@ -890,7 +890,6 @@ fn jstr(o: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::measured;
 
     fn repo_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1132,15 +1131,27 @@ mod tests {
         let root = repo_root();
         let out = run(&root, &["mac-arm".to_string()], 12, None).expect("survey runs");
         assert!(out.ok, "a resolvable cell is not a failure:\n{}", out.log);
-        let want = measured::MAC_ARM;
-        let loc_text = commas(want.third_party_loc);
+        // Baseline rows are ceilings, so a legitimate retirement may shrink
+        // below them. The report must print the current gathered quantities;
+        // loc's cell tests separately enforce both baseline and TSV ceilings.
+        let actual = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves");
+        let loc_text = format!(
+            "  third-party   {} LOC   ",
+            commas(actual.third_party_loc())
+        );
         assert!(
-            out.log.contains(&loc_text),
+            out.log.lines().any(|line| line.starts_with(&loc_text)),
             "third-party LOC is printed:\n{}",
             out.log
         );
+        let packages_text = format!(
+            "  packages      {} resolved   {} workspace   {} THIRD-PARTY",
+            commas(actual.graph.nodes.len() as u64),
+            commas((actual.graph.nodes.len() - actual.third_party().count()) as u64),
+            commas(actual.third_party().count() as u64),
+        );
         assert!(
-            out.log.contains(&want.third_party.to_string()),
+            out.log.lines().any(|line| line == packages_text),
             "third-party count is printed"
         );
         assert!(
@@ -1172,21 +1183,100 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("the JSON file was written");
         let _ = std::fs::remove_file(&path);
         json_wellformed(&body).unwrap_or_else(|e| panic!("hand-rolled JSON is malformed: {e}"));
-        let want = measured::MAC_ARM;
+        let actual = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves");
         assert!(
-            body.contains(&format!("\"third_party\": {}", want.third_party)),
+            body.contains(&format!(
+                "\"third_party\": {},",
+                actual.third_party().count()
+            )),
             "measured count in JSON"
         );
         assert!(
-            body.contains(&format!("\"third_party_loc\": {}", want.third_party_loc)),
+            body.contains(&format!(
+                "\"third_party_loc\": {},",
+                actual.third_party_loc()
+            )),
             "measured LOC in JSON"
         );
         // `--top` is a DISPLAY bound; the machine-readable form keeps every row.
         let rows = body.matches("\"dom_pkgs\"").count();
         assert_eq!(
-            rows, want.third_party,
+            rows,
+            actual.third_party().count(),
             "every third-party row is in the JSON regardless of --top"
         );
+    }
+
+    #[test]
+    fn report_totals_follow_a_retirement_instead_of_reprinting_the_old_ceiling() {
+        use crate::model::{Graph, PkgFacts};
+
+        let root = PkgId::new("root", "1.0.0");
+        let kept = PkgId::new("kept", "1.0.0");
+        let retired = PkgId::new("retired", "1.0.0");
+        let before = CellSurvey {
+            cell: cell("mac-arm"),
+            graph: Graph {
+                root: root.clone(),
+                nodes: BTreeSet::from([root.clone(), kept.clone(), retired.clone()]),
+                edges: BTreeMap::from([(
+                    root.clone(),
+                    BTreeSet::from([kept.clone(), retired.clone()]),
+                )]),
+            },
+            facts: [
+                (root.clone(), 99_999, false),
+                (kept, 1_234, true),
+                (retired.clone(), 11_111, true),
+            ]
+            .into_iter()
+            .map(|(id, loc, is_third_party)| {
+                (
+                    id,
+                    PkgFacts {
+                        loc,
+                        is_third_party,
+                        ..PkgFacts::default()
+                    },
+                )
+            })
+            .collect(),
+        };
+        let mut after = before.clone();
+        assert!(after.graph.nodes.remove(&retired));
+        assert!(after.graph.edges.get_mut(&root).unwrap().remove(&retired));
+        assert!(after.facts.remove(&retired).is_some());
+
+        let mut previous: Option<(String, String)> = None;
+        for (survey, count, loc_text, loc_number) in
+            [(&before, 2, "12,345", 12_345), (&after, 1, "1,234", 1_234)]
+        {
+            let mut report = String::new();
+            cell_section(&mut report, survey, 1);
+            let json = json_report(Path::new("."), std::slice::from_ref(survey), &[]);
+            json_wellformed(&json).expect("synthetic JSON is well formed");
+            let header = format!("  third-party   {loc_text} LOC   ");
+            let count_field = format!("\"third_party\": {count},");
+            let loc_field = format!("\"third_party_loc\": {loc_number},");
+            assert!(report.lines().any(|line| line.starts_with(&header)));
+            let packages_text = format!(
+                "  packages      {} resolved   1 workspace   {count} THIRD-PARTY",
+                count + 1,
+            );
+            assert!(report.lines().any(|line| line == packages_text));
+            assert!(report.contains("PARTITION CHECK OK"));
+            assert!(json.contains(&count_field));
+            assert!(json.contains(&loc_field));
+            assert_eq!(json.matches("\"dom_pkgs\"").count(), count);
+            if let Some((stale_report, stale_json)) = previous {
+                // Negative control: reusing the old ceiling/output after a
+                // retirement must fail the same named-field checks.
+                assert!(!stale_report.lines().any(|line| line.starts_with(&header)));
+                assert!(!stale_json.contains(&count_field));
+                assert!(!stale_json.contains(&loc_field));
+            }
+            previous = Some((report, json));
+        }
     }
 
     #[test]

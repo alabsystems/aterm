@@ -1,0 +1,14 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, Dde() (tengu_auto_default_nudge: Ei, paddingX 2 / paddingY 1, He hideIndexes, NO footer), on the measured 2.1.280/2.1.281 box geometry (title at column one under the full-width rule; body and options at the column the dialog's paddingX puts them) · the auto-mode-default nudge, a setup dialog, footerless
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Make auto mode your default permission mode?
+
+   Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+   prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+
+   ❯ Yes, set auto mode as my default permission mode
+     No, keep default
+
+

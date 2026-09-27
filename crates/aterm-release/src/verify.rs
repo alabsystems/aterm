@@ -12,7 +12,7 @@
 //! This module also owns the OTHER read-side surfaces built on the same scan:
 //! `ship status` (ledger tail vs releases API — dangling claims,
 //! freshness), the remote-derived resume/recut decision of spec §5 (pure —
-//! tests/resume.rs pins the table), `cut --abandon`, and `ship yank`.
+//! tests/it/resume.rs pins the table), `cut --abandon`, and `ship yank`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -328,7 +328,7 @@ fn missing_release_asset(release_id: u64, name: &str) -> Error {
 /// immutable ID, from a single paginated listing.
 ///
 /// `publish::release_identity_jq(true)` emits byte-identical
-/// [`publish::ReleaseObjectIdentity`] rows to the exact-ID program — `tests/resume.rs`
+/// [`publish::ReleaseObjectIdentity`] rows to the exact-ID program — `tests/it/resume.rs`
 /// pins that equivalence — so a row read here compares against a captured
 /// snapshot on exactly the same four fields the per-ID read compared.
 fn release_identity_listing(
@@ -687,7 +687,7 @@ pub fn release_state(slug: &str, tag: &str) -> Result<ReleaseState> {
 }
 
 // ---------------------------------------------------------------------------
-// remote-derived cut mode (spec §5) — pure; tests/resume.rs pins the table
+// remote-derived cut mode (spec §5) — pure; tests/it/resume.rs pins the table
 // ---------------------------------------------------------------------------
 
 /// The three remote-derived facts the §5 decision reads. Gathered by the

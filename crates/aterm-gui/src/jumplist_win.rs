@@ -204,7 +204,6 @@ struct PropVariant {
 /// pointer can be viewed through it for `QueryInterface`/`Release` without
 /// caring which concrete interface it is.
 #[repr(C)]
-#[allow(dead_code)] // query_interface is called; add_ref is layout-only
 struct IUnknownVtbl {
     query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
@@ -218,7 +217,6 @@ struct IUnknownRepr {
 
 /// `ICustomDestinationList` (shobjidl_core.h).
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct ICustomDestinationListVtbl {
     query_interface: unsafe extern "system" fn(
         *mut ICustomDestinationList,
@@ -255,7 +253,6 @@ struct ICustomDestinationList {
 
 /// `IObjectCollection` (IUnknown → IObjectArray → IObjectCollection).
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct IObjectCollectionVtbl {
     query_interface:
         unsafe extern "system" fn(*mut IObjectCollection, *const Guid, *mut *mut c_void) -> i32,
@@ -283,7 +280,6 @@ struct IObjectCollection {
 /// `SetDescription` are called; the fourteen slots before them keep the
 /// documented method order so those three land on the right vtable entries.
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct IShellLinkWVtbl {
     query_interface:
         unsafe extern "system" fn(*mut IShellLinkW, *const Guid, *mut *mut c_void) -> i32,
@@ -316,7 +312,6 @@ struct IShellLinkW {
 
 /// `IPropertyStore` (propsys.h).
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct IPropertyStoreVtbl {
     query_interface:
         unsafe extern "system" fn(*mut IPropertyStore, *const Guid, *mut *mut c_void) -> i32,

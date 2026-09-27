@@ -111,6 +111,35 @@ pub(crate) struct RenderPassDesc<'a> {
     pub(crate) scissor: Option<MtlScissorRect>,
 }
 
+/// Test-only census of the FFI calls a device-loss refusal must precede: the
+/// `commandBuffer` mints in [`EncodeSession::begin`] and `Frame::present`, and
+/// the `nextDrawable` in the swapchain's `acquire_drawable` — the calls those
+/// refusal paths would reach first. It is NOT every mint off the queue: the
+/// one-shot helpers in `ffi.rs` (`dispatch_compute`, `draw_and_read`) are not
+/// counted, because no refusal path reaches them.
+/// PER THREAD, so tests running beside each other in the lib binary never
+/// count each other's calls. The loss tests hold it still across every
+/// refusal — "refuses before any FFI" as a count, not a stopwatch (the
+/// load-sensitive test audit of 2026-09-27).
+#[cfg(test)]
+pub(crate) mod queue_ffi_census {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// One `commandBuffer` mint or `nextDrawable` about to run on this thread.
+    pub(crate) fn note() {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    /// How many this thread has made so far.
+    pub(crate) fn calls() -> u64 {
+        CALLS.with(Cell::get)
+    }
+}
+
 /// The owner of THE render queue — see the module header's ownership section.
 ///
 /// Raw-pointer holder: thread-pinned, no `unsafe impl Send/Sync`, per the
@@ -175,6 +204,8 @@ impl EncodeSession {
                  not minting a command buffer on the dead queue — downgrade instead"
             ));
         }
+        #[cfg(test)]
+        queue_ffi_census::note();
         let _pool = AutoreleasePool::new();
         // SAFETY: `commandBuffer` returns a +0 command buffer owned by the
         // pool; it is retained to +1 so it outlives the pop, exactly as
@@ -312,6 +343,7 @@ impl<'s> CommandBuffer<'s> {
     /// Texture → texture, FULL extent. The mid-frame copy `renderer.rs` uses
     /// at 4 sites (scroll shift, present compose, shimmer scratch) in its
     /// whole-texture form.
+    #[cfg(test)]
     pub(crate) fn copy_texture_to_texture(
         &mut self,
         src: &SealedTexture,
@@ -948,7 +980,7 @@ mod tests {
 
     /// Every test here needs a GPU; a machine without one SKIPs loudly.
     fn device() -> Option<Device> {
-        let d = Device::system_default();
+        let d = Device::preferred();
         if d.is_none() {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }
@@ -1866,8 +1898,9 @@ mod tests {
     /// (4,000 full-target instanced quads over 512x512 — half a billion
     /// fragment writes, milliseconds of GPU time against the microseconds
     /// this thread needs to reach the first poll), and B commits behind it on
-    /// the SAME queue, so B cannot be terminal at the first poll. The test
-    /// then pins the whole polling contract:
+    /// the SAME queue, so B is not terminal at the first poll unless this
+    /// thread was preempted past the fill — a take that is then repeated. The
+    /// test then pins the whole polling contract:
     ///
     /// * the first poll of B is `None` and FEEDS NOTHING (the debug counter
     ///   is flat) — polling is free of latch traffic until there is an
@@ -1914,47 +1947,61 @@ mod tests {
             &bg_stream(&[([0, 0, W as u16, H as u16], [200, 40, 120, 255])]),
         );
 
-        // A: the heavy submit.
-        let mut cb_a = session.begin().expect("cb A");
-        {
-            let pass = cb_a
-                .render_pass(&RenderPassDesc {
-                    target: &target,
-                    load: BLACK,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("heavy pass");
-            let vu = bg_spec
-                .binds
-                .vertex_uniform
-                .expect("the bg row has a vertex uniform") as usize;
-            pass.set_vertex_buffer(&ubuf, vu).expect("uniforms");
-            pass.set_pipeline(&bg);
-            pass.set_instance_stream(&stream);
-            pass.draw_instanced(pipelines::metal_primitive_type(bg_spec.topology), 6, 4_000)
-                .expect("armed draw: pipeline and stream are set in this fixture");
+        // A take proves the None poll only if THIS thread reached it while A's
+        // fill was still running. A preemption between the commits and the
+        // poll that outlasts the fill makes B terminal for a reason that is not
+        // about `try_outcome`, so such a take (and only such a take) is drained
+        // and repeated. A `try_outcome` that blocks answers terminal on EVERY
+        // take and still fails (the load-sensitive test audit of 2026-09-27).
+        const TAKES: usize = 5;
+        let mut polled = None;
+        for _ in 0..TAKES {
+            // A: the heavy submit.
+            let mut cb_a = session.begin().expect("cb A");
+            {
+                let pass = cb_a
+                    .render_pass(&RenderPassDesc {
+                        target: &target,
+                        load: BLACK,
+                        store: StoreAction::Store,
+                        viewport: None,
+                        scissor: None,
+                    })
+                    .expect("heavy pass");
+                let vu = bg_spec
+                    .binds
+                    .vertex_uniform
+                    .expect("the bg row has a vertex uniform") as usize;
+                pass.set_vertex_buffer(&ubuf, vu).expect("uniforms");
+                pass.set_pipeline(&bg);
+                pass.set_instance_stream(&stream);
+                pass.draw_instanced(pipelines::metal_primitive_type(bg_spec.topology), 6, 4_000)
+                    .expect("armed draw: pipeline and stream are set in this fixture");
+            }
+            let a = cb_a.commit();
+
+            // B: empty, committed behind A on the same queue.
+            let b = session.begin().expect("cb B").commit();
+
+            #[cfg(debug_assertions)]
+            let fed_before = latch.fed_count();
+            if b.try_outcome().is_some() {
+                assert_eq!(a.wait_outcome(), loss::CbOutcome::Completed, "A completes");
+                continue;
+            }
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                latch.fed_count(),
+                fed_before,
+                "a None poll must feed the latch NOTHING"
+            );
+            polled = Some((a, b));
+            break;
         }
-        let a = cb_a.commit();
-
-        // B: empty, committed behind A on the same queue.
-        let b = session.begin().expect("cb B").commit();
-
-        #[cfg(debug_assertions)]
-        let fed_before = latch.fed_count();
-        let first = b.try_outcome();
-        assert!(
-            first.is_none(),
-            "B polled terminal at the first poll — the heavy submit finished in \
-             microseconds, which contradicts the 512x512 x 4000-instance fill; \
-             got {first:?}"
-        );
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            latch.fed_count(),
-            fed_before,
-            "a None poll must feed the latch NOTHING"
+        let (a, b) = polled.expect(
+            "B polled terminal at the first poll on every take — the heavy submit \
+             finished before this thread could poll, which contradicts the \
+             512x512 x 4000-instance fill, or `try_outcome` waits for the outcome",
         );
 
         assert_eq!(a.wait_outcome(), loss::CbOutcome::Completed, "A completes");
@@ -1998,6 +2045,14 @@ mod tests {
     /// begin`] refuses in microseconds naming the first loss — the same
     /// refuse-before-any-FFI contract acquire and present already carry,
     /// now on the third face of the triangle.
+    ///
+    /// "Before any FFI" is COUNTED, not timed ([`queue_ffi_census`], the
+    /// load-sensitive test audit of 2026-09-27). The old `< 50 ms` stopwatch
+    /// could not tell a refusal that minted one command buffer first from
+    /// one that did not — a mint costs microseconds too — and it failed
+    /// whenever a loaded gate descheduled the test for 50 ms. The census
+    /// fails on exactly that mint and on nothing the scheduler does, so it
+    /// replaces the stopwatch.
     #[test]
     fn an_injected_loss_refuses_further_encodes_fast_and_named() {
         let Some(dev) = device() else { return };
@@ -2005,8 +2060,16 @@ mod tests {
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
 
-        // Healthy first: an empty submit completes and does not latch.
+        // Healthy first: an empty submit completes and does not latch — and
+        // the census sees its one mint, so a census that stopped counting
+        // cannot pass the refusals below.
+        let minted = queue_ffi_census::calls();
         let s0 = session.begin().expect("healthy begin").commit();
+        assert_eq!(
+            queue_ffi_census::calls(),
+            minted + 1,
+            "a healthy begin mints exactly one command buffer"
+        );
         assert_eq!(s0.wait_outcome(), loss::CbOutcome::Completed);
         assert!(!latch.is_lost());
 
@@ -2032,7 +2095,7 @@ mod tests {
         assert!(latch.is_lost());
 
         for attempt in 0..2 {
-            let started = std::time::Instant::now();
+            let minted = queue_ffi_census::calls();
             let err = session
                 .begin()
                 .expect_err("begin after the loss must refuse");
@@ -2040,9 +2103,11 @@ mod tests {
                 err.contains("encode refused") && err.contains("PageFault"),
                 "attempt {attempt}: the refusal names the first loss: {err}"
             );
-            assert!(
-                started.elapsed() < std::time::Duration::from_millis(50),
-                "attempt {attempt}: the refusal must precede any FFI"
+            assert_eq!(
+                queue_ffi_census::calls(),
+                minted,
+                "attempt {attempt}: the refusal must precede any FFI — it \
+                 minted a command buffer on the dead queue"
             );
         }
     }

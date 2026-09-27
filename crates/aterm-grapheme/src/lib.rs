@@ -50,7 +50,7 @@ mod width;
 pub use emoji_presentation::{is_emoji_presentation, is_vs16_emoji_capable};
 pub use grapheme_iter::{GraphemeClusters, GraphemeIndices, Graphemes};
 pub use position::{byte_to_column, column_to_char_index};
-pub use tables::{char_width, char_width_cjk, is_ambiguous_width, str_width, str_width_cjk};
+pub use tables::{char_width, char_width_cjk, is_ambiguous_width, str_width};
 pub use types::{Grapheme, GraphemeInfo};
 pub use width::{
     grapheme_display_width, grapheme_display_width_with_config, grapheme_grid_columns,

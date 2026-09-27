@@ -38,6 +38,7 @@ impl Terminal {
     /// BiDi is disabled or the line is pure left-to-right, so a renderer can apply
     /// the result unconditionally.
     #[must_use]
+    #[cfg(test)]
     pub fn bidi_visual_order(&self, scalars: &[char]) -> Vec<usize> {
         compute_visual_order(
             self.modes.bidi_mode,
@@ -231,6 +232,7 @@ impl Terminal {
 /// without constructing a `Terminal`. `Terminal::bidi_visual_order` is the
 /// one-line wrapper over it.
 #[must_use]
+#[cfg(test)]
 pub fn compute_visual_order(
     mode: BiDiMode,
     dir: ParagraphDirection,
@@ -248,7 +250,7 @@ pub fn compute_visual_order(
 /// Cell-level companion to [`compute_visual_order`]: parallel per-cell scalar and
 /// wide-continuation slices in, visual→logical CELL permutation out. Kept
 /// free-standing so it is testable without constructing a `Terminal`; wide-glyph
-/// cell pairs are kept together (see [`aterm_bidi::reorder_cells`]).
+/// cell pairs are kept together (see [`aterm_bidi::reorder_cells_with_classes`]).
 /// `autodetect` is DECSET 2501, as for [`compute_visual_order`].
 #[must_use]
 pub fn compute_visual_order_cells(
@@ -290,6 +292,7 @@ pub fn compute_visual_order_cells(
 /// character) has no direct UAX #9 analogue: it resolves to `Auto` when a
 /// strong L/R/AL character is present and `Rtl` otherwise, matching its
 /// "default to RTL" intent. SCP 1/2 (`Ltr`/`Rtl`) force their direction.
+#[cfg(test)]
 fn base_direction(
     dir: ParagraphDirection,
     autodetect: bool,

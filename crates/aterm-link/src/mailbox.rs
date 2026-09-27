@@ -106,6 +106,16 @@ pub enum Source {
     Aterm,
 }
 
+/// Queued inputs that replay must yield to. A fleet halt or lane closure is
+/// never delayed for catch-up; local events and addressed mail allow the
+/// roster's one-page progress exception after its control work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayPressure {
+    Clear,
+    Pending,
+    Urgent,
+}
+
 /// The most records ONE source may hold before its reader is made to wait.
 ///
 /// A thousand rows is a deep enough buffer that an ordinary burst never touches
@@ -169,24 +179,30 @@ impl Queues {
     /// would let a chatty topic delay mail somebody addressed — and each say
     /// record costs up to one synchronous `deliver` PER SUBSCRIBED SESSION,
     /// which is the most expensive item the loop can take.
-    fn take(&mut self) -> Option<Item> {
+    /// Whether taking this item released room for a blocked producer. The
+    /// readers park only at their OWN queue's bound, so a routine item from an
+    /// uncapped queue (or a different source) has nobody to wake.
+    fn take(&mut self) -> Option<(Item, bool)> {
         if let Some(s) = self.closed.pop_front() {
-            return Some(Item::Closed(s));
+            return Some((Item::Closed(s), false));
         }
         if let Some(r) = self.fleet.pop_front() {
+            let released = over_bound(self.fleet.len() + 1, self.bytes[FLEET]);
             self.bytes[FLEET] = self.bytes[FLEET].saturating_sub(record_bytes(&r));
-            return Some(Item::Fleet(r));
+            return Some((Item::Fleet(r), released));
         }
         if let Some(e) = self.events.pop_front() {
-            return Some(Item::Event(e));
+            return Some((Item::Event(e), over_bound(self.events.len() + 1, 0)));
         }
         if let Some(r) = self.inbox.pop_front() {
+            let released = over_bound(self.inbox.len() + 1, self.bytes[INBOX]);
             self.bytes[INBOX] = self.bytes[INBOX].saturating_sub(record_bytes(&r));
-            return Some(Item::Inbox(r));
+            return Some((Item::Inbox(r), released));
         }
         self.say.pop_front().map(|r| {
+            let released = over_bound(self.say.len() + 1, self.bytes[SAY]);
             self.bytes[SAY] = self.bytes[SAY].saturating_sub(record_bytes(&r));
-            Item::Say(r)
+            (Item::Say(r), released)
         })
     }
 }
@@ -217,6 +233,21 @@ pub struct Mailbox {
 impl Mailbox {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queues> {
         self.queues.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether the loop has an input that outranks broadcast replay waiting.
+    /// A page already in flight cannot be preempted, but the bridge checks this
+    /// before each next page so an arriving halt or addressed message never
+    /// waits behind an entire replay slice.
+    pub(crate) fn replay_pressure(&self) -> ReplayPressure {
+        let q = self.lock();
+        if !q.closed.is_empty() || !q.fleet.is_empty() {
+            ReplayPressure::Urgent
+        } else if !q.events.is_empty() || !q.inbox.is_empty() {
+            ReplayPressure::Pending
+        } else {
+            ReplayPressure::Clear
+        }
     }
 
     /// The broker incarnation a reader spawned NOW must stamp its pushes with.
@@ -398,9 +429,11 @@ impl Mailbox {
     /// reconnect attempt) without a second timer, and it is generous.
     pub fn take(&self, timeout: Duration) -> Option<Item> {
         let mut q = self.lock();
-        if let Some(item) = q.take() {
+        if let Some((item, released)) = q.take() {
             drop(q);
-            self.drained.notify_all();
+            if released {
+                self.drained.notify_all();
+            }
             return Some(item);
         }
         let (mut q, _) = self
@@ -409,10 +442,10 @@ impl Mailbox {
             .unwrap_or_else(|p| p.into_inner());
         let item = q.take();
         drop(q);
-        if item.is_some() {
+        if item.as_ref().is_some_and(|(_, released)| *released) {
             self.drained.notify_all();
         }
-        item
+        item.map(|(item, _)| item)
     }
 }
 
@@ -476,6 +509,32 @@ mod tests {
         // [`Queues::take`]. Pushed FIRST above so the order below is the
         // priority and not the arrival.
         assert_eq!(seen, ["closed", "fleet", "event", "inbox", "say"]);
+    }
+
+    #[test]
+    fn replay_yields_to_every_queue_ahead_of_the_say_face() {
+        let mb = Mailbox::default();
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+        mb.push_say(rec(1), 0);
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+
+        mb.push_inbox(rec(2), 0);
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Pending);
+        assert!(matches!(mb.take(Duration::ZERO), Some(Item::Inbox(_))));
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+
+        mb.push_event("EVENT 1 topic add probe".into());
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Pending);
+        assert!(matches!(mb.take(Duration::ZERO), Some(Item::Event(_))));
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+
+        mb.push_fleet(rec(3), 0);
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Urgent);
+        assert!(matches!(mb.take(Duration::ZERO), Some(Item::Fleet(_))));
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+
+        mb.push_aterm_closed();
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Urgent);
     }
 
     /// The wait is EVENT-DRIVEN: a push from another thread wakes it, and the

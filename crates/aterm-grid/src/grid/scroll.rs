@@ -133,6 +133,11 @@ impl Grid {
             compute_display_offset_damage(old_offset, self.storage.display_offset, self.rows());
         self.storage.damage.apply_display_offset_damage(dmg);
         self.note_reader_descent_to_live_bottom(old_offset);
+        // Ruling 238: while the history is away, the reader's ask is kept.
+        self.note_detached_reader_motion(
+            super::scrollback_offload::ReaderMotion::By(delta),
+            old_offset,
+        );
         debug_assert!(self.storage.display_offset <= self.storage.scrollback_lines());
     }
 
@@ -184,6 +189,7 @@ impl Grid {
         let dmg = compute_display_offset_damage(old_offset, target, self.rows());
         self.storage.damage.apply_display_offset_damage(dmg);
         self.note_reader_descent_to_live_bottom(old_offset);
+        self.note_detached_reader_motion(super::scrollback_offload::ReaderMotion::Top, old_offset);
         debug_assert_eq!(self.storage.display_offset, self.storage.scrollback_lines());
     }
 
@@ -205,6 +211,7 @@ impl Grid {
         let before = self.storage.display_offset;
         self.reset_display_offset_with_damage();
         self.note_reader_descent_to_live_bottom(before);
+        self.note_detached_reader_motion(super::scrollback_offload::ReaderMotion::Live, before);
         debug_assert_eq!(self.storage.display_offset, 0);
     }
 
@@ -773,17 +780,6 @@ impl Grid {
     /// (lazy-buffer drain, scrollback-reflow restore): enforce the memory
     /// budget, then re-clamp the display offset.
     pub(crate) fn enforce_scrollback_budget_and_clamp(&mut self) {
-        // Enforce memory budget: evict oldest cold-tier lines to disk spill
-        // if the scrollback exceeds the configured budget. Disk cold-tier only;
-        // on wasm (feature off) there is no disk spill — hot/warm RAM tiers only.
-        #[cfg(feature = "disk-tier")]
-        if let Some(enforcer) = self.storage.budget_enforcer.as_mut()
-            && let Some(scrollback) = self.storage.scrollback.as_mut()
-            && let Err(error) = enforcer.enforce(scrollback)
-        {
-            aterm_log::warn!("scrollback budget enforcement failed: {error}");
-        }
-
         // push_line can trigger line-limit enforcement or memory-pressure
         // eviction, reducing total scrollback lines.  If the user was scrolled
         // back, display_offset may now exceed scrollback_lines(), violating the

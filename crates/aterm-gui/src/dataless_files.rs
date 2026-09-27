@@ -37,11 +37,9 @@
 /// Whether reads on the CALLING thread may block to download a dataless file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializePolicy {
-    /// Inherit the process policy (the kernel default is to materialize).
-    #[allow(
-        dead_code,
-        reason = "the third SDK value; read back by the diagnostic seam"
-    )]
+    /// Inherit the process policy (the kernel default is to materialize). Only
+    /// the tests restore it; the shipped callers pick `Off` or `On`.
+    #[cfg(test)]
     Default,
     /// Never wait: a dataless read fails immediately with `EDEADLK`.
     Off,
@@ -57,9 +55,8 @@ mod sys {
     // since the policy was introduced (10.15) and are asserted by the round-trip
     // test below through `getiopolicy_np`.
     pub(super) const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
-    #[allow(dead_code, reason = "documented sibling of the scope in use")]
-    pub(super) const IOPOL_SCOPE_PROCESS: c_int = 0;
     pub(super) const IOPOL_SCOPE_THREAD: c_int = 1;
+    #[cfg(test)]
     pub(super) const IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT: c_int = 0;
     pub(super) const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
     pub(super) const IOPOL_MATERIALIZE_DATALESS_FILES_ON: c_int = 2;
@@ -78,6 +75,7 @@ mod sys {
 
     pub(super) const fn raw(policy: super::MaterializePolicy) -> c_int {
         match policy {
+            #[cfg(test)]
             super::MaterializePolicy::Default => IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT,
             super::MaterializePolicy::Off => IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
             super::MaterializePolicy::On => IOPOL_MATERIALIZE_DATALESS_FILES_ON,

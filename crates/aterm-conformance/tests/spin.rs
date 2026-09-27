@@ -78,8 +78,9 @@
 //! WIRING: `tools/spin_guard.sh`, in the `guards` lane of `xtask gate lint` —
 //! beside `paint_guard`, and fingerprinted the same way, so a run that does not
 //! touch the event loop costs one content hash. NOTHING RUNS THAT LANE
-//! AUTOMATICALLY: `.githooks/pre-push` was demoted to advisory on 2026-08-24
-//! (its body is one printf and `exit 0`), and `tools/verify.sh --fast` — the
+//! AUTOMATICALLY: there is no git hook (the `.githooks/pre-push` that once ran
+//! it was demoted to advisory on 2026-08-24 and deleted on 2026-09-25, by the
+//! owner's no-hooks mandate), and `tools/verify.sh` — the
 //! merge contract — runs `grep_guard.sh` and the license sweep as stages of its
 //! own but never `run_repo_guards`, so it never reaches this script or
 //! `paint_guard`. So this guard runs when a human runs

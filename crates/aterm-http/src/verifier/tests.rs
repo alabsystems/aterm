@@ -245,12 +245,9 @@ struct Case {
 impl Case {
     /// The expectation for the arm that is actually compiled in.
     fn expected(&self) -> Outcome {
-        #[cfg(target_vendor = "apple")]
-        {
+        if cfg!(target_vendor = "apple") {
             self.apple
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
+        } else {
             self.webpki
         }
     }

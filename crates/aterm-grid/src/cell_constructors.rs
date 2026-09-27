@@ -7,7 +7,7 @@
 //! Extracted from `cell.rs` to keep the main file focused on accessors
 //! and predicates.
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, kani))]
 use super::super::style::StyleId;
 use super::{Cell, CellFlags, PackedColor, PackedColors};
 
@@ -18,6 +18,7 @@ impl Cell {
     /// `USES_STYLE_ID` and `COMPLEX` payloads.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn from_checkpoint_raw(char_data: u16, flags: CellFlags, colors_raw: u32) -> Self {
         Self {
             char_data,
@@ -165,7 +166,7 @@ impl Cell {
     /// Create a cell with overflow index for complex character (test/kani-only).
     ///
     /// The actual character string is stored in CellExtras.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     #[inline]
     pub const fn with_overflow_index(index: u16) -> Self {
@@ -199,6 +200,7 @@ impl Cell {
         clippy::cast_possible_truncation,
         reason = "cp verified <= 0xFFFF before cast"
     )]
+    #[cfg(any(test, kani))]
     pub const fn with_style_id(c: char, style_id: StyleId, cell_flags: CellFlags) -> Self {
         let cp = c as u32;
         let char_data = if cp <= Self::MAX_DIRECT_CODEPOINT {
@@ -225,7 +227,7 @@ impl Cell {
     /// - `byte` is printable ASCII (0x20..=0x7E)
     ///
     /// This is the hot path for ASCII output with style interning.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     #[inline]
     pub const fn from_ascii_with_style_id(

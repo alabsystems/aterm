@@ -63,10 +63,9 @@ use std::sync::Mutex;
 
 use aterm_core::selection::SelectionSide;
 use aterm_core::terminal::{ModeMirror, Terminal};
-use aterm_session::Op;
-#[cfg(test)]
-use aterm_session::sink::ImmediateWrite;
-use aterm_session::sink::{AcceptedOrder, InputEpoch, SinkWriter, WriteReceipt, WriteReceiptError};
+use aterm_session::sink::{
+    AcceptedOrder, BulkMeter, InputEpoch, SinkWriter, WriteReceipt, WriteReceiptError,
+};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_event};
 use aterm_types::mouse::MouseButton;
 
@@ -76,7 +75,7 @@ use crate::term_lock;
 /// (`Source::Human`) and by a control verb (`Source::Controller`); the seam turns
 /// it into PTY bytes / viewport side-effects the SAME way for both.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InputEvent {
+pub(crate) enum InputEvent {
     /// A key chord. `base_layout` is the US-QWERTY equivalent of the physical key,
     /// fed to `encode_key_with_layout` so Kitty `REPORT_ALTERNATE_KEYS` carries the
     /// 3rd CSI-u field identically for both sources (kills divergences f/h).
@@ -266,7 +265,7 @@ impl InputEvent {
 /// no real pointer) sends [`PixelOffset::CELL_ORIGIN`] (`0, 0`), i.e. the cell's
 /// top-left, so a controller-driven 1016 press still lands on the right cell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PixelOffset {
+pub(crate) struct PixelOffset {
     /// Horizontal device pixels from the cell's left edge (`0..cell_w`).
     pub x: u16,
     /// Vertical device pixels from the cell's top edge (`0..cell_h`).
@@ -276,7 +275,7 @@ pub struct PixelOffset {
 impl PixelOffset {
     /// The cell's top-left corner — the offset a Controller (no real pointer)
     /// uses, so a 1016 report it drives is exactly the cell origin in pixels.
-    pub const CELL_ORIGIN: Self = Self { x: 0, y: 0 };
+    pub(crate) const CELL_ORIGIN: Self = Self { x: 0, y: 0 };
 }
 
 /// WHEN the bracketed-paste (DEC 2004) question is answered for one
@@ -300,7 +299,7 @@ impl PixelOffset {
 /// produce identical bytes and the `bytes_human_eq_controller` invariant is
 /// untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PasteFraming {
+pub(crate) enum PasteFraming {
     /// Read DEC 2004 when the bytes are produced. Nothing was promised about this
     /// paste: the `paste`/`paste-bin` control verbs (no gesture, no confirmation —
     /// their documented contract is the terminal's mode at write time) and the
@@ -316,7 +315,7 @@ impl PasteFraming {
     /// The framing decision for a paste being written now, given the terminal's
     /// LIVE DEC 2004 state. The one place the two answers are reconciled.
     #[must_use]
-    pub fn bracketed(self, live: bool) -> bool {
+    pub(crate) fn bracketed(self, live: bool) -> bool {
         match self {
             Self::AtDrain => live,
             Self::Gesture { bracketed } => bracketed,
@@ -326,7 +325,7 @@ impl PasteFraming {
 
 /// Tracking-agnostic scrollback navigation for [`InputEvent::ScrollView`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrollIntent {
+pub(crate) enum ScrollIntent {
     /// One screen toward older content.
     Up,
     /// One screen toward the live bottom.
@@ -380,45 +379,35 @@ pub(crate) fn jump_prompt_target(t: &Terminal, prev: bool) -> Option<u64> {
     }
 }
 
-/// WHO produced an [`InputEvent`]. AUDIT-ONLY — the seam MUST NOT branch on this
-/// (the Tier-1 indistinguishability invariant). `Op` is carried for the §7.5
-/// audit log only; it is `Copy`, so `Source` stays `Copy` and the `Wake::Input`
-/// drain loop can pass it by value into every event.
+/// WHO produced an [`InputEvent`]. ATTRIBUTION-ONLY — the seam MUST NOT branch on
+/// this for a byte (the Tier-1 indistinguishability invariant). Its one reader is
+/// who-typed bookkeeping after the egress: a `Human` press, text, paste, click,
+/// drag, wheel or view scroll stamps the session's `human_ms=`
+/// (`app_input::note_person`), which the
+/// automatic supervisor reads to keep its hands off a person. `Copy`, so the
+/// `Wake::Input` drain loop can pass it by value into every event.
 ///
-/// NOTE: design A.2 wrote `Controller { edge: EdgeId }`, but there is NO `EdgeId`
-/// type in `aterm-session` (only `SessionId`, `EdgeToken`, `Op`). We carry the
-/// `Op` of the OPERATION being performed (the verb's audit class — `ReadScreen` for
-/// view control like `scroll`, `WriteInput` for the input verbs), captured at the
-/// verb in `control.rs` (`post_input`/`post_input_reply`). It is deliberately NOT
-/// read off the connection's `Scope`: the cached connect-time op there can drift from
-/// what the verb actually does once the active session swings, which would corrupt the
-/// audit trail. The session-owner connection maps to `Controller` too (an owner is
-/// still a controller, never `Human`): `Human` is built ONLY by the in-thread winit
+/// The session-owner connection maps to `Controller` too (an owner is still a
+/// controller, never `Human`): `Human` is built ONLY by the in-thread winit
 /// handlers.
 #[derive(Clone, Copy, Debug)]
-pub enum Source {
+pub(crate) enum Source {
     /// An in-thread winit handler (real keyboard/mouse/focus on this window).
     Human,
-    /// A control-socket verb. `op` is the audit class of the OPERATION (the verb's
-    /// own op, not the connection's scope). AUDIT-ONLY: captured for a future §7.5
-    /// audit log; the seam binds `src` to `_audit` and NEVER reads it for a
-    /// behavioural decision (the indistinguishability invariant), so it has no reader.
-    Controller {
-        #[allow(dead_code)]
-        op: Op,
-    },
+    /// A control-socket verb.
+    Controller,
 }
 
 /// The reply a reply-bearing verb gets back from the seam. Fire-and-forget
 /// callers ignore it. `Copy` so the drain loop can keep the last outcome cheaply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputOutcome {
+pub(crate) enum InputOutcome {
     /// Applied (bytes written and/or viewport moved).
     Ok,
     /// A `Resize` fell outside `1..=MAX_GRID_*` and was not applied.
     RangeRejected,
     /// The encoded bytes were NOT (fully) written to the PTY — a short write (peer
-    /// closed mid-frame) or a hard error (audit finding: the input seam must not
+    /// closed mid-frame), full ordered-input queue or a hard error (the input seam must not
     /// report OK for bytes that did not land; it is the reply-fidelity contract that
     /// `OK` means delivered).
     WriteFailed,
@@ -433,7 +422,7 @@ pub enum InputOutcome {
 /// [`Full`]: Delivery::Full
 /// [`Failed`]: Delivery::Failed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Delivery {
+pub(crate) enum Delivery {
     /// Every intended byte reached the PTY (or there were none to write).
     Full,
     /// Every intended byte reached the PTY through an epoch-conditional write.
@@ -454,7 +443,7 @@ pub enum Delivery {
 
 impl Delivery {
     #[must_use]
-    pub const fn is_full(self) -> bool {
+    pub(crate) const fn is_full(self) -> bool {
         matches!(self, Self::Full | Self::FullAt { .. })
     }
 }
@@ -494,7 +483,7 @@ fn delivered_receipt(
 /// the viewport/gesture/window side-effects stay in `App::input` (they need the
 /// renderer/window the headless byte test does not have).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Egress {
+pub(crate) enum Egress {
     /// The event produced a tracking report (or had no local fallback): the seam
     /// is done with it. Carries whether the encoded bytes actually reached the PTY
     /// so the reply-bearing caller is told the truth (audit: no false OK).
@@ -521,7 +510,7 @@ pub enum Egress {
 /// fresh queue position behind the PTY reader's `process()` slice, microseconds
 /// after this lock had the same values in hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WheelViewport {
+pub(crate) struct WheelViewport {
     /// `Grid::display_offset()` — the viewport's current row into history.
     pub display_offset: usize,
     /// `Grid::scrollback_lines()` — the clamp bound for the glide's target.
@@ -815,7 +804,7 @@ fn wheel_scaled_lines(
 /// not on [`Source`]). It NEVER changes WHICH bytes are produced, so the Tier-1
 /// `bytes_human_eq_controller` byte-equality invariant holds for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EgressMode {
+pub(crate) enum EgressMode {
     /// The UI event-loop thread: use the non-parking egress so a wedged foreground
     /// can NEVER park the loop that serves rendering + input for every window/tab.
     Interactive,
@@ -825,13 +814,6 @@ pub enum EgressMode {
     /// foreground feels backpressure on THIS thread instead of growing the spill
     /// without bound. MUST NOT be used on the UI thread.
     Backpressured,
-    /// A guarded actuator call: either write one bounded frame to the kernel
-    /// immediately or fail without spilling it for later delivery.  This mode is
-    /// non-parking and preserves the generation checked immediately before the
-    /// action; [`Delivery::Failed`] means the caller must stop and treat the
-    /// action as refused/in-doubt, never retry it blindly.
-    #[cfg(test)]
-    TryImmediate,
 }
 
 /// Deliver `bytes` to `sink` per `mode`. Transport only: the bytes are identical
@@ -847,20 +829,26 @@ fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8], accepted: &mut Accept
         EgressMode::Backpressured => {
             delivered_receipt(sink.write_frame_with_receipt(bytes), bytes.len())
         }
-        #[cfg(test)]
-        EgressMode::TryImmediate => {
-            let (write, order) = sink.try_write_frame_immediate_with_receipt(bytes);
-            let delivery = match write {
-                ImmediateWrite::Full => Delivery::Full,
-                ImmediateWrite::BusyZero => Delivery::BusyZero,
-                ImmediateWrite::ConflictZero => Delivery::ConflictZero,
-                ImmediateWrite::PartialInDoubt { accepted } => {
-                    Delivery::PartialInDoubt { accepted }
-                }
-            };
-            (delivery, order, false)
-        }
     };
+    if order.is_some() {
+        accepted.order = order;
+        accepted.direct = direct;
+    }
+    delivery
+}
+
+/// [`emit`]'s `Backpressured` arm for a metered bulk frame (a large paste):
+/// the same blocking, `SPILL_CAP`-enforcing write, reporting into `meter`.
+fn emit_metered(
+    sink: &SinkWriter,
+    bytes: &[u8],
+    accepted: &mut Accepted,
+    meter: &BulkMeter,
+) -> Delivery {
+    let (delivery, order, direct) = delivered_receipt(
+        sink.write_frame_metered_with_receipt(bytes, meter),
+        bytes.len(),
+    );
     if order.is_some() {
         accepted.order = order;
         accepted.direct = direct;
@@ -884,8 +872,7 @@ struct Accepted {
 /// [`ModeMirror`] (Key/Text arms: no mutex on the press path at all), the mouse and
 /// paste modes under a single `term_lock` — ending at the `mode`-selected
 /// [`emit`] (`Interactive` = non-parking on the UI thread; `Backpressured` =
-/// blocking + `SPILL_CAP` on an expendable thread; `TryImmediate` = guarded,
-/// non-spilling actuator egress). Sole BYTE-PRODUCING reader:
+/// blocking + `SPILL_CAP` on an expendable thread). Sole BYTE-PRODUCING reader:
 /// the predictive-echo gate reads the narrow
 /// `Terminal::kitty_suppresses_predictive_echo()` projection too, but only to
 /// decide whether a local guess may PAINT — a display-only read that can never
@@ -902,7 +889,7 @@ struct Accepted {
 /// Only the byte-producing arms are handled here; the viewport/gesture/clipboard/
 /// blink/snap/resize side-effects (which need the renderer + window + gesture
 /// state) stay in `App::input`, which calls this and then runs those.
-pub fn seam_egress(
+pub(crate) fn seam_egress(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
     sink: &SinkWriter,
@@ -910,7 +897,7 @@ pub fn seam_egress(
     mode: EgressMode,
 ) -> Egress {
     let mut accepted = Accepted::default();
-    seam_egress_inner(term, modes, sink, ev, mode, &mut accepted)
+    seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, None)
 }
 
 /// Receipt-bearing twin of [`seam_egress`]. The byte-producing decision remains
@@ -923,8 +910,26 @@ pub(crate) fn seam_egress_receipt(
     ev: &InputEvent,
     mode: EgressMode,
 ) -> EgressReceipt {
+    seam_egress_receipt_metered(term, modes, sink, ev, mode, None)
+}
+
+/// [`seam_egress_receipt`] with a [`BulkMeter`] for a large paste (design
+/// ruling 231): the paste's ONE frame is written through
+/// [`SinkWriter::write_frame_metered_with_receipt`], which reports its
+/// progress and honours its stop. The bytes are the seam's, unchanged — the
+/// meter is transport, like [`EgressMode`], and applies only to a paste
+/// written from an expendable thread (`Backpressured`); every other event and
+/// mode ignores it.
+pub(crate) fn seam_egress_receipt_metered(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    mode: EgressMode,
+    meter: Option<&BulkMeter>,
+) -> EgressReceipt {
     let mut accepted = Accepted::default();
-    let egress = seam_egress_inner(term, modes, sink, ev, mode, &mut accepted);
+    let egress = seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, meter);
     EgressReceipt {
         egress,
         accepted_order: accepted.order,
@@ -939,6 +944,7 @@ fn seam_egress_inner(
     ev: &InputEvent,
     mode: EgressMode,
     accepted_order: &mut Accepted,
+    meter: Option<&BulkMeter>,
 ) -> Egress {
     // PAIRING OBLIGATION (debug builds): `modes` must be THIS terminal's mirror.
     // A mirror derived from some other terminal (or a bare `Default`) would
@@ -1235,16 +1241,31 @@ fn seam_egress_inner(
                 let t = term_lock(term);
                 t.format_paste_framed(text, framing.bracketed(t.modes().bracketed_paste))
             };
-            let d = if out.is_empty() {
-                Delivery::Full
-            } else {
-                emit(sink, mode, &out, accepted_order)
+            let d = match meter {
+                Some(meter) if !out.is_empty() && mode == EgressMode::Backpressured => {
+                    emit_metered(sink, &out, accepted_order, meter)
+                }
+                meter => {
+                    let d = if out.is_empty() {
+                        Delivery::Full
+                    } else {
+                        emit(sink, mode, &out, accepted_order)
+                    };
+                    // A meter this arm did not write through — the sanitizer
+                    // left nothing to send (64 KiB of controls, unbracketed),
+                    // or a mode the metered write does not serve — is settled
+                    // here, or its watch would never end: the row, and a 4 Hz
+                    // sample with nothing in flight (design ruling 236).
+                    if let Some(meter) = meter {
+                        meter.settle_unmetered(d.is_full());
+                    }
+                    d
+                }
             };
             Egress::Reported(d)
         }
         InputEvent::Focus(focused) => {
-            // SOLE focus-report egress: ESC[I / ESC[O under DEC 1004, byte-identical
-            // to the engine's `encode_focus_state`.
+            // SOLE focus-report egress: ESC[I / ESC[O under DEC 1004.
             //
             // LOCK-FREE like the Key/Text arms, and for a sharper reason than
             // they had. This arm is now reached from `App::recompute_focus_reports`
@@ -1302,7 +1323,7 @@ pub(crate) fn shell_escape_path(path: &str) -> String {
 /// expands `$name` even inside double quotes; no single quoting works in both
 /// shells, and such names are vanishingly rare in droppable paths. Defined
 /// winit/fs-free so it is unit-tested on every target.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(windows, test))]
 pub(crate) fn shell_escape_path_windows(path: &str) -> String {
     let inert = |c: char| c.is_alphanumeric() || matches!(c, '\\' | '/' | ':' | '.' | '-' | '_');
     if path.chars().all(inert) {
@@ -1335,7 +1356,7 @@ pub(crate) fn shell_escape_path_windows(path: &str) -> String {
 /// digits, and all multibyte UTF-8 — is shell-inert and passes through verbatim,
 /// so a plain path is returned unchanged. Defined winit/fs-free so it is
 /// unit-tested on every target.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(unix, test))]
 pub(crate) fn shell_escape_path_posix(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
@@ -1387,9 +1408,9 @@ pub(crate) fn shell_escape_path_posix(path: &str) -> String {
 /// Winit/fs-free so the join contract is unit-tested on every target; the
 /// escaping itself is pinned by the `shell_escape_path_*` suites above it.
 /// Its one production caller is the Windows `CF_HDROP` arm of
-/// `App::paste_clipboard_into`, hence the off-Windows dead-code allowance
-/// (the `shell_escape_path_posix` shape).
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+/// `App::paste_clipboard_into`, hence the Windows-or-test gate (the
+/// `shell_escape_path_posix` shape).
+#[cfg(any(windows, test))]
 pub(crate) fn paths_paste_insertion(paths: &[String]) -> String {
     let mut out = String::new();
     for p in paths {
@@ -1625,21 +1646,21 @@ mod tests {
 
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            pub fn CreatePipe(
+            pub(crate) fn CreatePipe(
                 read: *mut isize,
                 write: *mut isize,
                 attrs: *mut c_void,
                 size: u32,
             ) -> i32;
-            pub fn CreateEventW(
+            pub(crate) fn CreateEventW(
                 attrs: *mut c_void,
                 manual_reset: i32,
                 initial_state: i32,
                 name: *const u16,
             ) -> isize;
-            pub fn SetEvent(event: isize) -> i32;
-            pub fn CloseHandle(handle: isize) -> i32;
-            pub fn PeekNamedPipe(
+            pub(crate) fn SetEvent(event: isize) -> i32;
+            pub(crate) fn CloseHandle(handle: isize) -> i32;
+            pub(crate) fn PeekNamedPipe(
                 pipe: isize,
                 buf: *mut u8,
                 buf_len: u32,
@@ -1647,7 +1668,7 @@ mod tests {
                 avail: *mut u32,
                 left_this_message: *mut u32,
             ) -> i32;
-            pub fn ReadFile(
+            pub(crate) fn ReadFile(
                 file: isize,
                 buf: *mut u8,
                 want: u32,
@@ -1866,7 +1887,6 @@ mod tests {
     /// hand-maintained Vec with no such structural guard). Never called — it exists to
     /// fail to COMPILE if a variant is added, not to run. KeySequence is the variant
     /// this guard would have caught.
-    #[allow(dead_code)]
     fn _convergence_matrix_is_exhaustive(ev: &InputEvent) {
         match ev {
             InputEvent::Key { .. }

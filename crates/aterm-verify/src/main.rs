@@ -58,7 +58,7 @@ fn main() {
     let Some(root) = resolve_root(parsed.root.clone()) else {
         eprintln!(
             "verify: cannot find the repo root (no directory above the cwd holds both \
-             Cargo.toml and tools/verify.sh) — pass --root <dir> or set ATERM_VERIFY_ROOT"
+             Cargo.toml and tools/verify.sh) — pass --root <dir>"
         );
         std::process::exit(exit::COULD_NOT_RUN);
     };
@@ -75,14 +75,9 @@ fn main() {
 
     // Timings are a side channel: a file that cannot be opened is said on
     // stderr and costs the TSV, never the run.
-    let timings = env.verify_timings.as_deref().and_then(|p| {
+    let timings = parsed.timings.as_deref().and_then(|p| {
         exec::Timings::create(p)
-            .map_err(|e| {
-                eprintln!(
-                    "verify: cannot open ATERM_VERIFY_TIMINGS={}: {e}",
-                    p.display()
-                )
-            })
+            .map_err(|e| eprintln!("verify: cannot open --timings {}: {e}", p.display()))
             .ok()
     });
 
@@ -100,10 +95,11 @@ fn main() {
     // A gate started BY the holding gate (a stage driving this binary) runs
     // inside that hold instead of queueing on its own ancestor until the stage
     // ceiling kills the stage.
-    let _machine = if parsed.selftest || snapshot::inside_machine_holder() {
+    let machine_lock = snapshot::machine_lock_dir(parsed.machine_lock_dir.as_deref());
+    let _machine = if parsed.selftest || snapshot::inside_machine_holder(machine_lock.as_deref()) {
         None
     } else {
-        match snapshot::hold_machine(&root) {
+        match snapshot::hold_machine(&root, machine_lock.as_deref()) {
             Ok(hold) => Some(hold),
             Err(why) => {
                 print!("{}", snapshot::machine_could_not_run_text(&why));
@@ -113,9 +109,16 @@ fn main() {
         }
     };
 
+    // THE TOOLCHAIN, discovered ONCE for the whole run and handed to the lane
+    // stamp, the scope and the stages ([`aterm_verify::run_toolchain`]): each
+    // discovery races the staleness rule's date probes against a clock, so two
+    // of them in one run can name two compilers. The pin read is the caller's
+    // `rust-toolchain.toml`, which the snapshot copies.
+    let tools = aterm_verify::run_toolchain(&env, &root);
+
     // THE SNAPSHOT, before anything reads the tree — `--changed` included, so
     // its selection is of the same tree the stages build.
-    let (snap, notes) = match choose_source(&parsed, &root, &env, &scratch) {
+    let (snap, notes) = match choose_source(&parsed, &root, &env, &scratch, &tools) {
         Ok(chosen) => chosen,
         Err(why) => {
             print!("{}", snapshot::could_not_run_text(&why));
@@ -129,26 +132,33 @@ fn main() {
 
     // `--changed` decides the scope BEFORE the ladder is planned, so it runs
     // here rather than as a stage: every header below names the scope it picks.
-    let (scope, prelude) = resolve_scope(&parsed, &run_root, &env);
+    let (scope, prelude) = resolve_scope(&parsed, &run_root, &env, &tools);
 
     // THE GATE KEEPS ITS OWN COPY OF THE LADDER, so nobody has to `| tee` one
     // into the checkout (the failure above) to have a record afterwards. It
     // lives in the gate's state directory, which no `TreeState` reads and
-    // `.gitignore` already covers, and `ATERM_VERIFY_LOG=<path>` moves it —
-    // empty turns it off.
-    let log = open_log(&env, &run_root);
+    // `.gitignore` already covers; `--log <path>` moves it and `--no-log` turns
+    // it off.
+    let log = open_log(&parsed, &run_root);
 
-    let mut ctx = Ctx::new(
+    let mut ctx = Ctx::new_with_tools(
         run_root,
         parsed.mode,
         scope,
         parsed.selftest,
         env,
         scratch.clone(),
+        tools,
     )
     .with_prelude(prelude)
     .with_timings(timings)
     .with_progress_log(log.as_ref().and_then(|(_, f)| f.try_clone().ok()))
+    .with_child_ceiling(
+        parsed
+            .stage_timeout
+            .unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)),
+    )
+    .with_gui_smoke_skipped(parsed.skip_gui_smoke)
     .with_notes(
         identity::own_output_note(&excluded)
             .into_iter()
@@ -161,7 +171,7 @@ fn main() {
     // AFTER the snapshot is chosen, because the git stamp is resolved from the
     // root this run will actually build — and BEFORE any stage runs, because the
     // whole point is that every child of one run is given the same answer.
-    ctx = ctx.with_pinned_child_facts();
+    ctx = ctx.with_pinned_child_facts(parsed.test_threads);
     // Every child learns which gate holds the machine, so a gate a stage
     // starts is recognised as part of this run (`snapshot::inside_machine_holder`).
     if _machine.is_some() {
@@ -216,22 +226,22 @@ fn main() {
 /// `--scope` is the flag's value and nothing else. `--changed` has to READ the
 /// repo — the diff, the workspace members, the inverted graph — and any part of
 /// that it cannot read widens the run back to the whole workspace and says so;
-/// see [`changed`]. The toolchain is discovered twice (here and in [`Ctx::new`])
-/// because the selection needs `targo` before a `Ctx` exists: a handful of
-/// `stat` calls, against a decision that must not be taken twice.
-fn resolve_scope(parsed: &cli::Args, root: &Path, env: &EnvSnapshot) -> (Scope, Option<Report>) {
+/// see [`changed`]. The selection needs `targo` before a `Ctx` exists, so it is
+/// handed the run's one toolchain (`tools`, [`aterm_verify::run_toolchain`]) —
+/// never a discovery of its own, which could name another compiler than the
+/// stages run.
+fn resolve_scope(
+    parsed: &cli::Args,
+    root: &Path,
+    env: &EnvSnapshot,
+    tools: &Toolchain,
+) -> (Scope, Option<Report>) {
     if !parsed.changed {
         return (Scope::from_option(parsed.scope.clone()), None);
     }
-    let base = parsed.base_ref(env.verify_base.as_deref());
-    let tools = Toolchain::discover(
-        env.trust_stage2_bin.as_deref(),
-        &env.home,
-        &env.path,
-        aterm_verify::toolchain::pinned_channel(root).as_deref(),
-    );
+    let base = parsed.base_ref();
     let path_env = tools.path_with_stage2_first(&env.path);
-    let selection = changed::resolve(root, &tools, &path_env, &base);
+    let selection = changed::resolve(root, tools, &path_env, &base);
     let (scope, report) = changed::stage_report(&base, &selection);
     (scope, Some(report))
 }
@@ -249,6 +259,7 @@ fn choose_source(
     root: &Path,
     env: &EnvSnapshot,
     scratch: &Path,
+    tools: &Toolchain,
 ) -> Result<(Option<snapshot::Snapshot>, Vec<String>), String> {
     if parsed.in_place || parsed.selftest {
         return Ok((None, Vec::new()));
@@ -267,21 +278,13 @@ fn choose_source(
             )],
         ));
     }
-    // The compiler's commit, for the lane stamps: the same discovery `Ctx::new`
-    // makes, so the stamp names the compiler the stages will run.
-    let prefix = aterm_verify::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
-    let tools = Toolchain::discover_with_store(
-        env.trust_stage2_bin.as_deref(),
-        &env.home,
-        Some(&prefix),
-        &env.path,
-        aterm_verify::toolchain::pinned_channel(root).as_deref(),
-    );
+    // The compiler's commit, for the lane stamps: the run's one toolchain,
+    // the very one its stages run.
     let path_env = tools.path_with_stage2_first(&env.path);
     let snap = snapshot::prepare(&snapshot::Options {
         caller: root,
-        snapshot: env
-            .verify_snapshot
+        snapshot: parsed
+            .snapshot
             .clone()
             .unwrap_or_else(|| snapshot::default_root(root)),
         path_env: &path_env,
@@ -294,7 +297,7 @@ fn choose_source(
 /// stdout, and the gate's own copy of the ladder.
 ///
 /// A log write NEVER decides anything: a full disk costs the record, not the
-/// run, exactly as `ATERM_VERIFY_TIMINGS` does. `write` reports what reached
+/// run, exactly as `--timings` does. `write` reports what reached
 /// STDOUT, so a short write on the log cannot be mistaken for a short write on
 /// the ladder.
 struct Tee<'a, W: Write> {
@@ -323,7 +326,7 @@ impl<W: Write> Write for Tee<'_, W> {
 /// not filling a disk with: the newest few runs are what anyone reads.
 const LOGS_KEPT: usize = 20;
 
-/// Open this run's log — `ATERM_VERIFY_LOG` when set (empty turns it off),
+/// Open this run's log — `--log <path>` when given (`--no-log` keeps none),
 /// otherwise `<run root>/.aterm-verify/logs/verify-<pid>.log`.
 ///
 /// Inside the gate's state directory ON PURPOSE: `identity::is_gate_state`
@@ -331,9 +334,11 @@ const LOGS_KEPT: usize = 20;
 /// `git status`, so the gate writing a log cannot become the gate watching its
 /// own log move. A path that cannot be opened is said once on stderr and costs
 /// the record, never the run.
-fn open_log(env: &EnvSnapshot, run_root: &Path) -> Option<(PathBuf, std::fs::File)> {
-    let path = match &env.verify_log {
-        Some(p) if p.as_os_str().is_empty() => return None,
+fn open_log(parsed: &cli::Args, run_root: &Path) -> Option<(PathBuf, std::fs::File)> {
+    if parsed.no_log {
+        return None;
+    }
+    let path = match &parsed.log {
         Some(p) => p.clone(),
         None => {
             let dir = run_root
@@ -384,13 +389,10 @@ fn prune_logs(dir: &Path) {
     }
 }
 
-/// `--root`, then `ATERM_VERIFY_ROOT`, then a walk up from the cwd.
+/// `--root`, else a walk up from the cwd.
 fn resolve_root(flag: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(r) = flag {
         return Some(r);
-    }
-    if let Some(r) = std::env::var_os("ATERM_VERIFY_ROOT") {
-        return Some(PathBuf::from(r));
     }
     let cwd = std::env::current_dir().ok()?;
     aterm_verify::locate_root(&cwd)

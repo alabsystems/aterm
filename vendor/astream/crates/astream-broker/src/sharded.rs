@@ -23,22 +23,18 @@
 //! Strict durability + crash recovery, group commit, pipelining, fork/cognition verbs)
 //! holds within a shard unchanged.
 //!
-//! HONEST throughput note (measured, `broker_sharded_bench`): on a SINGLE disk at
-//! Strict durability, sharding does NOT increase aggregate throughput and can reduce
-//! it — one optimally-batched log is already disk-fsync-bound, so splitting a fixed
-//! producer set across N shards just fragments group-commit batching across N fsync
-//! streams contending for the one disk. Sharding is a HORIZONTAL-SCALE architecture: it
-//! pays off across multiple disks/nodes, or in a CPU/lock-bound regime (e.g. the
-//! `Relaxed` tier, where there is no per-message fsync and the single writer thread —
-//! not the disk — is the bottleneck). The single-node single-disk throughput wins are
-//! group commit + pipelining (both measured). We do NOT claim a sharding throughput
-//! win we cannot show; this module's evidence is its routing/ordering/recovery
-//! CORRECTNESS (`broker.sharded-routing`).
+//! Throughput: on a SINGLE disk at Strict durability, sharding does not raise
+//! aggregate throughput and can lower it — one optimally-batched log is already
+//! fsync-bound, and N shards fragment group commit across N fsync streams contending
+//! for the one disk (`broker_sharded_bench`). Sharding pays off across multiple
+//! disks/nodes, or where the single writer thread rather than the disk is the
+//! bottleneck (the `Relaxed` tier).
 
 use crate::client::SubscriptionCloser;
 use crate::{Broker, BrokerHandle, Client, Durability};
 use astream_wire::{assign_partition, Filter, PartitionKey};
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
@@ -65,6 +61,37 @@ fn read_shards_file(dir: &Path) -> io::Result<Option<u32>> {
         }),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Record `shards` in `dir`'s sidecar atomically and durably: a temp file, fsync'd,
+/// renamed over the sidecar, then the directory fsync'd. A plain `fs::write` can leave
+/// an EMPTY sidecar after a power loss (the name durable, the bytes not), which every
+/// later open then refuses as an unreadable count; and a reader racing a rewrite
+/// could see it half-written.
+fn write_shards_file(dir: &Path, shards: u32) -> io::Result<()> {
+    let tmp = dir.join(format!("{SHARDS_FILE}.tmp"));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(format!("{shards}\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(SHARDS_FILE))?;
+    match File::open(dir).and_then(|d| d.sync_all()) {
+        // A filesystem that cannot fsync a directory handle, or a directory this
+        // process may write but not open: the file's own bytes are durable, and there
+        // is nothing more to do about the entry.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(())
+        }
+        r => r,
     }
 }
 
@@ -109,7 +136,7 @@ fn check_or_record_log_shards(dir: &Path, shards: u32) -> io::Result<()> {
                     return Err(mismatch(dir, have, shards));
                 }
             }
-            std::fs::write(dir.join(SHARDS_FILE), format!("{shards}\n"))
+            write_shards_file(dir, shards)
         }
     }
 }
@@ -175,7 +202,7 @@ impl ShardedBroker {
     pub fn serve(&self, sock_dir: impl AsRef<Path>) -> io::Result<ShardedHandle> {
         let dir = sock_dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join(SHARDS_FILE), format!("{}\n", self.shards))?;
+        write_shards_file(dir, self.shards)?;
         let mut handles = Vec::with_capacity(self.shards as usize);
         for (i, b) in self.brokers.iter().enumerate() {
             handles.push(b.serve(dir.join(format!("shard-{i}.sock")))?);

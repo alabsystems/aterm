@@ -177,33 +177,6 @@ impl Uri {
         };
         format!("{host}:{}", self.port)
     }
-
-    /// Whether the host is an IPv4/IPv6 loopback literal or `localhost`.
-    ///
-    /// Name-based: `localhost` is treated as loopback WITHOUT resolving it,
-    /// which is the conservative direction for the one decision this feeds —
-    /// whether to bypass a configured proxy. Sending loopback traffic direct
-    /// can only keep it on this machine.
-    #[must_use]
-    pub fn host_is_loopback(&self) -> bool {
-        host_is_loopback(&self.host)
-    }
-}
-
-/// Whether a bare host string names the loopback interface.
-#[must_use]
-pub fn host_is_loopback(host: &str) -> bool {
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
-        return v4.is_loopback();
-    }
-    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
-        return v6.is_loopback();
-    }
-    false
 }
 
 /// ASCII-case-insensitive `strip_prefix` (schemes are case-insensitive).
@@ -293,7 +266,6 @@ mod tests {
         assert_eq!(u.port(), 11434);
         assert_eq!(u.path_and_query(), "/api/chat");
         assert_eq!(u.host_header(), "127.0.0.1:11434");
-        assert!(u.host_is_loopback());
 
         let u = Uri::parse("https://llm.example.test/v1/chat/completions").unwrap();
         assert_eq!(u.scheme(), Scheme::Https);
@@ -301,7 +273,6 @@ mod tests {
         // Default port is elided from the Host header.
         assert_eq!(u.host_header(), "llm.example.test");
         assert_eq!(u.path_and_query(), "/v1/chat/completions");
-        assert!(!u.host_is_loopback());
     }
 
     #[test]
@@ -373,11 +344,9 @@ mod tests {
         // ...and re-bracketed for the Host header and the CONNECT target.
         assert_eq!(u.host_header(), "[::1]:8080");
         assert_eq!(u.authority(), "[::1]:8080");
-        assert!(u.host_is_loopback());
 
         let u = Uri::parse("https://[2606:4700::1111]/p").unwrap();
         assert_eq!(u.host_header(), "[2606:4700::1111]");
-        assert!(!u.host_is_loopback());
     }
 
     #[test]
@@ -413,27 +382,5 @@ mod tests {
         // the caller's own textual split of the same input.
         let u = Uri::parse("http://[::1]:8080/p").unwrap();
         assert_eq!(u.authority_as_written(), "[::1]:8080");
-    }
-
-    #[test]
-    fn loopback_detection_covers_the_forms_a_local_daemon_is_named_by() {
-        for yes in [
-            "http://127.0.0.1:11434/",
-            "http://127.9.9.9/",
-            "http://localhost:11434/",
-            "http://LocalHost/",
-            "http://[::1]/",
-        ] {
-            assert!(Uri::parse(yes).unwrap().host_is_loopback(), "{yes}");
-        }
-        for no in [
-            "http://10.0.0.1/",
-            "http://example.test/",
-            "http://[2606:4700::1111]/",
-            // Not loopback: a name that merely CONTAINS localhost.
-            "http://localhost.evil.test/",
-        ] {
-            assert!(!Uri::parse(no).unwrap().host_is_loopback(), "{no}");
-        }
     }
 }

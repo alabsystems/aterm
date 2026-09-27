@@ -4,10 +4,14 @@
 //! The single PTY spawn + IO seam (ATERM_DESIGN WS-G).
 //!
 //! Every raw PTY primitive — Unix `forkpty`, `execve`, `read`, `write`,
-//! `ioctl(TIOCSWINSZ)`; Windows ConPTY (`CreatePseudoConsole` + anonymous
-//! pipes) — is contained HERE, in one auditable crate, so the frontend holds no
-//! unsafe PTY code and there is exactly one place where a child process is
-//! spawned. The master is returned as a raw `i32` because aterm's frontend
+//! `ioctl(TIOCSWINSZ)`, and the two queue probes [`input_queue_len`]
+//! (`FIONREAD`: input the program has not read) and [`output_queue_len`]
+//! (`TIOCOUTQ`: output aterm has not read), macOS-only readings added
+//! 2026-09-24 when a frozen program's unread Enter was invisible to every
+//! driver, with [`flush_input_queue`] (`TCIFLUSH`, 2026-09-25) to drop that
+//! input before a restart hands it to the shell; Windows ConPTY (`CreatePseudoConsole` + anonymous pipes) — is
+//! contained HERE, in one auditable crate, so the frontend holds no unsafe PTY
+//! code and there is exactly one place where a child process is spawned. The master is returned as a raw `i32` because aterm's frontend
 //! shares it across the input, reader, and control-socket threads (the same
 //! sharing it already did); the unsafe is what moves, not the ownership model.
 //!
@@ -39,23 +43,15 @@
 /// pseudoconsole (the console-close analog of SIGHUP-on-controlling-tty).
 #[derive(Debug, Clone, Copy)]
 pub struct SpawnedShell {
-    /// The PTY master fd (what `spawn_shell` returns on its own).
+    /// The PTY master fd.
     pub master: i32,
     /// The child's pid == its process-group id (session leader via `login_tty`).
     pub pid: i32,
 }
 
-/// The UTF-8 locale aterm forces whenever it must guarantee UTF-8 character
-/// encoding — the override [`resolve_spawn_locale`] injects for spawned children,
-/// and (in aterm-gui) the locale the clipboard helper subprocesses (`pbcopy`/
-/// `pbpaste`) are pinned to. `en_US.UTF-8` is guaranteed present on macOS. Kept
-/// here as the single source of truth so the spawn-side and clipboard-side pins
-/// cannot drift.
-pub const UTF8_LOCALE: &str = "en_US.UTF-8";
-
 /// Build the child shell's environment: the `inherited` environment with every
 /// deny-listed key removed (AI-tool vars `CLAUDE*`/`ANTHROPIC_*`/`COPILOT_*`/… and
-/// the containment vars `ATERM_CONTAINMENT_MODE`/`_ALLOWLIST`, via the canonical
+/// the recursion-provisioning identity vars, via the canonical
 /// [`aterm_types::domain::is_ai_env_var`]), then `env_add` applied on top —
 /// overriding an existing key or appending a new one. So a deny-listed var present
 /// in aterm's own environment never leaks into the spawned shell, while explicitly
@@ -131,7 +127,8 @@ fn is_denied_env_key(key: &std::ffi::OsStr) -> bool {
 
 /// What the line discipline will do with the NEXT byte typed into a PTY —
 /// the two `c_lflag` bits that decide whether a keypress is the kernel's to
-/// echo, read by [`tty_echo`] at the moment of the press.
+/// echo, and the characters `ISIG` turns into signals ([`TtySignals`]), read
+/// by [`tty_echo`] at the moment of the press.
 ///
 /// The four corners, measured on this machine's ptys (2026-09-12):
 ///
@@ -153,6 +150,9 @@ pub struct TtyEcho {
     pub echo: bool,
     /// `ICANON` is set: line-at-a-time input, so echo is the kernel's job.
     pub canonical: bool,
+    /// The signal characters while `ISIG` is set; `None` when it is clear
+    /// (raw mode), where every byte is queued for the program to read.
+    pub signals: Option<TtySignals>,
 }
 
 impl TtyEcho {
@@ -163,6 +163,37 @@ impl TtyEcho {
     #[must_use]
     pub const fn swallows_input(self) -> bool {
         !self.echo && self.canonical
+    }
+}
+
+/// The slave's signal characters — `c_cc[VINTR]`, `c_cc[VQUIT]` and
+/// `c_cc[VSUSP]` — read while `ISIG` is set. The line discipline turns each of
+/// them into a signal for the foreground group AS IT IS WRITTEN: the byte never
+/// enters the input queue, and (unless `NOFLSH`) the queue is flushed with it.
+///
+/// Measured on Darwin 25.6 (2026-09-24, `openpty`, one unread `q` queued, then
+/// `^C`, `^\` or `^Z` written through the master): with `ICANON` off and `ISIG`
+/// on (cbreak — readline between keys, `watch`, `htop`) FIONREAD falls from 1
+/// to 0; in raw mode (`ISIG` off) it rises to 2, the character queued behind
+/// the `q` like any byte. A remapped `VINTR` moves the signal with it: with
+/// `VINTR = ^G`, `^C` queues and `^G` flushes. `None` is a disabled character
+/// (`_POSIX_VDISABLE`: 0xff on macOS, NUL on Linux), which signals nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TtySignals {
+    /// `VINTR` (SIGINT; `^C` by default).
+    pub intr: Option<u8>,
+    /// `VQUIT` (SIGQUIT; `^\` by default).
+    pub quit: Option<u8>,
+    /// `VSUSP` (SIGTSTP; `^Z` by default).
+    pub susp: Option<u8>,
+}
+
+impl TtySignals {
+    /// Whether `byte`, written into the PTY, is turned into a signal rather
+    /// than queued.
+    #[must_use]
+    pub fn signals(self, byte: u8) -> bool {
+        [self.intr, self.quit, self.susp].contains(&Some(byte))
     }
 }
 
@@ -200,7 +231,7 @@ mod tests {
     //
     // REGRESSION: the deny-list CLASSIFIER (`is_ai_env_var`) is unit-tested in
     // aterm-types, but the PTY spawn seam never CALLED it — so AI-tool vars and the
-    // containment vars leaked into every child shell. This proves `build_child_env`
+    // provisioning vars leaked into every child shell. This proves `build_child_env`
     // (which `spawn_shell_with_pid` uses to build `envp`) drops the deny-listed keys
     // while keeping ordinary vars, and that `env_add` still overrides.
     #[test]
@@ -209,7 +240,7 @@ mod tests {
         let os = |s: &str| OsString::from(s);
         let inherited = vec![
             (os("PATH"), os("/usr/bin")),
-            (os("ATERM_CONTAINMENT_MODE"), os("containment")),
+            (os("ATERM_SESSION_ID"), os("s-0123456789abcdef0123")),
             (os("ANTHROPIC_API_KEY"), os("secret")),
             (os("CLAUDECODE"), os("1")),
             (os("CURSOR_TRACE_ID"), os("xyz")),
@@ -221,9 +252,9 @@ mod tests {
             .iter()
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
-        // Every deny-listed key (AI-tool + containment) is filtered out.
+        // Every deny-listed key (AI-tool + provisioning) is filtered out.
         for denied in [
-            "ATERM_CONTAINMENT_MODE",
+            "ATERM_SESSION_ID",
             "ANTHROPIC_API_KEY",
             "CLAUDECODE",
             "CURSOR_TRACE_ID",

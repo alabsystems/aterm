@@ -565,7 +565,7 @@ struct Closing<'a> {
 
 /// The mint's DONE facts, re-rendered on THIS transcript's grid as `(label, value)`.
 ///
-/// Pure, and separate from [`close`], so `tests/transcript_grid.rs` can construct a
+/// Pure, and separate from [`close`], so `tests/it/transcript_grid.rs` can construct a
 /// `Report` with every conditional set and assert that every load-bearing clause survives.
 /// That test is what licenses re-rendering locally instead of splicing `render_report`'s
 /// own lines in on their narrower gutter: the fact-loss risk is handled by a test, not by
@@ -711,7 +711,7 @@ fn band(name: &str) {
 /// than this transcript's. Splicing them in preserves that gutter, and four mint facts on
 /// a different grid look like output from a different program — which is exactly what lets
 /// an operator's eye skip them. Every field it reads is `pub`, so this re-renders from the
-/// `Report` itself; `tests/transcript_grid.rs` pins every load-bearing clause so a field
+/// `Report` itself; `tests/it/transcript_grid.rs` pins every load-bearing clause so a field
 /// added there cannot be silently dropped here.
 #[cfg(unix)]
 fn close(c: Closing<'_>) -> Result<()> {

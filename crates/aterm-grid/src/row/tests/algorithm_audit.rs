@@ -261,7 +261,7 @@ fn clear_range_middle_preserves_len() {
     assert_eq!(row.len(), 10);
 
     // Clear cols 3-5 (middle of content)
-    row.clear_range(3, 6);
+    row.clear_range_with(3, 6, Cell::EMPTY);
     // Content should be: "ABC   GHIJ"
     // len should still be 10 since cols 6-9 have content
     assert_eq!(

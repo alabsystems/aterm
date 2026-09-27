@@ -132,27 +132,6 @@ impl CommandMark {
         self.exit_code == Some(0)
     }
 
-    /// Calculate the command input duration in milliseconds.
-    ///
-    /// Returns the time between prompt display (A) and command input start (B).
-    /// Returns `None` if timestamps are incomplete or inconsistent.
-    #[must_use]
-    pub fn prompt_duration_ms(&self) -> Option<u64> {
-        elapsed_ms(self.prompt_time_ms, self.command_input_start_time_ms)
-    }
-
-    /// Calculate the command typing duration in milliseconds.
-    ///
-    /// Returns the time between command input start (B) and execution start (C).
-    /// Returns `None` if timestamps are incomplete or inconsistent.
-    #[must_use]
-    pub fn input_duration_ms(&self) -> Option<u64> {
-        elapsed_ms(
-            self.command_input_start_time_ms,
-            self.command_exec_start_time_ms,
-        )
-    }
-
     /// Calculate the command execution duration in milliseconds.
     ///
     /// Returns the time between command execution start (C) and completion (D).
@@ -160,16 +139,6 @@ impl CommandMark {
     #[must_use]
     pub fn exec_duration_ms(&self) -> Option<u64> {
         elapsed_ms(self.command_exec_start_time_ms, self.command_end_time_ms)
-    }
-
-    /// Calculate the total command duration in milliseconds.
-    ///
-    /// Returns the wall-clock time from prompt display (A) to completion (D),
-    /// spanning all phases: prompt, input, and execution.
-    /// Returns `None` if either timestamp is missing or inconsistent.
-    #[must_use]
-    pub fn command_duration_ms(&self) -> Option<u64> {
-        elapsed_ms(self.prompt_time_ms, self.command_end_time_ms)
     }
 }
 
@@ -263,82 +232,6 @@ impl Annotation {
             hidden: false,
         }
     }
-
-    /// Create a new hidden annotation.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Unique identifier for this annotation
-    /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert)
-    /// * `col` - Column position
-    /// * `message` - The annotation content
-    pub fn new_hidden(id: u64, row: u64, col: u16, message: String) -> Self {
-        Self {
-            id,
-            row,
-            col,
-            length: None,
-            message,
-            hidden: true,
-        }
-    }
-}
-
-/// Shell integration event sent to callbacks.
-///
-/// Row coordinates use absolute row numbers (u64) that survive scrollback eviction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ShellEvent {
-    /// Prompt started (OSC 133 ; A).
-    PromptStart {
-        /// Row where prompt started (absolute line number).
-        row: u64,
-        /// Column where prompt started.
-        col: u16,
-    },
-    /// Command input started (OSC 133 ; B).
-    CommandStart {
-        /// Row where command input started (absolute line number).
-        row: u64,
-        /// Column where command input started.
-        col: u16,
-    },
-    /// Command execution started (OSC 133 ; C).
-    OutputStart {
-        /// Row where output started (absolute line number).
-        row: u64,
-    },
-    /// Command finished (`OSC 133 ; D ; <code>`).
-    CommandFinished {
-        /// Exit code of the command.
-        exit_code: i32,
-    },
-    /// Current working directory changed (OSC 7 or OSC 633 ; P ; Cwd=...).
-    DirectoryChanged {
-        /// New working directory, or `None` when the shell clears it.
-        path: Option<Box<str>>,
-    },
-    /// Explicit shell text payload (OSC 633 ; E).
-    SemanticText {
-        /// Unescaped text payload reported by the shell integration layer.
-        text: Box<str>,
-    },
-    /// Progress tracking started (OSC 633 ; F).
-    ProgressStart {
-        /// Raw progress payload, if one was supplied by the shell.
-        payload: Option<Box<str>>,
-    },
-    /// Progress tracking updated (OSC 633 ; G).
-    ProgressUpdate {
-        /// Raw progress payload, if one was supplied by the shell.
-        payload: Option<Box<str>>,
-    },
-    /// Progress tracking ended (OSC 633 ; H).
-    ProgressEnd {
-        /// Raw progress payload, if one was supplied by the shell.
-        payload: Option<Box<str>>,
-    },
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@
 //! Both directions are panic-free:
 //! * [`Frame::encode`] returns `Err(FrameError::TooLarge)` instead of
 //!   `.expect()`-ing when the payload exceeds the [`MAX_PAYLOAD_LEN`] policy cap
-//!   (16 MiB) or the `u32` length field (kafka2 panicked here).
+//!   (16 MiB) or the `u32` length field.
 //! * [`Frame::decode`] returns `Ok(None)` when more bytes are needed,
 //!   `Err(..)` on malformed/corrupt input, and never indexes out of bounds.
 
@@ -255,7 +255,6 @@ mod tests {
 
     #[test]
     fn error_display_strings_are_distinct_and_named() {
-        // Documented Display behavior, previously untested.
         assert!(FrameError::TooLarge.to_string().contains("exceeds"));
         assert!(FrameError::BadMagic.to_string().contains("magic"));
         assert!(FrameError::BadVersion.to_string().contains("version"));
@@ -275,7 +274,7 @@ mod tests {
 
         // A 16 MiB + 1 payload: rejected by the cap on encode, and a header
         // advertising that length is rejected by the cap on decode -- both must
-        // surface the same (now truthful) message.
+        // surface the same message.
         let over = Frame::new(vec![0u8; MAX_PAYLOAD_LEN + 1]);
         let err = over.encode().unwrap_err();
         assert_eq!(err, FrameError::TooLarge);

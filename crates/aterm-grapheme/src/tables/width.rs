@@ -686,12 +686,6 @@ pub fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
-/// Display width of a string in CJK mode (ambiguous = 2).
-#[inline]
-pub fn str_width_cjk(s: &str) -> usize {
-    s.chars().map(char_width_cjk).sum()
-}
-
 /// Whether a character has East Asian Ambiguous width.
 #[inline]
 pub const fn is_ambiguous_width(c: char) -> bool {

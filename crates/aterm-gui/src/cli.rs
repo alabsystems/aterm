@@ -2,9 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! CLI argument parsing for `aterm-gui`. Pure, no `App` coupling: parses
-//! `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`, promoting each
-//! `ATERM_*` knob to a first-class flag (flag > env) by setting the matching env
-//! var so the existing env > config > default precedence funnel is reused.
+//! `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`. A launch flag is
+//! recorded — the render/font flags (`--cpu`/`--gpu`, `--font`, `--font-px`,
+//! `--scale`) in [`crate::launch`], the rest in [`LaunchFlags`], process state the
+//! rest of the window reads — and never exported: no environment variable changes
+//! what a shipped aterm does (owner, 2026-09-22: "NOT ENV VARS those are for
+//! development"), so the flag is the one spelling and a child process inherits
+//! nothing from it.
+
+use std::sync::RwLock;
 
 /// Parsed CLI: the `-e` command to run instead of `$SHELL` (if any), the
 /// `--working-directory` to start it in (if any), whether to `--hold` the
@@ -13,91 +19,102 @@ pub(crate) struct Cli {
     pub(crate) exec_command: Option<Vec<String>>,
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
-    /// `--headless` appeared on the command line. The flag ALSO sets
-    /// `$ATERM_HEADLESS=1` (the shared funnel every other knob uses), so this
-    /// field is not what arms the mode — it only records the SOURCE, so the
-    /// startup announcement can name the flag rather than the environment.
+    /// `--headless`: no window is ever created — engine + PTY + control socket
+    /// only — and on macOS the process cannot be activated either (no Dock tile,
+    /// never the front app; `launch_posture` in `lib.rs`), so a harness may boot
+    /// one beside a human who is typing. The flag is the one spelling; an update
+    /// successor inherits it with the rest of argv.
     pub(crate) headless: bool,
+    /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file
+    /// means the process that started this instance is gone, so it shuts down
+    /// ([`crate::lifeline`]). `None` — every launch that does not pass the flag —
+    /// changes nothing.
+    pub(crate) lifeline_fd: Option<i32>,
+    /// The render/font flags, for `main` to [`crate::launch::install`].
+    pub(crate) launch: crate::launch::Launch,
 }
 
-/// Whether this launch runs headless, and — because a misread of this decision
-/// costs a full misdiagnosis (a harness that hangs on a socket that never
-/// appears) — WHY, in words the startup announcement can print.
+/// THE LAUNCH FLAGS — what this process's command line asked of it, recorded by
+/// [`parse_cli`] before any thread exists and read wherever the window needs it
+/// (the socket plan, the initial grid, the shell, the containment funnel).
 ///
-/// Headless has exactly ONE meaning and TWO equivalent ways to ask for it: the
-/// `--headless` flag and `$ATERM_HEADLESS`. The flag is the canonical spelling
-/// and simply sets the env var ([`flag_env`]), so both arrive at the single read
-/// site in `main` through the same funnel every other `ATERM_*` knob uses.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum HeadlessArming {
-    /// No window is ever created: engine + PTY + control socket only — and on
-    /// macOS the process cannot be activated either (no Dock tile, never the
-    /// front app; `launch_posture` in `lib.rs`), so a harness may boot one
-    /// beside a human who is typing. The payload names the source for the
-    /// stderr announcement.
-    Armed(HeadlessSource),
-    /// Windowed, and nothing asked otherwise — the ordinary interactive launch.
-    Windowed,
-    /// `$ATERM_HEADLESS` is SET, but to a DISABLING value (`0`, `off`, or
-    /// empty), and no `--headless` flag came with it. The launch is windowed.
-    ///
-    /// This case exists to be LOUD. A script that exports the variable and then
-    /// waits for a control socket is one typo away from waiting forever, so the
-    /// binary says on stderr that the variable it set did not arm the mode,
-    /// rather than starting a window and hanging in silence. The payload is the
-    /// rejected value, echoed back so the diagnostic names the real input.
-    Refused(String),
+/// They used to be ENVIRONMENT variables the parser wrote back (`--columns` set
+/// `$ATERM_COLUMNS`, and every `ATERM_*` spelling worked on its own), so an export
+/// in a shell rc changed what a shipped window did, and a flag leaked into every
+/// child that did not strip it. A flag now lives here and nowhere else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaunchFlags {
+    /// `--columns <n>` (20..=500, validated on the way in).
+    pub(crate) columns: Option<u16>,
+    /// `--lines <n>` (5..=300, validated on the way in).
+    pub(crate) lines: Option<u16>,
+    /// `--shell <name|path>`: outranks the config `shell` for every new tab.
+    pub(crate) shell: Option<String>,
+    /// `--containment <mode>` / `--sandbox` / `--no-sandbox`, as typed: the parse,
+    /// and its fail-closed fallback, are the launch funnel's in `main`.
+    pub(crate) containment: Option<String>,
+    /// `--control-sock <path|0|off>` / `--no-control-sock`: the socket
+    /// directive's two inputs ([`aterm_types::control_socket::socket_directive`]).
+    pub(crate) control_sock: Option<String>,
+    /// `--no-control-sock`.
+    pub(crate) no_control_sock: bool,
+    /// `--no-shell-integration`.
+    pub(crate) no_shell_integration: bool,
+    /// `--verbose`: the routine startup notices on stderr.
+    pub(crate) verbose: bool,
 }
 
-/// Which of the two equivalent spellings armed headless mode.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum HeadlessSource {
-    /// `--headless` on the command line.
-    Flag,
-    /// `$ATERM_HEADLESS` set to an enabling value.
-    Env,
-}
+impl LaunchFlags {
+    /// Nothing asked — the ordinary launch.
+    const NONE: Self = Self {
+        columns: None,
+        lines: None,
+        shell: None,
+        containment: None,
+        control_sock: None,
+        no_control_sock: false,
+        no_shell_integration: false,
+        verbose: false,
+    };
 
-impl HeadlessSource {
-    /// How the announcement spells this source.
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            HeadlessSource::Flag => "--headless",
-            HeadlessSource::Env => "$ATERM_HEADLESS",
-        }
+    /// The control-socket directive these flags ask for — the SAME decision a
+    /// client makes about a socket path ([`aterm_types::control_socket::socket_directive`]).
+    pub(crate) fn socket_directive(&self) -> aterm_types::control_socket::SocketDirective {
+        aterm_types::control_socket::socket_directive(
+            self.control_sock.as_deref(),
+            self.no_control_sock.then_some("1"),
+        )
     }
 }
 
-/// Decide headless mode from the `--headless` flag and the VALUE of
-/// `$ATERM_HEADLESS` (`None` = unset). Pure, so the whole truth table is a unit
-/// test rather than a launch experiment.
-///
-/// The flag wins outright (it overwrites the variable on its way in, so `flag >
-/// env` holds even here). Otherwise the variable follows the same enabling
-/// convention as its sibling `$ATERM_NO_CONTROL_SOCK` — `0`, `off`
-/// (case-insensitive), and empty DISABLE; any other value enables — instead of
-/// bare presence. Presence semantics made `ATERM_HEADLESS=0` mean *headless*,
-/// which is the one reading no caller has ever intended.
-#[must_use]
-pub(crate) fn headless_arming(flag: bool, env: Option<&str>) -> HeadlessArming {
-    if flag {
-        return HeadlessArming::Armed(HeadlessSource::Flag);
-    }
-    match env {
-        None => HeadlessArming::Windowed,
-        Some(v) if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") => {
-            HeadlessArming::Refused(v.to_string())
-        }
-        Some(_) => HeadlessArming::Armed(HeadlessSource::Env),
-    }
+/// The process's launch flags. Written only by [`parse_cli`] (single-threaded
+/// startup, so a diagnostic verb later on the same command line — `--columns 120
+/// --show-config` — reports what the flags before it asked for).
+static LAUNCH_FLAGS: RwLock<LaunchFlags> = RwLock::new(LaunchFlags::NONE);
+
+/// This process's launch flags (a copy; a poisoned lock still yields its value).
+pub(crate) fn launch_flags() -> LaunchFlags {
+    LAUNCH_FLAGS.read().map_or_else(
+        |poisoned| poisoned.into_inner().clone(),
+        |flags| flags.clone(),
+    )
+}
+
+/// Record one flag. Only [`parse_cli`] calls this.
+fn set_launch_flag(set: impl FnOnce(&mut LaunchFlags)) {
+    let mut flags = LAUNCH_FLAGS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set(&mut flags);
 }
 
 /// The `--help` text. A clean OPTIONS section where every user-facing flag shows
-/// its argument, a one-line description, AND its `[env: ATERM_*]` equivalent, plus
-/// an ENVIRONMENT section — the discoverable surface an AI (or human) reads to
-/// drive aterm without source-diving. Kept in constants printed only by the
-/// `--help` arm, so a no-arg / Finder launch never touches them. Each ATERM_* knob
-/// enumerated below also has a first-class flag (precedence: flag > env > config > default).
+/// its argument, a one-line description, AND its `[config: key]` equivalent where
+/// it has one — the discoverable surface an AI (or human) reads to drive aterm
+/// without source-diving. Kept in constants printed only by the `--help` arm, so a
+/// no-arg / Finder launch never touches them. There is no ENVIRONMENT section: no
+/// variable changes what a shipped aterm does, so precedence is flag > config >
+/// default.
 const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
     "\n",
@@ -111,10 +128,10 @@ const HELP_HEAD: &str = concat!(
     "    -d, --working-directory <dir>  Start the shell/command in <dir>.\n",
     "        --hold                     Keep the window open after the -e command\n",
     "                                   exits (close it manually).\n",
-    "        --font-px <px>             Glyph size in physical px (6..=200).\n",
-    "                                       [env: ATERM_FONT_PX]\n",
-    "        --font <name>              Primary font FAMILY (e.g. \"JetBrains Mono\").\n",
-    "                                       [env: ATERM_FONT]\n",
+    "        --font-px <px>             Glyph size in physical px (6..=200) for this\n",
+    "                                   launch.                 [config: font_px]\n",
+    "        --font <name|path>         Primary font FAMILY (e.g. \"JetBrains Mono\") or\n",
+    "                                   font file for this launch. [config: font_family]\n",
     "        --shell <name|path>        Interactive shell to spawn. Discovery-resolved:\n",
     "                                   \"bash\" finds Git Bash even off PATH; \"pwsh\",\n",
     "                                   \"cmd\", \"wsl\", \"nu\", or an absolute path also work.\n",
@@ -123,39 +140,35 @@ const HELP_HEAD: &str = concat!(
     "                                   pwsh and \"wsl\" (bash login shell). \"cmd\" is partial:\n",
     "                                   prompt marks, jump-to-prompt and cwd work, but blocks\n",
     "                                   carry no command text or exit code. \"nu\" gets none.\n",
-    "                                       [env: ATERM_SHELL] [config: shell]\n",
+    "                                       [config: shell]\n",
     "        --scale <f>                Force the render scale factor (font + padding).\n",
     "                                   In a window this overrides the display scale;\n",
     "                                   headless it makes the `image` capture render at\n",
     "                                   that DPI (e.g. --scale 2 ≈ a 2× Retina window).\n",
-    "                                       [env: ATERM_FORCE_SCALE]\n",
-    "        --gpu                      Force GPU rendering — the DEFAULT (wgpu: Metal\n",
-    "                                   on macOS, Vulkan on Linux; auto CPU fallback).\n",
-    "                                       [env: ATERM_GPU]\n",
-    "        --cpu                      Force the CPU renderer (overrides --gpu/config).\n",
-    "        --containment <mode>       Containment mode: master|user|safety|containment.\n",
-    "                                       [env: ATERM_CONTAINMENT_MODE]\n",
+    "        --gpu                      Force GPU rendering — the DEFAULT (Metal on macOS,\n",
+    "                                   wgpu elsewhere; auto CPU fallback). [config: gpu]\n",
+    "        --cpu                      Force the CPU renderer (overrides config; the\n",
+    "                                   last of --cpu/--gpu wins).\n",
+    "        --containment <mode>       Containment mode: master|user|safety|containment\n",
+    "                                   (an invalid value fails closed to containment).\n",
     "        --sandbox                  Shorthand for --containment containment.\n",
     "        --no-sandbox               Shorthand for --containment user.\n",
     "        --control-sock <path>      Bind the control socket at <path> (or 0/off to\n",
-    "                                   disable).               [env: ATERM_CONTROL_SOCK]\n",
+    "                                   disable); clients reach it with --sock <path>.\n",
     "        --no-control-sock          Disable the control socket.\n",
-    "                                       [env: ATERM_NO_CONTROL_SOCK]\n",
-    "        --headless                 No window; engine + control socket only. Exactly\n",
-    "                                   equivalent to the env var; either way the launch\n",
-    "                                   announces the mode on stderr.\n",
-    "                                       [env: ATERM_HEADLESS]\n",
+    "        --headless                 No window; engine + control socket only. The\n",
+    "                                   launch announces the mode on stderr.\n",
+    "        --lifeline-fd <n>          With --headless: shut down when descriptor <n>\n",
+    "                                   (a pipe's read end) reads end-of-file — the\n",
+    "                                   launcher that holds its write end is gone. For\n",
+    "                                   harnesses: a killed test run takes its instance\n",
+    "                                   with it.\n",
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
     "        --shell-integration        OSC 133/633 command marks (blocks/cwd/title) — ON by\n",
     "                                       default; this flag is a no-op.\n",
     "        --no-shell-integration     Disable shell-integration marks (default is on).\n",
-    "                                       [env: ATERM_NO_SHELL_INTEGRATION]\n",
-    "        --no-procedural-glyphs     Disable procedural box/Powerline glyphs.\n",
-    "                                       [env: ATERM_NO_PROCEDURAL_GLYPHS]\n",
-    "        --trace-latency            Print PTY→present latency samples to stderr.\n",
-    "                                       [env: ATERM_TRACE_LATENCY]\n",
-    "        --verbose                  Verbose diagnostics.       [env: ATERM_VERBOSE]\n",
+    "        --verbose                  Verbose diagnostics on stderr.\n",
     "        --diagnose                 Print a diagnostics report (version, build,\n",
     "                                   renderer, capabilities, config, env) and exit.\n",
     "        --list-actions             List the bindable [keybindings] action names\n",
@@ -249,26 +262,6 @@ fn keys_help() -> String {
 }
 
 const HELP_TAIL: &str = concat!(
-    "ENVIRONMENT (each has a flag above; precedence is flag > env > config > default):\n",
-    "    ATERM_FONT_PX=N            Glyph size in physical pixels.\n",
-    "    ATERM_FONT=<name>          Primary font family.\n",
-    "    ATERM_FORCE_SCALE=<f>      Force the render scale factor (font + padding).\n",
-    "    ATERM_GPU=1                Force GPU (already the DEFAULT; CPU is the auto fallback).\n",
-    "    ATERM_CONTAINMENT_MODE=<m> master|user|safety|containment (fail-closed).\n",
-    "    ATERM_CONTROL_SOCK=<path>  Control socket path (0/off disables it).\n",
-    "    ATERM_NO_CONTROL_SOCK=1    Disable the control socket.\n",
-    "    ATERM_HEADLESS=1           No window; engine + control socket only — the exact\n",
-    "                               equivalent of --headless. 0/off/empty do NOT arm it\n",
-    "                               (and say so on stderr rather than starting a window\n",
-    "                               under a script that is waiting for a socket).\n",
-    "    ATERM_NO_SHELL_INTEGRATION=1  Disable shell-integration marks (default is on).\n",
-    "    ATERM_NO_PROCEDURAL_GLYPHS=1  Disable procedural box/Powerline glyphs.\n",
-    "    ATERM_TRACE_LATENCY=1      Print PTY→present latency samples.\n",
-    "    ATERM_VERBOSE=1            Verbose diagnostics.\n\n",
-    "ENVIRONMENT (no flag; opt-in):\n",
-    "    ATERM_AI_HINT=1           Inject a one-line, dim \"this terminal is AI-introspectable,\n",
-    "                              drive it with aterm-ctl\" hint above the first prompt. OFF by\n",
-    "                              default — a transparent terminal injects nothing; opt-in only.\n\n",
     "CHILD-SHELL ENV HYGIENE:\n",
     "    The spawned shell has every AI-agent context variable STRIPPED before exec —\n",
     "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, CURSOR_*, AI_*, and _DEVTOOL_* — so they\n",
@@ -277,7 +270,7 @@ const HELP_TAIL: &str = concat!(
     "    a session spawned with `aterm ctl spawn identity=<name>` gets each agent's home\n",
     "    variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into <state>/identities/<name>/ —\n",
     "    set AFTER the strip, so neither your login nor the identity's leaks into the other.\n\n",
-    "CONFIG:  ~/.config/aterm/aterm.toml  (live settings reload; launch/session settings disclose their timing; precedence env > config > default)\n",
+    "CONFIG:  ~/.config/aterm/aterm.toml  (live settings reload; launch/session settings disclose their timing; precedence flag > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground,\n",
@@ -304,22 +297,21 @@ const HELP_TAIL: &str = concat!(
     "              voice), trail_sound_style (the typing sound: auto | music box |\n",
     "              warm pluck | glitter | ice chime | droplet | pew | zap | tick |\n",
     "              crackle | mechanical | typewriter | marimba | felt), tone_melody,\n",
-    "              trail_sound_bed (the ambient texture; default off),\n",
+    "              trail_sound_bed (the ambient texture; default on),\n",
     "              trail_sound_riff (the sing-along song — the loudest voice),\n",
     "              bell_sound (the audible BEL beep; macOS/Windows),\n",
+    "              choice_sound (the chime when the supervisor answers a question),\n",
     "              sparkle_words.profanity.bonk[_detonation] (the curse bonk).\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
-    "              stem_gamma (aliases $ATERM_STEM_GAMMA),\n",
-    "              font_hinting (Linux/Windows: full | light | native | off;\n",
-    "              aliases $ATERM_FONT_HINTING),\n",
-    "              font_subpixel (Linux CPU renderer: off | rgb | bgr;\n",
-    "              aliases $ATERM_FONT_SUBPIXEL),\n",
+    "              stem_gamma,\n",
+    "              font_hinting (Linux/Windows: full | light | native | off),\n",
+    "              font_subpixel (Linux CPU renderer: off | rgb | bgr),\n",
     "              font_variation [\"wght=450\", ...], font_weight,\n",
     "              font_weight_dark_nudge (variable fonts, e.g. SF Mono),\n",
     "              font_family_bold/_italic/_bold_italic, font_synthetic_style,\n",
     "              fallback_fonts [ordered], symbol_font, emoji_font\n",
-    "              (config > $ATERM_{FALLBACK,SYMBOL,EMOJI}_FONT alias > discovery).\n",
+    "              (config > built-in discovery).\n",
     "  Behaviour   gpu, scrollback_lines, columns, lines, copy_on_select,\n",
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
     "              shell priority follows window focus; default on),\n",
@@ -358,14 +350,14 @@ const STARTER_CONFIG: &str = "\
 # aterm — ~/.config/aterm/aterm.toml
 # Every setting is optional; uncomment to override. Live settings reload on save;
 # renderer/initial-grid settings require relaunch, and session settings require a new session.
-# Environment (ATERM_*) and CLI flags take precedence over this file.
+# Launch flags (aterm-gui --help) take precedence over this file for that launch.
 
 # --- shell --------------------------------------------------------------------
 # shell = \"bash\"        # interactive shell. Discovery-resolved: \"bash\" finds Git
 #                       # Bash even if it is not on PATH; \"pwsh\", \"cmd\", \"wsl\",
 #                       # \"nu\", or an absolute path also work. Unset = platform
 #                       # default (Windows: pwsh > powershell > cmd). Override at
-#                       # launch with --shell or ATERM_SHELL.
+#                       # launch with --shell.
 #                       # Shell integration (prompt marks, jump-to-prompt, command
 #                       # blocks, cwd tracking) is injected automatically for zsh,
 #                       # bash, fish, pwsh/powershell and \"wsl\" (whose distro must
@@ -384,9 +376,9 @@ const STARTER_CONFIG: &str = "\
 # font_family_italic = \"JetBrains Mono Italic\"  # real italic face
 # font_family_bold_italic = \"JetBrains Mono Bold Italic\"
 # font_synthetic_style = true      # false: never fake bold/italic (regular when no real face)
-# fallback_fonts = [\"Sarasa Mono\"] # ordered Unicode fallbacks; outranks $ATERM_FALLBACK_FONT
-# symbol_font = \"Symbols Nerd Font\"   # monochrome symbol fallback; outranks $ATERM_SYMBOL_FONT
-# emoji_font = \"Noto Color Emoji\"     # colour-emoji face; outranks $ATERM_EMOJI_FONT
+# fallback_fonts = [\"Sarasa Mono\"] # ordered Unicode fallbacks, tried before built-in discovery
+# symbol_font = \"Symbols Nerd Font\"   # monochrome symbol fallback
+# emoji_font = \"Noto Color Emoji\"     # colour-emoji face
 # font_px = 16                     # physical px (13 looks small on a 100+ DPI panel)
 # theme = \"Default\"               # a built-in scheme, or \"dark:<name>,light:<name>\"
 # foreground = \"#C8D3F5\"
@@ -462,7 +454,7 @@ const STARTER_CONFIG: &str = "\
 #                                  #   mechanical (keyboard click + thock) | typewriter (clack + platen, bell + carriage on Enter) | marimba | felt (muted piano)
 #                                  #   aliases: the trail-style names (water, comet, rainbow kitty, ...), bell, raindrop, mech, thock, piano, clack
 # tone_melody = true               # the melody leans with the typed line's inferred mood (on-device, typed input only); default ON and deliberately subtle
-# trail_sound_bed = false          # the continuous ambient BED texture behind the notes (default OFF; true re-enables the per-style drone)
+# trail_sound_bed = true           # the continuous ambient BED texture behind the notes (default ON; false silences the bed)
 # trail_sound_riff = true          # the held-key SING-ALONG song (the loudest voice); false quiets just the song and keeps its visuals (default ON)
 # bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep); false keeps the visual flash and window attention (default ON)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
@@ -488,20 +480,17 @@ const STARTER_CONFIG: &str = "\
 # ambiguous_width = \"narrow\"       # East-Asian ambiguous width: narrow | wide
 # text_blending = \"linear-corrected\" # AA weight: linear-corrected (native feel) | linear
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
-# stem_gamma = 1.0                 # aesthetic stem weight (<1 thicker, >1 thinner);
-#                                  # aliases $ATERM_STEM_GAMMA (env wins)
+# stem_gamma = 1.0                 # aesthetic stem weight (<1 thicker, >1 thinner)
 # font_hinting = \"full\"           # Linux/Windows grid fitting: full (crispest, default) | light
-#                                  # (hintslight look) | native (font bytecode) | off;
-#                                  # aliases $ATERM_FONT_HINTING (env wins)
+#                                  # (hintslight look) | native (font bytecode) | off
 # font_subpixel = \"off\"           # Linux subpixel-RGB text (CPU renderer only, stage 1):
-#                                  # off (default) | rgb | bgr; opaque frames only;
-#                                  # aliases $ATERM_FONT_SUBPIXEL (env wins)
+#                                  # off (default) | rgb | bgr; opaque frames only
 # font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default = Regular / wght=400)
 # font_weight = 450                # wght shorthand; wins over a font_variation wght entry
 # font_weight_dark_nudge = 0       # extra wght on DARK themes (applied only when grid-safe)
 
 # --- behaviour ----------------------------------------------------------------
-# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); set false / --cpu / $ATERM_CPU to force CPU
+# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); set false (or launch with --cpu) to force CPU
 # copy_on_select = true            # auto-copy mouse selection to CLIPBOARD (DEFAULT on; OFF on Linux, where a
                                    # selection owns PRIMARY and the CLIPBOARD stays for explicit copies; true opts into both)
 # show_build_badge = false         # OPTIONAL floating top-right v<version>·<build> pill — DEFAULT off
@@ -656,27 +645,13 @@ const STARTER_CONFIG: &str = "\
 # \"ctrl+shift+space\" = \"toggle_vi_mode\"   # keyboard copy-mode (h/j/k/l, w/b/e, f/t, v, Esc)
 ";
 
-/// Set an environment variable so a downstream env read (the existing precedence
-/// funnel) observes the CLI flag. The flag OVERWRITES any inherited env value,
-/// which is exactly the desired `flag > env` precedence; every existing
-/// `env::var(...)` site is then byte-identical whether the knob came from a flag
-/// or the environment. SAFETY: called only from [`parse_cli`], which runs at the
-/// very top of `main` before any thread is spawned (no concurrent env access), so
-/// the edition-2024 `set_var` safety contract holds.
-fn flag_env(key: &str, val: &str) {
-    // Single-threaded program startup (see fn doc) — no other thread can be
-    // reading the environment concurrently — and routed through the workspace's
-    // one lock-scoped env helper rather than a raw `set_var`.
-    aterm_log::env::set(key, val);
-}
-
 /// Pull the next argument as the value for `flag`, exiting 2 with a hint if it is
 /// missing. Used by the value-taking flags so they share one error shape.
 fn flag_value(flag: &str, args: &mut impl Iterator<Item = String>) -> String {
     match args.next() {
         Some(v) => v,
         None => {
-            eprintln!("aterm-gui: {flag} requires a value (try --help)");
+            eprintln!("aterm: {flag} requires a value (try --help)");
             std::process::exit(2);
         }
     }
@@ -688,10 +663,12 @@ fn valid_font_px_flag(value: &str) -> bool {
         .is_ok_and(|px| px.is_finite() && (crate::FONT_PX_MIN..=crate::FONT_PX_MAX).contains(&px))
 }
 
-fn valid_initial_dimension_flag(value: &str, min: u16, max: u16) -> bool {
+/// `value` as an initial grid dimension within `min..=max`, or `None`.
+fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
     value
         .parse::<u16>()
-        .is_ok_and(|dimension| (min..=max).contains(&dimension))
+        .ok()
+        .filter(|dimension| (min..=max).contains(dimension))
 }
 
 /// CLI: `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`.
@@ -699,11 +676,10 @@ fn valid_initial_dimension_flag(value: &str, min: u16, max: u16) -> bool {
 /// directory, `-e` without a command, or a value flag missing its argument prints
 /// a hint and exits 2 (no window launch). With no args (a Finder/.app launch) this
 /// is a no-op and a normal interactive shell starts in the inherited working
-/// directory. Each `ATERM_*` knob ALSO has a flag here; a flag sets the matching
-/// env var ([`flag_env`]) so the existing env > config > default precedence funnel
-/// is reused unchanged and `flag > env` falls out naturally (overwrite). Numeric
-/// flags are validated here for a clean early error; containment is validated by
-/// its own fail-closed funnel in `main`.
+/// directory. A launch flag is recorded, never exported: the render/font flags in
+/// [`Cli::launch`], the rest in [`LaunchFlags`]. Numeric flags are validated here
+/// for a clean early error; containment is validated by its own fail-closed funnel
+/// in `main`.
 pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     // Lossy conversion mirrors the binary era's `env::args()` UTF-8 boundary
     // (a non-UTF8 flag was a panic there; here it degrades to a usage error).
@@ -711,6 +687,9 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     let mut cwd: Option<String> = None;
     let mut hold = false;
     let mut headless = false;
+    let mut lifeline_fd: Option<String> = None;
+    let mut exec_command: Option<Vec<String>> = None;
+    let mut launch = crate::launch::Launch::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -744,6 +723,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             // after the env-setting flags so e.g. `--gpu --diagnose` reports the
             // effective renderer.
             "--diagnose" => {
+                crate::launch::install(launch.clone());
                 print!("{}", crate::diagnostics::collect().render());
                 std::process::exit(0);
             }
@@ -754,6 +734,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 std::process::exit(0);
             }
             "--validate-config" => {
+                crate::launch::install(launch.clone());
                 let (msg, ok) = crate::diagnostics::validate_config();
                 println!("{msg}");
                 std::process::exit(i32::from(!ok));
@@ -763,6 +744,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 std::process::exit(0);
             }
             "--show-config" => {
+                crate::launch::install(launch.clone());
                 print!("{}", crate::diagnostics::show_config());
                 std::process::exit(0);
             }
@@ -801,7 +783,8 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             }
             "--show-face" => {
                 // Optional family argument; empty falls back to the effective
-                // font_family (env > config). Exits non-zero if it does not resolve.
+                // font_family (--font > config). Exits non-zero if it does not resolve.
+                crate::launch::install(launch.clone());
                 let family = args.next().unwrap_or_default();
                 let (msg, ok) = crate::diagnostics::show_face(&family);
                 print!("{msg}");
@@ -922,102 +905,88 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             "-d" | "--working-directory" => {
                 let dir = flag_value("-d/--working-directory", &mut args);
                 if !std::path::Path::new(&dir).is_dir() {
-                    eprintln!("aterm-gui: not a directory: {dir}");
+                    eprintln!("aterm: not a directory: {dir}");
                     std::process::exit(2);
                 }
                 cwd = Some(dir);
             }
             "--hold" => hold = true,
-            // --- ATERM_* knobs promoted to first-class flags (flag > env). ---
+            // --- The render/font flags: carried by `launch`, no env twin. ---
             "--font-px" => {
                 let v = flag_value("--font-px", &mut args);
                 if valid_font_px_flag(&v) {
-                    flag_env("ATERM_FONT_PX", &v);
+                    launch.font_px = v.parse().ok();
                 } else {
                     eprintln!(
-                        "aterm-gui: --font-px expects a number from {} through {}, got '{v}' (try --help)",
+                        "aterm: --font-px expects a number from {} through {}, got '{v}' (try --help)",
                         crate::FONT_PX_MIN,
                         crate::FONT_PX_MAX,
                     );
                     std::process::exit(2);
                 }
             }
-            "--font" => flag_env("ATERM_FONT", &flag_value("--font", &mut args)),
-            // --shell: the interactive shell to spawn. Discovery-resolved by the
-            // PTY layer — "bash" finds Git for Windows off-PATH, "pwsh"/"cmd"/
-            // "wsl"/"nu" resolve, an absolute path is verbatim. Sets ATERM_SHELL
-            // (early, single-threaded → the set_var contract holds), which the
-            // spawn resolver reads at highest precedence over config `shell`.
-            "--shell" => flag_env("ATERM_SHELL", &flag_value("--shell", &mut args)),
+            "--font" => {
+                let v = flag_value("--font", &mut args);
+                launch.font_family = (!v.trim().is_empty()).then_some(v);
+            }
             "--scale" => {
                 let v = flag_value("--scale", &mut args);
-                if v.parse::<f64>()
-                    .map(|f| f.is_finite() && f > 0.0)
-                    .unwrap_or(false)
-                {
-                    flag_env("ATERM_FORCE_SCALE", &v);
-                } else {
-                    eprintln!(
-                        "aterm-gui: --scale expects a positive number, got '{v}' (try --help)"
-                    );
-                    std::process::exit(2);
+                match v.parse::<f64>() {
+                    Ok(f) if f.is_finite() && f > 0.0 => launch.scale = Some(f),
+                    _ => {
+                        eprintln!(
+                            "aterm: --scale expects a positive number, got '{v}' (try --help)"
+                        );
+                        std::process::exit(2);
+                    }
                 }
             }
-            "--gpu" => {
-                // Symmetric last-flag-wins precedence: an inherited or earlier
-                // --cpu must not outrank this explicit later flag.
-                // Startup, single-threaded (see flag_env).
-                aterm_log::env::unset("ATERM_CPU");
-                flag_env("ATERM_GPU", "1");
+            // `--gpu` / `--cpu`: the LAST one given wins (each overwrites the other),
+            // and either outranks config `gpu`.
+            "--gpu" => launch.renderer = Some(crate::launch::RendererFlag::Gpu),
+            "--cpu" => launch.renderer = Some(crate::launch::RendererFlag::Cpu),
+            // --- The rest of the launch flags: recorded in `LaunchFlags`. ---
+            // --shell: the interactive shell to spawn. Discovery-resolved by the
+            // PTY layer — "bash" finds Git for Windows off-PATH, "pwsh"/"cmd"/
+            "--shell" => {
+                let shell = flag_value("--shell", &mut args);
+                set_launch_flag(|f| f.shell = Some(shell));
             }
-            // CPU override: clear any inherited/earlier ATERM_GPU so the GPU path
-            // is not taken (config `gpu = true` still loses to an explicit --cpu).
-            "--cpu" => {
-                // Startup, single-threaded (see flag_env).
-                aterm_log::env::unset("ATERM_GPU");
-                flag_env("ATERM_CPU", "1");
-            }
+            // Containment: the LAST of these wins (`--sandbox --containment
+            // user` is user); the fail-closed parse is the launch funnel's.
             "--containment" => {
-                flag_env(
-                    "ATERM_CONTAINMENT_MODE",
-                    &flag_value("--containment", &mut args),
-                );
+                let mode = flag_value("--containment", &mut args);
+                set_launch_flag(|f| f.containment = Some(mode));
             }
-            "--sandbox" => flag_env("ATERM_CONTAINMENT_MODE", "containment"),
-            "--no-sandbox" => flag_env("ATERM_CONTAINMENT_MODE", "user"),
+            "--sandbox" => set_launch_flag(|f| f.containment = Some("containment".into())),
+            "--no-sandbox" => set_launch_flag(|f| f.containment = Some("user".into())),
             "--control-sock" => {
-                flag_env(
-                    "ATERM_CONTROL_SOCK",
-                    &flag_value("--control-sock", &mut args),
-                );
+                let sock = flag_value("--control-sock", &mut args);
+                set_launch_flag(|f| f.control_sock = Some(sock));
             }
-            "--no-control-sock" => flag_env("ATERM_NO_CONTROL_SOCK", "1"),
-            // --headless: no window, engine + control socket only. Sets the env
-            // var like every other knob (so the single read site in `main` is
-            // unchanged and `flag > env` falls out of the overwrite), and records
-            // the SOURCE so the startup announcement can name the flag.
-            "--headless" => {
-                flag_env("ATERM_HEADLESS", "1");
-                headless = true;
-            }
+            "--no-control-sock" => set_launch_flag(|f| f.no_control_sock = true),
+            "--headless" => headless = true,
+            // Validated once the whole command line is read: it needs `--headless`,
+            // which may come after it.
+            "--lifeline-fd" => lifeline_fd = Some(flag_value("--lifeline-fd", &mut args)),
             "--columns" => {
                 let v = flag_value("--columns", &mut args);
-                if valid_initial_dimension_flag(&v, 20, 500) {
-                    flag_env("ATERM_COLUMNS", &v);
+                if let Some(n) = initial_dimension_flag(&v, 20, 500) {
+                    set_launch_flag(|f| f.columns = Some(n));
                 } else {
                     eprintln!(
-                        "aterm-gui: --columns expects an integer from 20 through 500, got '{v}' (try --help)"
+                        "aterm: --columns expects an integer from 20 through 500, got '{v}' (try --help)"
                     );
                     std::process::exit(2);
                 }
             }
             "--lines" => {
                 let v = flag_value("--lines", &mut args);
-                if valid_initial_dimension_flag(&v, 5, 300) {
-                    flag_env("ATERM_LINES", &v);
+                if let Some(n) = initial_dimension_flag(&v, 5, 300) {
+                    set_launch_flag(|f| f.lines = Some(n));
                 } else {
                     eprintln!(
-                        "aterm-gui: --lines expects an integer from 5 through 300, got '{v}' (try --help)"
+                        "aterm: --lines expects an integer from 5 through 300, got '{v}' (try --help)"
                     );
                     std::process::exit(2);
                 }
@@ -1028,22 +997,19 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             // a variable no code has ever read — a write-only name in the env
             // surface. The flag stays; the phantom variable is gone.
             "--shell-integration" => {}
-            "--no-shell-integration" => flag_env("ATERM_NO_SHELL_INTEGRATION", "1"),
-            "--no-procedural-glyphs" => flag_env("ATERM_NO_PROCEDURAL_GLYPHS", "1"),
-            "--trace-latency" => flag_env("ATERM_TRACE_LATENCY", "1"),
-            "--verbose" => flag_env("ATERM_VERBOSE", "1"),
+            "--no-shell-integration" => set_launch_flag(|f| f.no_shell_integration = true),
+            "--verbose" => {
+                set_launch_flag(|f| f.verbose = true);
+                aterm_gpu::set_verbose(true);
+            }
             "-e" | "--command" => {
                 let cmd: Vec<String> = args.by_ref().collect();
                 if cmd.is_empty() {
-                    eprintln!("aterm-gui: -e/--command requires a command (try --help)");
+                    eprintln!("aterm: -e/--command requires a command (try --help)");
                     std::process::exit(2);
                 }
-                return Cli {
-                    exec_command: Some(cmd),
-                    cwd,
-                    hold,
-                    headless,
-                };
+                exec_command = Some(cmd);
+                break;
             }
             // NOTE: verbs are NOT parsed here. `ship` briefly was, and that was the
             // whole defect — this parser is reached only when the mode fork already
@@ -1051,17 +1017,54 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             // front door (`crates/aterm/src/main.rs`) owns every verb in
             // `aterm_cli::Verb`, above the fork.
             other => {
-                eprintln!("aterm-gui: unknown option '{other}' (try --help)");
+                // A bare word is a command the front door did not resolve, not an
+                // option — the session parser's same split, so one mistake reads
+                // one way at a terminal and through a pipe.
+                let noun = if other.starts_with('-') {
+                    "option"
+                } else {
+                    "command"
+                };
+                eprintln!("aterm: unknown {noun} '{other}' (try --help)");
                 std::process::exit(2);
             }
         }
     }
+    let lifeline_fd = lifeline_request(lifeline_fd.as_deref(), headless).unwrap_or_else(|why| {
+        eprintln!("aterm: {why} (try --help)");
+        std::process::exit(2);
+    });
     Cli {
-        exec_command: None,
+        exec_command,
         cwd,
         hold,
         headless,
+        lifeline_fd,
+        launch,
     }
+}
+
+/// The `--lifeline-fd` decision, pure: `Ok(None)` when the flag is absent — the
+/// launch every person and service makes, left exactly as it was — the descriptor
+/// number when it is well-formed on a headless launch, and the usage error
+/// otherwise. A WINDOW is refused rather than armed: it is a person's to close,
+/// and the quit path a cut lifeline takes would ask them first.
+fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(fd) = value.parse::<i32>().ok().filter(|fd| *fd >= 0) else {
+        return Err(format!(
+            "--lifeline-fd expects a descriptor number, got '{value}'"
+        ));
+    };
+    if !cfg!(unix) {
+        return Err("--lifeline-fd is not supported on this platform".to_string());
+    }
+    if !headless {
+        return Err("--lifeline-fd needs --headless (a window is a person's to close)".to_string());
+    }
+    Ok(Some(fd))
 }
 
 #[cfg(test)]
@@ -1146,82 +1149,74 @@ mod tests {
         );
     }
 
-    /// `--headless` and `$ATERM_HEADLESS` are ONE mechanism with two spellings.
-    /// The flag wins outright (it overwrites the variable on the way in), and a
-    /// bare enabling value arms the same mode by the same funnel.
+    /// `--headless` arms the mode through the `Cli` field alone: nothing is
+    /// exported, so a child the window spawns inherits no headless request.
     #[test]
-    fn headless_flag_and_env_are_the_same_mechanism() {
-        use super::{HeadlessArming as A, HeadlessSource as S, headless_arming};
-        // The flag arms it, whatever the environment says — including the
-        // disabling values, which it overwrote.
-        for env in [None, Some("1"), Some("0"), Some("off"), Some("")] {
-            assert_eq!(headless_arming(true, env), A::Armed(S::Flag), "{env:?}");
-        }
-        // The variable alone arms exactly the same mode.
-        for env in ["1", "yes", "true", "headless"] {
-            assert_eq!(headless_arming(false, Some(env)), A::Armed(S::Env), "{env}");
-        }
-    }
-
-    /// The failure mode must never be silent. A variable set to a DISABLING
-    /// value is a refusal the binary reports, not a windowed launch nobody
-    /// mentions — that combination is what costs a harness its whole run.
-    #[test]
-    fn headless_env_refusal_is_reported_not_silent() {
-        use super::{HeadlessArming as A, headless_arming};
-        for env in ["0", "off", "OFF", "Off", ""] {
-            assert_eq!(
-                headless_arming(false, Some(env)),
-                A::Refused(env.to_string()),
-                "ATERM_HEADLESS={env} must be REFUSED (and thus announced), not \
-                 silently windowed"
-            );
-        }
-        // An unset variable is the ordinary interactive launch: windowed, and
-        // nothing to announce (nobody asked for headless).
-        assert_eq!(headless_arming(false, None), A::Windowed);
-    }
-
-    /// `--headless` must reach `main` by BOTH channels: the env var (the shared
-    /// flag > env > config > default funnel every knob uses) and the `Cli` field
-    /// that names the source for the startup announcement.
-    #[test]
-    fn headless_flag_sets_the_env_var_and_records_its_source() {
-        // No `env::scoped_*` wrapper here: `parse_cli` writes through the same
-        // module, and that lock is not reentrant (documented on `scoped`). The
-        // variable is instead restored by hand at the end of the test.
+    fn the_headless_flag_is_recorded_and_exports_nothing() {
         let cli = super::parse_cli(vec![std::ffi::OsString::from("--headless")]);
-        assert!(cli.headless, "the flag must record itself as the source");
-        assert_eq!(
-            aterm_log::env::read("ATERM_HEADLESS").as_deref(),
-            Some(std::ffi::OsStr::new("1")),
-            "the flag must also set the env var the single read site consumes"
+        assert!(cli.headless);
+        assert!(
+            HELP_HEAD.contains("--headless") && !HELP_HEAD.contains("[env: ATERM_HEADLESS]"),
+            "--help names the flag and no environment spelling"
         );
-        // And the two channels agree on the outcome.
-        assert_eq!(
-            super::headless_arming(cli.headless, Some("1")),
-            super::HeadlessArming::Armed(super::HeadlessSource::Flag)
-        );
-        aterm_log::env::unset("ATERM_HEADLESS");
+        // No lifeline unless one is asked for: a person's or a service's headless
+        // instance runs exactly as it did before the flag existed.
+        assert_eq!(cli.lifeline_fd, None);
     }
 
+    /// `--lifeline-fd` arms only a headless launch, in either order, with a
+    /// descriptor number; everything else is a usage error that names the fix —
+    /// and the `-e` payload after it is still the payload.
     #[test]
-    fn help_documents_headless_as_flag_and_env_equivalents() {
+    fn the_lifeline_flag_arms_only_a_headless_launch() {
+        use super::lifeline_request as req;
+        assert_eq!(req(None, true), Ok(None));
+        assert_eq!(req(None, false), Ok(None));
+        #[cfg(unix)]
+        {
+            assert_eq!(req(Some("0"), true), Ok(Some(0)));
+            assert_eq!(req(Some("7"), true), Ok(Some(7)));
+            let window = req(Some("0"), false).expect_err("a window is refused");
+            assert!(window.contains("needs --headless"), "{window}");
+            let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+            for argv in [
+                os(&["--lifeline-fd", "0", "--headless", "-e", "sh"]),
+                os(&["--headless", "--lifeline-fd", "0", "-e", "sh"]),
+            ] {
+                let cli = super::parse_cli(argv);
+                assert_eq!(cli.lifeline_fd, Some(0));
+                assert_eq!(cli.exec_command, Some(vec!["sh".to_string()]));
+            }
+        }
+        for bad in ["-1", "x", ""] {
+            let err = req(Some(bad), true).expect_err(bad);
+            assert!(err.contains("expects a descriptor number"), "{err}");
+        }
         assert!(
-            HELP_HEAD.contains("--headless"),
-            "--headless must be advertised in the help text"
+            HELP_HEAD.contains("--lifeline-fd <n>"),
+            "--help documents it"
         );
-        assert!(
-            HELP_HEAD.contains("[env: ATERM_HEADLESS]"),
-            "--help must name the env var as the flag's equivalent"
+    }
+
+    /// The socket directive of the launch flags is the shared one: a path binds
+    /// there, `0`/`off` and `--no-control-sock` disable, nothing is per-instance.
+    #[test]
+    fn launch_flags_decide_the_socket_like_every_client() {
+        use aterm_types::control_socket::SocketDirective as D;
+        let with = |sock: Option<&str>, off: bool| super::LaunchFlags {
+            control_sock: sock.map(str::to_string),
+            no_control_sock: off,
+            ..super::LaunchFlags::default()
+        };
+        assert_eq!(with(None, false).socket_directive(), D::PerInstance);
+        assert_eq!(
+            with(Some("/r/a.sock"), false).socket_directive(),
+            D::Explicit("/r/a.sock".to_string())
         );
-        assert!(
-            super::HELP_TAIL.contains("ATERM_HEADLESS=1"),
-            "the ENVIRONMENT section must document ATERM_HEADLESS"
-        );
-        assert!(
-            super::HELP_TAIL.contains("0/off/empty do NOT arm it"),
-            "--help must document the values that do NOT arm headless mode"
+        assert_eq!(with(Some("off"), false).socket_directive(), D::Disabled);
+        assert_eq!(
+            with(Some("/r/a.sock"), true).socket_directive(),
+            D::Disabled
         );
     }
 
@@ -1239,45 +1234,61 @@ mod tests {
     fn initial_dimension_flags_accept_exact_documented_domains_only() {
         for accepted in ["20", "80", "500"] {
             assert!(
-                super::valid_initial_dimension_flag(accepted, 20, 500),
+                super::initial_dimension_flag(accepted, 20, 500).is_some(),
                 "columns {accepted}"
             );
         }
         for rejected in ["0", "1", "19", "501", "65536", "nope"] {
             assert!(
-                !super::valid_initial_dimension_flag(rejected, 20, 500),
+                super::initial_dimension_flag(rejected, 20, 500).is_none(),
                 "columns {rejected}"
             );
         }
         for accepted in ["5", "24", "300"] {
             assert!(
-                super::valid_initial_dimension_flag(accepted, 5, 300),
+                super::initial_dimension_flag(accepted, 5, 300).is_some(),
                 "lines {accepted}"
             );
         }
         for rejected in ["0", "1", "4", "301", "65536", "nope"] {
             assert!(
-                !super::valid_initial_dimension_flag(rejected, 5, 300),
+                super::initial_dimension_flag(rejected, 5, 300).is_none(),
                 "lines {rejected}"
             );
         }
     }
 
+    /// `--cpu` / `--gpu` are symmetric, the last one wins, and neither — nor any
+    /// other launch flag — writes the environment: the render/font flags reach
+    /// their readers through `Cli::launch` alone.
     #[test]
-    fn gpu_and_cpu_flag_arms_are_symmetric_last_writer_wins() {
+    fn render_flags_ride_the_launch_struct_and_the_last_renderer_flag_wins() {
+        use crate::launch::RendererFlag;
+        let parse = |args: &[&str]| {
+            super::parse_cli(args.iter().map(std::ffi::OsString::from).collect()).launch
+        };
+        assert_eq!(parse(&["--cpu", "--gpu"]).renderer, Some(RendererFlag::Gpu));
+        assert_eq!(parse(&["--gpu", "--cpu"]).renderer, Some(RendererFlag::Cpu));
+        assert_eq!(parse(&[]), crate::launch::Launch::NONE);
+        let all = parse(&["--font-px", "24", "--font", "Menlo", "--scale", "2"]);
+        assert_eq!(all.font_px, Some(24.0));
+        assert_eq!(all.font_family.as_deref(), Some("Menlo"));
+        assert_eq!(all.scale, Some(2.0));
+        assert_eq!(
+            parse(&["--font", "  "]).font_family,
+            None,
+            "a blank family is no pin"
+        );
+        // The parser has no way left to write the environment at all (the
+        // `flag_env` funnel every flag once exported through is deleted).
         let source = include_str!("cli.rs");
-        let gpu = source
-            .split_once("\"--gpu\" => {")
-            .and_then(|(_, tail)| tail.split_once("\"--cpu\" =>"))
-            .map(|(arm, _)| arm)
-            .expect("GPU flag arm");
-        assert!(gpu.contains("env::unset(\"ATERM_CPU\")"));
-        let cpu = source
-            .split_once("\"--cpu\" => {")
-            .and_then(|(_, tail)| tail.split_once("\"--containment\" =>"))
-            .map(|(arm, _)| arm)
-            .expect("CPU flag arm");
-        assert!(cpu.contains("env::unset(\"ATERM_GPU\")"));
+        for writer in [["aterm_log::env::", "set("], ["fn flag_", "env("]] {
+            let writer = writer.concat();
+            assert!(
+                !source.contains(&writer),
+                "a launch flag must not export anything: found `{writer}`"
+            );
+        }
     }
 
     #[test]
@@ -1379,13 +1390,9 @@ mod tests {
     }
 
     #[test]
-    fn help_documents_ai_hint_and_env_stripping() {
-        // FINDING #7: the opt-in AI-discoverability banner and the child-shell env
-        // sanitization must be discoverable from --help, not only the README.
-        assert!(
-            super::HELP_TAIL.contains("ATERM_AI_HINT"),
-            "the opt-in AI hint must be documented in --help"
-        );
+    fn help_documents_env_stripping() {
+        // FINDING #7: the child-shell env sanitization must be discoverable from
+        // --help, not only the README.
         for prefix in [
             "CLAUDE",
             "ANTHROPIC_",

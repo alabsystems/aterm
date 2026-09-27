@@ -355,6 +355,34 @@ pub(crate) struct HdrReconfigureProjection {
         project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HdrReconfigureRetag",
+        action = "BuggyRetagFailureIgnored",
+        reason = "Buggy=1 negative control only; a failed re-tag of an f16 surface plans \
+                  FallbackToSdr, never KeepHdr"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HdrReconfigureRetag",
+        action = "BuggyUpgradeFailureKeepsF16",
+        reason = "Buggy=1 negative control only; an upgrade whose tag failed plans \
+                  FallbackToSdr and restores the SDR format"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HdrReconfigureRetag",
+        action = "BuggyEscapeKeepsLinearCapture",
+        reason = "Buggy=1 negative control only; apply_hdr_reconfigure_plan reconciles capture \
+                  metadata with the SDR format it selects, and renderer.rs's unapplied-escape \
+                  control reads the slip back off a real window"
+    )
+)]
 #[must_use]
 pub fn hdr_reconfigure_plan(swapchain_is_f16: bool, scrgb_retagged: bool) -> HdrReconfigurePlan {
     match (swapchain_is_f16, scrgb_retagged) {

@@ -5,6 +5,10 @@
 //! bridge child between them, and the bounded waits that keep the whole thing
 //! deterministic.
 //!
+//! Every suite in `tests/` mounts this file, so it carries NO `#[test]` of its own:
+//! one would run once per mounting binary. Its self-tests live in
+//! `tests/harness_self.rs`, which runs them once.
+//!
 //! NOTHING HERE SLEEPS AS SYNCHRONISATION. Every wait is `until <observable
 //! state>`, bounded by [`DEADLINE`] — and that bound is a HANG DETECTOR, not a
 //! performance assertion: a healthy step here takes single-digit milliseconds,
@@ -197,10 +201,11 @@ fn refuse_a_dirty_machine() {
 /// and was filtered away, and the stray count was unconditionally zero — a guard that
 /// could not fire, shipped as a guard. It survived because a guard that never fires
 /// and a machine that is always clean look identical from the outside. Hence
-/// [`self_check_age_reader`], which asserts this function can read a real process.
+/// `self_check_age_reader` (`tests/harness_self.rs`), which asserts this function can
+/// read a real process.
 ///
 /// `etime` is POSIX and prints `[[dd-]hh:]mm:ss`.
-fn process_age_secs(pid: &str) -> Option<i64> {
+pub fn process_age_secs(pid: &str) -> Option<i64> {
     let out = std::process::Command::new("ps")
         .args(["-o", "etime=", "-p", pid])
         .output()
@@ -223,7 +228,7 @@ fn process_age_secs(pid: &str) -> Option<i64> {
 
 /// A process's command line (`ps -o command=`), so a refusal names the binary the
 /// stray runs from — which checkout's `target/` left it behind — not just a pid.
-fn process_command(pid: &str) -> String {
+pub fn process_command(pid: &str) -> String {
     std::process::Command::new("ps")
         .args(["-o", "command=", "-p", pid])
         .output()
@@ -233,8 +238,28 @@ fn process_command(pid: &str) -> String {
         .unwrap_or_else(|| "<command unreadable>".to_string())
 }
 
+/// The file name of the executable a process runs (`ps -o comm=`: the path it was
+/// started from on macOS, the kernel's short name on Linux — its last component
+/// either way), or `None` when the process is gone.
+pub fn process_executable(pid: &str) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", pid])
+        .output()
+        .ok()?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let name = std::path::Path::new(raw.trim()).file_name()?;
+    Some(name.to_string_lossy().into_owned())
+}
+
 /// The stray daemons alive RIGHT NOW, or `None` when the machine is clean (or when the
 /// question cannot be asked, in which case the harness says nothing rather than guessing).
+///
+/// A DAEMON IS THE BINARY, NOT A MENTION OF IT. `pgrep -f` matches the whole command
+/// line, so a shell whose script merely NAMES a pattern matched too: on 2026-09-26
+/// another session's `zsh -c '... pgrep -f 'aterm-gui --headless' ...'` wait loop read
+/// as three stray daemons, and every e2e suite here answered COULD NOT RUN on a
+/// machine running no daemon at all. So a candidate counts only when its executable is
+/// the pattern's own binary.
 fn strays_now() -> Option<String> {
     if std::env::var_os("ATERM_LINK_ALLOW_STRAYS").is_some() {
         return None;
@@ -255,6 +280,7 @@ fn strays_now() -> Option<String> {
         let older: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::trim)
+            .filter(|pid| process_executable(pid).as_deref() == pattern.split(' ').next())
             // A couple of seconds of slack: our own children are born a moment after we
             // are, and ps reports whole seconds.
             .filter(|pid| process_age_secs(pid).is_some_and(|age| age > my_age + 2))
@@ -323,173 +349,6 @@ pub fn node_grants(node: &str) -> Vec<String> {
     ]
 }
 
-/// The six grants a HUMAN needs (§8.2's "A human's ring"), one per face they
-/// touch. A human is not a node: they host no session, own no `pub/<n>/`
-/// subtree, and hold no `term/<n>/>` read grant. What they do hold that a node
-/// never may is the fleet halt and the drive lane keyed to their OWN principal —
-/// `rw,p=<h>:/f/<F>/term/*/*/in/<h>` — which is the split that stops a node
-/// forging a driver into its own sessions.
-pub fn human_grants(h: &str) -> Vec<String> {
-    vec![
-        // the fleet halt, theirs alone
-        format!("rw,p={h}:/f/{FLEET}/fleet/{h}/>"),
-        // talk to anyone, AS this human, any kind
-        format!("rw,p={h}:/f/{FLEET}/in/*/*/{h}/*"),
-        // the drive face, keyed to this human
-        format!("rw,p={h}:/f/{FLEET}/term/*/*/in/{h}"),
-        // their own read lane, and the cursor name that drains it
-        format!("ro:/f/{FLEET}/in/p/{h}/>"),
-        format!("rw,p={h}:/f/{FLEET}/cur/p/{h}/>"),
-        // every member's presence and digest
-        format!("ro:/f/{FLEET}/pub/>"),
-    ]
-}
-
-/// A HUMAN AT A THIRD CLIENT — a phone, a laptop, anything that is not one of
-/// the fleet's nodes (§6.6's story B4).
-///
-/// It holds a minted `h-*` ring and one sealed broker connection, and it has no
-/// aterm at all: everything it does is a record. That is the point of the type —
-/// a test that drove a session through a `Node`'s control socket would be
-/// testing aterm, not the fabric, and every rung that proved a human "took
-/// control" that way would have proved nothing about the bus.
-///
-/// The producer id is DERIVED from the principal, not chosen: the broker binds
-/// `rw,p=<h>:` grants to `producer_id_of(h)` and refuses a publish under any
-/// other (R4's dedup-poisoning rule), so a `Human` that picked its own number
-/// would be refused at the first publish.
-pub struct Human {
-    pub name: String,
-    conn: aterm_link::transport::Conn,
-    producer: u64,
-    seq: u64,
-}
-
-impl Human {
-    /// Mint this human's ring and attach it over the fleet's sealed wire.
-    pub fn arrive(fleet: &Fleet, name: &str) -> Self {
-        let (mut conn, closer) =
-            aterm_link::transport::connect(&fleet_transport(fleet.key()), &fleet.addr)
-                .expect("the human reaches the broker over the sealed wire");
-        // The closer is deliberately dropped: this connection lives as long as
-        // the `Human` and is closed by the socket going away with it.
-        drop(closer);
-        for grant in human_grants(name) {
-            let cap = astream_cap::mint(SECRET, &grant).expect("mint a human grant");
-            conn.attach(&cap.filter, &cap.tag)
-                .unwrap_or_else(|e| panic!("attach {grant}: {e}"));
-        }
-        Self {
-            name: name.to_string(),
-            conn,
-            producer: astream_cap::producer_id_of(name),
-            seq: 0,
-        }
-    }
-
-    /// Publish one record as this human, answering the offset it landed at.
-    pub fn publish(&mut self, subject: &str, body: &[u8]) -> u64 {
-        self.seq += 1;
-        let (off, _) = self
-            .conn
-            .publish(self.producer, self.seq, subject, body)
-            .unwrap_or_else(|e| panic!("publish {subject}: {e}"));
-        off
-    }
-
-    /// A `control` message on a session's inbox lane (§6.6): `claim`, `request`,
-    /// `release` or `grant <p>`. `text=` is one whitespace-delimited body token,
-    /// so a two-word op is pct-encoded like every other body text (§4.1).
-    pub fn control(&mut self, node: &str, sid: &str, epoch: &str, op: &str) -> u64 {
-        let lane = format!("/f/{FLEET}/in/{node}/{sid}/{}/control", self.name);
-        let body = format!("v=1 t=1 epoch={epoch} text={}", op.replace(' ', "%20"));
-        self.publish(&lane, body.as_bytes())
-    }
-
-    /// Everything on this human's own read lane, oldest first, as
-    /// `(offset, subject, body)`. A bounded `Fetch`, not a drain: the point is to
-    /// SEE the mail, and a cursor would make two reads of the same exchange
-    /// disagree.
-    pub fn lane(&mut self) -> Vec<(u64, String, Vec<u8>)> {
-        let filter = format!("/f/{FLEET}/in/p/{}/>", self.name);
-        let mut out = Vec::new();
-        let mut from = 0u64;
-        loop {
-            let Ok((rows, (next, head))) = self.conn.fetch(from, &filter, 256) else {
-                return out;
-            };
-            out.extend(rows);
-            if next >= head || next <= from {
-                return out;
-            }
-            from = next;
-        }
-    }
-}
-
-/// THE AUDITOR — one read-only capability over the whole fleet, `ro:/f/<F>/>`,
-/// which is what §10's replay ("`Subscribe{0, /f/<F>/>}` … or `Fetch` paged")
-/// actually needs.
-///
-/// It is a SEPARATE principal from the human on purpose, and the separation is
-/// §8.2's rather than this harness's. A human's ring is
-/// `rw,p=<h>:/f/<F>/fleet/<h>/>` · `rw,p=<h>:/f/<F>/in/*/*/<h>/*` ·
-/// `rw,p=<h>:/f/<F>/term/*/*/in/<h>` · `ro:/f/<F>/in/p/<h>/>` ·
-/// `rw,p=<h>:/f/<F>/cur/p/<h>/>` · `ro:/f/<F>/pub/>` — it can halt the fleet,
-/// write to anyone, drive under its own name and read the roster, and it
-/// **cannot read another session's mail or any screen**. Reading the whole log
-/// back is a different authority, and a rung that had handed the human a fleet
-/// read grant to make its own replay convenient would have quietly widened the
-/// one capability this design is most careful about.
-pub struct Auditor {
-    conn: aterm_link::transport::Conn,
-}
-
-impl Auditor {
-    /// Attach `ro:/f/<F>/>` over the fleet's sealed wire.
-    pub fn arrive(fleet: &Fleet) -> Self {
-        let (mut conn, closer) =
-            aterm_link::transport::connect(&fleet_transport(fleet.key()), &fleet.addr)
-                .expect("the auditor reaches the broker over the sealed wire");
-        drop(closer);
-        let cap =
-            astream_cap::mint(SECRET, &format!("ro:/f/{FLEET}/>")).expect("mint the audit cap");
-        conn.attach(&cap.filter, &cap.tag)
-            .expect("attach the audit cap");
-        Self { conn }
-    }
-
-    /// The broker's head offset — a fleet CUT on the bus, which §10 says is one
-    /// offset because one broker gives the fleet a single spine.
-    pub fn head(&mut self) -> u64 {
-        let (_, (_, head)) = self
-            .conn
-            .fetch(0, &format!("/f/{FLEET}/>"), 0)
-            .expect("the head query");
-        head
-    }
-
-    /// Every record under `/f/<F>/` up to and including `cut`, oldest first —
-    /// the replay §10 names (`Fetch` paged from zero), stopped at the cut.
-    pub fn replay(&mut self, cut: u64) -> Vec<(u64, String, Vec<u8>)> {
-        let filter = format!("/f/{FLEET}/>");
-        let mut out: Vec<(u64, String, Vec<u8>)> = Vec::new();
-        let mut from = 0u64;
-        while let Ok((rows, (next, head))) = self.conn.fetch(from, &filter, 256) {
-            for row in rows {
-                if row.0 <= cut {
-                    out.push(row);
-                }
-            }
-            if next >= head || next <= from || next > cut {
-                break;
-            }
-            from = next;
-        }
-        out
-    }
-}
-
 /// THE INHERITED IDENTITY MUST BE STRIPPED, and this is not hygiene — it is the
 /// difference between a two-node test and a one-node test wearing two hats.
 ///
@@ -519,8 +378,8 @@ impl Auditor {
 /// So the rule is now derived from the PARENT'S OWN ENVIRONMENT: every inherited
 /// variable whose name begins with `ATERM_` is removed, whatever it is called
 /// and whenever it was invented. The exceptions are NAMED rather than assumed —
-/// the caller re-sets `ATERM_LINES`, `ATERM_COLUMNS` and `ATERM_FABRIC_COMMAND`
-/// after this runs. Automatic update checks and the package lane are switched off by
+/// the caller re-sets `ATERM_FABRIC_COMMAND` after this runs (the grid is the
+/// `--lines`/`--columns` flags). Automatic update checks and the package lane are switched off by
 /// the fixture CONFIG ([`FIXTURE_GUI_CONFIG`]), the way a person switches them off —
 /// the environment vetoes that used to be set here are gone (2026-09-23) — and the
 /// reroute's stubs land under the scratch HOME. A variable
@@ -543,6 +402,23 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
             cmd.env_remove(&name);
         }
     }
+}
+
+/// Arm a `--headless` launch with a LIFELINE held for the life of this test
+/// process (`aterm_uds::lifeline::arm_for_process`): the instance's `Drop`
+/// still kills it on every ordinary exit, and when this process dies without
+/// one — a SIGKILLed runner, a `timeout` — the kernel cuts the lifeline and the
+/// instance shuts itself down instead of outliving the run (gap #36; the
+/// [`strays_now`] guard above is what a leaked one used to trip). Call after
+/// `.stdin(..)`, before `spawn`. `dir` is the world's scratch root: the FIFO's
+/// name lives there only until both ends are open.
+///
+/// # Panics
+/// The FIFO could not be made in `dir` — a broken fixture, never a reason to boot
+/// an unwatched instance.
+pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
+    aterm_uds::lifeline::arm_for_process(cmd, dir)
+        .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", dir.display()));
 }
 
 /// These Fabric fixtures do not exercise update, package or machine configuration.
@@ -689,7 +565,7 @@ pub fn fleet_transport(key: [u8; 32]) -> aterm_link::transport::Transport {
 }
 
 /// The repository root: `crates/aterm-link` -> `crates` -> the workspace.
-fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -883,7 +759,10 @@ pub fn refuse_a_stale_binary(bin: &std::path::Path, krate: &str, env_var: &str) 
 
 /// The newest file that compiles into `bin`, and its path — cargo's depfile if there is
 /// one, else the narrow `crates/<krate>/src` walk. See [`refuse_a_stale_binary`].
-fn newest_input(bin: &std::path::Path, krate: &str) -> Option<(std::time::SystemTime, PathBuf)> {
+pub fn newest_input(
+    bin: &std::path::Path,
+    krate: &str,
+) -> Option<(std::time::SystemTime, PathBuf)> {
     // A depfile that names NO source falls back rather than answering "nothing is
     // newer": an empty answer here disarms the guard, and a guard that disarms itself
     // on a file it could not read is the shape of the defect this whole function is.
@@ -928,7 +807,7 @@ fn newest_input(bin: &std::path::Path, krate: &str) -> Option<(std::time::System
 /// from a component NAMED `target`, because a crate is entitled to a module directory of
 /// that name and a guard that silently drops a real source is the failure this whole
 /// function exists to stop.
-fn depfile_inputs(text: &str, target_root: &std::path::Path) -> Vec<PathBuf> {
+pub fn depfile_inputs(text: &str, target_root: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for line in text.lines() {
         // Everything up to the FIRST unescaped `:` is the rule's target(s). Cargo also
@@ -978,7 +857,7 @@ fn push_input(out: &mut Vec<PathBuf>, token: String, target_root: &std::path::Pa
 
 /// The build directory a found binary was written into — `target/<profile>/<name>`'s
 /// grandparent.
-fn target_root(bin: &std::path::Path) -> PathBuf {
+pub fn target_root(bin: &std::path::Path) -> PathBuf {
     bin.parent().and_then(std::path::Path::parent).map_or_else(
         || PathBuf::from("/dev/null/no-such-target-root"),
         PathBuf::from,
@@ -1129,8 +1008,7 @@ impl World {
             .env("XDG_RUNTIME_DIR", tmp.join("run"))
             .env("XDG_CONFIG_HOME", tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
-            .env("ATERM_LINES", "40")
-            .env("ATERM_COLUMNS", "120")
+            .args(["--lines", "40", "--columns", "120"])
             .env("ATERM_FABRIC_COMMAND", &fabric_cmd)
             .stdin(Stdio::null())
             .stdout(out)
@@ -1138,6 +1016,7 @@ impl World {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        arm_lifeline(&mut cmd, &tmp);
         let gui = cmd.spawn().expect("launch aterm-gui --headless");
 
         let mut world = World {
@@ -1255,11 +1134,11 @@ impl World {
             .env("XDG_RUNTIME_DIR", self.tmp.join("run"))
             .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
-            .env("ATERM_LINES", "40")
-            .env("ATERM_COLUMNS", "120")
+            .args(["--lines", "40", "--columns", "120"])
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(err);
+        arm_lifeline(&mut cmd, &self.tmp);
         let child = cmd.spawn().expect("launch a sibling aterm-gui --headless");
         let sock = self
             .tmp
@@ -1406,12 +1285,12 @@ impl World {
             .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
             .env("XDG_CONFIG_HOME", w.tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
-            .env("ATERM_LINES", "40")
-            .env("ATERM_COLUMNS", "120")
+            .args(["--lines", "40", "--columns", "120"])
             .env("ATERM_FABRIC_COMMAND", fabric_cmd.trim())
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
+        arm_lifeline(&mut cmd, &w.tmp);
         cmd.spawn().expect("relaunch aterm-gui --headless")
     }
 
@@ -1857,8 +1736,7 @@ impl Node {
             .env("XDG_RUNTIME_DIR", self.tmp.join("run"))
             .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
-            .env("ATERM_LINES", "40")
-            .env("ATERM_COLUMNS", "120")
+            .args(["--lines", "40", "--columns", "120"])
             .env("ATERM_FABRIC_COMMAND", &self.fabric_cmd)
             .stdin(Stdio::null())
             .stdout(out)
@@ -1866,28 +1744,8 @@ impl Node {
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
+        arm_lifeline(&mut cmd, &self.tmp);
         cmd.spawn().expect("launch aterm-gui --headless")
-    }
-
-    /// SIGKILL this node's aterm and bring a fresh one up on the same scratch
-    /// world: the same broker, the same bridge state dir, the same node id.
-    /// Every session it hosted is gone and its successor's are new — aterm mints
-    /// a fresh sid and a fresh launch nonce at every launch, which is what makes
-    /// this "a relaunch to a new epoch".
-    pub fn relaunch(&mut self) {
-        let _boot = boot_permit();
-        if let Some(mut gui) = self.gui.take() {
-            let _ = gui.kill();
-            let _ = gui.wait();
-        }
-        if let Ok(pid) = std::fs::read_to_string(self.state.join("pid")) {
-            if let Ok(pid) = pid.trim().parse::<i32>() {
-                kill(pid, 9);
-            }
-        }
-        let _ = std::fs::remove_file(self.state.join("pid"));
-        self.gui = Some(self.spawn_gui());
-        self.token = World::wait_for_token_at(&self.ctl_sock);
     }
 
     /// A fresh authenticated control connection.
@@ -1954,15 +1812,6 @@ impl Node {
             .collect()
     }
 
-    /// The session's LIVE generation, computed by the SAME function the bridge
-    /// checks a `gen=` against — one source of truth, so a test that passes is
-    /// not a test that agreed with itself.
-    pub fn gen(&self, sid: &str) -> String {
-        let reply = self.verb(&format!("@{sid} text --json"));
-        let frame = reply.rows().first().expect("text --json answers one row");
-        aterm_link::bridge::gen_of_frame(frame).expect("a frame carries a seq and rows")
-    }
-
     /// Every `ev` record this node has published, newest last — over EVERY `ev`
     /// face it owns. See [`World::ev`].
     pub fn ev(&self, fleet: &Fleet) -> Vec<String> {
@@ -1976,269 +1825,4 @@ impl Node {
         let lines: Vec<&str> = body.lines().collect();
         lines[lines.len().saturating_sub(20)..].join("\n")
     }
-}
-
-#[test]
-fn gui_fixture_defaults_disable_machine_writes_and_preserve_explicit_edits() {
-    let dir = std::env::temp_dir().join(format!("atl-isolation-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    prepare_fixture_config(&dir);
-    let path = dir.join("cfg/aterm/aterm.toml");
-    let text = std::fs::read_to_string(&path).expect("fixture config");
-    let config: aterm_toml::Table = aterm_toml::from_str(&text).expect("valid fixture config");
-    assert_eq!(
-        config.get("agents_auto_prime").and_then(|v| v.as_bool()),
-        Some(false)
-    );
-    let packages = config.get("packages").and_then(|v| v.as_table()).unwrap();
-    let machine = config.get("machine").and_then(|v| v.as_table()).unwrap();
-    assert_eq!(
-        packages.get("enabled").and_then(|v| v.as_bool()),
-        Some(false)
-    );
-    assert_eq!(
-        machine.get("spotlight_noindex").and_then(|v| v.as_bool()),
-        Some(false)
-    );
-    assert_eq!(
-        machine.get("universal_control").and_then(|v| v.as_str()),
-        Some("leave")
-    );
-
-    let edited = format!("{text}\n[fabric]\npresence = \"minimal\"\n");
-    std::fs::write(&path, &edited).expect("intentional fixture edit");
-    prepare_fixture_config(&dir);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
-
-    // The updater is off through the config, not the environment (2026-09-23).
-    let update = aterm_toml::from_str::<aterm_toml::Table>(FIXTURE_GUI_CONFIG)
-        .expect("fixture config")
-        .get("update")
-        .and_then(|v| v.as_table())
-        .cloned()
-        .expect("[update]");
-    assert_eq!(update.get("enabled").and_then(|v| v.as_bool()), Some(false));
-
-    // It must run first on a fresh Command (its own doc says why), so it can only
-    // REMOVE: every inherited ATERM_* is removed, and nothing is set in its place.
-    let mut command = Command::new("unused-fixture-program");
-    prepare_gui_environment(&mut command);
-    assert!(
-        command
-            .get_envs()
-            .filter(|(key, _)| key.to_string_lossy().starts_with("ATERM_"))
-            .all(|(_, value)| value.is_none()),
-        "the baseline sets no ATERM_* variable: isolation is the fixture config"
-    );
-    std::fs::remove_dir_all(dir).expect("remove owned fixture");
-}
-
-/// The age reader must be able to read OUR OWN age.
-///
-/// This is the test that was missing. `refuse_a_dirty_machine` degrades to silence when
-/// it cannot ask the question — correct behaviour, and precisely what hid a reader that
-/// could never answer. So assert the reader directly against a process that certainly
-/// exists: ourselves. If `ps` loses the `etime` keyword, or its format shifts, this fails
-/// loudly instead of quietly disarming the guard.
-#[test]
-fn self_check_age_reader() {
-    let me = std::process::id().to_string();
-    let age = process_age_secs(&me).unwrap_or_else(|| {
-        panic!("cannot read this process's own age; the dirty-machine guard is disarmed")
-    });
-    assert!(
-        (0..86_400).contains(&age),
-        "implausible age {age}s for the running test process"
-    );
-    assert_eq!(
-        process_age_secs("0"),
-        None,
-        "pid 0 is not ours to see; the reader must answer None, not a bogus age"
-    );
-}
-
-/// THE STALENESS GUARD MUST SEE EVERY CRATE IN THE BINARY, not one.
-///
-/// It used to walk `crates/aterm-gui/src` alone, so an edit to `crates/aterm-uds` or
-/// `crates/aterm-types` — both compiled into aterm-gui, both audited by the round the
-/// guard was written for — left it silent and the whole e2e suite drove the previous
-/// binary. This drives [`newest_input`] against a SYNTHETIC tree: a fake binary, cargo's
-/// depfile beside it, and the newest input in a crate that is not aterm-gui.
-///
-/// Deterministic: the mtimes are SET, not raced. No sleep, no clock comparison against
-/// wall time.
-/// The binary lookup searches the target dir THIS test was built into first, so a
-/// workspace built with `CARGO_TARGET_DIR` finds its own fresh binaries (2026-09-12:
-/// every e2e suite here was red under a custom target dir because only `<root>/target`
-/// was searched).
-#[test]
-fn the_binary_lookup_searches_the_target_dir_this_test_was_built_into_first() {
-    let exe = std::env::current_exe().expect("current_exe");
-    let dirs = target_dirs();
-    let first = dirs.first().expect("at least one target dir");
-    assert!(
-        exe.starts_with(first),
-        "{} is not under the first searched dir {}",
-        exe.display(),
-        first.display()
-    );
-    assert!(
-        dirs.contains(&workspace_root().join("target")),
-        "<root>/target is still searched as the last resort"
-    );
-    let mut sorted = dirs.clone();
-    sorted.dedup();
-    assert_eq!(
-        sorted.len(),
-        dirs.len(),
-        "no dir is searched twice: {dirs:?}"
-    );
-}
-
-#[test]
-fn the_stale_guard_sees_every_crate_the_binary_was_built_from() {
-    let dir = std::env::temp_dir().join(format!("atl-stale-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let uds = dir.join("crates/aterm-uds/src");
-    let gui = dir.join("crates/aterm-gui/src");
-    let git = dir.join(".git");
-    let out = dir.join("target/debug/build/x/out");
-    for d in [&uds, &gui, &git, &out] {
-        std::fs::create_dir_all(d).expect("scratch tree");
-    }
-    let bin = dir.join("target/debug/aterm-gui");
-    let spawnfd = uds.join("spawnfd.rs");
-    let app = gui.join("app.rs");
-    let index = git.join("index");
-    let generated = out.join("join_table.rs");
-    for f in [&bin, &spawnfd, &app, &index, &generated] {
-        std::fs::write(f, b"x").expect("write");
-    }
-
-    // The binary is one hour old; aterm-gui's own source is two hours old; the aterm-uds
-    // source, the git stamp and the generated file are all NEWER than the binary.
-    let hour = Duration::from_secs(3600);
-    let now = std::time::SystemTime::now();
-    set_mtime(&bin, now - hour);
-    set_mtime(&app, now - hour - hour);
-    set_mtime(&spawnfd, now);
-    set_mtime(&index, now);
-    set_mtime(&generated, now);
-
-    std::fs::write(
-        bin.with_extension("d"),
-        format!(
-            "{}: {} {} {} {}\n{}:\n",
-            bin.display(),
-            app.display(),
-            spawnfd.display(),
-            index.display(),
-            generated.display(),
-            app.display(),
-        ),
-    )
-    .expect("depfile");
-
-    let (_, newest) = newest_input(&bin, "aterm-gui").expect("the depfile names inputs");
-    assert_eq!(
-        newest, spawnfd,
-        "a source in a crate that is NOT aterm-gui must be able to make the binary \
-         stale; `.git` stamps and OUT_DIR generated files must not be the answer"
-    );
-
-    // THE TARGET IS NOT AN INPUT, and neither stamp class is.
-    let inputs = depfile_inputs(
-        &std::fs::read_to_string(bin.with_extension("d")).expect("read"),
-        &target_root(&bin),
-    );
-    assert_eq!(
-        inputs,
-        vec![app.clone(), spawnfd.clone()],
-        "the rule's target, `.git/*` and anything under target/ are not sources"
-    );
-
-    // A path with an escaped space survives the split as ONE path.
-    assert_eq!(
-        depfile_inputs(
-            "/a/bin: /a/one\\ two.rs /a/three.rs",
-            std::path::Path::new("/a/target")
-        ),
-        vec![PathBuf::from("/a/one two.rs"), PathBuf::from("/a/three.rs")],
-        "cargo escapes a space in a path as `\\ `"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// EVERY BINARY THIS CRATE FINDS IS AGE-CHECKED, not just the one somebody remembered.
-///
-/// `aterm-link` is its own workspace, so a binary of the aterm workspace cannot be
-/// declared with `CARGO_BIN_EXE_` and has to be LOCATED — `<target>/<profile>/<name>`,
-/// whatever the last build left there. There used to be two such finders, [`gui_binary`]
-/// here and `ctl_binary` in `glance_and_tui.rs`; the staleness guard was wired into the
-/// first only, and `aterm-ctl` was four and a half hours behind `control_verbs.rs` when
-/// that was found — the file the round was auditing, with the suite green over it. Since
-/// 2026-09-12 there is ONE finder, [`built_binary`], and since round 21 took
-/// `glance_and_tui.rs` there is one caller left (the second copy had also kept the
-/// `<root>/target`-only search that failed every suite under `CARGO_TARGET_DIR`).
-///
-/// The check is STRUCTURAL: every `for profile in ["debug", "release"]` search in the
-/// listed files must call [`refuse_a_stale_binary`] on what it found, and
-/// `harness/mod.rs` must still contain a search. It covers the files it reads and no
-/// others, which is stated here rather than implied: a finder in a file not listed
-/// below is not seen by this test, and adding one means adding it to the list.
-///
-/// ROUND 21 TOOK THE SECOND FILE, NOT THE SECOND CHECK. `glance_and_tui.rs` was the
-/// other entry, and it delegated its `aterm-ctl` lookup to [`built_binary`] rather
-/// than owning a search. The TUI it drove is gone and the file with it, so the entry is
-/// re-pointed by removal — which this test's own doc asks for in preference to deleting
-/// the test, and the remaining entry is the finder that actually matters.
-#[test]
-fn every_binary_this_crate_finds_is_age_checked() {
-    for (name, src) in [("harness/mod.rs", include_str!("mod.rs"))] {
-        let mut searches = 0;
-        for (i, _) in src.match_indices(r#"for profile in ["debug", "release"]"#) {
-            searches += 1;
-            let window = &src[i..src.len().min(i + 600)];
-            assert!(
-                window.contains("refuse_a_stale_binary"),
-                "{name}: a binary is FOUND under target/<profile> and never age-checked. \
-                 A found binary is whatever the last build left behind, and a suite that \
-                 drives the previous one reports a defect in code that is not running:\n\
-                 {window}"
-            );
-        }
-        assert!(
-            searches > 0,
-            "{name}: the search this test guards has moved or been renamed, so this test \
-             now guards nothing — re-point it rather than deleting it"
-        );
-    }
-}
-
-/// Set a file's modification time. `filetime` is not a dependency of this crate and one
-/// would not be added for a test, so this is the `utimensat(2)` the crate would wrap.
-fn set_mtime(path: &std::path::Path, when: std::time::SystemTime) {
-    let secs = when
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    let status = Command::new("touch")
-        .arg("-t")
-        .arg(stamp(secs))
-        .arg(path)
-        .status()
-        .expect("touch");
-    assert!(status.success(), "touch {}", path.display());
-}
-
-/// `touch -t`'s `[[CC]YY]MMDDhhmm[.ss]`, computed from a Unix second so the test needs
-/// no date library and no locale.
-fn stamp(secs: u64) -> String {
-    let out = Command::new("date")
-        .args(["-r", &secs.to_string(), "+%Y%m%d%H%M.%S"])
-        .output()
-        .expect("date -r");
-    assert!(out.status.success(), "date -r {secs}");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

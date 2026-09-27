@@ -9,13 +9,13 @@ license.workspace = true
 repository.workspace = true
 description = "aterm performance benchmarks (ROADMAP WS-K). Targets are RED until reproduced on the shipped binary."
 
-[dependencies]
+[dev-dependencies]
+# The engine every bench, example and test drives. The library itself (the shared
+# corpora) names neither it nor aterm-grid.
 aterm-core = { workspace = true }
 # The resize/rewrap fence harness steps PendingScrollbackReflow directly (the
 # wasm pump's schedule) — the step types live in aterm-grid, not re-exported.
 aterm-grid = { workspace = true }
-
-[dev-dependencies]
 criterion = "0.5"
 # CPU rasterizer for the deterministic end-to-end (bytes -> pixels) bench.
 aterm-render = { workspace = true }

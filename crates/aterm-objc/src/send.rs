@@ -48,7 +48,7 @@
 //! helper is the same defect as writing the wrong cast by hand, and has the
 //! same consequence — corrupted registers on both Apple ABIs.
 
-use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Id, NSRange, Sel, msg};
+use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Id, Sel, msg};
 
 /// `+alloc` on `cls` — a +1, zero-filled, UNINITIALISED instance.
 ///
@@ -92,9 +92,6 @@ pub unsafe fn send_v_id(recv: Id, sel: Sel, a: Id) {
 ///
 /// # Safety
 /// See the module note.
-// Reached from the ported modules' RUNTIME TESTS (which is where a
-// declared class is interrogated), not from their production paths.
-#[allow(dead_code)]
 pub unsafe fn send_v_id_id(recv: Id, sel: Sel, a: Id, b: Id) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
@@ -223,9 +220,6 @@ pub unsafe fn send_id_rect(recv: Id, sel: Sel, a: CGRect) -> Id {
 /// # Safety
 /// See the module note, including the ownership paragraph.
 #[must_use]
-// Reached from the ported modules' RUNTIME TESTS (which is where a
-// declared class is interrogated), not from their production paths.
-#[allow(dead_code)]
 pub unsafe fn send_id_isize(recv: Id, sel: Sel, a: isize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
@@ -239,9 +233,6 @@ pub unsafe fn send_id_isize(recv: Id, sel: Sel, a: isize) -> Id {
 /// # Safety
 /// See the module note.
 #[must_use]
-// Reached from the ported modules' RUNTIME TESTS (which is where a
-// declared class is interrogated), not from their production paths.
-#[allow(dead_code)]
 pub unsafe fn send_bool(recv: Id, sel: Sel) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it. `Bool`
     // and not `bool`: `msg` refuses the latter, deliberately.
@@ -256,9 +247,6 @@ pub unsafe fn send_bool(recv: Id, sel: Sel) -> bool {
 /// # Safety
 /// See the module note.
 #[must_use]
-// Reached from the ported modules' RUNTIME TESTS (which is where a
-// declared class is interrogated), not from their production paths.
-#[allow(dead_code)]
 pub unsafe fn send_bool_sel(recv: Id, sel: Sel, a: Sel) -> bool {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
@@ -298,9 +286,6 @@ pub unsafe fn send_isize(recv: Id, sel: Sel) -> isize {
 /// # Safety
 /// See the module note.
 #[must_use]
-// Reached from the ported modules' RUNTIME TESTS (which is where a
-// declared class is interrogated), not from their production paths.
-#[allow(dead_code)]
 pub unsafe fn send_usize(recv: Id, sel: Sel) -> usize {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
@@ -910,24 +895,6 @@ pub unsafe fn send_bool_cls(recv: Id, sel: Sel, a: ClassPtr) -> bool {
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, ClassPtr) -> Bool = msg();
         f(recv, sel, a).as_bool()
-    }
-}
-
-/// `-(NSRange)sel`.
-///
-/// `NSTextInputClient.h` — `-markedRange` / `-selectedRange`. 16 bytes of two
-/// `NSUInteger`s, which is NOT a homogeneous floating-point aggregate: on
-/// AAPCS64 it comes back in `x0`/`x1` rather than indirectly, and on `x86_64`
-/// in `rax`/`rdx`. Neither ABI uses `x8`/`objc_msgSend_stret` for it.
-///
-/// # Safety
-/// See the module note.
-#[must_use]
-pub unsafe fn send_range(recv: Id, sel: Sel) -> NSRange {
-    // SAFETY: the caller pins the prototype; this is the cast for it.
-    unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = msg();
-        f(recv, sel)
     }
 }
 

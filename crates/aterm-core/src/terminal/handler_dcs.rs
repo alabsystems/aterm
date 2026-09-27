@@ -7,7 +7,7 @@
 //! This module contains DCS routing and state machine helpers used by
 //! `ActionSink::{dcs_hook, dcs_put, dcs_unhook}`.
 
-use super::super::{DcsType, MAX_DCS_CALLBACK_BYTES, MAX_DCS_GLOBAL_BUDGET};
+use super::super::{DcsType, MAX_DCS_GLOBAL_BUDGET};
 use super::TerminalHandler;
 
 impl TerminalHandler<'_> {
@@ -28,8 +28,6 @@ impl TerminalHandler<'_> {
     ///
     /// This function identifies the DCS type and prepares state for `dcs_put` calls.
     /// The sequence is finalized by `dcs_unhook`.
-    ///
-    /// See `docs/ESCAPE_SEQUENCE_MATRIX.md` for complete DCS coverage.
     pub(super) fn dcs_hook_inner(&mut self, params: &[u16], intermediates: &[u8], final_byte: u8) {
         // Release budget from any abandoned prior sequence before starting
         // a new one. If dcs_hook is called without a preceding dcs_unhook
@@ -37,7 +35,6 @@ impl TerminalHandler<'_> {
         self.dcs.total_bytes = self.dcs.total_bytes.saturating_sub(self.dcs.sequence_bytes);
         self.dcs.data.clear();
         self.dcs.sequence_bytes = 0;
-        self.dcs.final_byte = Some(final_byte);
 
         // Deactivate an abandoned Sixel decoder. If the prior DCS was a Sixel
         // sequence interrupted by a parser reset (no dcs_unhook), the decoder's
@@ -60,8 +57,7 @@ impl TerminalHandler<'_> {
             #[cfg(feature = "sixel")]
             {
                 self.dcs.dcs_type = DcsType::Sixel;
-                let cursor = self.grid.cursor();
-                self.sixel.decoder.hook(params, cursor.row, cursor.col);
+                self.sixel.decoder.hook();
             }
             #[cfg(not(feature = "sixel"))]
             {
@@ -145,9 +141,6 @@ impl TerminalHandler<'_> {
                         self.dcs.sequence_bytes -= alloc_after;
                     }
                 }
-                if self.dcs.callback.is_some() && self.dcs.data.len() < MAX_DCS_CALLBACK_BYTES {
-                    self.dcs.data.push(byte);
-                }
             }
             DcsType::Xtgettcap => {
                 // Always count bytes against the budget, even when the data
@@ -160,14 +153,11 @@ impl TerminalHandler<'_> {
                 }
             }
             DcsType::Unknown | DcsType::None => {
-                // Always count bytes against the budget, even when no callback
-                // is registered. Otherwise Unknown DCS sequences bypass the
-                // global budget entirely (#7367).
+                // Always count bytes against the budget, even though nothing
+                // keeps them. Otherwise Unknown DCS sequences bypass the global
+                // budget entirely (#7367).
                 self.dcs.total_bytes += 1;
                 self.dcs.sequence_bytes += 1;
-                if self.dcs.callback.is_some() && self.dcs.data.len() < MAX_DCS_CALLBACK_BYTES {
-                    self.dcs.data.push(byte);
-                }
             }
         }
     }
@@ -234,19 +224,11 @@ impl TerminalHandler<'_> {
                         self.dcs.sequence_bytes -= alloc_after;
                     }
                 }
-                if self.dcs.callback.is_some() {
-                    self.push_dcs_data_capped(data, MAX_DCS_CALLBACK_BYTES);
-                }
             }
             // Accumulate hex-encoded capability names (Pt) up to 1024 bytes.
             DcsType::Xtgettcap => self.push_dcs_data_capped(data, 1024),
-            DcsType::Unknown | DcsType::None => {
-                // Bytes were already counted above even with no callback
-                // registered (#7367); only the callback buffer is conditional.
-                if self.dcs.callback.is_some() {
-                    self.push_dcs_data_capped(data, MAX_DCS_CALLBACK_BYTES);
-                }
-            }
+            // Bytes were already counted above (#7367); nothing keeps them.
+            DcsType::Unknown | DcsType::None => {}
         }
     }
 
@@ -266,7 +248,7 @@ impl TerminalHandler<'_> {
     /// - **Sixel**: Finalizes image and stores for retrieval
     /// - **XTGETTCAP**: Generates termcap capability responses
     ///
-    /// Triggers DCS callback if registered, then resets DCS state.
+    /// Then resets DCS state and releases the sequence's budget.
     pub(super) fn dcs_unhook_inner(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
@@ -304,26 +286,6 @@ impl TerminalHandler<'_> {
             }
         }
 
-        // #8009 CF-013: structural gate on raw DCS callback delivery.
-        // The payload in `self.dcs.data` is PTY-origin (accumulated by
-        // the parser from PTY bytes). `invoke_dcs_callback` wraps it in
-        // `Provenance<&[u8], Pty>` at the emission site before erasing
-        // provenance at the FFI boundary. The capability token proves
-        // the host has authorized raw-bytes callback delivery; a
-        // revoked `DcsAuth` drops the payload silently.
-        if let (Some(callback), Some(final_byte), Some(token)) = (
-            self.dcs.callback.as_mut(),
-            self.dcs.final_byte,
-            self.dcs_auth.try_mint_capability(),
-        ) {
-            super::super::dcs_auth::invoke_dcs_callback(
-                callback,
-                token,
-                self.dcs.data.as_slice(),
-                final_byte,
-            );
-        }
-
         // Reset DCS state and release global budget.
         // Use sequence_bytes (not data.len()) because Sixel feeds bytes to the
         // decoder without accumulating in data — data.len() would under-release (#5948).
@@ -335,6 +297,5 @@ impl TerminalHandler<'_> {
         if self.dcs.data.capacity() > 4096 {
             self.dcs.data.shrink_to(128);
         }
-        self.dcs.final_byte = None;
     }
 }

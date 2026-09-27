@@ -28,7 +28,7 @@
 //! struct StderrLogger;
 //!
 //! impl Log for StderrLogger {
-//!     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+//!     fn enabled(&self, metadata: &Metadata) -> bool {
 //!         metadata.level() <= Level::Info
 //!     }
 //!     fn log(&self, record: &Record<'_>) {
@@ -240,24 +240,18 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
 
 // ── Metadata and Record ─────────────────────────────────────────────────────
 
-/// Metadata about a log record (level and target).
+/// Metadata about a log record: its level, which is all a logger's `enabled`
+/// gate reads.
 #[derive(Debug)]
-pub struct Metadata<'a> {
+pub struct Metadata {
     level: Level,
-    target: &'a str,
 }
 
-impl<'a> Metadata<'a> {
+impl Metadata {
     /// The severity level.
     #[must_use]
     pub fn level(&self) -> Level {
         self.level
-    }
-
-    /// The target (typically the module path).
-    #[must_use]
-    pub fn target(&self) -> &'a str {
-        self.target
     }
 }
 
@@ -304,11 +298,8 @@ impl<'a> Record<'a> {
 
     /// Build metadata from this record.
     #[must_use]
-    pub fn metadata(&self) -> Metadata<'a> {
-        Metadata {
-            level: self.level,
-            target: self.target,
-        }
+    pub fn metadata(&self) -> Metadata {
+        Metadata { level: self.level }
     }
 }
 
@@ -317,7 +308,7 @@ impl<'a> Record<'a> {
 /// Trait for logger implementations.
 pub trait Log: Send + Sync {
     /// Whether this logger is interested in a record at the given metadata.
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool;
+    fn enabled(&self, metadata: &Metadata) -> bool;
 
     /// Log a record.
     fn log(&self, record: &Record<'_>);
@@ -336,9 +327,11 @@ pub fn set_max_level(level: LevelFilter) {
     MAX_LEVEL.store(level as usize, Ordering::Relaxed);
 }
 
-/// Get the current maximum log level.
+/// Get the current maximum log level. Test-only: the macros read the level
+/// through [`__log`]'s own gate.
+#[cfg(test)]
 #[must_use]
-pub fn max_level() -> LevelFilter {
+fn max_level() -> LevelFilter {
     match MAX_LEVEL.load(Ordering::Relaxed) {
         0 => LevelFilter::Off,
         1 => LevelFilter::Error,
@@ -392,7 +385,7 @@ pub fn __log(
         return;
     }
     if let Some(logger) = LOGGER.get() {
-        let metadata = Metadata { level, target };
+        let metadata = Metadata { level };
         if !logger.enabled(&metadata) {
             return;
         }
@@ -508,7 +501,7 @@ pub mod env {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard};
 
-    /// Serializes our own mutations against each other and against [`read`].
+    /// Serializes our own mutations against each other and against `read`.
     /// Poisoning is irrelevant here — the guarded section is a couple of libc calls
     /// with no invariant to break — so every acquisition recovers from a poisoned
     /// lock rather than propagating a panic into a startup path.
@@ -527,13 +520,21 @@ pub mod env {
 
     /// The one blessed `remove_var`. Callers hold [`ENV_LOCK`].
     fn remove_locked(key: &OsStr) {
+        // `env_mutation` is a Trust-compiler lint, so its `allow` rides the two cfgs only
+        // a Trust compiler sets — `trust_verify` (a verifying lane) and `clean_islands`
+        // (the off-switch lane `.cargo/config.toml` configures); an upstream lane (the
+        // Linux/Windows cells, the x86_64 compat slice) has no such lint to name.
+        //
         // SAFETY: the documented contract of this module — the caller is a
         // single-threaded startup, trusted-launcher, or single-test-binary path,
         // and this is one of the two blessed mutation sites in the workspace,
         // reached only with `ENV_LOCK` held.
-        #[allow(
-            env_mutation,
-            reason = "THE lock-scoped helper the env_mutation lint asks callers to route through; see the module docs for the bound this does and does not provide"
+        #[cfg_attr(
+            any(trust_verify, clean_islands),
+            allow(
+                env_mutation,
+                reason = "THE lock-scoped helper the env_mutation lint asks callers to route through; see the module docs for the bound this does and does not provide"
+            )
         )]
         unsafe {
             std::env::remove_var(key)
@@ -543,9 +544,12 @@ pub mod env {
     /// The one blessed `set_var`. Callers hold [`ENV_LOCK`].
     fn set_locked(key: &OsStr, value: &OsStr) {
         // SAFETY: as `remove_locked` — blessed mutation site, `ENV_LOCK` held.
-        #[allow(
-            env_mutation,
-            reason = "THE lock-scoped helper the env_mutation lint asks callers to route through; see the module docs for the bound this does and does not provide"
+        #[cfg_attr(
+            any(trust_verify, clean_islands),
+            allow(
+                env_mutation,
+                reason = "THE lock-scoped helper the env_mutation lint asks callers to route through; see the module docs for the bound this does and does not provide"
+            )
         )]
         unsafe {
             std::env::set_var(key, value)
@@ -593,7 +597,7 @@ pub mod env {
     /// `env_mutation` lint asks for.
     ///
     /// **`body` must not call back into this module** — the lock is a plain
-    /// `Mutex`, so a nested [`set`]/[`take`]/[`read`] would deadlock. `body` may
+    /// `Mutex`, so a nested [`set`]/[`take`]/`read` would deadlock. `body` may
     /// freely call code that READS the environment through `std::env` directly,
     /// which is the entire point: it observes the override.
     pub fn scoped<T>(
@@ -643,10 +647,11 @@ pub mod env {
     }
 
     /// Read `key` under the lock, so a reader cannot observe a key mid-mutation by
-    /// one of our own writers. Plain `std::env::var_os` remains fine for keys
-    /// nothing in-process mutates; use this one for keys the helpers above touch.
+    /// one of our own writers. Test-only: what the tests read the helpers above
+    /// back through.
+    #[cfg(test)]
     #[must_use]
-    pub fn read(key: impl AsRef<OsStr>) -> Option<OsString> {
+    pub(super) fn read(key: impl AsRef<OsStr>) -> Option<OsString> {
         let _guard = env_lock();
         std::env::var_os(key.as_ref())
     }
@@ -735,7 +740,6 @@ mod tests {
         };
         let meta = record.metadata();
         assert_eq!(meta.level(), Level::Warn);
-        assert_eq!(meta.target(), "test");
     }
 
     #[test]

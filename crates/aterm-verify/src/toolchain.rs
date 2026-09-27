@@ -7,11 +7,28 @@
 //! without a new edge, so it mirrors it and says so):
 //!
 //! 1. `$TRUST_STAGE2_BIN` — an explicit development override, never fallen back from;
-//! 2. the rustup toolchain the pin names, `~/.rustup/toolchains/<channel>` — atpkg lays
+//! 2. the rustup toolchain the pin names, `<rustup home>/toolchains/<channel>` — rustup's
+//!    home is `$RUSTUP_HOME`, else `~/.rustup` ([`rustup_home`]) — atpkg lays
 //!    it as a view of its store, and Trust's `scripts/promote-toolchain.sh` points it at
 //!    a SEALED from-source build, the sanctioned way to drive one (never the live tree);
 //! 3. the atpkg store's `store/trust/current/bin`;
 //! 4. `PATH`.
+//!
+//! EXCEPT that a rustup `trust` OLDER than the store's build ranks BELOW the store (2 and
+//! 3 swap). That is atpkg's one staleness rule — `atpkg::seam::stale_against_store`,
+//! mirrored here as [`Demoted`] — and the entry it catches is not hypothetical: measured
+//! 2026-09-24 on the owner's Mac, `~/.rustup/toolchains/trust` was a hand-made link to
+//! `$HOME/trust/build/host/stage2` (commit-date 2026-08-20) while the store held 9192
+//! (2026-09-17), so every gate run without a hand-exported `$TRUST_STAGE2_BIN` built,
+//! formatted and linted with a five-week-old compiler — and, that tree shipping no
+//! `targo-tippy`, skipped tippy and could not mint a merge-contract receipt. atpkg's
+//! unattended pass refused to re-point a link it did not lay, and only `aterm pkg repair`
+//! healed it, so no toolchain update ever reached the gates. Since 2026-09-26 that pass
+//! re-points this exact shape by itself — an older LIVE BUILD TREE
+//! (`atpkg::seam::live_build_tree`) — but not a seal, a link put back after it, or one a
+//! build is running through, so the demotion still has work to do. Demoted, not deleted: a
+//! store that is not the pin (rule 5) still falls through to the rustup entry, which is
+//! what the gate ran before; and an entry whose age cannot be read is never demoted.
 //!
 //! A LIVE BUILD TREE IS NOT A CANDIDATE. `$HOME/trust/build/host/stage2/bin` (and the
 //! `~/toolchains/<channel>-current` promote target) were probed here until
@@ -19,7 +36,8 @@
 //! delivery (2026-08-29). On m7 that made `aterm help rust` report a JULY stage2 —
 //! one whose `targo` no longer knows `--unverified` — as "the gates' toolchain"
 //! while PATH ran the store's. A build tree is also empty for the whole length of
-//! every `x.py build --stage 2`.
+//! every `x.py build --stage 2`. Not PROBED is not unreachable: a hand-made rustup
+//! link can still name one, which is the case the exception above exists for.
 //!
 //! The rules, all load-bearing:
 //!
@@ -41,10 +59,14 @@
 //!    lane; the workspace rides `--unverified` until the Trust-Std campaign
 //!    greens, the same statement `.cargo/config.toml`'s off-switch already makes.
 //!
-//! 4. THE STORE PREFIX IS A MIRROR. It is resolved the way atpkg resolves it
-//!    ([`atpkg_prefix`]: `[packages].prefix` from aterm.toml, else the platform
-//!    default) without a dependency edge, because this crate has none by charter
-//!    (see its Cargo.toml).
+//! 4. THE STORE PREFIX IS A MIRROR, AND SO IS RUSTUP'S HOME. The prefix is
+//!    resolved the way atpkg resolves it ([`atpkg_prefix`]: `[packages].prefix`
+//!    from aterm.toml, else the platform default), and rustup's home the way
+//!    `atpkg::seam::rustup_home_with` and `aterm-release` resolve it
+//!    ([`rustup_home`]: a non-empty `$RUSTUP_HOME`, else `~/.rustup`), both
+//!    without a dependency edge, because this crate has none by charter (see its
+//!    Cargo.toml). `aterm-cli`'s tests, which reach both crates, hold the two
+//!    rustup-home spellings to one table.
 //!
 //! 5. THE DIRECTORY MUST BE THE PIN. `rust-toolchain.toml` names `trust`; a
 //!    directory carrying a file called `targo` is not evidence that it is that
@@ -63,6 +85,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::is_executable_file;
 
@@ -188,6 +211,22 @@ pub fn atpkg_prefix(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
     default_atpkg_prefix(home)
 }
 
+/// Rustup's home: a non-empty `$RUSTUP_HOME` (passed in as `env_rustup_home`), else
+/// `<home>/.rustup` — rustup's own rule, and the mirror of
+/// `atpkg::seam::rustup_home_with`, which `aterm-release` resolves through (rule 4 of
+/// the module header). A SET-BUT-EMPTY `$RUSTUP_HOME` is unset here, as it is there:
+/// `RUSTUP_HOME= cmd` means "the default", never "the current directory".
+///
+/// `tools/verify.sh` and `tools/test-trust-contract-probe.sh` spell the same rule
+/// `${RUSTUP_HOME:-$HOME/.rustup}`, whose `:-` is the empty-is-unset half.
+#[must_use]
+pub fn rustup_home(env_rustup_home: Option<&OsStr>, home: &Path) -> PathBuf {
+    match env_rustup_home {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home.join(".rustup"),
+    }
+}
+
 /// The platform default prefix (the mirror of `atpkg::platform::default_prefix`).
 #[must_use]
 pub fn default_atpkg_prefix(home: &Path) -> PathBuf {
@@ -242,6 +281,176 @@ pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
     prefix.join("store/trust/current/bin")
 }
 
+/// The channel the atpkg store holds, and so the one rustup entry [`Demoted`] can be
+/// weighed against (`atpkg::seam::SEAM_PROGRAM`).
+const STORE_CHANNEL: &str = "trust";
+
+/// How long ONE `-vV` date probe may take: `atpkg::doctor`'s `PROBE_TIMEOUT`, mirrored, so
+/// both copies of the one staleness rule give up at the same point. A wedged driver costs
+/// the date — read as "unknown", which never demotes — never the gate.
+const DATE_PROBE_BOUND: Duration = Duration::from_secs(5);
+
+/// A rustup `trust` toolchain the walk ranked BELOW the atpkg store because it is older
+/// than the store's build (the module header's exception to the order).
+///
+/// THE RULE IS ATPKG'S, mirrored without a dependency edge (this crate has none, by
+/// charter): `atpkg::seam::stale_against_store` — the rule `aterm pkg doctor` warns by and
+/// `aterm pkg repair` re-points by — so the gate never ranks a toolchain differently from
+/// the verb that names the fix. Its three parts:
+///
+/// * the `commit-date:` each compiler's `-vV` reports (`bin/trustc`, else `bin/rustc`),
+///   a `YYYY-MM-DD` date, compared as text; OLDER is strictly before, so two builds of one
+///   day are not told apart and the entry keeps its rank;
+/// * an age that cannot be read — no answer inside `DATE_PROBE_BOUND`, no date line, a
+///   date of another shape — is never read as stale;
+/// * a dev-linked trust (`<prefix>/links/trust`, atpkg's link marker) presents its
+///   checkout, not the store, so nothing is stale against the store then. The mirror
+///   reads the marker's PRESENCE only; atpkg also treats an unreadable marker as no link,
+///   and there the mirror keeps the old order, the direction that changes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Demoted {
+    /// The rustup entry's physical `bin` directory.
+    pub dir: PathBuf,
+    /// Its compiler's `commit-date`.
+    pub its: String,
+    /// The store build's `commit-date`.
+    pub store: String,
+    /// Whether the rustup entry (`~/.rustup/toolchains/trust` itself) is a SYMLINK — the
+    /// one shape `aterm pkg repair` re-points. A real directory it refuses ([`Self::remedy`]).
+    pub linked: bool,
+    /// Whether the entry resolves into atpkg's OWN view of its store
+    /// (`<prefix>/rustup/…`, `atpkg::seam::views_root`): the view atpkg left on the build a
+    /// process was still running from when the store moved on. `aterm pkg repair` does not
+    /// re-point that — it adopts the entry and re-lays the view once nothing runs from it —
+    /// so its remedy is neither of the others ([`REMEDY_VIEW`]). aterm-release's
+    /// `gates::discovery_order` answers such an entry with the store itself; both rank the
+    /// store first.
+    pub view: bool,
+}
+
+/// The fix for a demoted entry that is a LINK: atpkg's `repair` replaces a stale foreign
+/// link with its view (`atpkg::seam::repair`).
+const REMEDY_LINK: &str = "`aterm pkg repair` re-points it at the store";
+
+/// What a demoted entry that is atpkg's own VIEW waits on ([`Demoted::view`]): nothing to
+/// run — the view is re-laid once the build running from it exits (review of 2026-09-25:
+/// it was sent to `aterm pkg repair`, which answers "left as it stands" for a view).
+pub const REMEDY_VIEW: &str = "it is atpkg's own view, left on the build still running from \
+     it: atpkg re-lays it once nothing runs from that build";
+
+/// The fix for a demoted entry that is a REAL DIRECTORY. `aterm pkg repair` refuses an
+/// entry that is not a link, whatever its age — a directory atpkg did not lay is not its
+/// to delete — and names `atpkg::seam::DETACH_FIX` instead, restated here (this crate has
+/// no atpkg edge; aterm-cli's tests hold the two spellings together).
+pub const REMEDY_DIRECTORY: &str = "`aterm pkg repair` will not replace a directory it did \
+     not lay: remove that entry yourself (e.g. `rustup toolchain uninstall trust`), then \
+     `aterm pkg repair`";
+
+impl Demoted {
+    /// The verb that fixes it, for the entry's SHAPE: `aterm pkg repair` for a link, and
+    /// the by-hand removal first for a real directory, which repair refuses — naming repair
+    /// alone there sent a reader to a command that answers "refusing to touch it" — and
+    /// nothing for atpkg's own view, which atpkg re-lays itself ([`REMEDY_VIEW`]).
+    #[must_use]
+    pub fn remedy(&self) -> &'static str {
+        if self.view {
+            REMEDY_VIEW
+        } else if self.linked {
+            REMEDY_LINK
+        } else {
+            REMEDY_DIRECTORY
+        }
+    }
+
+    /// The one sentence every surface says it in — the gate's header and `aterm help rust`.
+    #[must_use]
+    pub fn sentence(&self) -> String {
+        format!(
+            "rustup `trust` ({}) is a toolchain from {}, older than the atpkg store's {}: \
+             ranked below the store, not used — {}",
+            self.dir.display(),
+            self.its,
+            self.store,
+            self.remedy()
+        )
+    }
+}
+
+/// The `commit-date:` the compiler in `bin` reports — `trustc -vV`, else `rustc -vV` (a
+/// stage2 from before the Trust names) — when it is a `YYYY-MM-DD` date and the driver
+/// answered inside [`DATE_PROBE_BOUND`]. The mirror of `atpkg::seam::commit_date`.
+fn commit_date(bin: &Path) -> Option<String> {
+    ["trustc", "rustc"]
+        .iter()
+        .map(|n| bin.join(n))
+        .filter(|p| is_executable_file(p))
+        .find_map(|driver| {
+            let text = bounded_stdout(&driver, &["-vV"], DATE_PROBE_BOUND)?;
+            let date = text
+                .lines()
+                .find_map(|l| l.strip_prefix("commit-date: "))?
+                .trim()
+                .to_string();
+            let shaped = date.len() == 10
+                && date.bytes().enumerate().all(|(i, b)| {
+                    if i == 4 || i == 7 {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                });
+            shaped.then_some(date)
+        })
+}
+
+/// `program args…`'s stdout when it exits 0 inside `bound`; `None` otherwise, the child
+/// killed and reaped on the way out. POLLED with `try_wait`, for the reason
+/// [`crate::exec`]'s ceiling is: std has no wait-with-deadline and this crate takes no
+/// `libc`. A version answer is one short block, far inside a pipe buffer, so the child
+/// cannot wedge on a full pipe before it exits.
+fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < bound => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status.success().then_some(out)
+}
+
+/// `(its, store)` commit-dates when the rustup `bin` at `rustup` is OLDER than the build
+/// `<store_prefix>/store/trust/current` names — [`Demoted`]'s rule. `None` while trust is
+/// dev-linked, without a store build, or when either age cannot be read.
+fn older_than_store(rustup: &Path, store_prefix: &Path) -> Option<(String, String)> {
+    if std::fs::symlink_metadata(store_prefix.join("links").join(STORE_CHANNEL)).is_ok() {
+        return None;
+    }
+    let store = store_stage2_bin(store_prefix);
+    std::fs::metadata(&store).ok()?;
+    let its = commit_date(rustup)?;
+    let theirs = commit_date(&store)?;
+    (its < theirs).then_some((its, theirs))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolchain {
     /// The resolved (physical) stage2 `bin` directory.
@@ -259,12 +468,18 @@ pub struct Toolchain {
     /// prefix), whether or not it held anything, so the diagnostic can name the place
     /// `aterm pkg install trust` would have filled. `None` for an explicit override.
     pub store_bin: Option<PathBuf>,
+    /// The rustup entry the walk RANKED BELOW the store because it is older than the
+    /// store's build ([`Demoted`]) — `Some` only when that changed the answer (another
+    /// directory won), so the header and `aterm help rust` can say why the rustup
+    /// toolchain a reader expects is not the one the gates run.
+    pub demoted: Option<Demoted>,
 }
 
 impl Toolchain {
     /// [`Self::discover_with_store`] under the atpkg prefix atpkg itself would resolve
-    /// ([`atpkg_prefix`]; `$XDG_CONFIG_HOME` is the one environment read here, for the
-    /// config file atpkg reads). `pinned` is the channel `rust-toolchain.toml` names
+    /// ([`atpkg_prefix`]) and the rustup home rustup itself would ([`rustup_home`]);
+    /// `$XDG_CONFIG_HOME` (for the config file atpkg reads) and `$RUSTUP_HOME` are the
+    /// two environment reads here. `pinned` is the channel `rust-toolchain.toml` names
     /// ([`pinned_channel`]); `None` disables the pin check, which is what the pure unit
     /// tests below want and what a repo with no pin means.
     #[must_use]
@@ -276,16 +491,21 @@ impl Toolchain {
     ) -> Self {
         let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
         let prefix = atpkg_prefix(home, xdg.as_deref());
-        Self::discover_with_store(stage2_bin, home, Some(&prefix), path_env, pinned)
+        let rustup = rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), home);
+        Self::discover_with_store(stage2_bin, &rustup, Some(&prefix), path_env, pinned)
     }
 
     /// THE resolution order (the module header), first hit wins:
     ///
     /// 1. `stage2_bin` — `$TRUST_STAGE2_BIN`; checked, never fallen back from: naming a
     ///    toolchain that is not there is an error to surface, not a preference.
-    /// 2. `<home>/.rustup/toolchains/<channel>/bin` — the rustup toolchain the pin names.
+    /// 2. `<rustup_home>/toolchains/<channel>/bin` — the rustup toolchain the pin names;
+    ///    `rustup_home` is rustup's home itself ([`rustup_home`] resolves it), not `$HOME`.
     /// 3. `<store_prefix>/store/trust/current/bin` — the atpkg store (`None` skips it).
     /// 4. every `path_env` directory.
+    ///
+    /// 2 and 3 SWAP when the rustup entry carries a `targo` and is older than the store's
+    /// build ([`Demoted`]); `demoted` then names it whenever another directory won.
     ///
     /// A candidate must carry a `targo` AND be the pin (`is_pinned_toolchain`); the
     /// first one that carries a targo and is not is remembered in `refused` for the
@@ -295,13 +515,14 @@ impl Toolchain {
     #[must_use]
     pub fn discover_with_store(
         stage2_bin: Option<&Path>,
-        home: &Path,
+        rustup_home: &Path,
         store_prefix: Option<&Path>,
         path_env: &OsStr,
         pinned: Option<&str>,
     ) -> Self {
         let physical = |dir: PathBuf| std::fs::canonicalize(&dir).unwrap_or(dir);
         let mut refused = None;
+        let mut demoted = None;
         let (tool_dir, store_bin) = if let Some(explicit) = stage2_bin {
             // `$TRUST_STAGE2_BIN` is an ordinary environment variable and can name a tree
             // that is not the pin as easily as PATH can: a refused directory stays the
@@ -313,14 +534,24 @@ impl Toolchain {
             }
             (dir, None)
         } else {
-            let rustup = home
-                .join(".rustup/toolchains")
+            let rustup = rustup_home
+                .join("toolchains")
                 .join(pinned.unwrap_or("trust"))
                 .join("bin");
             let store_bin = store_prefix.map(store_stage2_bin);
-            let candidates = std::iter::once(rustup.clone())
-                .chain(store_bin.clone())
-                .chain(std::env::split_paths(path_env));
+            // The date probes run only where there is a rustup entry to weigh — a
+            // store-only machine spawns nothing new here.
+            let stale = store_prefix
+                .filter(|_| pinned.unwrap_or(STORE_CHANNEL) == STORE_CHANNEL)
+                .filter(|_| is_executable_file(&rustup.join("targo")))
+                .and_then(|prefix| older_than_store(&rustup, prefix));
+            let head: Vec<PathBuf> = match (&stale, &store_bin) {
+                (Some(_), Some(store)) => vec![store.clone(), rustup.clone()],
+                _ => std::iter::once(rustup.clone())
+                    .chain(store_bin.clone())
+                    .collect(),
+            };
+            let candidates = head.into_iter().chain(std::env::split_paths(path_env));
             let mut chosen = None;
             for dir in candidates {
                 if !is_executable_file(&dir.join("targo")) {
@@ -334,6 +565,25 @@ impl Toolchain {
                 }
                 refused.get_or_insert(dir);
             }
+            // Named only when it changed the answer: a demoted entry that won anyway (the
+            // store was not the pin) is simply the toolchain, as it was before the rule.
+            let rustup_dir = physical(rustup.clone());
+            let linked = rustup
+                .parent()
+                .and_then(|entry| std::fs::symlink_metadata(entry).ok())
+                .is_some_and(|m| m.file_type().is_symlink());
+            let view = store_prefix
+                .and_then(|prefix| std::fs::canonicalize(prefix.join("rustup")).ok())
+                .is_some_and(|views| rustup_dir.starts_with(views));
+            demoted = stale
+                .filter(|_| chosen.as_ref().is_some_and(|c| *c != rustup_dir))
+                .map(|(its, store)| Demoted {
+                    dir: rustup_dir,
+                    its,
+                    store,
+                    linked,
+                    view,
+                });
             let reported = chosen.unwrap_or_else(|| store_bin.clone().unwrap_or(rustup));
             (reported, store_bin)
         };
@@ -348,6 +598,7 @@ impl Toolchain {
             stage2_dir: tool_dir,
             refused,
             store_bin,
+            demoted,
         }
     }
 
@@ -568,12 +819,24 @@ mod tests {
         // rustup entry.
         let home = Path::new("/nonexistent-home");
         let prefix = default_atpkg_prefix(home);
-        let t = Toolchain::discover_with_store(None, home, Some(&prefix), OsStr::new(""), None);
+        let t = Toolchain::discover_with_store(
+            None,
+            &rustup_home(None, home),
+            Some(&prefix),
+            OsStr::new(""),
+            None,
+        );
         assert_eq!(t.targo, store_stage2_bin(&prefix).join("targo"));
         assert_eq!(t.trustdoc, store_stage2_bin(&prefix).join("trustdoc"));
         assert!(!t.have_targo());
         assert!(t.tippy.is_none());
-        let t = Toolchain::discover_with_store(None, home, None, OsStr::new(""), None);
+        let t = Toolchain::discover_with_store(
+            None,
+            &rustup_home(None, home),
+            None,
+            OsStr::new(""),
+            None,
+        );
         assert_eq!(
             t.targo,
             Path::new("/nonexistent-home/.rustup/toolchains/trust/bin/targo")
@@ -584,7 +847,13 @@ mod tests {
     fn the_missing_trustdoc_diagnosis_names_the_config_key_and_both_remedies() {
         let home = Path::new("/nonexistent-home");
         let prefix = default_atpkg_prefix(home);
-        let t = Toolchain::discover_with_store(None, home, Some(&prefix), OsStr::new(""), None);
+        let t = Toolchain::discover_with_store(
+            None,
+            &rustup_home(None, home),
+            Some(&prefix),
+            OsStr::new(""),
+            None,
+        );
         let label = t.missing_trustdoc_label();
         assert!(label.contains("x.py build --stage 2"), "{label}");
         assert!(label.contains("~/.local/bin/trustdoc"), "{label}");
@@ -597,7 +866,13 @@ mod tests {
         // developer alternative. Every diagnostic says them in that order.
         let home = Path::new("/nonexistent-home");
         let prefix = default_atpkg_prefix(home);
-        let t = Toolchain::discover_with_store(None, home, Some(&prefix), OsStr::new(""), None);
+        let t = Toolchain::discover_with_store(
+            None,
+            &rustup_home(None, home),
+            Some(&prefix),
+            OsStr::new(""),
+            None,
+        );
         for label in [
             t.missing_targo_label(),
             t.missing_trustdoc_label(),
@@ -618,7 +893,9 @@ mod tests {
     }
 
     /// A pinned toolchain bin under `root` — `targo` plus a `trustc` that answers with a
-    /// real sysroot — returned as its physical path.
+    /// real sysroot — returned as its physical path. Unix, with the test that pins
+    /// the symlinked shapes.
+    #[cfg(unix)]
     fn pinned_bin(root: &Path) -> PathBuf {
         fs::create_dir_all(root).expect("mkdir");
         exec_stub(&root.join("targo"));
@@ -649,7 +926,13 @@ mod tests {
         let promoted = pinned_bin(&home.join("toolchains/trust-current/bin"));
         let path = std::env::join_paths([&tree, &promoted, &on_path]).expect("join");
         let found = |explicit: Option<&Path>, path: &OsStr| {
-            Toolchain::discover_with_store(explicit, &home, Some(&prefix), path, Some("trust"))
+            Toolchain::discover_with_store(
+                explicit,
+                &rustup_home(None, &home),
+                Some(&prefix),
+                path,
+                Some("trust"),
+            )
         };
 
         // 1. An explicit override wins, and never consults the store.
@@ -680,6 +963,53 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    /// RUSTUP'S HOME IS `$RUSTUP_HOME` WHEN SET (2026-09-25). This probe read
+    /// `~/.rustup` directly while `aterm-release` honoured `$RUSTUP_HOME`, so on a
+    /// machine with a relocated rustup the cutter and the gate named two different
+    /// toolchains. The rule is rustup's (and `atpkg::seam::rustup_home_with`'s):
+    /// a non-empty value wins, an empty one is unset.
+    #[test]
+    fn rustup_home_is_the_variable_when_set_and_home_dot_rustup_otherwise() {
+        let home = Path::new("/h");
+        assert_eq!(rustup_home(None, home), Path::new("/h/.rustup"));
+        assert_eq!(
+            rustup_home(Some(OsStr::new("")), home),
+            Path::new("/h/.rustup")
+        );
+        assert_eq!(
+            rustup_home(Some(OsStr::new("/opt/rustup")), home),
+            Path::new("/opt/rustup")
+        );
+    }
+
+    /// …and discovery looks where that answer points: a toolchain linked under a
+    /// relocated rustup home is found, and the same entry under `~/.rustup` is not
+    /// consulted when the variable names somewhere else. NEGATIVE CONTROL: the
+    /// default home finds nothing there.
+    #[cfg(unix)]
+    #[test]
+    fn a_relocated_rustup_home_is_where_the_pinned_toolchain_is_found() {
+        let home = crate::mktemp_dir("atv-rustup-home").expect("mktemp");
+        let relocated = home.join("elsewhere/rustup");
+        let linked = pinned_bin(&home.join("sealed/bin"));
+        fs::create_dir_all(relocated.join("toolchains")).expect("mkdir");
+        std::os::unix::fs::symlink(home.join("sealed"), relocated.join("toolchains/trust"))
+            .expect("ln rustup");
+        let found = |rustup: &Path| {
+            Toolchain::discover_with_store(None, rustup, None, OsStr::new(""), Some("trust"))
+        };
+        let t = found(&rustup_home(Some(relocated.as_os_str()), &home));
+        assert!(t.have_targo(), "{}", t.stage2_dir.display());
+        assert_eq!(t.stage2_dir, linked);
+        let t = found(&rustup_home(None, &home));
+        assert!(
+            !t.have_targo(),
+            "the default home holds no entry: {}",
+            t.stage2_dir.display()
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn a_store_targo_that_is_not_the_pin_is_refused_and_the_search_goes_on() {
         let home = crate::mktemp_dir("atv-storepin").expect("mktemp");
@@ -694,7 +1024,7 @@ mod tests {
 
         let t = Toolchain::discover_with_store(
             None,
-            &home,
+            &rustup_home(None, &home),
             Some(&prefix),
             OsStr::new(real.to_string_lossy().as_ref()),
             Some("trust"),
@@ -704,7 +1034,7 @@ mod tests {
 
         let t = Toolchain::discover_with_store(
             None,
-            &home,
+            &rustup_home(None, &home),
             Some(&prefix),
             OsStr::new(""),
             Some("trust"),
@@ -714,6 +1044,210 @@ mod tests {
             t.refused,
             Some(fs::canonicalize(&store).expect("canonicalize"))
         );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// A toolchain bin under `sysroot` whose `trustc` answers like a real one on BOTH
+    /// questions discovery asks: `--print sysroot` (the pin check) and `-vV` (the date,
+    /// read from `<sysroot>/commit-date`), beside an executable `targo`. Returned physical.
+    ///
+    /// Every `trustc` is a HARD LINK to one script per fixture, run once here unbounded:
+    /// macOS assesses a new executable file on its first exec (measured ~20 s on a loaded
+    /// m7, 2026-09-24, in atpkg's copy of this fixture — past the 5 s date bound), and a
+    /// link to an assessed file is not new. The probes under test time the date rule, not
+    /// Gatekeeper.
+    #[cfg(unix)]
+    fn dated_bin(fixture: &Path, sysroot: &Path, date: &str) -> PathBuf {
+        let script = fixture.join("dated-trustc");
+        if !script.is_file() {
+            fs::write(
+                &script,
+                "#!/bin/sh\nroot=$(cd \"$(dirname \"$0\")/..\" && pwd -P)\n\
+                 case \"$1\" in\n  --print) echo \"$root\" ;;\n  \
+                 -vV) d=$(cat \"$root/commit-date\"); echo \"rustc 1.99.0-dev (0000000 $d)\"; \
+                 echo \"commit-date: $d\" ;;\nesac\n",
+            )
+            .expect("write");
+            make_runnable(&script);
+            let _ = std::process::Command::new(&script).output();
+        }
+        let bin = sysroot.join("bin");
+        fs::create_dir_all(sysroot.join("lib/rustlib")).expect("mkdir rustlib");
+        fs::create_dir_all(&bin).expect("mkdir bin");
+        let _ = fs::remove_file(bin.join("trustc"));
+        fs::hard_link(&script, bin.join("trustc")).expect("link trustc");
+        if !bin.join("targo").is_file() {
+            exec_stub(&bin.join("targo"));
+        }
+        fs::write(sysroot.join("commit-date"), date).expect("date");
+        fs::canonicalize(&bin).expect("canonicalize")
+    }
+
+    /// THE STALE RUSTUP LINK (measured 2026-09-24 on the owner's Mac: rustup's `trust` a
+    /// hand-made link to `$HOME/trust/build/host/stage2`, 2026-08-20, the store 9192 at
+    /// 2026-09-17; `aterm help rust` named the stage2 "the gates' toolchain"). Older than
+    /// the store ⇒ ranked below it and NAMED; newer, undated, or with trust dev-linked ⇒
+    /// the rustup entry keeps its rank; a store that is not the pin ⇒ the demoted entry is
+    /// still reached before PATH, exactly the pre-rule answer, and is not named.
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_trust_older_than_the_store_ranks_below_it_and_is_named() {
+        let home = crate::mktemp_dir("atv-demote").expect("mktemp");
+        let prefix = default_atpkg_prefix(&home);
+        let store = dated_bin(&home, &prefix.join("store/trust/9192"), "2026-09-17");
+        std::os::unix::fs::symlink(
+            prefix.join("store/trust/9192"),
+            prefix.join("store/trust/current"),
+        )
+        .expect("ln current");
+        let stage2 = home.join("trust/build/aarch64-apple-darwin/stage2");
+        let tree = dated_bin(&home, &stage2, "2026-08-20");
+        fs::create_dir_all(home.join("trust/build")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            home.join("trust/build/aarch64-apple-darwin"),
+            home.join("trust/build/host"),
+        )
+        .expect("ln host");
+        fs::create_dir_all(home.join(".rustup/toolchains")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            home.join("trust/build/host/stage2"),
+            home.join(".rustup/toolchains/trust"),
+        )
+        .expect("ln rustup");
+        let found = || {
+            Toolchain::discover_with_store(
+                None,
+                &home.join(".rustup"),
+                Some(&prefix),
+                OsStr::new(""),
+                Some("trust"),
+            )
+        };
+
+        let t = found();
+        assert!(t.have_targo());
+        assert_eq!(t.stage2_dir, store, "the older rustup entry must not win");
+        let d = t.demoted.clone().expect("the demotion is named");
+        assert_eq!(
+            (d.dir.as_path(), d.its.as_str(), d.store.as_str()),
+            (tree.as_path(), "2026-08-20", "2026-09-17")
+        );
+        let said = d.sentence();
+        assert!(
+            said.contains("older than the atpkg store's 2026-09-17"),
+            "{said}"
+        );
+        assert!(d.linked, "the measured entry is a link");
+        assert!(said.ends_with(REMEDY_LINK), "{said}");
+
+        // A REAL DIRECTORY at the entry, older than the store: demoted all the same, but
+        // `aterm pkg repair` refuses an entry that is not a link, so the sentence names the
+        // by-hand removal first — never repair alone, which would answer "refusing".
+        let entry = home.join(".rustup/toolchains/trust");
+        fs::remove_file(&entry).expect("rm the link");
+        let entry_bin = dated_bin(&home, &entry, "2026-08-20");
+        let t = found();
+        assert_eq!(t.stage2_dir, store, "a directory entry is demoted too");
+        let d = t.demoted.clone().expect("and named");
+        assert_eq!((d.dir.as_path(), d.linked), (entry_bin.as_path(), false));
+        let said = d.sentence();
+        assert!(
+            said.ends_with(REMEDY_DIRECTORY) && !said.contains(REMEDY_LINK),
+            "{said}"
+        );
+        fs::remove_dir_all(&entry).expect("rm the directory");
+        std::os::unix::fs::symlink(home.join("trust/build/host/stage2"), &entry)
+            .expect("ln rustup again");
+
+        // Negative controls: every way the rule must NOT fire.
+        for (date, why) in [
+            ("2026-09-18", "newer"),
+            ("2026-09-17", "same day"),
+            ("unknown", "undated"),
+        ] {
+            dated_bin(&home, &stage2, date);
+            let t = found();
+            assert_eq!(t.stage2_dir, tree, "{why}: the rustup entry keeps its rank");
+            assert_eq!(t.demoted, None, "{why}");
+        }
+        dated_bin(&home, &stage2, "2026-08-20");
+        fs::create_dir_all(prefix.join("links")).expect("mkdir links");
+        fs::write(prefix.join("links/trust"), "a dev-link marker").expect("marker");
+        let t = found();
+        assert_eq!(
+            t.stage2_dir, tree,
+            "dev-linked: nothing is stale against the store"
+        );
+        assert_eq!(t.demoted, None);
+        fs::remove_file(prefix.join("links/trust")).expect("rm marker");
+
+        // A store that cannot answer for itself is refused by the pin check; the demoted
+        // entry is the next candidate, ahead of PATH, and wins unnamed.
+        fs::write(prefix.join("store/trust/9192/commit-date"), "2026-09-17").expect("date");
+        fs::remove_dir_all(prefix.join("store/trust/9192/lib")).expect("rm sysroot");
+        let on_path = pinned_bin(&home.join("elsewhere/bin"));
+        let t = Toolchain::discover_with_store(
+            None,
+            &home.join(".rustup"),
+            Some(&prefix),
+            on_path.as_os_str(),
+            Some("trust"),
+        );
+        assert_eq!(
+            t.stage2_dir, tree,
+            "demoted below the store, never below PATH"
+        );
+        assert_eq!(t.demoted, None, "it won, so nothing was demoted in effect");
+        assert!(t.refused.is_none());
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// ATPKG'S OWN VIEW, LEFT BEHIND (review of 2026-09-25): when a build was still
+    /// running from atpkg's view (`<prefix>/rustup/trust`, where it lays rustup's `trust`
+    /// entry) as the store moved on, the view lags the store. The store is still the
+    /// right answer — but the note sent the reader to `aterm pkg repair` "re-points it",
+    /// and repair only adopts a view entry and re-lays the view once nothing runs from
+    /// it. It now says the view is re-laid by atpkg itself. NEGATIVE CONTROL: the same
+    /// older entry as a foreign link keeps the link remedy.
+    #[cfg(unix)]
+    #[test]
+    fn atpkgs_own_lagging_view_is_ranked_below_the_store_and_never_sent_to_repair() {
+        let home = crate::mktemp_dir("atv-view").expect("mktemp");
+        let prefix = default_atpkg_prefix(&home);
+        let store = dated_bin(&home, &prefix.join("store/trust/9200"), "2026-09-24");
+        std::os::unix::fs::symlink(
+            prefix.join("store/trust/9200"),
+            prefix.join("store/trust/current"),
+        )
+        .expect("ln current");
+        let view = dated_bin(&home, &prefix.join("rustup/trust"), "2026-09-17");
+        fs::create_dir_all(home.join(".rustup/toolchains")).expect("mkdir");
+        let entry = home.join(".rustup/toolchains/trust");
+        std::os::unix::fs::symlink(prefix.join("rustup/trust"), &entry).expect("ln rustup");
+        let found = || {
+            Toolchain::discover_with_store(
+                None,
+                &home.join(".rustup"),
+                Some(&prefix),
+                OsStr::new(""),
+                Some("trust"),
+            )
+        };
+        let t = found();
+        assert_eq!(t.stage2_dir, store, "the store is the answer");
+        let d = t.demoted.clone().expect("the lagging view is said");
+        assert_eq!(d.dir, view);
+        assert!(d.view && d.linked, "{d:?}");
+        let said = d.sentence();
+        assert!(said.ends_with(REMEDY_VIEW), "{said}");
+        assert!(!said.contains("aterm pkg repair"), "{said}");
+        // Negative control: a foreign link to an older tree is re-pointed by repair.
+        let tree = dated_bin(&home, &home.join("stage2"), "2026-09-17");
+        fs::remove_file(&entry).expect("rm link");
+        std::os::unix::fs::symlink(home.join("stage2"), &entry).expect("ln foreign");
+        let d = found().demoted.expect("a foreign older link is said");
+        assert_eq!((d.dir.as_path(), d.view), (tree.as_path(), false));
+        assert!(d.sentence().ends_with(REMEDY_LINK));
         fs::remove_dir_all(&home).ok();
     }
 

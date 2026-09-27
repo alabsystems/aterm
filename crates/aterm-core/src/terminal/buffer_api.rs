@@ -136,11 +136,6 @@ impl Terminal {
         self.grid.scrollback()
     }
 
-    /// Get a mutable reference to the tiered scrollback storage, if attached.
-    pub fn scrollback_mut(&mut self) -> Option<&mut crate::scrollback::ScrollbackStorage> {
-        self.grid.scrollback_mut()
-    }
-
     /// Drain deferred scrollback rows into attached tiered storage for all grids.
     ///
     /// The grid keeps recently scrolled rows in a lazy buffer for write-path
@@ -151,16 +146,6 @@ impl Terminal {
         if let Some(ref mut alt) = self.alt_grid {
             let _ = alt.scrollback_mut();
         }
-    }
-
-    /// Estimate total memory used by the terminal (grid + alt screen + scrollback).
-    #[must_use]
-    pub fn memory_used(&self) -> usize {
-        let mut total = self.grid.memory_used();
-        if let Some(ref alt) = self.alt_grid {
-            total += alt.memory_used();
-        }
-        total
     }
 
     /// Set the scrollback memory budget (bytes) for the main and alt grids.
@@ -259,7 +244,7 @@ impl Terminal {
     /// Highest scrollback watermark pressure across the main and alternate
     /// grids — the tiered stores' budget watermarks, plus the advisory RING
     /// byte watermark (audit E10a) when one is configured via
-    /// [`set_ring_byte_watermark`](Self::set_ring_byte_watermark), so a
+    /// `set_ring_byte_watermark`, so a
     /// ring-only "unlimited" terminal still reports memory pressure.
     #[must_use]
     pub fn scrollback_pressure_level(&self) -> crate::scrollback::WatermarkLevel {
@@ -282,6 +267,7 @@ impl Terminal {
     /// [`scrollback_pressure_level`](Self::scrollback_pressure_level) report
     /// Yellow/Red as ring memory approaches it. Advisory only (no eviction).
     /// `None` (default) disables it.
+    #[cfg(test)]
     pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
         self.grid.set_ring_byte_watermark(budget);
     }
@@ -464,18 +450,6 @@ impl Terminal {
     #[must_use]
     pub fn has_osc_events(&self) -> bool {
         !self.transient.osc_events.is_empty()
-    }
-
-    /// Check if there is pending response data.
-    #[must_use]
-    pub fn has_pending_response(&self) -> bool {
-        !self.transient.response_buffer.is_empty()
-    }
-
-    /// Get the number of bytes in the response buffer.
-    #[must_use]
-    pub fn pending_response_len(&self) -> usize {
-        self.transient.response_buffer.len()
     }
 
     /// Format text for pasting into the terminal.

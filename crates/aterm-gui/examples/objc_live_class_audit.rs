@@ -307,14 +307,13 @@
 
 /// Every row agreed with the runtime's own authority.
 ///
-/// The `allow` is scoped to the builds where the constant is genuinely
-/// unreachable — off macOS the only outcome is `NOT_RUN` — rather than to the
-/// whole file, so the four codes can still be declared together where the
-/// contract is stated.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Off macOS the only outcome is `NOT_RUN`, so the three macOS outcomes are
+/// gated to it; the four codes are still declared together where the contract
+/// is stated.
+#[cfg(target_os = "macos")]
 const PASS: i32 = 0;
 /// At least one finding. See the transcript.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
 /// The audit could not execute here. NOT a pass; see the module docs.
 const NOT_RUN: i32 = 2;
@@ -330,6 +329,7 @@ const NOT_RUN: i32 = 2;
 /// a shape) under a label that says which claim was actually made, so a reader
 /// six months later can tell the two runs apart. See `objc_audit_outcome` in
 /// `crates/aterm-verify/src/stages.rs`, which is where that label lives.
+#[cfg(target_os = "macos")]
 const FORK_DECLARED: i32 = 3;
 
 #[cfg(not(target_os = "macos"))]

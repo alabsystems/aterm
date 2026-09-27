@@ -68,6 +68,7 @@ impl MetalResourceDevice {
     }
 
     /// The loss domain this mint stamps.
+    #[cfg(test)]
     pub(crate) const fn latch(&self) -> &Arc<LossLatch> {
         &self.latch
     }

@@ -12,8 +12,10 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::f32::consts::TAU;
+#[cfg(all(not(test), any(target_os = "macos", windows)))]
+use std::sync::atomic::AtomicBool;
 #[cfg(not(test))]
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use aterm_render::Theme;
 
@@ -60,7 +62,7 @@ static TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
 /// "nothing moved", skipped the `last_strip_fp` invalidation, and left every
 /// PRE-EXISTING window painting the old OS palette until the next tab open/close.
 /// Latching makes the answer independent of who happened to read first.
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "macos", windows)))]
 static CHROME_INPUTS_MOVED: AtomicBool = AtomicBool::new(false);
 
 // Same test/production split, and the same rationale, as the snapshot below: libtest
@@ -73,6 +75,7 @@ thread_local! {
 
 /// Record that an OS-owned chrome input moved. Idempotent; see
 /// [`CHROME_INPUTS_MOVED`].
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn note_chrome_inputs_moved() {
     #[cfg(test)]
     TEST_CHROME_INPUTS_MOVED.with(|slot| slot.set(true));
@@ -83,6 +86,7 @@ pub(crate) fn note_chrome_inputs_moved() {
 /// Consume the latch: `true` when an OS-owned chrome input has moved since the last
 /// re-sample settled the windows. THE one caller is `App::resample_os_preferences`.
 #[must_use]
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn take_chrome_inputs_moved() -> bool {
     #[cfg(test)]
     {
@@ -135,6 +139,8 @@ pub(crate) fn install_preferences(preferences: AppearancePreferences) -> bool {
             old_flags != flags || old_scale != preferences.text_scale.to_bits()
         }
     };
+    // Only the hosts that re-sample OS preferences read the latch.
+    #[cfg(any(target_os = "macos", windows, test))]
     if moved {
         note_chrome_inputs_moved();
     }

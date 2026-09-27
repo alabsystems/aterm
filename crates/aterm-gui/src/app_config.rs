@@ -15,7 +15,8 @@ use winit::dpi::PhysicalSize;
 use crate::input::{InputEvent, Source};
 use crate::platform::AppRt;
 use crate::{
-    App, Backend, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget, WindowId, keybinding, term_lock,
+    App, Backend, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget, WindowId, keybinding, launch,
+    term_lock,
 };
 
 /// THE PLATFORM DEFAULT for decoration that paints OVER content the user is trying
@@ -89,12 +90,12 @@ pub(crate) const DEFAULT_DECORATIVE_EFFECTS: bool = !cfg!(windows);
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
-    /// Glyph size in physical px (like `$ATERM_FONT_PX`).
+    /// Glyph size in physical px (`--font-px` outranks it for one launch).
     pub(crate) font_px: Option<f32>,
     /// GPU (wgpu/Metal/Vulkan) rendering. Default ON (all platforms) with an
     /// automatic CPU fallback if the GPU is unavailable (device init OR the first
-    /// window's surface fails); set `gpu = false` (or `--cpu` / `$ATERM_CPU`) to
-    /// force the CPU renderer. `$ATERM_GPU` forces on.
+    /// window's surface fails); set `gpu = false` (or launch with `--cpu`) to
+    /// force the CPU renderer. `--gpu` forces on.
     pub(crate) gpu: Option<bool>,
     /// Scrollback history limit, in lines (engine `TerminalConfig.scrollback_limit`;
     /// default 100 000). 0 means unlimited (bounded only by the memory budget).
@@ -201,8 +202,8 @@ pub(crate) struct Config {
     /// keystroke peaks ≈ −22 dBFS: audible in a quiet room, far under the
     /// bell). Config-file only; the panel exposes the on/off toggle.
     pub(crate) trail_sound_volume: Option<f32>,
-    /// Trail sound AMBIENT BED (`trail_sound_bed`, default OFF — the owner
-    /// dislikes the drone): the continuous per-style background texture that
+    /// Trail sound AMBIENT BED (`trail_sound_bed`, default ON since the owner's
+    /// 2026-09-09 ruling): the continuous per-style background texture that
     /// swells behind fast typing (water's stream, fire's ember wash, the
     /// beam's hum…). `false` gates the bed mixer ENTIRELY — the synth's bed
     /// layer is never fed, so it renders exactly zero samples (not a muted
@@ -303,6 +304,23 @@ pub(crate) struct Config {
     /// Parsed and preserved everywhere; INERT off macOS/Windows, which have no
     /// beep call to gate (see `crate::diagnostics` capability warnings).
     pub(crate) bell_sound: Option<bool>,
+    /// THE SUPERVISOR'S CHOICE CHIME (`choice_sound`, default ON — the owner's
+    /// "a little sound … for choosing", 2026-09-23).
+    ///
+    /// When the in-window supervisor answers Claude Code's question dialog
+    /// (`[harness] answer_questions`, or the session's own `meta set questions
+    /// recommended`), the window tells it as a `chose` story and plays one
+    /// short, quiet chime through the cursor-trail synth's output
+    /// (`App::chose_chime`). Bell-class, not trail-class: it plays for a
+    /// session in a background tab too, because the point is that the human
+    /// NOTICES a question was answered without them — but never headless,
+    /// never in serious mode, never with the Music effects master
+    /// (`trail_sounds`) off, and at most one per two seconds. `false` silences
+    /// the chime only; the band's `◆ chose` flash and the rim pulse stay.
+    ///
+    /// Parsed and preserved everywhere; INERT off macOS, where the synth has
+    /// no output (see `crate::diagnostics` capability warnings).
+    pub(crate) choice_sound: Option<bool>,
     /// Trail colour, `#RRGGBB`. Defaults to the (themed) cursor colour, so the
     /// trail matches the cursor unless overridden here.
     pub(crate) cursor_trail_color: Option<String>,
@@ -472,8 +490,8 @@ pub(crate) struct Config {
     /// smart discovery — `"bash"` finds Git for Windows' `bash.exe` even off
     /// `%PATH%`, `"pwsh"`/`"cmd"`/`"wsl"`/`"nu"` resolve too — or an absolute path
     /// used verbatim. Unset → the platform default (Windows: pwsh → powershell →
-    /// cmd; Unix: `$SHELL`). Overridden by the `--shell` flag and, on Windows,
-    /// still by `%ATERM_SHELL%` when this is unset. See `windows::shell`.
+    /// cmd; Unix: `$SHELL`). Overridden by the `--shell` flag. See
+    /// `windows::shell`.
     ///
     /// Shell-integration tier by shell: zsh/bash/fish/pwsh and `"wsl"` (whose
     /// distro must use bash as its login shell) get the full OSC 7 + OSC 133
@@ -501,8 +519,8 @@ pub(crate) struct Config {
     pub(crate) search_history_lines: Option<u32>,
     /// Primary font FAMILY name (e.g. `"JetBrains Mono"`). Resolved to a font
     /// file via [`resolve_font_family`]; on a miss the loader falls back to
-    /// `$ATERM_FONT` then the built-in [`FONT_CANDIDATES`], so an unset / unknown
-    /// family is byte-identical to before.
+    /// the built-in [`FONT_CANDIDATES`], so an unset / unknown family is
+    /// byte-identical to before. `--font` outranks it for one launch.
     pub(crate) font_family: Option<String>,
     /// DISPLAY FACE (`display_font`): one of the bundled display faces by id
     /// (`"pixel"`, `"chunky"`, `"engraved"`, `"bubble"` —
@@ -511,8 +529,8 @@ pub(crate) struct Config {
     /// `display:<id>` from embedded bytes, never the filesystem). Unset = the
     /// normal font selection, byte-identical to before this key existed. The
     /// Settings "Display Faces" page drives this as mutually-exclusive
-    /// toggles (all off ⇒ the key is cleared). Hot-reloadable. `$ATERM_FONT`
-    /// still outranks it (env > config, the one precedence law).
+    /// toggles (all off ⇒ the key is cleared). Hot-reloadable. `--font`
+    /// still outranks it (launch flag > config, the one precedence law).
     ///
     /// `game_font` is the DEPRECATED spelling and stays a serde alias: deleting
     /// a shipped key would turn every config that carries it into a complaint
@@ -543,16 +561,15 @@ pub(crate) struct Config {
     /// most-preferred first — `fallback_fonts = ["Sarasa Mono", "Apple Symbols"]`
     /// or the comma-separated string form `fallback_fonts = "Sarasa Mono, Apple
     /// Symbols"` (what the Settings editor writes). Explicit entries strictly
-    /// outrank the deprecated `$ATERM_FALLBACK_FONT` alias, which outranks the
-    /// built-in discovery candidates (the renderer's proven
+    /// outrank the built-in discovery candidates (the renderer's proven
     /// `fallback_chain_order` law). Hot-reloadable.
     pub(crate) fallback_fonts: Option<FontList>,
     /// Monochrome SYMBOL fallback face (W6): family name or path, consulted only
-    /// after the primary + broad fallback miss. Outranks the deprecated
-    /// `$ATERM_SYMBOL_FONT` alias, then discovery. Hot-reloadable.
+    /// after the primary + broad fallback miss. Outranks discovery.
+    /// Hot-reloadable.
     pub(crate) symbol_font: Option<String>,
-    /// Colour-EMOJI face (W6): family name or path. Outranks the deprecated
-    /// `$ATERM_EMOJI_FONT` alias, then discovery. Hot-reloadable.
+    /// Colour-EMOJI face (W6): family name or path. Outranks discovery.
+    /// Hot-reloadable.
     pub(crate) emoji_font: Option<String>,
     /// Window CHROME appearance (titlebar / traffic lights), independent of the
     /// terminal body theme: `"auto"` (default — follow the OS light/dark setting,
@@ -668,8 +685,6 @@ pub(crate) struct Config {
     /// `aterm_cli::WindowingBehavior` (that crate owns the front-door grammar
     /// and this crate does not depend on it); an unrecognized value warns once
     /// and falls back to `new_window` — a typo may not move where terminals open.
-    /// `$ATERM_WINDOWING_BEHAVIOR` overrides it, as every other key's env twin
-    /// does.
     pub(crate) windowing_behavior: Option<String>,
     /// Show the subtle TOP-RIGHT build/version badge (`v{version} · {build}`) so the
     /// running build is answerable at a glance without opening About. Default OFF.
@@ -883,19 +898,16 @@ pub(crate) struct Config {
     /// compensation. ABSENT/0 = off. Clamped 0..=300.
     pub(crate) font_weight_dark_nudge: Option<f32>,
     /// Aesthetic stem-weight gamma applied to glyph coverage (`< 1.0`
-    /// thickens, `> 1.0` thins; clamped 0.30..=3.0). The config alias of the
-    /// `ATERM_STEM_GAMMA` env var, which still takes precedence (the usual
-    /// env-over-config-over-default order). ABSENT = `1.0` (identity — the
-    /// linear-light pipeline needs no correction). Hot-reloadable.
+    /// thickens, `> 1.0` thins; clamped 0.30..=3.0). ABSENT = `1.0` (identity —
+    /// the linear-light pipeline needs no correction). Hot-reloadable.
     pub(crate) stem_gamma: Option<f32>,
     /// Native (Linux/Windows) glyph grid-fitting mode (W13/R2): `"full"` (the
     /// autohinter snaps stems in BOTH axes, the crispest grayscale result,
     /// measured side-by-side against `light`/`native`/`off` in the R2
     /// evidence), `"light"` (vertical-only — the desktop `hintslight` look),
     /// `"native"` (the font's own bytecode when it has one), or `"off"` (no
-    /// grid fitting — the raw fontdue raster). The config alias of the
-    /// `ATERM_FONT_HINTING` env var, which still takes precedence. ABSENT (or
-    /// an unrecognized spelling) = `"full"`. LIVE on Linux and Windows; inert
+    /// grid fitting — the raw fontdue raster). ABSENT (or an unrecognized
+    /// spelling) = `"full"`. LIVE on Linux and Windows; inert
     /// on macOS, where CoreText applies its own grid discipline.
     /// Hot-reloadable (drops the glyph atlas).
     pub(crate) font_hinting: Option<String>,
@@ -903,12 +915,10 @@ pub(crate) struct Config {
     /// (the DEFAULT — grayscale everywhere, byte-identical to before),
     /// `"rgb"` (per-channel LCD coverage on horizontal-RGB panels), or
     /// `"bgr"`. CPU-COMPOSITOR ONLY this stage: the GPU backend renders
-    /// grayscale regardless (run with `gpu = false` / `--cpu` / `$ATERM_CPU`
-    /// to see it), and the CPU path itself falls back to grayscale under
-    /// translucency (`background_opacity < 1`) or a wallpaper, and for
-    /// non-primary-family glyphs. The config alias of the
-    /// `ATERM_FONT_SUBPIXEL` env var, which still takes precedence. ABSENT
-    /// (or an unrecognized spelling) = `"off"`. Inert on macOS (subpixel was
+    /// grayscale regardless (run with `gpu = false` / `--cpu` to see it), and
+    /// the CPU path itself falls back to grayscale under translucency
+    /// (`background_opacity < 1`) or a wallpaper, and for non-primary-family
+    /// glyphs. ABSENT (or an unrecognized spelling) = `"off"`. Inert on macOS (subpixel was
     /// removed OS-wide) and Windows. Hot-reloadable.
     pub(crate) font_subpixel: Option<String>,
     /// Line-height multiplier on the cell BOX (W5a): rows space out (or
@@ -1065,9 +1075,14 @@ pub(crate) struct Config {
     /// The fabric bridge (`[fabric]`): the `aterm-link serve …` child this
     /// instance launches, holding the far ends of two socketpairs at fds 3 and 4
     /// and speaking `Scope::Bridge` over them. Absent ⇒ no fabric (secure
-    /// default, exactly like the embedded operator). `ATERM_FABRIC_COMMAND`
-    /// overrides it. See [`FabricConfig`] and [`crate::fabric_launch`].
+    /// default, exactly like the embedded operator). The one spelling in a shipped
+    /// build (a development build's `ATERM_FABRIC_COMMAND` seam overrides it). See
+    /// [`FabricConfig`] and [`crate::fabric_launch`].
     pub(crate) fabric: Option<FabricConfig>,
+    /// The embedded operator (`[operator]`): the EXPERIMENTAL in-process observer
+    /// and durable attention queue behind `aterm fleet manage`. Absent ⇒ OFF. See
+    /// [`OperatorConfig`] and [`crate::operator_host`].
+    pub(crate) operator: Option<OperatorConfig>,
     /// In-app self-update (`[update]`): whether the silent updater runs (`enabled`), how
     /// a staged build applies (`auto_apply`), and — in a DEVELOPMENT build only — which
     /// GitHub repo it pulls notarized releases from. Absent ⇒ on, and the compiled-in
@@ -1123,12 +1138,13 @@ pub(crate) struct Config {
     /// an edit; the GUI only displays and edits it.
     /// Absent ⇒ both on. See [`MachineConfig`].
     pub(crate) machine: Option<MachineConfig>,
-    /// The aterm WRAPPER's durable master switch (`[harness]`, design
-    /// `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2). Absent ⇒ ON. It is
-    /// here rather than in the harness's own config so the kill switch never
-    /// depends on the thing it kills; `aterm harness status` reads this same
-    /// file itself, with no GUI in the path. See [`HarnessConfig`].
-    pub(crate) harness: Option<HarnessConfig>,
+    /// The supervisor's `[harness]` policy, as the table's ONE reader takes it
+    /// from the file's whole text ([`HarnessPolicy`]). Not deserialized: that
+    /// reader also reads a `harness.<key>` written below another table's
+    /// header and a file that is not TOML at all, so the loader sets it
+    /// ([`Config::parse`]).
+    #[serde(skip)]
+    pub(crate) harness: HarnessPolicy,
 }
 
 /// Source used to produce a terminal's live, human-readable description.
@@ -1678,7 +1694,7 @@ impl ThemeCatalog {
         Self::discover_in_with(directory, true, || {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn try_discover_in_after_scan(
         directory: &std::path::Path,
         after_scan: impl FnOnce(),
@@ -2544,137 +2560,60 @@ pub(crate) struct PresenceConfig {
     pub(crate) rim: Option<bool>,
 }
 
-/// The `[harness]` table (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
-/// §4.6.2): the DURABLE master switch for the aterm wrapper — the harness
-/// that watches, classifies and journals over a vendor program running inside
-/// a session.
+/// The `[harness]` table as the supervisor reads it: the policy every agent
+/// session this window hosts is supervised under, and one note per key its
+/// reader refused or found outside the root table.
 ///
-/// It lives HERE and not in the harness's own config precisely so it still
-/// works when the harness tree is missing, broken or mid-update: *"the kill
-/// switch may never depend on the thing it kills"* (design §4.6.2). Everything
-/// finer — which capabilities are on, and the policy each one follows — lives
-/// in the harness's own state, and `aterm harness enable|disable` is what
-/// edits it. No key exists in both homes.
-///
-/// Absent ⇒ ON, which is what [`Config::harness_enabled`] encodes: a fresh
-/// machine has no `aterm.toml`, and reading that as "the owner switched it
-/// off" would make the product inert out of the box for a reason nothing
-/// displays.
-///
-/// THE SUPERVISOR'S POLICY lives in the same table (2026-09-23): every other
-/// key is one of [`aterm_agent::supervise::config::KEYS`], kept as written
-/// ([`Self::keys`]) and applied by [`Config::harness_policy`] — so the host and
-/// the engine read one struct, and a changed key makes a changed `Config` (a
-/// reload that only edits `[harness] continue` is not deduped away). The
-/// table parses whatever its values are: a value the policy refuses is a
-/// config notice ([`Config::harness_notices`]), never a failed load.
-#[derive(Default, Clone, PartialEq)]
-pub(crate) struct HarnessConfig {
-    /// The master switch. Absent ⇒ ON; `false` re-renders the `agents/` twin
-    /// without the harness prelude, so the NEXT launch is plain, and stops the
-    /// in-GUI supervisor at once. It is the one switch: the per-session
-    /// `$ATERM_NO_HARNESS` bypass is gone (2026-09-23).
-    pub(crate) enabled: Option<bool>,
-    /// Every key the table holds, `enabled` included, in key order.
-    pub(crate) keys: Vec<(String, HarnessValue)>,
+/// Read by [`aterm_agent::supervise::SupervisorConfig::from_aterm_toml`], the
+/// table's ONE reader — the same one `aterm drive watch|supervise` and the
+/// live-upgrade sweep read it with — so no two of them disagree on a key, a
+/// default or a refusal. Its rule is the owner's (2026-09-24): every power is
+/// on by default and the file can only take power away; a malformed value is
+/// its key's limit, and a `false` filed under another table still limits.
+/// Part of [`Config`]'s `PartialEq`, so a reload that only edits `[harness]`
+/// is not deduped away.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct HarnessPolicy {
+    /// The policy.
+    pub(crate) policy: aterm_agent::supervise::SupervisorConfig,
+    /// What the reader said about the file.
+    pub(crate) notes: Vec<String>,
 }
 
-/// One `[harness]` value, as the policy's [`SupervisorConfig::set`] takes its
-/// text ([`Self::text`]).
-///
-/// [`SupervisorConfig::set`]: aterm_agent::supervise::SupervisorConfig::set
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum HarnessValue {
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Str(String),
-    /// An array, each element as its text.
-    List(Vec<String>),
-    /// A table or a date: nothing the policy takes.
-    Other(&'static str),
-}
-
-impl HarnessValue {
-    /// The text [`SupervisorConfig::set`] parses: `true`/`false`, a decimal,
-    /// the string itself, an array's elements joined by `,`.
-    ///
-    /// [`SupervisorConfig::set`]: aterm_agent::supervise::SupervisorConfig::set
-    pub(crate) fn text(&self) -> String {
-        match self {
-            Self::Bool(b) => b.to_string(),
-            Self::Int(n) => n.to_string(),
-            Self::Float(f) => f.to_string(),
-            Self::Str(s) => s.clone(),
-            Self::List(items) => items.join(","),
-            Self::Other(what) => format!("<{what}>"),
-        }
+impl HarnessPolicy {
+    /// The policy `text` — the whole `aterm.toml` — writes.
+    pub(crate) fn read(text: &str) -> Self {
+        let (policy, notes) = aterm_agent::supervise::SupervisorConfig::from_aterm_toml(text);
+        Self { policy, notes }
     }
-}
 
-impl<'de> serde::Deserialize<'de> for HarnessValue {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Visit;
-        impl<'de> serde::de::Visitor<'de> for Visit {
-            type Value = HarnessValue;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a [harness] value")
-            }
-            fn visit_bool<E>(self, v: bool) -> Result<HarnessValue, E> {
-                Ok(HarnessValue::Bool(v))
-            }
-            fn visit_i64<E>(self, v: i64) -> Result<HarnessValue, E> {
-                Ok(HarnessValue::Int(v))
-            }
-            fn visit_u64<E>(self, v: u64) -> Result<HarnessValue, E> {
-                Ok(i64::try_from(v).map_or(HarnessValue::Float(v as f64), HarnessValue::Int))
-            }
-            fn visit_f64<E>(self, v: f64) -> Result<HarnessValue, E> {
-                Ok(HarnessValue::Float(v))
-            }
-            fn visit_str<E>(self, v: &str) -> Result<HarnessValue, E> {
-                Ok(HarnessValue::Str(v.to_string()))
-            }
-            fn visit_string<E>(self, v: String) -> Result<HarnessValue, E> {
-                Ok(HarnessValue::Str(v))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<HarnessValue, A::Error> {
-                let mut items = Vec::new();
-                while let Some(item) = seq.next_element::<HarnessValue>()? {
-                    items.push(item.text());
-                }
-                Ok(HarnessValue::List(items))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<HarnessValue, A::Error> {
-                while map
-                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                    .is_some()
-                {}
-                Ok(HarnessValue::Other("a table"))
-            }
-        }
-        d.deserialize_any(Visit)
+    /// The policy the file at `path` writes: no file is the defaults.
+    pub(crate) fn read_path(path: Option<&std::path::Path>) -> Self {
+        let (policy, notes) = aterm_agent::supervise::SupervisorConfig::from_path(path);
+        Self { policy, notes }
     }
-}
 
-impl<'de> serde::Deserialize<'de> for HarnessConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let table: std::collections::BTreeMap<String, HarnessValue> =
-            serde::Deserialize::deserialize(d)?;
-        let enabled = match table.get("enabled") {
-            Some(HarnessValue::Bool(b)) => Some(*b),
-            _ => None,
-        };
-        Ok(Self {
-            enabled,
-            keys: table.into_iter().collect(),
-        })
+    /// What the policy is, in the words Settings ▸ Harness shows: `Automatic`
+    /// when every key is at its full-power default, `Off` when the master
+    /// switch is, else `Automatic · limited: <key: value> · …` — each written
+    /// key named as the LIMIT it is, never as a feature switched on, because
+    /// none can switch one on (the rule above) — and `· yours: <key>, …` for
+    /// what the file changed without limiting (a text). Which is which is the
+    /// contract's own reading (`SupervisorConfig::against_default`); this only
+    /// formats it.
+    pub(crate) fn words(&self) -> String {
+        if !self.policy.enabled {
+            return "Off: no agent session is supervised".to_string();
+        }
+        let written = self.policy.against_default();
+        let mut words = "Automatic".to_string();
+        if !written.limits.is_empty() {
+            words += &format!(" \u{b7} limited: {}", written.limits.join(" \u{b7} "));
+        }
+        if !written.own.is_empty() {
+            words += &format!(" \u{b7} yours: {}", written.own.join(", "));
+        }
+        words
     }
 }
 
@@ -2972,12 +2911,12 @@ pub(crate) struct MachineConfig {
     pub(crate) spotlight_noindex: Option<bool>,
 }
 
-/// The `[net]` table: the inbound listener settings (persisting what was
-/// `ATERM_NET_LISTEN`/`_CERT`/`_KEY`) and the outbound `[[net.connections]]`
-/// registry. Every field optional; an empty/absent table is the secure default
-/// (no port bound, nothing to dial). Env vars still OVERRIDE the listener fields,
-/// and the listener binds ONLY in a top-level aterm (never one launched inside
-/// another aterm — see [`crate::net_listen`]).
+/// The `[net]` table: the inbound listener settings and the outbound
+/// `[[net.connections]]` registry. Every field optional; an empty/absent table is
+/// the secure default (no port bound, nothing to dial). The table is the one
+/// spelling — no environment variable overrides it (2026-09-24) — and the
+/// listener binds ONLY in a top-level aterm (never one launched inside another
+/// aterm — see [`crate::net_listen`]).
 ///
 /// ```toml
 /// [net]
@@ -3003,11 +2942,11 @@ pub(crate) struct NetConfig {
     /// Inbound numeric `IP:port` bind address for the TLS listener, e.g.
     /// `"0.0.0.0:7100"` or `"[::1]:7100"`. Hostnames are deliberately rejected
     /// so startup and Manual validation never block on DNS. Absent ⇒ listener
-    /// OFF. (`ATERM_NET_LISTEN` overrides.)
+    /// OFF.
     pub(crate) listen: Option<String>,
-    /// Path to the operator's server certificate (DER). (`ATERM_NET_CERT` overrides.)
+    /// Path to the operator's server certificate (DER).
     pub(crate) cert: Option<String>,
-    /// Path to the server private key (PKCS#8 DER). (`ATERM_NET_KEY` overrides.)
+    /// Path to the server private key (PKCS#8 DER).
     pub(crate) key: Option<String>,
     /// Saved remote endpoints this aterm can `dial <name>` to drive.
     pub(crate) connections: Vec<Connection>,
@@ -3071,6 +3010,36 @@ pub(crate) struct Connection {
 pub(crate) struct FabricConfig {
     /// The bridge command line. Absent or blank ⇒ the fabric is off.
     pub(crate) command: Option<String>,
+}
+
+/// The `[operator]` table: whether this process starts the embedded operator.
+///
+/// ```toml
+/// [operator]
+/// enabled = true   # then `aterm fleet manage <sid>`
+/// ```
+///
+/// OFF by default and on purpose: a new profile's managed allowlist is empty, so
+/// an operator nobody opted into observes nothing while still costing a resident
+/// thread, a durable WAL under the state root and a place in the self-update path
+/// (`docs/OPERATOR-EMBEDDED.md`). This key is the one spelling — the
+/// `ATERM_OPERATOR` / `ATERM_NO_OPERATOR` / `ATERM_OPERATOR_PROFILE` variables are
+/// gone (2026-09-24). Read once, at launch.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct OperatorConfig {
+    /// Start the embedded operator. Absent ⇒ `false`.
+    pub(crate) enabled: Option<bool>,
+}
+
+impl Config {
+    /// Whether this process starts the embedded operator (`[operator] enabled`).
+    pub(crate) fn operator_enabled(&self) -> bool {
+        self.operator
+            .as_ref()
+            .and_then(|operator| operator.enabled)
+            .unwrap_or(false)
+    }
 }
 
 /// The `[update]` table: whether the in-app self-updater runs (`enabled`, "Check for
@@ -3214,7 +3183,7 @@ pub(crate) fn update_auto_apply(config: &Config) -> bool {
 /// is a no-op ([`crate::platform::AppRtLinux`]), so the in-grid strip is the ONLY
 /// tab UI: it defaults to `1` row, otherwise a second/third tab is completely
 /// invisible and un-switchable by mouse. Override either way with config
-/// `tab_strip_rows = N` or `ATERM_TAB_STRIP_ROWS`.
+/// `tab_strip_rows = N`.
 #[cfg(target_os = "macos")]
 pub(crate) const DEFAULT_TAB_STRIP_ROWS: u16 = 0;
 /// See the macOS variant above — non-macOS defaults the in-grid strip ON.
@@ -3223,16 +3192,13 @@ pub(crate) const DEFAULT_TAB_STRIP_ROWS: u16 = 1;
 /// Upper clamp on `tab_strip_rows` so a mis-set config can't starve the terminal.
 pub(crate) const MAX_TAB_STRIP_ROWS: u16 = 4;
 
-/// Resolve the configured tab-strip row count (env `ATERM_TAB_STRIP_ROWS` wins, then
-/// config, then [`DEFAULT_TAB_STRIP_ROWS`]), clamped to `0..=MAX_TAB_STRIP_ROWS`.
-/// Env precedence mirrors the other window settings (env > config > default).
+/// Resolve the configured tab-strip row count (config, else
+/// [`DEFAULT_TAB_STRIP_ROWS`]), clamped to `0..=MAX_TAB_STRIP_ROWS`.
 pub(crate) fn resolve_tab_strip_rows(config: &Config) -> u16 {
-    let raw = std::env::var("ATERM_TAB_STRIP_ROWS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .or(config.tab_strip_rows)
-        .unwrap_or(DEFAULT_TAB_STRIP_ROWS);
-    raw.min(MAX_TAB_STRIP_ROWS)
+    config
+        .tab_strip_rows
+        .unwrap_or(DEFAULT_TAB_STRIP_ROWS)
+        .min(MAX_TAB_STRIP_ROWS)
 }
 
 /// Resolve the ⌘F / socket `search` index depth cap from `search_history_lines`: how
@@ -3282,6 +3248,28 @@ pub(crate) fn resolve_theme_name_value(
 }
 
 impl Config {
+    /// `aterm.toml`'s text as the running configuration: the typed parse, and
+    /// the `[harness]` policy the table's one reader takes from the same text
+    /// ([`HarnessPolicy::read`]). Every load the window runs on comes through
+    /// here — the launch ([`load_config`]) and the config service's every
+    /// observation and patch — so the policy is always the file's.
+    pub(crate) fn parse(text: &str) -> Result<Self, aterm_toml::Error> {
+        let mut config: Self = aterm_toml::from_str(text)?;
+        config.harness = HarnessPolicy::read(text);
+        Ok(config)
+    }
+
+    /// What a load runs on when `text` is not a configuration: every setting
+    /// at its default, and the `[harness]` lines the owner wrote still read
+    /// (the table's reader reads a file that is not TOML line by line), so a
+    /// limit written there holds through a typo in any other table.
+    pub(crate) fn stand_in(text: &str) -> Self {
+        Self {
+            harness: HarnessPolicy::read(text),
+            ..Self::default()
+        }
+    }
+
     /// Resolve the scheme NAME this config selects for `appearance`, honouring the
     /// optional OS-appearance SPLIT `theme = "dark:<name>,light:<name>"`.
     ///
@@ -3717,8 +3705,8 @@ impl Config {
         self.notice_sparkle.unwrap_or(true)
     }
 
-    /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is
-    /// opt-in; see the field docs: notes/brrrring/bonk/melody unaffected).
+    /// Ambient-bed on/off (`trail_sound_bed`, default ON since 2026-09-09; see
+    /// the field docs: notes/brrrring/bonk/melody unaffected).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
         // ON by default — the owner, 2026-09-09: "i don't know what rainbow sky
         // bed is but turn it on and let me see it". The pad is voiced from the
@@ -3743,6 +3731,14 @@ impl Config {
     /// does not reach this: the beep is an OS sound, not a synth voice.
     pub(crate) fn bell_sound_or_default(&self) -> bool {
         self.bell_sound.unwrap_or(true)
+    }
+
+    /// The supervisor's choice chime on/off (`choice_sound`, default ON).
+    /// Gates ONLY the chime a `chose` story plays — never the band's flash or
+    /// the rim pulse. Read by `App::chose_chime` after serious mode and the
+    /// Music effects master, and before the chime's own rate limiter.
+    pub(crate) fn choice_sound_or_default(&self) -> bool {
+        self.choice_sound.unwrap_or(true)
     }
 
     /// The parsed `trail_sound_style` voice (default `"auto"` → follow the
@@ -4814,116 +4810,42 @@ impl Config {
         self.presence.as_ref().and_then(|p| p.rim).unwrap_or(true)
     }
 
-    /// The `[harness] enabled` RESOLVED bit (default TRUE): whether the aterm
-    /// wrapper arms on the next launch.
-    ///
-    /// The one switch (the per-session `$ATERM_NO_HARNESS` bypass that used to sit
-    /// beside it is gone, 2026-09-23): this resolver answers "what does the file
-    /// say", which is what the Settings row seeds from and what `aterm harness`
-    /// reads out of the same file with no GUI in the path (`aterm_agent::harness::
-    /// mark`), so the switch the owner can see in
-    /// Settings never silently means something else than the file.
-    ///
-    /// It is the SUPERVISOR'S bit ([`Self::harness_policy`]), so the launcher
-    /// and the supervisor cannot disagree: absent is ON, and a value the
-    /// policy refuses (`enabled = "no"`, `enabled = 0`) is OFF, as the
-    /// supervisor reads it — the owner wrote the key to say something, and
-    /// the switch that presses fails closed.
+    /// The `[harness] enabled` RESOLVED bit (default TRUE): whether the
+    /// window supervises the agent sessions it hosts — the Settings ▸ Harness
+    /// row. It is the SUPERVISOR'S bit ([`Self::harness`], read by the
+    /// table's one reader), so the row and the supervisor cannot disagree:
+    /// absent is ON, and a value the reader cannot take (`enabled = "no"`,
+    /// `enabled = 0`) or a `false` filed under another table is OFF.
     pub(crate) fn harness_enabled(&self) -> bool {
-        self.harness_policy().0.enabled
+        self.harness.policy.enabled
     }
 
-    /// The policy the supervisor host STARTS under: [`Self::harness_policy`]
-    /// — unless the launch could not load `aterm.toml` (`load_failed`,
-    /// [`launch_load_failed`]), when `self` is the defaults stand-in and
-    /// the host escalates only ([`SupervisorConfig::escalate_only`]) until a
-    /// load or reload supplies the owner's table. The defaults act on every
-    /// switch, so falling back to them would turn a typo anywhere in the
-    /// file into full autonomy (the safety review of 2026-09-24).
-    ///
-    /// [`SupervisorConfig::escalate_only`]: aterm_agent::supervise::SupervisorConfig::escalate_only
-    pub(crate) fn harness_policy_at_launch(
-        &self,
-        load_failed: bool,
-    ) -> aterm_agent::supervise::SupervisorConfig {
-        if load_failed {
-            aterm_agent::supervise::SupervisorConfig::escalate_only()
-        } else {
-            self.harness_policy().0
+    /// The `[harness] approve` RESOLVED level (`all` by default; owner,
+    /// 2026-09-24): what the supervisor answers a permission box with —
+    /// `all`, `safe` or `none`. Read from the same one reader as
+    /// [`Self::harness_enabled`], so the Settings row and the supervisor cannot
+    /// disagree: a value the reader cannot take is its limit here too.
+    pub(crate) fn harness_approve(&self) -> &'static str {
+        use aterm_agent::supervise::config::Approve;
+        match self.harness.policy.approve {
+            Approve::All => "all",
+            Approve::Safe => "safe",
+            Approve::None => "none",
         }
     }
 
-    /// The supervisor's policy: [`SupervisorConfig::default`] (the owner
-    /// decisions the 2026-09-23 audit adopted) with every `[harness]` key the
-    /// file sets applied by [`SupervisorConfig::set`], and the refusals, one
-    /// sentence each.
-    ///
-    /// It FAILS CLOSED, because every default that acts is ON: a switch whose
-    /// value is refused (`rm_breaker = "no"`, `enabled = 0`) resolves OFF,
-    /// `continue_per_hour` resolves to 0, and a key the policy does not know
-    /// (`rm_breakr = false` — the owner meant to say something about
-    /// pressing) turns every approval rule off, so nothing is pressed until
-    /// the file is fixed. Each refusal's sentence says what it resolved to.
-    /// The unknown key's own refusal is left to the config language's
-    /// ignored-key notice ([`collect_key_notices`]); what it did to the
-    /// approvals is [`Self::harness_notices`]'s.
-    ///
-    /// [`SupervisorConfig::default`]: aterm_agent::supervise::SupervisorConfig
-    /// [`SupervisorConfig::set`]: aterm_agent::supervise::SupervisorConfig::set
-    pub(crate) fn harness_policy(&self) -> (aterm_agent::supervise::SupervisorConfig, Vec<String>) {
-        use aterm_agent::supervise::{ApprovalToggles, config::KEYS};
-        let mut cfg = aterm_agent::supervise::SupervisorConfig::default();
-        let mut refused = Vec::new();
-        let mut unknown = Vec::new();
-        for (key, value) in self.harness.iter().flat_map(|h| h.keys.iter()) {
-            let Err(e) = cfg.set(key, &value.text()) else {
-                continue;
-            };
-            if !KEYS.contains(&key.as_str()) {
-                unknown.push(key.as_str());
-                refused.push(e);
-                continue;
-            }
-            // The one text key a value can be refused for, and the one
-            // count; every other refusable key is a switch.
-            let closed = match key.as_str() {
-                "continue_text" => None,
-                "continue_per_hour" => Some("0"),
-                _ => Some("false"),
-            };
-            match closed {
-                Some(off) if cfg.set(key, off).is_ok() => {
-                    refused.push(format!("{e}; {key} = {off} until it is fixed"));
-                }
-                _ => refused.push(e),
-            }
-        }
-        if !unknown.is_empty() {
-            cfg.approvals = ApprovalToggles::off();
-            refused.push(format!(
-                "[harness] {}: {} the supervisor does not know, so every approval rule is \
-                 off (nothing is pressed) until it is fixed or removed",
-                unknown.join(", "),
-                if unknown.len() == 1 { "a key" } else { "keys" },
-            ));
-        }
-        (cfg, refused)
-    }
-
-    /// The `[harness]` values the policy refused, as config notices (`config
-    /// [harness] <key>: …`), each with what it resolved to — and, for an
-    /// unknown key, that the approvals are off. The unknown key's bare
-    /// refusal is not repeated: the config language's ignored-key notice
-    /// already names it.
+    /// What the `[harness]` reader said about the file, as config notices
+    /// (`config harness.<key>: …`), each with what the key resolved to. A
+    /// key that is not a harness key, or a retired one, is left out: the
+    /// config language's ignored-key or retired-key notice already names it,
+    /// the latter in the reader's words ([`collect_key_notices`]).
     pub(crate) fn harness_notices(&self) -> Vec<String> {
-        // Everything but `SupervisorConfig::set`'s own unknown-key refusal,
-        // which the ignored-key notice already says.
-        let known = |line: &str| !line.contains(": not a harness key (known:");
-        self.harness_policy()
-            .1
-            .into_iter()
-            .filter(|line| known(line))
-            .map(|line| format!("config {line}"))
+        use aterm_agent::supervise::config::{is_retired_key_note, is_unknown_key_note};
+        self.harness
+            .notes
+            .iter()
+            .filter(|note| !is_unknown_key_note(note) && !is_retired_key_note(note))
+            .map(|note| format!("config {note}"))
             .collect()
     }
 
@@ -5652,45 +5574,30 @@ impl Config {
         }
     }
 
-    /// EFFECTIVE stem gamma with the startup precedence every key follows:
-    /// `$ATERM_STEM_GAMMA` (the historical env knob, now an alias) > the
-    /// `stem_gamma` config key > `1.0` (identity). Clamped to the renderer's
-    /// `0.30..=3.0`; a non-finite value falls back to the identity.
+    /// EFFECTIVE stem gamma: the `stem_gamma` config key, else `1.0` (identity).
+    /// Clamped to the renderer's `0.30..=3.0`; a non-finite value falls back to
+    /// the identity.
     pub(crate) fn stem_gamma_or_default(&self) -> f32 {
-        let g = std::env::var("ATERM_STEM_GAMMA")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|g| g.is_finite())
-            .or(self.stem_gamma)
-            .unwrap_or(1.0);
-        aterm_render::clamp_stem_gamma(g)
+        aterm_render::clamp_stem_gamma(self.stem_gamma.unwrap_or(1.0))
     }
 
-    /// EFFECTIVE native grid-fitting mode with the startup precedence every key
-    /// follows: `$ATERM_FONT_HINTING` (the historical env knob, now an alias)
-    /// wins over the `font_hinting` config key, which wins over `"full"`. The
-    /// renderer's own parser resolves unrecognized spellings to the default, so
-    /// this stays a plain string hand-off (the setter is the single source of
-    /// spelling truth).
+    /// EFFECTIVE native grid-fitting mode: the `font_hinting` config key, else
+    /// `"full"`. The renderer's own parser resolves unrecognized spellings to the
+    /// default, so this stays a plain string hand-off (the setter is the single
+    /// source of spelling truth).
     pub(crate) fn font_hinting_or_default(&self) -> String {
-        std::env::var("ATERM_FONT_HINTING")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| self.font_hinting.clone())
+        self.font_hinting
+            .clone()
             .unwrap_or_else(|| "full".to_string())
     }
 
-    /// EFFECTIVE Linux subpixel-RGB mode with the startup precedence every key
-    /// follows: `$ATERM_FONT_SUBPIXEL` (the env alias) wins over the
-    /// `font_subpixel` config key, which wins over `"off"`. The renderer's own
-    /// parser resolves unrecognized spellings to the default, so this stays a
-    /// plain string hand-off (the setter is the single source of spelling
-    /// truth) — the `font_hinting` discipline exactly.
+    /// EFFECTIVE Linux subpixel-RGB mode: the `font_subpixel` config key, else
+    /// `"off"`. The renderer's own parser resolves unrecognized spellings to the
+    /// default, so this stays a plain string hand-off — the `font_hinting`
+    /// discipline exactly.
     pub(crate) fn font_subpixel_or_default(&self) -> String {
-        std::env::var("ATERM_FONT_SUBPIXEL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| self.font_subpixel.clone())
+        self.font_subpixel
+            .clone()
             .unwrap_or_else(|| "off".to_string())
     }
 
@@ -5852,7 +5759,7 @@ impl Config {
     /// built-in candidates with zero output and `--validate-config`
     /// false-greened (W5h). Returns the message so startup/reload can both
     /// print it AND surface it in the config-notice banner. `family` is the
-    /// EFFECTIVE family (env `$ATERM_FONT` > config), matching what the
+    /// EFFECTIVE family (`--font` > config), matching what the
     /// backend will actually try.
     pub(crate) fn font_family_warning(family: Option<&str>) -> Option<String> {
         Self::font_family_admission(family).err()
@@ -5987,7 +5894,7 @@ impl Config {
     /// seam's, Windows and Linux) and by this file's own tests, so on macOS it
     /// is a live-but-uncalled resolver rather than a missing one — the config
     /// key still parses and validates everywhere, exactly like `right_click`'s.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn tab_menu_chord_or_default(&self) -> TabMenuChord {
         match self.tab_menu_chord.as_deref() {
             None => TabMenuChord::MenuKey,
@@ -6179,9 +6086,9 @@ pub(crate) struct GlyphRasterKnobs {
     pub(crate) text_shaping: aterm_render::TextShapingConfig,
     /// `font_thicken` → `set_font_thicken`.
     pub(crate) font_thicken: bool,
-    /// `stem_gamma` (env alias `ATERM_STEM_GAMMA`) → `set_stem_gamma`.
+    /// `stem_gamma` → `set_stem_gamma`.
     pub(crate) stem_gamma: f32,
-    /// `font_hinting` (env alias `ATERM_FONT_HINTING`) → `set_font_hinting`.
+    /// `font_hinting` → `set_font_hinting`.
     pub(crate) font_hinting: String,
     /// `line_height` → `set_line_height`.
     pub(crate) line_height: f32,
@@ -6253,11 +6160,8 @@ impl FontConfig {
     /// Resolve the W6 font keys from a config. Returns the resolved paths plus
     /// human warnings for entries that do not resolve to a font file (surfaced
     /// like [`Config::font_family_warning`] — never a hard failure; the
-    /// unresolvable entry is skipped and everything else still applies). Also
-    /// emits the once-per-process deprecation notice for the legacy
-    /// `$ATERM_{FALLBACK,SYMBOL,EMOJI}_FONT` env aliases when they are set.
+    /// unresolvable entry is skipped and everything else still applies).
     pub(crate) fn from_config(cfg: &Config) -> (Self, Vec<String>) {
-        warn_deprecated_font_env_aliases_once();
         let mut warns = Vec::new();
         let mut resolve = |key: &str, fam: Option<&str>| -> Option<String> {
             let fam = fam.map(str::trim).filter(|s| !s.is_empty())?;
@@ -6531,24 +6435,6 @@ mod titlebar_band_acceptance_tests {
     }
 }
 
-fn warn_deprecated_font_env_aliases_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        for (var, key) in [
-            ("ATERM_FALLBACK_FONT", "fallback_fonts"),
-            ("ATERM_SYMBOL_FONT", "symbol_font"),
-            ("ATERM_EMOJI_FONT", "emoji_font"),
-        ] {
-            if std::env::var_os(var).is_some() {
-                crate::logging::stderr_line!(
-                    "aterm-gui: ${var} is deprecated; set `{key}` in aterm.toml instead \
-                     (an explicit config entry outranks the env alias)"
-                );
-            }
-        }
-    });
-}
-
 /// Deprecation notice (once per process) for the PRE-RENAME display-face
 /// spellings — the `game_font` key and the game-named ids (`minecraft`, …).
 ///
@@ -6750,12 +6636,11 @@ impl RightClickGesture {
 /// application's — outranks the second Windows spelling, which stays one
 /// config line away.
 ///
-/// Compiled everywhere so the config key parses and validates on every platform
-/// (`--validate-config` must not depend on the host), but only READ by the
-/// Windows-and-Linux chord arms — hence the platform-scoped dead-code allowance
-/// rather than a `#[cfg]` on the type itself.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+/// Only the Windows-and-Linux chord arms (and the tests) read it, so the type is
+/// gated to them; the `tab_menu_chord` key itself is a plain string that parses
+/// on every platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) enum TabMenuChord {
     /// Both Windows spellings: the dedicated Menu/Application key AND Shift+F10.
     /// The opt-in (`tab_menu_chord = "on"`), never the default.
@@ -6767,11 +6652,12 @@ pub(crate) enum TabMenuChord {
     Off,
 }
 
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 impl TabMenuChord {
     /// Parse a config `tab_menu_chord` value (case-insensitive, trimmed):
     /// `on` / `both`, `menu_key` (aliases `menu-key`, `menu`), or `off`.
     /// `None` on any other value (caller falls back to [`Self::MenuKey`]).
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "on" | "both" => Some(Self::On),
@@ -6782,11 +6668,13 @@ impl TabMenuChord {
     }
 
     /// Whether this policy claims the dedicated Menu / Application key.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn claims_menu_key(self) -> bool {
         matches!(self, Self::On | Self::MenuKey)
     }
 
     /// Whether this policy claims Shift+F10.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn claims_shift_f10(self) -> bool {
         matches!(self, Self::On)
     }
@@ -7773,7 +7661,7 @@ impl Config {
 }
 
 /// Resolve the config file path without creating anything.
-/// The `font_px_explicit` pin after a config reload: an admitted `$ATERM_FONT_PX` /
+/// The `font_px_explicit` pin after a config reload: an admitted `--font-px` /
 /// `config.font_px` pins outright; otherwise an effective px that DIFFERS from the
 /// (re-derived) scale default is a LIVE Cmd-+/− zoom this reload is preserving — it
 /// must KEEP its pin. Dropping the pin while keeping the zoomed px re-arms
@@ -7810,6 +7698,8 @@ pub(crate) fn config_path() -> Option<std::path::PathBuf> {
 /// cannot disagree about an environment-pinned value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActiveEnvironmentOverride {
+    /// The launch flag that set it (`--font-px`, `--columns`): since
+    /// 2026-09-24 no environment variable overrides an aterm.toml key.
     pub(crate) variable: &'static str,
     pub(crate) effective: String,
 }
@@ -7823,74 +7713,29 @@ pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironment
         effective,
     };
     match key {
-        "columns" => env_u16("ATERM_COLUMNS")
-            .map(|value| resolved("ATERM_COLUMNS", value.clamp(20, 500).to_string())),
-        "lines" => env_u16("ATERM_LINES")
-            .map(|value| resolved("ATERM_LINES", value.clamp(5, 300).to_string())),
-        "font_px" => {
-            font_px_environment_override().map(|value| resolved("ATERM_FONT_PX", value.to_string()))
-        }
-        "font_family" => std::env::var("ATERM_FONT")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| resolved("ATERM_FONT", value)),
-        "window_theme"
-            if cfg!(target_os = "macos") && std::env::var_os("ATERM_NO_DARK_CHROME").is_some() =>
-        {
-            Some(resolved("ATERM_NO_DARK_CHROME", "auto".to_string()))
-        }
-        "gpu" if std::env::var_os("ATERM_CPU").is_some() => {
-            Some(resolved("ATERM_CPU", "CPU".to_string()))
-        }
-        "gpu" if std::env::var_os("ATERM_GPU").is_some() => {
-            Some(resolved("ATERM_GPU", "GPU".to_string()))
-        }
-        "tab_strip_rows" => std::env::var("ATERM_TAB_STRIP_ROWS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u16>().ok())
-            .map(|value| {
-                resolved(
-                    "ATERM_TAB_STRIP_ROWS",
-                    value.min(MAX_TAB_STRIP_ROWS).to_string(),
-                )
-            }),
-        "stem_gamma" => std::env::var("ATERM_STEM_GAMMA")
-            .ok()
-            .and_then(|value| value.trim().parse::<f32>().ok())
-            .filter(|value| value.is_finite())
-            .map(|value| {
-                resolved(
-                    "ATERM_STEM_GAMMA",
-                    aterm_render::clamp_stem_gamma(value).to_string(),
-                )
-            }),
-        "shell" => std::env::var("ATERM_SHELL")
-            .ok()
+        "columns" => explicit_initial_columns()
+            .map(|value| resolved("--columns", value.clamp(20, 500).to_string())),
+        "lines" => explicit_initial_lines()
+            .map(|value| resolved("--lines", value.clamp(5, 300).to_string())),
+        "font_px" => launch::flags()
+            .font_px
+            .map(|value| resolved("--font-px", value.to_string())),
+        "font_family" => launch::flags()
+            .font_family
+            .clone()
+            .map(|value| resolved("--font", value)),
+        "gpu" => launch::flags().renderer.map(|flag| match flag {
+            launch::RendererFlag::Cpu => resolved("--cpu", "CPU".to_string()),
+            launch::RendererFlag::Gpu => resolved("--gpu", "GPU".to_string()),
+        }),
+        "shell" => crate::cli::launch_flags()
+            .shell
             .filter(|value| !value.is_empty())
-            .map(|value| resolved("ATERM_SHELL", value)),
-        // Reported UNVALIDATED, deliberately: this resolver's contract is "what
-        // ambient value is in force", and the front door's own fallback for an
-        // unrecognized spelling is `new_window` with a warning. Filtering an
-        // invalid value out here would show the operator a config value that is
-        // NOT what the launch will use, which is the confusion this whole
-        // resolver exists to prevent.
-        "windowing_behavior" => std::env::var("ATERM_WINDOWING_BEHAVIOR")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| resolved("ATERM_WINDOWING_BEHAVIOR", value)),
-        "net.listen" => std::env::var("ATERM_NET_LISTEN")
-            .ok()
-            .map(|value| resolved("ATERM_NET_LISTEN", value)),
-        "net.cert" => std::env::var("ATERM_NET_CERT")
-            .ok()
-            .map(|value| resolved("ATERM_NET_CERT", value)),
-        "net.key" => std::env::var("ATERM_NET_KEY")
-            .ok()
-            .map(|value| resolved("ATERM_NET_KEY", value)),
-        // No `update.*` or `packages.*` key has an environment override any more
-        // (2026-09-23: `ATERM_UPDATE_OWNER`/`_REPO`, `ATERM_NO_AUTO_APPLY` and
-        // `ATPKG_ACCOUNT` are gone), so none is resolved here.
+            .map(|value| resolved("--shell", value)),
+        // No `update.*`, `packages.*` or `net.*` key has an environment override
+        // any more (2026-09-23: `ATERM_UPDATE_OWNER`/`_REPO`, `ATERM_NO_AUTO_APPLY`
+        // and `ATPKG_ACCOUNT` are gone; 2026-09-24: the `[net]` listener's three
+        // variables), so none is resolved here.
         _ => None,
     }
 }
@@ -7911,11 +7756,11 @@ pub(crate) fn load_config() -> Config {
                 return Config::default();
             }
         };
-    let config: Config = aterm_toml::from_str(&observation.text).unwrap_or_else(|e| {
+    let config = Config::parse(&observation.text).unwrap_or_else(|e| {
         let notice = launch_config_notice(&path, LaunchConfigProblem::Invalid(&e));
         crate::logging::stderr_line!("aterm-gui: {notice}");
         note_launch_load_failed(notice);
-        Config::default()
+        Config::stand_in(&observation.text)
     });
     warn_deprecated_display_font_spelling(&observation.text, &config);
     config
@@ -8002,23 +7847,6 @@ pub(crate) fn agents_auto_prime_setting() -> bool {
     }
 }
 
-/// The `[update] owner`/`repo` repoint alone, read WITHOUT [`load_config`]'s
-/// user-visible side effects (2026-09-14, audit LT-4/LT-7): the front door's
-/// headless `aterm update check` and its session-mode background check need the
-/// same channel the window checks, and they run with a terminal attached where
-/// a stray stderr line would land in the user's shell. Same file, same parse;
-/// an unreadable, missing or malformed file resolves to no repoint, exactly as
-/// [`load_config`] resolves it.
-pub(crate) fn update_repoint_setting() -> (Option<String>, Option<String>) {
-    let Some(path) = config_path() else {
-        return (None, None);
-    };
-    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
-        Ok(observation) => update_repoint_from_text(&observation.text),
-        Err(_) => (None, None),
-    }
-}
-
 /// Read source and application policy from ONE persisted config observation.
 /// Missing config keeps defaults; unreadable/malformed existing config refuses
 /// automatic work rather than silently turning a saved manual policy on.
@@ -8054,19 +7882,6 @@ pub(crate) fn update_check_settings(config: &Config) -> aterm_update::CheckSetti
     }
 }
 
-/// Pure core of [`update_repoint_setting`]: the `[update]` owner and repo in
-/// `text`, or none when the text does not parse as a config.
-pub(crate) fn update_repoint_from_text(text: &str) -> (Option<String>, Option<String>) {
-    match aterm_toml::from_str::<Config>(text) {
-        Ok(config) => config
-            .update
-            .as_ref()
-            .map(|update| (update.owner.clone(), update.repo.clone()))
-            .unwrap_or((None, None)),
-        Err(_) => (None, None),
-    }
-}
-
 /// Pure core of [`agents_auto_prime_setting`]: the knob's value in `text`, the
 /// default when the text does not parse as a config.
 pub(crate) fn agents_auto_prime_from_text(text: &str) -> bool {
@@ -8077,77 +7892,60 @@ pub(crate) fn agents_auto_prime_from_text(text: &str) -> bool {
 }
 
 /// Resolve the glyph size in physical px with the canonical precedence
-/// `$ATERM_FONT_PX > config.font_px > FONT_PX default`. Only finite values inside
+/// `--font-px > config.font_px > FONT_PX default`. Only finite values inside
 /// `FONT_PX_MIN..=FONT_PX_MAX` are admitted; an invalid source falls through instead
 /// of being clamped. Shared by startup (`main`) and live
 /// hot-reload (`App::reload_config`) so a reload re-applies the SAME precedence —
-/// an env override still wins after the user edits the config file.
+/// the launch flag still wins after the user edits the config file.
 pub(crate) fn resolve_font_px(config: &Config) -> f32 {
-    resolve_font_px_with(
-        std::env::var("ATERM_FONT_PX").ok().as_deref(),
-        config.font_px,
-    )
+    resolve_font_px_with(launch::flags().font_px, config.font_px)
 }
 
-/// Whether a valid environment/config size pins the physical glyph size.
+/// Whether a valid flag/config size pins the physical glyph size.
 /// Merely authoring an invalid `font_px` must not disable the display-scaled
 /// default: admission and explicitness deliberately share the same predicate.
 pub(crate) fn font_px_is_explicit(config: &Config) -> bool {
-    font_px_is_explicit_with(
-        std::env::var("ATERM_FONT_PX").ok().as_deref(),
-        config.font_px,
-    )
-}
-
-/// ATERM_FONT_PX only counts as an explicit pin when the runtime would
-/// actually admit it. A malformed or out-of-domain inherited value falls
-/// through to config/default and must not accidentally disable HiDPI auto-size.
-pub(crate) fn font_px_environment_override() -> Option<f32> {
-    std::env::var("ATERM_FONT_PX")
-        .ok()?
-        .parse::<f32>()
-        .ok()
-        .filter(font_px_in_range)
+    font_px_is_explicit_with(launch::flags().font_px, config.font_px)
 }
 
 /// Whether the GPU renderer should be requested at launch, resolved with the SAME
 /// precedence the `main` backend-selection funnel uses so the running renderer and
 /// the `--diagnose` / `--show-config` reports cannot drift on it. Most specific
-/// first: `--cpu`/`$ATERM_CPU` force CPU; else `$ATERM_GPU` forces GPU; else config
-/// `gpu = false`/`true` decides; else DEFAULT TO GPU on every platform (the CPU
-/// renderer is the automatic fallback when no device initializes).
+/// first: `--cpu` forces CPU; else `--gpu` forces GPU (the last of the two given
+/// wins); else config `gpu = false`/`true` decides; else DEFAULT TO GPU on every
+/// platform (the CPU renderer is the automatic fallback when no device initializes).
 pub(crate) fn resolve_want_gpu(config: &Config) -> bool {
+    let flag = launch::flags().renderer;
     resolve_want_gpu_with(
-        std::env::var_os("ATERM_CPU").is_some(),
-        std::env::var_os("ATERM_GPU").is_some(),
+        flag == Some(launch::RendererFlag::Cpu),
+        flag == Some(launch::RendererFlag::Gpu),
         config.gpu,
     )
 }
 
-/// Effective shell command captured by every newly-created session. The CLI
-/// flag collapses into `ATERM_SHELL` before the app starts, so this resolver is
-/// shared by startup and config reload: saved `shell` edits reach the next tab
-/// without waiting for a process restart while the launch override keeps its
-/// documented precedence.
+/// Effective shell command captured by every newly-created session: `--shell`
+/// outranks the config `shell`. Shared by startup and config reload, so saved
+/// `shell` edits reach the next tab without waiting for a process restart while
+/// the launch flag keeps its documented precedence.
 pub(crate) fn resolve_shell_override(config: &Config) -> Option<String> {
-    resolve_shell_override_with(std::env::var("ATERM_SHELL").ok(), config.shell.as_deref())
+    resolve_shell_override_with(crate::cli::launch_flags().shell, config.shell.as_deref())
 }
 
-fn resolve_shell_override_with(env: Option<String>, configured: Option<&str>) -> Option<String> {
-    env.filter(|value| !value.is_empty())
+fn resolve_shell_override_with(flag: Option<String>, configured: Option<&str>) -> Option<String> {
+    flag.filter(|value| !value.is_empty())
         .or_else(|| configured.map(str::to_string))
 }
 
-/// Pure precedence core for [`resolve_want_gpu`] with the two env presences and the
-/// config value passed in explicitly, so it is deterministically unit-testable
-/// without mutating process-global env. Mirrors the `main` funnel exactly.
+/// Pure precedence core for [`resolve_want_gpu`] with the two flags and the config
+/// value passed in explicitly, so it is deterministically unit-testable. Mirrors
+/// the `main` funnel exactly.
 pub(crate) fn resolve_want_gpu_with(
     force_cpu: bool,
-    gpu_env: bool,
+    force_gpu: bool,
     config_gpu: Option<bool>,
 ) -> bool {
     !force_cpu
-        && match (gpu_env, config_gpu) {
+        && match (force_gpu, config_gpu) {
             (true, _) => true,
             (false, Some(explicit)) => explicit,
             (false, None) => true,
@@ -8163,8 +7961,8 @@ pub(crate) fn resolve_want_gpu_with(
 /// `config.restart` row of the message band (`message_reporters::ConfigFamily::Restart`).
 ///
 /// PURE + total (no `self`, no I/O) so it unit-tests without a window — the same shape
-/// as the keybinding `*_warn` helpers that already feed the band. Env overrides
-/// (`ATERM_COLUMNS`/`ATERM_LINES`) are intentionally ignored: they are fixed for the
+/// as the keybinding `*_warn` helpers that already feed the band. The launch flags
+/// (`--columns`/`--lines`) are intentionally ignored: they are fixed for the
 /// process, so they can't change across a reload and never generate a spurious notice.
 pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
     let mut out = Vec::new();
@@ -8217,6 +8015,19 @@ pub(crate) fn collect_key_notices(
     warns.extend(ConfigFamily::RetiredKeys, prefixed_notices(keys.retired));
 }
 
+/// The supervisor's `[harness]` notices ([`Config::harness_notices`]: what
+/// its one reader refused, each with what it resolved to), added to `warns`
+/// as `ConfigFamily::UnacceptedValues` — the one spelling the launch and both
+/// reload paths share, so the three can never disagree about what the band
+/// says.
+pub(crate) fn collect_harness_notices(
+    warns: &mut crate::message_reporters::ConfigWarnings,
+    config: &Config,
+) {
+    use crate::message_reporters::ConfigFamily;
+    warns.extend(ConfigFamily::UnacceptedValues, config.harness_notices());
+}
+
 /// The `IgnoredKeys` half of [`collect_key_notices`], for the tests that read
 /// its sentences.
 #[cfg(test)]
@@ -8252,22 +8063,10 @@ fn prefixed_notices(lines: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Parse a non-zero `u16` from an environment variable, returning `None` when the
-/// var is unset, empty, unparseable, or zero. Used to let `--columns`/`--lines`
-/// (which set `ATERM_COLUMNS`/`ATERM_LINES`) override the config grid size while
-/// keeping the same clamp + default fallback the config path already applies.
-pub(crate) fn env_u16(key: &str) -> Option<u16> {
-    std::env::var(key)
-        .ok()?
-        .parse::<u16>()
-        .ok()
-        .filter(|&n| n != 0)
-}
-
-/// Fresh-launch terminal width after the documented environment > config >
-/// default precedence and the same safety clamp used by window construction.
+/// Fresh-launch terminal width after the documented flag > config > default
+/// precedence and the same safety clamp used by window construction.
 pub(crate) fn resolve_initial_columns(config: &Config) -> u16 {
-    env_u16("ATERM_COLUMNS")
+    explicit_initial_columns()
         .or(config.columns)
         .unwrap_or(80)
         .clamp(20, 500)
@@ -8277,15 +8076,14 @@ pub(crate) fn resolve_initial_columns(config: &Config) -> u16 {
 /// [`resolve_initial_columns`]. A seamless handoff may supply a carried frame
 /// ahead of this resolver, but a normal launch and `--show-config` share it.
 pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
-    env_u16("ATERM_LINES")
+    explicit_initial_lines()
         .or(config.lines)
         .unwrap_or(24)
         .clamp(5, 300)
 }
 
-/// The EXPLICIT launch-time grid overrides alone — `$ATERM_COLUMNS`/`$ATERM_LINES`
-/// (set by `--columns`/`--lines`), WITHOUT the config fallback the resolvers
-/// above fold in. W3's cold-restore grid seed needs the distinction: an explicit
+/// The EXPLICIT launch-time grid overrides alone — `--columns`/`--lines`,
+/// WITHOUT the config fallback the resolvers above fold in. W3's cold-restore grid seed needs the distinction: an explicit
 /// `aterm --columns 200` is a per-launch request that outranks the persisted
 /// session's grid, while a config `columns` is a static default that restore
 /// exists to supersede (config > manifest would mean quitting a resized window
@@ -8293,66 +8091,50 @@ pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
 /// key). Unclamped on purpose — callers clamp alongside the value they merge
 /// with, keeping one clamp per decision.
 pub(crate) fn explicit_initial_columns() -> Option<u16> {
-    env_u16("ATERM_COLUMNS")
+    crate::cli::launch_flags().columns
 }
 
 /// Row twin of [`explicit_initial_columns`].
 pub(crate) fn explicit_initial_lines() -> Option<u16> {
-    env_u16("ATERM_LINES")
+    crate::cli::launch_flags().lines
 }
 
-/// An explicit render-scale override from `$ATERM_FORCE_SCALE` (set directly or by
-/// the `--scale` flag). `Some(f)` for a finite, positive value; `None` when unset
-/// or invalid. When set it overrides BOTH the headless 1.0 default and a real
-/// window's `scale_factor()`, driving the auto-scaled font (`round(FONT_PX·f)`) and the
-/// interior padding (`pad_for_scale(f)`) so an offscreen `image` capture renders at
-/// the same DPI a real window of that scale would (e.g. `--scale 2` ≈ 2× Retina).
-///
-/// Resolved ONCE per process (`OnceLock`), like [`crate::headroom_override`]: this
-/// sits on the redraw path — `apply_window_scale` calls it for every frame BEFORE
-/// the repaint early-out — and `env::var` takes the process-wide env lock and
-/// linearly scans the whole environ block, which is far too expensive to repeat at
-/// frame rate for a launch-time-only knob. `--scale` therefore has to keep writing
-/// the variable during CLI parsing (cli.rs), before `run()` — which it already does.
+/// The explicit render-scale override from `--scale` (finite and positive, checked
+/// by the flag parser). When set it overrides BOTH the headless 1.0 default and a
+/// real window's `scale_factor()`, driving the auto-scaled font (`round(FONT_PX·f)`)
+/// and the interior padding (`pad_for_scale(f)`) so an offscreen `image` capture
+/// renders at the same DPI a real window of that scale would (e.g. `--scale 2` ≈ 2×
+/// Retina). One load of the installed launch flags: this sits on the redraw path.
 pub(crate) fn resolve_force_scale() -> Option<f64> {
-    static FORCE_SCALE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    *FORCE_SCALE.get_or_init(|| {
-        std::env::var("ATERM_FORCE_SCALE")
-            .ok()?
-            .parse::<f64>()
-            .ok()
-            .filter(|f| f.is_finite() && *f > 0.0)
-    })
+    launch::flags().scale
 }
 
-/// Pure precedence core for [`resolve_font_px`], with the `$ATERM_FONT_PX` env
-/// value and the config value passed in explicitly so it is deterministically
-/// unit-testable (no process-global env mutation). Order: a finite, in-range env
-/// value wins; else a finite, in-range config value; else the built-in default.
-/// A present-but-unparseable/out-of-range env value falls through to the config,
-/// matching the startup `.parse().ok().or(config).filter(in_range)` chain.
-pub(crate) fn resolve_font_px_with(env: Option<&str>, config: Option<f32>) -> f32 {
-    // Filter EACH source by range independently so an out-of-range env value falls
-    // through to a valid config value (as documented) instead of `.or(config)`
-    // pinning the bad env value and then `.filter` collapsing straight to default.
-    admitted_font_px(env, config).unwrap_or(FONT_PX)
+/// Pure precedence core for [`resolve_font_px`], with the `--font-px` flag value
+/// and the config value passed in explicitly so it is deterministically
+/// unit-testable. Order: a finite, in-range flag value wins; else a finite,
+/// in-range config value; else the built-in default. An out-of-range source falls
+/// through rather than being clamped.
+pub(crate) fn resolve_font_px_with(flag: Option<f32>, config: Option<f32>) -> f32 {
+    // Filter EACH source by range independently so an out-of-range value falls
+    // through to a valid config value instead of `.or(config)` pinning the bad
+    // value and then `.filter` collapsing straight to default.
+    admitted_font_px(flag, config).unwrap_or(FONT_PX)
 }
 
 fn font_px_in_range(value: &f32) -> bool {
     value.is_finite() && *value >= FONT_PX_MIN && *value <= FONT_PX_MAX
 }
 
-fn admitted_font_px(env: Option<&str>, config: Option<f32>) -> Option<f32> {
-    env.and_then(|value| value.parse::<f32>().ok())
-        .filter(font_px_in_range)
+fn admitted_font_px(flag: Option<f32>, config: Option<f32>) -> Option<f32> {
+    flag.filter(font_px_in_range)
         .or(config.filter(font_px_in_range))
 }
 
 /// Pure explicit-pin counterpart of [`resolve_font_px_with`]. Keeping this on
 /// the same admission helper prevents an invalid authored value from pinning
 /// the 12px fallback and silently bypassing HiDPI auto-size.
-pub(crate) fn font_px_is_explicit_with(env: Option<&str>, config: Option<f32>) -> bool {
-    admitted_font_px(env, config).is_some()
+pub(crate) fn font_px_is_explicit_with(flag: Option<f32>, config: Option<f32>) -> bool {
+    admitted_font_px(flag, config).is_some()
 }
 
 /// Resolve one raw style against the exact catalog revision used by the host.
@@ -8467,7 +8249,9 @@ pub(crate) fn resolve_trail_presentation_from_style(
 /// every one of those predicates; `prefs`'
 /// `cursor_trail_style_aliases_agree_with_engine_parse` pins it), and a
 /// `pack:<id>` token comes back unchanged because no builtin predicate matches
-/// it whether or not the pack is loaded.
+/// it whether or not the pack is loaded. The tests' reading of what
+/// [`resolve_trail_style`] settles on.
+#[cfg(test)]
 pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
     let raw = raw.trim();
     if raw.starts_with("pack:") {
@@ -9293,7 +9077,7 @@ impl App {
                 // only the first term is proportional to `scale`; `round(head_pts·s')`
                 // therefore reproduces the law at a NEW scale only while `pad_top` and
                 // `cell_h` happen to move with the DPI too. Under `font_px_explicit`
-                // (or `ATERM_FORCE_SCALE`) the font — and so `cell_h` — is pinned, and
+                // (or `--scale`) the font — and so `cell_h` — is pinned, and
                 // the interim band is off by the residue. That is accepted, not
                 // overlooked: `ScaleFactorChanged` is always followed by the `Resized`
                 // winit emits for the new size, which lands right back here and
@@ -9501,7 +9285,7 @@ impl App {
         let previous_px = self.font_px;
         let previous_explicit = self.font_px_explicit;
         self.font_px = px;
-        // A live zoom is an EXPLICIT font size, exactly like `$ATERM_FONT_PX` /
+        // A live zoom is an EXPLICIT font size, exactly like `--font-px` /
         // `config.font_px`: pin it so (a) HiDPI auto-scale (`apply_window_scale`) can't
         // revert the zoom on the next scale re-eval, and (b) `refresh_all_window_metrics`
         // resolves each window at THIS px (`applied`) instead of the scale-derived
@@ -9966,8 +9750,8 @@ impl App {
     /// DPI. This is the SAME derivation [`Self::attach_os_window`] runs once at window
     /// creation, now applied on the fly instead of being frozen at the creation DPI.
     ///
-    /// Honored only for the AUTO font (no `$ATERM_FONT_PX` / `config.font_px`) and
-    /// when no scale is force-pinned (`--scale` / `$ATERM_FORCE_SCALE` deliberately
+    /// Honored only for the AUTO font (no `--font-px` / `config.font_px`) and
+    /// when no scale is force-pinned (`--scale` deliberately
     /// ignore the real monitor — a forced scale must render identically everywhere).
     /// A no-op when neither the font nor the pad would change (a spurious event, or
     /// the initial post-creation event whose scale `attach_os_window` already applied,
@@ -10056,7 +9840,7 @@ impl App {
         // hoisted above the pinned-font early return: the cell pixel size the
         // engines report over DEC 1016 and size OSC 1337 images with is a property
         // of the window's resolved metrics regardless of HOW the font was pinned,
-        // so an explicit `$ATERM_FONT_PX` / `config.font_px` / `--scale` must not
+        // so an explicit `--font-px` / `config.font_px` / `--scale` must not
         // route around it. This is also the seam that corrects the BOOT session,
         // spawned before the backend build was joined (`cell_px: None`) — every
         // raster seam runs `apply_window_scale`, so the first frame fixes it.
@@ -10306,8 +10090,8 @@ impl App {
     /// its diagnostics can repair the exact rejected bytes.
     ///
     /// PRECEDENCE (no regression): font size flows through [`resolve_font_px`] —
-    /// the SAME `$ATERM_FONT_PX > config > default` order as startup — so an env
-    /// override still wins after an edit. GPU is a launch-time decision and is NOT
+    /// the SAME `--font-px > config > default` order as startup — so the launch
+    /// flag still wins after an edit. GPU is a launch-time decision and is NOT
     /// hot-swapped here (`self.use_gpu` is fixed); only font size, the renderer
     /// theme, and the engine `TerminalConfig` (scrollback/cursor/colours/palette,
     /// diffed by `Terminal::apply_config`) are re-applied.
@@ -10591,10 +10375,7 @@ impl App {
             // (Phase 3 review, ruling 28).
             let mut warns = crate::message_reporters::ConfigWarnings::default();
             collect_key_notices(&mut warns, &config_snapshot.text);
-            warns.extend(
-                crate::message_reporters::ConfigFamily::UnacceptedValues,
-                config.harness_notices(),
-            );
+            collect_harness_notices(&mut warns, &config);
             let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
             warns.extend(
                 crate::message_reporters::ConfigFamily::UnacceptedValues,
@@ -10691,9 +10472,7 @@ impl App {
         // The supervisor's `[harness]` policy applies on reload: its workers
         // restart under a changed policy, and `enabled = false` stops them
         // within one wait (`harness_host`; a lock and a wake, no I/O here).
-        if let Some(host) = self.harness.as_ref() {
-            host.set_config(self.config.harness_policy().0);
-        }
+        self.adopt_harness_policy(config.harness.clone());
         // Secure Keyboard Entry is PROCESS-level (Carbon secure input), so a
         // config commit records the wish here, once, beside the swap — not per
         // window or per session (engagement is focus-gated in secure_input).
@@ -10993,7 +10772,7 @@ impl App {
         // for that key.
         // The supervisor's `[harness]` values it refused (a known key with a
         // value it cannot take: `continue = "yes"`).
-        warns.extend(ConfigFamily::UnacceptedValues, config.harness_notices());
+        collect_harness_notices(&mut warns, &config);
         let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
         warns.extend(ConfigFamily::UnacceptedValues, unaccepted);
         for w in warns.sentences() {
@@ -11282,7 +11061,7 @@ impl App {
         // Effective family keeps the env > config > platform-default precedence on
         // live reload too (the SAME `effective_font_family` as startup and the
         // `--show-config` diagnostics, so the `family_changed` diff below can never
-        // see a spurious change from resolution drift): a `--font`/$ATERM_FONT
+        // see a spurious change from resolution drift): a `--font`
         // override set at launch stays in force across a config reload rather than
         // being clobbered by the reloaded config `font_family`.
         // A rejected configured family is not a request to swap to a built-in
@@ -11527,7 +11306,7 @@ impl App {
     }
 
     /// Re-resolve EVERY window's per-window [`MetricsView`] from the live font
-    /// regime (W12). An explicit `$ATERM_FONT_PX` / `config.font_px` (or a
+    /// regime (W12). An explicit `--font-px` / `config.font_px` (or a
     /// force-pinned scale) fixes the px for all windows — each keeps its own
     /// scale-derived `pad`; otherwise each window's metrics are the pure
     /// [`MetricsView::for_scale`] of its OWN display scale. Used after a config
@@ -11653,7 +11432,7 @@ impl App {
                 // window's pad re-resolves from the live config at its own scale
                 // (identical to the old kept value when `window_padding` is
                 // unset, since attach derived it from the same constants) so a
-                // padding edit hot-applies under `$ATERM_FONT_PX` too. A
+                // padding edit hot-applies under `--font-px` too. A
                 // never-attached window keeps its sealed boot pad, as below.
                 let (pad, pad_top) = if attached {
                     let pad = crate::logical_to_device_px(pad_l, ws.scale);
@@ -12279,9 +12058,11 @@ window_title_format = "description"
 mod cfg_engine_tests {
     use super::{
         Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES,
-        MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogWatchError, TrailPackCatalog,
-        ignored_key_notices, open_regular_theme_file, unaccepted_value_notices,
+        MAX_USER_THEME_FILES, ThemeCatalog, TrailPackCatalog, ignored_key_notices,
+        unaccepted_value_notices,
     };
+    #[cfg(unix)]
+    use super::{ThemeCatalogWatchError, open_regular_theme_file};
     use aterm_core::config::BiDiMode;
 
     fn cfg(toml: &str) -> Config {
@@ -13059,9 +12840,7 @@ mod cfg_engine_tests {
     }
 
     /// W2 `font_thicken` + `stem_gamma`: defaults (off / identity), explicit
-    /// values, and the stem-gamma clamp. (The `$ATERM_STEM_GAMMA` env alias
-    /// wins by the same env > config precedence as every other key; not
-    /// exercised here to keep the test env-hermetic.)
+    /// values, and the stem-gamma clamp.
     #[test]
     fn font_thicken_and_stem_gamma_parse() {
         assert!(!Config::default().font_thicken_or_default());
@@ -13110,9 +12889,9 @@ mod cfg_engine_tests {
         assert!(!cfg("robi = false").robi_or_default());
     }
 
-    /// The ambient-bed knob: shipped DISABLED (owner: the drone is opt-in;
-    /// notes/brrrring/bonk/melody are unaffected by it), a plain bool that
-    /// round-trips, and `true` re-enables the bed at the drain seams.
+    /// The ambient-bed knob: ON by default since the owner's 2026-09-09
+    /// ruling (notes/brrrring/bonk/melody are unaffected by it), a plain bool
+    /// that round-trips, and `false` gates the bed off at the drain seams.
     #[test]
     fn trail_sound_bed_defaults_off_and_round_trips() {
         assert!(
@@ -14863,51 +14642,93 @@ mod output_streak_cfg_tests {
         );
     }
 
-    /// The safety review of 2026-09-24: an `aterm.toml` that does not parse
-    /// at launch leaves `Config::default()` standing in, whose `[harness]`
-    /// is absent — every act ON — so an owner's `continue = false` was lost
-    /// to a typo in any table. The host now STARTS escalate-only on a failed
-    /// launch load. Negative control: a load that worked starts under the
-    /// file's own policy (and a default-only file under the defaults).
+    /// A launch that could not take `aterm.toml` runs every setting at its
+    /// default — but the `[harness]` lines the owner wrote still read (the
+    /// table's reader reads a file that is not TOML line by line), so a limit
+    /// written there holds through a typo in any other table. NEGATIVE
+    /// CONTROL: a broken file with no `[harness]` lines is every power on,
+    /// the owner's rule for a file that limits nothing.
+    /// Settings ▸ Harness's words: every key the file limits is named, in the
+    /// supervisor's KEYS order, as `<key>: <value>`; a rewritten text is named
+    /// apart, as `yours`, never as a limit; `trust_roots` only where `safe`
+    /// reads it; `Off` outranks every limit. NEGATIVE CONTROL: no table is
+    /// `Automatic`.
     #[test]
-    fn a_launch_that_could_not_load_the_file_starts_the_supervisor_escalate_only() {
-        use aterm_agent::supervise::{ApprovalToggles, SupervisorConfig};
-        let stand_in = Config::default();
-        let p = stand_in.harness_policy_at_launch(true);
-        assert_eq!(p, SupervisorConfig::escalate_only());
-        assert!(p.enabled && p.approvals == ApprovalToggles::off() && !p.continue_policy);
+    fn the_harness_words_name_every_limit_in_key_order() {
+        assert_eq!(super::HarnessPolicy::read("").words(), "Automatic");
+        let all = "[harness]\nheadless = false\napprove = \"none\"\ntrust_roots = []\n\
+                   answer_questions = false\nanswer_text = \"ask me\"\n\
+                   dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
+                   continue_per_hour = 2\nrules_file = \"/r\"\nretry_api_errors = false\n\
+                   resume_limits = false\nmodel_fallback = \"\"\n\
+                   compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
+                   human_grace_s = 600\n";
         assert_eq!(
-            stand_in.harness_policy_at_launch(false),
-            SupervisorConfig::default()
+            super::HarnessPolicy::read(all).words(),
+            "Automatic \u{b7} limited: headless: off \u{b7} approve: none \
+             \u{b7} answer_questions: off \u{b7} dismiss_surveys: off \u{b7} continue: off \
+             \u{b7} continue_per_hour: 2 \u{b7} retry_api_errors: off \u{b7} resume_limits: off \
+             \u{b7} model_fallback: off \u{b7} compact_on_context_wall: off \u{b7} relaunch: off \
+             \u{b7} upgrade: off \u{b7} human_grace_s: 600 \
+             \u{b7} yours: answer_text, continue_text, rules_file"
         );
-        let owner: Config =
-            aterm_toml::from_str("[harness]\ncontinue = false\n").expect("valid toml");
-        let p = owner.harness_policy_at_launch(false);
-        assert!(!p.continue_policy && p.approvals == ApprovalToggles::default());
+        assert_eq!(
+            super::HarnessPolicy::read("[harness]\napprove = \"safe\"\ntrust_roots = []\n").words(),
+            "Automatic \u{b7} limited: approve: safe \u{b7} trust_roots: off"
+        );
+        assert_eq!(
+            super::HarnessPolicy::read("[harness]\nanswer_text = \"ask me\"\n").words(),
+            "Automatic \u{b7} yours: answer_text"
+        );
+        assert_eq!(
+            super::HarnessPolicy::read(&format!("{all}enabled = false\n")).words(),
+            "Off: no agent session is supervised"
+        );
     }
 
-    /// THE SUPERVISOR'S POLICY is read out of `[harness]` with every key the
-    /// file sets applied (arrays flattened with `,`): a key a reload changes
-    /// makes a changed `Config` (so it is not deduped away), a value the
-    /// policy refuses is a config notice naming the key, and an unknown key is
-    /// left to the ignored-key notice — never a failed load, never silence.
+    #[test]
+    fn a_launch_that_could_not_load_the_file_still_reads_its_harness_lines() {
+        let text = "font_px = \n[harness]\ncontinue = false\napprove = \"safe\"\n";
+        assert!(Config::parse(text).is_err(), "the fixture is not a config");
+        let stand_in = Config::stand_in(text);
+        let p = &stand_in.harness.policy;
+        assert!(p.enabled && !p.continue_policy);
+        assert_eq!(p.approve, aterm_agent::supervise::config::Approve::Safe);
+        assert!(stand_in.harness.notes[0].contains("not valid TOML"));
+        assert!(
+            stand_in.font_px.is_none(),
+            "every other setting at its default"
+        );
+        assert_eq!(
+            Config::stand_in("font_px = \n").harness.policy,
+            aterm_agent::supervise::SupervisorConfig::default()
+        );
+    }
+
+    /// THE SUPERVISOR'S POLICY is `[harness]` as its one reader
+    /// (`SupervisorConfig::from_aterm_toml`) takes the file's text: a key a
+    /// reload changes makes a changed `Config` (so it is not deduped away), a
+    /// value the reader cannot take is its key's LIMIT and a config notice
+    /// naming the key, a `false` filed under another table still limits and
+    /// is named, and an unknown key is left to the ignored-key notice — never
+    /// a failed load, never silence.
     #[test]
     fn the_harness_table_is_the_supervisors_policy() {
-        let cfg = |text: &str| -> Config { aterm_toml::from_str(text).expect("valid toml") };
-        let (policy, refused) = Config::default().harness_policy();
-        assert_eq!(policy, aterm_agent::supervise::SupervisorConfig::default());
-        assert!(refused.is_empty());
+        use aterm_agent::supervise::{SuperviseOpts, SupervisorConfig};
+        let cfg = |text: &str| Config::parse(text).expect("valid config");
+        assert_eq!(Config::default().harness, super::HarnessPolicy::default());
+        assert_eq!(
+            Config::default().harness.policy,
+            SupervisorConfig::default()
+        );
 
-        let text = "[harness]\nenabled = true\nheadless = true\ncontinue = false\n\
+        let text = "[harness]\nenabled = true\nheadless = false\ncontinue = false\n\
                     continue_per_hour = 2\ntrust_roots = [\"~/a*\", \"/b\"]\n\
                     model_fallback = \"\"\n";
         let set = cfg(text);
-        let (policy, refused) = set.harness_policy();
-        // Nothing refused, and nothing named "not applied yet": the engine
-        // reads every one of these keys since the engine lane's merge
-        // (no key is "not applied yet").
-        assert!(refused.is_empty(), "{refused:?}");
-        assert!(policy.enabled && policy.headless && !policy.continue_policy);
+        let policy = &set.harness.policy;
+        assert!(set.harness.notes.is_empty(), "{:?}", set.harness.notes);
+        assert!(policy.enabled && !policy.headless && !policy.continue_policy);
         assert_eq!(policy.continue_per_hour, 2);
         assert_eq!(
             policy.trust_roots,
@@ -14918,97 +14739,66 @@ mod output_streak_cfg_tests {
         // A reload that changes only a policy key is a changed Config.
         assert!(set != cfg(&text.replace("continue = false", "continue = true")));
 
-        // A refused VALUE is a notice naming the key; the load still stands and
-        // the rest of the table still applies.
-        let bad = cfg("[harness]\ncontinue = \"yes\"\nheadless = true\ncontine = true\n");
-        let (policy, refused) = bad.harness_policy();
-        assert!(policy.headless, "the other keys still apply");
-        assert!(!policy.continue_policy, "the refused switch is off");
-        // The refused value, the unknown key, and what the unknown key did.
-        assert_eq!(refused.len(), 3, "{refused:?}");
-        let notices = bad.harness_notices();
-        assert_eq!(notices.len(), 2, "{notices:?}");
+        // A refused VALUE is its key's limit and a notice naming the key; the
+        // load still stands and the rest of the table still applies.
+        let bad = cfg("[harness]\ncontinue = \"yes\"\nheadless = false\ncontine = true\n");
+        assert!(!bad.harness.policy.headless, "the other keys still apply");
         assert!(
-            notices[0].starts_with("config [harness] continue:") && notices[0].contains("yes"),
+            !bad.harness.policy.continue_policy,
+            "the refused switch is off"
+        );
+        assert_eq!(bad.harness.notes.len(), 2, "{:?}", bad.harness.notes);
+        let notices = bad.harness_notices();
+        assert_eq!(notices.len(), 1, "the unknown key is the config language's");
+        assert!(
+            notices[0].starts_with("config harness.continue:")
+                && notices[0].contains("yes")
+                && notices[0].contains("read as its limit"),
             "{notices:?}"
         );
-        assert!(notices[1].contains("contine"), "{notices:?}");
-        // `upgrade` is a known key (the live agent upgrade's switch), so it
-        // is no unknown key that turns the approvals off.
-        let upgrade = cfg("[harness]\nupgrade = false\n");
-        let (policy, refused) = upgrade.harness_policy();
-        assert!(refused.is_empty() && !policy.upgrade, "{refused:?}");
-        assert_eq!(
-            policy.approvals,
-            aterm_agent::supervise::SupervisorConfig::default().approvals
-        );
-        // The unknown key is the config language's to report (once).
         let ignored = crate::native_config_language::key_warnings(
-            "[harness]\ncontinue = \"yes\"\nheadless = true\ncontine = true\n",
+            "[harness]\ncontinue = \"yes\"\nheadless = false\ncontine = true\n",
         )
         .ignored;
         assert!(ignored.iter().any(|l| l.contains("contine")), "{ignored:?}");
-        // `enabled` of the wrong type no longer fails the whole file: it is
-        // refused by name and the switch FAILS CLOSED — off for the launcher
-        // and the supervisor alike.
         let wrong = cfg("[harness]\nenabled = \"no\"\n");
         assert!(!wrong.harness_enabled());
-        assert!(!wrong.harness_policy().0.enabled);
-        assert!(wrong.harness_notices()[0].contains("enabled = false until it is fixed"));
-    }
-
-    /// A `[harness]` value the policy cannot read FAILS CLOSED: the owner
-    /// wrote the key to say something, and every default that acts is ON, so
-    /// a refused switch resolves OFF and an unknown key turns every approval
-    /// rule off — no box is pressed on a misread file. `SuperviseOpts`'s
-    /// `auto_reads` is the engine's one gate on pressing an approval.
-    /// NEGATIVE CONTROL: the same keys spelled right keep pressing on, and a
-    /// string `"false"` (which `set` reads) means what it says, so the
-    /// launcher and the supervisor agree on it.
-    #[test]
-    fn a_harness_value_the_policy_refuses_fails_closed() {
-        use aterm_agent::supervise::{ApprovalToggles, SuperviseOpts};
-        let cfg = |text: &str| -> Config { aterm_toml::from_str(text).expect("valid toml") };
-        let presses = |c: &Config| {
-            let (policy, _) = c.harness_policy();
-            policy.enabled && SuperviseOpts::hosted_with(&policy).auto_reads
-        };
-        let breaker = cfg("[harness]\nrm_breaker = \"no\"\n");
-        let (policy, _) = breaker.harness_policy();
-        assert!(!policy.approvals.rm_breaker, "a refused switch is off");
-        assert!(policy.approvals.auto_reads, "the others keep their value");
-        assert!(breaker.harness_notices()[0].contains("rm_breaker = false until it is fixed"));
-        for text in [
-            "[harness]\nenabled = 0\n",
-            "[harness]\nrm_breakr = false\n",
-            "[harness]\nauto_reads = 0\nrm_breaker = 0\nread_outside_cwd = 0\ntrust_dialog = 0\n",
-        ] {
-            assert!(!presses(&cfg(text)), "{text:?} still presses");
-        }
-        let typo = cfg("[harness]\nrm_breakr = false\n");
-        assert_eq!(typo.harness_policy().0.approvals, ApprovalToggles::off());
-        let notices = typo.harness_notices();
-        assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(
-            notices[0].contains("rm_breakr") && notices[0].contains("nothing is pressed"),
-            "{notices:?}"
-        );
+        // The config language's own domain check stands down for a value the
+        // reader already named: its "the default is used at load" would be
+        // false, the value being the key's limit. NEGATIVE CONTROL: without
+        // the reader's note, the domain check says it.
+        let text = "[harness]\napprove = \"everything\"\n";
+        let told = cfg(text).harness_notices();
+        assert!(told[0].contains("read as its limit"), "{told:?}");
         assert_eq!(
-            cfg("[harness]\ncontinue_per_hour = \"lots\"\n")
-                .harness_policy()
-                .0
-                .continue_per_hour,
-            0
+            super::unaccepted_value_notices(text, &told),
+            Vec::<String>::new()
         );
-        // NEGATIVE CONTROL: spelled right, it presses; `"false"` is read.
-        assert!(presses(&cfg(
-            "[harness]\nenabled = true\nrm_breaker = true\n"
-        )));
-        assert!(presses(&Config::default()));
-        let string_off = cfg("[harness]\nenabled = \"false\"\n");
-        assert!(!string_off.harness_enabled() && !presses(&string_off));
-    }
+        assert_eq!(super::unaccepted_value_notices(text, &[]).len(), 1);
 
+        // A `false` below another table's header still limits, and is said.
+        let misplaced = cfg("[packages]\nharness.enabled = false\n");
+        assert!(!misplaced.harness_enabled());
+        assert!(
+            misplaced.harness_notices()[0].contains("`packages.harness.enabled`"),
+            "{:?}",
+            misplaced.harness_notices()
+        );
+
+        // `approve = "none"` is what stops the engine pressing.
+        // NEGATIVE CONTROL: the default presses.
+        let presses = |c: &Config| {
+            SuperviseOpts::hosted_with(&c.harness.policy).policy.approve
+                != aterm_agent::supervise::config::Approve::None
+        };
+        assert!(!presses(&cfg("[harness]\napprove = \"none\"\n")));
+        assert!(
+            !presses(&cfg("[harness]\napprove = 0\n")),
+            "malformed: none"
+        );
+        assert!(presses(&Config::default()));
+        assert!(presses(&cfg("[harness]\napprove = \"safe\"\n")));
+    }
     /// The whole table round-trips through serde — the hot-reload contract.
     /// `Config` is replaced wholesale on a config-file generation and derives
     /// `PartialEq` through every embedded table, so a semantic no-op still
@@ -17616,14 +17406,12 @@ mod agents_auto_prime_tests {
     }
 }
 
-/// The `[update]` repoint, readable without a full config load (2026-09-14):
-/// the front door's headless update lanes read the same channel the window
-/// checks, and a nested instance whose env repoint was stripped at the shell
-/// hop still lands on the configured one.
+/// The front door's update policy (`aterm_gui::configured_update_settings`):
+/// source and apply policy from ONE parse of the persisted file, and a
+/// malformed existing policy refuses automatic work rather than defaulting it
+/// back on.
 #[cfg(test)]
-mod update_repoint_tests {
-    use super::update_repoint_from_text;
-
+mod update_check_settings_tests {
     #[test]
     fn persisted_check_settings_bind_source_and_manual_policy_in_one_parse() {
         let defaults = super::update_check_settings_from_text("").unwrap();
@@ -17641,37 +17429,6 @@ mod update_repoint_tests {
         assert!(
             super::update_check_settings_from_text("[update]\nauto_apply = invalid").is_none(),
             "malformed existing policy must not fall back to automatic"
-        );
-    }
-
-    #[test]
-    fn the_repoint_reads_without_a_full_config_load() {
-        assert_eq!(
-            update_repoint_from_text(""),
-            (None, None),
-            "empty file: none"
-        );
-        assert_eq!(
-            update_repoint_from_text("tab_status = false"),
-            (None, None),
-            "unrelated key: none"
-        );
-        assert_eq!(
-            update_repoint_from_text("[update]\nowner = \"private-org\"\nrepo = \"aterm-fork\"\n"),
-            (
-                Some("private-org".to_string()),
-                Some("aterm-fork".to_string())
-            )
-        );
-        assert_eq!(
-            update_repoint_from_text("[update]\nowner = \"private-org\"\n"),
-            (Some("private-org".to_string()), None),
-            "half a repoint is carried as written; `Source::resolve` fills the rest"
-        );
-        // A malformed file resolves the way `load_config` resolves it: defaults.
-        assert_eq!(
-            update_repoint_from_text("[update]\nowner = \n"),
-            (None, None)
         );
     }
 }

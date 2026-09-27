@@ -75,14 +75,9 @@ impl SearchResults {
         }
     }
 
-    /// Number of matches.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.matches.len()
-    }
-
     /// True if there are no matches.
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
     }
@@ -115,6 +110,7 @@ pub struct DirectedFind {
 }
 
 /// Search result iterator (internal).
+#[cfg(any(test, kani))]
 pub(super) enum SearchResult {
     None,
     All(std::ops::Range<u32>),
@@ -122,6 +118,7 @@ pub(super) enum SearchResult {
     Bitmap(Box<crate::bitmap::SparseBitmapIntoIter>),
 }
 
+#[cfg(any(test, kani))]
 impl Iterator for SearchResult {
     type Item = u32;
 

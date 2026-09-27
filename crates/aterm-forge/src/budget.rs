@@ -44,7 +44,8 @@
 //! # What is deliberately NOT seeded
 //!
 //! `shipped.<triple> packages` and `lock packages` are SUPPORTED metrics, and
-//! [`seed`] does not arm them. Both count aterm's own workspace crates, so a new
+//! the seeded rows (`--update` into an empty checkout, `seed_shape`) do not
+//! arm them. Both count aterm's own workspace crates, so a new
 //! first-party crate would trip the gate and demand an 80-character
 //! justification for growth that is not third-party surface at all. A ratchet
 //! that fires on the wrong thing trains people to write throwaway reasons, which
@@ -238,51 +239,6 @@ pub fn render(rows: &[Row]) -> String {
         s.push_str(&r.line());
         s.push('\n');
     }
-    s
-}
-
-/// The seed body: the surface as MEASURED on this checkout (2026-08-22,
-/// `cargo tree --locked --offline -e normal` per cell, LOC by
-/// `rs-physical-all-files-v1`), for the integrate phase to write.
-///
-/// Only third-party facts are armed — see the module docs on why
-/// `shipped.<triple> packages` and `lock packages` are supported but not seeded.
-///
-/// FROZEN, AND ITS wasm ROW IS PRE-CORRECTION. This body is the 2026-08-22
-/// measurement kept verbatim; its `shipped.wasm32-unknown-unknown` row was taken
-/// with the wasm cell rooted at the `aterm` BINARY, which is never compiled for
-/// wasm32 ([`crate::resolve::default_cells`] records what that got wrong). It is
-/// NOT restated here, because there is no 2026-08-22 measurement of the two
-/// shipped browser modules to restate it with, and inventing one would be worse
-/// than a labelled stale number. Nothing in the product calls this — [`unarmed`]
-/// is what `--update` writes into an empty checkout, and it renders the LIVE
-/// matrix ([`seed_shape`] picks the rows). Against that matrix this body's wasm
-/// scope no longer names a cell, so [`validate_metric`] refuses it by name
-/// rather than accepting it.
-pub fn seed() -> String {
-    let mut s = String::new();
-    let cells: &[(&str, [u64; 5])] = &[
-        // triple                       tp_pkgs  tp_loc    build  proc  dup
-        ("aarch64-apple-darwin", [161, 2_130_888, 27, 6, 8]),
-        ("x86_64-unknown-linux-gnu", [256, 3_894_048, 41, 17, 12]),
-        ("x86_64-pc-windows-msvc", [162, 4_417_176, 28, 7, 5]),
-        ("wasm32-unknown-unknown", [146, 1_956_117, 27, 7, 4]),
-    ];
-    for (triple, v) in cells {
-        let scope = format!("shipped.{triple}");
-        for (metric, value) in [
-            ("third_party_packages", v[0]),
-            ("third_party_loc", v[1]),
-            ("build_scripts", v[2]),
-            ("proc_macros", v[3]),
-            ("duplicate_names", v[4]),
-        ] {
-            let _ = writeln!(s, "{scope}\t{metric}\t{value}");
-        }
-    }
-    s.push_str("lock\tthird_party_packages\t556\n");
-    s.push_str("patch\tentries\t6\n");
-    s.push_str("patch\tlive_entries\t6\n");
     s
 }
 
@@ -1128,30 +1084,6 @@ mod tests {
         let rows = parse(&text).unwrap();
         assert_eq!(rows[0].regress_reason.as_deref(), Some(REASON_80));
         assert_eq!(render(&rows), text);
-    }
-
-    #[test]
-    fn the_seed_body_parses_and_names_only_measurable_facts() {
-        let rows = parse(&seed()).expect("the seed body is a valid ratchet");
-        assert_eq!(rows.len(), 23, "4 cells x 5 + lock + 2 patch");
-        let mut live = Live::default();
-        for triple in [
-            "aarch64-apple-darwin",
-            "x86_64-unknown-linux-gnu",
-            "x86_64-pc-windows-msvc",
-            "wasm32-unknown-unknown",
-        ] {
-            live.scopes.push(format!("shipped.{triple}"));
-        }
-        for r in &rows {
-            validate_metric(r, &live).expect("every seeded row names a measured fact");
-        }
-        // The macOS ground truth, as measured on this checkout.
-        let mac = rows
-            .iter()
-            .find(|r| r.scope == "shipped.aarch64-apple-darwin" && r.metric == "third_party_loc")
-            .unwrap();
-        assert_eq!(mac.ceiling, 2_130_888);
     }
 
     #[test]

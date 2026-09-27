@@ -144,12 +144,6 @@ pub fn https_host(url: &str) -> Option<&str> {
     Some(host)
 }
 
-/// Whether `url` is `https://` on an exactly-allow-listed vendor host.
-#[must_use]
-pub fn url_allowed(url: &str) -> bool {
-    https_host(url).is_some_and(|h| VENDOR_HOSTS.contains(&h))
-}
-
 /// Whether `s` is a 64-character lowercase-or-uppercase hex SHA-256 spelling.
 fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -416,6 +410,7 @@ enum AtManaged {
 
 /// The Windows `PATHEXT` a lookup falls back to when the variable is unset or empty —
 /// `cmd.exe`'s own default.
+#[cfg(any(windows, test))]
 pub const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
 /// The file names a Windows `PATH` lookup of `name` tries in ONE directory, in order —
@@ -427,6 +422,7 @@ pub const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 /// matches on Windows — it is not executable there. Pure, so the rule is unit-tested on
 /// every platform; the Windows walk feeds it the process's `PATHEXT`.
 #[must_use]
+#[cfg(any(windows, test))]
 pub fn windows_lookup_names(name: &str, pathext: &str) -> Vec<String> {
     let source = if pathext.trim().is_empty() {
         DEFAULT_PATHEXT
@@ -683,7 +679,7 @@ pub fn path_var() -> Option<std::ffi::OsString> {
 
 /// Run `f` with `path` as what [`path_var`] answers on this thread for its duration —
 /// `None` is an unset `PATH`. Nested scopes restore the outer one. Test-only.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn with_path_var<R>(path: Option<&OsStr>, f: impl FnOnce() -> R) -> R {
     let prior = PATH_VAR.with(|p| p.replace(Some(path.map(OsStr::to_os_string))));
     let out = f();
@@ -930,7 +926,6 @@ mod tests {
             for tail in ["", "/", "/a/b/c?x=1#f"] {
                 let mut a = row();
                 a.url = format!("https://{host}{tail}");
-                assert!(url_allowed(&a.url), "{}", a.url);
                 check_row(&a, &exposes()).unwrap_or_else(|e| panic!("{}: {e}", a.url));
             }
         }
@@ -1389,6 +1384,7 @@ mod tests {
 
     // ---- the system-satisfaction probe ----
 
+    #[cfg(unix)]
     fn scratch(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("atpkg-vendor-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);

@@ -54,6 +54,11 @@ pub struct Cmd {
     /// Spawn under UTILITY QoS rather than the gate's inherited tier — see
     /// [`Cmd::demoted`] for which children may, and why the rest may not.
     pub demoted: bool,
+    /// When the gate must end this child early — its ceiling fired, or the
+    /// gate itself was interrupted — send its group `SIGTERM` first and give it
+    /// this long to exit before the `SIGKILL`. `None` (the default): `SIGKILL`
+    /// at once. See [`Cmd::term_grace`] for which children ask for it.
+    pub term_grace: Option<Duration>,
 }
 
 impl Cmd {
@@ -65,6 +70,7 @@ impl Cmd {
             envs: Vec::new(),
             capture: Capture::Emit,
             demoted: false,
+            term_grace: None,
         }
     }
 
@@ -127,6 +133,36 @@ impl Cmd {
         self
     }
 
+    /// End this child with `SIGTERM` and a `grace` before the `SIGKILL`
+    /// (2026-09-26), so a shell suite's `trap … EXIT` runs.
+    ///
+    /// WHY. Every stage child leads a process group of its own, and both ways
+    /// the gate ends one early — the wall-clock ceiling ([`kill_and_reap`]) and
+    /// an interrupted gate ([`group::kill_on_interrupt`]) — sent that group
+    /// `SIGKILL`, which no process can catch. A shell suite cleans up in its
+    /// EXIT trap, and bash runs that trap on `SIGTERM` but never on `SIGKILL`
+    /// (measured under /bin/bash 3.2 and bash 5.3: a group `SIGTERM` leaves the
+    /// trap's marker, a group `SIGKILL` does not). So a killed suite left what
+    /// only its trap removes: `tools/test-dev-sign-id.sh` a scratch keychain in
+    /// the owner's real `~/Library/Keychains`, the live lanes their private
+    /// instance's temp tree, and `tools/test-codex-live-upgrade.sh` its
+    /// `/tmp/cxlive.*` tree plus the Codex app-server daemons and background
+    /// terminals that left the group on purpose and that only its pid-walking
+    /// cleanup finds.
+    ///
+    /// OPT-IN, like [`Cmd::demoted`]. A compile has no trap to run and a
+    /// `SIGTERM` would only delay its death, so the default stays the
+    /// immediate `SIGKILL`. The grace is a BOUND, not a wait: the gate moves on
+    /// as soon as the group has emptied, and a child still alive at its end is
+    /// `SIGKILL`ed as before, so a suite that ignores `SIGTERM` costs `grace`
+    /// and nothing more. An interrupted gate waits at most [`TERM_GRACE`],
+    /// whatever a child asked for.
+    #[must_use]
+    pub fn term_grace(mut self, grace: Duration) -> Self {
+        self.term_grace = Some(grace);
+        self
+    }
+
     /// The argv as printable strings — for tests and for ladder labels.
     #[must_use]
     pub fn argv(&self) -> Vec<String> {
@@ -146,16 +182,15 @@ pub struct ExecEnv<'a> {
     pub scratch: &'a Path,
     /// The wall-clock ceiling on ONE child, or `None` for "wait forever" — the
     /// behaviour every child had before [`DEFAULT_CHILD_CEILING`] existed.
-    /// Resolved once, on the main thread, from the environment snapshot
-    /// ([`crate::Ctx::exec_env`]); carried per invocation rather than read here
-    /// so a stage's decision stays a function of a value a test can construct.
+    /// Resolved once, from `--stage-timeout` ([`crate::Ctx::exec_env`]); carried
+    /// per invocation rather than read here so a stage's decision stays a
+    /// function of a value a test can construct.
     pub child_ceiling: Option<Duration>,
     /// Variables REMOVED from every child's inherited environment before its
     /// own [`Cmd::envs`] are applied — so a stage that names a variable
-    /// explicitly still wins. Every run, in place or not, removes the gate's own
-    /// side channels ([`crate::GATE_CHANNELS`]: `ATERM_VERIFY_TIMINGS` and
-    /// `ATERM_VERIFY_SNAPSHOT`) and otherwise inherits exactly what it always
-    /// did. A SNAPSHOT run also removes `CARGO_TARGET_DIR` (2026-09-13):
+    /// explicitly still wins. An in-place run removes nothing (the gate's own
+    /// side channels are flags since 2026-09-24, so no child can inherit one).
+    /// A SNAPSHOT run removes `CARGO_TARGET_DIR` (2026-09-13):
     /// the snapshot's lanes are its own directories, and a caller's redirect
     /// would put every cargo child straight back into the shared, contended
     /// target dir the snapshot exists to get away from.
@@ -174,12 +209,12 @@ pub struct ExecEnv<'a> {
     /// 55 GB and run the volume to `No space left on device`
     /// ([`crate::Ctx::with_pinned_child_facts`]).
     pub add_env: &'a [(OsString, OsString)],
-    /// Where per-child timing rows go when `ATERM_VERIFY_TIMINGS` names a file.
-    /// `None` spawns nothing extra and writes nothing.
+    /// Where per-child timing rows go when `--timings` names a file. `None`
+    /// spawns nothing extra and writes nothing.
     pub timings: Option<&'a Timings>,
 }
 
-/// `ATERM_VERIFY_TIMINGS=<file>`: one TSV row per child — and one per stage,
+/// `--timings <file>`: one TSV row per child — and one per stage,
 /// with the child column `(stage)` — naming the stage, the child, the lane, its
 /// start and end in seconds since the gate started, how it ended, and the
 /// one-minute load average at both ends.
@@ -436,9 +471,9 @@ impl Run {
 /// in this tree:
 ///
 ///  * `tools/paint_guard.sh` — 720 s in the pathological run recorded in
-///    docs/RELEASE-PROOF-DISCIPLINE.md:221 (a four-row matrix stuck at 4 x its
-///    own 180 s budget, before the orphaned-watchdog defect was fixed); 242 s
-///    for the paint matrix as it stands today.
+///    docs/RELEASE-PROOF-DISCIPLINE.md, harness-defect item 5 (a four-row
+///    matrix stuck at 4 x its own 180 s budget, before the orphaned-watchdog
+///    defect was fixed); 242 s for the paint matrix as it stands today.
 ///  * The ay full-domain SimHash obligation behind `--full`: 129.8 s, with
 ///    drafting probes measured at 76 s on other encodings
 ///    (docs/sparkle-words-v2-design.md:1748).
@@ -493,51 +528,46 @@ impl Run {
 /// does), and the diagnostic says so where an operator will read it.
 pub const DEFAULT_CHILD_CEILING: Duration = Duration::from_secs(3 * 60 * 60);
 
-/// The environment variable that moves, or removes, [`DEFAULT_CHILD_CEILING`].
-///
-/// Seconds, fractional accepted; `0`, `off`, `none` or `never` disable the
-/// ceiling entirely and restore the unbounded wait.
-pub const CEILING_ENV: &str = "ATERM_VERIFY_STAGE_TIMEOUT";
+/// The `SIGTERM` grace the stage suites ask for ([`Cmd::term_grace`]), and the
+/// longest an interrupted gate waits for any group it sent `SIGTERM` before it
+/// `SIGKILL`s the rest and dies. A bound on the slowest cleanup, never a
+/// sleep: the gate stops waiting the moment every such group has exited.
+pub const TERM_GRACE: Duration = Duration::from_secs(10);
 
 /// Anything past a century is not a number of seconds anyone meant, and
 /// `Duration::from_secs_f64` panics outright on a value it cannot hold.
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
-/// Parse [`CEILING_ENV`] into a ceiling. Pure, so every branch below is a unit
-/// test rather than an exported variable in a live process.
+/// Parse a `--stage-timeout` value: `Some(Some(d))` moves
+/// [`DEFAULT_CHILD_CEILING`] to `d` (seconds, fractional accepted),
+/// `Some(None)` removes it (`0`, `off`, `none`, `never`) and restores the
+/// unbounded wait, and `None` is a value this cannot read — which the command
+/// line refuses as a usage error. Pure, so every branch is a unit test.
 ///
-/// The direction of failure is fixed the way [`crate::changed`] fixes it: a value
-/// this cannot read honestly falls back to the DEFAULT, never to "disabled".
-/// Removing the only backstop against a silent gate has to be something an
-/// operator TYPED — `ATERM_VERIFY_STAGE_TIMEOUT=off` — not something they
-/// achieved by fat-fingering `45m` into a field that wants seconds.
+/// The direction of failure is fixed the way [`crate::changed`] fixes it:
+/// removing the only backstop against a silent gate has to be something an
+/// operator TYPED — `--stage-timeout off` — never something they achieved by
+/// fat-fingering `45m` into a field that wants seconds.
 #[must_use]
-pub fn ceiling_from_env(raw: Option<&OsStr>) -> Option<Duration> {
-    let Some(text) = raw.and_then(OsStr::to_str) else {
-        return Some(DEFAULT_CHILD_CEILING);
-    };
+pub fn parse_ceiling(text: &str) -> Option<Option<Duration>> {
     let text = text.trim();
     if text == "0"
         || text.eq_ignore_ascii_case("off")
         || text.eq_ignore_ascii_case("none")
         || text.eq_ignore_ascii_case("never")
     {
-        return None;
+        return Some(None);
     }
     match text.parse::<f64>() {
         // `is_finite` first, so a NaN never reaches the range test — a NaN
-        // compares false against everything, which would land it in the default
+        // compares false against everything, which would land it in the refused
         // arm anyway, but only by accident.
         Ok(v) if v.is_finite() && (0.0..=MAX_CEILING_SECS).contains(&v) => {
             // `0.0` (and `0.000`) mean what the bare `0` above means.
-            if v > 0.0 {
-                Some(Duration::from_secs_f64(v))
-            } else {
-                None
-            }
+            Some((v > 0.0).then(|| Duration::from_secs_f64(v)))
         }
-        // Empty, negative, `45m`, `NaN`, a century: the default.
-        _ => Some(DEFAULT_CHILD_CEILING),
+        // Empty, negative, `45m`, `NaN`, a century: not a ceiling.
+        _ => None,
     }
 }
 
@@ -700,12 +730,23 @@ fn finish(
     let read_log = |log: Option<&Path>| {
         log.map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
     };
+    // An interrupted gate is on its way down: a child spawned now would only
+    // be killed before it could say anything. (The handler raises the flag
+    // before it signals anything, so at most a spawn already past this check
+    // races it — and that child is on the live list for the final SIGKILL.)
+    #[cfg(unix)]
+    if group::stopping() {
+        return (
+            failed_to_wait("the gate was interrupted before this child started"),
+            read_log(log),
+        );
+    }
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
     };
     #[cfg(unix)]
-    let _live = group::Live::enter(child.id());
+    let _live = group::Live::enter(child.id(), cmd.term_grace.is_some());
     let Some(limit) = ceiling else {
         let r = reaped(child.wait());
         return (r, read_log(log));
@@ -748,7 +789,7 @@ fn finish(
         let Some(left) = limit.checked_sub(elapsed) else {
             // Kill and reap FIRST, then read: the bytes the child wrote before it
             // died are the ones the note and the splice both describe.
-            let killed = kill_and_reap(&mut child);
+            let killed = kill_and_reap(&mut child, cmd.term_grace);
             let logged = read_log(log);
             return (
                 over_ceiling(cmd, elapsed, limit, &killed, logged.as_deref()),
@@ -768,7 +809,44 @@ fn finish(
 ///
 /// The group goes FIRST, while the unreaped child still holds its id, so the
 /// signal cannot land on a group some later process was given.
-fn kill_and_reap(child: &mut std::process::Child) -> String {
+///
+/// With a `grace` ([`Cmd::term_grace`]) the group is sent `SIGTERM` first and
+/// given up to `grace` to empty — polled without reaping, so the child's id
+/// stays held and the rule above still holds for the `SIGKILL` that follows
+/// if it did not. A group that emptied in time needs no `SIGKILL`: its EXIT
+/// traps ran, and the note says so.
+fn kill_and_reap(child: &mut std::process::Child, grace: Option<Duration>) -> String {
+    #[cfg(unix)]
+    let term = match grace {
+        None => String::new(),
+        Some(grace) => match group::term(child.id()) {
+            Ok(()) => {
+                let deadline = Instant::now() + grace;
+                while group::alive(child.id()) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                if !group::alive(child.id()) {
+                    let _ = child.wait();
+                    return format!(
+                        "  (SIGTERM first, with a {:.1}s grace: the group exited within it, so \
+                         its EXIT traps ran)\n",
+                        grace.as_secs_f64()
+                    );
+                }
+                format!(
+                    "  (SIGTERM first; the group outlived its {:.1}s grace and was SIGKILLed, \
+                     so an EXIT trap still running was cut short)\n",
+                    grace.as_secs_f64()
+                )
+            }
+            Err(e) => format!("  (SIGTERM to its group failed: {e}; SIGKILLed at once)\n"),
+        },
+    };
+    #[cfg(not(unix))]
+    let term = {
+        let _ = grace;
+        String::new()
+    };
     #[cfg(unix)]
     let kill = match group::kill(child.id()) {
         Ok(()) => String::new(),
@@ -789,7 +867,7 @@ fn kill_and_reap(child: &mut std::process::Child) -> String {
     // SIGKILL is not maskable, so this returns as soon as the kernel has torn
     // the process down.
     let _ = child.wait();
-    kill
+    term + &kill
 }
 
 /// The ceiling fired: a FAILURE that says so out loud — never a skip, never a
@@ -822,8 +900,8 @@ fn over_ceiling(
              {kill}\
              \x20 This stage decided NOTHING: a child that never exits is a FAIL, never a pass \
              and never a skip.\n\
-             \x20 Raise the ceiling with {CEILING_ENV}=<seconds>, or remove it with \
-             {CEILING_ENV}=off.\n\
+             \x20 Raise the ceiling with --stage-timeout <seconds>, or remove it with \
+             --stage-timeout off.\n\
              \x20 The kill reached the child's whole process group (a targo's trustc \
              processes, a harness's own children); only a process that left the group — one \
              that started its own session, as a PTY-hosted shell does — may still be running.\n"
@@ -854,13 +932,15 @@ fn over_ceiling(
 /// no longer receives the terminal's `SIGINT` — the terminal signals its
 /// foreground group, and that is the gate's — so the gate must forward it, and
 /// std has no signal handling. The handler does only async-signal-safe work:
-/// atomic loads, `killpg`, then `signal(SIG_DFL)` and `raise`, so the gate still
-/// dies of the signal it was sent, with the exit status that says so. This crate
-/// has no dependencies on purpose (Cargo.toml), and three libc symbols declared
-/// here are not one.
+/// atomic loads and stores, `killpg`, `nanosleep` (the bounded `SIGTERM` grace,
+/// 2026-09-26 — see [`Cmd::term_grace`]), then `signal(SIG_DFL)` and `raise`,
+/// so the gate still dies of the signal it was sent, with the exit status that
+/// says so. This crate has no dependencies on purpose (Cargo.toml), and four
+/// libc symbols declared here are not one.
 #[cfg(unix)]
 pub mod group {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::ffi::c_long;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     const SIGHUP: i32 = 1;
     const SIGINT: i32 = 2;
@@ -869,10 +949,19 @@ pub mod group {
     /// `SIG_DFL`, as the handler-pointer value `signal(3)` takes.
     const SIG_DFL: usize = 0;
 
+    /// `struct timespec`: `time_t` and `long` are both `long` on every LP64
+    /// target this gate runs on (macOS and Linux, arm64 and x86_64).
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: c_long,
+        tv_nsec: c_long,
+    }
+
     unsafe extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
         fn signal(sig: i32, handler: usize) -> usize;
         fn raise(sig: i32) -> i32;
+        fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i32;
     }
 
     /// The process groups of the stage children running right now, `0` for a
@@ -880,20 +969,30 @@ pub mod group {
     /// Stages run their children one at a time, so a few dozen are ever live;
     /// a child that finds every slot taken still runs, and only an interrupt
     /// would miss it.
+    ///
+    /// A NEGATIVE entry is a group that asked for a `SIGTERM` grace
+    /// ([`crate::exec::Cmd::term_grace`]): one atomic carries both facts, so
+    /// the handler can never read a group with another child's flag.
     static LIVE: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
+
+    /// Raised by the interrupt handler before it signals anything, so no stage
+    /// starts a child the gate is about to kill (`finish` asks).
+    static STOPPING: AtomicBool = AtomicBool::new(false);
 
     /// A child's group on the live list, for as long as this value lives.
     pub struct Live(Option<usize>);
 
     impl Live {
-        /// Put `pgid` — the child's pid, which leads its group — on the list.
+        /// Put `pgid` — the child's pid, which leads its group — on the list;
+        /// `graceful` when the child asked for a `SIGTERM` grace.
         #[must_use]
-        pub fn enter(pgid: u32) -> Self {
+        pub fn enter(pgid: u32, graceful: bool) -> Self {
             let Ok(g) = i32::try_from(pgid) else {
                 return Self(None);
             };
+            let entry = if graceful { -g } else { g };
             Self(LIVE.iter().position(|slot| {
-                slot.compare_exchange(0, g, Ordering::SeqCst, Ordering::SeqCst)
+                slot.compare_exchange(0, entry, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             }))
         }
@@ -907,27 +1006,112 @@ pub mod group {
         }
     }
 
-    /// `SIGKILL` every process in group `pgid`.
-    ///
-    /// # Errors
-    /// The OS's reason, when no process was signalled.
-    pub fn kill(pgid: u32) -> std::io::Result<()> {
+    fn signal_group(pgid: u32, sig: i32) -> std::io::Result<()> {
         let g = i32::try_from(pgid).map_err(std::io::Error::other)?;
         // SAFETY: `killpg` takes two integers and touches no memory of ours.
-        if unsafe { killpg(g, SIGKILL) } == 0 {
+        if unsafe { killpg(g, sig) } == 0 {
             Ok(())
         } else {
             Err(std::io::Error::last_os_error())
         }
     }
 
+    /// `SIGKILL` every process in group `pgid`.
+    ///
+    /// # Errors
+    /// The OS's reason, when no process was signalled.
+    pub fn kill(pgid: u32) -> std::io::Result<()> {
+        signal_group(pgid, SIGKILL)
+    }
+
+    /// `SIGTERM` every process in group `pgid`.
+    ///
+    /// # Errors
+    /// The OS's reason, when no process was signalled.
+    pub fn term(pgid: u32) -> std::io::Result<()> {
+        signal_group(pgid, SIGTERM)
+    }
+
+    /// Does group `pgid` still hold a process that a signal would reach?
+    /// `killpg(g, 0)`, which delivers nothing. On macOS a group whose only
+    /// member is its unreaped, exited leader answers `EPERM` (measured
+    /// 2026-09-26), so this reads it as empty without reaping the leader —
+    /// which keeps the leader's id, and so the group's, from being reused.
+    #[must_use]
+    pub fn alive(pgid: u32) -> bool {
+        signal_group(pgid, 0).is_ok()
+    }
+
+    /// Has an interrupt begun ending the gate?
+    #[must_use]
+    pub fn stopping() -> bool {
+        STOPPING.load(Ordering::SeqCst)
+    }
+
+    /// Sleep `ms` milliseconds, async-signal-safely.
+    fn nap(ms: c_long) {
+        let t = Timespec {
+            tv_sec: 0,
+            tv_nsec: ms * 1_000_000,
+        };
+        // SAFETY: `nanosleep` reads the struct we own and writes nothing when
+        // `rem` is null; it is async-signal-safe.
+        unsafe {
+            nanosleep(&raw const t, std::ptr::null_mut());
+        }
+    }
+
     extern "C" fn on_signal(sig: i32) {
+        // A SECOND interrupt while the first one waits out its grace is the
+        // operator saying "now": it skips straight to the SIGKILLs below.
+        let first = !STOPPING.swap(true, Ordering::SeqCst);
+        // Phase 1: SIGKILL every plain group at once, as before; SIGTERM every
+        // group that asked for a grace, and remember which, so none of them is
+        // ever sent a second SIGTERM (bash would take it in the middle of its
+        // EXIT trap, and the trap is the point).
+        let mut termed = [0_i32; 256];
+        let mut n = 0;
         for slot in &LIVE {
-            let g = slot.load(Ordering::SeqCst);
-            if g > 0 {
+            let v = slot.load(Ordering::SeqCst);
+            if v > 0 || (v < 0 && !first) {
                 // SAFETY: async-signal-safe, and touches no memory of ours.
                 unsafe {
-                    killpg(g, SIGKILL);
+                    killpg(v.abs(), SIGKILL);
+                }
+            } else if v < 0 {
+                // SAFETY: as above.
+                unsafe {
+                    killpg(-v, SIGTERM);
+                }
+                termed[n] = -v;
+                n += 1;
+            }
+        }
+        // Phase 2: wait — at most TERM_GRACE — for those groups to empty.
+        let grace_ms = c_long::try_from(super::TERM_GRACE.as_millis()).unwrap_or(10_000);
+        let mut waited: c_long = 0;
+        // SAFETY (the `killpg` probes): as above; signal 0 delivers nothing.
+        while n > 0
+            && waited < grace_ms
+            && termed[..n].iter().any(|&g| unsafe { killpg(g, 0) } == 0)
+        {
+            nap(50);
+            waited += 50;
+        }
+        // Phase 3: SIGKILL whatever is still there — the graced groups that
+        // outlived their grace, and any child that started in the meantime.
+        for g in &termed[..n] {
+            // SAFETY: as above.
+            unsafe {
+                killpg(*g, SIGKILL);
+            }
+        }
+        for slot in &LIVE {
+            let v = slot.load(Ordering::SeqCst);
+            if v != 0 {
+                // SAFETY: as above.
+                unsafe {
+                    killpg(v.abs(), SIGKILL);
                 }
             }
         }
@@ -939,8 +1123,12 @@ pub mod group {
         }
     }
 
-    /// On `SIGINT`, `SIGTERM` or `SIGHUP`, kill every live stage child's group,
-    /// then die of the signal. Idempotent: it installs the same handler.
+    /// On `SIGINT`, `SIGTERM` or `SIGHUP`, end every live stage child's group,
+    /// then die of the signal: `SIGKILL` at once, except a group whose child
+    /// asked for a `SIGTERM` grace ([`crate::exec::Cmd::term_grace`]), which is
+    /// sent `SIGTERM` and given up to [`super::TERM_GRACE`] to exit — its EXIT
+    /// traps run — before the `SIGKILL`. Idempotent: it installs the same
+    /// handler.
     pub fn kill_on_interrupt() {
         let handler = on_signal as extern "C" fn(i32) as usize;
         for sig in [SIGHUP, SIGINT, SIGTERM] {
@@ -1121,6 +1309,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn spawned_argv(c: &Command) -> Vec<String> {
         std::iter::once(c.get_program())
             .chain(c.get_args())
@@ -1314,28 +1503,34 @@ mod tests {
         let quick = Cmd::new("/bin/sh").args(["-c", "exit 0"]);
         const N: u32 = 20;
 
-        let mut unbounded = Duration::ZERO;
-        let mut ceilinged = Duration::ZERO;
+        // The overhead of each ceilinged child over the unbounded one beside
+        // it, in ms. The MEDIAN decides: a wrong backoff charges EVERY child,
+        // while one exec stall or preemption charges one pair. Two sums against
+        // one 1 s slack let a single slow spawn decide it (the load-sensitive
+        // test audit of 2026-09-27).
+        let mut overhead_ms = Vec::with_capacity(N as usize);
         for _ in 0..N {
             let t = Instant::now();
             assert!(run(&quick, ceiled(&tmp, None)).ok);
-            unbounded += t.elapsed();
+            let unbounded = t.elapsed();
 
             let t = Instant::now();
             let r = run(&quick, env_in(&tmp));
-            ceilinged += t.elapsed();
+            let ceilinged = t.elapsed();
             assert!(r.ok, "a child that exits 0 is untouched by the ceiling");
             assert!(r.output.is_empty(), "and gains no diagnostic");
+            overhead_ms.push((ceilinged.as_secs_f64() - unbounded.as_secs_f64()) * 1e3);
         }
+        overhead_ms.sort_by(f64::total_cmp);
+        let median = overhead_ms[overhead_ms.len() / 2];
 
         // A poll loop that had (say) settled at a 1-second tick would blow this
         // by two orders of magnitude; the real schedule tops out at 25 ms and
         // reaches that only after 127 ms, which no child here survives.
-        let slack = Duration::from_millis(50) * N;
         assert!(
-            ceilinged <= unbounded + slack,
-            "polling cost {ceilinged:?} for {N} children against {unbounded:?} unbounded — \
-             more than {slack:?} of overhead means the backoff is wrong"
+            median <= 50.0,
+            "polling cost a median {median:.1} ms per child over the unbounded wait \
+             ({overhead_ms:.1?}) — more than 50 ms of overhead means the backoff is wrong"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1381,8 +1576,8 @@ mod tests {
         // exactly; a loaded machine may overshoot 300 ms by a whole tick.
         assert!(out.contains("child killed after "), "{out}");
         assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
-        assert!(out.contains(CEILING_ENV), "{out}");
-        assert!(out.contains("=off"), "{out}");
+        assert!(out.contains("--stage-timeout <seconds>"), "{out}");
+        assert!(out.contains("--stage-timeout off"), "{out}");
         assert!(out.contains("whole process group"), "{out}");
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1547,6 +1742,208 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// The ceiling for [`suite_with_trap`] runs. The ceiling clock starts at the
+    /// spawn, so it must outlast bash's startup to its traps and the pidfile:
+    /// one that fires first kills a shell with no trap installed, and the
+    /// tests below then read "no marker" or "no pid" for a reason that is not
+    /// about the grace. It was 300-500 ms, 20-60x a quiet startup but
+    /// reachable under a loaded gate (the load-sensitive test audit of
+    /// 2026-09-27); 3 s is still a small fraction of every grace compared.
+    #[cfg(unix)]
+    const SUITE_CEILING: Duration = Duration::from_secs(3);
+
+    /// A shell SUITE's shape: an EXIT trap that leaves `marker`, and a
+    /// grandchild `sleep` (its pid in `pidfile`) the shell waits on. `ignore`
+    /// makes the shell — and so the `sleep`, which inherits the disposition —
+    /// ignore `SIGTERM`, the suite that will not go quietly.
+    #[cfg(unix)]
+    fn suite_with_trap(marker: &Path, pidfile: &Path, ignore: bool) -> Cmd {
+        Cmd::new("/bin/bash").args([
+            "-c",
+            &format!(
+                "{}trap 'touch {}' EXIT; sleep 600 & echo $! > '{}'; wait",
+                if ignore { "trap '' TERM; " } else { "" },
+                marker.display(),
+                pidfile.display()
+            ),
+        ])
+    }
+
+    /// A GRACEFUL CHILD'S EXIT TRAP RUNS BEFORE THE CEILING KILL (2026-09-26).
+    /// The ceiling fires, the group is sent `SIGTERM`, bash runs its trap, the
+    /// group empties, and the gate moves on without waiting out the grace —
+    /// and the grandchild is gone too. The NEGATIVE CONTROL is the same suite
+    /// with no grace: the `SIGKILL` this replaced, which bash cannot trap, so
+    /// the marker never appears.
+    #[cfg(unix)]
+    #[test]
+    fn a_graceful_child_runs_its_exit_trap_before_the_ceiling_kill() {
+        let tmp = crate::mktemp_dir("atv-ceil-grace").expect("mktemp");
+        let (marker, pidfile) = (tmp.join("trap-ran"), tmp.join("grandchild.pid"));
+        let t = Instant::now();
+        let r = run(
+            &suite_with_trap(&marker, &pidfile, false).term_grace(Duration::from_secs(20)),
+            ceiled(&tmp, Some(SUITE_CEILING)),
+        );
+        let waited = t.elapsed();
+        assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
+        assert!(
+            marker.exists(),
+            "SIGTERM first: the EXIT trap ran\n{}",
+            r.output
+        );
+        assert!(
+            r.output
+                .contains("SIGTERM first, with a 20.0s grace: the group exited within it"),
+            "{}",
+            r.output
+        );
+        assert!(
+            waited < SUITE_CEILING + Duration::from_secs(10),
+            "the grace is a bound, not a sleep: {waited:?}"
+        );
+        let grandchild = read_pid(&pidfile);
+        assert!(
+            gone_within_5s(&grandchild),
+            "{grandchild} outlived the kill"
+        );
+
+        // The negative control: no grace, so SIGKILL, so no trap.
+        let (marker, pidfile) = (tmp.join("control-trap-ran"), tmp.join("control.pid"));
+        let r = run(
+            &suite_with_trap(&marker, &pidfile, false),
+            ceiled(&tmp, Some(SUITE_CEILING)),
+        );
+        assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
+        let grandchild = read_pid(&pidfile);
+        assert!(
+            gone_within_5s(&grandchild),
+            "{grandchild} outlived the kill"
+        );
+        assert!(
+            !marker.exists(),
+            "a SIGKILLed shell ran its trap, so this test cannot tell the two apart"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// …AND A CHILD THAT IGNORES `SIGTERM` IS STILL KILLED when its grace runs
+    /// out: the grace delays the `SIGKILL`, it never replaces it.
+    #[cfg(unix)]
+    #[test]
+    fn a_graceful_child_that_ignores_sigterm_is_killed_when_its_grace_runs_out() {
+        let tmp = crate::mktemp_dir("atv-ceil-grace-deaf").expect("mktemp");
+        let (marker, pidfile) = (tmp.join("trap-ran"), tmp.join("grandchild.pid"));
+        let t = Instant::now();
+        let r = run(
+            &suite_with_trap(&marker, &pidfile, true).term_grace(Duration::from_millis(700)),
+            ceiled(&tmp, Some(SUITE_CEILING)),
+        );
+        let waited = t.elapsed();
+        assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
+        assert!(
+            r.output
+                .contains("SIGTERM first; the group outlived its 0.7s grace and was SIGKILLed"),
+            "{}",
+            r.output
+        );
+        assert!(
+            waited >= SUITE_CEILING + Duration::from_millis(700),
+            "the ceiling, then the whole grace: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(30), "{waited:?}");
+        let grandchild = read_pid(&pidfile);
+        assert!(
+            gone_within_5s(&grandchild),
+            "{grandchild} outlived the kill"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// AN INTERRUPTED GATE LETS A GRACEFUL CHILD RUN ITS EXIT TRAP (2026-09-26).
+    /// The stand-in gate of [`an_interrupted_gate_kills_every_live_stage_group`],
+    /// running a suite-shaped child with a grace: `SIGINT` reaches it, its
+    /// handler sends the child's group `SIGTERM`, the trap runs, the
+    /// grandchild is gone, and the stand-in still dies of `SIGINT`. The
+    /// NEGATIVE CONTROL is the same child without a grace: `SIGKILL`, no trap.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_gate_lets_a_graceful_child_run_its_exit_trap() {
+        use std::os::unix::process::ExitStatusExt as _;
+        const DIR: &str = "ATV_GRACE_INTERRUPT_DIR";
+        const GRACE: &str = "ATV_GRACE_INTERRUPT_GRACEFUL";
+        if let Some(dir) = std::env::var_os(DIR) {
+            group::kill_on_interrupt();
+            let dir = PathBuf::from(dir);
+            let mut child = suite_with_trap(&dir.join("trap-ran"), &dir.join("gc.pid"), false);
+            if std::env::var_os(GRACE).is_some() {
+                child = child.term_grace(TERM_GRACE);
+            }
+            let _ = run(&child, ceiled(&dir, None));
+            return;
+        }
+        let tmp = crate::mktemp_dir("atv-grace-interrupt").expect("mktemp");
+        let me = std::env::current_exe().expect("the test binary");
+        let stand_in = |dir: &Path, graceful: bool| {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            let mut c = std::process::Command::new(&me);
+            c.args([
+                "--exact",
+                "exec::tests::an_interrupted_gate_lets_a_graceful_child_run_its_exit_trap",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DIR, dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            if graceful {
+                c.env(GRACE, "1");
+            }
+            let mut child = c.spawn().expect("the stand-in gate starts");
+            let grandchild = read_pid(&dir.join("gc.pid"));
+            let t = Instant::now();
+            std::process::Command::new("/bin/kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .expect("kill -INT");
+            let status = child.wait().expect("the stand-in exits");
+            (
+                status,
+                grandchild,
+                t.elapsed(),
+                dir.join("trap-ran").exists(),
+            )
+        };
+
+        let (status, grandchild, took, trapped) = stand_in(&tmp.join("graceful"), true);
+        assert_eq!(
+            status.signal(),
+            Some(2),
+            "it still dies of SIGINT: {status:?}"
+        );
+        assert!(trapped, "the graceful child's EXIT trap ran");
+        assert!(
+            gone_within_5s(&grandchild),
+            "{grandchild} outlived the gate"
+        );
+        assert!(
+            took < TERM_GRACE,
+            "the handler stops waiting once the group has gone: {took:?}"
+        );
+
+        let (status, grandchild, _, trapped) = stand_in(&tmp.join("plain"), false);
+        assert_eq!(status.signal(), Some(2), "{status:?}");
+        assert!(
+            gone_within_5s(&grandchild),
+            "{grandchild} outlived the gate"
+        );
+        assert!(
+            !trapped,
+            "a plain child's trap ran too, so this test cannot tell the two apart"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn a_timed_out_test_child_names_the_test_it_was_still_running() {
         // The 3-hour hang of 2026-09-16: the ceiling ended it and the block
@@ -1574,8 +1971,8 @@ mod tests {
         assert!(out.contains("  child: /bin/sh -c printf "), "{out}");
         assert!(out.contains("child killed after "), "{out}");
         assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
-        assert!(out.contains(CEILING_ENV), "{out}");
-        assert!(out.contains("=off"), "{out}");
+        assert!(out.contains("--stage-timeout <seconds>"), "{out}");
+        assert!(out.contains("--stage-timeout off"), "{out}");
         assert!(out.contains("whole process group"), "{out}");
 
         // The order: the child's bytes, the TIMEOUT line, the name, the verdict
@@ -1657,46 +2054,42 @@ mod tests {
     }
 
     #[test]
-    fn the_env_override_moves_the_ceiling_and_only_a_typed_word_removes_it() {
-        // Unset is the default, and so is anything unreadable: the direction of
-        // failure is fixed at "keep the backstop".
-        assert_eq!(ceiling_from_env(None), Some(DEFAULT_CHILD_CEILING));
+    fn the_flag_moves_the_ceiling_and_only_a_typed_word_removes_it() {
+        // Anything unreadable is refused (the command line makes it a usage
+        // error): the direction of failure is fixed at "keep the backstop".
         for junk in ["", "  ", "45m", "soon", "-5", "NaN", "1e400", "4e9"] {
             assert_eq!(
-                ceiling_from_env(Some(OsStr::new(junk))),
-                Some(DEFAULT_CHILD_CEILING),
+                parse_ceiling(junk),
+                None,
                 "{junk:?} is not a number of seconds, and must not disable the ceiling"
             );
         }
         // Only a value that says so removes it.
         for off in ["0", "0.0", "off", "OFF", "none", "Never", " off "] {
             assert_eq!(
-                ceiling_from_env(Some(OsStr::new(off))),
-                None,
+                parse_ceiling(off),
+                Some(None),
                 "{off:?} must disable the ceiling"
             );
         }
+        assert_eq!(parse_ceiling("90"), Some(Some(Duration::from_secs(90))));
         assert_eq!(
-            ceiling_from_env(Some(OsStr::new("90"))),
-            Some(Duration::from_secs(90))
+            parse_ceiling(" 5400 "),
+            Some(Some(Duration::from_secs(5400)))
         );
         assert_eq!(
-            ceiling_from_env(Some(OsStr::new(" 5400 "))),
-            Some(Duration::from_secs(5400))
-        );
-        assert_eq!(
-            ceiling_from_env(Some(OsStr::new("0.25"))),
-            Some(Duration::from_millis(250))
+            parse_ceiling("0.25"),
+            Some(Some(Duration::from_millis(250)))
         );
     }
 
     #[test]
     fn an_overridden_ceiling_is_the_one_that_actually_fires() {
         // The parse above is pure; this is the same value threaded through the
-        // path the gate uses — snapshot string, `ceiling_from_env`, `ExecEnv` —
+        // path the gate uses — the flag's string, `parse_ceiling`, `ExecEnv` —
         // ending in a real child that really dies.
         let tmp = crate::mktemp_dir("atv-ceil-env").expect("mktemp");
-        let ceiling = ceiling_from_env(Some(OsStr::new("0.4")));
+        let ceiling = parse_ceiling("0.4").expect("a ceiling");
         assert_eq!(ceiling, Some(Duration::from_millis(400)));
 
         let t = Instant::now();
@@ -1726,7 +2119,7 @@ mod tests {
         let tmp = crate::mktemp_dir("atv-ceil-off").expect("mktemp");
         let r = run(
             &Cmd::new("/bin/sh").args(["-c", "sleep 0.4; echo late"]),
-            ceiled(&tmp, ceiling_from_env(Some(OsStr::new("off")))),
+            ceiled(&tmp, parse_ceiling("off").expect("off parses")),
         );
         assert!(r.ok, "nothing kills a child when the ceiling is off");
         assert_eq!(r.trimmed_output(), "late");

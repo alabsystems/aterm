@@ -208,11 +208,10 @@ enum ObservationRetryTransition {
 /// Shipping projection of the derived model's capacity-one observation retry.
 ///
 /// Deliberately a named function rather than four inlined literals: it is the
-/// ONE place the shipping code states the policy, which is what
-/// `observation_retry_transitions_conform_to_derived_model` compares against
-/// `title_summary_model()`. Fold it back into its call sites and the retry
-/// policy is expressed only by which sites happen to clear `retries`, and the
-/// model can drift away from the code with nothing left to notice.
+/// ONE place the shipping code states the policy, and every site that arms or
+/// clears a retry consults it. `observation_retry_transitions_conform_to_derived_model`
+/// drives those sites and compares the retry state they leave against
+/// `title_summary_model()`.
 fn retry_pending_after(transition: ObservationRetryTransition) -> bool {
     transition == ObservationRetryTransition::Contended
 }
@@ -2932,7 +2931,7 @@ mod tests {
             "managed Ollama socket ownership remains HTTP-only"
         );
         assert_eq!(
-            loopback_socket("http://127.42.0.9:11434/api/chat").map(|(socket, _)| socket),
+            loopback_socket("http://127.42.0.9:11434/api/chat"),
             Some("127.42.0.9:11434".parse().unwrap()),
             "all of 127/8 is classified and connected as loopback"
         );
@@ -2943,7 +2942,7 @@ mod tests {
             "http://[::1]:11434/api/chat",
             "http://[::ffff:127.0.0.1]:11434/api/chat",
         ] {
-            let (socket, _) = loopback_socket(endpoint)
+            let socket = loopback_socket(endpoint)
                 .unwrap_or_else(|| panic!("accepted loopback must resolve directly: {endpoint}"));
             assert!(
                 match socket.ip() {
@@ -3778,6 +3777,20 @@ mod tests {
         assert_eq!(crashed["endpoint1"], 0);
         assert_eq!(crashed["health_endpoint1"], 0);
         assert!(model.check_invariant("RevokedHealthIsClear", &crashed));
+
+        // Negative control: an exit handler that reports the runtime down but
+        // keeps the dead daemon's record (the genuine one cleared it above:
+        // `health.endpoint == None`) hands the next request an endpoint, and a
+        // reuse capability, that no live process owns.
+        let kept =
+            aterm_spec::interp::with_buggy(&model, 1).successors("Crash1", &ready)[0].clone();
+        assert_eq!(kept["process1"], 0);
+        assert_eq!(kept["endpoint1"], ready["endpoint1"]);
+        assert_eq!(kept["health_endpoint1"], ready["endpoint1"]);
+        assert_eq!(kept["reused1"], 1);
+        assert_eq!(aterm_spec::interp::admits(&model, &ready, &kept), None);
+        assert!(!model.check_invariant("EndpointBelongsToOwnedProcess", &kept));
+        assert!(!model.check_invariant("ReuseRetainsOwnedEndpoint", &kept));
     }
 
     /// FRAME AUDIT #3, end to end over the REAL App wiring: the published
@@ -4573,6 +4586,23 @@ mod tests {
             !buggy.check_invariant("PriorityCannotStarveBackground", &priority_twice),
             "negative control must reject repeated priority bypass"
         );
+
+        // Negative control: a fresh batch without the active-first promotion
+        // starts at the sorted head. The shipping selector does exactly that
+        // when it is given no active session, and the mutant's first turn is
+        // that pick for the active session 2.
+        let mut unpromoted = Coordinator::new(None);
+        for session in [1, 2, 3] {
+            unpromoted.retries.insert(session, now);
+        }
+        let first = unpromoted.due_observations(now, None);
+        assert_eq!(first, vec![1]);
+        assert_eq!(bulk["chosen"], 1);
+        assert_eq!(bulk["first_chosen"], 1);
+        assert!(
+            !buggy.check_invariant("ActiveSessionStartsBatch", &bulk),
+            "negative control must reject a batch that does not start active"
+        );
     }
 
     #[test]
@@ -4986,6 +5016,19 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             premature["phase"] == 1,
             "negative control: the old ambiguity-drop transition must disagree"
         );
+
+        // A structural error from the genuine parser fails closed; a retry arm
+        // without its transient filter would retry it.
+        let oversized = format!("p700\nn{}\n", "x".repeat(2048));
+        let structural_error =
+            parse_established_server_pid(oversized.as_bytes(), server, client).unwrap_err();
+        assert!(!socket_owner_observation_is_transient(&structural_error));
+        let retried = buggy.successors("ObserveStructuralError", &initial)[0].clone();
+        assert_ne!(
+            socket_owner_observation_is_transient(&structural_error),
+            retried["phase"] == 1,
+            "negative control: the unfiltered retry transition must disagree"
+        );
     }
 
     /// THIS ONE SHELLS OUT TO `lsof`, and that is the whole of its flakiness.
@@ -5217,7 +5260,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             (&second_controller, 202, &second_endpoint),
         ] {
             let process = controller.endpoint_process(endpoint, epoch).unwrap();
-            let (socket, _) = loopback_socket(endpoint).unwrap();
+            let socket = loopback_socket(endpoint).unwrap();
             let stream =
                 std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(1)).unwrap();
             attest_managed_server_stream(&stream, process).unwrap();
@@ -5295,8 +5338,8 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         // the child, because the `timed out` assertions above hold even if the
         // group kill silently stopped applying (the runner deliberately never
         // joins the reader, so a surviving grandchild is invisible to them).
-        // Both probes report through a file: the output struct's fields are
-        // private to the runner's module, and the timeout path returns none.
+        // Both probes report through a file: the timeout path returns no output,
+        // and the group probe runs with stdout discarded (`stdout_limit` 0).
         let probe_file = std::env::temp_dir().join(format!(
             "aterm-title-group-probe-{}-{:?}",
             std::process::id(),
@@ -5307,13 +5350,15 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             "echo $$ > '{0}'; ps -o pgid= -p $$ >> '{0}'",
             probe_file.display()
         );
-        run_command_bounded(
+        let group = run_command_bounded(
             std::process::Command::new("/bin/sh").args(["-c", &script]),
             Duration::from_secs(10),
             0,
             "test helper group",
         )
         .unwrap();
+        assert!(group.status.success(), "the probe script ran to completion");
+        assert!(group.stdout.is_empty(), "a zero stdout limit keeps nothing");
         let probe = std::fs::read_to_string(&probe_file).unwrap();
         let _ = std::fs::remove_file(&probe_file);
         let mut lines = probe.lines().map(str::trim);
@@ -5340,19 +5385,32 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         ));
         let _ = std::fs::remove_file(&pid_file);
         let script = format!("sleep 600 & echo $! > '{}'; wait", pid_file.display());
-        let escaped = run_command_bounded(
-            std::process::Command::new("/bin/sh").args(["-c", &script]),
-            Duration::from_secs(2),
-            128,
-            "test helper escaped grandchild",
-        )
-        .unwrap_err();
+        // A take proves the group kill only if the shell RAN inside the budget:
+        // forked the grandchild and wrote its pid. A loaded machine can starve
+        // the spawn past a 2 s budget, which says nothing about the kill, so
+        // such a take (and only such a take) is repeated with a larger one —
+        // the script ends only by the kill, so each budget is paid in full
+        // (the load-sensitive test audit of 2026-09-27).
+        let mut ran = None;
+        for budget in [2, 8, 30].map(Duration::from_secs) {
+            let escaped = run_command_bounded(
+                std::process::Command::new("/bin/sh").args(["-c", &script]),
+                budget,
+                128,
+                "test helper escaped grandchild",
+            )
+            .unwrap_err();
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+            {
+                ran = Some((escaped, pid));
+                break;
+            }
+        }
+        let (escaped, grandchild) =
+            ran.expect("the shell wrote the grandchild pid inside even the largest budget");
         assert!(escaped.contains("timed out"));
-        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
-            .expect("the shell wrote the grandchild pid before the deadline")
-            .trim()
-            .parse()
-            .unwrap();
         let _ = std::fs::remove_file(&pid_file);
         assert!(grandchild > 1);
         let gone_by = Instant::now() + Duration::from_secs(30);
@@ -5374,7 +5432,9 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
 
         let oversized = run_command_bounded(
             std::process::Command::new("/bin/sh").args(["-c", "printf '%02048d' 0"]),
-            Duration::from_secs(1),
+            // The byte limit trips the moment 2048 bytes arrive, so a generous
+            // budget costs nothing; at 1 s a starved spawn read "timed out".
+            Duration::from_secs(30),
             128,
             "test helper",
         )
@@ -5696,6 +5756,13 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         let first = buggy.successors("Launch1", &buggy.init_state())[0].clone();
         let collision = buggy.successors("Launch2", &first)[0].clone();
         assert!(!buggy.check_invariant("ConcurrentAutomaticEndpointsAreDistinct", &collision,));
+
+        // The mutant's endpoints are the shared default (value 3) resolved through
+        // configuration; the genuine reservations above are two distinct
+        // ephemeral ports.
+        assert_eq!(collision["endpoint1"], 3);
+        assert_eq!(collision["endpoint2"], 3);
+        assert!(!model.check_invariant("AutomaticEndpointNeverUsesSharedDefault", &first));
     }
 
     #[cfg(unix)]
@@ -5988,39 +6055,77 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         ));
     }
 
-    /// The shipping retry projection ([`retry_pending_after`]) and the derived
-    /// `title_summary_model` must agree on which transitions leave a retry
-    /// armed. Drives the model through the real transition names and compares
-    /// its `retry_pending` against the shipping answer, so a policy change on
-    /// either side that is not made on both fails here.
+    /// The shipping retry state and the derived `title_summary_model` agree on
+    /// which transitions leave a retry armed. Drives the REAL coordinator —
+    /// `defer_observation`, `observation_succeeded`, a disabling `reconfigure`,
+    /// `retire` — and projects `retry_pending` from its per-session state (the
+    /// `retries` deadline and the `contended` backoff), so a teardown path that
+    /// forgets either one fails here, not only a change to the policy table
+    /// ([`retry_pending_after`]) those paths consult.
     #[test]
     fn observation_retry_transitions_conform_to_derived_model() {
+        const SESSION: u64 = 7;
         let model = aterm_spec::derive::title_summary_model();
+        let retry_pending = |coordinator: &Coordinator| {
+            i64::from(
+                coordinator.retries.contains_key(&SESSION)
+                    || coordinator.contended.contains_key(&SESSION),
+            )
+        };
+        let enabled = Config {
+            descriptive_titles: Some(true),
+            title_summary_provider: Some(TitleSummaryProvider::Builtin),
+            ..Config::default()
+        };
+        let armed_coordinator = || {
+            let mut coordinator = Coordinator::new(None);
+            coordinator.reconfigure(&enabled);
+            coordinator.defer_observation(SESSION, Instant::now());
+            coordinator
+        };
+
+        let mut coordinator = armed_coordinator();
         let armed = model.successors("LockContended", &model.init_state())[0].clone();
-        assert_eq!(
-            armed["retry_pending"] == 1,
-            retry_pending_after(ObservationRetryTransition::Contended)
-        );
+        assert_eq!(retry_pending(&coordinator), armed["retry_pending"]);
+        coordinator.defer_observation(SESSION, Instant::now());
         let still_armed = model.successors("RetryContended", &armed)[0].clone();
-        assert_eq!(
-            still_armed["retry_pending"] == 1,
-            retry_pending_after(ObservationRetryTransition::Contended)
-        );
+        assert_eq!(retry_pending(&coordinator), still_armed["retry_pending"]);
+        coordinator.observation_succeeded(SESSION);
         let succeeded = model.successors("ObserveSuccess", &still_armed)[0].clone();
-        assert_eq!(
-            succeeded["retry_pending"] == 1,
-            retry_pending_after(ObservationRetryTransition::Succeeded)
-        );
+        assert_eq!(retry_pending(&coordinator), succeeded["retry_pending"]);
+
+        let mut coordinator = armed_coordinator();
+        assert!(coordinator.reconfigure(&Config {
+            title_summary_provider: Some(TitleSummaryProvider::Off),
+            ..enabled.clone()
+        }));
         let disabled = model.successors("Disable", &armed)[0].clone();
-        assert_eq!(
-            disabled["retry_pending"] == 1,
-            retry_pending_after(ObservationRetryTransition::Disabled)
-        );
+        assert_eq!(retry_pending(&coordinator), disabled["retry_pending"]);
+
+        let mut coordinator = armed_coordinator();
+        coordinator.retire(SESSION);
         let retired = model.successors("Retire", &armed)[0].clone();
+        assert_eq!(retry_pending(&coordinator), retired["retry_pending"]);
+
+        // Negative control, 7230de0fa: `retire` dropped every per-session map
+        // but the contended backoff. Replayed by putting that one entry back,
+        // the retired session still owns an observation retry — the mutant's
+        // `Retire`, which the healthy model does not admit.
+        let mut leaked = armed_coordinator();
+        let strikes = leaked.contended[&SESSION];
+        leaked.retire(SESSION);
+        leaked.contended.insert(SESSION, strikes);
+        let mut leaked_state = retired.clone();
+        leaked_state.insert("retry_pending", retry_pending(&leaked));
         assert_eq!(
-            retired["retry_pending"] == 1,
-            retry_pending_after(ObservationRetryTransition::Retired)
+            aterm_spec::interp::with_buggy(&model, 1).successors("Retire", &armed),
+            vec![leaked_state.clone()]
         );
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &armed, &leaked_state),
+            None
+        );
+        assert!(!model.check_invariant("RetiredObservationIsQuiescent", &leaked_state));
     }
 
     /// THE FOLD-SEAM FLOOR (busy-rearm audit, item 4). Due-but-unserviced is

@@ -9,7 +9,7 @@
 //! owner-only DACL on the control directory — [`ensure_private_dir`] refuses a
 //! directory the current user does NOT own (the Windows twin of the Unix SEC-3
 //! owner gate) and rewrites its DACL to a PROTECTED (non-inheriting) grant to
-//! the user + SYSTEM + Administrators, so an explicit `ATERM_CONTROL_SOCK` placed
+//! the user + SYSTEM + Administrators, so an explicit `--control-sock` placed
 //! in a world-writable location — or a pre-existing loosely-ACL'd `%LOCALAPPDATA%`
 //! subtree — cannot leave the socket + token world-readable/-writable. There is
 //! still NO peer-uid gate (AF_UNIX on Windows has no `SO_PEERCRED`/`getpeereid`
@@ -26,11 +26,11 @@ use aterm_uds::CtlStream;
 /// user owns it, tightening its DACL to an owner-only (user + SYSTEM +
 /// Administrators), non-inheriting grant. This is the Windows twin of the Unix
 /// `ensure_private_dir` owner check + `0700` chmod: a directory owned by another
-/// user (a planted `%LOCALAPPDATA%\aterm`, or an explicit `ATERM_CONTROL_SOCK`
+/// user (a planted `%LOCALAPPDATA%\aterm`, or an explicit `--control-sock`
 /// under someone else's tree) is REFUSED, and a same-owned but loosely-ACL'd
 /// directory is re-protected so the socket + token it will hold are not
 /// world-accessible.
-pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     acl::verify_owner_and_harden(dir)
 }
@@ -44,7 +44,7 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
 /// Atomically (re)point the `latest` alias — a regular POINTER FILE on
 /// Windows (contents = the relative instance sock name) — at this instance's
 /// socket. Same temp-name + rename publish as the Unix symlink; best-effort.
-pub fn publish_latest_link(link: &Path, sock_path: &str) {
+pub(crate) fn publish_latest_link(link: &Path, sock_path: &str) {
     aterm_uds::latest::publish(link, sock_path);
 }
 
@@ -52,7 +52,7 @@ pub fn publish_latest_link(link: &Path, sock_path: &str) {
 /// 64-char lowercase hex string, or `None` when entropy is unavailable (the
 /// caller must then refuse to start the socket — fail closed).
 #[must_use]
-pub fn random_token_hex() -> Option<String> {
+pub(crate) fn random_token_hex() -> Option<String> {
     let mut buf = [0u8; 32];
     aterm_uds::rand::fill(&mut buf).ok()?;
     let mut hex = String::with_capacity(64);
@@ -75,7 +75,7 @@ pub fn random_token_hex() -> Option<String> {
 /// Returns `None` when entropy is unavailable or the file cannot be written;
 /// a `None` here MUST make the caller skip binding the socket (fail closed).
 #[must_use]
-pub fn provision_token(path: &Path) -> Option<String> {
+pub(crate) fn provision_token(path: &Path) -> Option<String> {
     use std::io::Write;
     let token = random_token_hex()?;
     let _ = std::fs::remove_file(path);
@@ -92,7 +92,7 @@ pub fn provision_token(path: &Path) -> Option<String> {
 /// No-op on Windows (documented): there are no POSIX mode bits to tighten;
 /// the socket file inherits the private dir's ACL, and the directory ACL +
 /// mandatory token are the in-force gates.
-pub fn lock_socket_file(_path: &str) {}
+pub(crate) fn lock_socket_file(_path: &str) {}
 
 /// The accept-time peer gate. Windows AF_UNIX has NO peer-credential
 /// primitive, so this always passes — a "refuse when unverifiable" posture
@@ -103,7 +103,7 @@ pub fn lock_socket_file(_path: &str) {}
     clippy::unnecessary_wraps,
     reason = "signature shared with the Unix peer-uid gate"
 )]
-pub fn peer_check(_stream: &CtlStream) -> Result<(), String> {
+pub(crate) fn peer_check(_stream: &CtlStream) -> Result<(), String> {
     Ok(())
 }
 

@@ -8,11 +8,6 @@
 //! and restore all speak the same coordinates. Rendering lowers these nodes through the
 //! native semantic UI tree.
 
-#![allow(
-    dead_code,
-    reason = "native tab-app integration lands in staged consumers"
-)]
-
 use std::{borrow::Cow, ops::Range};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +130,7 @@ pub(crate) enum MarkdownInlineKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct MarkdownSourceSegment {
     pub(crate) display: Range<usize>,
     pub(crate) source: Range<usize>,
@@ -142,6 +138,7 @@ pub(crate) struct MarkdownSourceSegment {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct MarkdownSemanticProjection {
     pub(crate) text: String,
     pub(crate) source_map: Vec<MarkdownSourceSegment>,
@@ -547,6 +544,7 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
 }
 
 /// Canonical semantic reading order used by app introspection and clipboard selection.
+#[cfg(test)]
 pub(crate) fn semantic_text(document: &MarkdownDocument) -> String {
     semantic_projection(document).text
 }
@@ -555,6 +553,7 @@ pub(crate) fn semantic_text(document: &MarkdownDocument) -> String {
 /// Block segments guarantee total coverage; nested inline segments refine the
 /// exact authored range for styled/link/image content without invalidating the
 /// coarser mapping used by assistive technology.
+#[cfg(test)]
 pub(crate) fn semantic_projection(document: &MarkdownDocument) -> MarkdownSemanticProjection {
     let mut out = String::new();
     let mut source_map = Vec::new();
@@ -615,6 +614,7 @@ pub(crate) fn semantic_projection(document: &MarkdownDocument) -> MarkdownSemant
     }
 }
 
+#[cfg(test)]
 pub(crate) fn inline_runs_in_range(
     document: &MarkdownDocument,
     source: Range<usize>,
@@ -712,6 +712,7 @@ pub(crate) struct MarkdownSourceWindow {
 /// Materialize a UTF-8-safe, line-aligned source window around a reading
 /// anchor. Source and split modes stay bounded even for adversarial files while
 /// retaining canonical byte coordinates for selection/copy.
+#[cfg(test)]
 pub(crate) fn source_window(
     source: &str,
     anchor: usize,
@@ -1018,6 +1019,7 @@ fn source_anchor_for_visual_row(document: &MarkdownDocument, block: usize, row: 
 }
 
 /// Move a reading anchor by block count without converting through fragile pixels.
+#[cfg(test)]
 pub(crate) fn move_block_anchor(
     document: &MarkdownDocument,
     source_anchor: usize,
@@ -1036,6 +1038,7 @@ pub(crate) fn move_block_anchor(
 /// directions use the same width-aware block estimator as the visible layout,
 /// so a short final page never shrinks the following "previous page" move to a
 /// single block. Work is capped independently of document size.
+#[cfg(test)]
 pub(crate) fn page_target_block(
     document: &MarkdownDocument,
     source_anchor: usize,
@@ -2208,6 +2211,35 @@ mod tests {
         drive_history(&model, &mut real, "Back", RealHistory::back);
         drive_history(&model, &mut real, "Forward", RealHistory::forward);
         drive_history(&model, &mut real, "Duplicate", RealHistory::duplicate);
+
+        // The cursor's two edges, driven on the real history: at the newest
+        // entry `forward` stays put, and at the oldest `back` does. Stepping past
+        // either (the off-by-one `next > len`, or `checked_sub(1)` taking the
+        // cursor to `None` with entries left) is neither admitted nor safe.
+        let at_newest = real.project(&model);
+        assert!(!real.history.can_forward());
+        real.history.forward();
+        assert_eq!(
+            real.project(&model),
+            at_newest,
+            "forward at the newest entry"
+        );
+        let mut past_newest = at_newest.clone();
+        past_newest.insert("cursor", at_newest["len"] + 1);
+        assert_eq!(admits(&model, &at_newest, &past_newest), None);
+        assert!(!model.check_invariant("CursorWithinHistory", &past_newest));
+
+        drive_history(&model, &mut real, "Back", RealHistory::back);
+        drive_history(&model, &mut real, "Back", RealHistory::back);
+        let at_oldest = real.project(&model);
+        assert_eq!(at_oldest["cursor"], 1);
+        assert!(!real.history.can_back());
+        real.history.back();
+        assert_eq!(real.project(&model), at_oldest, "back at the oldest entry");
+        let mut off_oldest = at_oldest.clone();
+        off_oldest.insert("cursor", 0);
+        assert_eq!(admits(&model, &at_oldest, &off_oldest), None);
+        assert!(!model.check_invariant("EmptyIffNoCursor", &off_oldest));
 
         // Negative control 1: an append beyond capacity is neither admitted by
         // the real model nor able to satisfy its named bound.

@@ -71,15 +71,6 @@ pub use astream_broker::Closer;
 /// path per verb rather than one per wire.
 pub type Conn = astream_broker::AnyClient;
 
-/// The most pages one last-value walk may take before it is called a FAILURE —
-/// astream's own bound, now that the walk itself lives there.
-///
-/// A liveness bound, not a size one: the resume cursor advances every page, so a
-/// walk that has not finished in this many has met something pathological, and
-/// the honest answer to a caller that must not read absence as evidence is an
-/// error rather than a short list.
-pub use astream_broker::LAST_WALK_PAGES_MAX as LAST_PAGES_MAX;
-
 /// WALK EVERY ROW OF A LAST-VALUE FACE, paging on the RESUME CURSOR — the one
 /// place in this crate that knows how a `Last` answer ends.
 ///
@@ -104,7 +95,8 @@ pub use astream_broker::LAST_WALK_PAGES_MAX as LAST_PAGES_MAX;
 /// # Errors
 ///
 /// Any broker or transport failure, an `on_row` that fails, or a walk that did
-/// not END within [`LAST_PAGES_MAX`] pages — because a caller that cannot tell
+/// not END within [`astream_broker::LAST_WALK_PAGES_MAX`] pages (a liveness
+/// bound: the resume cursor advances every page) — because a caller that cannot tell
 /// "no rows" from "I stopped looking" is the caller that reports an empty fleet
 /// while a node is escalating.
 pub fn walk_last<F>(conn: &mut Conn, filter: &str, mut on_row: F) -> io::Result<()>

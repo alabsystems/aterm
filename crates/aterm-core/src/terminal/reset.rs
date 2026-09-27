@@ -15,8 +15,8 @@ use super::TaskbarProgress;
 #[cfg(feature = "sixel")]
 use super::grouped_state::SixelState;
 use super::grouped_state::{
-    ClipboardState, CursorSaveState, DcsState, Iterm2State, MarksState, NotificationState,
-    SemanticState, ShellIntegrationState, TitleState,
+    CursorSaveState, DcsState, Iterm2State, MarksState, NotificationState, ShellIntegrationState,
+    TitleState,
 };
 use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TerminalModes};
@@ -33,13 +33,11 @@ pub(super) struct ResetGroups<'a> {
     pub(super) xterm_keyboard: &'a mut XtermKeyboardState,
     pub(super) iterm2: &'a mut Iterm2State,
     pub(super) shell: &'a mut ShellIntegrationState,
-    pub(super) semantic: &'a mut SemanticState,
     #[cfg(feature = "sixel")]
     pub(super) sixel: &'a mut SixelState,
     pub(super) title: &'a mut TitleState,
     pub(super) dcs: &'a mut DcsState,
     pub(super) notifications: &'a mut NotificationState,
-    pub(super) clipboard: &'a mut ClipboardState,
     pub(super) marks_state: &'a mut MarksState,
     pub(super) taskbar_progress: &'a mut Option<TaskbarProgress>,
 }
@@ -50,13 +48,11 @@ impl ResetGroups<'_> {
         self.xterm_keyboard.reset();
         self.iterm2.reset();
         self.shell.reset();
-        self.semantic.reset();
         self.title.reset();
         #[cfg(feature = "sixel")]
         self.sixel.reset();
         self.dcs.reset();
         self.notifications.reset();
-        self.clipboard.reset();
         // Clear marks and annotations — they reference positions in the now-erased
         // grid. Preserve next_*_id counters for ID uniqueness.
         self.marks_state.marks.clear();
@@ -164,7 +160,6 @@ impl Terminal {
         let allow_osc52_set = self.modes.allow_osc52_set;
         let allow_window_ops = self.modes.allow_window_ops;
         let allow_notifications = self.modes.allow_notifications;
-        let allow_session_memory = self.modes.allow_session_memory;
         let allow_palette_reconfigure = self.modes.allow_palette_reconfigure;
         let require_shell_integration_nonce = self.modes.require_shell_integration_nonce;
         // Capability toggle, not runtime negotiation state: RIS must not let a
@@ -182,13 +177,11 @@ impl Terminal {
             xterm_keyboard: &mut self.xterm_keyboard,
             iterm2: &mut self.iterm2,
             shell: &mut self.shell,
-            semantic: &mut self.semantic,
             #[cfg(feature = "sixel")]
             sixel: &mut self.sixel,
             title: &mut self.title,
             dcs: &mut self.dcs,
             notifications: &mut self.notifications,
-            clipboard: &mut self.clipboard,
             marks_state: &mut self.marks_state,
             taskbar_progress: &mut self.taskbar_progress,
         };
@@ -212,7 +205,6 @@ impl Terminal {
         self.modes.allow_osc52_set = allow_osc52_set;
         self.modes.allow_window_ops = allow_window_ops;
         self.modes.allow_notifications = allow_notifications;
-        self.modes.allow_session_memory = allow_session_memory;
         self.modes.allow_palette_reconfigure = allow_palette_reconfigure;
         self.modes.require_shell_integration_nonce = require_shell_integration_nonce;
         self.modes.kitty_keyboard_enabled = kitty_keyboard_enabled;

@@ -454,7 +454,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CompletionDisposition, Lane, PrimarySeed, Request, completion_disposition, prepare,
+        Completion, CompletionDisposition, Lane, PrimarySeed, Request, completion_disposition,
+        prepare,
     };
 
     fn request(sequence: u64) -> Request {
@@ -573,6 +574,211 @@ mod tests {
         // completion and would replace theme 1 with assets resolved from theme 0.
         let old_guard = |requested, completed| requested == completed;
         assert!(old_guard(requested_config, 1));
+    }
+
+    /// The two theme catalogs the `FontThemeGeneration` trace admits, by
+    /// generation, and the assets of every completion it has prepared, by
+    /// config sequence — the identities its projection reads back.
+    struct ThemeTrace {
+        themes: [Arc<crate::app_config::ThemeCatalog>; 2],
+        prepared: Vec<(i64, Arc<crate::app_config::ConfigAssetCatalog>)>,
+        /// The theme generation of the last completion the worker produced.
+        completed_theme: i64,
+        /// Sticky: a publication was ever seen naming a superseded theme.
+        stale_published: i64,
+    }
+
+    impl ThemeTrace {
+        fn project(
+            &mut self,
+            app: &crate::App,
+            in_hand: Option<&Completion>,
+        ) -> Result<aterm_spec::interp::State, String> {
+            let generation = |n: u64| i64::try_from(n).expect("a bounded generation");
+            // WHICH completion the config service now holds: its assets Arc is
+            // the one the published completion carried, and nothing else's.
+            let held = app.native_config_service.snapshot().assets;
+            let published = self
+                .prepared
+                .iter()
+                .find(|(_, assets)| Arc::ptr_eq(assets, &held))
+                .map_or(0, |(sequence, _)| *sequence);
+            let published_theme = if published == 0 {
+                0
+            } else {
+                self.themes
+                    .iter()
+                    .position(|themes| Arc::ptr_eq(themes, &held.themes))
+                    .ok_or("the published assets carry a catalog this trace never admitted")?
+                    as i64
+            };
+            let theme = generation(app.theme_catalog_generation);
+            if published != 0 && published_theme != theme {
+                self.stale_published = 1;
+            }
+            Ok(std::collections::BTreeMap::from([
+                ("requested", generation(app.requested_font_catalog_sequence)),
+                ("theme", theme),
+                ("completed", in_hand.map_or(0, |c| generation(c.sequence))),
+                ("completed_theme", self.completed_theme),
+                ("published", published),
+                ("published_theme", published_theme),
+                ("stale_published", self.stale_published),
+            ]))
+        }
+
+        /// The worker's half: prepare one request for real, remembering the
+        /// assets it carries so a later publication can be named.
+        fn complete(&mut self, request: Request) -> Completion {
+            let completion = prepare(request);
+            self.completed_theme = i64::try_from(completion.theme_generation).expect("bounded");
+            self.prepared.push((
+                i64::try_from(completion.sequence).expect("bounded"),
+                Arc::clone(&completion.assets),
+            ));
+            completion
+        }
+    }
+
+    type FinishFn = fn(&mut crate::App, Completion);
+
+    fn shipped_finish(app: &mut crate::App, completion: Completion) {
+        app.finish_font_catalog_generation(completion);
+    }
+
+    /// The guard from before theme generations existed: a completion naming the
+    /// CURRENT config request is current, whatever catalog it was prepared
+    /// against — the model's `Buggy = 1` publication of a theme-stale generation.
+    fn sequence_only_finish(app: &mut crate::App, completion: Completion) {
+        if completion.sequence == app.requested_font_catalog_sequence {
+            app.apply_prepared_config_generation(completion.into_generation());
+        }
+    }
+
+    /// Drive the overtaken-config trace on a REAL headless App and its real
+    /// font-catalog worker function, checking every step against `model`.
+    /// Returns every state visited, or the first real step the model refuses.
+    fn font_theme_trace(
+        model: &aterm_spec::derive::Model,
+        finish: FinishFn,
+    ) -> Result<std::collections::BTreeSet<aterm_spec::interp::State>, String> {
+        let mut app = crate::App::headless_for_test();
+        let (lane, requests) = Lane::test_pair();
+        app.native_font_catalog = Some(lane);
+        let scheme = aterm_types::scheme::builtin("Dracula").expect("a built-in scheme");
+        let mut trace = ThemeTrace {
+            themes: [
+                Arc::clone(&app.config_assets.themes),
+                crate::app_config::ThemeCatalog::from_schemes([("Work".to_string(), scheme)]),
+            ],
+            prepared: Vec::new(),
+            completed_theme: 0,
+            stale_published: 0,
+        };
+        let mut state = trace.project(&app, None)?;
+        if state != model.init_state() {
+            return Err(format!("the App starts at {state:?}, the model at Init"));
+        }
+        let mut visited = std::collections::BTreeSet::from([state.clone()]);
+        let mut step = |action: &str,
+                        state: &mut aterm_spec::interp::State,
+                        app: &crate::App,
+                        in_hand: Option<&Completion>,
+                        trace: &mut ThemeTrace|
+         -> Result<(), String> {
+            let after = trace.project(app, in_hand)?;
+            let expected = model.successors(action, state);
+            if expected != vec![after.clone()] {
+                return Err(format!(
+                    "real {action} took {state:?} to {after:?}, the model's {action} to \
+                     {expected:?}"
+                ));
+            }
+            visited.insert(after.clone());
+            *state = after;
+            Ok(())
+        };
+
+        // The config watcher admits an edit; its font prepare is queued
+        // against theme generation 0.
+        app.reload_prepared_config_observation(
+            request_with_text(90, "trail_sounds = false\n").prepared,
+        );
+        step("RequestConfig", &mut state, &app, None, &mut trace)?;
+        // The theme directory publishes a new catalog before that prepare ends.
+        app.reload_theme_catalog(Arc::clone(&trace.themes[1]));
+        let admitted = &app.config_assets.themes;
+        if !Arc::ptr_eq(admitted, &trace.themes[1]) {
+            // The catalog the App actually admitted is generation 1.
+            trace.themes[1] = Arc::clone(admitted);
+        }
+        step("ThemeChanged", &mut state, &app, None, &mut trace)?;
+        // The worker finishes the OLD-theme prepare.
+        let old = requests
+            .try_recv()
+            .map_err(|e| format!("no queued request: {e}"))?;
+        let old = trace.complete(old);
+        step("CompleteOldTheme", &mut state, &app, Some(&old), &mut trace)?;
+        // The App decides: re-prepare the current config against the new theme.
+        finish(&mut app, old);
+        step("ReprepareLatestTheme", &mut state, &app, None, &mut trace)?;
+        let latest = requests
+            .try_recv()
+            .map_err(|e| format!("the re-preparation was not queued: {e}"))?;
+        // The worker could never deliver the same request twice, but the App's
+        // decision must not depend on that: the model lets it, so drive it.
+        for request in [latest.clone(), latest] {
+            let completion = trace.complete(request);
+            step(
+                "CompleteLatestTheme",
+                &mut state,
+                &app,
+                Some(&completion),
+                &mut trace,
+            )?;
+            finish(&mut app, completion);
+            step("PublishCurrent", &mut state, &app, None, &mut trace)?;
+        }
+        Ok(visited)
+    }
+
+    /// Tier-1 conformance for `FontThemeGeneration`
+    /// (`aterm_spec::derive::font_theme_generation_model`): a theme catalog
+    /// that overtakes an in-flight font prepare, driven on a REAL headless App —
+    /// `reload_prepared_config_observation`, `reload_theme_catalog` and
+    /// `finish_font_catalog_generation` — with the worker's real `prepare`
+    /// between them. Every step is read back out of the App: its request and
+    /// theme generations, the completion in hand, and WHICH completion (and so
+    /// which theme catalog) the config service ended up holding. The trace
+    /// reaches every state the model can. (The model's `PublishCurrent` at Init
+    /// is a stutter with nothing prepared — no real counterpart, and no state
+    /// of its own.)
+    ///
+    /// NEGATIVE CONTROL: the same trace with the pre-theme-generation guard
+    /// (publish whatever completes for the current config request) is refused
+    /// by the model at the re-preparation, where it publishes theme 0's
+    /// generation over theme 1; and the shipped App is in turn refused by the
+    /// `Buggy = 1` model.
+    #[test]
+    fn overtaking_theme_catalog_conforms_to_font_theme_generation_model() {
+        let model = aterm_spec::derive::font_theme_generation_model();
+        let visited =
+            font_theme_trace(&model, shipped_finish).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(
+            Ok(visited.len()),
+            aterm_spec::interp::bmc(&model),
+            "the real trace must visit every state the model reaches"
+        );
+
+        let stale = font_theme_trace(&model, sequence_only_finish)
+            .expect_err("the model must refuse a theme-stale publication");
+        assert!(
+            stale.contains("real ReprepareLatestTheme"),
+            "the refusal must land where the stale generation publishes: {stale}"
+        );
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        font_theme_trace(&buggy, shipped_finish)
+            .expect_err("the shipped App must not conform to the stale-publishing model");
     }
 
     #[test]

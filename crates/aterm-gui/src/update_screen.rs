@@ -31,6 +31,10 @@ pub(crate) struct UpdateState {
     current_build: u64,
     /// A strictly-newer staged build `(build, version)`, if one is ready to apply.
     staged: Option<(u64, String)>,
+    /// The stage is an installed-bundle ACTIVATION
+    /// (`StagedUpdate::is_installed_activation`): already at this app's path, never
+    /// downloaded, so the detail does not say "downloaded".
+    staged_activation: bool,
     /// The staged build's "what changed" notes, rendered from Markdown to clean lines.
     changelog: Vec<String>,
     /// Whether the native updater runs here (`aterm_update::enabled`: macOS and Linux —
@@ -96,6 +100,71 @@ pub(crate) struct UpdateState {
     /// When the last check completed (Unix seconds), `None` before any has: the page
     /// says "Checked 12 min ago" from it ([`UpdateProjection::checked_line`]).
     checked_at: Option<i64>,
+    /// The automatic lane's download in flight, which the band does not show
+    /// (design ruling 220): the headline and detail say it.
+    downloading: Option<QuietDownload>,
+    /// A DEV-MARKED copy (`tools/dev-app.sh`), which the updater leaves alone on
+    /// purpose; `None` for every other copy ([`Self::with_dev_build`], gap #30).
+    dev_build: Option<DevBuildPage>,
+}
+
+/// A dev-marked copy as the page says it (gap #30). The updater leaves it alone on
+/// purpose, so the "move it to Applications" remedy the other copies that cannot
+/// update get would be wrong for it (the CLI learned that in 2dead72c9); and where it
+/// stands against the public channel is the news the page carries for it —
+/// `standing` is the dev-channel watch's last reading
+/// (`aterm_update::dev_channel`), `None` before it has read one (automatic checks off,
+/// or the channel unreachable, say nothing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DevBuildPage {
+    pub(crate) standing: Option<aterm_update::dev_channel::DevLag>,
+}
+
+impl DevBuildPage {
+    /// The headline: how far behind, when that is known and true; else that it is a
+    /// dev build. Short, like every headline on the page.
+    fn headline(&self) -> String {
+        use aterm_update::dev_channel::DevLag;
+        match &self.standing {
+            Some(DevLag::Behind {
+                releases: Some(1), ..
+            }) => "This dev build is 1 release behind.".to_string(),
+            Some(DevLag::Behind {
+                releases: Some(n), ..
+            }) => format!("This dev build is {n} releases behind."),
+            Some(DevLag::Behind { latest, .. }) => {
+                format!("This dev build is older than aterm {latest}.")
+            }
+            _ => "This is a dev build.".to_string(),
+        }
+    }
+
+    /// The detail: where it stands, in the dev channel's words, then why nothing moves
+    /// it and what does.
+    fn detail(&self) -> String {
+        let standing = self
+            .standing
+            .as_ref()
+            .map(|lag| format!("It is {}. ", lag.words()))
+            .unwrap_or_default();
+        format!(
+            "{standing}The updater leaves a dev build alone: rebuild it with tools/dev-app.sh, \
+             or use the release (tools/install.sh puts it in Applications)."
+        )
+    }
+}
+
+/// A download (or its check) nobody is waiting on — the automatic lane's — as the
+/// page says it (design ruling 220): it takes no row on the band, so this page is
+/// where its progress is seen. `title` is the flow's own phase title
+/// (`Downloading aterm v0.92.0`), `progress` the bytes so far (`45 MB / 74 MB`, or
+/// `45 MB` with no total; empty while it is checked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QuietDownload {
+    /// The version, for the record a failure writes.
+    pub(crate) version: String,
+    pub(crate) title: String,
+    pub(crate) progress: String,
 }
 
 /// Owned, structured read projection shared with the native Settings `/updates`
@@ -151,6 +220,10 @@ pub(crate) struct UpdateProjection {
     /// under "This copy of aterm can't update itself" — a claim about a release
     /// list this process never fetched (2026-08-19 round-6 audit).
     pub(crate) installable: bool,
+    /// This copy is DEV-MARKED (`tools/dev-app.sh`, gap #30): `installable` is false on
+    /// purpose, so every card that would say "can't update" or "reinstall" says it is a
+    /// dev build instead.
+    pub(crate) dev_build: bool,
     /// The stranded verdict (see [`UpdateState`]): the compact card must say
     /// "Can't check", never "Current", while the channel is unreadable.
     pub(crate) channel_unreadable: bool,
@@ -213,6 +286,11 @@ impl UpdateState {
             (snapshot.enabled && staged.build > snapshot.current_build)
                 .then(|| (staged.build, staged.version.clone()))
         });
+        let staged_activation = staged.is_some()
+            && snapshot
+                .staged
+                .as_ref()
+                .is_some_and(crate::native_updater_service::StagedUpdate::is_installed_activation);
         let changelog = snapshot
             .staged
             .as_ref()
@@ -234,6 +312,7 @@ impl UpdateState {
             current_version: snapshot.current_version.clone(),
             current_build: snapshot.current_build,
             staged,
+            staged_activation,
             changelog,
             enabled: snapshot.enabled,
             automatic_checks: true,
@@ -250,6 +329,8 @@ impl UpdateState {
             channel_unreadable: snapshot.channel_unreadable,
             checking,
             checked_at: snapshot.checked_at,
+            downloading: None,
+            dev_build: None,
         }
         .without_inapplicable_stage()
     }
@@ -294,6 +375,7 @@ impl UpdateState {
             current_version: current_version.to_string(),
             current_build,
             staged,
+            staged_activation: false,
             changelog,
             enabled: status.map(|s| s.enabled).unwrap_or(false),
             automatic_checks: true,
@@ -317,6 +399,8 @@ impl UpdateState {
             checking,
             checked_at: status
                 .and_then(|s| aterm_update_core::pkg_check::rfc3339_to_unix(&s.updated_at)),
+            downloading: None,
+            dev_build: None,
         }
         .without_inapplicable_stage()
     }
@@ -329,6 +413,33 @@ impl UpdateState {
         self.automatic_checks = running;
         self.automatic_checks_saved = saved;
         self
+    }
+
+    /// The automatic lane's download in flight (`App::update_quiet`, design ruling
+    /// 220): no row says it, so the page does.
+    pub(crate) fn with_download(mut self, downloading: Option<QuietDownload>) -> Self {
+        self.downloading = downloading;
+        self
+    }
+
+    /// This copy is dev-marked (`App::dev_build`, gap #30): the page says so, and where
+    /// it stands, instead of the move-it remedy.
+    pub(crate) fn with_dev_build(mut self, dev_build: Option<DevBuildPage>) -> Self {
+        self.dev_build = dev_build;
+        self
+    }
+
+    /// The quiet download, where the page may say it: macOS, an installable copy
+    /// with the updater on, nothing staged, and no check a person started (whose
+    /// own words and row own the surface).
+    fn quiet_download(&self) -> Option<&QuietDownload> {
+        self.downloading.as_ref().filter(|_| {
+            !self.linux_host
+                && self.enabled
+                && self.installable
+                && self.staged.is_none()
+                && !self.checking
+        })
     }
 
     /// A stage this copy CANNOT APPLY is not a stage for this copy.
@@ -441,6 +552,7 @@ impl UpdateState {
             // not argue with the "Checking…" the user is looking at.
             apply_trouble: (!self.checking).then(|| self.apply_trouble()).flatten(),
             installable: self.installable,
+            dev_build: self.dev_build.is_some(),
             channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
             checked_at: self.checked_at,
             headline: self.headline(),
@@ -526,13 +638,21 @@ impl UpdateState {
             "Update ready, but applying it failed.".to_string()
         } else if self.staged.is_some() {
             "Update ready".to_string()
+        } else if let Some(quiet) = self.quiet_download() {
+            // The automatic lane's download: the band stays quiet (design ruling
+            // 220), so this is where it is seen — `Downloading aterm v0.92.0…`.
+            format!("{}\u{2026}", quiet.title)
         } else if !self.installable {
             // NOT "You're up to date": this copy cannot be replaced at all — it is
             // running from the mounted disk image, from a Gatekeeper-translocated
             // location, or from a dev-marked install, so no check thread ever starts
             // and every ledger field below is the pristine default of a machine that
-            // structurally cannot update (2026-08-19 round-5 audit).
-            "This copy of aterm can\u{2019}t update itself.".to_string()
+            // structurally cannot update (2026-08-19 round-5 audit). A dev build is
+            // that on purpose, and is told where it stands instead (gap #30).
+            match &self.dev_build {
+                Some(dev) => dev.headline(),
+                None => "This copy of aterm can\u{2019}t update itself.".to_string(),
+            }
         } else if !self.enabled {
             // No native updater runs on this platform at all — macOS and Linux have one
             // (Linux answers in its own ladder above), so this is neither, and the line
@@ -595,9 +715,10 @@ impl UpdateState {
         };
         match (self.automatic_checks, self.automatic_checks_saved) {
             (true, true) => None,
+            // The switch's timing is the card's to say (its caption and the row's
+            // "Applies next launch"), not this sentence's.
             (false, false) => Some(format!(
-                "Nothing checks for updates by itself \u{2014} {manual} still checks now; \
-                 turning automatic checks on applies next launch."
+                "Nothing checks for updates by itself \u{2014} {manual} still checks now."
             )),
             (false, true) => Some(format!(
                 "Automatic checks start next launch \u{2014} until then, {manual} still \
@@ -620,35 +741,48 @@ impl UpdateState {
     /// status` and the log, which the page links to (Settings ▸ Messages).
     fn detail(&self) -> Option<String> {
         if self.linux_host {
-            let direction = if !self.installable || self.linux.is_none() {
-                "Run `aterm update status` for this copy; use `aterm update enable` explicitly for an eligible installed copy."
-            } else if self
-                .linux
-                .as_ref()
-                .is_some_and(|status| status.staged_build.is_some())
+            // ONE next step, and only where there is one: the idle copy's headline is
+            // the whole fact, and that terminals keep running is the page subtitle's.
+            // A copy that cannot update gets none either: the outcome (joined below) is
+            // the whole of it — a copy simply not enrolled names `aterm update enable`
+            // in the ledger's own sentence, and every other cause there (an unsafe
+            // install prefix, a worker that did not start) is one `enable` cannot fix.
+            let direction = if self.installable
+                && self
+                    .linux
+                    .as_ref()
+                    .is_some_and(|status| status.staged_build.is_some())
             {
-                "Run `aterm update apply` to install the authenticated download. Existing terminal sessions continue on their running build."
+                "Run `aterm update apply` to install it."
             } else {
-                "Run `aterm update status` for the installed build, startup trial, and last check. Existing terminal sessions keep running."
+                ""
             };
+            // What the headline names, version first; the running build is About's.
             let identity = self
                 .linux
                 .as_ref()
                 .map(|status| {
-                    let mut text = format!("Installed build {}", status.installed_build);
+                    let mut facts = Vec::new();
                     if let Some(build) = status.staged_build {
-                        text.push_str(&format!("; downloaded build {build}"));
-                        if let Some(version) = &status.staged_version {
-                            text.push_str(&format!(" (version {version})"));
+                        facts.push(match &status.staged_version {
+                            Some(version) => format!("Version {version} is downloaded"),
+                            None => format!("Build {build} is downloaded"),
+                        });
+                    }
+                    if status.trial_phase.is_some() && !status.trial_healthy {
+                        // Only once the new executable is in place (`Installed`: the
+                        // installed build IS the trial's); mid-install or mid-rollback
+                        // nothing waits for a launch yet.
+                        if status.trial_phase.as_deref() == Some("Installed") {
+                            facts.push(format!(
+                                "Build {} waits for a clean launch",
+                                status.installed_build
+                            ));
                         }
+                    } else if status.installed_build > self.current_build {
+                        facts.push(format!("Build {} is installed", status.installed_build));
                     }
-                    if let Some(phase) = &status.trial_phase {
-                        text.push_str(&format!(
-                            "; startup trial {phase}, starts {}, healthy {}",
-                            status.trial_starts, status.trial_healthy
-                        ));
-                    }
-                    text
+                    facts.join(". ")
                 })
                 .unwrap_or_default();
             let detail = [identity.as_str(), self.outcome.trim(), direction]
@@ -661,18 +795,21 @@ impl UpdateState {
             // alone fill those lines at every width, so a timing sentence appended after
             // them never painted (seen in the 2026-09-24 capture). The whole string stays
             // the slot's semantic value.
-            return Some(match self.automatic_checks_detail() {
+            let detail = match self.automatic_checks_detail() {
+                Some(checks) if detail.is_empty() => checks,
                 Some(checks) => format!("{checks} {detail}"),
                 None => detail,
-            });
+            };
+            return (!detail.is_empty()).then_some(detail);
         }
         if !self.installable {
-            return Some(
-                "Move aterm.app to your Applications folder and open it from there. \
-                 A copy running from a disk image, a quarantined download, or a local \
-                 build is never replaced in place."
+            return Some(match &self.dev_build {
+                Some(dev) => dev.detail(),
+                None => "Move aterm.app to your Applications folder and open it from there. \
+                         A copy running from a disk image, a quarantined download, or a \
+                         local build is never replaced in place."
                     .to_string(),
-            );
+            });
         }
         if let Some((_, v)) = self.staged.as_ref() {
             // Not the ledger `outcome`: the check lane rewrites that every cycle with
@@ -719,7 +856,20 @@ impl UpdateState {
                      checked right now{why}.{LOG_POINTER}"
                 ));
             }
+            if self.staged_activation {
+                return Some(format!("Version {v} is ready to install."));
+            }
             return Some(format!("Version {v} is downloaded and ready to install."));
+        }
+        if let Some(quiet) = self.quiet_download() {
+            // How far it has got (ruling 220): the bytes so far, or — while it
+            // is checked — only that. How it installs is the staged page's to
+            // say, once there is a build to install.
+            return Some(if quiet.progress.is_empty() {
+                "Checking the download.".to_string()
+            } else {
+                format!("{} downloaded.", quiet.progress)
+            });
         }
         if self.channel_unreadable && !self.checking && self.enabled {
             // For the stranded state the outcome IS the explanation — the cause and the
@@ -818,13 +968,14 @@ mod tests {
         let state = linux_state(Some(linux_facts()), 0);
         let projection = state.projection();
         assert!(projection.headline.contains("downloaded"));
+        let detail = projection.detail.as_deref().unwrap();
+        // The version is the fact; build numbers are About's.
         assert!(
-            projection
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("aterm update apply")
+            detail.starts_with("Version 0.5.15 is downloaded"),
+            "{detail}"
         );
+        assert!(detail.contains("aterm update apply"), "{detail}");
+        assert!(!detail.contains("build 8"), "{detail}");
         assert!(projection.staged.is_none());
         assert_eq!(projection.linux.as_ref().unwrap().staged_build, Some(830));
         assert_eq!(
@@ -850,12 +1001,27 @@ mod tests {
                 .detail
                 .as_deref()
                 .unwrap()
-                .contains("healthy false")
+                .starts_with("Build 830 waits for a clean launch."),
+            "{:?}",
+            projection.detail
         );
         assert_eq!(
             crate::native_settings::compact_update_headline(&projection),
             "Awaiting startup"
         );
+        // Mid-install and mid-rollback nothing waits for a launch yet.
+        for phase in ["Prepared", "RollbackPrepared"] {
+            let mut facts = state.linux.clone().expect("the Linux facts");
+            facts.trial_phase = Some(phase.into());
+            let detail = linux_state(Some(facts), 0).projection().detail;
+            assert!(
+                !detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("clean launch"),
+                "{phase}: {detail:?}"
+            );
+        }
     }
 
     #[test]
@@ -888,7 +1054,8 @@ mod tests {
         let projection = state.projection();
         let detail = projection.detail.as_deref().unwrap();
         assert!(detail.contains("group writable"));
-        assert!(detail.contains("aterm update enable"));
+        // `aterm update enable` fails with this same error: it is not the remedy.
+        assert!(!detail.contains("aterm update enable"), "{detail}");
         assert!(!detail.contains("Applications"));
         assert!(!detail.contains(".app"));
         assert_eq!(projection.outcome, state.outcome);
@@ -933,8 +1100,7 @@ mod tests {
         assert!(
             detail.starts_with(
                 "Nothing checks for updates by itself \u{2014} `aterm update check` still \
-                 checks now; turning automatic checks on applies next launch. Installed \
-                 build 828. "
+                 checks now. "
             ),
             "{detail}"
         );
@@ -950,7 +1116,7 @@ mod tests {
         assert!(
             starting.detail.as_deref().unwrap().starts_with(
                 "Automatic checks start next launch \u{2014} until then, `aterm update \
-                 check` still checks now. Installed build"
+                 check` still checks now. "
             ),
             "{:?}",
             starting.detail
@@ -995,7 +1161,8 @@ mod tests {
         // started (2026-09-24 review): the detail opens with the facts its headline names,
         // never with the switch's timing, in the three lines the status card paints.
         let mut trial = idle.clone();
-        trial.trial_phase = Some("Pending".into());
+        trial.installed_build = 830;
+        trial.trial_phase = Some("Installed".into());
         trial.trial_starts = 1;
         let mut installed = idle;
         installed.installed_build = 830;
@@ -1003,16 +1170,19 @@ mod tests {
             (
                 trial,
                 "Startup pending.",
-                "startup trial Pending, starts 1, healthy false",
+                "Build 830 waits for a clean launch",
             ),
-            (installed, "New build installed.", "Installed build 830"),
+            (installed, "New build installed.", "Build 830 is installed"),
         ] {
             for (running, saved) in [(false, false), (false, true), (true, false)] {
                 let projection = page(facts.clone(), 0, running, saved);
                 assert_eq!(projection.headline, headline);
                 let detail = projection.detail.expect("the Linux detail");
-                assert!(detail.starts_with("Installed build"), "{headline} {detail}");
-                assert!(detail.contains(fact), "{headline} {detail}");
+                assert!(detail.starts_with(fact), "{headline} {detail}");
+                assert!(
+                    !detail.contains("healthy") && !detail.contains("starts 1"),
+                    "no raw trial fields: {headline} {detail}"
+                );
                 assert!(
                     !detail.contains("Automatic checks") && !detail.contains("Nothing checks"),
                     "{headline} {detail}"
@@ -1262,6 +1432,98 @@ mod tests {
         assert_eq!(ok.headline, "You\u{2019}re up to date.");
     }
 
+    /// A DEV BUILD IS TOLD IT IS ONE, AND WHERE IT STANDS (gap #30): a dev-marked copy
+    /// cannot be replaced either, but on purpose — "move it to Applications" is wrong
+    /// for it. The page says it is a dev build, how far behind the newest release it is
+    /// once the dev channel has read that, and what moves it. A copy that is not
+    /// dev-marked keeps the move-it remedy.
+    #[test]
+    fn a_dev_build_is_told_where_it_stands_not_to_move() {
+        use aterm_update::dev_channel::DevLag;
+        let mut st = staged_status();
+        st.staged_build = None;
+        st.staged_version = None;
+        st.staged_dmg_sha256 = None;
+        st.changelog = None;
+        st.installable = false;
+        let page = |standing: Option<DevLag>| {
+            UpdateState::from_status(828, "0.91.0", Some(&st), false)
+                .with_dev_build(Some(DevBuildPage { standing }))
+                .projection()
+        };
+        let unread = page(None);
+        assert_eq!(unread.headline, "This is a dev build.");
+        let detail = unread.detail.expect("detail");
+        assert!(
+            detail.starts_with("The updater leaves a dev build alone"),
+            "{detail}"
+        );
+        assert!(detail.contains("tools/dev-app.sh"), "{detail}");
+        let behind = page(Some(DevLag::Behind {
+            latest: "v0.93.0".into(),
+            releases: Some(2),
+        }));
+        assert_eq!(behind.headline, "This dev build is 2 releases behind.");
+        assert!(
+            behind
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("It is 2 releases behind aterm v0.93.0. ")),
+            "{:?}",
+            behind.detail
+        );
+        assert_eq!(
+            page(Some(DevLag::Behind {
+                latest: "v0.93.0".into(),
+                releases: Some(1),
+            }))
+            .headline,
+            "This dev build is 1 release behind."
+        );
+        assert_eq!(
+            page(Some(DevLag::Behind {
+                latest: "v1.0.0".into(),
+                releases: None,
+            }))
+            .headline,
+            "This dev build is older than aterm v1.0.0."
+        );
+        let current = page(Some(DevLag::Current {
+            latest: "v0.91.0".into(),
+        }));
+        assert_eq!(current.headline, "This is a dev build.");
+        assert!(
+            current
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("It is at aterm v0.91.0, the newest release. ")),
+            "{:?}",
+            current.detail
+        );
+        // Every compact card reads the same mark: "Dev build", never "Can't update".
+        assert!(behind.dev_build);
+        assert_eq!(
+            crate::native_settings::compact_update_headline(&behind),
+            "Dev build"
+        );
+        // The control: the same copy without the dev mark keeps the move-it remedy.
+        let plain = UpdateState::from_status(828, "0.91.0", Some(&st), false).projection();
+        assert!(!plain.dev_build);
+        assert_eq!(
+            crate::native_settings::compact_update_headline(&plain),
+            "Can\u{2019}t update"
+        );
+        assert_eq!(
+            plain.headline,
+            "This copy of aterm can\u{2019}t update itself."
+        );
+        assert!(
+            plain
+                .detail
+                .is_some_and(|d| d.contains("Applications folder"))
+        );
+    }
+
     #[test]
     fn a_staged_build_that_keeps_failing_to_apply_says_so() {
         let mut st = staged_status();
@@ -1316,70 +1578,6 @@ mod tests {
         );
     }
 
-    /// THE DEFECT, ON THE SURFACE THAT HID IT (owner's machine, 2026-08-21).
-    ///
-    /// `aterm ctl update status` was reporting `staged_version=0.56.0
-    /// relaunch_ready=true failing_applies=2 apply_failure="overlap handoff failed
-    /// safely: handoff proof ended ChildDied"`, and the window said "Update ready"
-    /// for hours. TWO is below `PERSISTENT_AFTER`, so every surface keyed on the
-    /// escalation verdict stayed silent through exactly the window in which a person
-    /// would have wanted to know — and a person who did not know could not tell
-    /// "downloaded, waiting for you" from "tried twice, the handoff died both times".
-    ///
-    /// So the assertion is on the SURFACED STRING, and on both halves of it: the
-    /// number of attempts, and a cause in words rather than the proof-outcome enum
-    /// name. (What actually happened that night: the machine was 8x-oversubscribed,
-    /// the child was STARVED rather than broken, and the identical builds applied
-    /// unaided once the load dropped — which a reader can only reason about if the
-    /// window tells them the successor kept dying.)
-    #[test]
-    fn a_stage_that_already_failed_twice_names_the_count_and_a_human_cause() {
-        let mut st = staged_status();
-        st.failing_applies = 2;
-        // The check lane keeps rewriting its healthy sentence while a stage is held;
-        // that is precisely why it cannot be the only thing on the page.
-        st.outcome = "staged 0.5.15 (build 830) \u{2014} verified and ready to apply".to_string();
-        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false)
-            .with_apply_lane(
-                "overlap handoff failed safely: handoff proof ended ChildDied",
-                ApplyRetry::Scheduled,
-            )
-            .projection();
-
-        assert!(
-            !p.apply_is_failing,
-            "two failures is BELOW the escalation threshold — which is exactly the \
-             window in which the old surface said nothing at all"
-        );
-        assert!(
-            p.apply_trouble.is_some(),
-            "…and exactly the window this projection now has to speak in"
-        );
-        assert_ne!(
-            p.headline, "Update ready",
-            "a build the engine has already failed to start twice is not simply ready"
-        );
-
-        let detail = p.detail.expect("a staged build always has a detail line");
-        assert!(
-            detail.contains("twice"),
-            "the surfaced string must name the ATTEMPT COUNT: {detail}"
-        );
-        assert!(
-            detail.contains("did not finish starting"),
-            "…and the CAUSE in human words: {detail}"
-        );
-        assert!(
-            !detail.contains("ChildDied"),
-            "\"handoff proof ended ChildDied\" is the register of a log line, not of a \
-             window: {detail}"
-        );
-        assert!(
-            detail.contains("try again by itself"),
-            "…and whether the person has to do anything: {detail}"
-        );
-    }
-
     /// A STAGED UPDATE WAITING FOR A QUIET WINDOW IS A DIFFERENT SENTENCE.
     ///
     /// Deferrals and blocks are recorded as REFUSALS and advance no streak, so a
@@ -1413,6 +1611,44 @@ mod tests {
                  failure ({alarming:?} in {detail:?})"
             );
         }
+    }
+
+    /// AN INSTALLED-BUNDLE ACTIVATION WAS NEVER DOWNLOADED (2026-09-27 audit). The
+    /// reducer imports a newer bundle already at this app's path — the cutter writing
+    /// into its own bundle, a dragged-in `.app` — as a stage whose digest is the
+    /// activation identity. The page's "Update ready" detail must not call it
+    /// downloaded; a real download stage still says so (the negative control).
+    #[test]
+    fn an_installed_activation_is_not_called_downloaded() {
+        use crate::native_updater_service::{
+            NativeUpdaterService, StagedUpdate, installed_activation_digest,
+        };
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let detail_for = |dmg_sha256: String| {
+            let mut snapshot = NativeUpdaterService::new(828, "0.5.14", true)
+                .snapshot()
+                .clone();
+            snapshot.staged = Some(StagedUpdate {
+                build: 830,
+                version: "0.5.15".to_string(),
+                commit: Some(commit.to_string()),
+                dmg_sha256,
+                changelog: None,
+                generation: 1,
+            });
+            let p = UpdateState::from_service(&snapshot, false, ApplyRetry::Scheduled).projection();
+            assert_eq!(p.headline, "Update ready");
+            p.detail
+        };
+
+        assert_eq!(
+            detail_for(installed_activation_digest(830, commit)).as_deref(),
+            Some("Version 0.5.15 is ready to install.")
+        );
+        assert_eq!(
+            detail_for("ab".repeat(32)).as_deref(),
+            Some("Version 0.5.15 is downloaded and ready to install.")
+        );
     }
 
     /// "IT WILL FIX ITSELF" AND "IT WILL NOT" ARE DIFFERENT SITUATIONS FOR THE READER.

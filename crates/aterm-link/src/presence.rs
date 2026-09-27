@@ -92,7 +92,7 @@ pub const PHASES: [&str; 6] = ["busy", "idle", "prompt", "question", "survey", "
 /// The word an OLDER server sent for an agent at a limit, before the walls
 /// were named: still carried, so a bridge newer than its instance loses
 /// nothing. A current server never sends it (`limited` lives on only as
-/// `level=limited` and `await agent limited`).
+/// `level=limited`, the severity of any wall).
 pub const LEGACY_PHASES: [&str; 1] = ["limited"];
 
 /// `wall:<kind>` with `<kind>` of 1..=32 bytes of `[a-z0-9_-]` — the shape

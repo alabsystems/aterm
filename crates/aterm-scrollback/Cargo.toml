@@ -17,7 +17,6 @@ description = "Tiered scrollback storage with LZ4/Zstd compression and disk offl
 # for what would otherwise be the zstd-compressed cold tier.
 default = []
 fuzz = []
-testing = []
 # Opt-in zstd-compressed cold tier (default = LZ4-only). Gates the `zstd` dep and
 # all of its encode/decode sites. Off by default to keep the engine pure-Rust.
 zstd = ["dep:zstd"]
@@ -37,7 +36,6 @@ spec-anchors = ["dep:aterm-spec"]
 [dependencies]
 aterm-rle = { workspace = true }
 aterm-types = { workspace = true }
-aterm-error = { workspace = true }
 aterm-alloc = { workspace = true }
 aterm-lz4 = { workspace = true }
 zstd = { workspace = true, optional = true }

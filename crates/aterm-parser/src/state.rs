@@ -93,23 +93,11 @@ impl State {
 
     /// Returns true if we're inside a CSI sequence.
     #[inline]
+    #[cfg(test)]
     pub const fn is_csi(self) -> bool {
         matches!(
             self,
             State::CsiEntry | State::CsiParam | State::CsiIntermediate | State::CsiIgnore
-        )
-    }
-
-    /// Returns true if we're inside a DCS sequence.
-    #[inline]
-    pub const fn is_dcs(self) -> bool {
-        matches!(
-            self,
-            State::DcsEntry
-                | State::DcsParam
-                | State::DcsIntermediate
-                | State::DcsPassthrough
-                | State::DcsIgnore
         )
     }
 }

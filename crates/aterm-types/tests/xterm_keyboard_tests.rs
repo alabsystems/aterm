@@ -32,8 +32,8 @@ fn test_default_vs_new_divergence() {
     assert_eq!(new.query_modify_other_keys_response(), "\x1b[>4;0m");
 
     // Neither counts as "enabled" for modifier encoding purposes
-    assert!(!default.modify_other_keys_enabled());
-    assert!(!new.modify_other_keys_enabled());
+    assert!(!matches!(default.modify_other_keys(), Some(v) if v > 0));
+    assert!(!matches!(new.modify_other_keys(), Some(v) if v > 0));
 }
 
 #[test]

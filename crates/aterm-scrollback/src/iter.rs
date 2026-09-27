@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Forward and reverse iterators over scrollback lines.
+//! Forward iterators over scrollback lines.
 //!
-//! The FORWARD iterators stream whole storage segments (a warm block / cold
-//! page decodes once and its lines are MOVED out), instead of routing every
-//! line through the random-access `get_line` — which paid a binary search, a
-//! cache probe, and a full `Line` clone per line on an O(N) sequential walk
-//! (ST-6). The reverse iterator keeps the per-line path: reverse walks are
-//! short (`iter_rev().take(k)`) and a reversed block stream would buy nothing
-//! there.
+//! They stream whole storage segments (a warm block / cold page decodes once
+//! and its lines are MOVED out), instead of routing every line through the
+//! random-access `get_line` — which paid a binary search, a cache probe, and a
+//! full `Line` clone per line on an O(N) sequential walk (ST-6). Newest-first
+//! reads use `get_line_rev` directly.
 
 use std::collections::VecDeque;
 
@@ -32,16 +30,6 @@ impl Scrollback {
             idx: 0,
             skipped_lines: 0,
             buf: VecDeque::new(),
-        }
-    }
-
-    /// Iterate over recent lines (newest to oldest).
-    #[must_use]
-    pub fn iter_rev(&self) -> ScrollbackRevIter<'_> {
-        ScrollbackRevIter {
-            scrollback: self,
-            rev_idx: 0,
-            skipped_lines: 0,
         }
     }
 
@@ -116,6 +104,7 @@ impl ScrollbackIter<'_> {
     /// Non-zero after iteration indicates corrupt warm blocks caused incomplete
     /// results — the iterator yielded fewer items than `line_count()`.
     #[must_use]
+    #[cfg(test)]
     pub fn skipped_lines(&self) -> usize {
         self.skipped_lines
     }
@@ -178,59 +167,5 @@ impl<'a> IntoIterator for &'a Scrollback {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
-    }
-}
-
-/// Reverse iterator over scrollback lines (newest to oldest).
-///
-/// When corrupt warm blocks cause decompression errors, affected lines are
-/// skipped. Call [`skipped_lines`](Self::skipped_lines) after iteration to
-/// detect incomplete results (#5947).
-pub struct ScrollbackRevIter<'a> {
-    scrollback: &'a Scrollback,
-    rev_idx: usize,
-    skipped_lines: usize,
-}
-
-impl ScrollbackRevIter<'_> {
-    /// Number of lines skipped due to decompression errors during iteration.
-    #[must_use]
-    pub fn skipped_lines(&self) -> usize {
-        self.skipped_lines
-    }
-}
-
-impl Iterator for ScrollbackRevIter<'_> {
-    type Item = Line;
-
-    // Skip: the tier-walk driver — its line lookups route into the
-    // per-tier `get_line`s (each individually classified: guarded-index /
-    // decode class). Round-trip and ARENA-SCROLL tested.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn next(&mut self) -> Option<Self::Item> {
-        let total = self.scrollback.line_count;
-        while self.rev_idx < total {
-            match self.scrollback.get_line_rev(self.rev_idx) {
-                Ok(Some(cow_line)) => {
-                    self.rev_idx += 1;
-                    return Some(cow_line.into_owned());
-                }
-                Ok(None) => return None,
-                Err(e) => {
-                    aterm_log::warn!(
-                        "scrollback rev_iter: skipping rev_index {}: {e}",
-                        self.rev_idx
-                    );
-                    self.skipped_lines += 1;
-                    self.rev_idx += 1;
-                }
-            }
-        }
-        None
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.scrollback.line_count.saturating_sub(self.rev_idx);
-        (0, Some(remaining))
     }
 }

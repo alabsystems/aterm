@@ -9,13 +9,10 @@
 
 mod protocol;
 
-use super::callbacks::{
-    self, AdvancedNotificationCallback, ClipboardCallback, CopyToClipboardCallback,
-    NotificationCallback, RemoteHostCallback, SemanticBlockCallback, SemanticButtonCallback,
-};
-use super::shell::{Annotation, CommandMark, OutputBlock, ShellCallback, ShellState, TerminalMark};
+use super::callbacks::{AdvancedNotificationCallback, ClipboardCallback, NotificationCallback};
+use super::shell::{Annotation, CommandMark, OutputBlock, ShellState, TerminalMark};
 use super::transient_state::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND};
-use super::types::{CopyToClipboardState, SavedCursorState, SemanticBlock, SemanticButton};
+use super::types::SavedCursorState;
 use super::{PendingNotificationsMap, UserVarsMap};
 use aterm_types::{ColorPalette, Rgb};
 use std::collections::VecDeque;
@@ -236,9 +233,8 @@ pub(super) enum ShellIntegrationPhase {
 
 /// Grouped state for shell integration (OSC 133/633).
 ///
-/// Bundles the shell state machine, command marks, output blocks, and
-/// the shell callback. Accessed from OSC 133/633 handlers, shell_api.rs,
-/// blocks_api.rs, and semantic_api.rs.
+/// Bundles the shell state machine, command marks and output blocks.
+/// Accessed from OSC 133/633 handlers, shell_api.rs and blocks_api.rs.
 pub(super) struct ShellIntegrationState {
     /// Shell integration state machine (OSC 133).
     pub(super) state: ShellState,
@@ -251,8 +247,6 @@ pub(super) struct ShellIntegrationState {
     pub(super) current_mark: Option<CommandMark>,
     /// Completed command marks (FIFO eviction via VecDeque).
     pub(super) command_marks: VecDeque<CommandMark>,
-    /// Shell integration callback.
-    pub(super) callback: Option<ShellCallback>,
     /// Output blocks (command+output units) for block-based model (FIFO eviction).
     pub(super) output_blocks: VecDeque<OutputBlock>,
     /// Current block being built (in progress).
@@ -270,6 +264,15 @@ pub(super) struct ShellIntegrationState {
     /// `Cell` so the `&self` `block_output`/`block_command` accessors can record
     /// an eviction without taking `&mut self`.
     pub(super) eviction_reads: std::cell::Cell<u64>,
+    /// Which integration BODY the shell runs (the LOADER / BODY split,
+    /// 2026-09-26): the 16 lowercase hex digits of the script folder its body
+    /// came from, as the body signs it before every prompt
+    /// (`633;P;AtermIntegration=<rev>;id=<nonce>`). Recorded only from a mark
+    /// that passed the nonce gate, so a program's output cannot claim one;
+    /// `None` until the first. Kept across `reset()`: a RIS clears the screen,
+    /// not the shell's script. Carried across a seamless update by the carry
+    /// projections, like the nonce (`TerminalCheckpoint::shell_integration_rev`).
+    pub(super) integration_rev: Option<[u8; 16]>,
 }
 
 impl ShellIntegrationState {
@@ -279,16 +282,16 @@ impl ShellIntegrationState {
             phase: ShellIntegrationPhase::None,
             current_mark: None,
             command_marks: VecDeque::new(),
-            callback: None,
             output_blocks: VecDeque::new(),
             current_block: None,
             next_block_id: 0,
             completed_seq: 0,
             eviction_reads: std::cell::Cell::new(0),
+            integration_rev: None,
         }
     }
 
-    /// Reset data fields while preserving callback and block ID counter.
+    /// Reset data fields while preserving the block ID counter.
     pub(super) fn reset(&mut self) {
         self.state = ShellState::Ground;
         self.phase = ShellIntegrationPhase::None;
@@ -327,21 +330,15 @@ impl CursorSaveState {
     }
 }
 
-/// Grouped title/icon state and callback.
+/// Grouped title/icon state.
 ///
-/// Bundles window title (OSC 0/2), icon name (OSC 0/1), title callback, and
-/// title stack state for XTWINOPS push/pop operations.
+/// Bundles window title (OSC 0/2), icon name (OSC 0/1), the title-change
+/// epoch, and title stack state for XTWINOPS push/pop operations.
 pub(super) struct TitleState {
     /// Window title (OSC 0 or OSC 2).
     pub(super) window: Arc<str>,
     /// Icon name (OSC 0 or OSC 1).
     pub(super) icon: Arc<str>,
-    /// Title change callback (invoked for window title updates, legacy v2).
-    pub(super) callback: Option<callbacks::TitleCallback>,
-    /// Title event callback with type discriminator (v3).
-    ///
-    /// Fires for all OSC 0/1/2 title changes with the title type.
-    pub(super) event_callback: Option<callbacks::TitleEventCallback>,
     /// Title stack for CSI 22/23 t push/pop operations.
     ///
     /// Stores (icon_name, window_title) pairs. Capped at `TITLE_STACK_MAX_DEPTH`
@@ -362,16 +359,13 @@ impl TitleState {
         Self {
             window: Arc::from(""),
             icon: Arc::from(""),
-            callback: None,
-            event_callback: None,
             stack: Vec::new(),
             epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Reset title data while preserving callback (xterm clears titles on RIS).
-    ///
-    /// Fires the title callback so the host UI updates its titlebar.
+    /// Reset title data (xterm clears titles on RIS). Hosts see the clear
+    /// through [`Terminal::title_epoch`](super::Terminal::title_epoch).
     pub(super) fn reset(&mut self) {
         // Clearing a non-empty window title is a real title change; bump the
         // change epoch so a host UI observing a background tab sees the RIS
@@ -383,13 +377,6 @@ impl TitleState {
         self.window = Arc::from("");
         self.icon = Arc::from("");
         self.stack.clear();
-        // Notify host that the title was cleared.
-        if let Some(ref mut callback) = self.callback {
-            callback(&self.window);
-        }
-        if let Some(ref mut callback) = self.event_callback {
-            callback(aterm_types::TitleType::WindowAndIcon, &self.window);
-        }
     }
 }
 
@@ -436,55 +423,19 @@ impl NotificationState {
 pub(super) struct ClipboardState {
     /// Clipboard callback for OSC 52 operations.
     pub(super) callback: Option<ClipboardCallback>,
-    /// Callback for OSC 1337 named pasteboard operations.
-    pub(super) copy_callback: Option<CopyToClipboardCallback>,
-    /// State for CopyToClipboard text capture mode.
-    pub(super) copy_state: Option<CopyToClipboardState>,
 }
 
 impl ClipboardState {
     pub(super) fn new() -> Self {
-        Self {
-            callback: None,
-            copy_callback: None,
-            copy_state: None,
-        }
-    }
-
-    /// Reset in-progress copy capture while preserving callbacks.
-    pub(super) fn reset(&mut self) {
-        self.copy_state = None;
+        Self { callback: None }
     }
 }
 
 /// Grouped state for Terminal OSC 1337 protocol extensions.
 ///
-/// Bundles Terminal-specific callbacks and state: profile, badge, colors,
-/// cursor line highlight, variable reporting, cell size, shell integration
-/// version, remote host, and user variables.
-// The OSC 1337 callback fields below are registered and invoked via the FFI
-// app-callback layer (ffi_bridge/app_callbacks); they are inert (never read) in
-// the default lib build, where no callback consumer is compiled.
-#[allow(
-    dead_code,
-    reason = "OSC 1337 callback registry consumed by the FFI app-callback layer"
-)]
+/// Bundles the OSC 1337 state the engine keeps: user variables, cursor line
+/// highlight, shell integration version, remote host, and the cell pixel size.
 pub(super) struct Iterm2State {
-    /// Callback for OSC 1337 SetProfile requests.
-    pub(super) set_profile_callback: Option<callbacks::SetProfileCallback>,
-    /// Callback for OSC 1337 SetBadgeFormat requests.
-    pub(super) set_badge_format_callback: Option<callbacks::SetBadgeFormatCallback>,
-    /// Callback for OSC 1337 SetColors requests.
-    pub(super) set_colors_callback: Option<callbacks::SetColorsCallback>,
-    /// Callback for OSC 1337 HighlightCursorLine requests.
-    pub(super) highlight_cursor_line_callback: Option<callbacks::HighlightCursorLineCallback>,
-    /// Callback for OSC 1337 ReportVariable queries.
-    pub(super) report_variable_callback: Option<callbacks::ReportVariableCallback>,
-    /// Callback for OSC 1337 ReportCellSize queries.
-    pub(super) report_cell_size_callback: Option<callbacks::ReportCellSizeCallback>,
-    /// Callback for OSC 1337 ShellIntegrationVersion reports.
-    pub(super) shell_integration_version_callback:
-        Option<callbacks::ShellIntegrationVersionCallback>,
     /// User variables (OSC 1337 SetUserVar).
     pub(super) user_vars: UserVarsMap,
     /// Insertion order of `user_vars` keys, for deterministic oldest-first
@@ -501,10 +452,6 @@ pub(super) struct Iterm2State {
     pub(super) shell_integration_version: Option<super::types::Iterm2ShellIntegrationVersion>,
     /// Current remote host (OSC 1337 RemoteHost).
     pub(super) remote_host: Option<super::types::RemoteHost>,
-    /// Callback for remote host change events.
-    pub(super) remote_host_callback: Option<RemoteHostCallback>,
-    /// Generic KVP callback for all OSC 1337 commands (first-refusal interceptor).
-    pub(super) kvp_callback: Option<callbacks::KvpCallback>,
     /// Cell pixel size `(width, height)` used to convert pixel/auto image
     /// dimensions (OSC 1337 `File=`) into a CELL footprint. The frontend sets it
     /// from its real font metrics via [`Terminal::set_cell_pixel_size`]; the
@@ -533,20 +480,11 @@ pub(super) const DEFAULT_CELL_PX: (u16, u16) = (8, 16);
 impl Iterm2State {
     pub(super) fn new() -> Self {
         Self {
-            set_profile_callback: None,
-            set_badge_format_callback: None,
-            set_colors_callback: None,
-            highlight_cursor_line_callback: None,
-            report_variable_callback: None,
-            report_cell_size_callback: None,
-            shell_integration_version_callback: None,
             user_vars: UserVarsMap::default(),
             user_vars_order: std::collections::VecDeque::new(),
             highlight_cursor_line: None,
             shell_integration_version: None,
             remote_host: None,
-            remote_host_callback: None,
-            kvp_callback: None,
             cell_px: DEFAULT_CELL_PX,
             cell_px_from_host: false,
         }
@@ -570,52 +508,6 @@ impl Iterm2State {
         self.shell_integration_version = None;
         self.user_vars.clear();
         self.user_vars_order.clear();
-    }
-}
-
-/// Semantic block storage.
-type SemanticBlockMap = std::collections::HashMap<String, SemanticBlock>;
-
-/// Grouped state for semantic blocks/buttons and callbacks (OSC 1337).
-///
-/// Bundles semantic code blocks, semantic buttons, and their callbacks.
-/// Accessed from OSC 1337 handlers, semantic API accessors, and callback setters.
-pub(super) struct SemanticState {
-    /// Semantic code blocks (OSC 1337 Block).
-    /// Maps block ID to block data. Open blocks are tracked until closed.
-    pub(super) blocks: SemanticBlockMap,
-    /// Semantic buttons (OSC 1337 Button).
-    /// Buttons attached to terminal content for copy or custom actions.
-    /// Uses VecDeque for O(1) FIFO eviction at capacity (vs O(n) Vec::remove(0)).
-    pub(super) buttons: std::collections::VecDeque<SemanticButton>,
-    /// Callback for semantic block events.
-    #[allow(
-        dead_code,
-        reason = "registered/invoked via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(super) block_callback: Option<SemanticBlockCallback>,
-    /// Callback for semantic button events.
-    #[allow(
-        dead_code,
-        reason = "registered/invoked via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(super) button_callback: Option<SemanticButtonCallback>,
-}
-
-impl SemanticState {
-    pub(super) fn new() -> Self {
-        Self {
-            blocks: SemanticBlockMap::new(),
-            buttons: std::collections::VecDeque::new(),
-            block_callback: None,
-            button_callback: None,
-        }
-    }
-
-    /// Reset data fields while preserving callbacks.
-    pub(super) fn reset(&mut self) {
-        self.blocks.clear();
-        self.buttons.clear();
     }
 }
 

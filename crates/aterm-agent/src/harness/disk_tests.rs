@@ -620,7 +620,7 @@ fn the_purge_row_is_surfaced_and_never_run_from_here() {
 fn the_report_json_carries_every_row_with_its_witness() {
     let mut survey = Survey::new(NOW);
     survey.free_bytes = Some(12 * GIB);
-    survey.trigger = Trigger::UpdateDone;
+    survey.trigger = Trigger::OnDemand;
     survey.versions.push(VersionDir {
         path: PathBuf::from("/v/2.1.259"),
         bytes: 7,
@@ -630,7 +630,7 @@ fn the_report_json_carries_every_row_with_its_witness() {
     let rep = report(&survey, Config::default());
     let json = rep.to_json();
     assert!(json.contains("\"kind\":\"disk\""), "{json}");
-    assert!(json.contains("\"trigger\":\"update-done\""), "{json}");
+    assert!(json.contains("\"trigger\":\"on-demand\""), "{json}");
     assert!(json.contains("\"warn\":true"), "{json}");
     assert!(json.contains("\"apply_allowed\":false"), "{json}");
     assert!(json.contains("\"witness\":\"not-link-target\""), "{json}");
@@ -704,10 +704,10 @@ fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
         live_link: Some(link),
         ..Roots::default()
     };
-    let survey = scan(&roots, NOW, Trigger::Tick, Config::default(), Some(GIB));
+    let survey = scan(&roots, NOW, Trigger::OnDemand, Config::default(), Some(GIB));
     assert_eq!(survey.versions.len(), 2);
     assert_eq!(survey.free_bytes, Some(GIB));
-    assert_eq!(survey.trigger, Trigger::Tick);
+    assert_eq!(survey.trigger, Trigger::OnDemand);
     #[cfg(unix)]
     {
         // The link points at the BINARY; the class is about the version

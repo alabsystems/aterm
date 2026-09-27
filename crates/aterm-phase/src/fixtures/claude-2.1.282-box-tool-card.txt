@@ -1,0 +1,14 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, y5n() in CARD mode (a tool with a permission card, tool.permissionCard: Ei({title: card.question}) when the box has no origin and the question fits one row, else Ei({title: userFacingName}) with the question in the card; options bV({question: null}), so no `Do you want …` row); the card rows under the title (Kt/qn: lines, values, paddingX 2) are this file's own, their exact layout not read · a card-mode tool box titled by its card's question
+⏺ Filing the issue.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Create an issue in alabsystems/aterm?
+
+   title   Harness presses a quoted box
+   labels  bug, harness
+
+ ❯ 1. Yes
+   2. Yes, and don't ask again for github - create_issue commands in ~/aterm
+   3. No
+
+ Esc to cancel · Tab to amend

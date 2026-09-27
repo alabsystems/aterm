@@ -197,6 +197,19 @@ pub(crate) fn latest_tag(
     Some(latest.tag)
 }
 
+/// The tag the ledger last authorized against `source`, WHICHEVER build recorded it:
+/// the machine's newest known release of that repository. What
+/// `github::app_build_in_flight` ranks a source-only channel head against. Not
+/// [`latest_tag`], which answers only the build that recorded it: the head-in-flight
+/// count is machine-wide (`check_receipt`), so the predicate it counts must give
+/// every build the same answer, or one build's checks start the ladder that
+/// another's reset (the review of 2026-09-25, F7).
+pub(crate) fn authorized_tag(staging: &Staging, source: &crate::Source) -> Option<String> {
+    read_latest(staging)
+        .filter(|latest| latest.source.eq_ignore_ascii_case(&source_slug(source)))
+        .map(|latest| latest.tag)
+}
+
 /// Forget the authorized tag — on disk and for the rest of this process's check — so
 /// the next check re-fetches and re-judges the channel head. Called when a published
 /// stage is RETIRED ([`Staging::retire_published`]): "up to date (channel head vX)"

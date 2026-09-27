@@ -1147,7 +1147,7 @@ impl CursorCat {
     /// alike — record to the ledger and never hand a look here, so the only
     /// route is the user's own act: the favourite pin. Output text that
     /// happens to say `cat` must neither activate nor re-dress the companion,
-    /// and a typed `kitty` presents the cat it already has ([`Self::on_summon`]).
+    /// and a typed `kitty` presents the cat it already has (`Self::on_summon`).
     pub fn on_collect(&mut self, now: Instant, look: KittyLook) {
         self.look = look.normalized();
         // Two-path rule, path 2 ([`Self::set_look`]): the hello IS the
@@ -1189,6 +1189,7 @@ impl CursorCat {
     /// delights in place: `CursorCat` enters `FadeIn` only from `Hidden`/
     /// `FadeOut`, so `kittykittykitty` extends one appearance rather than
     /// strobing it.
+    #[cfg(test)]
     pub fn on_summon(&mut self, now: Instant, hits: u8) {
         self.momentum.set_value(now, 1.0);
         self.last = Some(now);

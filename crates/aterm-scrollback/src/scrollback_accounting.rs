@@ -4,10 +4,13 @@
 
 //! Accounting and watermark maintenance helpers for [`Scrollback`].
 
-use super::{Scrollback, WatermarkLevel, threshold_bytes};
+use super::Scrollback;
+#[cfg(test)]
+use super::{WatermarkLevel, threshold_bytes};
 
 impl Scrollback {
     /// Configure watermark thresholds as percentages (0-100) of the memory budget.
+    #[cfg(test)]
     pub fn set_watermark_thresholds(&mut self, yellow_percent: usize, red_percent: usize) {
         let yellow = yellow_percent.clamp(1, 100);
         let red = red_percent.clamp(yellow, 100);
@@ -40,7 +43,7 @@ impl Scrollback {
     /// An inline image is retained for exactly as long as its line is held
     /// UNCOMPRESSED, in the hot tier. The wire format that the warm (LZ4) and
     /// cold (zstd, in RAM or on disk) tiers store lines in carries no image
-    /// section — see [`Line::serialize`] for why a shared payload cannot be
+    /// section — see `Line::serialize` for why a shared payload cannot be
     /// written per line without multiplying it by the footprint's height — so
     /// crossing out of the hot tier is where the picture ends and this counter
     /// starts moving.
@@ -56,8 +59,6 @@ impl Scrollback {
     /// The count is in footprint ROWS (one per history line), so a ten-row
     /// picture reports ten as it crosses. It never decreases and is not reset
     /// by [`clear`](Self::clear).
-    ///
-    /// [`Line::serialize`]: crate::Line::serialize
     #[must_use]
     pub fn image_rows_dropped_by_compression(&self) -> u64 {
         self.image_rows_dropped_by_compression

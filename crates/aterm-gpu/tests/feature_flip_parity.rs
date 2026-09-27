@@ -7,9 +7,6 @@
 // (`GpuRenderer::set_text_shaping` -> `invalidate_atlas`) on a live renderer. These
 // tests drive the same renderer through a config change and re-render.
 //
-// Own test BINARY (separate process) so the $ATERM_FONT env set here never races
-// the other parity SUITES; within this binary the set is hoisted behind a OnceLock
-// (see ligature_test_font) so the parallel #[test] threads never race it either.
 // Gated: no GPU / font -> skip cleanly.
 
 use aterm_core::terminal::Terminal;
@@ -17,61 +14,28 @@ use aterm_render::{LigatureMode, TextShapingConfig, Theme};
 use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
 
 mod common;
-use common::{backends, max_channel_delta_frame as max_channel_delta};
+use common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
 // Layout-independent ligature font discovery (mirrors ligature_parity.rs): the
 // bundled JetBrains Mono ligates `=>` and carries a `zero` (slashed-zero) feature.
-// This is also the SINGLE point where $ATERM_FONT is exported to both renderers:
-// both #[test] fns in this binary want the SAME font, but libtest runs them on
-// PARALLEL threads — a per-test set_var would race the sibling test's renderer
-// construction (C-side getenv/setenv under concurrent mutation is
-// dangling-pointer UB). `get_or_init` parks every caller until the closure
-// returns, so the ONE write is complete before any renderer in this process is
-// built — the same guarantee glow_parity.rs gets from its Once.
-//
-// Returns (path, is_fixture). is_fixture is captured AT RESOLUTION TIME — true
-// iff discovery fell through to the bundled fixture — because after the hoist
-// $ATERM_FONT is always set, so it can no longer be inferred from the
-// environment (the old per-test `env::var(..).is_err()` probe could also read a
-// sibling test's export and silently downgrade a real failure to a SKIP).
-//
-// DISCOVERY DOES NOT READ $ATERM_FONT, only WRITES it. $ATERM_FONT is a
-// production setting that outranks `font_family` in config, so reading it here
-// let a developer's own font preference displace the committed fixture. The
-// override is the dedicated $ATERM_LIGATURE_TEST_FONT; the export below is
-// unchanged, because pointing both renderers at the resolved font is this
-// helper's actual job.
-fn ligature_test_font() -> Option<(&'static std::path::Path, bool)> {
-    static FONT: std::sync::OnceLock<Option<(std::path::PathBuf, bool)>> =
-        std::sync::OnceLock::new();
-    FONT.get_or_init(|| {
-        let from_env = std::env::var("ATERM_LIGATURE_TEST_FONT")
-            .ok()
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.exists());
-        let (found, is_fixture) = match from_env {
-            Some(p) => (p, false),
-            None => {
-                const FIXTURE: &str = concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-                );
-                let p = std::path::PathBuf::from(FIXTURE);
-                if !p.exists() {
-                    return None;
-                }
-                (p, true)
-            }
-        };
-        // Set exactly once per process (OnceLock init), before any renderer is
-        // constructed — every concurrent caller is parked in get_or_init until this
-        // write completes, so no getenv can observe it mid-mutation — and routed
-        // through the workspace's one lock-scoped env helper.
-        aterm_log::env::set("ATERM_FONT", &found);
-        Some((found, is_fixture))
-    })
-    .as_ref()
-    .map(|(p, is_fixture)| (p.as_path(), *is_fixture))
+// The dedicated $ATERM_LIGATURE_TEST_FONT overrides it. The path is handed to both
+// renderers as their FAMILY (`backends_with_font`), so nothing here writes the
+// environment. Returns (path, is_fixture): is_fixture is true iff discovery fell
+// through to the bundled fixture, whose `zero` feature the tests may rely on.
+fn ligature_test_font() -> Option<(std::path::PathBuf, bool)> {
+    if let Some(p) = std::env::var("ATERM_LIGATURE_TEST_FONT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        return Some((p, false));
+    }
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
+    );
+    let p = std::path::PathBuf::from(FIXTURE);
+    p.exists().then_some((p, true))
 }
 
 /// A live ligature on->off flip via `set_text_shaping` reaches GPU pixels and keeps
@@ -83,15 +47,15 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
-    if ligature_test_font().is_none() {
+    // Builds BOTH renderers on the ligature font (see ligature_test_font).
+    let Some((font, _)) = ligature_test_font() else {
         eprintln!(
             "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
         );
         return;
-    }
+    };
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
 
@@ -143,22 +107,21 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
 /// A live `font_features` flip (`zero` = slashed zero) reaches GPU pixels and keeps
 /// CPU==GPU. This proves the headline `font_features` knob is not a no-op on the GPU
 /// backend. Non-vacuity is enforced for the bundled JetBrains Mono fixture; if a
-/// host points $ATERM_FONT at a font WITHOUT a `zero` feature it SKIPs (logged)
-/// rather than failing, so the suite stays portable.
+/// host points $ATERM_LIGATURE_TEST_FONT at a font WITHOUT a `zero` feature it
+/// SKIPs (logged) rather than failing, so the suite stays portable.
 #[test]
 fn live_font_feature_flip_reaches_gpu_pixels() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Resolves AND exports $ATERM_FONT once per process; is_fixture is captured at
-    // resolution time, NOT probed from the (already-mutated) environment (see
-    // ligature_test_font).
-    let Some((_, is_fixture)) = ligature_test_font() else {
+    // is_fixture: whether the bundled fixture (with its `zero` feature) is in use
+    // (see ligature_test_font).
+    let Some((font, is_fixture)) = ligature_test_font() else {
         eprintln!("SKIP: no ligature test font");
         return;
     };
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
 

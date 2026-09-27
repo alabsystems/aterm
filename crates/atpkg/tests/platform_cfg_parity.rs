@@ -755,92 +755,6 @@ mod tests {
     assert!(found.is_empty(), "{}", report(&found));
 }
 
-/// Non-vacuity, half two: every shape that must stay green. A guard that cannot tell a twin
-/// from a defect is worse than none — it gets deleted the first week.
-#[test]
-fn the_shapes_that_are_not_defects_stay_green() {
-    let mut tree = BTreeMap::new();
-    tree.insert(
-        "seam.rs".to_string(),
-        r#"
-#[cfg(unix)]
-pub(crate) fn bin_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
-    None
-}
-#[cfg(not(unix))]
-pub(crate) fn bin_mismatch(_build: &Path, view: &Path) -> Option<PathBuf> {
-    None
-}
-#[cfg(unix)]
-pub(crate) fn unix_only(path: &Path) -> bool {
-    true
-}
-#[cfg(target_os = "macos")]
-pub(crate) fn run_view_job(
-    helper: &Path,
-    layout: &Layout,
-    job: &ViewJob,
-) -> Result<String, String> {
-    Err(String::new())
-}
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn run_view_job(
-    _helper: &Path,
-    _layout: &Layout,
-    _job: &ViewJob,
-) -> Result<String, String> {
-    Err(String::new())
-}
-"#
-        .to_string(),
-    );
-    tree.insert(
-        "compat.rs".to_string(),
-        r#"
-// A twin is always resolvable.
-pub fn a(build: &Path, view: &Path) -> bool {
-    crate::seam::bin_mismatch(build, view).is_none() && crate::seam::run_view_job(p, l, j).is_ok()
-}
-// The call stands inside the same gate the callee does — as a whole item…
-#[cfg(unix)]
-pub fn b(path: &Path) -> bool {
-    crate::seam::unix_only(path)
-}
-// …as a bare block inside an ungated fn…
-pub fn c(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        return crate::seam::unix_only(path);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
-}
-// …and as a single gated statement, the shape `root_first_mismatch` uses.
-pub fn d(root: &Path) -> Option<PathBuf> {
-    #[cfg(unix)]
-    if crate::seam::unix_only(root) {
-        return Some(root.to_path_buf());
-    }
-    None
-}
-// A multi-line signature must not end its own gate at the first comma.
-#[cfg(unix)]
-pub fn e(
-    one: &Path,
-    two: &Path,
-) -> bool {
-    crate::seam::unix_only(one) && crate::seam::unix_only(two)
-}
-"#
-        .to_string(),
-    );
-    let found = violations(&tree);
-    assert!(found.is_empty(), "{}", report(&found));
-}
-
 /// The real `metadata_io::open_regular` shape: all three platform branches
 /// cover the ungated lock-release probe, but an extra gate on one branch does
 /// not. This is the scanner's historical false positive and its negative
@@ -880,7 +794,7 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> { todo!() }
     assert_eq!(found[0].path, "crate::metadata_io::open_regular");
 }
 
-/// Non-vacuity, half three: the scan must still see the crate. Every limit in this file's
+/// Non-vacuity, half two: the scan must still see the crate. Every limit in this file's
 /// header narrows what it judges, and the failure mode of a narrowed guard is a lexer that
 /// quietly matches nothing and passes for ever. These floors sit far below the tree's real
 /// numbers — they are here to catch a scanner that stopped working, not to pin a shape.

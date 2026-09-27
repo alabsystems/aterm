@@ -13,6 +13,11 @@ description = "aterm GPU renderer (wgpu/Metal): glyph-atlas + instanced cell qua
 # Native drawable starvation conformance only; absent from shipped builds.
 acquire-conformance = []
 default = []
+# DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
+# reads (the `ATERM_GPU_*` adapter/power/memblock/present/frame-latency seams and
+# the `ATERM_METAL_INJECT_LOSS` drill). A debug build compiles them anyway; the
+# release cutter never enables it (aterm-gui's `dev-seams` forwards here).
+dev-seams = []
 # THE FLIP (map §5 W6): the wgpu ORACLE arm, OFF in every production build.
 # On macOS the wgpu dependency below is OPTIONAL and this feature is its only
 # activator; the target-gated self-dev-dependency at the bottom of this file
@@ -41,7 +46,6 @@ spec-anchors = ["dep:aterm-spec", "aterm-render/spec-anchors"]
 # crate from pulling zstd into the wasm32 closure.
 aterm-core = { path = "../aterm-core", default-features = false }
 aterm-render = { path = "../aterm-render", default-features = false }
-aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # Fast non-DoS hasher (FxHash) for the per-drawable-cell glyph atlas lookups.
 aterm-hash = { workspace = true }
 # `std::time::Instant::now()` PANICS on wasm32-unknown-unknown ("time not
@@ -50,6 +54,9 @@ aterm-hash = { workspace = true }
 # clocks below use it so GPU init/present never traps in the web renderer —
 # same clock aterm-effects already uses across this crate's wasm closure.
 aterm-time = { workspace = true }
+# `aterm_types::dev_seam!`, the one reader of this crate's `ATERM_GPU_*` development
+# seams (compiled out of a shipped binary). Already in the closure via aterm-render.
+aterm-types = { workspace = true }
 # THE FLIP: the base `wgpu` row is GONE — wgpu is declared per target below
 # (macOS: optional, oracle-only; linux/windows/wasm: required, unchanged).
 # THE ROW's one public leak, closed. `GpuRenderer::create_window_surface` took
@@ -74,10 +81,10 @@ raw-window-handle = "0.6"
 # the SOLE activator of that `derive` feature on macOS once wgpu-types and
 # wgpu-hal left the normal graph (rustybuzz, the row's other parent, asks only
 # for `extern_crate_alloc`). `aterm-bits` is this workspace's own `Pod`/
-# `Zeroable` and the byte casts over them (already `aterm-core`'s), with no
-# derive: the ten `#[repr(C)]` uniform/instance structs in `renderer.rs` carry
-# hand-written `unsafe impl`s through the `impl_pod_zeroable!` macro there,
-# which restates the padding proof the derive used to check.
+# `Zeroable` and the byte casts over them, with no derive: the ten `#[repr(C)]`
+# uniform/instance structs in `renderer.rs` carry hand-written `unsafe impl`s
+# through the `impl_pod_zeroable!` macro there, which restates the padding proof
+# the derive used to check.
 #
 # PRIZE, measured: `bytemuck_derive 1.10.2` — 2,934 LOC, a PROC MACRO — leaves
 # the mac-arm graph, taking the cell's proc-macro count 3 -> 2 and `syn`'s
@@ -140,15 +147,13 @@ aterm-spec = { workspace = true, optional = true }
 #            resolved ash or glow. Hygiene only; the binary does not change.
 #
 # THE TRADE, stated plainly because it is a real regression for one class of user:
-# `ATERM_GPU_BACKEND` (src/lib.rs:263-271, documented at :302-322 as the "escape
-# hatch for a broken driver path") still PARSES `gl` and `vulkan` — the
-# `Backends` bitflags are plain wgpu-types constants with no feature cfg — but on
-# a cell that no longer compiles that backend, `enumerate_adapters` finds no
-# adapter for it. So a Linux box whose Vulkan driver is broken, or a Windows box
-# whose DX12 driver is broken, previously fell to a SECOND GPU backend and now
-# falls to the CPU softbuffer present path instead. That path exists and is the
-# documented fail-soft arm for device loss; this makes it the first fallback
-# rather than the second. Reverting is one feature name per row.
+# a Linux box whose Vulkan driver is broken, or a Windows box whose DX12 driver is
+# broken, previously fell to a SECOND GPU backend and now falls to the CPU
+# softbuffer present path instead. That path exists and is the documented
+# fail-soft arm for device loss; this makes it the first fallback rather than the
+# second. Reverting is one feature name per row. (With one backend per cell there
+# was nothing left for the old `ATERM_GPU_BACKEND` escape hatch to select, so it
+# was deleted on 2026-09-24; `gpu = false` chooses the CPU path outright.)
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-objc = { workspace = true }
 # THE FLIP: optional — the first-party Metal renderer is the macOS backend,
@@ -162,14 +167,14 @@ wgpu = { version = "29", optional = true, default-features = false, features = [
 wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
 
 # Windows-only: the DX12 backend. This is the one cell where `dx12` builds a real
-# device, and it is the DEFAULT backend there (src/lib.rs `backends_from_env`) plus
+# device, and it is THE backend there (src/lib.rs `default_backends`) plus
 # the only one wired for the HDR/scRGB present. Every first-party DX12 call site is
 # already `#[cfg(windows)]` — `wgpu::hal::api::Dx12` at src/renderer.rs:8099/:8147
 # (inside `#[cfg(windows)] fn surface_output_hdr_enabled` / `fn tag_swapchain_scrgb`)
 # and `wgpu::Dx12SwapchainKind` at src/lib.rs:506. `wgpu::Backends::DX12`
 # (src/lib.rs:265, :310, :903) is NOT gated by this feature: it is a plain
 # wgpu-types bitflag (wgpu-types-29.0.3/src/backend.rs:110, and wgpu-types has no
-# `dx12` feature at all), so `ATERM_GPU_BACKEND=dx12` still parses on every cell.
+# `dx12` feature at all), so the constant exists on every cell.
 # (declared in the existing `cfg(windows)` dependency table below, next to the
 # `windows` crate that the same DX12 present path needs.)
 
@@ -227,6 +232,9 @@ aterm-gpu = { path = ".", features = ["wgpu-oracle"] }
 
 [dev-dependencies]
 criterion = "0.5"
+# The CPU/GPU parity test builds a cursor trail from `TrailCell`s; the library
+# itself names nothing from aterm-render-api.
+aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
 # these parity tests export a font / rasterizer selection to both renderers, and
 # every mutation in the workspace routes through that helper rather than a raw
@@ -247,9 +255,6 @@ aterm-core = { workspace = true, features = ["sixel"] }
 # drives the real slice-precondition decision over the bg-instance count.
 aterm-spec = { workspace = true }
 aterm-spec-models = { workspace = true }
-# Test-only: build a TerminalConfig from a named ColorScheme for the named-theme
-# GPU/CPU parity test (tests/gpu_matches_cpu.rs).
-aterm-types = { workspace = true }
 # Test-only: the PURE supernova emitters (aterm-effects/src/supernova.rs) drive
 # the nova_parity supernova arm — emit_super/emit_super_decos are clockless
 # functions of (t, env), so the tests feed them straight into RenderInput

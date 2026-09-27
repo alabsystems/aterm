@@ -7,11 +7,6 @@
 //! deletion, or replacement becomes one local undo frame. Selection is represented in
 //! canonical UTF-8 byte offsets but every public mutation clamps to grapheme boundaries.
 
-#![allow(
-    dead_code,
-    reason = "native semantic input host integration lands in stages"
-)]
-
 use std::ops::Range;
 
 use aterm_grapheme::GraphemeClusters;
@@ -74,7 +69,6 @@ pub(crate) struct TextInputState {
     preedit: Option<ImePreedit>,
     undo: Vec<HistoryFrame>,
     redo: Vec<HistoryFrame>,
-    revision: u64,
 }
 
 impl TextInputState {
@@ -87,7 +81,6 @@ impl TextInputState {
             preedit: None,
             undo: Vec::new(),
             redo: Vec::new(),
-            revision: 1,
         }
     }
 
@@ -101,10 +94,6 @@ impl TextInputState {
 
     pub(crate) fn preedit(&self) -> Option<&ImePreedit> {
         self.preedit.as_ref()
-    }
-
-    pub(crate) const fn revision(&self) -> u64 {
-        self.revision
     }
 
     pub(crate) fn selected_text(&self) -> &str {
@@ -232,6 +221,7 @@ impl TextInputState {
         self.replace_selection("");
     }
 
+    #[cfg(any(a11y_tree, test))]
     pub(crate) fn insert(&mut self, text: &str) {
         self.replace_selection(text);
     }
@@ -254,13 +244,7 @@ impl TextInputState {
         let replaced = self.selection.range();
         let room = MAX_TEXT_INPUT_BYTES.saturating_sub(self.value.len() - replaced.len());
         let text = truncate_graphemes(text, room);
-        let selection = selection.and_then(|range| {
-            (range.start <= range.end
-                && range.end <= text.len()
-                && text.is_char_boundary(range.start)
-                && text.is_char_boundary(range.end))
-            .then(|| nearest_boundary(&text, range.start)..nearest_boundary(&text, range.end))
-        });
+        let selection = normalize_preedit_selection(&text, selection);
         self.preedit = (!text.is_empty()).then_some(ImePreedit { text, selection });
     }
 
@@ -339,7 +323,6 @@ impl TextInputState {
         self.value.replace_range(range.clone(), inserted);
         self.selection = TextSelection::caret(range.start.saturating_add(inserted.len()));
         self.preedit = None;
-        self.revision = self.revision.saturating_add(1);
     }
 
     fn push_undo(&mut self) {
@@ -361,8 +344,22 @@ impl TextInputState {
         self.value = frame.value;
         self.selection = frame.selection;
         self.preedit = None;
-        self.revision = self.revision.saturating_add(1);
     }
+}
+
+/// Preserve winit's UTF-8 selection convention for every native composition.
+/// Invalid ranges remain absent; valid scalar boundaries clamp to graphemes.
+pub(crate) fn normalize_preedit_selection(
+    text: &str,
+    selection: Option<Range<usize>>,
+) -> Option<Range<usize>> {
+    selection.and_then(|range| {
+        (range.start <= range.end
+            && range.end <= text.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end))
+        .then(|| nearest_boundary(text, range.start)..nearest_boundary(text, range.end))
+    })
 }
 
 fn truncate_graphemes(mut text: String, maximum: usize) -> String {

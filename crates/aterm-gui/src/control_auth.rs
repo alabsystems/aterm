@@ -28,7 +28,7 @@
 //! Instances do not collide: each binds its own `aterm-<pid>.sock` with a
 //! matching `aterm-<pid>.token`, and a `aterm.sock` symlink is atomically
 //! repointed at the newest instance so a single-instance `aterm-ctl` needs no
-//! flags. An instance on an explicit `$ATERM_CONTROL_SOCK` path is isolated
+//! flags. An instance on an explicit `--control-sock` path is isolated
 //! the same way — its token is named after ITS socket
 //! ([`control_socket::token_name_for_sock`], [`token_path_for_socket`]) — so
 //! two private instances in one directory keep their own credentials instead
@@ -62,9 +62,11 @@ mod imp;
 #[path = "control_auth_win.rs"]
 mod imp;
 
-#[cfg(unix)]
-pub use imp::our_uid;
-pub use imp::{
+// The socket's own peer check reads it inside `imp`; out here only the tests do
+// (the snapshot override that also named it was deleted, 2026-09-24).
+#[cfg(all(unix, test))]
+use imp::our_uid;
+pub(crate) use imp::{
     ensure_private_dir, lock_socket_file, peer_check, provision_token, publish_latest_link,
 };
 // Whether a pid is alive: the stale sweeps' one test, shared with the handoff's
@@ -86,17 +88,17 @@ use imp::random_token_hex;
 
 /// Filename of the `latest` symlink in the per-user directory, pointing at
 /// the newest instance's `aterm-<pid>.sock`.
-pub const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
+pub(crate) const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
 
 /// Subdirectory of the socket directory that confines `image`-verb PNG writes.
-pub const IMAGES_DIR: &str = "images";
+pub(crate) const IMAGES_DIR: &str = "images";
 
 /// Server-auto-named captures live below this private child, separated from
 /// caller-explicit filenames so retention can never delete an explicit target.
 const AUTO_IMAGES_DIR: &str = "auto";
 
 /// VIDEO introspection recordings subdir (frame sequences + index.json).
-pub const VIDEO_DIR: &str = "video";
+pub(crate) const VIDEO_DIR: &str = "video";
 /// Durable visibility marker created only when a complete recording becomes
 /// non-abortable at the guarded wire boundary.
 pub(crate) const VIDEO_PUBLISHED_FILE: &str = ".published";
@@ -535,6 +537,10 @@ enum ArtifactCleanupTask {
     VideoTombstoneContinuation(VideoTombstoneSweep),
     #[cfg(test)]
     Barrier(std::sync::mpsc::SyncSender<()>),
+    /// Parks the worker between two rendezvous on the barrier — see
+    /// [`hold_artifact_cleanup_for_test`].
+    #[cfg(all(test, unix))]
+    Hold(std::sync::Arc<std::sync::Barrier>),
     #[cfg(test)]
     PanicForTest(ArtifactCleanupPanicRecovery),
 }
@@ -559,6 +565,8 @@ enum ArtifactCleanupPanicRecovery {
     },
     #[cfg(test)]
     Barrier(std::sync::mpsc::SyncSender<()>),
+    #[cfg(all(test, unix))]
+    Hold,
 }
 
 impl ArtifactCleanupTask {
@@ -609,6 +617,8 @@ impl ArtifactCleanupTask {
             }
             #[cfg(test)]
             Self::Barrier(done) => ArtifactCleanupPanicRecovery::Barrier(done.clone()),
+            #[cfg(all(test, unix))]
+            Self::Hold(_) => ArtifactCleanupPanicRecovery::Hold,
             #[cfg(test)]
             Self::PanicForTest(recovery) => recovery.clone(),
         }
@@ -850,6 +860,9 @@ fn recover_artifact_cleanup_after_panic(
         ArtifactCleanupPanicRecovery::Barrier(done) => {
             let _ = sender.send(ArtifactCleanupTask::Barrier(done));
         }
+        // A hold owns no work to resume.
+        #[cfg(all(test, unix))]
+        ArtifactCleanupPanicRecovery::Hold => {}
     }
 }
 
@@ -899,6 +912,32 @@ fn finish_video_retention_sweep(key: &Path) {
     changed.notify_all();
 }
 
+/// One lease-registry entry as the artifact Tier-1 binds read it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactLeaseEntryForTest {
+    pub(crate) count: usize,
+    pub(crate) sweep_requested: bool,
+    pub(crate) sweeping: bool,
+    /// The entry still holds the retention admission it reserved on entry.
+    pub(crate) admission_held: bool,
+}
+
+/// The registry entry for `key`, or `None` once no lease holds it.
+#[cfg(test)]
+pub(crate) fn artifact_lease_registry_for_test(key: &Path) -> Option<ArtifactLeaseEntryForTest> {
+    let (leases, _) = artifact_path_leases();
+    let held = leases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.get(key).map(|state| ArtifactLeaseEntryForTest {
+        count: state.count,
+        sweep_requested: state.video_sweep_requested,
+        sweeping: state.sweeping,
+        admission_held: state.video_retention.is_some(),
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn wait_for_artifact_cleanup_for_test(path: &Path) {
     // Test fixtures often build paths under macOS's `/var` spelling while
@@ -933,7 +972,33 @@ pub(crate) fn wait_for_artifact_cleanup_for_test(path: &Path) {
     }
 }
 
-#[cfg(test)]
+/// Park the process-wide cleanup worker until the returned guard drops, and
+/// return only once it is parked. A retention task queued meanwhile can neither
+/// run nor finish, so a sweep the caller starts stays open for as long as it
+/// needs to judge it. Every test in the process shares the worker: hold it only
+/// across non-blocking registry calls, never across a wait for cleanup.
+#[cfg(all(test, unix))]
+pub(crate) fn hold_artifact_cleanup_for_test() -> ArtifactCleanupHold {
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    assert!(try_schedule_artifact_cleanup(ArtifactCleanupTask::Hold(
+        std::sync::Arc::clone(&gate)
+    )));
+    gate.wait();
+    ArtifactCleanupHold(gate)
+}
+
+/// Releases the worker parked by [`hold_artifact_cleanup_for_test`].
+#[cfg(all(test, unix))]
+pub(crate) struct ArtifactCleanupHold(std::sync::Arc<std::sync::Barrier>);
+
+#[cfg(all(test, unix))]
+impl Drop for ArtifactCleanupHold {
+    fn drop(&mut self) {
+        self.0.wait();
+    }
+}
+
+#[cfg(all(test, unix))]
 fn wait_for_best_effort_cleanup_barrier_for_test() {
     let (done, completed) = std::sync::mpsc::sync_channel(1);
     assert!(try_schedule_artifact_cleanup(ArtifactCleanupTask::Barrier(
@@ -1080,6 +1145,11 @@ fn run_best_effort_cleanup_task(
         #[cfg(test)]
         ArtifactCleanupTask::Barrier(done) => {
             let _ = done.try_send(());
+        }
+        #[cfg(all(test, unix))]
+        ArtifactCleanupTask::Hold(gate) => {
+            gate.wait();
+            gate.wait();
         }
         #[cfg(test)]
         ArtifactCleanupTask::PanicForTest(_) => {
@@ -1550,7 +1620,7 @@ impl Drop for ArtifactPathLease {
 /// key (a persistent, operator-owned dir). Unlike the per-launch control token, this
 /// SURVIVES a remote restart, so a saved `dial` credential is not invalidated every
 /// time the remote process restarts (R37).
-pub const NETWORK_DRIVE_TOKEN_FILE: &str = "aterm-network-drive.token";
+pub(crate) const NETWORK_DRIVE_TOKEN_FILE: &str = "aterm-network-drive.token";
 
 /// Load (or generate-once into a `0600` file) the PERSISTENT network-drive token in
 /// `dir` — the channel-binding secret a `dial` peer presents. Because it persists
@@ -1564,7 +1634,7 @@ pub const NETWORK_DRIVE_TOKEN_FILE: &str = "aterm-network-drive.token";
 /// creates the file, so the caller reveals the raw secret to the operator's log once
 /// (at provisioning) instead of on every boot (CWE-532).
 #[must_use]
-pub fn load_or_create_network_drive_token(dir: &Path) -> Option<(String, bool)> {
+pub(crate) fn load_or_create_network_drive_token(dir: &Path) -> Option<(String, bool)> {
     load_or_create_network_drive_token_with_hook(dir, || {})
 }
 
@@ -2118,7 +2188,7 @@ pub(crate) fn video_instance_root_for(sock_dir: &Path, instance: &str) -> Option
 /// control thread → Wake → VideoRec → encode job. Every non-published Drop
 /// removes the directory, covering refused begin, worker panic, and app drop.
 #[derive(Debug)]
-pub struct ConfinedVideoDir {
+pub(crate) struct ConfinedVideoDir {
     path: Option<PathBuf>,
     instance: crate::pinned_dir::PinnedDir,
     recording: Option<crate::pinned_dir::PinnedDir>,
@@ -2353,13 +2423,13 @@ impl ConfinedVideoDir {
     }
 
     #[must_use]
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn is_published(&self) -> bool {
         self.published
     }
 
     #[must_use]
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.path
             .as_deref()
             .expect("live confined video dir owns its path")
@@ -2458,7 +2528,7 @@ impl ConfinedVideoDir {
         self.cleanup()
     }
 
-    pub fn abort(mut self) -> std::io::Result<()> {
+    pub(crate) fn abort(mut self) -> std::io::Result<()> {
         self.abort_in_place()
     }
 
@@ -2511,7 +2581,7 @@ impl ConfinedVideoDir {
         self.publish_marker_with_hook(|| {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn publish_marker_with_test_hook(
         &mut self,
         after_publish: impl FnOnce(),
@@ -2612,7 +2682,7 @@ impl Drop for ConfinedVideoDir {
 /// is written through the retained directory capability used by image output.
 #[must_use]
 #[cfg(test)]
-pub fn confine_video_dir(sock_dir: &Path) -> Option<ConfinedVideoDir> {
+pub(crate) fn confine_video_dir(sock_dir: &Path) -> Option<ConfinedVideoDir> {
     confine_video_dir_with_admission(sock_dir, |_| true).ok()
 }
 
@@ -2778,6 +2848,13 @@ fn automatic_capture_sequence(name: &std::ffi::OsStr) -> Option<u64> {
 /// legitimate server-named overflow makes progress across later sweeps.
 /// Same-uid undeletable or adversarial clutter may prevent reaching the exact
 /// [`AUTO_IMAGE_KEEP`] cap; it never delays or invalidates the fresh reply.
+/// A sibling capture's retention sweep, run synchronously for the
+/// `ArtifactReplyPublication` Tier-1 bind.
+#[cfg(test)]
+pub(crate) fn prune_automatic_images_for_test(target: &ConfinedImage) {
+    prune_automatic_image_dir(target);
+}
+
 #[cfg(test)]
 fn prune_automatic_image_dir(target: &ConfinedImage) {
     let Some(pinned) = target.pinned.as_ref() else {
@@ -3177,7 +3254,7 @@ fn prune_video_dirs(
 /// Returns `None` only when the per-user base cannot be resolved from the
 /// environment, which should not happen for an interactive session.
 #[must_use]
-pub fn socket_dir() -> Option<PathBuf> {
+pub(crate) fn socket_dir() -> Option<PathBuf> {
     let dir = aterm_uds::control_socket_dir()?;
     ensure_private_dir(&dir).ok()?;
     Some(dir)
@@ -3185,25 +3262,25 @@ pub fn socket_dir() -> Option<PathBuf> {
 
 /// Everything the server needs to provision one instance's control socket.
 #[derive(Clone)]
-pub struct SocketPlan {
+pub(crate) struct SocketPlan {
     /// Path to bind the listening socket at.
     pub sock_path: String,
     /// Path of this instance's capability-token file.
     pub token_path: PathBuf,
     /// The `latest` convenience symlink to maintain (`None` for an explicit
-    /// `$ATERM_CONTROL_SOCK` override, which owns its path outright).
+    /// `--control-sock` override, which owns its path outright).
     pub latest_link: Option<PathBuf>,
 }
 
 /// How the control socket should be provisioned this launch.
-pub enum SocketResolution {
+pub(crate) enum SocketResolution {
     /// Bind per this plan.
     Enabled(SocketPlan),
     /// Explicitly disabled via the environment; do not bind.
     Disabled,
     /// No per-user directory and no override resolvable; do not bind.
     NoDir,
-    /// `$ATERM_CONTROL_SOCK` names a path too long for `sun_path`; do not bind.
+    /// `--control-sock` names a path too long for `sun_path`; do not bind.
     /// Both `bind` and `connect` on such a path fail `EINVAL` — and the fail-safe
     /// liveness probe must treat an unexpected connect error as "maybe live", so
     /// without this variant the launch log claimed "already has a live listener"
@@ -3215,7 +3292,7 @@ pub enum SocketResolution {
 /// The longest socket path `sockaddr_un` can carry on this platform, EXCLUDING
 /// the NUL terminator: `sun_path` is 104 bytes on the BSDs/macOS and 108 on
 /// Linux/Windows (`UNIX_PATH_MAX`), one of which the kernel spends on the NUL.
-pub const MAX_SUN_PATH: usize = if cfg!(any(
+pub(crate) const MAX_SUN_PATH: usize = if cfg!(any(
     target_os = "macos",
     target_os = "ios",
     target_os = "freebsd",
@@ -3231,21 +3308,19 @@ pub const MAX_SUN_PATH: usize = if cfg!(any(
 /// Whether `path` fits `sockaddr_un` on this platform (see [`MAX_SUN_PATH`]).
 /// Byte length, not char count — `sun_path` is a byte array.
 #[must_use]
-pub fn sun_path_ok(path: &str) -> bool {
+pub(crate) fn sun_path_ok(path: &str) -> bool {
     path.len() <= MAX_SUN_PATH
 }
 
-/// The socket plan decision. `$ATERM_CONTROL_SOCK` may name an explicit path,
-/// or disable the socket entirely with `0`/`off` (as does
-/// `$ATERM_NO_CONTROL_SOCK=1`); unset/empty means the per-instance default
-/// `aterm-<pid>.sock` inside [`socket_dir`], published via the `aterm.sock`
-/// symlink. The decision itself is engine-side
-/// ([`control_socket::socket_directive`]); this just reads the environment.
+/// The socket plan decision. `--control-sock <path>` may name an explicit path,
+/// or disable the socket entirely with `0`/`off` (as does `--no-control-sock`);
+/// no flag means the per-instance default `aterm-<pid>.sock` inside
+/// [`socket_dir`], published via the `aterm.sock` symlink. The decision itself is
+/// engine-side ([`control_socket::socket_directive`]); this just reads the
+/// launch flags.
 #[must_use]
-pub fn resolve_socket_plan() -> SocketResolution {
-    let explicit = std::env::var_os("ATERM_CONTROL_SOCK").map(|v| v.to_string_lossy().into_owned());
-    let kill = std::env::var_os("ATERM_NO_CONTROL_SOCK").map(|v| v.to_string_lossy().into_owned());
-    match control_socket::socket_directive(explicit.as_deref(), kill.as_deref()) {
+pub(crate) fn resolve_socket_plan() -> SocketResolution {
+    match crate::cli::launch_flags().socket_directive() {
         SocketDirective::Disabled => SocketResolution::Disabled,
         SocketDirective::Explicit(p) => {
             // An oversized path can never bind (EINVAL) — and its liveness probe
@@ -3288,7 +3363,7 @@ pub fn resolve_socket_plan() -> SocketResolution {
 /// so is the pair the `latest` alias ([`SOCK_FILE`]) names: that alias is
 /// repointed by the next instance to bind, and its old target goes at the sweep
 /// after that. A pid is dead only when `kill(pid, 0)` says so ([`pid_alive`]).
-pub fn sweep_stale_instances(dir: &Path) {
+pub(crate) fn sweep_stale_instances(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -3306,11 +3381,14 @@ pub fn sweep_stale_instances(dir: &Path) {
     }
 }
 
-/// Graceful-exit cleanup: remove this instance's socket + token, and the
-/// `latest` alias ONLY while it still points at our socket (a newer
-/// instance may have repointed it). Crash exits are covered by
-/// [`sweep_stale_instances`] at the next spawn.
-pub fn cleanup_socket(plan: &SocketPlan) {
+/// Graceful-exit cleanup OFF UNIX: remove this instance's socket + token by
+/// path, and the `latest` alias ONLY while it still points at our socket (a
+/// newer instance may have repointed it). Crash exits are covered by
+/// [`sweep_stale_instances`] at the next spawn. Unix removes by file identity
+/// instead (`owned_endpoint`), which no path check can stand in for; the rule
+/// is plain `std`, so its test runs here too.
+#[cfg(any(not(unix), test))]
+pub(crate) fn cleanup_socket(plan: &SocketPlan) {
     let _ = std::fs::remove_file(&plan.sock_path);
     let _ = std::fs::remove_file(&plan.token_path);
     if let Some(link) = &plan.latest_link {
@@ -3327,9 +3405,9 @@ pub fn cleanup_socket(plan: &SocketPlan) {
 }
 
 /// The directory a given socket `path` lives in — used to locate the sibling
-/// token file and `images/` subdir for an explicit `$ATERM_CONTROL_SOCK`.
+/// token file and `images/` subdir for an explicit `--control-sock`.
 #[must_use]
-pub fn dir_of_socket(path: &str) -> PathBuf {
+pub(crate) fn dir_of_socket(path: &str) -> PathBuf {
     Path::new(path)
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
@@ -3340,13 +3418,13 @@ pub fn dir_of_socket(path: &str) -> PathBuf {
 /// directory. The server writes exactly this file and the client derives the
 /// same one from the same rule, so the two ends cannot drift.
 ///
-/// Load-bearing: the explicit-`$ATERM_CONTROL_SOCK` arm used to write the one
+/// Load-bearing: the explicit-`--control-sock` arm used to write the one
 /// fixed `aterm.token` per DIRECTORY, so the second private instance an agent
 /// booted in a scratch directory overwrote the first one's credential — and
 /// every client of the first was refused `ERR auth` while its socket was still
 /// listening, with nothing in either log to say why.
 #[must_use]
-pub fn token_path_for_socket(path: &str) -> PathBuf {
+pub(crate) fn token_path_for_socket(path: &str) -> PathBuf {
     let name = Path::new(path)
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -3359,13 +3437,11 @@ pub fn token_path_for_socket(path: &str) -> PathBuf {
 /// so a drift between write and read shows up here rather than as an
 /// unexplained `ERR auth`. The `aterm-ctl` client reads it equivalently
 /// (resolving the per-instance token through the `latest` symlink first).
-/// Returns `None` if unreadable (wrong user, missing) — fail closed.
+/// Returns `None` if unreadable (wrong user, missing) — fail closed. The tests'
+/// read-back of what [`provision_token`] wrote.
+#[cfg(test)]
 #[must_use]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "symmetric API; client reads token equivalently")
-)]
-pub fn read_token(sock_path: &str) -> Option<String> {
+pub(crate) fn read_token(sock_path: &str) -> Option<String> {
     let raw = std::fs::read_to_string(token_path_for_socket(sock_path)).ok()?;
     let t = raw.trim().to_string();
     if t.is_empty() { None } else { Some(t) }
@@ -3378,7 +3454,7 @@ pub fn read_token(sock_path: &str) -> Option<String> {
 /// explicitly normalizes a missing path to `NotFound` so this fail-safe holds
 /// there too.)
 #[must_use]
-pub fn socket_is_live(path: &str) -> bool {
+pub(crate) fn socket_is_live(path: &str) -> bool {
     use std::io::ErrorKind;
     match CtlStream::connect(path) {
         Ok(_) => true,
@@ -3445,16 +3521,16 @@ pub(crate) fn connect_socket_nonblocking(path: &str) -> std::io::Result<CtlStrea
 /// treating it as "live" means running SOCKETLESS for the process lifetime with
 /// no retry (the 2026-07-05 dark-introspection incident's prime suspect). Only a
 /// SUCCESSFUL connect — a listener actually answering — refuses the bind here.
-/// Explicit shared `$ATERM_CONTROL_SOCK` paths keep the strict
+/// Explicit shared `--control-sock` paths keep the strict
 /// [`socket_is_live`] fail-safe (never hijack a maybe-live parent).
 #[must_use]
-pub fn socket_is_live_per_instance(path: &str) -> bool {
+pub(crate) fn socket_is_live_per_instance(path: &str) -> bool {
     CtlStream::connect(path).is_ok()
 }
 
 /// What to do with an existing socket path before binding (Item 5).
 #[derive(Debug, PartialEq, Eq)]
-pub enum BindAction {
+pub(crate) enum BindAction {
     /// No live listener — remove any stale file and bind.
     RemoveAndBind,
     /// A live listener already owns this path — do NOT touch it; run socket-less.
@@ -3463,11 +3539,11 @@ pub enum BindAction {
 
 /// Decide whether it is safe to (unlink and) bind a socket path, given whether a
 /// live listener is already there. REFUSE a live socket so a nested aterm that
-/// somehow still sees an explicit `$ATERM_CONTROL_SOCK` can never unlink+steal its
+/// somehow still sees an explicit `--control-sock` can never unlink+steal its
 /// parent's listener (the liveness BELT to the env deny-list's SUSPENDERS — GAP-5
 /// of the recursion topology). `is_live` is injected for unit-testability.
 #[must_use]
-pub fn decide_bind(is_live: bool) -> BindAction {
+pub(crate) fn decide_bind(is_live: bool) -> BindAction {
     if is_live {
         BindAction::RefuseLiveSocket
     } else {
@@ -3482,7 +3558,7 @@ pub fn decide_bind(is_live: bool) -> BindAction {
 /// folding the length comparison into the same flag. No `&&`/`||` short-circuit
 /// and no early `return` on first mismatch.
 #[must_use]
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max = a.len().max(b.len());
     // Length mismatch sets the flag regardless of WHICH bits of the delta
     // differ (the old `as u8 | (>>8) as u8` fold only covered bits 0..16, so a
@@ -3503,7 +3579,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Outcome of parsing/validating a connection's first line against the token.
 #[derive(Debug, PartialEq, Eq)]
-pub enum AuthOutcome {
+pub(crate) enum AuthOutcome {
     /// Authenticated. If the first line carried an inline `TOKEN <hex> <verb>`
     /// the remaining verb text is returned so the caller dispatches it now;
     /// a bare `AUTH <hex>` yields `None` (the next line is the first verb).
@@ -3522,7 +3598,7 @@ pub enum AuthOutcome {
 /// The comparison is constant-time. Anything else (no token line, wrong token,
 /// malformed) is [`AuthOutcome::Denied`].
 #[must_use]
-pub fn check_auth_line(line: &str, expected: &str) -> AuthOutcome {
+pub(crate) fn check_auth_line(line: &str, expected: &str) -> AuthOutcome {
     let line = line.strip_suffix('\r').unwrap_or(line);
     let (head, rest) = match line.split_once(' ') {
         Some((h, r)) => (h, r),
@@ -3563,7 +3639,7 @@ pub fn check_auth_line(line: &str, expected: &str) -> AuthOutcome {
 /// `O_DIRECTORY|O_NOFOLLOW` once and `openat` the final component, so there is no
 /// intermediate path component left to swap.
 #[derive(Clone, Debug)]
-pub struct ConfinedImage {
+pub(crate) struct ConfinedImage {
     /// The canonical `images/` directory (the only directory ever opened).
     pub dir: PathBuf,
     /// The single, validated filename to create inside `dir` (no separators).
@@ -3601,7 +3677,7 @@ impl ConfinedImage {
     /// The full path, for logging / `OK <w> <h> <path>` replies only — NOT for
     /// re-opening (the writer must use [`Self::dir`] + [`Self::file_name`]).
     #[must_use]
-    pub fn display_path(&self) -> PathBuf {
+    pub(crate) fn display_path(&self) -> PathBuf {
         self.dir.join(&self.file_name)
     }
 
@@ -3673,7 +3749,7 @@ impl ConfinedImage {
 
 #[must_use]
 #[cfg(test)]
-pub fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<ConfinedImage> {
+pub(crate) fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<ConfinedImage> {
     confine_image_path_with_admission(sock_dir, requested, |_| true).ok()
 }
 
@@ -3800,7 +3876,7 @@ pub(crate) fn confine_image_path_with_admission(
 /// Returns the confined (canonical-dir-rooted) path, or `None` to fail the forward
 /// closed. The legit publisher writes exactly `<sock_dir>/aterm-<pid>.sock`.
 #[must_use]
-pub fn confine_proxy_sock(sock_dir: &Path, requested: &str) -> Option<String> {
+pub(crate) fn confine_proxy_sock(sock_dir: &Path, requested: &str) -> Option<String> {
     let canon_dir = std::fs::canonicalize(sock_dir).ok()?;
     let req = Path::new(requested);
     if !req.is_absolute() {
@@ -5862,6 +5938,62 @@ mod tests {
         clear_pending_dead_namespace_sweep(&root);
     }
 
+    /// Run the SHIPPED worker loop, `artifact_cleanup_worker`, over a private
+    /// queue seeded with `tasks` and a wake channel that is already closed, and
+    /// return once that loop does.
+    ///
+    /// With its wake channel closed, the loop returns the first time it finds
+    /// both queues empty, and after seeding nothing but the worker itself can
+    /// enqueue onto this queue. Its return is therefore the event that every
+    /// seeded task, and every recovery, continuation, restart or admission
+    /// requeue it produced, has run to completion: the ordering a registry
+    /// assertion needs. An artifact vanishing from disk is not that event. A
+    /// sweep renames its target away well before it syncs the root and
+    /// reconciles its coalescing entry at EOF, and under load that tail was
+    /// measured (2026-09-24) at up to 35 ms after the path was gone. The shared
+    /// process-wide worker offers no such event either, since every other test
+    /// in the binary feeds it.
+    ///
+    /// No clock decides the verdict. The timeout only turns a wedged worker
+    /// (a recovery that requeues forever, say) into a failure instead of a hang.
+    fn drain_private_cleanup_worker(tasks: Vec<ArtifactCleanupTask>) {
+        let (video_sender, video_receiver) = std::sync::mpsc::channel::<VideoRetentionTask>();
+        let (best_effort, best_effort_receiver) = std::sync::mpsc::channel();
+        let (wake, wake_receiver) = std::sync::mpsc::sync_channel::<()>(1);
+        drop(video_sender);
+        drop(wake);
+        for task in tasks {
+            best_effort
+                .send(task)
+                .expect("the private cleanup queue is open");
+        }
+        let (returned, worker_returned) = std::sync::mpsc::sync_channel(1);
+        // No `aterm-` prefix: that names a SHIPPED worker, which the census in
+        // qos.rs holds to a scheduling role. This thread exists only in tests.
+        let worker = std::thread::Builder::new()
+            .name("private-artifact-cleanup-worker".into())
+            .spawn(move || {
+                artifact_cleanup_worker(
+                    &video_receiver,
+                    &best_effort_receiver,
+                    &wake_receiver,
+                    &best_effort,
+                );
+                let _ = returned.send(());
+            })
+            .expect("spawn the private cleanup worker");
+        match worker_returned.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(()) => worker.join().expect("the private cleanup worker returned"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The worker thread died outside its own catch_unwind.
+                std::panic::resume_unwind(worker.join().expect_err("the worker unwound"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the private cleanup worker never drained its queue after 60 s")
+            }
+        }
+    }
+
     #[test]
     fn cleanup_worker_recovers_both_pending_debts_after_task_panics() {
         let temp = aterm_tempfile::tempdir().expect("temporary namespace root");
@@ -5873,46 +6005,6 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(root.clone(), PendingDeadNamespaceSweep { dirty: false });
-
-        let scheduler = artifact_cleanup_scheduler().expect("cleanup worker");
-        scheduler
-            .best_effort
-            .send(ArtifactCleanupTask::PanicForTest(
-                ArtifactCleanupPanicRecovery::DeadNamespaces {
-                    root: root.clone(),
-                    current: "p1-current".into(),
-                    queue: ArtifactCleanupQueuePermit::unmetered(),
-                },
-            ))
-            .unwrap();
-        notify_artifact_cleanup_worker(scheduler);
-
-        // The wait ends on the sweep's final step, not its first visible one.
-        // The worker renames the namespace away in the middle of a batch, then
-        // finishes the cursor, fsyncs the root and releases its descriptors
-        // before it drops the coalescing entry at EOF. A poll that stops when
-        // the directory vanishes can land inside that gap, and a loaded
-        // machine widens it. The entry was inserted above, so it leaves the
-        // registry only through a sweep that ran (or a failure path, which
-        // leaves the namespace in place).
-        let namespace_pending = || {
-            pending_dead_namespace_sweeps()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&root)
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while namespace_pending() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            !namespace.exists(),
-            "panic recovery must requeue the pending root on a fresh cursor"
-        );
-        assert!(
-            !namespace_pending(),
-            "the recovered sweep must reconcile its coalescing registry"
-        );
 
         let video_root = ensure_canonical_direct_child(&root, "video-tombstones").unwrap();
         let tombstone = ensure_canonical_direct_child(&video_root, ".prune-panic").unwrap();
@@ -5928,37 +6020,46 @@ mod tests {
                 expected_root,
                 dirty: false,
             });
-        scheduler
-            .best_effort
-            .send(ArtifactCleanupTask::PanicForTest(
-                ArtifactCleanupPanicRecovery::VideoTombstones {
-                    root: video_root.clone(),
-                    expected_root,
-                    queue: ArtifactCleanupQueuePermit::unmetered(),
-                },
-            ))
-            .unwrap();
-        notify_artifact_cleanup_worker(scheduler);
 
-        // The same ordering holds for video: the tombstone is removed inside
-        // the batch and the registry entry only after the cursor reaches EOF.
-        let video_pending = || {
-            pending_video_tombstone_sweeps()
+        // Both debts are outstanding at once and ONE worker loop takes both
+        // injected panics back to back, so the drain also proves the loop
+        // survives the first panic to recover the second debt. The dead-
+        // namespace sweep skips `video-tombstones`: it is neither a PID-shaped
+        // instance name nor an instance tombstone.
+        drain_private_cleanup_worker(vec![
+            ArtifactCleanupTask::PanicForTest(ArtifactCleanupPanicRecovery::DeadNamespaces {
+                root: root.clone(),
+                current: "p1-current".into(),
+                queue: ArtifactCleanupQueuePermit::unmetered(),
+            }),
+            ArtifactCleanupTask::PanicForTest(ArtifactCleanupPanicRecovery::VideoTombstones {
+                root: video_root.clone(),
+                expected_root,
+                queue: ArtifactCleanupQueuePermit::unmetered(),
+            }),
+        ]);
+
+        assert!(
+            !namespace.exists(),
+            "panic recovery must requeue the pending root on a fresh cursor"
+        );
+        assert!(
+            !pending_dead_namespace_sweeps()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .any(|entry| entry.root == video_root && entry.expected_root == expected_root)
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while video_pending() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+                .contains_key(&root),
+            "the recovered sweep must reconcile its coalescing registry"
+        );
         assert!(
             !tombstone.exists(),
             "video panic recovery must requeue the tombstone cursor"
         );
         assert!(
-            !video_pending(),
+            !pending_video_tombstone_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|entry| { entry.root == video_root && entry.expected_root == expected_root }),
             "the recovered video sweep must reconcile its coalescing registry"
         );
     }
@@ -6328,11 +6429,22 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: `fifo_c` is a valid NUL-terminated absent path.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        let started = std::time::Instant::now();
-        assert!(super::load_or_create_network_drive_token(&fifo_dir).is_none());
+        // The regression is an open() that blocks FOREVER on a writerless
+        // FIFO, so the load runs on its own thread and the bound is a hang
+        // discriminator: a hang fails here instead of wedging the suite, and a
+        // correct refusal is never measured against scheduler or fsync latency
+        // (it was a 1 s stopwatch — the load-sensitive test audit of 2026-09-27).
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let loader_dir = fifo_dir.clone();
+        std::thread::spawn(move || {
+            let _ =
+                loaded_tx.send(super::load_or_create_network_drive_token(&loader_dir).is_none());
+        });
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "the token loader must never block on a planted FIFO"
+            loaded_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the token loader must never block on a planted FIFO"),
+            "a planted FIFO is refused, never read as a token"
         );
 
         let _ = std::fs::remove_dir_all(hardlink_dir);

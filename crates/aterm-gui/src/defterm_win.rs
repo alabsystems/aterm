@@ -161,8 +161,10 @@ fn wide(s: &str) -> Vec<u16> {
 /// has none of its own; supplying one means shipping a MIDL-generated
 /// proxy/stub DLL (or acquiring MSIX identity), which is its own project.
 ///
-/// Until then the receiving half — `aterm_pty::adopt_handoff`, the signal-pipe
-/// resize, the broker's Wake plumbing — is built, tested and waiting.
+/// Until then the receiving half — `aterm_pty::adopt_handoff` and the
+/// signal-pipe resize — is built, tested and waiting. The STA broker thread
+/// that would pump the class factory's apartment was deleted on 2026-09-25 with
+/// no caller; it is written together with the server that needs it.
 #[must_use]
 pub(crate) fn handoff_server_available() -> bool {
     false

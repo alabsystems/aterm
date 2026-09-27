@@ -53,9 +53,23 @@ pub fn native_update_control_socket_handoff_model() -> Model {
 /// adopts its PTY into the replacement process.  It must therefore be admitted
 /// when the handoff lane is available.  If that lane cannot engage, a foreground
 /// job forbids the destructive cold-reexec fallback and leaves the staged update
-/// retryable.  Dirty/pending native documents remain a real blocker.  The mutant
-/// recreates the v0.53 regression by treating any foreground terminal job as a
-/// close-preflight blocker even when seamless adoption is available.
+/// retryable.  Dirty/pending native documents remain a real blocker.
+///
+/// `CompleteColdFallback` re-tests the foreground fact because the shipping cold
+/// arms do: the Windows arm execs only `if live_ptys == 0`, and the unix arm
+/// re-checks with `debug_assert!(live.is_empty())` — a check a RELEASE build
+/// compiles out, so on macOS the exec follows `classify`'s word alone.
+///
+/// Each `Buggy=1` mutant is its own action, dead at `Buggy=0`, so none can mask
+/// another: `BlockForegroundDespiteSeamless` is the v0.53 regression (a foreground
+/// terminal job treated as a close-preflight blocker even when seamless adoption is
+/// available); `HandoffWithoutAdoptingForeground` replaces the process without
+/// carrying the job's PTY; `ReexecColdOverLiveSessions` is the release macOS lane
+/// with `classify`'s live-session check dropped — the destructive re-exec runs on
+/// the classification, with nothing after it to refuse; `ClassifySeamlessOverUncertifiedState`
+/// drops `classify`'s native-state check; and `BlockLatchesWithoutRetry` is
+/// 0dea6c38c's shape — a block filed as a failed handoff, which latched automatic
+/// apply off for that build.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_admission_model() -> Model {
@@ -99,14 +113,41 @@ pub fn native_update_admission_model() -> Model {
                 phase == 0 && decision == 0 && verified == 1 &&
                 unsafe_native_state == 0 && seamless_available == 1
             ) {
-                phase = if Buggy == 1 && foreground_job == 1 { 3 } else { 1 };
-                decision = if Buggy == 1 && foreground_job == 1 { 3 } else { 1 };
+                phase = 1;
+                decision = 1;
                 attempt_count = if attempt_count <= MaxAttempts - 1 {
                     attempt_count + 1
                 } else {
                     attempt_count
                 };
-                retry_eligible = if Buggy == 1 && foreground_job == 1 { 1 } else { 0 };
+                retry_eligible = 0;
+            }
+            action BlockForegroundDespiteSeamless when (
+                Buggy == 1 && phase == 0 && decision == 0 && verified == 1 &&
+                unsafe_native_state == 0 && seamless_available == 1 &&
+                foreground_job == 1
+            ) {
+                phase = 3;
+                decision = 3;
+                attempt_count = if attempt_count <= MaxAttempts - 1 {
+                    attempt_count + 1
+                } else {
+                    attempt_count
+                };
+                retry_eligible = 1;
+            }
+            action ClassifySeamlessOverUncertifiedState when (
+                Buggy == 1 && phase == 0 && decision == 0 && verified == 1 &&
+                unsafe_native_state == 1 && seamless_available == 1
+            ) {
+                phase = 1;
+                decision = 1;
+                attempt_count = if attempt_count <= MaxAttempts - 1 {
+                    attempt_count + 1
+                } else {
+                    attempt_count
+                };
+                retry_eligible = 0;
             }
             action ClassifyCold when (
                 phase == 0 && decision == 0 && verified == 1 &&
@@ -115,6 +156,23 @@ pub fn native_update_admission_model() -> Model {
             ) {
                 phase = 1;
                 decision = 2;
+                attempt_count = if attempt_count <= MaxAttempts - 1 {
+                    attempt_count + 1
+                } else {
+                    attempt_count
+                };
+            }
+            // One action, classification and exec together: in a release build the
+            // unix cold arm's re-check is a compiled-out `debug_assert!`, so once
+            // `classify` says Cold nothing stands between it and the exec.
+            action ReexecColdOverLiveSessions when (
+                Buggy == 1 && phase == 0 && decision == 0 && verified == 1 &&
+                unsafe_native_state == 0 && seamless_available == 0 &&
+                foreground_job == 1
+            ) {
+                phase = 2;
+                decision = 2;
+                reexec_count = 1;
                 attempt_count = if attempt_count <= MaxAttempts - 1 {
                     attempt_count + 1
                 } else {
@@ -130,6 +188,16 @@ pub fn native_update_admission_model() -> Model {
                 decision = 3;
                 seamless_available = 0;
                 retry_eligible = 1;
+            }
+            action BlockLatchesWithoutRetry when (
+                Buggy == 1 && phase == 0 && decision == 0 && verified == 1 &&
+                unsafe_native_state == 0 && seamless_available == 0 &&
+                foreground_job == 1
+            ) {
+                phase = 3;
+                decision = 3;
+                seamless_available = 0;
+                retry_eligible = 0;
             }
             action BlockUnverifiedArtifact when (
                 phase == 0 && decision == 0 && verified == 0
@@ -150,6 +218,14 @@ pub fn native_update_admission_model() -> Model {
                 phase = 2;
                 reexec_count = 1;
                 adopted_foreground = foreground_job;
+            }
+            action HandoffWithoutAdoptingForeground when (
+                Buggy == 1 && phase == 1 && decision == 1 && reexec_count == 0 &&
+                foreground_job == 1
+            ) {
+                phase = 2;
+                reexec_count = 1;
+                adopted_foreground = 0;
             }
             action CompleteColdFallback when (
                 phase == 1 && decision == 2 && foreground_job == 0 &&
@@ -226,7 +302,6 @@ pub fn native_update_admission_model() -> Model {
                 } else {
                     decision <= 3
                 };
-            invariant ApplyAtMostOnce: reexec_count <= 1;
             invariant AttemptsBounded: attempt_count <= MaxAttempts;
         }
     }
@@ -237,15 +312,25 @@ pub fn native_update_admission_model() -> Model {
 /// A durable-stage wake may race an already-active manual check. The wake arms
 /// intent immediately; completion then imports the durable stage and makes that
 /// retained intent eligible. A blocked or failed attempt returns to the same
-/// retryable ready state. The mutant recreates the lost-wake regression by
-/// dropping intent solely because the manual check is active.
+/// retryable ready state.
 ///
 /// Terminal idleness is a bounded PREFERENCE, not a precondition: activity
-/// defers an attempt only while the grace window is open (`GraceWindowCloses`),
+/// defers the park only while the grace window is open (`GraceWindowCloses`),
 /// because the previous unbounded rule let a machine that is never quiet keep a
-/// verified build staged forever. The mutant still attempts with neither quiet
-/// nor a closed window, which
-/// `AutomaticAttemptRequiresQuietOrClosedGraceWindow` rejects.
+/// verified build staged forever.
+///
+/// Each `Buggy=1` mutant is its own action, dead at `Buggy=0`, so none masks
+/// another or removes a healthy path from the `Buggy=1` world:
+/// `StageWakeDroppingIntent` is the lost-wake regression (intent dropped solely
+/// because the manual check is active); `StaleWakeClearsNewerIntent` lets an older
+/// wake clear a newer armed target; `ParkWithoutQuietOrGrace` stops the readers
+/// with neither quiet nor a closed window, which
+/// `AutomaticAttemptRequiresQuietOrClosedGraceWindow` rejects; `AcceptWithoutPark`
+/// commits over a screen nobody froze; `AttemptDidNotReplaceSpendingIntent` is
+/// `finish` treating any non-accepted result as consumed, so the staged build
+/// waits for a wake that already came; and `AttemptPhysicalFailureKeepingIntent`
+/// latches manual-only but leaves the intent armed, so the next poll walks
+/// straight past the latch it just set.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_auto_intent_model() -> Model {
@@ -295,7 +380,14 @@ pub fn native_update_auto_intent_model() -> Model {
                 phase == 1 && active_check == 1 && durable_stage == 0
             ) {
                 durable_stage = 1;
-                intent = if Buggy == 1 { 0 } else { 1 };
+                intent = 1;
+                target = 1;
+            }
+            action StageWakeDroppingIntent when (
+                Buggy == 1 && phase == 1 && active_check == 1 && durable_stage == 0
+            ) {
+                durable_stage = 1;
+                intent = 0;
                 target = 1;
             }
             action StageWakeIdle when (phase == 0 && active_check == 0) {
@@ -313,7 +405,14 @@ pub fn native_update_auto_intent_model() -> Model {
             action ObserveStaleWake when (
                 phase == 5 && intent == 1 && target == 2 && stale_wake_seen == 0
             ) {
-                intent = if Buggy == 1 { 0 } else { 1 };
+                intent = 1;
+                stale_wake_seen = 1;
+            }
+            action StaleWakeClearsNewerIntent when (
+                Buggy == 1 && phase == 5 && intent == 1 && target == 2 &&
+                stale_wake_seen == 0
+            ) {
+                intent = 0;
                 stale_wake_seen = 1;
             }
             action ManualCheckCompletesAndImportsStage when (
@@ -358,7 +457,7 @@ pub fn native_update_auto_intent_model() -> Model {
             }
             action Attempt when (
                 phase == 2 && staged == 1 && intent == 1 &&
-                (Buggy == 1 || quiet == 1 || grace_expired == 1)
+                (quiet == 1 || grace_expired == 1)
             ) {
                 phase = 3;
                 attempts = if attempts <= MaxAttempts - 1 {
@@ -384,11 +483,16 @@ pub fn native_update_auto_intent_model() -> Model {
                 quiet = 1;
             }
             // THE PARK ITSELF, gated on the facts re-read at THIS instant —
-            // the whole content of `prelaunch_park_admitted`. `Buggy` parks
+            // the whole content of `prelaunch_park_admitted`. The mutant parks
             // regardless, which is the shape the invariant catches.
             action ParkReaders when (
-                phase == 3 && parked == 0 &&
-                (Buggy == 1 || quiet == 1 || grace_expired == 1)
+                phase == 3 && parked == 0 && (quiet == 1 || grace_expired == 1)
+            ) {
+                parked = 1;
+            }
+            action ParkWithoutQuietOrGrace when (
+                Buggy == 1 && phase == 3 && parked == 0 && quiet == 0 &&
+                grace_expired == 0
             ) {
                 parked = 1;
             }
@@ -416,6 +520,15 @@ pub fn native_update_auto_intent_model() -> Model {
                 last_unsuccessful = 1;
                 parked = 0;
             }
+            action AttemptDidNotReplaceSpendingIntent when (
+                Buggy == 1 && phase == 3 && staged == 1 && intent == 1 &&
+                accepted == 0
+            ) {
+                phase = 2;
+                intent = 0;
+                last_unsuccessful = 1;
+                parked = 0;
+            }
             action AttemptPhysicalFailure when (
                 phase == 3 && staged == 1 && intent == 1 && accepted == 0
             ) {
@@ -425,12 +538,29 @@ pub fn native_update_auto_intent_model() -> Model {
                 manual_only = 1;
                 parked = 0;
             }
+            action AttemptPhysicalFailureKeepingIntent when (
+                Buggy == 1 && phase == 3 && staged == 1 && intent == 1 &&
+                accepted == 0
+            ) {
+                phase = 6;
+                last_unsuccessful = 2;
+                manual_only = 1;
+                parked = 0;
+            }
             // COMMIT REQUIRES THE PARK. The proof the successor sends is over a
             // screen this process captured with every reader stopped; there is
             // no path to acceptance that did not park first.
             action AttemptAccepted when (
                 phase == 3 && staged == 1 && intent == 1 && accepted == 0 &&
-                (Buggy == 1 || parked == 1)
+                parked == 1
+            ) {
+                phase = 4;
+                intent = 0;
+                accepted = 1;
+            }
+            action AcceptWithoutPark when (
+                Buggy == 1 && phase == 3 && staged == 1 && intent == 1 &&
+                accepted == 0 && parked == 0
             ) {
                 phase = 4;
                 intent = 0;
@@ -466,16 +596,6 @@ pub fn native_update_auto_intent_model() -> Model {
                 } else {
                     stale_wake_seen <= 1
                 };
-            invariant AttemptRequiresImportedStage:
-                if phase == 3 {
-                    staged == 1 && attempts > 0 && accepted == 0
-                } else {
-                    if phase == 4 {
-                        staged == 1 && attempts > 0 && accepted == 1
-                    } else {
-                        accepted == 0
-                    }
-                };
             invariant AutomaticAttemptRequiresQuietOrClosedGraceWindow:
                 if parked == 1 {
                     quiet == 1 || grace_expired == 1
@@ -492,7 +612,6 @@ pub fn native_update_auto_intent_model() -> Model {
                     accepted == 0
                 };
             invariant DeferralsBounded: deferrals <= MaxDeferrals;
-            invariant AcceptedAtMostOnce: accepted <= 1;
             invariant AttemptsBounded: attempts <= MaxAttempts;
         }
     }
@@ -825,9 +944,21 @@ pub fn native_update_apply_ladder_model() -> Model {
 /// A background tab can consume output and handle its wake without ever presenting;
 /// its first-edge presentation-latency sample therefore remains armed. Admission is
 /// governed by the independently aging latest-output clock, not that presentation
-/// acknowledgement. Activity retries are also strictly future. The mutant recreates
-/// the regression by gating on the permanent presentation sample and deriving its
-/// retry from the already-expired output deadline.
+/// acknowledgement. Activity retries are also strictly future.
+///
+/// `AttemptOnlyAfterAgedQuiet` reads the CLOCK, not the quiet flag: an attempt
+/// is lawful only once the latest output is a full epoch old, whoever computed
+/// the flag.
+///
+/// Three `Buggy=1` mutants, each its own action so none masks another.
+/// `QuietGatedOnPresentationSample` recreates the regression: gating on the
+/// permanent presentation sample and deriving its retry from the already-expired
+/// output deadline. `QuietFromLastPresent` is its mirror image — idleness read
+/// off the last PRESENT instead of the latest output, so a hidden tab streaming
+/// output it never presents is computed quiet, and the ordinary `Attempt` then
+/// lands mid-output. `AckSampleOnHiddenWake` is the tempting wrong fix for the
+/// first: the wake handler closes the armed presentation-latency sample with no
+/// present, which frees the gate by fabricating a latency reading.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_hidden_output_quiet_model() -> Model {
@@ -868,19 +999,41 @@ pub fn native_update_hidden_output_quiet_model() -> Model {
                 phase == 2 && wake_handled == 1
             ) {
                 now_tick = latest_output_tick + QuietTicks;
-                activity_quiet = if Buggy == 1 && presentation_stamp == 1 { 0 } else { 1 };
-                phase = if Buggy == 1 && presentation_stamp == 1 { 2 } else { 3 };
-                retry_deadline = if Buggy == 1 && presentation_stamp == 1 {
-                    latest_output_tick + QuietTicks
-                } else {
-                    0
-                };
+                activity_quiet = 1;
+                phase = 3;
+                retry_deadline = 0;
+            }
+            action QuietGatedOnPresentationSample when (
+                Buggy == 1 && phase == 2 && wake_handled == 1 &&
+                presentation_stamp == 1
+            ) {
+                now_tick = latest_output_tick + QuietTicks;
+                activity_quiet = 0;
+                phase = 2;
+                retry_deadline = latest_output_tick + QuietTicks;
             }
             action Attempt when (
                 phase == 3 && activity_quiet == 1 && attempted == 0
             ) {
                 phase = 4;
                 attempted = 1;
+            }
+            // The present clock of a hidden tab is as old as its last present,
+            // so it reads quiet while the output clock is still inside the epoch.
+            action QuietFromLastPresent when (
+                Buggy == 1 && phase == 2 && wake_handled == 1 &&
+                now_tick <= latest_output_tick + QuietTicks - 1
+            ) {
+                activity_quiet = 1;
+                phase = 3;
+                retry_deadline = 0;
+            }
+            action AckSampleOnHiddenWake when (
+                Buggy == 1 && phase == 1 && presentation_stamp == 1
+            ) {
+                phase = 2;
+                wake_handled = 1;
+                presentation_stamp = 0;
             }
             invariant OldHiddenPresentationCannotGate:
                 if wake_handled == 1 &&
@@ -897,7 +1050,8 @@ pub fn native_update_hidden_output_quiet_model() -> Model {
                 };
             invariant AttemptOnlyAfterAgedQuiet:
                 if attempted == 1 {
-                    phase == 4 && activity_quiet == 1 && wake_handled == 1
+                    phase == 4 && wake_handled == 1 &&
+                    now_tick > latest_output_tick + QuietTicks - 1
                 } else {
                     phase <= 3
                 };
@@ -916,8 +1070,14 @@ pub fn native_update_hidden_output_quiet_model() -> Model {
 ///
 /// Every authorized attempt receives a fresh nonce. A failure may re-arm only
 /// the exact currently active nonce; replaying the first failure after a retry
-/// is live must be inert. The mutant accepts that stale abort and cancels the
-/// newer authority.
+/// is live must be inert.
+///
+/// Three `Buggy=1` mutants, each its own action so none masks another:
+/// `AcceptStaleAbort` accepts that stale replay and cancels the newer authority;
+/// `RetryReusingFailedNonce` re-arms the retry under the failed attempt's own
+/// nonce, the one identity a late replay of that failure still matches; and
+/// `AbortKeepingActiveIdentity` returns to retryable without clearing the dead
+/// attempt's active nonce.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_attempt_identity_model() -> Model {
@@ -953,14 +1113,38 @@ pub fn native_update_attempt_identity_model() -> Model {
                 live_authority = 0;
                 abort_count = abort_count + 1;
             }
+            // The replay of an old failure is inert: its nonce is not the live one.
             action ReplayOldAbort when (
                 phase == 1 && live_authority == 1 && old_attempt_nonce > 0 &&
                 active_attempt_nonce > old_attempt_nonce
             ) {
-                phase = if Buggy == 1 { 0 } else { phase };
-                active_attempt_nonce = if Buggy == 1 { 0 } else { active_attempt_nonce };
-                live_authority = if Buggy == 1 { 0 } else { live_authority };
-                wrong_abort = if Buggy == 1 { 1 } else { wrong_abort };
+                phase = phase;
+            }
+            action AcceptStaleAbort when (
+                Buggy == 1 && phase == 1 && live_authority == 1 &&
+                old_attempt_nonce > 0 && active_attempt_nonce > old_attempt_nonce
+            ) {
+                phase = 0;
+                active_attempt_nonce = 0;
+                live_authority = 0;
+                wrong_abort = 1;
+            }
+            action RetryReusingFailedNonce when (
+                Buggy == 1 && phase == 0 && live_authority == 0 &&
+                old_attempt_nonce > 0
+            ) {
+                phase = 1;
+                active_attempt_nonce = old_attempt_nonce;
+                live_authority = 1;
+            }
+            action AbortKeepingActiveIdentity when (
+                Buggy == 1 && phase == 1 && live_authority == 1 &&
+                abort_count <= MaxAborts - 1
+            ) {
+                phase = 0;
+                old_attempt_nonce = active_attempt_nonce;
+                live_authority = 0;
+                abort_count = abort_count + 1;
             }
             invariant ActiveIdentityIsCurrent:
                 if phase == 1 {
@@ -976,7 +1160,6 @@ pub fn native_update_attempt_identity_model() -> Model {
                     old_attempt_nonce <= attempt_nonce
                 };
             invariant StaleAbortCannotCancelRetry: wrong_abort == 0;
-            invariant OneLiveAttemptAuthority: live_authority <= 1;
             invariant NonceBounded: attempt_nonce <= MaxNonce;
             invariant AbortsBounded: abort_count <= MaxAborts;
         }
@@ -993,8 +1176,18 @@ pub fn native_update_attempt_identity_model() -> Model {
 /// worker death after an accepted message is a separate worker-supervision
 /// concern. `filler` abstracts the shipping `try_send(Full)` boundary; it does
 /// not count the independently active worker item, so this model makes no exact
-/// FIFO-occupancy or processing-duration claim. The mutant drops either the
-/// full-queue latch or its drain edge.
+/// FIFO-occupancy or processing-duration claim.
+///
+/// Each `Buggy=1` mutant is its own action, dead at `Buggy=0`, so none masks
+/// another (they used to share one `Buggy` world, where the dropped latch left no
+/// pending request for the dropped drain edge to strand): `DropApplyLatchWhenFull`
+/// is the historical "Full means success but retain nothing"; `DrainWithoutRetryEdge`
+/// dequeues without the edge that releases the latch; `ParkIdleMaterializingProxy`
+/// is the unconditional proxy clone (a CFRunLoop wake plus a warning) on every idle
+/// park; `ReportUnavailableKeepingLatch` reports Unavailable but leaves the latch
+/// set, so the next turn restarts and delivers the same request a second time; and
+/// `RetryRestartEveryTurn` retries a failed restart on every event turn — the hot
+/// loop the one-restart budget exists to refuse.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_worker_queue_model() -> Model {
@@ -1024,8 +1217,16 @@ pub fn native_update_worker_queue_model() -> Model {
                 live_intent == 0 && pending == 0 && queued_intent == 0 &&
                 completion_ready == 0 && idle_proxy_wakes == 0 && idle_warnings == 0
             ) {
-                idle_proxy_wakes = if Buggy == 1 { 1 } else { 0 };
-                idle_warnings = if Buggy == 1 { 1 } else { 0 };
+                idle_proxy_wakes = 0;
+                idle_warnings = 0;
+            }
+            action ParkIdleMaterializingProxy when (
+                Buggy == 1 && live_intent == 0 && pending == 0 &&
+                queued_intent == 0 && completion_ready == 0 &&
+                idle_proxy_wakes == 0 && idle_warnings == 0
+            ) {
+                idle_proxy_wakes = 1;
+                idle_warnings = 1;
             }
 
             action OccupyWorker when (
@@ -1056,7 +1257,7 @@ pub fn native_update_worker_queue_model() -> Model {
             ) {
                 live_intent = 1;
                 purpose = 1;
-                pending = if Buggy == 1 { 0 } else { 1 };
+                pending = 1;
             }
             action RequestApplyFull when (
                 connected == 1 && filler == 1 && queued_intent == 0 &&
@@ -1064,7 +1265,15 @@ pub fn native_update_worker_queue_model() -> Model {
             ) {
                 live_intent = 1;
                 purpose = 2;
-                pending = if Buggy == 1 { 0 } else { 1 };
+                pending = 1;
+            }
+            action DropApplyLatchWhenFull when (
+                Buggy == 1 && connected == 1 && filler == 1 && queued_intent == 0 &&
+                live_intent == 0 && delivered == 0 && failed_explicitly == 0
+            ) {
+                live_intent = 1;
+                purpose = 2;
+                pending = 0;
             }
             action UpgradePendingToApply when (
                 live_intent == 1 && pending == 1 && purpose == 1
@@ -1075,7 +1284,13 @@ pub fn native_update_worker_queue_model() -> Model {
                 connected == 1 && filler == 1 && queued_intent == 0
             ) {
                 filler = 0;
-                drain_edge = if Buggy == 1 { 0 } else { 1 };
+                drain_edge = 1;
+            }
+            action DrainWithoutRetryEdge when (
+                Buggy == 1 && connected == 1 && filler == 1 && queued_intent == 0
+            ) {
+                filler = 0;
+                drain_edge = 0;
             }
             action RetryPendingOnDrain when (
                 connected == 1 && pending == 1 && filler == 0 &&
@@ -1129,6 +1344,17 @@ pub fn native_update_worker_queue_model() -> Model {
                 failed_explicitly = 1;
                 restarts = 1;
             }
+            action ReportUnavailableKeepingLatch when (
+                Buggy == 1 && connected == 0 && pending == 1 && restarts == 0 &&
+                failed_explicitly == 0
+            ) {
+                failed_explicitly = 1;
+            }
+            action RetryRestartEveryTurn when (
+                Buggy == 1 && connected == 0 && pending == 1 && restarts <= 1
+            ) {
+                restarts = restarts + 1;
+            }
             action DisconnectIdle when (
                 connected == 1 && live_intent == 0 && filler == 0 &&
                 queued_intent == 0 && completion_ready == 0
@@ -1165,7 +1391,6 @@ pub fn native_update_worker_queue_model() -> Model {
                 } else {
                     pending + queued_intent + completion_ready == 0
                 };
-            invariant AbstractFifoBoundaryIsBinary: filler + queued_intent <= 1;
             invariant PendingEmptyQueueHasRetryEdge:
                 if pending == 1 && filler == 0 && queued_intent == 0 &&
                     connected == 1 {
@@ -1205,22 +1430,57 @@ pub fn native_update_worker_queue_model() -> Model {
 ///
 /// `PickStatusInputs` is the bounded environment projection for
 /// `reconcile_status_outcome(running_build, checked_from_build, ready_present,
-/// persisted)`. `Buggy=1` reproduces the two regression classes: trusting the
-/// ledger's build instead of the caller and preserving an absent-Ready staged
-/// claim/mismatched outcome.
+/// persisted)`. Each `Buggy=1` mutant is its own reducer, dead at `Buggy=0`, so none
+/// masks another. Two are the historical regression classes: `ReconcileTrustingLedger`
+/// relabels the caller with the ledger's build and keeps its outcome whole, and
+/// `ReconcileOnMarkerPresence` keeps an absent-Ready staged claim (mere marker
+/// presence read as a stage). Two are the over-correction, each one conjunct of
+/// `!ready_present && (checked_from_build != running_build || claims_staged)`
+/// dropped: `NeutralizeDespiteReady` rewrites a Ready stage's outcome, and
+/// `NeutralizeEveryAbsentReady` rewrites an honest "up to date" or "network check
+/// failed" into "no update is staged".
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_status_reconciliation_model() -> Model {
-    let stale_without_ready = || {
-        and_(
-            eq(var("ready_present"), int(0)),
-            or_(
-                neq(var("ledger_build"), var("running_build")),
-                eq(var("persisted_staged_claim"), int(1)),
-            ),
+    let mismatched_or_claimed = || {
+        or_(
+            neq(var("ledger_build"), var("running_build")),
+            eq(var("persisted_staged_claim"), int(1)),
         )
     };
+    let stale_without_ready = || and_(eq(var("ready_present"), int(0)), mismatched_or_claimed());
     let settled = || eq(var("phase"), int(2));
+    let reconcile = |name: &'static str, buggy: bool, build: Expr, neutralize: Expr| {
+        let guard = eq(var("phase"), int(1));
+        Action {
+            name,
+            guard: Some(if buggy {
+                and_(eq(cst("Buggy"), int(1)), guard)
+            } else {
+                guard
+            }),
+            updates: vec![
+                Update {
+                    var: "reported_build",
+                    expr: build,
+                },
+                // A neutralized outcome is "running build N; no update is staged",
+                // which claims no stage; a preserved one repeats the ledger's claim.
+                Update {
+                    var: "reported_staged_claim",
+                    expr: if_(neutralize.clone(), int(0), var("persisted_staged_claim")),
+                },
+                Update {
+                    var: "neutralized",
+                    expr: if_(neutralize, int(1), int(0)),
+                },
+                Update {
+                    var: "phase",
+                    expr: int(2),
+                },
+            ],
+        }
+    };
 
     Model {
         name: "NativeUpdateStatusReconciliation",
@@ -1287,44 +1547,36 @@ pub fn native_update_status_reconciliation_model() -> Model {
                     },
                 ],
             },
-            Action {
-                name: "ReconcileStatus",
-                guard: Some(eq(var("phase"), int(1))),
-                updates: vec![
-                    Update {
-                        var: "reported_build",
-                        expr: if_(
-                            eq(cst("Buggy"), int(1)),
-                            var("ledger_build"),
-                            var("running_build"),
-                        ),
-                    },
-                    Update {
-                        var: "reported_staged_claim",
-                        expr: if_(
-                            eq(cst("Buggy"), int(1)),
-                            var("persisted_staged_claim"),
-                            if_(
-                                eq(var("ready_present"), int(0)),
-                                int(0),
-                                var("persisted_staged_claim"),
-                            ),
-                        ),
-                    },
-                    Update {
-                        var: "neutralized",
-                        expr: if_(
-                            eq(cst("Buggy"), int(1)),
-                            int(0),
-                            if_(stale_without_ready(), int(1), int(0)),
-                        ),
-                    },
-                    Update {
-                        var: "phase",
-                        expr: int(2),
-                    },
-                ],
-            },
+            reconcile(
+                "ReconcileStatus",
+                false,
+                var("running_build"),
+                stale_without_ready(),
+            ),
+            reconcile(
+                "ReconcileTrustingLedger",
+                true,
+                var("ledger_build"),
+                Expr::Bool(false),
+            ),
+            reconcile(
+                "ReconcileOnMarkerPresence",
+                true,
+                var("running_build"),
+                Expr::Bool(false),
+            ),
+            reconcile(
+                "NeutralizeDespiteReady",
+                true,
+                var("running_build"),
+                mismatched_or_claimed(),
+            ),
+            reconcile(
+                "NeutralizeEveryAbsentReady",
+                true,
+                var("running_build"),
+                eq(var("ready_present"), int(0)),
+            ),
         ],
         invariants: vec![
             Invariant {
@@ -1945,6 +2197,204 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
                 owner_a <= 2 && owner_b <= 2 && captured <= 1 &&
                 proof_matched <= 1 && revoked <= 1 && warrant <= 1 &&
                 resumed <= 1 && commits <= 2;
+        }
+    }
+}
+
+/// What a STRUCTURAL convergence of the automatic apply lane may still do: the
+/// latch the lane took on build N's bytes after two handoffs that the bytes
+/// answered for (gap 14, 2026-09-26).
+///
+/// THE STRAND THIS MACHINE EXISTS FOR. A launched-lane candidate installs its
+/// bundle before it dials, so a structural failure lands on the installed
+/// ACTIVATION of N, and the latch there covered the whole build with
+/// `retry_at: None`. The activation outranks every newer download while the
+/// bundle is newer than the running process — a swap from the running image
+/// has no rollback source any more, and N's unconfirmed boot trial owns the
+/// fixed rollback path — so the one lane that can carry a newer release onto
+/// the machine is N's activation, whose successor applies the newer stage on
+/// its own terms. With the latch deadline-less, that lane never ran again:
+/// every later release waited for a person's click or a relaunch, the
+/// 20-25 h strand of 0.90/0.91 made permanent.
+///
+/// The healthy `Decide` is the shipping `structural_latch` decision, taken at
+/// every look the lane has at the latch after something changed:
+///
+/// * `DayPasses` — the ONE re-sample, 24 h after convergence, is due;
+/// * `NewerArrives` — a verified download strictly newer than N is on disk
+///   that has not yet had an attempt;
+///
+/// either EARNS one attempt, and one attempt answers both. It is released only
+/// when one more launch of N keeps its boot trial under the revert threshold
+/// (`room`, picked once by `TrialHasRoom`/`TrialIsSpent` — the sentinel's own
+/// count, read after the attempt that converged returned): a structural
+/// `ChildDied` keeps its counted launch, so after two of them the next launch
+/// of N is the one `check_boot_health` reverts on, and an automatic attempt
+/// must never be the thing that spends it. Without room the earned attempt is
+/// HELD and SAID (`said`), never taken silently — and the hold spends the
+/// re-sample too, due or not: every launch left is the reverting one, so a
+/// later look could only say the same thing again. The first count is itself a
+/// look (gap 14 review, 2026-09-26): convergence PROMISES the day's re-sample
+/// before any count is read, and a count that rules it out withdraws the
+/// promise at once, said, rather than leaving it on the notice for a day.
+/// `AttemptFails` is that attempt failing structurally again: the verdict
+/// stands, so it re-latches at once with no confirming retry. `ArmSameBuild`
+/// is an artifact of build N — the same bytes, or a re-publish under another
+/// digest — offered while the latch holds: it stays latched.
+///
+/// `Buggy=1` reproduces, each catchable ALONE:
+///
+/// * TODAY'S STRAND, on the runs where the trial has room: `Decide` releases
+///   nothing, spends nothing and says nothing — the newer release is blocked
+///   forever and the re-sample never comes (`NewerReleaseIsTried`,
+///   `ResampleAfterADay`);
+/// * a trial-blind release, on the runs where it has none: the attempt is
+///   taken and is the launch that reverts N, in silence
+///   (`NeverSpendsTheRevertingLaunch`, `ATrialHoldIsSaid`) — and, until a day
+///   or a newer release comes, the convergence notice goes on promising a
+///   retry the trial cannot afford (`NoRetryPromisedPastTheTrial`);
+/// * a verdict-less convergence, where every structural failure buys a fresh
+///   24 h re-sample — the transient lane's re-sample-forever applied to a
+///   verdict about the bytes (`ResampleAtMostOnce`);
+/// * a digest-keyed latch, where a re-publish of N escapes it — which also
+///   releases the latch with no event (`SameBuildStaysLatched`,
+///   `ReleasedOnlyByAnEvent`).
+///
+/// The two `Decide` mutants are scoped to disjoint `room` runs so neither
+/// masks the other, as `NativeUpdateFailedMarkSuppression` scopes its writer
+/// and reader defects.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_structural_latch_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateStructuralLatch {
+            const Buggy = 0;
+            // 0 = the boot trial's room is not yet picked, 1 = running.
+            var phase = 0;
+            // One more launch of N keeps its boot trial under the revert
+            // threshold (the sentinel's count, measured).
+            var room = 0;
+            // The structural latch on build N holds.
+            var latched = 1;
+            // An observation the lane has not yet decided on.
+            var pending = 0;
+            // The one re-sample's deadline, 24 h after convergence, passed.
+            var day = 0;
+            // The one re-sample is still owed.
+            var owed = 1;
+            // The one re-sample was spent (taken, or held for the trial).
+            var spent = 0;
+            // A verified download strictly newer than N is on disk.
+            var newer = 0;
+            // That newer download already had its attempt (or was held).
+            var newer_spent = 0;
+            // A hold for the boot trial was said (log, `update status`, notice).
+            var said = 0;
+            // An artifact of build N went through while the latch held.
+            var escaped = 0;
+            // The first count read after the attempt that converged — a look
+            // like any other observation.
+            action TrialHasRoom when (phase == 0) {
+                room = 1;
+                phase = 1;
+                pending = 1;
+            }
+            action TrialIsSpent when (phase == 0) {
+                room = 0;
+                phase = 1;
+                pending = 1;
+            }
+            action DayPasses when (phase == 1 && day == 0) {
+                day = 1;
+                pending = 1;
+            }
+            action NewerArrives when (phase == 1 && newer == 0) {
+                newer = 1;
+                pending = 1;
+            }
+            action Decide when (phase == 1 && latched == 1 && pending == 1) {
+                latched = if ((day == 1 && owed == 1) || (newer == 1 && newer_spent == 0)) &&
+                    ((Buggy == 0 && room == 1) || (Buggy == 1 && room == 0)) {
+                    0
+                } else {
+                    1
+                };
+                owed = if (day == 1 && owed == 1 && (Buggy == 0 || room == 0)) ||
+                    (Buggy == 0 && room == 0) {
+                    0
+                } else {
+                    owed
+                };
+                spent = if (day == 1 && owed == 1 && (Buggy == 0 || room == 0)) ||
+                    (Buggy == 0 && room == 0 && owed == 1) {
+                    1
+                } else {
+                    spent
+                };
+                newer_spent = if newer == 1 && newer_spent == 0 && (Buggy == 0 || room == 0) {
+                    1
+                } else {
+                    newer_spent
+                };
+                // Every look without room says so while there is something to
+                // say: an earned attempt held, or the promised re-sample
+                // withdrawn (`owed` covers the day's, due or not).
+                said = if (owed == 1 || (newer == 1 && newer_spent == 0)) && room == 0 &&
+                    Buggy == 0 {
+                    1
+                } else {
+                    said
+                };
+                pending = 0;
+            }
+            action AttemptFails when (phase == 1 && latched == 0) {
+                latched = 1;
+                owed = if Buggy == 1 { 1 } else { owed };
+                day = if Buggy == 1 { 0 } else { day };
+            }
+            action ArmSameBuild when (phase == 1 && latched == 1) {
+                latched = if Buggy == 1 { 0 } else { latched };
+                escaped = if Buggy == 1 { 1 } else { escaped };
+            }
+            // The newer release gets its attempt: once the lane has looked,
+            // a latch still holding over an unspent newer download with room
+            // in the trial is the strand.
+            invariant NewerReleaseIsTried:
+                if pending == 0 && latched == 1 && room == 1 && newer == 1 {
+                    newer_spent == 1
+                } else {
+                    newer_spent <= 1
+                };
+            // …and so does the day: past the deadline, a look spends the
+            // re-sample.
+            invariant ResampleAfterADay:
+                if pending == 0 && latched == 1 && room == 1 && day == 1 {
+                    owed == 0
+                } else {
+                    owed <= 1
+                };
+            // An earned attempt the trial cannot afford is said, not dropped.
+            invariant ATrialHoldIsSaid:
+                if pending == 0 && phase == 1 && room == 0 && (day == 1 || newer == 1) {
+                    said == 1
+                } else {
+                    said <= 1
+                };
+            // Once a count has been looked at, no retry is promised that the
+            // trial cannot afford.
+            invariant NoRetryPromisedPastTheTrial:
+                if pending == 0 && phase == 1 && room == 0 { owed == 0 } else { owed <= 1 };
+            // No automatic attempt spends the launch the boot trial reverts on.
+            invariant NeverSpendsTheRevertingLaunch:
+                if room == 0 { latched == 1 } else { latched <= 1 };
+            // ONE re-sample: once spent it is never owed again.
+            invariant ResampleAtMostOnce:
+                if spent == 1 { owed == 0 } else { owed <= 1 };
+            // The latch covers build N, whatever the digest.
+            invariant SameBuildStaysLatched: escaped == 0;
+            // A release has a reason: the day, or a newer release.
+            invariant ReleasedOnlyByAnEvent:
+                if latched == 0 { day == 1 || newer == 1 } else { latched == 1 };
         }
     }
 }

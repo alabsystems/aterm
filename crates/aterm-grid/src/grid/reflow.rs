@@ -267,6 +267,11 @@ impl Grid {
         }
 
         let (revealed, reveal_extras) = self.adjust_row_count(new_rows, new_cols);
+        if revealed > 0 {
+            // History handed back to the screen is live again: fence every
+            // absolute-row reader of history on it (`history_reveal_gen`).
+            self.storage.history_reveal_gen = self.storage.history_reveal_gen.wrapping_add(1);
+        }
         // Discard CellExtras entries for rows that were removed during
         // adjust_row_count. Without this, orphaned HashMap entries for
         // deleted rows leak memory until the next full grid clear. (#7409)

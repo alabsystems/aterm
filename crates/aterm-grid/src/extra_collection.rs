@@ -124,6 +124,7 @@ impl ComplexCharRing {
     ///
     /// Computes `ring_row` once and writes at col, col+2, col+4...
     #[inline]
+    #[cfg(test)]
     pub(crate) fn set_wide_run(&mut self, row: u16, start_col: u16, chars: &[char]) {
         if chars.is_empty() || start_col >= self.stride {
             return;
@@ -1196,6 +1197,7 @@ impl CellExtras {
     ///
     /// Hoists the ring_row computation to avoid per-char overhead.
     #[inline]
+    #[cfg(test)]
     pub fn set_complex_char_wide_run(
         &mut self,
         row: u16,
@@ -2218,6 +2220,7 @@ impl CellExtras {
     ///
     /// O(E) linear scan over all extras entries.
     #[must_use]
+    #[cfg(test)]
     pub fn row_has_hyperlinks(&self, row: u16) -> bool {
         let internal_row = self.internal_row(row);
         self.data

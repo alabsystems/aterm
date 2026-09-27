@@ -543,6 +543,7 @@ impl CursorTrail {
     /// Hidden→visible relocations this engine's hide bridge has admitted or
     /// declined — see [`BridgeTally`].
     #[must_use]
+    #[cfg(test)]
     pub fn bridge_tally(&self) -> BridgeTally {
         self.bridge_tally
     }
@@ -667,6 +668,7 @@ impl CursorTrail {
     }
 
     /// Classify a settled user resize/re-grid.
+    #[cfg(test)]
     pub fn note_reflow(&mut self, now: Instant) {
         self.note_move(now);
     }

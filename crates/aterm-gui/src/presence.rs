@@ -38,16 +38,18 @@
 //!
 //! The agent PHASE (busy / prompt / question / limited / idle / survey) is the
 //! SERVER'S published verdict ([`agent_verdict`], run by the status sweep in
-//! `session_status.rs`): `aterm_phase`'s readers over the last
-//! [`CLASSIFY_ROWS`] rows, applied only to a session identified as an agent,
-//! and re-run only when the content moved AND those rows changed — at most
-//! 4 Hz per session, never per frame; the test-only [`classifier_calls`]
-//! counter is the gate's proof. This module only folds that verdict in.
+//! `session_status.rs`): `aterm_phase`'s readers over the [`live_zone`] (the
+//! last [`CLASSIFY_ROWS`] rows of the screen's content), applied only to a
+//! session identified as an agent, and re-run only when the content moved
+//! AND those rows changed — at most 4 Hz per session, never per frame; the
+//! test-only [`classifier_calls`] counter is the gate's proof. This module
+//! only folds that verdict in.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use aterm_agent::supervise::limit;
 use aterm_session::SessionId;
 use winit::event_loop::EventLoopProxy;
 
@@ -110,10 +112,30 @@ pub(crate) fn post_fabric_changed(session: &SessionId) {
 // ---------------------------------------------------------------------------
 
 /// How many screen rows the agent-phase classifier reads: the composer frame
-/// and the live zone above it fit in the last 40 rows of any screen tall enough
-/// to show them, and the whole-screen fallback (no composer frame) reads the
-/// same rows a supervisor would.
+/// and the live zone above it fit in the last 40 rows of any screen's CONTENT
+/// ([`live_zone`]), and the whole-screen fallback (no composer frame) reads
+/// the same rows a supervisor would.
 pub(crate) const CLASSIFY_ROWS: usize = 40;
+
+/// THE LIVE ZONE the agent verdict reads ([`agent_verdict`]) and the status
+/// sweep's classifier gate hashes (`session_status`'s `agent_observe`): the
+/// last [`CLASSIFY_ROWS`] rows of the screen's content — up to its last
+/// non-blank row — and the blank rows under it. The live run of 2026-09-26
+/// (Claude Code 2.1.283 in a fresh 149x62 pane whose shell prompt sat at the
+/// top) drew the folder-trust dialog on rows 5-20: the last 40 rows of the
+/// SCREEN were blank, the dialog wholly above them, and `status` published
+/// `agent=idle` for 3+ minutes while the hosted loop, which waits on that
+/// verdict at an idle point (`await agent`), slept. The zone never shrinks:
+/// on a screen whose last row has content it is the last 40 rows, as
+/// before; it reaches up only by as many rows as the screen's foot is blank,
+/// so a reader is handed the same rows under the content it always was.
+pub(crate) fn live_zone(rows: &[String]) -> &[String] {
+    let content = rows
+        .iter()
+        .rposition(|r| !r.trim().is_empty())
+        .map_or(0, |last| last + 1);
+    &rows[content.saturating_sub(CLASSIFY_ROWS)..]
+}
 
 #[cfg(test)]
 thread_local! {
@@ -201,32 +223,6 @@ impl AgentPhase {
     }
 }
 
-/// Whether `agent=wall:<kind>`'s `<kind>` is a LIMIT wall: one aterm-phase
-/// always reads as a limit ([`aterm_phase::WallKind::reads_limited`]) — a
-/// usage window, a model bucket, spend. The retired `agent=limited` word
-/// named these, and the supervise engine escalates them itself (a limit
-/// episode). An `api-error` is not one here: the word does not carry the one
-/// status (429) that makes it a limit.
-pub(crate) fn wall_kind_is_limit(kind: &str) -> bool {
-    use aterm_phase::WallKind as K;
-    [
-        K::UsageSession,
-        K::UsageWeekly,
-        K::ModelBucket { consent: false },
-        K::Spend,
-        K::Context,
-        K::Auth,
-        K::ApiError {
-            code: None,
-            retryable: false,
-        },
-        K::Overloaded,
-    ]
-    .iter()
-    .find(|k| k.name() == kind)
-    .is_some_and(K::reads_limited)
-}
-
 /// `wall:<kind>` for a wall kind — `status agent=`'s spelling, `wall:` and
 /// [`aterm_phase::WallKind::name`] (pinned by a test). Static because a
 /// published verdict word is.
@@ -241,6 +237,7 @@ pub(crate) fn wall_word(kind: aterm_phase::WallKind) -> &'static str {
         K::Auth => "wall:auth",
         K::ApiError { .. } => "wall:api-error",
         K::Overloaded => "wall:overloaded",
+        K::Memory => "wall:memory",
     }
 }
 
@@ -251,10 +248,12 @@ pub(crate) enum AgentVerdict {
     /// The foreground program is not an identified agent: `agent=-`, no band
     /// phase, no rim. A shell whose last line ends in `?` lands here.
     NotAgent,
-    /// An identified agent's reading. `by_frame` is true when only Claude
-    /// Code's own screen (its composer frame, or one of its boxes) identified
-    /// it (the caller keeps that identity for the rest of the foreground job,
-    /// since an approval box hides the frame). `subject` is the approval
+    /// An identified agent's reading. `by_frame` is true when only the
+    /// agent's own screen identified it — Claude Code's composer frame or one
+    /// of its boxes, Codex's composer or one of its boxes (the caller keeps
+    /// that identity, `program`, for the rest of the foreground job: a box
+    /// hides the composer, and Codex's composer holding a draft names
+    /// nothing). `subject` is the approval
     /// box's command or path, folded to one clipped line, for the host's own
     /// menu row and notification ([`crate::status_item::escalation`]) — never
     /// for the wire or the band; `None` unless the phase is a prompt.
@@ -319,12 +318,13 @@ impl AgentVerdict {
 /// per-program readers ([`aterm_phase::identify`]); this only decides WHICH
 /// reader to ask, and whether to ask at all: a session whose foreground
 /// program is an identified agent (`claude`, `codex`) gets that program's
-/// reader; one `known_agent` already (identified by Claude Code's screen
-/// earlier in this foreground job) keeps the Claude reader; one whose program
-/// is a runtime an agent runs under ([`aterm_phase::may_host_agent`]) or cannot be
-/// known (no foreground group to name) is identified by its SCREEN
-/// (`identify(None, rows)`: Claude Code's composer frame or one of its boxes,
-/// a Codex choice box). A program still being RESOLVED (`program_pending`: a
+/// reader; one `known_agent` already (identified by its screen earlier in
+/// this foreground job) keeps that agent's reader; one whose program is a
+/// runtime an agent runs under ([`aterm_phase::may_host_agent`]) or cannot
+/// be known (no foreground group to name) is identified by its SCREEN
+/// (`identify(None, rows)`: Claude Code's composer frame or one of its boxes;
+/// Codex's composer — empty, or under its status row — or one of its boxes).
+/// A program still being RESOLVED (`program_pending`: a
 /// group, no name yet) identifies nothing until it is named — a shell's own
 /// group is re-named after every job, and a frame left on screen by `cat`
 /// must not flash an agent verdict in that gap. Anything else, and any screen
@@ -334,30 +334,52 @@ impl AgentVerdict {
 pub(crate) fn agent_verdict(
     program: Option<&str>,
     program_pending: bool,
-    known_agent: bool,
+    known_agent: Option<aterm_phase::Program>,
     rows: &[String],
     now: Instant,
 ) -> AgentVerdict {
     use aterm_phase::{Program, ScreenReader};
+    // The live zone: the last CLASSIFY_ROWS of the screen's content
+    // ([`live_zone`]); `whole` is read again for a box whose head the zone
+    // cuts.
+    let whole = rows;
+    let rows = live_zone(whole);
     // The one name table is aterm-phase's (`program_of`, `may_host_agent`).
     let by_program = program.is_some_and(|p| aterm_phase::program_of(p).is_some());
     // A frame identification made while the program was unresolved does not
     // survive the program resolving to something that cannot host an agent.
     let frame_may_identify = program.map_or(!program_pending, aterm_phase::may_host_agent);
-    let known_agent = known_agent && frame_may_identify;
+    let known_agent = known_agent.filter(|_| frame_may_identify);
     let (reader, by_frame): (&dyn ScreenReader, bool) = if by_program {
         (aterm_phase::identify(program, rows), false)
-    } else if known_agent {
-        (&aterm_phase::ClaudeReader, false)
+    } else if let Some(known) = known_agent {
+        (known.reader(), false)
     } else if frame_may_identify {
-        let reader = aterm_phase::identify(None, rows);
+        let reader = match aterm_phase::identify(None, rows) {
+            // A box the zone cut names its program on the whole screen.
+            r if r.program() == Program::Generic && whole.len() > rows.len() => {
+                aterm_phase::identify(None, whole)
+            }
+            r => r,
+        };
         match reader.program() {
             Program::Generic => return AgentVerdict::NotAgent,
-            // Only Claude Code's identity is carried across its boxes.
-            p => (reader, p == Program::Claude),
+            // The identity is carried across the job's boxes and drafts.
+            _ => (reader, true),
         }
     } else {
         return AgentVerdict::NotAgent;
+    };
+    // A box the zone cut — its title above the zone of a taller screen — is
+    // read on the whole screen, as the supervisor's loop reads it
+    // (the E2E probe of 2026-09-25: a trust dialog at the top of a 45-row
+    // pane was published `agent_detail=other`, and the menu bar said "other
+    // approval").
+    let rows = if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen)
+    {
+        whole
+    } else {
+        rows
     };
     let (reading, subject) = classify(reader, rows, now);
     AgentVerdict::Agent {
@@ -368,17 +390,87 @@ pub(crate) fn agent_verdict(
     }
 }
 
+/// [`agent_verdict`] behind the screen reader's panic fence
+/// ([`crate::reader_guard`]) — what the sweep (`session_status`) publishes.
+/// A reader panic reads as [`unreadable_verdict`] (an identified agent's
+/// `unknown`, never a prompt) and is warned once per session per panic
+/// location, instead of taking the terminal and every session with it.
+pub(crate) fn agent_verdict_guarded(
+    session: u64,
+    program: Option<&str>,
+    program_pending: bool,
+    known_agent: Option<aterm_phase::Program>,
+    rows: &[String],
+    now: Instant,
+) -> AgentVerdict {
+    fenced_verdict(session, program, program_pending, known_agent, rows, || {
+        agent_verdict(program, program_pending, known_agent, rows, now)
+    })
+}
+
+/// The fence around one verdict `read` (the seam the tests inject a
+/// panicking reader through).
+fn fenced_verdict(
+    session: u64,
+    program: Option<&str>,
+    program_pending: bool,
+    known_agent: Option<aterm_phase::Program>,
+    rows: &[String],
+    read: impl FnOnce() -> AgentVerdict,
+) -> AgentVerdict {
+    match crate::reader_guard::guarded(read) {
+        Ok(verdict) => verdict,
+        Err(panic) => {
+            crate::reader_guard::warn_once(&format!("{session}"), "agent verdict", &panic, rows);
+            unreadable_verdict(program, program_pending, known_agent)
+        }
+    }
+}
+
+/// The verdict for a screen the reader could not read (it panicked): an
+/// agent identified WITHOUT the screen — by its program's name, or by the
+/// frame this foreground job already showed — is that agent at
+/// [`AgentPhase::Unknown`], the reading a reader with no evidence gets
+/// (nothing acts on it, nothing announces it); anything else is
+/// [`AgentVerdict::NotAgent`], since identifying it would need the screen.
+/// Never a prompt, a question or a wall.
+fn unreadable_verdict(
+    program: Option<&str>,
+    program_pending: bool,
+    known_agent: Option<aterm_phase::Program>,
+) -> AgentVerdict {
+    let frame_may_identify = program.map_or(!program_pending, aterm_phase::may_host_agent);
+    let program = match program.and_then(aterm_phase::program_of) {
+        Some(p) => p,
+        None => match known_agent.filter(|_| frame_may_identify) {
+            Some(known) => known,
+            None => return AgentVerdict::NotAgent,
+        },
+    };
+    AgentVerdict::Agent {
+        reading: AgentReading {
+            phase: AgentPhase::Unknown,
+            context_pct: None,
+        },
+        by_frame: false,
+        subject: None,
+        program,
+    }
+}
+
 /// Classify one screen with one program's reader: the reading, and the
 /// box's command or path for the host's menu row ([`AgentVerdict::Agent`]).
 /// The ONLY caller of `aterm_phase`'s readers in this crate, so the test
-/// counter is total; `rows` is the tail cut at [`CLASSIFY_ROWS`]. Callers go
-/// through [`agent_verdict`].
+/// counter is total; `rows` is the [`live_zone`] (or the whole screen, for a
+/// box whose head it cuts). Callers go through [`agent_verdict`].
 ///
 /// A reading that is not [`aterm_phase::Reading::phase_authoritative`] is
 /// [`AgentPhase::Unknown`], whatever its default phase. A wall
 /// ([`aterm_phase::Reading::wall`], which the reader leaves `None` under a
-/// box and a hard busy) outranks the phase it ended on — `idle`, `question`,
-/// a background monitor's soft busy: the worker will not move past it.
+/// box, and under a hard busy keeps only Claude Code's critical-memory
+/// banner) outranks the phase it ended on — `idle`, `question`, a background
+/// monitor's soft busy, and for that banner a running spinner: the worker
+/// will not move past it.
 pub(crate) fn classify(
     reader: &dyn aterm_phase::ScreenReader,
     rows: &[String],
@@ -465,132 +557,40 @@ fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
 // The reset clock: placing a limit notice's reset time on this machine's clock.
 // ---------------------------------------------------------------------------
 
-/// A limit notice's reset time as far as the band can read it: an optional
-/// month and day, the hour and minute, and the zone the notice named
-/// (`7:30pm (America/Los_Angeles)`, `3am`, `Sep 19 at 11am (…)`, `19:30`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResetSpec {
-    pub(crate) date: Option<(u8, u8)>,
-    pub(crate) hour: u8,
-    pub(crate) minute: u8,
-    pub(crate) zone: Option<String>,
-}
-
-/// Read a reset time out of the notice's own words. `None` for anything the
-/// grammar above does not cover — the band then prints the reset text alone.
-pub(crate) fn parse_reset(text: &str) -> Option<ResetSpec> {
-    let (body, zone) = match text.find('(') {
-        Some(i) => {
-            let z = text[i + 1..].trim().trim_end_matches(')').trim();
-            (&text[..i], (!z.is_empty()).then(|| z.to_string()))
-        }
-        None => (text, None),
-    };
-    let mut month: Option<u8> = None;
-    let mut date: Option<(u8, u8)> = None;
-    let mut time: Option<(u8, u8)> = None;
-    for tok in body.split_whitespace() {
-        let t = tok.trim_matches(|c: char| c == ',' || c == '.');
-        if t.is_empty() || t.eq_ignore_ascii_case("at") || t.eq_ignore_ascii_case("on") {
-            continue;
-        }
-        if let Some(m) = month_of(t) {
-            month = Some(m);
-            continue;
-        }
-        if let Some(m) = month
-            && date.is_none()
-            && let Ok(d) = t.parse::<u8>()
-            && (1..=31).contains(&d)
-        {
-            date = Some((m, d));
-            continue;
-        }
-        if let Some((h, mm)) = time
-            && (t.eq_ignore_ascii_case("am") || t.eq_ignore_ascii_case("pm"))
-        {
-            time = Some((meridian(h, t.eq_ignore_ascii_case("pm"))?, mm));
-            continue;
-        }
-        if let Some(clock) = parse_clock(t) {
-            time = Some(clock);
-        }
-    }
-    let (hour, minute) = time?;
-    Some(ResetSpec {
-        date,
-        hour,
-        minute,
-        zone,
-    })
-}
-
-fn month_of(t: &str) -> Option<u8> {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
-    if t.len() < 3 || !t.is_char_boundary(3) {
-        return None;
-    }
-    let head = t[..3].to_ascii_lowercase();
-    MONTHS
-        .iter()
-        .position(|m| *m == head)
-        .map(|i| i as u8 + 1)
-        .filter(|_| t[3..].chars().all(|c| c.is_ascii_alphabetic()))
-}
-
-/// A 12-hour figure onto the 24-hour clock.
-fn meridian(h: u8, pm: bool) -> Option<u8> {
-    if !(1..=12).contains(&h) {
-        return None;
-    }
-    Some(match (h, pm) {
-        (12, false) => 0,
-        (12, true) => 12,
-        (h, false) => h,
-        (h, true) => h + 12,
-    })
-}
-
-/// `H`, `H:MM`, `Ham`, `H:MMpm`, `HH:MM` — 24-hour when no meridian.
-fn parse_clock(t: &str) -> Option<(u8, u8)> {
-    let lower = t.to_ascii_lowercase();
-    let (num, pm) = if let Some(n) = lower.strip_suffix("am") {
-        (n, Some(false))
-    } else if let Some(n) = lower.strip_suffix("pm") {
-        (n, Some(true))
-    } else {
-        (lower.as_str(), None)
-    };
-    let (h, m) = match num.split_once(':') {
-        Some((h, m)) => (h.parse::<u8>().ok()?, m.parse::<u8>().ok()?),
-        None => (num.parse::<u8>().ok()?, 0),
-    };
-    if m > 59 {
-        return None;
-    }
-    let h = match pm {
-        Some(pm) => meridian(h, pm)?,
-        None if h <= 23 => h,
-        None => return None,
-    };
-    Some((h, m))
-}
-
 /// How long until `reset` falls, on THIS machine's clock — the figure the
-/// limited row counts down. `None` when the words cannot be read, when the
-/// notice names a zone that is not this machine's, or when the reset is
-/// already behind us: then the row prints the reset time and no figure.
+/// limited row counts down. The notice's words are read by the supervisor's
+/// own grammar ([`limit::parse_reset`], placed by [`limit::reset_at`]), so
+/// the band and the engine never read one notice two ways. `None` when the
+/// words cannot be read, when the notice names a zone that is not this
+/// machine's, or when the reset is already behind us: then the row prints
+/// the reset time and no figure.
 pub(crate) fn countdown_to_reset(reset: &str) -> Option<Duration> {
-    let spec = parse_reset(reset)?;
-    if let Some(named) = &spec.zone
-        && let Some(local) = local_zone()
-        && &local != named
+    countdown_at(
+        reset,
+        limit::unix_now(),
+        local_offset_s()?,
+        local_zone().as_deref(),
+    )
+}
+
+/// [`countdown_to_reset`] with the clock, the offset and the local zone
+/// passed in — pure, so the rules are testable at any hour. A notice in
+/// another zone is no figure rather than one placed by a `date` spawned per
+/// read; with no zone named, or this machine's, it is placed at `offset`.
+fn countdown_at(reset: &str, now: i64, offset: i64, local_zone: Option<&str>) -> Option<Duration> {
+    let spec = limit::parse_reset(reset)?;
+    if let limit::ResetSpec::At {
+        zone: Some(named), ..
+    } = &spec
+        && local_zone.is_some_and(|local| local != named)
     {
         return None;
     }
-    local_countdown(&spec)
+    let at = limit::reset_at(&spec, now, offset, |_| None);
+    u64::try_from(at - now)
+        .ok()
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
 }
 
 /// This machine's IANA zone name, when it can be read (`TZ`, else the
@@ -606,49 +606,6 @@ fn local_zone() -> Option<String> {
     let s = link.to_str()?;
     let i = s.find("zoneinfo/")?;
     Some(s[i + "zoneinfo/".len()..].to_string())
-}
-
-/// The countdown on this machine's clock: the reset's civil time at the local
-/// UTC offset, against `SystemTime::now()`. A bare clock time is the NEXT such
-/// time; a dated reset already behind us is nothing to count down to. The
-/// offset is read ONCE from `date +%z` (the one place every aterm crate reads
-/// its zone — the `libc` shim declares no `localtime_r`), so a reset on the
-/// far side of a daylight-saving switch counts at the offset of today.
-fn local_countdown(spec: &ResetSpec) -> Option<Duration> {
-    let offset = local_offset_s()?;
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs(),
-    )
-    .ok()?;
-    countdown_at(spec, now, offset)
-}
-
-/// [`local_countdown`] with the clock and the offset passed in — pure, so the
-/// rollover law is testable at any hour.
-fn countdown_at(spec: &ResetSpec, now: i64, offset: i64) -> Option<Duration> {
-    let local = now + offset;
-    let today = local.div_euclid(86_400);
-    let (year, _, _) = aterm_types::rfc3339::civil_from_days(today);
-    let tod = i64::from(spec.hour) * 3600 + i64::from(spec.minute) * 60;
-    let mut at = match spec.date {
-        // A dated reset is THIS year's; one already behind us (a stale
-        // notice) is nothing to count down to.
-        Some((m, d)) => {
-            aterm_types::rfc3339::days_from_civil(year, i64::from(m), i64::from(d)) * 86_400 + tod
-        }
-        None => today * 86_400 + tod,
-    };
-    if at <= local {
-        if spec.date.is_some() {
-            return None;
-        }
-        // A bare clock time is the NEXT such time.
-        at += 86_400;
-    }
-    Some(Duration::from_secs(u64::try_from(at - local).ok()?))
 }
 
 /// The local clock's offset from UTC in seconds, from `date +%z`, read once;
@@ -667,7 +624,7 @@ pub(crate) fn local_offset_s() -> Option<i64> {
         if !out.status.success() {
             return None;
         }
-        parse_utc_offset(String::from_utf8_lossy(&out.stdout).trim())
+        limit::parse_zone(String::from_utf8_lossy(&out.stdout).trim())
     })
 }
 
@@ -697,27 +654,12 @@ pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
     if !out.status.success() {
         return None;
     }
-    parse_utc_offset(String::from_utf8_lossy(&out.stdout).trim())
+    limit::parse_zone(String::from_utf8_lossy(&out.stdout).trim())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn local_offset_at(_unix: i64) -> Option<i64> {
     None
-}
-
-/// `+0200` / `-0700` as seconds.
-fn parse_utc_offset(z: &str) -> Option<i64> {
-    let (sign, digits) = match z.as_bytes().first()? {
-        b'+' => (1, &z[1..]),
-        b'-' => (-1, &z[1..]),
-        _ => return None,
-    };
-    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let hh: i64 = digits[..2].parse().ok()?;
-    let mm: i64 = digits[2..].parse().ok()?;
-    Some(sign * (hh * 3600 + mm * 60))
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +781,12 @@ pub(crate) struct Facts {
     pub(crate) mail: MailFacts,
     pub(crate) link: Link,
     pub(crate) turn: Option<TurnFact>,
+    /// The server's published input stall (`input_stall::InputStallFact`,
+    /// `status input=stalled|stopped`): the program has stopped reading its
+    /// input. Ranks [`Level::Limited`] and takes the phase slot as `frozen`
+    /// (or `stopped`) — ahead of typed attention, which during a stall is the
+    /// server's own entry saying the same thing at length.
+    pub(crate) input_stall: Option<crate::input_stall::InputStallFact>,
 }
 
 impl Default for Facts {
@@ -855,6 +803,7 @@ impl Default for Facts {
             mail: MailFacts::default(),
             link: Link::Absent,
             turn: None,
+            input_stall: None,
         }
     }
 }
@@ -895,13 +844,21 @@ pub(crate) enum StoryVerb {
     Compacted,
     /// `ctl story warned` — the watcher warned (context running low).
     Warned,
+    /// `ctl story chose <policy>` — the SUPERVISOR answered Claude Code's
+    /// question dialog by policy (`[harness] answer_questions`, or the
+    /// session's `meta set questions recommended`), the text naming the policy
+    /// word. The one told
+    /// verb whose teller is the harness, not a watcher, and the one the window
+    /// answers with a chime and a pulse (`App::tell_story`), because the point
+    /// of it is that the human notices a question was answered without them.
+    Chose,
 }
 
 impl StoryVerb {
     /// The closed set of words `aterm ctl story <verb>` accepts, in the order
     /// the usage line prints them. A word outside it is a usage error, never a
     /// free-text story point.
-    pub(crate) const TOLD_WORDS: [&'static str; 7] = [
+    pub(crate) const TOLD_WORDS: [&'static str; 8] = [
         "approved",
         "dismissed",
         "reconnected",
@@ -909,6 +866,7 @@ impl StoryVerb {
         "exit",
         "compacted",
         "warned",
+        "chose",
     ];
 
     /// The verb a `ctl story <word>` names, `None` outside the closed set.
@@ -921,6 +879,7 @@ impl StoryVerb {
             "exit" => Self::Exit,
             "compacted" => Self::Compacted,
             "warned" => Self::Warned,
+            "chose" => Self::Chose,
             _ => return None,
         })
     }
@@ -936,6 +895,9 @@ impl StoryVerb {
             Self::Exit => ('\u{2715}', "exit"),
             Self::Compacted => ('\u{25c7}', "compacted"),
             Self::Warned => ('\u{26a0}', "warned"),
+            // A filled diamond: distinct from an approval's check, and the
+            // solid twin of the quiet summary's `◇`.
+            Self::Chose => ('\u{25c6}', "chose"),
             Self::Turn
             | Self::TurnTimedOut
             | Self::Mail
@@ -944,6 +906,30 @@ impl StoryVerb {
             | Self::Question
             | Self::Resumed => return None,
         })
+    }
+
+    /// WHO decided a told point, for the spoken sentence (`approved by
+    /// watcher`, `chose by harness`): the harness for [`Self::Chose`], a
+    /// watcher for every other told word. Saying "watcher" for a choice the
+    /// harness made would misname who acted for the human.
+    pub(crate) const fn teller(self) -> &'static str {
+        match self {
+            Self::Chose => "harness",
+            Self::Approval
+            | Self::Dismissed
+            | Self::Reconnected
+            | Self::Timeout
+            | Self::Exit
+            | Self::Compacted
+            | Self::Warned
+            | Self::Turn
+            | Self::TurnTimedOut
+            | Self::Mail
+            | Self::Hold
+            | Self::Limited
+            | Self::Question
+            | Self::Resumed => "watcher",
+        }
     }
 }
 
@@ -989,6 +975,8 @@ pub(crate) struct Slot {
     pub(crate) mail: MailFacts,
     pub(crate) link: Link,
     pub(crate) turn: Option<TurnFact>,
+    /// [`Facts::input_stall`].
+    pub(crate) input_stall: Option<crate::input_stall::InputStallFact>,
     /// When the last turn SETTLED (the Success tone's 2 s window).
     pub(crate) settled_at: Option<Instant>,
     /// When a stop (hold or limit) began, for the story's stop duration.
@@ -1004,6 +992,12 @@ pub(crate) struct Slot {
     story: VecDeque<StoryPoint>,
     /// The seq of the newest story point; 0 = nothing ever happened.
     pub(crate) story_seq: u64,
+    /// The story up to this seq is CLOSED: the agent it was about left the
+    /// session, so it is no longer news to hold the row for (2026-09-24,
+    /// D10: `level=story` stood on a bare shell long after the agent exited,
+    /// and in a headless instance nobody ever acts to read it). Every
+    /// window's watermark is read as at least this.
+    story_closed: u64,
     /// The last TOLD point (`ctl story`), with its text: the phase slot reads
     /// it for [`TOLD_FLASH`] after `at`, then returns to the phase.
     told: Option<(StoryVerb, String, Instant)>,
@@ -1024,11 +1018,13 @@ impl Slot {
             mail: MailFacts::default(),
             link: Link::Absent,
             turn: None,
+            input_stall: None,
             settled_at: None,
             stop_began: None,
             baselined: false,
             story: VecDeque::new(),
             story_seq: 0,
+            story_closed: 0,
             told: None,
         }
     }
@@ -1117,6 +1113,12 @@ impl Slot {
             if self.agent != agent {
                 changed = true;
             }
+            // The agent LEFT (a verdict, then none): what it did while nobody
+            // looked is closed, not left standing on the shell it returned to.
+            if self.agent.is_some() && agent.is_none() && self.story_closed < self.story_seq {
+                self.story_closed = self.story_seq;
+                changed = true;
+            }
             self.agent = agent;
         }
         if self.hand != facts.hand {
@@ -1150,6 +1152,10 @@ impl Slot {
             self.link = facts.link;
             changed = true;
         }
+        if self.input_stall != facts.input_stall {
+            self.input_stall = facts.input_stall;
+            changed = true;
+        }
         if self.turn != facts.turn {
             // A CARRIED record settled in a previous process: the baseline,
             // not news (see [`TurnFact::carried`]).
@@ -1175,6 +1181,11 @@ impl Slot {
     pub(crate) fn level(&self, watermark: u64) -> Level {
         if self.hold.is_some() {
             return Level::Hold;
+        }
+        // A program that reads nothing is stopped as surely as one at a
+        // wall, whatever its screen still shows (2026-09-24).
+        if self.input_stall.is_some() {
+            return Level::Limited;
         }
         if matches!(
             self.agent.as_ref().map(|a| &a.phase),
@@ -1203,7 +1214,7 @@ impl Slot {
         }
         // A story outranks waiting mail: "something happened since you
         // looked" is the glance fact, and the mail slot prints the mail.
-        if self.story_seq > watermark {
+        if self.story_seq > watermark.max(self.story_closed) {
             return Level::Story;
         }
         if self.mail.unread > 0
@@ -1260,6 +1271,7 @@ impl Slot {
     /// fold away — the fold law's second conjunct.
     pub(crate) fn calm(&self) -> bool {
         self.hold.is_none()
+            && self.input_stall.is_none()
             && matches!(self.hand, Hand::None)
             && self.attention.is_none()
             && !matches!(
@@ -1284,9 +1296,11 @@ impl Slot {
         Tone::Info
     }
 
-    /// The story points after `watermark`, oldest first.
+    /// The story points after `watermark` (and after a closed story), oldest
+    /// first.
     pub(crate) fn story_since(&self, watermark: u64) -> impl Iterator<Item = &StoryPoint> {
-        self.story.iter().filter(move |p| p.seq > watermark)
+        let seen = watermark.max(self.story_closed);
+        self.story.iter().filter(move |p| p.seq > seen)
     }
 
     /// The current stop (hold / limit) in progress, for the story's summary.
@@ -1438,6 +1452,7 @@ impl ChipLevel {
     }
 
     /// The hover-help clause.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) const fn help(self) -> Option<&'static str> {
         match self {
             Self::Off => None,
@@ -1803,19 +1818,24 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
         } else {
             vec![text.to_string()]
         };
+        let teller = verb.teller();
         let spoken = if text.is_empty() {
-            format!("{word} by watcher")
+            format!("{word} by {teller}")
         } else {
-            format!("{word} by watcher, {text}")
+            format!("{word} by {teller}, {text}")
         };
         (format!("{glyph} {word}"), since, spoken)
+    } else if let Some(fact) = &slot.input_stall {
+        crate::input_stall::band_phase(fact, now)
     } else if let Some(text) = &slot.attention {
         let t = sanitize_token(text, 48);
         (t.clone(), Vec::new(), format!("attention, {t}"))
     } else if level == Level::Story {
-        // The summary of what happened after the watermark (≤5 clauses, zero
-        // counts omitted): turns · timed out · mails · approvals · questions ·
-        // the longest stop that ended since.
+        // The summary of what happened after the watermark (≤6 clauses, zero
+        // counts omitted): turns · timed out · mails · approvals · choices ·
+        // questions · the longest stop that ended since. A `choice` is the
+        // harness answering a question box by policy — counted apart from the
+        // watcher's approvals, and apart from `question` (a box that WAITED).
         let count = |verb: StoryVerb| {
             slot.story_since(watermark)
                 .filter(|p| p.verb == verb)
@@ -1829,6 +1849,7 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
             (timeouts, "timed out"),
             (count(StoryVerb::Mail), "mail"),
             (count(StoryVerb::Approval), "approval"),
+            (count(StoryVerb::Chose), "choice"),
             (count(StoryVerb::Question), "question"),
         ] {
             if n > 0 {
@@ -2143,6 +2164,18 @@ pub(crate) struct WindowView {
     /// (and always `None` under reduced motion — amplitude 0 means the ripple
     /// never STARTS, so the frame is the steady image).
     pub(crate) ripple_at: Option<Instant>,
+    /// The running ripple is a CHOICE PULSE (`App::start_presence_pulse`): the
+    /// harness answered a question box in the session this window's FRONT tab
+    /// shows. It paints in the story tone and paints on a window with NO rim —
+    /// the one ripple a quiet window shows. Reset with `ripple_at`.
+    pub(crate) ripple_chose: bool,
+    /// When the words' `since` figures next move — the band's own text clock
+    /// (1 s while they print seconds, 60 s after), set by `App::presence_tick`
+    /// when it recomposes them; `None` until the first tick of a row. The tick
+    /// recomposes a window only when this is due, so another owner's wakes
+    /// (the band's 30 fps motion, blink) never re-read presence facts at their
+    /// own rate (audit 2026-09-24).
+    pub(crate) words_due: Option<Instant>,
     /// The painted band row for `(seed, cols, palette)`, reused until one moves.
     pub(crate) cached_row: Vec<aterm_core::terminal::RenderCell>,
     pub(crate) cached_key: Option<(u64, usize, u64)>,
@@ -2158,6 +2191,8 @@ impl Default for WindowView {
             words: None,
             seed: 0,
             ripple_at: None,
+            ripple_chose: false,
+            words_due: None,
             cached_row: Vec::new(),
             cached_key: None,
         }
@@ -2415,6 +2450,117 @@ mod tests {
         assert_eq!(words(&lost, now, 0).fabric, "\u{2715} lost");
     }
 
+    /// THE INCIDENT'S BAND (2026-09-24): an approval box on the screen, the
+    /// supervisor's "answer this box" as typed attention, a supervisor's turn
+    /// on the hand — and a published input stall. The slot stands at
+    /// `Limited` (the stop rim), is not calm (a keystroke does not fold it),
+    /// and its phase reads `frozen` with the stall's age and why, ahead of the
+    /// attention text. A stopped job reads `stopped` and says to resume it.
+    /// NEGATIVE CONTROL: the same facts with the stall cleared are the box's
+    /// attention again, at `Attention`.
+    #[test]
+    fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
+        let now = t0();
+        let fact = crate::input_stall::InputStallFact {
+            word: aterm_session::input_backlog::InputWord::Stalled,
+            since: now,
+            bytes: 1,
+            stopped: false,
+            rss_mb: Some(39_731),
+            restart: crate::input_stall::Restart::default(),
+        };
+        let facts = |stall: Option<crate::input_stall::InputStallFact>| Facts {
+            attention: Some("answer this box: 4. Chat about this".into()),
+            agent_seq: 1,
+            agent: Some(AgentReading {
+                phase: AgentPhase::Prompt {
+                    detail: Some("question".into()),
+                },
+                context_pct: None,
+            }),
+            hand: Hand::DrivenTurn {
+                id: 3,
+                holder: Some("supervisor".into()),
+            },
+            input_stall: stall,
+            ..Facts::default()
+        };
+        let mut s = Slot::new(now);
+        assert!(s.absorb(facts(Some(fact.clone())), now));
+        assert_eq!(s.level(0), Level::Limited);
+        assert_eq!(s.level(0).rim(), Rim::Stop { hold: false });
+        assert!(!s.calm());
+        assert_eq!(s.why(0), "-");
+        let later = now + Duration::from_secs(123);
+        let w = words(&s, later, 0);
+        assert_eq!(w.phase, "frozen");
+        assert_eq!(
+            w.since,
+            vec!["2m03s".to_string(), "not reading input".to_string()]
+        );
+        assert!(
+            w.fit(120)
+                .contains("frozen 2m03s \u{00b7} not reading input"),
+            "{}",
+            w.fit(120)
+        );
+        assert!(!w.fit(120).contains("answer this box"), "{}", w.fit(120));
+        assert!(
+            w.sentence
+                .contains("frozen, not reading input for 2m03s; restart it"),
+            "{}",
+            w.sentence
+        );
+        assert_eq!(w.tone, Tone::Warn);
+        // A stopped job: resume it.
+        let stopped = crate::input_stall::InputStallFact {
+            word: aterm_session::input_backlog::InputWord::Stopped,
+            stopped: true,
+            ..fact
+        };
+        assert!(s.absorb(facts(Some(stopped)), later));
+        let w = words(&s, now + Duration::from_secs(41), 0);
+        assert_eq!(w.phase, "stopped");
+        assert_eq!(w.since, vec!["41s".to_string(), "input queued".to_string()]);
+        assert!(
+            w.sentence
+                .contains("stopped with input queued for 41s; resume it"),
+            "{}",
+            w.sentence
+        );
+        assert_eq!(s.level(0), Level::Limited);
+        // NEGATIVE CONTROL: the stall clears — the box's attention is back.
+        assert!(s.absorb(facts(None), later));
+        assert_eq!(s.level(0), Level::Attention);
+        assert_eq!(s.why(0), "prompt,escalation");
+        let w = words(&s, later, 0);
+        assert!(w.phase.starts_with("answer this box"), "{}", w.phase);
+        // A hold still outranks it.
+        let mut held = Slot::new(now);
+        held.absorb(
+            Facts {
+                hold: Some(HoldFact {
+                    reason: "review".into(),
+                    fleet: false,
+                }),
+                ..facts(Some(fact_stalled(now)))
+            },
+            now,
+        );
+        assert_eq!(held.level(0), Level::Hold);
+    }
+
+    fn fact_stalled(since: Instant) -> crate::input_stall::InputStallFact {
+        crate::input_stall::InputStallFact {
+            word: aterm_session::input_backlog::InputWord::Stalled,
+            since,
+            bytes: 1,
+            stopped: false,
+            rss_mb: None,
+            restart: crate::input_stall::Restart::default(),
+        }
+    }
+
     /// The story row: quiet, with a since-summary of what happened after the
     /// watermark — and it folds to Quiet once the watermark catches up.
     #[test]
@@ -2509,6 +2655,62 @@ mod tests {
         assert!(s.calm());
         assert_eq!(s.level(s.story_seq), Level::Quiet);
         assert!(!s.level(s.story_seq).shows_row());
+    }
+
+    /// D10 (2026-09-24): the story an agent told while nobody looked closes
+    /// when the agent LEAVES — a shell does not stand at `level=story` for a
+    /// run that is over, least of all in a headless instance where no person
+    /// ever acts to read it. NEGATIVE CONTROL: the same story with the agent
+    /// still there stands, and a new point after the exit is news again.
+    #[test]
+    fn an_agents_story_closes_when_the_agent_leaves() {
+        let now = Instant::now();
+        let reading = |phase| AgentReading {
+            phase,
+            context_pct: None,
+        };
+        let mut s = Slot::new(now);
+        s.absorb(Facts::default(), now);
+        for (seq, phase) in [(1, AgentPhase::Question), (2, AgentPhase::Idle)] {
+            s.absorb(
+                Facts {
+                    agent_seq: seq,
+                    agent: Some(reading(phase)),
+                    ..Facts::default()
+                },
+                now,
+            );
+        }
+        assert_eq!(
+            s.level(0),
+            Level::Story,
+            "the question is news while it runs"
+        );
+        assert!(s.story_since(0).next().is_some());
+        s.absorb(
+            Facts {
+                agent_seq: 3,
+                agent: None,
+                ..Facts::default()
+            },
+            now,
+        );
+        assert_eq!(s.level(0), Level::Quiet, "the agent left: its story closed");
+        assert_eq!(s.story_since(0).count(), 0);
+        s.absorb(
+            Facts {
+                turn: Some(TurnFact {
+                    id: 1,
+                    settled: true,
+                    dur_ms: 5,
+                    carried: false,
+                }),
+                ..Facts::default()
+            },
+            now,
+        );
+        assert_eq!(s.level(0), Level::Story, "a point after the exit is news");
+        assert_eq!(s.story_since(0).count(), 1);
     }
 
     /// The tone: Warn while a human should look, Success for 2 s after a
@@ -2674,6 +2876,76 @@ mod tests {
         }
     }
 
+    /// The published verdict behind the reader's panic fence: a panicking
+    /// stand-in for the reader does not unwind out of the sweep's call (the
+    /// window's thread lives), and degrades to the no-evidence reading — an
+    /// agent identified by its program name (or by the frame this job already
+    /// showed) is that agent at `unknown`, never a prompt; one that only its
+    /// screen could identify is no agent. Controls: the guarded verdict of a
+    /// real screen is the unguarded one, box and subject included.
+    #[test]
+    fn a_reader_panic_degrades_the_verdict_to_unknown_and_the_thread_lives() {
+        let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::BOX_RM);
+        let boom = || -> AgentVerdict { panic!("stand-in reader panic") };
+        let unknown = |v: &AgentVerdict| {
+            matches!(
+                v,
+                AgentVerdict::Agent {
+                    reading: AgentReading {
+                        phase: AgentPhase::Unknown,
+                        context_pct: None
+                    },
+                    by_frame: false,
+                    subject: None,
+                    ..
+                }
+            )
+        };
+        let claude = fenced_verdict(9_001, Some("claude"), false, None, &rows, boom);
+        assert!(unknown(&claude), "{claude:?}");
+        assert_eq!(claude.program(), Some(aterm_phase::Program::Claude));
+        assert_eq!(claude.word(), "unknown");
+        let codex = fenced_verdict(9_001, Some("codex"), false, None, &rows, boom);
+        assert_eq!(codex.program(), Some(aterm_phase::Program::Codex));
+        assert!(unknown(&codex), "{codex:?}");
+        // By the frame this job showed, under a runtime or no name at all.
+        let node = fenced_verdict(
+            9_001,
+            Some("node"),
+            false,
+            Some(aterm_phase::Program::Claude),
+            &rows,
+            boom,
+        );
+        assert!(unknown(&node), "{node:?}");
+        let codex_job = fenced_verdict(
+            9_001,
+            None,
+            false,
+            Some(aterm_phase::Program::Codex),
+            &rows,
+            boom,
+        );
+        assert!(unknown(&codex_job));
+        assert_eq!(codex_job.program(), Some(aterm_phase::Program::Codex));
+        // Only the screen could have identified these.
+        let claude = Some(aterm_phase::Program::Claude);
+        for (program, pending, known) in [
+            (Some("node"), false, None),
+            (None, false, None),
+            (None, true, claude),
+            (Some("zsh"), false, claude),
+        ] {
+            let v = fenced_verdict(9_001, program, pending, known, &rows, boom);
+            assert_eq!(v, AgentVerdict::NotAgent, "{program:?} {pending} {known:?}");
+        }
+        let guarded = agent_verdict_guarded(9_001, Some("claude"), false, None, &rows, t0());
+        let plain = agent_verdict(Some("claude"), false, None, &rows, t0());
+        assert_eq!(guarded, plain);
+        assert_eq!(guarded.word(), "prompt");
+        assert!(guarded.subject().is_some());
+    }
+
     /// `agent=wall:<kind>` is `wall:` and aterm-phase's own kind name, for
     /// every kind; the band keeps `limited` for exactly the kinds
     /// `worker_phase` has always read so.
@@ -2697,6 +2969,7 @@ mod tests {
                 retryable: true,
             },
             K::Overloaded,
+            K::Memory,
         ];
         for kind in kinds {
             assert_eq!(wall_word(kind), format!("wall:{}", kind.name()));
@@ -2757,16 +3030,68 @@ mod tests {
             ("quoted 529", quoted, "idle"),
         ];
         for (name, rows, want) in &cases {
-            let v = agent_verdict(Some("claude"), false, false, rows, t0());
+            let v = agent_verdict(Some("claude"), false, None, rows, t0());
             assert_eq!(v.word(), *want, "{name}");
-            let shell = agent_verdict(Some("zsh"), false, false, rows, t0());
+            let shell = agent_verdict(Some("zsh"), false, None, rows, t0());
             assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
         }
         // The detail is the reset the notice named, nothing of its text.
-        let session = agent_verdict(Some("claude"), false, false, &cases[1].1, t0());
+        let session = agent_verdict(Some("claude"), false, None, &cases[1].1, t0());
         assert_eq!(
             session.detail().as_deref(),
             Some("3pm (America/Los_Angeles)")
+        );
+    }
+
+    /// Claude Code's critical-memory banner under a RUNNING spinner (the
+    /// 2026-09-24 incident: 36 minutes into a turn, 38.8 GiB resident, no
+    /// input read for 2h41m) publishes `wall:memory`, not `busy` — the one
+    /// wall aterm-phase keeps under a hard busy — with no detail and the
+    /// band word `memory`, never `limited`. NEGATIVE CONTROLS: the same
+    /// words in the composer draft alone read `busy`, and under a shell the
+    /// screen is no agent. The row is built from aterm-phase's anchor.
+    #[test]
+    fn the_memory_banner_publishes_wall_memory_under_a_busy_spinner() {
+        use aterm_phase::prompt::fixtures::composer;
+        let banner = format!(
+            "{} (140.4GB) \u{2014} restart and resume with {}",
+            aterm_phase::anchor_text("wall.memory"),
+            aterm_phase::resume_hint(aterm_phase::Program::Claude).unwrap()
+        );
+        let screen = |banner_row: &str, draft: &str| {
+            let mut r = vec![
+                "\u{23fa} Running the reflow suite.".to_string(),
+                String::new(),
+                "\u{00b7} Gesticulating\u{2026} (36m 1s)".to_string(),
+                banner_row.to_string(),
+            ];
+            let mut frame =
+                composer("  \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt");
+            frame[1] = format!("\u{276f} {draft}");
+            r.extend(frame);
+            r
+        };
+        // Right-aligned, ending two columns short of the 120-column rule.
+        let live = screen(&format!("{banner:>118}"), "");
+        let v = agent_verdict(Some("claude"), false, None, &live, t0());
+        assert_eq!(v.word(), "wall:memory");
+        assert_eq!(v.detail(), None);
+        match &v {
+            AgentVerdict::Agent { reading, .. } => {
+                assert_eq!(reading.phase.band_word(), "memory");
+            }
+            AgentVerdict::NotAgent => panic!("claude is an agent by name"),
+        }
+        assert!(!aterm_phase::WallKind::Memory.reads_limited());
+        let quoted = screen("", &banner);
+        assert_eq!(
+            agent_verdict(Some("claude"), false, None, &quoted, t0()).word(),
+            "busy",
+            "the draft's quote"
+        );
+        assert_eq!(
+            agent_verdict(Some("zsh"), false, None, &live, t0()).word(),
+            "-"
         );
     }
 
@@ -2777,14 +3102,14 @@ mod tests {
     fn a_reading_without_evidence_is_unknown_not_idle() {
         use aterm_phase::prompt::fixtures::{CODEX_TRUST, screen};
         let idle = screen("\u{203a} ready\n\n  gpt-5 \u{00b7} 100% context left\n");
-        match agent_verdict(Some("codex"), false, false, &idle, t0()) {
+        match agent_verdict(Some("codex"), false, None, &idle, t0()) {
             AgentVerdict::Agent { reading, .. } => {
                 assert_eq!(reading.phase, AgentPhase::Unknown);
                 assert_eq!(reading.phase.word(), "unknown");
             }
             AgentVerdict::NotAgent => panic!("codex is an agent by name"),
         }
-        let gate = agent_verdict(Some("codex"), false, false, &screen(CODEX_TRUST), t0());
+        let gate = agent_verdict(Some("codex"), false, None, &screen(CODEX_TRUST), t0());
         assert_eq!(gate.word(), "prompt");
     }
 
@@ -2793,106 +3118,136 @@ mod tests {
     #[test]
     fn the_prompt_subject_comes_from_the_reading() {
         use aterm_phase::prompt::fixtures::{BOX_RM, END_529, screen};
-        let rm = agent_verdict(Some("claude"), false, false, &screen(BOX_RM), t0());
+        let rm = agent_verdict(Some("claude"), false, None, &screen(BOX_RM), t0());
         assert_eq!(rm.word(), "prompt");
         let subject = rm.subject().expect("the rm box names its command");
         assert!(subject.contains("rm"), "{subject}");
         assert!(!subject.contains('\n'));
-        let wall = agent_verdict(Some("claude"), false, false, &screen(END_529), t0());
+        let wall = agent_verdict(Some("claude"), false, None, &screen(END_529), t0());
         assert_eq!(wall.subject(), None);
     }
 
-    /// The reset clock reads the notice's own words: a bare time, a 12-hour
-    /// time with its meridian attached or apart, a month-day, a zone in
-    /// parens — and refuses what it cannot place.
+    /// THE FRESH PANE (the live run of 2026-09-26: Claude Code 2.1.283 in a
+    /// private headless aterm, a fresh 149x62 pane whose shell prompt sat at
+    /// the top). The folder-trust dialog was drawn on rows 5-20, wholly above
+    /// the last 40 rows of the screen, every one of them blank, and `status`
+    /// published `agent=idle` for 3+ minutes: the zone was the last 40 rows
+    /// of the SCREEN. It is the last 40 rows of the screen's CONTENT
+    /// ([`live_zone`]): the dialog is published a trust prompt — by the
+    /// program's name, and by its frame while the program is unnamed. The
+    /// same session's subagent Bash box with the rm breaker's note, drawn at
+    /// the top of the pane, likewise (its command the subject, clipped). NEGATIVE
+    /// CONTROLS: an idle Claude composer at the top of the same pane, blank
+    /// rows under it, stays idle; and a screen whose last row has content
+    /// keeps its last 40 rows as its zone, unchanged.
     #[test]
-    fn the_reset_clock_reads_the_notices_words() {
-        let spec = |date, hour, minute, zone: Option<&str>| ResetSpec {
-            date,
-            hour,
-            minute,
-            zone: zone.map(str::to_string),
+    fn a_box_above_the_last_rows_of_a_mostly_blank_pane_is_classified() {
+        use aterm_phase::prompt::fixtures::{self as f, composer, screen};
+        let blank_foot = |rows: &[String]| {
+            rows[rows.len() - CLASSIFY_ROWS..]
+                .iter()
+                .all(String::is_empty)
         };
-        assert_eq!(
-            parse_reset("7:30pm (America/Los_Angeles)"),
-            Some(spec(None, 19, 30, Some("America/Los_Angeles")))
-        );
-        assert_eq!(parse_reset("3am"), Some(spec(None, 3, 0, None)));
-        assert_eq!(parse_reset("12am"), Some(spec(None, 0, 0, None)));
-        assert_eq!(parse_reset("12:15 pm"), Some(spec(None, 12, 15, None)));
-        assert_eq!(parse_reset("19:30"), Some(spec(None, 19, 30, None)));
-        assert_eq!(
-            parse_reset("Sep 19 at 11am (America/Los_Angeles)"),
-            Some(spec(Some((9, 19)), 11, 0, Some("America/Los_Angeles")))
+        let trust = screen(f::TRUST_FRESH_PANE);
+        assert_eq!(trust.len(), 62);
+        assert!(
+            blank_foot(&trust),
+            "the dialog is wholly above the last 40 rows"
         );
         assert_eq!(
-            parse_reset("Sep 19, 11:00"),
-            Some(spec(Some((9, 19)), 11, 0, None))
+            live_zone(&trust),
+            &trust[..],
+            "21 rows of content: all of it"
         );
-        assert_eq!(parse_reset("soon"), None);
-        assert_eq!(parse_reset("25:00"), None);
-        assert_eq!(parse_reset("13pm"), None);
-        assert_eq!(parse_reset(""), None);
+        for program in [Some("claude"), None] {
+            let v = agent_verdict(program, false, None, &trust, t0());
+            assert_eq!(v.word(), "prompt", "{program:?}");
+            assert_eq!(v.detail().as_deref(), Some("trust"), "{program:?}");
+            assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
+        }
+
+        let live = screen(f::BOX_RM_SUBAGENT_FRESH_PANE);
+        let mut boxed = vec![String::new()];
+        boxed.extend_from_slice(&live[22..=40]);
+        boxed.resize(62, String::new());
+        assert!(blank_foot(&boxed));
+        for program in [Some("claude"), None] {
+            let v = agent_verdict(program, false, None, &boxed, t0());
+            assert_eq!(v.word(), "prompt", "{program:?}");
+            assert_eq!(
+                v.detail().as_deref(),
+                Some("bash:not-read-only"),
+                "{program:?}"
+            );
+            assert!(
+                v.subject()
+                    .is_some_and(|s| s.starts_with("cd /var/folders/")),
+                "{:?}",
+                v.subject()
+            );
+        }
+
+        let mut idle = aterm_phase::prompt::fixtures::rows(&[
+            "\u{23fa} Done.",
+            "",
+            "\u{273b} Cogitated for 4s \u{00b7} done 2:41 PM",
+            "",
+        ]);
+        idle.extend(composer("  ? for shortcuts"));
+        idle.resize(62, String::new());
+        assert!(blank_foot(&idle));
+        for program in [Some("claude"), None] {
+            let v = agent_verdict(program, false, None, &idle, t0());
+            assert_eq!(v.word(), "idle", "{program:?}");
+        }
+
+        // The live capture's content ends on row 40: its zone is the last
+        // 40 rows of that content and the blank foot under it. A screen with
+        // content on its last row: its last 40 rows, as it always was; an
+        // all-blank one reads whole.
+        assert_eq!(live_zone(&live), &live[41 - CLASSIFY_ROWS..]);
+        let mut full = trust.clone();
+        full[61] = "x".to_string();
+        assert_eq!(live_zone(&full), &full[62 - CLASSIFY_ROWS..]);
+        let blank = vec![String::new(); 62];
+        assert_eq!(live_zone(&blank).len(), 62);
     }
 
-    /// The countdown is measured on THIS machine's clock: a bare clock time
-    /// two hours from now counts down two hours; one an hour ago is tomorrow's;
-    /// a dated reset behind us is no figure at all. Pure through
-    /// [`countdown_at`] at a fixed clock, then the live path once.
+    /// The countdown is measured on THIS machine's clock, through the
+    /// supervisor's own reset grammar (`supervise::limit`, whose tests own
+    /// the words): a bare clock time two hours ahead counts down two hours;
+    /// one an hour ago has fallen (a session limit resets within five hours,
+    /// so it is today's, passed) and is no figure; a dated reset behind us is
+    /// no figure; the span and the auto-continue forms the band's old copy of
+    /// the grammar could not read count down too; a notice in another zone is
+    /// no figure, never a wrong one. Pure through [`countdown_at`] at a fixed
+    /// clock, then the live path once.
     #[test]
-    fn the_countdown_is_to_the_next_such_time_on_this_clock() {
+    fn the_countdown_is_to_the_reset_on_this_clock() {
         // 2026-09-19 10:00:00 UTC, at -0700: 03:00 local on the 19th.
         let now = 1_789_812_000_i64;
         let off = -7 * 3600;
-        let spec = |date, hour, minute| ResetSpec {
-            date,
-            hour,
-            minute,
-            zone: None,
-        };
+        let la = Some("America/Los_Angeles");
+        let at = |text: &str| countdown_at(text, now, off, la);
+        assert_eq!(at("5am"), Some(Duration::from_secs(2 * 3600)));
+        assert_eq!(at("2am"), None, "an hour ago has fallen");
+        assert_eq!(at("3am"), None, "now is no countdown");
         assert_eq!(
-            countdown_at(&spec(None, 5, 0), now, off),
-            Some(Duration::from_secs(2 * 3600))
-        );
-        assert_eq!(
-            countdown_at(&spec(None, 2, 0), now, off),
-            Some(Duration::from_secs(23 * 3600)),
-            "an hour ago is tomorrow's"
-        );
-        assert_eq!(
-            countdown_at(&spec(None, 3, 0), now, off),
-            Some(Duration::from_secs(86_400))
-        );
-        assert_eq!(
-            countdown_at(&spec(Some((9, 21)), 11, 0), now, off),
+            at("Sep 21 at 11am (America/Los_Angeles)"),
             Some(Duration::from_secs(2 * 86_400 + 8 * 3600))
         );
+        assert_eq!(at("Sep 18 at 11am"), None, "behind us");
+        assert_eq!(at("Sep 19 at 2am"), None, "behind us today");
+        assert_eq!(at("in 45m"), Some(Duration::from_secs(45 * 60)));
         assert_eq!(
-            countdown_at(&spec(Some((9, 18)), 11, 0), now, off),
-            None,
-            "behind us"
+            at("continuing automatically at 5am"),
+            Some(Duration::from_secs(2 * 3600))
         );
-        assert_eq!(
-            countdown_at(&spec(Some((9, 19)), 2, 0), now, off),
-            None,
-            "behind us today"
-        );
-        // The offset reader: `+0200` / `-0700` / nothing else.
-        assert_eq!(parse_utc_offset("+0200"), Some(7200));
-        assert_eq!(parse_utc_offset("-0700"), Some(-25_200));
-        assert_eq!(parse_utc_offset("0700"), None);
-        assert_eq!(parse_utc_offset("+07:00"), None);
+        assert_eq!(at("5am (Etc/UTC)"), None, "another zone");
+        assert_eq!(at("soon"), None);
         // The live path, once: a bare time two hours from now on this clock.
         if let Some(offset) = local_offset_s() {
-            let local = i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap()
-                + offset
-                + 2 * 3600;
+            let local = limit::unix_now() + offset + 2 * 3600;
             let tod = local.rem_euclid(86_400);
             let text = format!("{}:{:02}", tod / 3600, (tod % 3600) / 60);
             let ahead = countdown_to_reset(&text).expect("placeable");
@@ -2901,15 +3256,6 @@ mod tests {
                     .contains(&ahead),
                 "{text}: {ahead:?}"
             );
-            // A zone that is not this machine's: no figure, never a wrong one.
-            if let Some(local_zone) = local_zone() {
-                let other = if local_zone == "Etc/UTC" {
-                    "America/Los_Angeles"
-                } else {
-                    "Etc/UTC"
-                };
-                assert_eq!(countdown_to_reset(&format!("{text} ({other})")), None);
-            }
         }
         assert_eq!(countdown_to_reset("soon"), None);
     }
@@ -3153,6 +3499,37 @@ mod tests {
     /// the program resolving to a shell, and a group still being named waits
     /// for its name. NEGATIVE CONTROL: the same screen under `node`, or with
     /// no foreground group to name, IS read as the question it shows.
+    /// A Codex started under `node` (an npm install) names no agent: its
+    /// screen does — its composer at idle ([`aterm_phase::identify`]) — and,
+    /// as Claude Code's frame does across its boxes, that identity is kept
+    /// for the job (`known_agent`): a draft standing in the composer, which
+    /// alone identifies nothing, is still read by Codex's reader. NEGATIVE
+    /// CONTROL: the draft screen with nothing known is no agent.
+    #[test]
+    fn a_node_run_codex_keeps_its_reader_across_its_job() {
+        use aterm_phase::Program;
+        use aterm_phase::codex::fixtures as cx;
+        use aterm_phase::prompt::fixtures::screen;
+        match agent_verdict(Some("node"), false, None, &screen(cx::IDLE), t0()) {
+            AgentVerdict::Agent {
+                by_frame, program, ..
+            } => assert!(by_frame && program == Program::Codex, "{program:?}"),
+            AgentVerdict::NotAgent => panic!("Codex's composer identifies it"),
+        }
+        let draft = screen(cx::DRAFT);
+        assert!(
+            matches!(
+                agent_verdict(Some("node"), false, None, &draft, t0()),
+                AgentVerdict::NotAgent
+            ),
+            "NEGATIVE CONTROL: a draft alone names nothing"
+        );
+        match agent_verdict(Some("node"), false, Some(Program::Codex), &draft, t0()) {
+            AgentVerdict::Agent { program, .. } => assert_eq!(program, Program::Codex),
+            AgentVerdict::NotAgent => panic!("the job's identity is kept"),
+        }
+    }
+
     #[test]
     fn a_shell_showing_a_captured_claude_frame_is_not_an_agent() {
         let mut rows = vec![
@@ -3165,24 +3542,24 @@ mod tests {
             "PRECONDITION"
         );
         for program in ["sh", "zsh", "cat", "less"] {
-            for known in [false, true] {
+            for known in [None, Some(aterm_phase::Program::Claude)] {
                 assert!(
                     matches!(
                         agent_verdict(Some(program), false, known, &rows, t0()),
                         AgentVerdict::NotAgent
                     ),
-                    "{program} (known={known}) is not an agent"
+                    "{program} (known={known:?}) is not an agent"
                 );
             }
         }
         // A group whose name is still being resolved identifies nothing yet
         // (the shell's own group is re-named after every job).
         assert!(matches!(
-            agent_verdict(None, true, false, &rows, t0()),
+            agent_verdict(None, true, None, &rows, t0()),
             AgentVerdict::NotAgent
         ));
         for program in [None, Some("node")] {
-            match agent_verdict(program, false, false, &rows, t0()) {
+            match agent_verdict(program, false, None, &rows, t0()) {
                 AgentVerdict::Agent {
                     reading, by_frame, ..
                 } => {

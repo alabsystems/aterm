@@ -52,7 +52,7 @@
 //! two answers, and this module ships both:
 //!
 //! 1. **Make the slot's address stable, so the move never touches it.**
-//!    [`WeakObj`] and [`Weak<T>`] own a `Box<`[`WeakSlot`]`>`; a move moves the
+//!    [`WeakObj`] owns a `Box<`[`WeakSlot`]`>`; a move moves the
 //!    BOX POINTER and the registered address does not change. This is the safe
 //!    API and the one every call site should use. (It is also objc2's answer,
 //!    reached independently and for the same reason.)
@@ -177,9 +177,7 @@
 
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::marker::PhantomData;
 
-use crate::retained::{ClassType, Retained};
 use crate::runtime::{Id, Obj};
 
 #[link(name = "objc")]
@@ -285,7 +283,7 @@ impl WeakSlot {
     /// and `value` must be nil or a live, non-deallocating object. The slot's
     /// address is unchanged, so the immovability obligation from
     /// [`WeakSlot::init`] continues to apply.
-    pub unsafe fn store(&self, value: Id) {
+    pub(crate) unsafe fn store(&self, value: Id) {
         // SAFETY: the caller pins the slot as initialised; `objc_storeWeak`
         // unregisters this address from its old target under the weak lock and
         // registers it with `value`.
@@ -340,7 +338,7 @@ impl WeakSlot {
     /// # Safety
     /// `self` must be UNINITIALISED and `from` INITIALISED, and both carry the
     /// immovability obligation from [`WeakSlot::init`] afterwards.
-    pub unsafe fn copy_from(&self, from: &Self) {
+    pub(crate) unsafe fn copy_from(&self, from: &Self) {
         // SAFETY: the caller pins `self` uninitialised and `from` initialised;
         // `objc_copyWeak` reads `from` under the weak lock and registers
         // `self`'s address with the same target, leaving `from` alone.
@@ -418,8 +416,7 @@ impl fmt::Debug for WeakSlot {
 /// reference to an `NSWindow`, which is an `objc2` BINDING type; this crate
 /// deliberately has no bindings, so there is no Rust type to parameterise over
 /// and the honest handle is the one that carries an address and an ownership
-/// rule and nothing else. [`Weak<T>`] is the typed twin for classes
-/// [`crate::declare_class!`] mints.
+/// rule and nothing else.
 ///
 /// # Moving this is free and correct
 ///
@@ -570,87 +567,6 @@ impl fmt::Debug for WeakObj {
             f,
             "WeakObj@{:p}({})",
             self.slot.addr(),
-            if self.is_live() { "live" } else { "gone" }
-        )
-    }
-}
-
-/// A TYPED weak reference — the weak twin of [`Retained<T>`].
-///
-/// Same machinery as [`WeakObj`], plus the class type, for the classes
-/// [`crate::declare_class!`] mints. The bound is [`ClassType`], the same trait
-/// [`Retained`] carries, so a weak reference is expressible for exactly the
-/// classes this crate can name and no others.
-pub struct Weak<T: ClassType> {
-    inner: WeakObj,
-    /// `Weak<T>` does NOT own a `T` — that is the point of it — but it must be
-    /// invariant-free in the same way `Retained<T>` is, so it carries the
-    /// borrow-shaped marker rather than the owning one.
-    _ty: PhantomData<fn() -> T>,
-}
-
-impl<T: ClassType> Weak<T> {
-    /// A weak reference to a live instance of `T`.
-    ///
-    /// Safe, for [`WeakObj::from_obj`]'s reason: the caller is holding a +1.
-    #[must_use]
-    pub fn from_retained(obj: &Retained<T>) -> Self {
-        // SAFETY: `obj` owns a live +1 reference for the duration of the call,
-        // so its target is live and not mid-`dealloc`.
-        Self {
-            inner: unsafe { WeakObj::new(obj.as_id()) },
-            _ty: PhantomData,
-        }
-    }
-
-    /// An empty typed weak reference.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            inner: WeakObj::empty(),
-            _ty: PhantomData,
-        }
-    }
-
-    /// The target at +1, or `None`.
-    #[must_use]
-    pub fn load(&self) -> Option<Retained<T>> {
-        let obj = self.inner.load()?;
-        // SAFETY: this handle was constructed from a `Retained<T>`, so the
-        // target is an instance of `T`'s class; `obj` owns the +1
-        // `objc_loadWeakRetained` produced and `into_raw` passes it on.
-        unsafe { Retained::from_owned(obj.into_raw()) }
-    }
-
-    /// Whether the target is still alive.
-    #[must_use]
-    pub fn is_live(&self) -> bool {
-        self.inner.is_live()
-    }
-
-    /// A second typed weak reference to the same instance.
-    #[must_use]
-    pub fn clone_weak(&self) -> Self {
-        Self {
-            inner: self.inner.clone_weak(),
-            _ty: PhantomData,
-        }
-    }
-
-    /// The untyped handle underneath, borrowed.
-    #[must_use]
-    pub const fn as_untyped(&self) -> &WeakObj {
-        &self.inner
-    }
-}
-
-impl<T: ClassType> fmt::Debug for Weak<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Weak<{}>@{:p}({})",
-            T::NAME,
-            self.inner.slot_addr(),
             if self.is_live() { "live" } else { "gone" }
         )
     }

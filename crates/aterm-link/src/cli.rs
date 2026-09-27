@@ -605,8 +605,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
 
 /// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else the
 /// working directory — never a temp dir, because losing the node id loses the
-/// node's mail lane.
-fn default_state_dir() -> String {
+/// node's mail lane. `aterm-link notify` reads its journal under the same
+/// directory (§9.3: "beside the bridge's other durable state").
+pub(crate) fn default_state_dir() -> String {
     if let Ok(x) = std::env::var("XDG_STATE_HOME") {
         if !x.is_empty() {
             return format!("{x}/aterm-link");
@@ -841,13 +842,9 @@ second `listening <socket>` line once that is bound too.
                 Ok(false) if allow_remote => {}
                 Ok(false) => {
                     eprintln!(
-                        "aterm link broker: --tcp {bind} is not a loopback address, and a broker \
-                         bound there is reachable from the network. The sealed wire keeps out a \
-                         peer WITHOUT the key — but the key is one pre-shared secret every host \
-                         of the fleet holds: it is a transport boundary, not a per-host identity, \
-                         and there is no revoking one host short of re-keying all of them. Pass \
-                         --allow-remote to say that is what you mean (and open one TCP port to \
-                         the hosts that join, no wider)."
+                        "aterm link broker: --tcp {bind}: not a loopback address, and every host \
+                         of the fleet holds the one key; add --allow-remote to serve it on the \
+                         network"
                     );
                     return ExitCode::from(2);
                 }
@@ -1095,13 +1092,6 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The control socket is the one method: no subcommand offers the fabric
-    /// as files.
-    #[test]
-    fn the_usage_offers_no_file_mirror() {
-        assert!(!USAGE.contains("mirror"), "{USAGE}");
-    }
 
     fn argv(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_string).collect()

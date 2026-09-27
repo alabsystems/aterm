@@ -17,8 +17,8 @@
 // PROVEN INVARIANTS (the W6 brief):
 //   1. Styled-face resolution is TOTAL: every (style, config) input resolves
 //      to a face without panic, falling back to Primary.
-//   2. Chain precedence law: explicit TOML entries strictly outrank env
-//      aliases, which strictly outrank discovery.
+//   2. Chain precedence law: explicit TOML entries strictly outrank
+//      discovery.
 //   3. (Config round-trip for the new keys lives with the config code:
 //      aterm-gui/src/prefs.rs `w6_font_keys_round_trip`.)
 
@@ -175,34 +175,26 @@ fn resolve_styled_face_precedence_pins() {
 }
 
 /// INVARIANT 2 (the precedence LAW, over the full presence lattice): the chain
-/// is exactly `config ++ env ++ discovery` — every config entry precedes every
-/// env entry precedes every discovery entry, relative order within each class
-/// is preserved, and nothing is dropped or invented. Marker strings make class
-/// membership unambiguous.
+/// is exactly `config ++ discovery` — every config entry precedes every
+/// discovery entry, relative order within each class is preserved, and nothing
+/// is dropped or invented. Marker strings make class membership unambiguous.
 #[test]
 fn fallback_chain_order_precedence_law() {
     let configs: [&[&str]; 3] = [&[], &["c1"], &["c1", "c2"]];
-    let envs = [None, Some("e1")];
     let discos: [&[&str]; 3] = [&[], &["d1"], &["d1", "d2"]];
     for cfg in configs {
-        for env in envs {
-            for disc in discos {
-                let cfg_v: Vec<String> = cfg.iter().map(|s| (*s).to_string()).collect();
-                let disc_v: Vec<String> = disc.iter().map(|s| (*s).to_string()).collect();
-                let out = fallback_chain_order(&cfg_v, env.map(str::to_string), &disc_v);
-                // Nothing dropped or invented; order == concatenation.
-                let mut expect = cfg_v.clone();
-                expect.extend(env.map(str::to_string));
-                expect.extend(disc_v.clone());
-                assert_eq!(out, expect, "cfg {cfg:?} env {env:?} disc {disc:?}");
-                // Class precedence: positions strictly increase config < env < disc.
-                let pos = |m: &str| out.iter().position(|x| x == m);
-                if let (Some(c), Some(e)) = (pos("c1"), pos("e1")) {
-                    assert!(c < e, "config must outrank env");
-                }
-                if let (Some(e), Some(d)) = (pos("e1"), pos("d1")) {
-                    assert!(e < d, "env must outrank discovery");
-                }
+        for disc in discos {
+            let cfg_v: Vec<String> = cfg.iter().map(|s| (*s).to_string()).collect();
+            let disc_v: Vec<String> = disc.iter().map(|s| (*s).to_string()).collect();
+            let out = fallback_chain_order(&cfg_v, &disc_v);
+            // Nothing dropped or invented; order == concatenation.
+            let mut expect = cfg_v.clone();
+            expect.extend(disc_v.clone());
+            assert_eq!(out, expect, "cfg {cfg:?} disc {disc:?}");
+            // Class precedence: every config position precedes every discovery one.
+            let pos = |m: &str| out.iter().position(|x| x == m);
+            if let (Some(c), Some(d)) = (pos("c2").or(pos("c1")), pos("d1")) {
+                assert!(c < d, "config must outrank discovery");
             }
         }
     }
@@ -210,36 +202,26 @@ fn fallback_chain_order_precedence_law() {
 
 /// Tier-1 bind to the FallbackPrecedence ty model: the real function's FIRST
 /// candidate class equals the model's `winner` for every presence combination
-/// (1 = config, 2 = env, 3 = discovery; discovery is always non-empty in the
-/// shipping candidate lists).
+/// (1 = config, 2 = discovery; discovery is always non-empty in the shipping
+/// candidate lists). The negative control is the model's own `Buggy` arm
+/// (discovery first), which `ty` refutes.
 #[test]
 fn fallback_chain_order_first_element_matches_model_winner() {
     let disc = vec!["d".to_string()];
-    for (cfg_present, env_present) in [(false, false), (true, false), (false, true), (true, true)] {
+    for cfg_present in [false, true] {
         let cfg: Vec<String> = if cfg_present {
             vec!["c".into()]
         } else {
             vec![]
         };
-        let env = env_present.then(|| "e".to_string());
-        let out = fallback_chain_order(&cfg, env, &disc);
+        let out = fallback_chain_order(&cfg, &disc);
         let winner = match out.first().map(String::as_str) {
             Some("c") => 1,
-            Some("e") => 2,
-            Some("d") => 3,
+            Some("d") => 2,
             other => panic!("unexpected head {other:?}"),
         };
-        let expect = if cfg_present {
-            1
-        } else if env_present {
-            2
-        } else {
-            3
-        };
-        assert_eq!(
-            winner, expect,
-            "cfg_present {cfg_present} env_present {env_present}"
-        );
+        let expect = if cfg_present { 1 } else { 2 };
+        assert_eq!(winner, expect, "cfg_present {cfg_present}");
     }
 }
 

@@ -389,13 +389,14 @@ fn coord(cols: u16, rows: u16) -> ffi::COORD {
 }
 
 /// Spawn the selected shell in a fresh ConPTY of `rows`×`cols`, returning the
-/// master key. Same contract as the Unix `spawn_shell` (see the crate docs and
+/// master key. Same contract as the Unix `spawn_shell_with_pid` (see the crate docs and
 /// [`spawn_shell_with_pid`] for the full sequence); this thin wrapper drops the
 /// pid and preserves the historical hardened default limits.
 ///
 /// # Errors
 /// See [`spawn_shell_with_pid`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn spawn_shell(
     rows: u16,
     cols: u16,
@@ -443,7 +444,7 @@ pub fn spawn_shell(
 /// profile on macOS.)
 ///
 /// `limits` are actuated on the Job Object while the child is still SUSPENDED
-/// (`aterm_sandbox::job_limits_actuated()` is `true`): the address-space, CPU,
+/// (`aterm_sandbox::Limits::apply_to_job`): the address-space, CPU,
 /// active-process and UI-restriction lanes fold into the job before resume. A
 /// limit that cannot be installed terminates the never-resumed child and fails
 /// closed with the actuator's error.
@@ -1190,11 +1191,9 @@ pub enum ReadOutcome {
     Eof,
     /// Never produced on Windows (ConPTY teardown EOFs the reader — see
     /// [`make_wake_pipe`]); present to mirror the Unix enum for the shared loop.
-    #[allow(dead_code)]
     Wake,
     /// Never produced on Windows (a plain blocking read has no poll-timeout / stop-flag
     /// path); present to mirror the Unix enum for the shared loop.
-    #[allow(dead_code)]
     Idle,
 }
 
@@ -1257,6 +1256,36 @@ pub fn fd_is_tty(_fd: i32) -> bool {
 /// on Unix.
 #[must_use]
 pub fn tty_echo(_master: i32) -> Option<crate::TtyEcho> {
+    None
+}
+
+/// Windows twin of the Unix [`input_queue_len`]: ConPTY's input pipe is read
+/// by conhost, not by the program, so its depth says nothing about whether the
+/// program is reading — `None`, the same "not measured" a non-tty fd gets on
+/// Unix, and a caller that gates on the count then never refuses here.
+#[must_use]
+pub fn input_queue_len(_master: i32) -> Option<usize> {
+    None
+}
+
+/// Windows twin of the Unix [`output_queue_len`]: `None`, for the reason
+/// [`input_queue_len`] gives.
+#[must_use]
+pub fn output_queue_len(_master: i32) -> Option<usize> {
+    None
+}
+
+/// Windows twin of the Unix [`tty_passes_every_byte`]: `None` — ConPTY has no
+/// line discipline to ask ([`tty_echo`]), so no queue count is read as a read.
+#[must_use]
+pub fn tty_passes_every_byte(_master: i32) -> Option<bool> {
+    None
+}
+
+/// Windows twin of the Unix [`flush_input_queue`]: `None`, nothing discarded —
+/// there is no measured queue to flush ([`input_queue_len`]).
+#[must_use]
+pub fn flush_input_queue(_master: i32) -> Option<usize> {
     None
 }
 
@@ -1460,7 +1489,8 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
 /// shell can never starve the terminal itself. Failures are ignored like the
 /// Unix `TIOCSWINSZ`'s (a dead child's handle simply no-ops); a
 /// fabricated/closed key is a no-op. Cheap non-blocking syscalls — safe on
-/// the UI thread. `ATERM_TRACE_BOOST=1` traces each application to stderr.
+/// the UI thread. A development build's `ATERM_TRACE_BOOST` seam
+/// ([`aterm_types::dev_seam!`]) traces each application to stderr.
 pub fn set_focus_boost(master: i32, on: bool) {
     let Some(s) = session(master) else {
         return;
@@ -1497,7 +1527,7 @@ pub fn set_focus_boost(master: i32, on: bool) {
                 std::mem::size_of::<ffi::PROCESS_POWER_THROTTLING_STATE>() as u32,
             )
         };
-        if std::env::var_os("ATERM_TRACE_BOOST").is_some() {
+        if aterm_types::dev_seam!("ATERM_TRACE_BOOST").is_some() {
             let which = if h == s.process { "shell" } else { "conhost" };
             // Best-effort: `eprintln!` PANICS when stderr is closed or its reader is
             // gone, and this trace runs on the spawn path inside the GUI process.

@@ -11,7 +11,7 @@ rust-version.workspace = true
 # isolated crypto-dependency boundary -- exactly as astream-cap isolates sha2.
 # forbid(unsafe) applies to THIS crate's own code (the dep may use SIMD unsafe).
 [dependencies]
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
 getrandom = "0.2"
 # Rung 7 handshake, behind the `handshake` feature (off by default). We OWN the
 # protocol, the transcript binding, and HMAC/HKDF-SHA256 (composed here over the

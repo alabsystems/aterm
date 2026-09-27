@@ -13,7 +13,6 @@ description = "OSC / escape-sequence policy engine data model and built-in profi
 default = []
 
 [dependencies]
-aterm-error = { workspace = true }
 serde = { workspace = true }
 aterm-toml = { workspace = true }
 # aterm_time::Instant is a byte-identical re-export of std on native, but uses

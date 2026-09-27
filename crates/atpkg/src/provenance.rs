@@ -44,7 +44,10 @@
 //! (v0.83.0, 2026-09-12: bundle `trust/8590`, seeded from a shell that was itself
 //! tracked). The 02:27 seed of `trust/8589` by the app's own update lane, from an
 //! untracked app, came out clean, and the cut succeeded once that bundle was first on
-//! PATH. So every store-changing door and `aterm pkg repair` end with [`heal_store`], the
+//! PATH. So every build is healed as it is staged, before its flip ([`heal_staged`]: after
+//! it, the heal moved ctimes a running tippy pins), and so is each part of the rustup view
+//! before it is exchanged into place (`seam::swap_in`: a tracked `rename(2)` tags what it
+//! moves); every store-changing door and `aterm pkg repair` end with [`heal_store`], the
 //! cutter clears its own toolchain with [`heal`] and refuses before the claim whatever
 //! stays tagged (`aterm-release::gates::provenance_gate`), and `aterm pkg doctor` counts
 //! what is still tagged. Installs write in-process like any other program: until
@@ -97,13 +100,13 @@ pub fn xattr_names(path: &Path) -> io::Result<Vec<String>> {
 /// the store scan reads ([`scan_roots`]), which must never wander out of the roots it was
 /// handed.
 #[cfg(target_os = "macos")]
-fn xattr_names_nofollow(path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn xattr_names_nofollow(path: &Path) -> io::Result<Vec<String>> {
     list_names(path, libc::XATTR_NOFOLLOW)
 }
 
 /// See the macOS body.
 #[cfg(not(target_os = "macos"))]
-fn xattr_names_nofollow(_path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn xattr_names_nofollow(_path: &Path) -> io::Result<Vec<String>> {
     Ok(Vec::new())
 }
 
@@ -451,6 +454,37 @@ pub fn heal_store(layout: &crate::store::Layout) -> HealOutcome {
     heal_store_with(layout, store_healer())
 }
 
+/// [`heal`] over ONE staged build, BEFORE the flip makes it live — what every stage of a
+/// build runs between its extract and its activation (`flow::stage_fetched`, and the
+/// single-program install), and what the rustup view runs over itself before each part is
+/// exchanged in (`seam::swap_in`) — so the door-end [`heal_store`] finds that tree clean and
+/// touches nothing a running tool pins. The caller holds the store lock. The door-end heal
+/// stays the backstop, and it is the one that speaks: a staged build this heal could not
+/// clear is flipped all the same and cleared, or reported, at the door's end.
+///
+/// MEASURED 2026-09-26 (macOS 26 / Darwin 25.6, installed trust build 9192, on an APFS
+/// clone of it made under a worktree's `target/` by a TRACKED shell — the state a build a
+/// person's `aterm pkg update` stages is in; never the real prefix):
+/// * clearing the tag moves `st_ctime` and never `st_mtime` or the inode, on the build
+///   root, `bin/`, `lib/` and every executable in `bin/` (+1.1 s, the job's own moment);
+/// * that is exactly what tippy refuses: it holds the toolchain's `bin/` and sysroot to
+///   their EXACT metadata, its executables likewise, and an ancestor's ctime moving without
+///   its mtime is its rename-and-restore signature (`tippy/src/path_identity.rs`). A `targo
+///   tippy` started from the tagged clone and parked in a build script exited 2 once the
+///   heal ran under it — "compiler identity changed while Targo was running: selected
+///   Trust toolchain directory ancestor `…/9192/bin` changed identity or contents" — and
+///   the same run with no heal exited 0;
+/// * the backstop is safe over a build healed here: a door-end job that still runs (the
+///   shims the flip lays are tagged) left every ctime in the already-clean build as it was.
+///
+/// So after the flip, the heal was a hazard for any tippy started between the flip and the
+/// door's end; before it, nothing runs from the tree. Inside atpkg's own unit tests this is
+/// `test_bind`'s stand-in, exactly as [`heal_store`] is.
+#[must_use]
+pub fn heal_staged(layout: &crate::store::Layout, build_dir: &Path) -> HealOutcome {
+    store_healer()(&[build_dir.to_path_buf()], &heal_scratch(layout))
+}
+
 /// The heal [`heal_store`] runs: [`heal`].
 #[cfg(not(test))]
 fn store_healer() -> Healer {
@@ -479,13 +513,37 @@ pub(crate) mod test_bind {
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
 
+    /// What a test reads at the moment of each heal, before its scan ([`observe`]).
+    type Observer = Box<dyn Fn(&[PathBuf])>;
+
     thread_local! {
         static REAL: Cell<bool> = const { Cell::new(false) };
         static FAKED: RefCell<Vec<(Vec<PathBuf>, Scan)>> = const { RefCell::new(Vec::new()) };
+        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    }
+
+    /// Hand every heal the stand-in answers on this thread to `observer` — with its roots,
+    /// at the moment it runs — until the guard drops: what lets a test say what was LIVE
+    /// when a heal ran, which the record [`faked`] keeps cannot.
+    #[cfg(unix)]
+    pub(crate) fn observe(observer: impl Fn(&[PathBuf]) + 'static) -> ObserveGuard {
+        OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(observer)));
+        ObserveGuard
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct ObserveGuard;
+
+    #[cfg(unix)]
+    impl Drop for ObserveGuard {
+        fn drop(&mut self) {
+            OBSERVER.with(|o| *o.borrow_mut() = None);
+        }
     }
 
     /// Run the REAL heal ([`super::heal`]: one launchd job when anything carries the tag)
     /// in every [`super::heal_store`] on this thread until the guard drops.
+    #[cfg(unix)]
     pub(crate) fn real() -> Guard {
         REAL.with(|r| r.set(true));
         Guard
@@ -503,6 +561,11 @@ pub(crate) mod test_bind {
     /// with nothing submitted: `Clean` when nothing carries the tag, `Healed` with the
     /// count otherwise. Kept for the test to read ([`faked`]).
     fn scan_only(roots: &[PathBuf], _scratch: &Path) -> HealOutcome {
+        OBSERVER.with(|o| {
+            if let Some(observer) = o.borrow().as_ref() {
+                observer(roots);
+            }
+        });
         let scan = super::scan_roots(roots, super::PROVENANCE_XATTR);
         let outcome = if scan.carriers.is_empty() {
             HealOutcome::Clean
@@ -518,12 +581,15 @@ pub(crate) mod test_bind {
     /// Every store heal the stand-in answered on this thread since the last call, oldest
     /// first: the roots it was handed and what it found carrying the tag. Draining, so a
     /// test that calls it before its door reads only that door's heals.
+    #[cfg(unix)]
     pub(crate) fn faked() -> Vec<(Vec<PathBuf>, Scan)> {
         FAKED.with(|f| std::mem::take(&mut *f.borrow_mut()))
     }
 
+    #[cfg(unix)]
     pub(crate) struct Guard;
 
+    #[cfg(unix)]
     impl Drop for Guard {
         fn drop(&mut self) {
             REAL.with(|r| r.set(false));
@@ -884,6 +950,72 @@ mod tests {
             heal_with(std::slice::from_ref(&root), &scratch, "user.aterm.probe"),
             HealOutcome::Clean
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// WHY A STAGED BUILD IS HEALED BEFORE ITS FLIP (gap #35, [`heal_staged`]): clearing
+    /// the attribute moves the ctime of a directory and of an executable, and neither its
+    /// mtime nor its inode — the signature tippy refuses on a toolchain it pins — while a
+    /// later heal whose job runs for ANOTHER root (the flip's own tagged shims) leaves a
+    /// root that is already clean exactly as it was, so the door-end backstop cannot move
+    /// what the pre-flip heal cleared.
+    #[test]
+    fn clearing_moves_ctime_alone_and_a_clean_root_is_left_as_it_was() {
+        use std::os::unix::fs::MetadataExt as _;
+        let d = tmp("ctime");
+        let build = d.join("build");
+        let shims = d.join("shims");
+        let scratch = d.join("scratch");
+        for dir in [build.join("bin"), shims.clone(), scratch.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let exe = build.join("bin").join("trustc");
+        std::fs::write(&exe, b"#!/bin/true\n").unwrap();
+        let pinned = [build.clone(), build.join("bin"), exe.clone()];
+        for path in &pinned {
+            set_xattr_for_test(path, "user.aterm.probe", b"1").unwrap();
+        }
+        let stat = |path: &PathBuf| {
+            let m = std::fs::symlink_metadata(path).unwrap();
+            (
+                (m.ctime(), m.ctime_nsec()),
+                (m.mtime(), m.mtime_nsec()),
+                m.ino(),
+            )
+        };
+        let tagged: Vec<_> = pinned.iter().map(stat).collect();
+        assert_eq!(
+            heal_with(std::slice::from_ref(&build), &scratch, "user.aterm.probe"),
+            HealOutcome::Healed { cleared: 1 }
+        );
+        for (path, before) in pinned.iter().zip(&tagged) {
+            let after = stat(path);
+            assert_ne!(after.0, before.0, "{}: ctime moved", path.display());
+            assert_eq!(after.1, before.1, "{}: mtime did not", path.display());
+            assert_eq!(after.2, before.2, "{}: same inode", path.display());
+        }
+        let clean: Vec<_> = pinned.iter().map(stat).collect();
+        let shim = shims.join("trustc");
+        std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+        set_xattr_for_test(&shim, "user.aterm.probe", b"1").unwrap();
+        assert_eq!(
+            heal_with(
+                &[build.clone(), shims.clone()],
+                &scratch,
+                "user.aterm.probe"
+            ),
+            HealOutcome::Healed { cleared: 1 },
+            "the job ran, over both roots"
+        );
+        assert!(!carries(&shim, "user.aterm.probe"));
+        for (path, before) in pinned.iter().zip(&clean) {
+            assert_eq!(
+                &stat(path),
+                before,
+                "{}: a clean root is left as it was",
+                path.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

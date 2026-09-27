@@ -22,13 +22,13 @@
 //!   state-transition or side-effect methods.
 //!
 //! - **Side-effects** (inline in protocol handlers): callbacks and external
-//!   service activation (bell, buffer switch).
+//!   service activation (bell, notifications, clipboard, window ops).
 
 use crate::grid::Grid;
 
 use super::{
-    BufferActivationCallback, CurrentStyle, DcsState, MAX_RESPONSE_BUFFER_SIZE, TerminalModes,
-    TransientState, Vt52CursorState, WindowCallback,
+    CurrentStyle, DcsState, MAX_RESPONSE_BUFFER_SIZE, TerminalModes, TransientState,
+    Vt52CursorState, WindowCallback,
 };
 use aterm_types::KittyKeyboardState;
 use aterm_types::charset::CharacterSetState;
@@ -132,7 +132,6 @@ define_terminal_handler! {
     dcs: DcsState => dcs,
     shell: super::ShellIntegrationState => shell,
     marks_state: super::MarksState => marks_state,
-    semantic: super::SemanticState => semantic,
     color: super::ColorState => color,
     #[cfg(feature = "sixel")]
     sixel: super::SixelState => sixel,
@@ -169,14 +168,11 @@ define_terminal_handler! {
     kitty_file_resolver: Option<Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>> => kitty_file_resolver,
     last_bell_time: Option<aterm_time::Instant> => last_bell_time,
     bell_total: u64 => bell_total,
-    cursor_style_callback: Option<Box<dyn FnMut(aterm_types::CursorStyle) + Send>> => cursor_style_callback,
     default_cursor_style: aterm_types::CursorStyle => default_cursor_style,
-    buffer_activation_callback: Option<BufferActivationCallback> => buffer_activation_callback,
     notifications: super::NotificationState => notifications,
     clipboard: super::ClipboardState => clipboard,
     iterm2: super::Iterm2State => iterm2,
     window_callback: Option<WindowCallback> => window_callback,
-    text_sizing_callback: Option<super::callbacks::TextSizingCallback> => text_sizing_callback,
     taskbar_progress: Option<super::TaskbarProgress> => taskbar_progress,
     // Host-side OSC 52 clipboard authorization (CF-004, CF-005).
     // The only path to ClipboardWriteCapability / ClipboardQueryCapability
@@ -206,15 +202,6 @@ define_terminal_handler! {
     // handler calling it — only the reader of this line. See
     // super::hyperlink_auth.
     hyperlink_auth: super::hyperlink_auth::HyperlinkAuth => hyperlink_auth,
-    // Host-side raw DCS callback delivery authorization (CF-013).
-    // The only path to `DcsEmitCapability` is through this field's
-    // `try_mint_capability` method, which requires prior host-side
-    // authorization via `Terminal::authorize_dcs` (defaults to
-    // authorized for backward-compat). Handlers cannot construct the
-    // zero-sized token directly (private `_seal: ()` field) — so the
-    // parser path cannot reach `self.dcs.callback` without a host-
-    // issued capability. See super::dcs_auth.
-    dcs_auth: super::dcs_auth::DcsAuth => dcs_auth,
 }
 
 /// Narrow SGR-only borrow view extracted from `TerminalHandler` for style and
@@ -233,8 +220,6 @@ pub(super) struct CursorStateHandler<'a> {
     pub(super) modes: &'a mut TerminalModes,
     pub(super) charset: &'a mut CharacterSetState,
     pub(super) cursor_save: &'a mut super::CursorSaveState,
-    pub(super) cursor_style_callback:
-        &'a mut Option<Box<dyn FnMut(aterm_types::CursorStyle) + Send>>,
     /// Current underline color for DECSC/DECRC save/restore (#7295).
     pub(super) underline_color: &'a mut Option<u32>,
     /// Cached `has_transient_extras` flag for DECRC update (#7403).
@@ -267,7 +252,6 @@ impl TerminalHandler<'_> {
                 update,
                 self.shell,
                 self.marks_state,
-                self.semantic,
                 self.transient,
                 self.absolute_row_revision,
             );
@@ -289,7 +273,6 @@ impl TerminalHandler<'_> {
             modes: &mut *self.modes,
             charset: &mut *self.charset,
             cursor_save: &mut *self.cursor_save,
-            cursor_style_callback: &mut *self.cursor_style_callback,
             underline_color: &mut self.transient.current_underline_color,
             has_transient_extras: &mut self.transient.has_transient_extras,
             has_hyperlink: self.transient.current_hyperlink.is_some(),
@@ -490,7 +473,6 @@ pub(super) fn apply_absolute_row_update(
     update: aterm_grid::AbsoluteRowUpdate,
     shell: &mut super::ShellIntegrationState,
     marks_state: &mut super::MarksState,
-    semantic: &mut super::SemanticState,
     transient: &mut TransientState,
     absolute_row_revision: &mut u64,
 ) {
@@ -502,8 +484,6 @@ pub(super) fn apply_absolute_row_update(
         shell.current_block = None;
         marks_state.marks.clear();
         marks_state.annotations.clear();
-        semantic.blocks.clear();
-        semantic.buttons.clear();
         // Coordinate-bearing events were queued before the coordinate space
         // became unknowable. Keep unrelated OSC events and row-free D events,
         // but never deliver A/B/C with a row known to be wrong.
@@ -566,13 +546,6 @@ pub(super) fn apply_absolute_row_update(
     for annotation in &mut marks_state.annotations {
         shift_point(&mut annotation.row);
     }
-    for block in semantic.blocks.values_mut() {
-        shift_point(&mut block.start_row);
-        shift_optional_point(&mut block.end_row);
-    }
-    for button in &mut semantic.buttons {
-        shift_point(&mut button.row);
-    }
 }
 
 /// Parse the exact coordinate-bearing OSC 133 payloads aterm itself queues.
@@ -596,8 +569,7 @@ fn shell_event_row(payload: &str, code: u32) -> Option<(char, u64, u16)> {
 #[cfg(test)]
 mod absolute_row_update_tests {
     use super::super::{
-        Annotation, MarksState, OutputBlock, SemanticBlock, SemanticButton, SemanticState,
-        ShellIntegrationState, TerminalMark, TransientState,
+        Annotation, MarksState, OutputBlock, ShellIntegrationState, TerminalMark, TransientState,
     };
     use super::apply_absolute_row_update;
 
@@ -617,14 +589,6 @@ mod absolute_row_update_tests {
             .annotations
             .push_back(Annotation::new(0, 3, 0, "footer".into()));
 
-        let mut semantic = SemanticState::new();
-        let mut block = SemanticBlock::new("footer".into(), 3, 0);
-        block.end_row = Some(3);
-        semantic.blocks.insert("footer".into(), block);
-        semantic
-            .buttons
-            .push_back(SemanticButton::copy("footer".into(), 3, 0));
-
         let mut revision = 0;
         let mut transient = TransientState::new();
         transient
@@ -636,7 +600,6 @@ mod absolute_row_update_tests {
             aterm_grid::AbsoluteRowUpdate::Splice { at: 3, inserted: 1 },
             &mut shell,
             &mut marks,
-            &mut semantic,
             &mut transient,
             &mut revision,
         );
@@ -647,9 +610,6 @@ mod absolute_row_update_tests {
         assert_eq!(shell.output_blocks[1].end_row, Some(4));
         assert_eq!(marks.marks[0].row, 4);
         assert_eq!(marks.annotations[0].row, 4);
-        assert_eq!(semantic.blocks["footer"].start_row, 4);
-        assert_eq!(semantic.blocks["footer"].end_row, Some(4));
-        assert_eq!(semantic.buttons[0].row, 4);
         assert_eq!(
             transient.osc_events.into_iter().collect::<Vec<_>>(),
             vec![
@@ -665,7 +625,6 @@ mod absolute_row_update_tests {
     fn invalidation_drops_only_coordinate_bearing_shell_events() {
         let mut shell = ShellIntegrationState::new();
         let mut marks = MarksState::new();
-        let mut semantic = SemanticState::new();
         let mut transient = TransientState::new();
         for event in [
             (133, "A;row=3;col=0".into()),
@@ -683,7 +642,6 @@ mod absolute_row_update_tests {
             aterm_grid::AbsoluteRowUpdate::Invalidate,
             &mut shell,
             &mut marks,
-            &mut semantic,
             &mut transient,
             &mut revision,
         );

@@ -11,7 +11,7 @@
 //! # Contract
 //!
 //! * The file lives beside `aterm.log` and the crash artifacts, created
-//!   `0600`; always on, never gated by `$ATERM_LOG` — a person opening
+//!   `0600`; always on, never gated by the log level — a person opening
 //!   Settings ▸ Messages after a crash must find the record whatever their
 //!   logging preference was.
 //! * **The log never drops, and never reorders.** Appends go through a
@@ -76,7 +76,9 @@ pub(crate) const FILE_NAME: &str = "messages.log";
 /// How much of the file's tail a launch reads. The ring holds `LOG_CAP`
 /// records and a record at every cap is under 32 KiB, so the tail is the
 /// ring's ceiling, generously; a crash record with a 1.5 KiB head is the
-/// largest producer in practice (design open question 9).
+/// largest producer in practice (DESIGN-unified-messages owner question 9;
+/// its interim default, that the retention constants stand, was taken as
+/// decided on 2026-09-25).
 pub(crate) const TAIL_BYTES: u64 = 1024 * 1024;
 /// The file's rotation: renamed to `messages.log.1` past the [`TAIL_BYTES`] a
 /// launch reads, so the pair stays near 2 MiB; every writer looks within
@@ -505,6 +507,7 @@ mod tests {
             title: format!("m{id}"),
             detail: Vec::new(),
             repeats: 1,
+            mark: None,
         }
     }
 

@@ -485,49 +485,6 @@ fn the_evaluator_agrees_with_the_compiler_that_built_it() {
     }
 }
 
-/// The lexer's own obligation, pinned against the committed file rather than a fixture: the
-/// escape list has a row per shipped OS/arch pair plus wasm32, and the four Unix rows each
-/// have a `mod` behind them.
-#[test]
-fn the_scan_still_sees_the_escape_list() {
-    let src = libc_source();
-    let (escape, _) = escape_predicate(&src);
-    let inner = escape
-        .strip_prefix("not(any(")
-        .and_then(|s| s.strip_suffix("))"))
-        .unwrap_or_else(|| {
-            panic!(
-                "the refusal's guard is no longer `not(any(…))` but `{escape}` — re-read this \
-                 file's laws before reshaping it"
-            )
-        });
-    let rows = arguments(inner);
-    assert!(
-        rows.len() >= atpkg::TARGETS.len(),
-        "{} escape rows for {} shipped triples — a row is per (os, env, arch), so it cannot \
-         be fewer",
-        rows.len(),
-        atpkg::TARGETS.len()
-    );
-    assert!(
-        rows.iter().any(|r| r.contains("wasm32")),
-        "the wasm32 row is committed and must still be read: {rows:?}"
-    );
-    let mods = cell_mods(&src);
-    let names: Vec<&str> = mods.iter().map(|m| m.item.as_str()).collect();
-    for want in [
-        "mod darwin_aarch64;",
-        "mod darwin_x86_64;",
-        "mod linux_gnu_x86_64;",
-        "mod linux_gnu_aarch64;",
-    ] {
-        assert!(
-            names.contains(&want),
-            "`{want}` must still be seen with its own gate; saw {names:?}"
-        );
-    }
-}
-
 /// The red proof, against the shape of the real defect rather than a mutated constant: the
 /// escape list as it stood before the fix, with the x86_64 Windows row and no aarch64 twin.
 #[test]

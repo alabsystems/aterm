@@ -16,7 +16,6 @@ crate-type = ["cdylib", "rlib"]
 # GPU crate's whole closure is wasm32-clean.
 aterm-core = { path = "../aterm-core", default-features = false, features = ["sixel"] }
 aterm-render = { path = "../aterm-render", default-features = false }
-aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # The shared cursor-wake + sparkle-words engines (the SAME art the native app
 # runs — extracted from aterm-gui). Closure is wasm32-clean (aterm-time clock).
 aterm-effects = { path = "../aterm-effects" }

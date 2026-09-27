@@ -6,8 +6,9 @@
 //! to `packages.log` in the log directory under its HOME — and a verb the store lock
 //! refused leaves one `pass-end` saying it did not run.
 //!
-//! NEVER THE REAL STORE OR THE REAL LOG. HOME, the config dir and the state dir are temp
-//! directories; `<prefix>/declined` makes `seed` exit 0 with one sentence before any index
+//! NEVER THE REAL STORE OR THE REAL LOG. HOME, the config dir, the state dir and aterm's
+//! own state root (`ATERM_STATE_HOME`, which moves the log) are temp directories — set,
+//! never inherited, so a run from inside an isolated instance cannot write into its root; `<prefix>/declined` makes `seed` exit 0 with one sentence before any index
 //! work, so no network and no store mutation happen.
 
 #![cfg(unix)]
@@ -39,13 +40,30 @@ impl Fixture {
         Self { root, home, prefix }
     }
 
-    /// Where `packages.log` lands for this HOME: the one log-directory rule.
+    /// Where `packages.log` lands under this fixture's state root: the one
+    /// log-directory rule.
     fn log(&self) -> PathBuf {
-        aterm_types::dirs::resolve_logs_dir(aterm_types::dirs::StatePlatform {
-            home: Some(self.home.clone()),
-            xdg_state_home: Some(self.root.join("state")),
-            local_app_data: None,
-        })
+        self.log_under(Some(self.state_home()))
+    }
+
+    /// Where it would land for this HOME alone, with no state root.
+    fn home_log(&self) -> PathBuf {
+        self.log_under(None)
+    }
+
+    fn state_home(&self) -> PathBuf {
+        self.root.join("aterm-state")
+    }
+
+    fn log_under(&self, state_home: Option<PathBuf>) -> PathBuf {
+        aterm_types::dirs::resolve_logs_dir(
+            state_home,
+            aterm_types::dirs::StatePlatform {
+                home: Some(self.home.clone()),
+                xdg_state_home: Some(self.root.join("state")),
+                local_app_data: None,
+            },
+        )
         .unwrap()
         .join(atpkg::packages_log::LOG_NAME)
     }
@@ -56,6 +74,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("ATERM_STATE_HOME", self.state_home())
             .env_remove("ATPKG_DISABLE")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
             .stdin(Stdio::null())
@@ -126,6 +145,9 @@ fn every_lane_logs_its_pass_start_and_end() {
         let mode = std::fs::metadata(fx.log()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the log is the owner's alone");
     }
+    // The state root moved it: nothing landed where HOME alone puts it.
+    assert_ne!(fx.log(), fx.home_log());
+    assert!(!fx.home_log().exists(), "{}", fx.home_log().display());
 }
 
 /// A typed verb the store lock refuses leaves one `pass-end` (exit 75), no start.

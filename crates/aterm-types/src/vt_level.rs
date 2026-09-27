@@ -76,24 +76,6 @@ impl VtLevel {
         self as u8
     }
 
-    /// Create from DA2 parameter value.
-    #[must_use]
-    pub const fn from_da2_param(param: u8) -> Option<Self> {
-        match param {
-            0 => Some(Self::VT100),
-            1 => Some(Self::VT220),
-            2 => Some(Self::VT240),
-            18 => Some(Self::VT330),
-            19 => Some(Self::VT340),
-            24 => Some(Self::VT320),
-            41 => Some(Self::VT420),
-            61 => Some(Self::VT510),
-            64 => Some(Self::VT520),
-            65 => Some(Self::VT525),
-            _ => None,
-        }
-    }
-
     /// Get the DECSCL (Set Conformance Level) parameter for this level.
     ///
     /// Used in `CSI Ps ; Ps " p` sequence.
@@ -137,74 +119,6 @@ impl VtLevel {
             Self::VT525 => "VT525",
         }
     }
-
-    /// Check if this level supports 8-bit C1 control codes.
-    #[must_use]
-    pub const fn supports_c1_controls(self) -> bool {
-        matches!(
-            self,
-            Self::VT220
-                | Self::VT240
-                | Self::VT320
-                | Self::VT330
-                | Self::VT340
-                | Self::VT420
-                | Self::VT510
-                | Self::VT520
-                | Self::VT525
-        )
-    }
-
-    /// Check if this level supports user-defined keys (DECUDK).
-    #[must_use]
-    pub const fn supports_user_defined_keys(self) -> bool {
-        self.supports_c1_controls() // VT220+
-    }
-
-    /// Check if this level supports DRCS (downloadable soft fonts).
-    #[must_use]
-    pub const fn supports_drcs(self) -> bool {
-        self.supports_c1_controls() // VT220+
-    }
-
-    /// Check if this level supports Sixel graphics.
-    #[must_use]
-    pub const fn supports_sixel(self) -> bool {
-        matches!(self, Self::VT240 | Self::VT330 | Self::VT340 | Self::VT525)
-    }
-
-    /// Check if this level supports locator (mouse) input.
-    #[must_use]
-    pub const fn supports_mouse(self) -> bool {
-        matches!(
-            self,
-            Self::VT320
-                | Self::VT330
-                | Self::VT340
-                | Self::VT420
-                | Self::VT510
-                | Self::VT520
-                | Self::VT525
-        )
-    }
-
-    /// Check if this level supports rectangular area operations.
-    #[must_use]
-    pub const fn supports_rectangular_ops(self) -> bool {
-        matches!(self, Self::VT420 | Self::VT510 | Self::VT520 | Self::VT525)
-    }
-
-    /// Check if this level supports multiple pages.
-    #[must_use]
-    pub const fn supports_pages(self) -> bool {
-        matches!(self, Self::VT420 | Self::VT510 | Self::VT520 | Self::VT525)
-    }
-
-    /// Check if this level supports session management.
-    #[must_use]
-    pub const fn supports_sessions(self) -> bool {
-        matches!(self, Self::VT520 | Self::VT525)
-    }
 }
 
 impl std::fmt::Display for VtLevel {
@@ -216,41 +130,6 @@ impl std::fmt::Display for VtLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Regression test for #3883: VtLevel capabilities work without ordering.
-    ///
-    /// The `compile_fail` doctest on the `VtLevel` type itself guards against
-    /// re-adding `PartialOrd`/`Ord`. This test verifies the capability methods
-    /// that replaced ordering-based comparisons.
-    #[test]
-    fn vt_level_no_derived_ordering() {
-        // VT330/VT340 are supersets of VT320 (add Sixel graphics), but their
-        // DA2 params are 18/19 vs VT320's 24. With derived Ord, VT330 < VT320.
-        assert!(VtLevel::VT330.supports_mouse());
-        assert!(VtLevel::VT340.supports_mouse());
-        assert!(VtLevel::VT340.supports_sixel());
-        assert!(!VtLevel::VT320.supports_sixel());
-    }
-
-    #[test]
-    fn da2_param_roundtrip() {
-        for level in [
-            VtLevel::VT100,
-            VtLevel::VT220,
-            VtLevel::VT240,
-            VtLevel::VT320,
-            VtLevel::VT330,
-            VtLevel::VT340,
-            VtLevel::VT420,
-            VtLevel::VT510,
-            VtLevel::VT520,
-            VtLevel::VT525,
-        ] {
-            let param = level.da2_param();
-            let recovered = VtLevel::from_da2_param(param);
-            assert_eq!(recovered, Some(level), "Failed for {level}");
-        }
-    }
 
     #[test]
     fn decscl_param_roundtrip() {
@@ -264,69 +143,6 @@ mod tests {
             let param = level.decscl_param();
             let recovered = VtLevel::from_decscl_param(param);
             assert_eq!(recovered, Some(level), "Roundtrip failed for {level}");
-        }
-    }
-
-    /// Each capability against the levels either side of where it appears
-    /// (and, for sixel, where it disappears again: VT420 has no graphics).
-    #[test]
-    fn capability_boundaries() {
-        use VtLevel::{VT100, VT220, VT240, VT320, VT340, VT420, VT520, VT525};
-        type Supports = fn(VtLevel) -> bool;
-        type Boundary = (&'static str, Supports, &'static [(VtLevel, bool)]);
-        let cases: [Boundary; 8] = [
-            (
-                "c1 controls",
-                VtLevel::supports_c1_controls,
-                &[(VT100, false), (VT220, true), (VT520, true)],
-            ),
-            (
-                "user-defined keys",
-                VtLevel::supports_user_defined_keys,
-                &[(VT100, false), (VT220, true), (VT520, true)],
-            ),
-            (
-                "drcs",
-                VtLevel::supports_drcs,
-                &[(VT100, false), (VT220, true), (VT520, true)],
-            ),
-            (
-                "sixel",
-                VtLevel::supports_sixel,
-                &[
-                    (VT100, false),
-                    (VT220, false),
-                    (VT240, true),
-                    (VT340, true),
-                    (VT420, false), // VT420 doesn't have graphics
-                    (VT525, true),
-                ],
-            ),
-            (
-                "mouse",
-                VtLevel::supports_mouse,
-                &[(VT100, false), (VT220, false), (VT320, true), (VT520, true)],
-            ),
-            (
-                "rectangular ops",
-                VtLevel::supports_rectangular_ops,
-                &[(VT100, false), (VT320, false), (VT420, true), (VT520, true)],
-            ),
-            (
-                "pages",
-                VtLevel::supports_pages,
-                &[(VT100, false), (VT320, false), (VT420, true), (VT520, true)],
-            ),
-            (
-                "sessions",
-                VtLevel::supports_sessions,
-                &[(VT420, false), (VT520, true), (VT525, true)],
-            ),
-        ];
-        for (what, supports, rows) in cases {
-            for &(level, want) in rows {
-                assert_eq!(supports(level), want, "{what}: {level}");
-            }
         }
     }
 }

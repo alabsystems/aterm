@@ -41,7 +41,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Every `cut` flag (spec §5), parsed by cli.rs. (`PartialEq` exists for the
-/// CLI parse table in tests/resume.rs.)
+/// CLI parse table in tests/it/resume.rs.)
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CutOptions {
     /// Path to the ONE credentials profile (`--release-credentials`). A PATH only
@@ -113,9 +113,9 @@ pub const VALUE_COL: usize = 13;
 
 /// The longest label the grid can carry: 2 indent + 10 + 1 hard space = [`VALUE_COL`].
 ///
-/// Enforced by a `debug_assert` in [`grid_block`] and by a census over every label
-/// literal in the crate (`tests/transcript_grid.rs`), because the failure mode is a
-/// line that still PRINTS — it just prints two facts glued together.
+/// Enforced by a `debug_assert` in [`grid_block`]. A longer label can no longer glue
+/// two facts together — the hard space after the pad is unconditional — but it still
+/// pushes its value off [`VALUE_COL`], out of line with every row around it.
 pub const LABEL_MAX: usize = VALUE_COL - 3;
 
 /// How wide a transcript line may be.
@@ -2147,22 +2147,40 @@ pub fn publish_checked(
     channel_floor_covered(carried_floor, newest_floor)
 }
 
-/// CAS-safe unlock. Deletion is permitted only with the exact expected owner;
-/// an already-absent ref converges a crash after delete/before journal mark.
-#[allow(dead_code)] // exercised by integration/Tier-1 fixtures; production uses the paired unlock
-pub fn release_release_lease(git: &dyn GitRunner, expected_owner: &str) -> Result<LeaseRelease> {
-    release_release_lease_inner(git, expected_owner, false)
-}
-
-/// Unlock-only crash convergence. This is valid exclusively after every
-/// publishing step is journaled: a foreign create-only owner proves our ref
-/// was absent after our prior CAS delete, so it is a successor, not a lease
-/// we may touch. All earlier states use [`release_release_lease`] and refuse.
+/// CAS-safe unlock-only crash convergence, valid exclusively after every
+/// publishing step is journaled. Deletion is permitted only with the exact
+/// expected owner; an already-absent ref converges a crash after delete/before
+/// journal mark, and a foreign create-only owner proves our ref was absent after
+/// our prior CAS delete, so it is a successor, not a lease we may touch. Nothing
+/// unlocks earlier: an interrupted cut keeps its lease and resumes as its owner.
 pub fn release_completed_release_lease(
     git: &dyn GitRunner,
     expected_owner: &str,
 ) -> Result<LeaseRelease> {
-    release_release_lease_inner(git, expected_owner, true)
+    let expected_owner = expected_owner.to_ascii_lowercase();
+    match release_lease_owner(git)? {
+        None => return Ok(LeaseRelease::AlreadyAbsent),
+        Some(owner) if owner != expected_owner => return Ok(LeaseRelease::AlreadySuperseded),
+        Some(_) => {}
+    }
+    let lease = format!("--force-with-lease={RELEASE_LEASE_REF}:{expected_owner}");
+    let delete = format!(":{RELEASE_LEASE_REF}");
+    let out = git.git(&["push", &lease, "origin", &delete])?;
+    let now = release_lease_owner(git)?;
+    if now.is_none() {
+        return Ok(LeaseRelease::Released);
+    }
+    // We observed our exact owner immediately before the CAS attempt. Any
+    // different create-only owner observed now can exist only after ours was
+    // absent, regardless of whether the transport reported success.
+    if now.as_deref() != Some(expected_owner.as_str()) {
+        return Ok(LeaseRelease::AlreadySuperseded);
+    }
+    Err(Error::new(format!(
+        "CAS release of {RELEASE_LEASE_REF} failed: {}; current owner is {}",
+        out.stderr_utf8().trim(),
+        now.as_deref().unwrap_or("absent")
+    )))
 }
 
 /// Unlock-only replay when this process has no fence guard (the crash may have
@@ -2200,45 +2218,6 @@ pub fn release_completed_session_without_guard(
         ))),
         (_, None) => release_completed_release_lease(git, &expected_owner),
     }
-}
-
-fn release_release_lease_inner(
-    git: &dyn GitRunner,
-    expected_owner: &str,
-    allow_successor: bool,
-) -> Result<LeaseRelease> {
-    let expected_owner = expected_owner.to_ascii_lowercase();
-    match release_lease_owner(git)? {
-        None => return Ok(LeaseRelease::AlreadyAbsent),
-        Some(owner) if owner != expected_owner && allow_successor => {
-            return Ok(LeaseRelease::AlreadySuperseded);
-        }
-        Some(owner) if owner != expected_owner => {
-            return Err(Error::new(format!(
-                "release lease is owned by {owner}, not {expected_owner}; refusing to delete \
-                 another cut's lease"
-            )));
-        }
-        Some(_) => {}
-    }
-    let lease = format!("--force-with-lease={RELEASE_LEASE_REF}:{expected_owner}");
-    let delete = format!(":{RELEASE_LEASE_REF}");
-    let out = git.git(&["push", &lease, "origin", &delete])?;
-    let now = release_lease_owner(git)?;
-    if now.is_none() {
-        return Ok(LeaseRelease::Released);
-    }
-    // We observed our exact owner immediately before the CAS attempt. Any
-    // different create-only owner observed now can exist only after ours was
-    // absent, regardless of whether the transport reported success.
-    if now.as_deref() != Some(expected_owner.as_str()) {
-        return Ok(LeaseRelease::AlreadySuperseded);
-    }
-    Err(Error::new(format!(
-        "CAS release of {RELEASE_LEASE_REF} failed: {}; current owner is {}",
-        out.stderr_utf8().trim(),
-        now.as_deref().unwrap_or("absent")
-    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2674,7 +2653,7 @@ impl Journal {
 }
 
 // ---------------------------------------------------------------------------
-// pure publish helpers (tested in tests/resume.rs)
+// pure publish helpers (tested in tests/it/resume.rs)
 // ---------------------------------------------------------------------------
 
 /// Admission decision for a non-idempotent remote POST whose response may be
@@ -3394,94 +3373,6 @@ pub struct AppcastRelease {
     pub assets: Vec<AppcastAsset>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SignedChannelAsset {
-    release_id: u64,
-    tag: String,
-    manifest_asset_id: u64,
-    manifest_name: String,
-    signature_asset_id: u64,
-    signature_name: String,
-}
-
-/// Enumerate every published signature together with the manifest bytes it
-/// authenticates.  Both live exact names and deterministic archived names are
-/// channel history; looking only at the current exact name would let archive
-/// migration silently reset the signing ratchet.
-fn signed_channel_assets(releases: &[AppcastRelease]) -> Result<Vec<SignedChannelAsset>> {
-    let mut signed = Vec::new();
-    for release in releases.iter().filter(|release| !release.draft) {
-        let archived_manifest = manifest_out::archived_manifest_asset(&release.tag);
-        let archived_signature = manifest_out::archived_manifest_signature_asset(&release.tag);
-        let exact_manifest = unique_asset_id(release, manifest_out::MANIFEST_ASSET)?;
-        let archived_manifest_id = unique_asset_id(release, &archived_manifest)?;
-        let exact_signature = unique_asset_id(release, manifest_out::MANIFEST_SIG_ASSET)?;
-        let archived_signature_id = unique_asset_id(release, &archived_signature)?;
-        if exact_signature.is_some() && archived_signature_id.is_some() {
-            return Err(Error::new(format!(
-                "published release {} has both exact and archived manifest signatures",
-                release.tag
-            )));
-        }
-        let signature_is_exact = exact_signature.is_some();
-        let signature_name = if signature_is_exact {
-            Some(manifest_out::MANIFEST_SIG_ASSET.to_string())
-        } else if archived_signature_id.is_some() {
-            Some(archived_signature)
-        } else {
-            None
-        };
-        if let Some(signature_name) = signature_name {
-            // During archive convergence the manifest is renamed before its
-            // signature. Prefer the same naming tier as the signature, then
-            // the other tier for that one valid transitional state. If both
-            // manifests exist, the archive planner separately rejects the
-            // name collision before any PATCH; pairing remains deterministic.
-            let (manifest_name, manifest_asset_id) =
-                if signature_is_exact && let Some(id) = exact_manifest {
-                    (manifest_out::MANIFEST_ASSET.to_string(), id)
-                } else if !signature_is_exact && let Some(id) = archived_manifest_id {
-                    (archived_manifest, id)
-                } else if let Some(id) = exact_manifest {
-                    (manifest_out::MANIFEST_ASSET.to_string(), id)
-                } else if let Some(id) = archived_manifest_id {
-                    (archived_manifest, id)
-                } else {
-                    return Err(Error::new(format!(
-                        "published release {} has signature {signature_name} without an exact \
-                         or archived paired manifest",
-                        release.tag
-                    )));
-                };
-            signed.push(SignedChannelAsset {
-                release_id: release.release_id,
-                tag: release.tag.clone(),
-                manifest_asset_id,
-                manifest_name,
-                signature_asset_id: exact_signature
-                    .or(archived_signature_id)
-                    .expect("signature name implies asset ID"),
-                signature_name,
-            });
-        }
-    }
-    Ok(signed)
-}
-
-/// The signing ratchet is retired: signing is never REQUIRED by published
-/// history. Older releases may still carry `.sig` assets, but an unsigned
-/// successor is always permitted (Tier REPO). This still validates that the
-/// signed-asset inventory is internally consistent (duplicate/orphan pairs are
-/// hard errors) so the archive planner sees coherent metadata; the verdict it
-/// returns to publish/archive decisions is unconditionally "not required".
-#[allow(dead_code)] // Public pure Tier-1/integration-test seam.
-pub fn channel_signature_required(releases: &[AppcastRelease]) -> Result<bool> {
-    // Surface any metadata inconsistency (e.g. exact + archived signature on one
-    // release) as an error, but never force a signed successor.
-    let _ = signed_channel_assets(releases)?;
-    Ok(false)
-}
-
 /// One reversible metadata-only rename. `id` binds the operation to the same
 /// stored bytes; production changes only the asset's `name` via REST PATCH.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3644,15 +3535,7 @@ fn prove_archive_authority<'a>(
 /// archive targets alongside exact-name sources are hard collisions; a source
 /// already absent with its archive target present is a successfully completed
 /// prefix from an interrupted prior run.
-#[allow(dead_code)] // Public pure Tier-1/integration-test seam.
 pub fn plan_appcast_archive(
-    releases: &[AppcastRelease],
-    current_tag: &str,
-) -> Result<Vec<AppcastRename>> {
-    plan_appcast_archive_with_policy(releases, current_tag, channel_signature_required(releases)?)
-}
-
-fn plan_appcast_archive_with_policy(
     releases: &[AppcastRelease],
     current_tag: &str,
     current_signature_required: bool,
@@ -3702,16 +3585,7 @@ fn plan_appcast_archive_with_policy(
 /// owns the exact manifest name, and no historical published release retains
 /// the matching exact signature name. Draft assets are intentionally outside
 /// the update channel and remain untouched.
-#[allow(dead_code)] // Public pure Tier-1/integration-test seam.
-pub fn prove_single_appcast_head(releases: &[AppcastRelease], current_tag: &str) -> Result<()> {
-    prove_single_appcast_head_with_policy(
-        releases,
-        current_tag,
-        channel_signature_required(releases)?,
-    )
-}
-
-fn prove_single_appcast_head_with_policy(
+pub fn prove_single_appcast_head(
     releases: &[AppcastRelease],
     current_tag: &str,
     current_signature_required: bool,
@@ -3808,45 +3682,26 @@ fn prove_renames_preserved_assets(
 /// preservation (same asset IDs under archive names) and the sole exact head.
 /// A crash leaves the journal at `archive`; the next run plans only the
 /// unfinished suffix because successful metadata renames are already visible.
-#[allow(dead_code)] // Public pure Tier-1/integration-test seam.
-pub fn converge_appcast_archive(
-    remote: &mut impl AppcastArchiveRemote,
-    current_tag: &str,
-) -> Result<usize> {
-    let before = remote.list_releases()?;
-    let required = channel_signature_required(&before)?;
-    converge_appcast_archive_from_listing(remote, current_tag, required, before)
-}
-
-/// Converge an already identity-validated release under its epoch policy.
-/// This differs from [`converge_appcast_archive`] only for the explicitly
-/// supported v0.27-v0.54 unsigned-bootstrap recovery epoch: signed v0.26
-/// history must not make that unsigned *historical* head impossible to
+///
+/// `current_signature_required` is the release's own epoch policy, never one
+/// derived from published history (that ratchet is retired): signed v0.26
+/// history must not make the unsigned v0.27-v0.54 bootstrap heads impossible to
 /// archive. When signing is configured, callers verify the current
 /// manifest/signature pair under the configured key before this call; an
 /// unsigned channel has no such pair to check.
-pub fn converge_appcast_archive_with_policy(
+pub fn converge_appcast_archive(
     remote: &mut impl AppcastArchiveRemote,
     current_tag: &str,
     current_signature_required: bool,
 ) -> Result<usize> {
     let before = remote.list_releases()?;
-    converge_appcast_archive_from_listing(remote, current_tag, current_signature_required, before)
-}
-
-fn converge_appcast_archive_from_listing(
-    remote: &mut impl AppcastArchiveRemote,
-    current_tag: &str,
-    current_signature_required: bool,
-    before: Vec<AppcastRelease>,
-) -> Result<usize> {
-    let plan = plan_appcast_archive_with_policy(&before, current_tag, current_signature_required)?;
+    let plan = plan_appcast_archive(&before, current_tag, current_signature_required)?;
     for rename in &plan {
         remote.rename_asset(rename)?;
     }
     let after = remote.list_releases()?;
     prove_renames_preserved_assets(&plan, &after)?;
-    prove_single_appcast_head_with_policy(&after, current_tag, current_signature_required)?;
+    prove_single_appcast_head(&after, current_tag, current_signature_required)?;
     Ok(plan.len())
 }
 
@@ -4257,130 +4112,19 @@ pub fn verify_detached_manifest_signature(
         .map_err(|_| Error::new("manifest signature does not verify under the channel public key"))
 }
 
-/// Pure/injected verifier for the legacy updater signature ratchet. Metadata first
-/// proves an exact, unique signature on the current head (never an archive-name
-/// fallback); then every signed historical pair is checked under the same key.
-/// The current signature may additionally be required byte-identical to the
-/// local cut artifact.
-#[allow(dead_code)] // negative-control seam for the optional-signing verification path
+/// The exact-head signature check, with the asset download injected so the
+/// decision runs without GitHub: exactly one published `head_tag`, carrying the
+/// exact manifest and the exact signature (an archive-name fallback is
+/// forbidden), the signature byte-identical to the local cut artifact when one
+/// is given, and valid for `head_manifest` under `pubkey`.
 pub fn verify_channel_head_signature_with(
     releases: &[AppcastRelease],
     head_tag: &str,
     head_manifest: &[u8],
     local_head_signature: Option<&[u8]>,
-    signature_pubkey: Option<&str>,
-    mut fetch_asset: impl FnMut(u64, u64, &str, &str) -> Result<Vec<u8>>,
-) -> Result<bool> {
-    let signed = signed_channel_assets(releases)?;
-    // A trusted local/compiled key activates Tier SIG even if an attacker (or
-    // broken archive) removed every remote `.sig` asset. Remote absence can
-    // never reset a pin that installed updaters already enforce.
-    if signed.is_empty() && signature_pubkey.is_none() {
-        return Ok(false);
-    }
-    let pubkey = signature_pubkey.ok_or_else(|| {
-        Error::new(
-            "published signature history activates Tier SIG, but no signing key is \
-             available; verification cannot fall back to unsigned",
-        )
-    })?;
-    let heads: Vec<&AppcastRelease> = releases
-        .iter()
-        .filter(|release| !release.draft && release.tag == head_tag)
-        .collect();
-    if heads.len() != 1 {
-        return Err(Error::new(format!(
-            "signature verification requires exactly one published release {head_tag}; found {}",
-            heads.len()
-        )));
-    }
-    let head = heads[0];
-    if unique_asset_id(head, manifest_out::MANIFEST_ASSET)?.is_none() {
-        return Err(Error::new(format!(
-            "signed channel head {head_tag} has no exact {}",
-            manifest_out::MANIFEST_ASSET
-        )));
-    }
-    if unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?.is_none() {
-        return Err(Error::new(format!(
-            "signed channel head {head_tag} has no exact {}; archive-name fallback is forbidden",
-            manifest_out::MANIFEST_SIG_ASSET
-        )));
-    }
-
-    let head_signature = fetch_asset(
-        head.release_id,
-        unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?
-            .expect("checked exact head signature"),
-        head_tag,
-        manifest_out::MANIFEST_SIG_ASSET,
-    )?;
-    if let Some(local) = local_head_signature
-        && local != head_signature
-    {
-        return Err(Error::new(
-            "published manifest signature is not byte-identical to the local cut artifact",
-        ));
-    }
-    verify_detached_manifest_signature(pubkey, head_manifest, &head_signature).map_err(
-        |error| {
-            Error::new(format!(
-                "signed channel head {head_tag} is invalid under the pinned public key: {error}"
-            ))
-        },
-    )?;
-
-    for asset in signed {
-        if asset.tag == head_tag
-            && asset.manifest_name == manifest_out::MANIFEST_ASSET
-            && asset.signature_name == manifest_out::MANIFEST_SIG_ASSET
-        {
-            continue;
-        }
-        let manifest = fetch_asset(
-            asset.release_id,
-            asset.manifest_asset_id,
-            &asset.tag,
-            &asset.manifest_name,
-        )?;
-        let signature = fetch_asset(
-            asset.release_id,
-            asset.signature_asset_id,
-            &asset.tag,
-            &asset.signature_name,
-        )?;
-        verify_detached_manifest_signature(pubkey, &manifest, &signature).map_err(|error| {
-            Error::new(format!(
-                "signed channel history {} / {} is invalid under the pinned public key: {error}",
-                asset.tag, asset.signature_name
-            ))
-        })?;
-    }
-    Ok(true)
-}
-
-/// Live wrapper used by both cut-final verification and `cargo ship verify`.
-///
-/// Tier REPO model: with no configured/journaled update key the channel is
-/// unsigned and published signature history NEVER forces a signed successor.
-/// When a key IS configured, the exact live head signature is verified under
-/// it (and byte-compared against the local cut artifact during a live cut).
-pub fn verify_live_channel_head_signature(
-    _repo: &Path,
-    slug: &str,
-    head_tag: &str,
-    head_manifest: &[u8],
-    local_head_signature: Option<&[u8]>,
-    journal_pubkey: Option<&str>,
-) -> Result<bool> {
-    let Some(journal_pubkey) = journal_pubkey else {
-        // Unsigned channel: gh auth + SHA-256 + monotonic build number are the
-        // trust. No ratchet — older `.sig` assets never demand a signed head.
-        return Ok(false);
-    };
-    let pubkey = canonical_update_pubkey(journal_pubkey)?;
-    let mut remote = GhAppcastArchiveRemote::read_only(slug);
-    let releases = remote.list_releases()?;
+    pubkey: &str,
+    fetch_asset: impl FnOnce(u64, u64, &str, &str) -> Result<Vec<u8>>,
+) -> Result<()> {
     let heads: Vec<&AppcastRelease> = releases
         .iter()
         .filter(|release| !release.draft && release.tag == head_tag)
@@ -4403,9 +4147,7 @@ pub fn verify_live_channel_head_signature(
             manifest_out::MANIFEST_SIG_ASSET
         ))
     })?;
-    let head_signature = download_snapshot_appcast_asset(
-        slug,
-        &releases,
+    let head_signature = fetch_asset(
         head.release_id,
         signature_id,
         head_tag,
@@ -4418,11 +4160,44 @@ pub fn verify_live_channel_head_signature(
             "published manifest signature is not byte-identical to the local cut artifact",
         ));
     }
-    verify_detached_manifest_signature(&pubkey, head_manifest, &head_signature).map_err(
-        |error| {
-            Error::new(format!(
-                "signed channel head {head_tag} is invalid under the configured public key: {error}"
-            ))
+    verify_detached_manifest_signature(pubkey, head_manifest, &head_signature).map_err(|error| {
+        Error::new(format!(
+            "signed channel head {head_tag} is invalid under the configured public key: {error}"
+        ))
+    })
+}
+
+/// Live wrapper used by both cut-final verification and `cargo ship verify`.
+///
+/// Tier REPO model: with no configured/journaled update key the channel is
+/// unsigned and published signature history NEVER forces a signed successor.
+/// When a key IS configured, the exact live head signature is verified under
+/// it (and byte-compared against the local cut artifact during a live cut) by
+/// [`verify_channel_head_signature_with`], over a snapshot-bound download.
+pub fn verify_live_channel_head_signature(
+    _repo: &Path,
+    slug: &str,
+    head_tag: &str,
+    head_manifest: &[u8],
+    local_head_signature: Option<&[u8]>,
+    journal_pubkey: Option<&str>,
+) -> Result<bool> {
+    let Some(journal_pubkey) = journal_pubkey else {
+        // Unsigned channel: gh auth + SHA-256 + monotonic build number are the
+        // trust. No ratchet — older `.sig` assets never demand a signed head.
+        return Ok(false);
+    };
+    let pubkey = canonical_update_pubkey(journal_pubkey)?;
+    let mut remote = GhAppcastArchiveRemote::read_only(slug);
+    let releases = remote.list_releases()?;
+    verify_channel_head_signature_with(
+        &releases,
+        head_tag,
+        head_manifest,
+        local_head_signature,
+        &pubkey,
+        |release_id, asset_id, tag, name| {
+            download_snapshot_appcast_asset(slug, &releases, release_id, asset_id, tag, name)
         },
     )?;
     Ok(true)
@@ -8751,7 +8526,7 @@ pub fn ungated_range_lines(
 
 /// What a REAL cut publishes, and whether its claim is a recut: the READER half of
 /// the claim contract (`aterm_spec::derive::release_claim_landing_model`; Tier-1 in
-/// tests/claim_landing_model.rs), whose writer is [`ledger::claim`] with
+/// tests/it/claim_landing_model.rs), whose writer is [`ledger::claim`] with
 /// [`changelog::claim_changelogs`].
 ///
 /// `source` is the published commit's changelog, `main` is origin/main's. A version
@@ -9034,7 +8809,7 @@ pub fn run_as_the_trees_cutter(
 /// The `cut` invocation that means `opts` — what a handoff runs the tree's cutter
 /// with. Every field is spelled (the destructure below makes a new one a compile
 /// error here, not a silently dropped answer), and `cli::parse` of the result is
-/// `opts` again (tests/resume.rs).
+/// `opts` again (tests/it/resume.rs).
 #[must_use]
 pub fn cut_args(opts: &CutOptions) -> Vec<std::ffi::OsString> {
     let CutOptions {
@@ -9085,7 +8860,7 @@ pub fn cut_args(opts: &CutOptions) -> Vec<std::ffi::OsString> {
 
 /// The `recover` invocation that means these parsed arguments — what a recovery
 /// hands the release commit's own cutter. `cli::parse` of the result is the same
-/// recovery again (tests/resume.rs).
+/// recovery again (tests/it/resume.rs).
 #[must_use]
 pub fn recover_args(
     version: &str,
@@ -9122,6 +8897,10 @@ pub fn recover_args(
 /// never moves it. A real cut reads and builds the cut tree
 /// ([`gates::place_published`]); a dry run or rehearsal builds `repo` as it stands.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
+    // THIS PROCESS IS A CUT: the toolchain it pins is leased for as long as it runs
+    // ([`gates::arm_toolchain_lease`]), so the package manager never reclaims or re-lays
+    // it between two of the cut's steps.
+    gates::arm_toolchain_lease();
     // Resolved ONCE, here — the explicit flag when given, else this machine's
     // provisioned identity (`~/.aterm/machine.key`, the same file every atpkg
     // producer tool signs with). Every later stage — build, resume, recovery,
@@ -10466,15 +10245,17 @@ pub fn site_follows_the_cut(
 ///
 /// The gap it closes was walked, not imagined: the merge contract DOES run the
 /// censuses (an unconditional stage, in `--fast`), but nothing makes a commit on
-/// main have passed it. `.githooks/pre-push` refuses a push with no passing gate
-/// receipt again since 2026-09-17 (it was advisory from 2026-08-24, the window in
-/// which v0.65.0 shipped a self-recursive `OnceLock` that froze the main thread on
-/// the first automatic update apply) — but it has a named bypass,
-/// `ATERM_PUSH_NO_GATE=1`, and all four 0.91 pushes used it; there is no CI, by
-/// owner decision. So a commit can still reach origin/main ungated, `pub publish`
-/// can export it, and the cut builds exactly that published commit. This gate is
-/// the one proof that runs on every cut regardless; the ungated range itself is
-/// stated in the transcript ([`gates::receipt_report`]).
+/// main have passed it — there is no CI and no git hook, by owner decision ("I
+/// DONT WANT HOOKS! NO HOOKS NO CI", 2026-07-06). A `.githooks/pre-push` re-added
+/// without that sign-off was advisory from 2026-08-24 (the window in which v0.65.0
+/// shipped a self-recursive `OnceLock` that froze the main thread on the first
+/// automatic update apply), refused receipt-less pushes from 2026-09-17 behind a
+/// named bypass that all four 0.91 pushes used, and was deleted on 2026-09-25. So
+/// a commit can reach origin/main ungated, `pub publish` can export it, and the cut
+/// builds exactly that published commit. This gate is the one proof that runs on
+/// every cut regardless — INLINE, in the tool being run, which is where the owner
+/// puts every quality gate; the ungated range itself is stated in the transcript
+/// from the gate receipts the cutter reads itself ([`gates::receipt_report`]).
 ///
 /// It runs BEFORE the ledger claim, so a failure costs seconds and burns no
 /// build number — the same posture as every other gate in `gates.rs`.
@@ -10618,8 +10399,7 @@ pub fn notarize_and_package(
     pack: &dyn Packager,
 ) -> Result<PackagedCut> {
     // Said BEFORE the two notarization waits, and said HERE rather than in `sign.rs`,
-    // which deliberately references nothing else in the crate so `tests/signconf.rs` can
-    // mount it alone.
+    // which references nothing else in the crate — the transcript grid's `step` included.
     //
     // The crate teaches, in the ONE other place it mentions interrupting — the
     // certificate wait, "Ctrl-C is safe, nothing is lost and this step resumes" — that a
@@ -10801,7 +10581,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // and re-hash it — ONE ordered unit, because every step of that order is
     // load-bearing and none of it is observable from a green cut. See
     // `notarize_and_package`; its ordering and its fail-closed propagation are
-    // proved offline in tests/apple_tier.rs.
+    // proved offline in tests/it/apple_tier.rs.
     let PackagedCut {
         dmg: dout,
         dmg_sha256: dmg_sha,
@@ -11130,7 +10910,7 @@ pub const NO_PAINT_SMOKE_ACK_VALUE: &str = "this-cut-may-ship-dark";
 /// the real probe launches a GUI process and records video, which no unit test
 /// can afford, and the sequence that calls it is where a mutation is invisible
 /// and expensive — `if false`-ing the call site ships the next dark release.
-/// The recording fakes in tests/paint_smoke.rs drive the real decision code
+/// The recording fakes in tests/it/paint_smoke.rs drive the real decision code
 /// and assert what it DID, in what ORDER.
 pub trait PaintProbe {
     /// `Ok(report)` = the effect painted AND the take is evidence (the probe's
@@ -11344,7 +11124,7 @@ pub fn paint_probe_disposition(
 /// = skipped, with the transcript line that says so out loud; `Err` = the skip
 /// is REFUSED (a notarized real cut without the explicit acknowledgement).
 ///
-/// Pure and separated from the probe so tests/paint_smoke.rs can drive every
+/// Pure and separated from the probe so tests/it/paint_smoke.rs can drive every
 /// arm without launching anything.
 pub fn paint_smoke_policy(
     kind: CutKind,
@@ -11386,7 +11166,7 @@ pub fn paint_smoke_policy(
 /// are these functions' RETURN VALUES, so neither claim can be printed without
 /// its check having passed (the [`selfcheck_signing`] rule, extended).
 ///
-/// tests/paint_smoke.rs drives this with recording fakes across both seams and
+/// tests/it/paint_smoke.rs drives this with recording fakes across both seams and
 /// fails under exactly the mutations that would resurrect the blackout:
 /// `if false`-ing the probe call, reordering it after the signing gate, or
 /// downgrading a probe failure to a warning.
@@ -12727,8 +12507,7 @@ fn step_archive(ctx: &mut CutCtx) -> Result<()> {
         .as_ref()
         .ok_or_else(|| Error::new("archive has no unique publisher fence"))?;
     let mut remote = GhAppcastArchiveRemote::fenced(&ctx.slug, &ctx.repo, lease, fence);
-    let renamed =
-        converge_appcast_archive_with_policy(&mut remote, &ctx.tag, ctx.signature_required)?;
+    let renamed = converge_appcast_archive(&mut remote, &ctx.tag, ctx.signature_required)?;
     step(
         "archive",
         &format!(
@@ -13286,6 +13065,17 @@ const ANON_PROBE_ATTEMPTS: u32 = 10;
 /// Gap between anonymous probe attempts.
 const ANON_PROBE_DELAY: Duration = Duration::from_secs(6);
 
+/// Attempts for the evergreen pointer to name this cut once its head PATCH is sent
+/// ([`prove_pointer_serves`]). GitHub recomputes `releases/latest` behind a cache, and
+/// that is slower than an asset's CDN: measured on v0.93.0 (2026-09-24), the pointer still
+/// named v0.92.0 after the whole anonymous budget (10 × 6 s) and named v0.93.0 when read a
+/// minute later, so a cut whose release was already live failed and needed `--resume`.
+/// Five minutes, and still a bound: a pointer that never moves is refused as before.
+pub const POINTER_PROBE_ATTEMPTS: u32 = 30;
+
+/// Gap between evergreen-pointer attempts.
+pub const POINTER_PROBE_DELAY: Duration = Duration::from_secs(10);
+
 /// The HTTP status of an anonymous probe that was REFUSED — 403 or 429 — read out
 /// of `curl -f`'s stderr (it collapses every 4xx into exit 22 and names the status
 /// in its message, the same shape the client's `download_bytes` reads), or `None`
@@ -13626,10 +13416,11 @@ fn pointer_probe_from(
 /// The pointer is the cut's to set: [`mirror::ChannelRelease::make_head`] sends
 /// `make_latest=true` on every path before this runs.
 ///
-/// Retried on the same budget as the other anonymous probes: GitHub recomputes `latest`
-/// moments after the flip, and a client arriving seconds later is the real case. The
+/// Retried on its own bound ([`POINTER_PROBE_ATTEMPTS`] × [`POINTER_PROBE_DELAY`]): GitHub
+/// recomputes `latest` after the flip, more slowly than the other anonymous probes'
+/// budget allows, and a client arriving minutes later is the real case. The
 /// probe, the fetch and the sleep are injected so the gate itself runs against a fake
-/// GitHub in `tests/channel_latest.rs`; [`prove_evergreen_pointer_serves_this_cut`] is the
+/// GitHub in `tests/it/channel_latest.rs`; [`prove_evergreen_pointer_serves_this_cut`] is the
 /// real wiring. Returns the served manifest, for the transcript.
 ///
 /// # Errors
@@ -13646,7 +13437,7 @@ pub fn prove_pointer_serves(
     let asset = manifest_out::MANIFEST_ASSET;
     let mut last = PointerProbe::NoRelease;
     let mut location = None;
-    for attempt in 1..=ANON_PROBE_ATTEMPTS {
+    for attempt in 1..=POINTER_PROBE_ATTEMPTS {
         last = probe()?;
         if let PointerProbe::Tag {
             tag: named,
@@ -13661,8 +13452,8 @@ pub fn prove_pointer_serves(
         if matches!(last, PointerProbe::Refused { .. }) {
             break;
         }
-        if attempt < ANON_PROBE_ATTEMPTS {
-            sleep(ANON_PROBE_DELAY);
+        if attempt < POINTER_PROBE_ATTEMPTS {
+            sleep(POINTER_PROBE_DELAY);
         }
     }
     let Some(location) = location else {
@@ -14637,7 +14428,7 @@ mod roster_wiring_tests {
     //! THE PRODUCER-SIDE ATTACH PATH — the lines that decide whether an armed cut is
     //! attributed and carries its roster AT ALL.
     //!
-    //! These live inside `publish.rs` rather than in `tests/machine_roster.rs` because
+    //! These live inside `publish.rs` rather than in `tests/it/machine_roster.rs` because
     //! every property below is a private method of [`CutCtx`], and every one of them
     //! failed silently: a regression on any of them produces a WELL-FORMED release with
     //! no `machine_id` or no `aterm-machines.toml`, which an armed client refuses

@@ -177,6 +177,233 @@ fn a_linux_reading_assembles_from_the_texts() {
 }
 
 // ---------------------------------------------------------------------------
+// The Linux sampler over a fixture tree (ruling 227): the live path, run
+// here against realistic `/proc` and `/sys` files.
+// ---------------------------------------------------------------------------
+
+/// `tests/fixtures/linux`: a 4-core box with 16 GB, eight processes of three
+/// users, a pid that exited between the listing and the read, a `vmstat`
+/// longer than the read cap, and two thermal zones.
+///
+/// The repository holds no symlink (the spin and paint guards' source take
+/// fails closed on one), so each `/proc/<pid>/exe` link is committed as an
+/// `exe.link` text file naming its target. Every call copies the tree into a
+/// private scratch directory, makes those links real there (on unix), and
+/// removes the copy when the fixture drops.
+struct Fixture {
+    dir: std::path::PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("aterm-sysprobe-fixture-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        copy_fixture(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/linux"),
+            &dir,
+        );
+        Self { dir }
+    }
+
+    fn roots(&self) -> linux::Roots {
+        linux::Roots {
+            proc: self.dir.join("proc"),
+            sys: self.dir.join("sys"),
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn copy_fixture(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let (src, name) = (entry.path(), entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_fixture(&src, &to.join(&name));
+        } else if name == "exe.link" {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_to_string(&src).unwrap();
+                std::os::unix::fs::symlink(target.trim_end(), to.join("exe")).unwrap();
+            }
+        } else {
+            std::fs::copy(&src, to.join(&name)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn the_linux_sampler_reads_the_fixed_facts_under_its_root() {
+    let fx = Fixture::new();
+    let s = linux::Sampler::new(fx.roots());
+    // No `self/auxv` in the tree: USER_HZ and 4 KiB pages; the uid is
+    // `self/status`'s effective one; the cores are `stat`'s four `cpuN`,
+    // though the fixture's `intr` line (1400 IRQs, as on real hardware) is
+    // longer than the 4 KiB read and torn by it.
+    assert!(
+        std::fs::metadata(fx.roots().proc.join("stat"))
+            .unwrap()
+            .len()
+            > 4096,
+        "the fixture's `stat` is longer than the read cap"
+    );
+    assert_eq!(s.facts(), (100, 4, 4, Some(1000)));
+    assert_eq!(linux::Roots::live().proc, Path::new("/proc"));
+    assert_eq!(linux::Roots::live().sys, Path::new("/sys"));
+}
+
+#[test]
+fn the_linux_sampler_reads_a_whole_reading_from_the_fixture_tree() {
+    let fx = Fixture::new();
+    let mut s = linux::Sampler::new(fx.roots());
+    let at = Instant::now();
+    let r = s.reading(at);
+    let busy = 10_132_153 + 290_696 + 3_084_719 + 25_195;
+    assert_eq!(r.at, at);
+    assert_eq!(r.cores, 4);
+    assert_eq!(r.page_kib, 4);
+    assert_eq!(r.busy_ticks, Some((busy, busy + 46_828_483 + 16_683)));
+    assert_eq!(r.mem_mib, 15_936);
+    assert_eq!(r.mem_used_pm, Some(750));
+    // `vmstat` is longer than 4 KiB: the swap counters sit near its head,
+    // inside the one buffer, as on a live kernel.
+    let vmstat = std::fs::read_to_string(fx.roots().proc.join("vmstat")).unwrap();
+    assert!(vmstat.len() > READ_CAP, "the fixture outgrows the cap");
+    assert_eq!(r.swap_pages, Some(4600));
+    let psi = r.psi.expect("the pressure files");
+    assert_eq!(psi.cpu_some_pm, Some(429));
+    assert_eq!(psi.memory_full_pm, Some(50));
+    assert_eq!(psi.io_full_pm, Some(219));
+    // The package sensor is past its passive trip (97 °C over 95): the
+    // hottest zone decides, and the cooling device is not a zone.
+    assert_eq!(r.thermal, Some(Thermal::Serious));
+    assert_eq!(r.pressure, None, "Linux has no kernel level; PSI stands in");
+    assert_eq!(r.low_power, None);
+}
+
+#[test]
+fn a_linux_sweep_reads_every_pid_with_its_uid() {
+    let fx = Fixture::new();
+    let mut s = linux::Sampler::new(fx.roots());
+    let rows = s.scan();
+    let pids: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+    // Numeric entries only (`self`, `pressure`, `uptime` are not pids), in
+    // order; 9999 exited between the listing and the read: no row.
+    assert_eq!(pids, [1, 2, 812, 1733, 4242, 4300, 4301, 4302]);
+    let row = |pid| rows.iter().find(|r| r.pid == pid).unwrap();
+    // The uid is each process's own (`status`, effective), against ours.
+    for pid in [4242, 4300, 4301, 4302] {
+        assert!(row(pid).uid_is_ours, "{pid} is the person's");
+    }
+    for pid in [1, 2, 812, 1733] {
+        assert!(!row(pid).uid_is_ours, "{pid} is root's or postgres's");
+    }
+    let rustc = row(4301);
+    assert_eq!(rustc.name, "rustc");
+    assert_eq!(rustc.ppid, 4300);
+    assert_eq!(rustc.cpu_ns, Some((412_345 + 30_456) * 10_000_000));
+    assert_eq!(rustc.footprint_kib, Some(786_432 * 4));
+    assert_eq!(row(4302).name, "Web Content", "a comm with a space");
+    // Another user's process is measured (Linux shows its times), and its
+    // time is the services' by its uid, never by its name.
+    assert!(row(1733).cpu_ns.is_some());
+    // The rows worth naming read their `exe` link; a kernel thread has none.
+    // (The fixture makes its links real only where the host has symlinks.)
+    let want = cfg!(unix).then_some("/home/dev/.rustup/toolchains/trust/bin/rustc");
+    assert_eq!(rustc.bundle.as_deref(), want);
+    assert_eq!(row(2).bundle, None);
+    // A second sweep takes every path from the cache.
+    let again = s.scan();
+    assert_eq!(
+        again.iter().find(|r| r.pid == 4301).unwrap().bundle,
+        rustc.bundle
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_auxiliary_vector_gives_the_clock_tick_and_the_page_size() {
+    const W: usize = std::mem::size_of::<usize>();
+    let pairs: [(usize, usize); 4] = [(33, 0xdead), (6, 16_384), (17, 250), (0, 0)];
+    let bytes: Vec<u8> = pairs
+        .iter()
+        .flat_map(|(k, v)| k.to_ne_bytes().into_iter().chain(v.to_ne_bytes()))
+        .collect();
+    assert_eq!(linux::auxv_value(&bytes, 6), Some(16_384));
+    assert_eq!(linux::auxv_value(&bytes, 17), Some(250));
+    assert_eq!(linux::auxv_value(&bytes, 99), None);
+    assert_eq!(linux::auxv_value(&bytes[..W], 33), None, "a cut pair");
+    // A tree with an auxv and a pid the kernel refuses: the facts come from
+    // it, and the refused row stays, unmeasured and not ours.
+    let dir = std::env::temp_dir().join(format!("aterm-sysprobe-auxv-{}", std::process::id()));
+    let proc = dir.join("proc");
+    std::fs::create_dir_all(proc.join("self")).unwrap();
+    std::fs::create_dir_all(proc.join("77")).unwrap();
+    std::fs::write(proc.join("self/auxv"), &bytes).unwrap();
+    std::fs::write(proc.join("self/status"), "Uid:\t501\t501\t501\t501\n").unwrap();
+    std::fs::write(proc.join("stat"), "cpu  1 2 3 4\ncpu0 1 2 3 4\nctxt 5\n").unwrap();
+    std::fs::write(proc.join("77/stat"), PID_STAT.replace("4242 (", "77 (")).unwrap();
+    let mut s = linux::Sampler::new(linux::Roots {
+        proc: proc.clone(),
+        sys: dir.join("sys"),
+    });
+    assert_eq!(s.facts(), (250, 16, 1, Some(501)));
+    let r = s.reading(Instant::now());
+    assert_eq!(r.thermal, None, "no thermal zones: unknown, never heavy");
+    assert_eq!(r.swap_pages, None);
+    let rows = s.scan();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cpu_ns, Some(300 * 4_000_000), "250 ticks a second");
+    assert!(!rows[0].uid_is_ours, "no status: not ours");
+    use std::os::unix::fs::PermissionsExt as _;
+    let stat = proc.join("77/stat");
+    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&stat).is_err() {
+        let rows = s.scan();
+        assert_eq!(rows.len(), 1, "a refused pid keeps its row");
+        assert_eq!((rows[0].cpu_ns, rows[0].footprint_kib), (None, None));
+        assert!(!rows[0].uid_is_ours);
+    }
+    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_core_count_reads_only_a_whole_cpu_block() {
+    assert_eq!(linux::stat_cores(PROC_STAT), Some(2));
+    // Cut inside the `cpuN` lines (a many-core box past 4 KiB): unknown.
+    assert_eq!(
+        linux::stat_cores("cpu  1 2 3 4\ncpu0 1 2 3 4\ncpu1 1 2"),
+        None
+    );
+    assert_eq!(linux::stat_cores(""), None);
+    // The `intr` line after the block is torn by the cap on real hardware
+    // (one count per IRQ, thousands of bytes): its first bytes end the block.
+    let torn = "cpu  1 2 3 4\ncpu0 1 2 3 4\ncpu1 1 2 3 4\nintr 1462898413 0 9 0 0 1";
+    assert_eq!(linux::stat_cores(torn), Some(2));
+    assert_eq!(linux::stat_cores("cpu  1\ncpu0 1\ncpu1 1\ni"), Some(2));
+    // Cut at the start of another `cpuN` line: not whole.
+    assert_eq!(linux::stat_cores("cpu  1\ncpu0 1\ncpu1 1\ncp"), None);
+    assert_eq!(linux::stat_cores("cpu  1\ncpu0 1\ncpu1 1\nc"), None);
+    assert_eq!(linux::stat_cores("cpu  1\ncpu0 1\ncpu1 1\n"), None);
+    assert_eq!(
+        linux::status_uid("Name:\tx\nUid:\t1000\t0\t0\t0\nGid:\t1\n"),
+        Some(0),
+        "the effective uid"
+    );
+    assert_eq!(linux::status_uid("Name:\tx\n"), None);
+}
+
+// ---------------------------------------------------------------------------
 // The named tests of the spec (§11 "Probe").
 // ---------------------------------------------------------------------------
 
@@ -428,12 +655,30 @@ fn the_probe_can_move_to_its_thread() {
 // Live, on this host.
 // ---------------------------------------------------------------------------
 
-/// Burn this thread's CPU for `ms`.
+/// Burn `ms` of this thread's CPU — measured on the THREAD's CPU clock, not
+/// the wall. The live test asserts the process's `cpu_ns` moved by most of
+/// the spin, and a wall-clock spin on a machine loaded past its cores gets
+/// less than that share of a core, so the assert read the load, not the
+/// timebase (the load-sensitive test audit of 2026-09-27; the same shape as
+/// daea43981's input-stall fix). Process CPU is at least this thread's, so
+/// the assert holds at any load and still catches an unconverted mach tick.
 #[cfg(target_os = "macos")]
 fn spin(ms: u64) {
-    let until = Instant::now() + std::time::Duration::from_millis(ms);
+    fn thread_cpu_ns() -> u64 {
+        let mut stamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `stamp` is initialized and writable for this one call.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut stamp) };
+        assert_eq!(rc, 0, "the thread CPU clock is readable");
+        let secs = u64::try_from(stamp.tv_sec).expect("a thread CPU clock is non-negative");
+        let nanos = u64::try_from(stamp.tv_nsec).expect("a thread CPU clock is non-negative");
+        secs * 1_000_000_000 + nanos
+    }
+    let until = thread_cpu_ns() + ms * 1_000_000;
     let mut x: u64 = 1;
-    while Instant::now() < until {
+    while thread_cpu_ns() < until {
         x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
     }
 }
@@ -443,8 +688,38 @@ fn spin(ms: u64) {
 fn the_probe_reads_cpu_memory_and_thermal_on_this_host() {
     let mut probe = Probe::new();
     let a = probe.reading();
-    spin(120);
-    let b = probe.reading();
+    // THE KERNEL PUBLISHES THESE TICKS ON ITS OWN SCHEDULE, not on our read.
+    // `host_statistics(HOST_CPU_LOAD_INFO)` answers from a snapshot the kernel
+    // refreshes periodically, so two reads a fixed span apart can come back
+    // byte-identical however hard this thread spins in between — and then
+    // `CpuTicks::advance` folds a zero delta, correctly, and `total` does not
+    // move. MEASURED 2026-09-24 on an otherwise IDLE M5: a single `spin(120)`
+    // reproduced identical `busy_ticks` in roughly one run of three, which is
+    // a merge gate that refuses one branch in three for a reason that is not
+    // about the branch.
+    //
+    // So DRIVE the evidence instead of assuming a span is long enough for it:
+    // spin until the counter moves, bounded, and fail naming what never did.
+    // The property is unchanged and still refutable — busy CPU must advance
+    // these ticks — but it is no longer also a claim that 120 ms is always
+    // enough for the kernel to have said so.
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let b = loop {
+        spin(120);
+        let b = probe.reading();
+        let moved = a
+            .busy_ticks
+            .zip(b.busy_ticks)
+            .is_some_and(|((_, total_a), (_, total_b))| total_b > total_a);
+        if moved {
+            break b;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HOST_CPU_LOAD_INFO never advanced over 5 s of spinning — the \
+             probe is reading a counter that does not move: {a:?} -> {b:?}"
+        );
+    };
     assert!(b.cores > 0, "cores");
     assert!(b.mem_mib >= 1024, "hw.memsize: {} MiB", b.mem_mib);
     assert!(
@@ -569,4 +844,20 @@ fn a_reading_and_a_sweep_cost_milliseconds_not_more() {
         read_us[5], read_us[9], scan_us[5], scan_us[9]
     );
     assert!(read_us[5] < 50_000 && scan_us[5] < 250_000);
+}
+
+/// A process's working directory is read from the OS: this test's own is
+/// what the process says it is. NEGATIVE CONTROL: a pid that cannot exist
+/// reads as nothing, never as some directory.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_processs_working_directory_is_its_own() {
+    let own = crate::process_cwd(std::process::id()).expect("our own cwd");
+    let want = std::env::current_dir().expect("current dir");
+    assert_eq!(
+        std::fs::canonicalize(&own).ok(),
+        std::fs::canonicalize(&want).ok()
+    );
+    assert_eq!(crate::process_cwd(0), None);
+    assert_eq!(crate::process_cwd(u32::MAX), None);
 }

@@ -19,9 +19,10 @@ use crate::native_document_host::{
     DocumentPersistenceStore, GrantAccess,
 };
 use crate::native_document_journal::{
-    DocumentJournalStore, JournalCompletion, JournalEffect, JournalLockPatience,
-    JournalRewriteGeneration, JournalRewritePlan, JournalRewriteResult, execute_journal_append,
-    execute_journal_rewrite,
+    DocumentJournalStore, DraftCarryRefusal, JournalCompletion, JournalEffect, JournalLockPatience,
+    JournalReseatPlan, JournalReseatResult, JournalRewriteGeneration, JournalRewritePlan,
+    JournalRewriteResult, execute_journal_append, execute_journal_reseat, execute_journal_rewrite,
+    verify_carried_draft,
 };
 use crate::native_editor::{EditorCommand, EditorEffect, Selection};
 use crate::{App, WindowId};
@@ -144,6 +145,12 @@ enum NativeDocumentJob {
         plan: JournalRewritePlan,
         proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
     },
+    JournalReseat {
+        document: DocumentId,
+        path: std::path::PathBuf,
+        plan: JournalReseatPlan,
+        proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
+    },
 }
 
 impl NativeDocumentJob {
@@ -151,7 +158,8 @@ impl NativeDocumentJob {
         match self {
             Self::Save { proxy, .. }
             | Self::JournalAppend { proxy, .. }
-            | Self::JournalRewrite { proxy, .. } => proxy,
+            | Self::JournalRewrite { proxy, .. }
+            | Self::JournalReseat { proxy, .. } => proxy,
         }
     }
 }
@@ -194,16 +202,56 @@ impl JournalRetrySet {
         self.documents.pop_first()
     }
 
-    #[cfg(test)]
     fn contains(&self, document: DocumentId) -> bool {
         self.documents.contains(&document)
     }
+}
+
+/// An append the headless test seam held back from inline execution
+/// ([`DocumentHostRuntime::held_journal_appends`]).
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct HeldJournalAppend {
+    pub(crate) document: DocumentId,
+    path: std::path::PathBuf,
+    key: crate::native_document_io::JournalDocumentKey,
+    pub(crate) plan: crate::native_document_io::JournalAppendPlan,
+}
+
+/// A re-seat the headless test seam held back from inline execution
+/// ([`DocumentHostRuntime::held_journal_reseats`]).
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct HeldJournalReseat {
+    pub(crate) document: DocumentId,
+    path: std::path::PathBuf,
+    plan: JournalReseatPlan,
+}
+
+/// The status a successor gives a document whose unsaved draft it restored
+/// during an update: the draft is the buffer, and the file is as it was.
+pub(crate) const CARRIED_DRAFT_NOTICE: &str =
+    "Unsaved draft carried through the update — the file on disk is unchanged";
+
+/// Whether one document's unsaved draft rides an update to the successor
+/// ([`App::draft_carry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DraftCarry {
+    /// Durable in its journal and verified on disk: the successor's restore
+    /// replays exactly this text. Carries its size, which the update's cap sums.
+    Carried { bytes: usize },
+    /// Its journal is writing the latest edit (or re-establishing itself):
+    /// asking again shortly will tell, and nobody needs to act.
+    Writing,
+    /// It cannot ride this update; the words say why.
+    Refused(String),
 }
 
 #[derive(Clone, Copy)]
 enum JournalAdmissionEffect {
     Append(crate::native_document_io::JournalGeneration),
     Rewrite(JournalRewriteGeneration),
+    Reseat(JournalRewriteGeneration),
 }
 
 /// Admit an already-planned journal effect without blocking the UI. `Full` is
@@ -231,6 +279,9 @@ fn try_enqueue_document_journal_job<T>(
                 }
                 JournalAdmissionEffect::Rewrite(generation) => {
                     (journals.defer_rewrite(document, generation), "rewrite")
+                }
+                JournalAdmissionEffect::Reseat(generation) => {
+                    (journals.defer_reseat(document, generation), "re-seat")
                 }
             };
             if !deferred {
@@ -367,6 +418,24 @@ fn native_document_queue() -> Result<&'static std::sync::mpsc::SyncSender<Native
                                         result,
                                     });
                             }
+                            NativeDocumentJob::JournalReseat {
+                                document,
+                                path,
+                                plan,
+                                proxy,
+                            } => {
+                                let result = execute_journal_reseat(
+                                    &path,
+                                    &plan,
+                                    JournalLockPatience::Worker,
+                                );
+                                let _ =
+                                    proxy.send_event(crate::Wake::NativeDocumentJournalReseated {
+                                        document,
+                                        generation: plan.generation,
+                                        result,
+                                    });
+                            }
                         }
                     }
                 })
@@ -414,6 +483,29 @@ pub(crate) struct DocumentHostRuntime {
     /// latest-wins latch: full encoded plans are released before insertion and
     /// rebuilt from `DocumentJournalStore` when a worker receive frees a slot.
     journal_retries: JournalRetrySet,
+    /// A journal write LANDED while an update handoff was parked — after the
+    /// successor may have read the image it restores from. The Commit check
+    /// reads the image as the successor's copy, so a landing it cannot order
+    /// against the successor's read fails that check (`Wait:`); the rollback
+    /// clears it. Set from every completion path
+    /// ([`App::note_document_journal_landing`]).
+    journal_landed_while_parked: bool,
+    /// TEST SEAM — the headless App has no document worker, so its journal
+    /// effects run inline. When `Some`, appends are held here instead, for a
+    /// test to run later exactly as the worker would
+    /// (`App::run_held_journal_append_for_test`):
+    /// how a conformance test puts an append in flight across a park.
+    #[cfg(test)]
+    held_journal_appends: Option<Vec<HeldJournalAppend>>,
+    /// TEST SEAM — [`Self::held_journal_appends`] for re-seats
+    /// (`App::run_held_journal_reseat_for_test`).
+    #[cfg(test)]
+    held_journal_reseats: Option<Vec<HeldJournalReseat>>,
+    /// TEST SEAM — every test App is headless, and a headless successor
+    /// restores no document tab ([`App::successor_restores_document_tabs`]).
+    /// Set, the App answers as a windowed one does, so a test can carry drafts.
+    #[cfg(test)]
+    carry_as_windowed_for_test: bool,
     /// Documents whose on-disk generation no longer matches the saver baseline.
     /// This host-owned latch blocks every save entry point until an explicit
     /// reload/reconciliation installs a fresh stable observation.
@@ -459,6 +551,13 @@ impl DocumentHostRuntime {
             journal_unavailable,
             recovery_status: BTreeMap::new(),
             journal_retries: JournalRetrySet::default(),
+            journal_landed_while_parked: false,
+            #[cfg(test)]
+            held_journal_appends: None,
+            #[cfg(test)]
+            held_journal_reseats: None,
+            #[cfg(test)]
+            carry_as_windowed_for_test: false,
             disk_conflicts: BTreeSet::new(),
             inflight: BTreeSet::new(),
             pending_saves: BTreeMap::new(),
@@ -840,20 +939,21 @@ impl App {
             Some(NativeApp::Editor(editor)) => editor.document,
             _ => return Ok(None),
         };
-        if !matches!(
-            event,
-            AppEvent::InsertText(_)
-                | AppEvent::TextInput(_)
-                | AppEvent::EditorChord(_)
-                | AppEvent::EditorCommand(_)
-                | AppEvent::EditorCompletion(_)
-                | AppEvent::EditorConfigCompletion(_)
-                | AppEvent::EditorConfigCompletionRejected
-                | AppEvent::EditorConfigDiagnosticNavigate { .. }
-                | AppEvent::EditorSetSelection { .. }
-                | AppEvent::EditorViewportChanged { .. }
-                | AppEvent::ScrollLines(_)
-        ) {
+        let editor_event = match event {
+            #[cfg(any(a11y_tree, test))]
+            AppEvent::InsertText(_) | AppEvent::EditorSetSelection { .. } => true,
+            AppEvent::TextInput(_)
+            | AppEvent::EditorChord(_)
+            | AppEvent::EditorCommand(_)
+            | AppEvent::EditorCompletion(_)
+            | AppEvent::EditorConfigCompletion(_)
+            | AppEvent::EditorConfigCompletionRejected
+            | AppEvent::EditorConfigDiagnosticNavigate { .. }
+            | AppEvent::EditorViewportChanged { .. }
+            | AppEvent::ScrollLines(_) => true,
+            _ => false,
+        };
+        if !editor_event {
             return Ok(None);
         }
 
@@ -891,21 +991,29 @@ impl App {
                 return Err("editor buffer is not attached".to_string());
             };
             state.preedit.clear();
+            state.preedit_caret = None;
             if !matches!(
                 event,
                 AppEvent::ScrollLines(_)
                     | AppEvent::EditorViewportChanged { .. }
-                    | AppEvent::TextInput(TextInputEvent::Preedit(_))
+                    | AppEvent::TextInput(TextInputEvent::Preedit { .. })
             ) {
                 state.config_completion_selected = 0;
                 state.config_completion_interaction = None;
             }
             let reduced = match event {
-                AppEvent::InsertText(text) | AppEvent::TextInput(TextInputEvent::Commit(text)) => {
+                #[cfg(any(a11y_tree, test))]
+                AppEvent::InsertText(text) => workspace.insert_text(store, buffer, text),
+                AppEvent::TextInput(TextInputEvent::Commit(text)) => {
                     workspace.insert_text(store, buffer, text)
                 }
-                AppEvent::TextInput(TextInputEvent::Preedit(text)) => {
+                AppEvent::TextInput(TextInputEvent::Preedit { text, selection }) => {
                     state.preedit.clone_from(text);
+                    state.preedit_caret = crate::native_text_input::normalize_preedit_selection(
+                        text,
+                        selection.clone(),
+                    )
+                    .map(|selection| selection.end);
                     Ok(Vec::new())
                 }
                 AppEvent::TextInput(TextInputEvent::Backspace) => {
@@ -1072,6 +1180,7 @@ impl App {
                         Ok(Vec::new())
                     }
                 }
+                #[cfg(any(a11y_tree, test))]
                 AppEvent::EditorSetSelection { anchor, head } => {
                     if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
                         Ok(effects)
@@ -1119,7 +1228,7 @@ impl App {
                 event,
                 AppEvent::ScrollLines(_)
                     | AppEvent::EditorViewportChanged { .. }
-                    | AppEvent::TextInput(TextInputEvent::Preedit(_))
+                    | AppEvent::TextInput(TextInputEvent::Preedit { .. })
             ) && let Some(snapshot) = store.snapshot(document)
             {
                 let visible_lines = buffer.viewport_lines();
@@ -1161,6 +1270,14 @@ impl App {
         Ok(Some(EventResult::Handled))
     }
 
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Type",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
     fn publish_editor_commit(
         &mut self,
         document: DocumentId,
@@ -1240,13 +1357,18 @@ impl App {
         } else {
             None
         };
+        // THE RE-SEAT FENCE follows the handoff attempt: while a successor may
+        // be restoring from these journals, none is re-seated under it
+        // (`DocumentJournalStore::set_reseat_fenced`).
+        let fenced = self.update_handoff_in_flight();
         loop {
-            let effect = self
+            let journals = self
                 .native_documents
                 .journals
                 .as_mut()
-                .ok_or_else(|| "document journal is unavailable".to_string())?
-                .next_effect(document)?;
+                .ok_or_else(|| "document journal is unavailable".to_string())?;
+            journals.set_reseat_fenced(fenced);
+            let effect = journals.next_effect(document)?;
             let Some(effect) = effect else {
                 self.native_documents.journal_retries.remove(document);
                 return Ok(JournalDriveOutcome::Idle);
@@ -1274,6 +1396,16 @@ impl App {
                             &mut native_documents.journal_retries,
                         );
                     }
+                    #[cfg(test)]
+                    if let Some(held) = self.native_documents.held_journal_appends.as_mut() {
+                        held.push(HeldJournalAppend {
+                            document,
+                            path,
+                            key,
+                            plan,
+                        });
+                        return Ok(JournalDriveOutcome::Enqueued);
+                    }
                     // NO worker to hand this to (`proxy` is None, so the queue
                     // was never built), and this is the thread that owns `App`.
                     // It takes the frame-sized budget for that reason, and its
@@ -1287,6 +1419,7 @@ impl App {
                         .as_mut()
                         .expect("journal store checked above")
                         .complete_append(document, plan.generation, result);
+                    self.note_document_journal_landing(&completion);
                     if let Some(message) = journal_completion_error(completion) {
                         return Err(message);
                     }
@@ -1320,6 +1453,50 @@ impl App {
                         .as_mut()
                         .expect("journal store checked above")
                         .complete_rewrite(document, plan.generation, result);
+                    self.note_document_journal_landing(&completion);
+                    if let Some(message) = journal_completion_error(completion) {
+                        return Err(message);
+                    }
+                }
+                JournalEffect::Reseat { path, plan } => {
+                    if let (Some(proxy), Some(queue)) = (proxy.clone(), queue) {
+                        let native_documents = &mut self.native_documents;
+                        let journals = native_documents
+                            .journals
+                            .as_mut()
+                            .expect("journal store checked above");
+                        return try_enqueue_document_journal_job(
+                            queue,
+                            NativeDocumentJob::JournalReseat {
+                                document,
+                                path,
+                                plan: plan.clone(),
+                                proxy,
+                            },
+                            document,
+                            JournalAdmissionEffect::Reseat(plan.generation),
+                            journals,
+                            &mut native_documents.journal_retries,
+                        );
+                    }
+                    #[cfg(test)]
+                    if let Some(held) = self.native_documents.held_journal_reseats.as_mut() {
+                        held.push(HeldJournalReseat {
+                            document,
+                            path,
+                            plan,
+                        });
+                        return Ok(JournalDriveOutcome::Enqueued);
+                    }
+                    let result =
+                        execute_journal_reseat(&path, &plan, JournalLockPatience::EventLoop);
+                    let completion = self
+                        .native_documents
+                        .journals
+                        .as_mut()
+                        .expect("journal store checked above")
+                        .complete_reseat(document, plan.generation, result);
+                    self.note_document_journal_landing(&completion);
                     if let Some(message) = journal_completion_error(completion) {
                         return Err(message);
                     }
@@ -1357,10 +1534,72 @@ impl App {
             .map_or(JournalCompletion::Stale, |journals| {
                 journals.complete_append(document, generation, result)
             });
+        self.note_document_journal_landing(&completion);
         if matches!(&completion, JournalCompletion::Durable { .. }) {
             for (_, _, view) in self.document_native_views(document) {
                 self.set_editor_view_status(view, "Draft autosaved");
             }
+        }
+        if let Some(message) = journal_completion_error(completion) {
+            self.set_document_recovery_status(document, Some(message));
+            self.drive_owed_document_journal_reseat(document);
+            return;
+        }
+        if let Err(message) = self.drive_document_journal(document) {
+            self.set_document_recovery_status(document, Some(message));
+        }
+    }
+
+    /// An append or checkpoint that failed while a re-seat was owed most likely
+    /// failed BECAUSE of it (a successor's image on disk): drive the re-seat
+    /// now rather than at the next keystroke. A re-seat's own failure is never
+    /// re-driven from here, so a journal that keeps refusing cannot spin.
+    fn drive_owed_document_journal_reseat(&mut self, document: DocumentId) {
+        if self
+            .native_documents
+            .journals
+            .as_ref()
+            .is_some_and(|journals| journals.reseat_owed(document))
+            && let Err(message) = self.drive_document_journal(document)
+        {
+            self.set_document_recovery_status(document, Some(message));
+        }
+    }
+
+    pub(crate) fn finish_native_document_journal_reseat(
+        &mut self,
+        document: DocumentId,
+        generation: JournalRewriteGeneration,
+        result: JournalReseatResult,
+    ) {
+        let preserved = matches!(
+            &result,
+            JournalReseatResult::Republished {
+                preserved: true,
+                ..
+            }
+        );
+        let completion = self
+            .native_documents
+            .journals
+            .as_mut()
+            .map_or(JournalCompletion::Stale, |journals| {
+                journals.complete_reseat(document, generation, result)
+            });
+        self.note_document_journal_landing(&completion);
+        if matches!(&completion, JournalCompletion::Durable { .. }) {
+            aterm_log::info!(
+                "document journal: re-established as this process's own after an update \
+                 rolled back{}",
+                if preserved {
+                    "; the image a successor left there was preserved aside first"
+                } else {
+                    ""
+                }
+            );
+            // Whatever the successor's image made fail while it stood there
+            // (an append's "journal image changed") is over: say nothing stale.
+            self.set_document_recovery_status(document, None);
         }
         if let Some(message) = journal_completion_error(completion) {
             self.set_document_recovery_status(document, Some(message));
@@ -1369,6 +1608,349 @@ impl App {
         if let Err(message) = self.drive_document_journal(document) {
             self.set_document_recovery_status(document, Some(message));
         }
+    }
+
+    /// Whether one document's unsaved draft rides an update to the successor
+    /// — the per-document half of the Relaunch preflight
+    /// (`App::native_update_close_preflight`), asked when the update starts and
+    /// again at its Commit.
+    ///
+    /// CARRIED means: the journal store proved the editor's current head
+    /// durable (fsync'd file and directory, the exact append proof), nothing is
+    /// writing or owed, the file on disk is the one the draft was made against
+    /// as far as this process has observed, and the image on disk — read back
+    /// now, every record checksummed — replays to exactly the editor's text over
+    /// exactly that file ([`verify_carried_draft`]). The successor restores the
+    /// document by reopening its file, which replays that image; the file
+    /// itself is never written.
+    pub(crate) fn draft_carry(&self, document: DocumentId) -> DraftCarry {
+        let Some(head) = self.document_store.snapshot(document) else {
+            return DraftCarry::Refused("the document is no longer open".to_string());
+        };
+        if !self.successor_restores_document_tabs() {
+            return DraftCarry::Refused(
+                if self.headless {
+                    "a headless successor reopens no document tab, so the editor would close"
+                } else {
+                    "an update on this platform reopens no document tab, so the editor would close"
+                }
+                .to_string(),
+            );
+        }
+        let Some(journals) = self.native_documents.journals.as_ref() else {
+            return DraftCarry::Refused(format!(
+                "it has no draft journal ({})",
+                self.native_documents
+                    .journal_unavailable
+                    .as_deref()
+                    .unwrap_or("document recovery is unavailable")
+            ));
+        };
+        if self.native_documents.disk_conflicts.contains(&document) {
+            return DraftCarry::Refused(
+                "its file changed on disk after the draft began".to_string(),
+            );
+        }
+        let candidate = match journals.carry_candidate(&head) {
+            Ok(candidate) => candidate,
+            Err(DraftCarryRefusal::Writing | DraftCarryRefusal::Reseating) => {
+                return DraftCarry::Writing;
+            }
+            Err(DraftCarryRefusal::Behind)
+                if self.native_documents.journal_retries.contains(document) =>
+            {
+                return DraftCarry::Writing;
+            }
+            Err(DraftCarryRefusal::Behind) => {
+                return DraftCarry::Refused(
+                    "its latest edit is not in the draft journal (the editor's status says why)"
+                        .to_string(),
+                );
+            }
+            Err(DraftCarryRefusal::Unjournaled) => {
+                return DraftCarry::Refused("it has no draft journal".to_string());
+            }
+            Err(DraftCarryRefusal::ReseatFailed) => {
+                return DraftCarry::Refused(
+                    "its draft journal could not be re-established after an update rolled back \
+                     (the editor's status says why; it is retried before every update)"
+                        .to_string(),
+                );
+            }
+            Err(DraftCarryRefusal::AppendFailed) => {
+                return DraftCarry::Refused(
+                    "its latest edit could not be written to the draft journal (the editor's \
+                     status says why; it is retried before every update)"
+                        .to_string(),
+                );
+            }
+        };
+        let Some(observed) = self
+            .native_documents
+            .persistence
+            .observed(document)
+            .filter(|observed| observed.exists)
+        else {
+            return DraftCarry::Refused("its file is not on disk".to_string());
+        };
+        match verify_carried_draft(&candidate, &head.text, observed.content) {
+            Ok(()) => DraftCarry::Carried {
+                bytes: head.text.len(),
+            },
+            Err(why) => DraftCarry::Refused(why),
+        }
+    }
+
+    /// Whether this process's update successor reopens its document tabs. The
+    /// seamless successor restores the handed-over layout — every editor leaf
+    /// by reopening its file, which replays the draft — only when it has a
+    /// window to put them in (`main_entry` takes the handoff layout only when
+    /// not headless); a headless successor restores none, so no draft of a
+    /// headless process is carried. Nor is one off unix: only the unix overlap
+    /// handoff hands a layout over, and the Windows lane replaces the app cold
+    /// (spawn, then exit — `apply_staged_update_now`), which reopens nothing
+    /// and does not read the safety token's carried count.
+    pub(crate) fn successor_restores_document_tabs(&self) -> bool {
+        #[cfg(test)]
+        if self.native_documents.carry_as_windowed_for_test {
+            return true;
+        }
+        cfg!(unix) && !self.headless
+    }
+
+    /// Answer [`Self::successor_restores_document_tabs`] as a windowed App.
+    #[cfg(test)]
+    pub(crate) fn carry_drafts_as_windowed_for_test(&mut self) {
+        self.native_documents.carry_as_windowed_for_test = true;
+    }
+
+    /// Whether any draft-journal write is on the worker now (an update may not
+    /// start or commit over one — `DocumentJournalStore::writes_in_flight`).
+    pub(crate) fn document_journal_writes_in_flight(&self) -> bool {
+        self.native_documents
+            .journals
+            .as_ref()
+            .is_some_and(DocumentJournalStore::writes_in_flight)
+    }
+
+    /// Record a journal write that landed while an update handoff was parked
+    /// ([`DocumentHostRuntime::journal_landed_while_parked`]). Every path a
+    /// completion reduces through calls this — the worker's wakes and the
+    /// inline lane alike.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Land",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
+    fn note_document_journal_landing(&mut self, completion: &JournalCompletion) {
+        if matches!(completion, JournalCompletion::Durable { .. }) && self.update_handoff_parked() {
+            self.native_documents.journal_landed_while_parked = true;
+        }
+    }
+
+    /// Whether a journal write landed after the parked successor may have read
+    /// its image: the Commit check cannot vouch for what the successor restored.
+    pub(crate) fn document_journal_landed_while_parked(&self) -> bool {
+        self.native_documents.journal_landed_while_parked
+    }
+
+    /// After an update handoff rolls back, every journal the successor may
+    /// have republished while it restored its documents is owed a re-seat, and
+    /// each is driven now. With a worker this only enqueues (the rollback's
+    /// event-loop half does no filesystem I/O); a re-seat still fenced by the
+    /// attempt record runs at the next drive.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Rollback",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
+    pub(crate) fn reseat_document_journals_after_rollback(&mut self) {
+        // The attempt that was parked is over: a later landing orders against
+        // no successor.
+        self.native_documents.journal_landed_while_parked = false;
+        let Some(journals) = self.native_documents.journals.as_mut() else {
+            return;
+        };
+        for document in journals.owe_reseat_all() {
+            if let Err(message) = self.drive_document_journal(document) {
+                self.set_document_recovery_status(document, Some(message));
+            }
+        }
+    }
+
+    /// Drive every journal owing work nothing is doing (a re-seat, or a head
+    /// the last failed append left behind) — run before an update asks whether
+    /// each unsaved draft can be carried, so a transient journal failure is
+    /// retried by the update itself instead of holding it until the next
+    /// keystroke.
+    ///
+    /// ONLY AN UNSAVED DRAFT'S FAILED WRITE is retried here. The update carries
+    /// those drafts and says why it cannot when a journal keeps refusing
+    /// (`DraftCarryRefusal::AppendFailed` / `ReseatFailed`). Any other
+    /// journal's retry — a saved document's re-seat after a rollback, say —
+    /// would only be a write in flight when the preflight asks, holding the
+    /// update ("Wait:") without a word for as long as the failure lasts, over a
+    /// document it has nothing to carry of. That one is retried at its
+    /// document's next drive, and by the next rollback's re-seat.
+    pub(crate) fn drive_owed_document_journals(&mut self) {
+        let Some(journals) = self.native_documents.journals.as_ref() else {
+            return;
+        };
+        let owed = journals
+            .owed_documents()
+            .into_iter()
+            .filter(|document| {
+                !journals.write_failed(*document)
+                    || self.document_store.dirty(*document) == Some(true)
+            })
+            .collect::<Vec<_>>();
+        for document in owed {
+            if self.native_documents.journal_retries.contains(document) {
+                continue;
+            }
+            if let Err(message) = self.drive_document_journal(document) {
+                self.set_document_recovery_status(document, Some(message));
+            }
+        }
+    }
+
+    /// Point this App's draft journals at `root` — how a test gives an
+    /// outgoing App and its successor the one journal directory two processes
+    /// of one user share.
+    #[cfg(test)]
+    pub(crate) fn use_document_journal_root_for_test(&mut self, root: std::path::PathBuf) {
+        self.native_documents.journals =
+            Some(DocumentJournalStore::for_test(root).expect("test journal root"));
+        self.native_documents.journal_unavailable = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_journal_path_for_test(
+        &self,
+        document: DocumentId,
+    ) -> Option<std::path::PathBuf> {
+        self.native_documents
+            .journals
+            .as_ref()?
+            .journal_path(document)
+    }
+
+    /// The journal image this App last published for `document`.
+    #[cfg(test)]
+    pub(crate) fn document_journal_image_for_test(
+        &self,
+        document: DocumentId,
+    ) -> Option<crate::native_document_io::ContentFingerprint> {
+        self.native_documents
+            .journals
+            .as_ref()?
+            .durable_image(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_journal_durable_seq_for_test(
+        &self,
+        document: DocumentId,
+    ) -> Option<aterm_buffer::Seq> {
+        self.native_documents
+            .journals
+            .as_ref()?
+            .durable_seq(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_journal_reseat_owed_for_test(&self, document: DocumentId) -> bool {
+        self.native_documents
+            .journals
+            .as_ref()
+            .is_some_and(|journals| journals.reseat_owed(document))
+    }
+
+    /// Hold every journal append from now on instead of running it inline
+    /// ([`DocumentHostRuntime::held_journal_appends`]).
+    #[cfg(test)]
+    pub(crate) fn hold_journal_appends_for_test(&mut self) {
+        self.native_documents.held_journal_appends = Some(Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_journal_appends_for_test(&self) -> &[HeldJournalAppend] {
+        self.native_documents
+            .held_journal_appends
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Run the oldest held append exactly as the document worker does — the
+    /// worker's executor and patience, then the completion the worker's wake
+    /// delivers (`finish_native_document_journal`).
+    #[cfg(test)]
+    pub(crate) fn run_held_journal_append_for_test(&mut self) -> bool {
+        let Some(held) = self
+            .native_documents
+            .held_journal_appends
+            .as_mut()
+            .filter(|held| !held.is_empty())
+            .map(|held| held.remove(0))
+        else {
+            return false;
+        };
+        let result = execute_journal_append(
+            &held.path,
+            held.key,
+            &held.plan,
+            JournalLockPatience::Worker,
+        );
+        self.finish_native_document_journal(held.document, held.plan.generation, result);
+        true
+    }
+
+    /// Hold every journal re-seat from now on instead of running it inline
+    /// ([`DocumentHostRuntime::held_journal_reseats`]).
+    #[cfg(test)]
+    pub(crate) fn hold_journal_reseats_for_test(&mut self) {
+        self.native_documents.held_journal_reseats = Some(Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_journal_reseats_for_test(&self) -> &[HeldJournalReseat] {
+        self.native_documents
+            .held_journal_reseats
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Run the oldest held re-seat exactly as the document worker does — the
+    /// worker's executor and patience, then the completion its wake delivers
+    /// (`finish_native_document_journal_reseat`).
+    #[cfg(test)]
+    pub(crate) fn run_held_journal_reseat_for_test(&mut self) -> bool {
+        let Some(held) = self
+            .native_documents
+            .held_journal_reseats
+            .as_mut()
+            .filter(|held| !held.is_empty())
+            .map(|held| held.remove(0))
+        else {
+            return false;
+        };
+        let result = execute_journal_reseat(&held.path, &held.plan, JournalLockPatience::Worker);
+        self.finish_native_document_journal_reseat(held.document, held.plan.generation, result);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_recovery_status_for_test(&self, document: DocumentId) -> Option<&str> {
+        self.native_documents
+            .recovery_status
+            .get(&document)
+            .map(String::as_str)
     }
 
     pub(crate) fn finish_native_document_journal_rewrite(
@@ -1384,6 +1966,7 @@ impl App {
             .map_or(JournalCompletion::Stale, |journals| {
                 journals.complete_rewrite(document, generation, result)
             });
+        self.note_document_journal_landing(&completion);
         if matches!(&completion, JournalCompletion::Durable { .. }) {
             for (_, _, view) in self.document_native_views(document) {
                 self.set_editor_view_status(view, "Draft autosaved");
@@ -1391,6 +1974,7 @@ impl App {
         }
         if let Some(message) = journal_completion_error(completion) {
             self.set_document_recovery_status(document, Some(message));
+            self.drive_owed_document_journal_reseat(document);
             return;
         }
         if let Err(message) = self.drive_document_journal(document) {
@@ -2986,6 +3570,22 @@ impl App {
     /// the document with recovery and persistence, then create or focus the tab.
     /// No filesystem read happens here beyond the cheap binding revalidation of
     /// an already-minted grant.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Restore",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "RestoreIdentical",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
     fn install_admitted_document(
         &mut self,
         wid: WindowId,
@@ -3156,7 +3756,19 @@ impl App {
             return Err(error);
         }
         if let Some(notice) = recovery_notice {
-            self.set_document_recovery_status(document, Some(notice.message()));
+            // AN UPDATE'S SUCCESSOR recovering a draft is the update carrying
+            // it: the outgoing process certified exactly this journal before it
+            // let the update start, so say what happened rather than suggest a
+            // crash.
+            let message = match notice {
+                crate::native_document_journal::RecoveryNotice::Recovered { .. }
+                    if self.incoming_handoff_pending =>
+                {
+                    CARRIED_DRAFT_NOTICE.to_string()
+                }
+                notice => notice.message(),
+            };
+            self.set_document_recovery_status(document, Some(message));
         } else if let Some(status) = self
             .native_documents
             .recovery_status
@@ -6360,6 +6972,56 @@ mod tests {
     }
 
     #[test]
+    fn editor_ime_input_route_preserves_document_and_minibuffer_marked_carets() {
+        let (dir, uri) = admission_fixture("ime-marked-caret", b"original\n");
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &uri).unwrap();
+        let wid = WindowId(0);
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        for minibuffer in [false, true] {
+            if minibuffer {
+                drive_native(&mut app, isearch_key());
+            }
+            for (selection, expected) in [
+                (Some((3, 6)), Some(6)),
+                (Some((1, 3)), Some(3)),
+                (Some((2, 3)), None),
+                (Some((6, 3)), None),
+                (Some((0, 99)), None),
+                (None, None),
+            ] {
+                app.on_ime_preedit(wid, "e\u{301}日本".to_string(), selection);
+                let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                    panic!("editor")
+                };
+                assert_eq!(state.preedit, "e\u{301}日本");
+                assert_eq!(
+                    state.preedit_caret, expected,
+                    "minibuffer={minibuffer}, selection={selection:?}"
+                );
+                assert_eq!(
+                    state.buffer.as_ref().unwrap().minibuffer_active(),
+                    minibuffer
+                );
+                let current = app.document_store.snapshot(document).unwrap();
+                assert_eq!(
+                    (current.seq, current.text.as_ref()),
+                    (original.seq, original.text.as_ref())
+                );
+            }
+            app.on_ime_preedit(wid, String::new(), None);
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("editor")
+            };
+            assert!(state.preedit.is_empty());
+            assert_eq!(state.preedit_caret, None);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn editor_input_mutates_shared_document_and_save_advances_checkpoint() {
         let dir = std::env::temp_dir().join(format!("aterm-app-edit-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -7038,6 +7700,19 @@ mod tests {
         assert_eq!(aterm_spec::interp::admits(&model, &state, &dropped), None);
         assert!(!buggy.check_invariant("SettledCoversLatestRequest", &dropped));
         assert!(!buggy.check_invariant("WaitingCloseHasCompletionPump", &dropped));
+
+        // Negative control: a close committed the moment it is armed. The
+        // genuine plan is not ready — `prepare_close` finds no checkpoint
+        // covering the frozen sequence — and nothing the model sees moves.
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, Vec::new())
+        );
+        assert_eq!(project(&model, &app, document, controller), state);
+        let early = buggy.successors("CommitClose", &state)[0].clone();
+        assert_eq!(early["closed"], 1);
+        assert_eq!(aterm_spec::interp::admits(&model, &state, &early), None);
+        assert!(!model.check_invariant("ClosedSequenceIsDurable", &early));
 
         finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
             // NOT decoration. When this replay fails, the panic used to read only

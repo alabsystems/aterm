@@ -319,6 +319,7 @@ impl PaletteState {
     /// target. Ordinary palettes always retain menu rows, so they cannot be
     /// mistaken for a close refusal when deferred teardown replay decides
     /// whether the blocker must keep focus.
+    #[cfg(any(unix, test))]
     pub(crate) fn is_native_close_recovery_for(
         &self,
         window: crate::WindowId,
@@ -703,7 +704,7 @@ impl PaletteState {
 
     /// Move the cursor to a specific FILTERED-set index (an OS accessibility Focus/Click on a
     /// row lands here), clamped into range and kept on-screen. A no-op when nothing matches.
-    #[cfg_attr(not(a11y_tree), allow(dead_code))]
+    #[cfg(a11y_tree)]
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -1310,7 +1311,6 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
             h: card_h + 6.0,
             radius: radius + 3.0,
             fill: rgba([0, 0, 0], 0x2A),
-            blur: false,
         },
         DrawPrim::Panel {
             x: card_x - 1.0,
@@ -1319,7 +1319,6 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
             h: card_h + 3.0,
             radius: radius + 1.0,
             fill: rgba([0, 0, 0], 0x30),
-            blur: false,
         },
         // Opaque: the shared tray rasterizer does not implement backdrop blur, so
         // translucency here would make the owning app's text ghost through the commands.
@@ -1330,7 +1329,6 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
             h: card_h,
             radius,
             fill: rgba(r.surface, 0xFF),
-            blur: false,
         },
         DrawPrim::Stroke {
             x: card_x,
@@ -1465,7 +1463,6 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
                 h: height,
                 radius: ch * 0.3,
                 fill: rgba(r.accent, 0x22),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x,
@@ -2436,7 +2433,6 @@ mod tests {
                     w,
                     h,
                     fill,
-                    blur: false,
                     ..
                 } if *x == card_x
                     && *y == card_y

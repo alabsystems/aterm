@@ -69,20 +69,17 @@
 #![deny(clippy::all)]
 
 mod builtin_patterns;
-mod ffi_types;
 mod rules;
 mod text_selection;
 
 #[cfg(test)]
 pub(crate) use builtin_patterns::BuiltinRules;
-pub use ffi_types::{
-    AtermSelectionBounds, AtermSelectionError, AtermSelectionKind, AtermSelectionMatch,
-    AtermSelectionState, AtermSelectionType, AtermSmartSelection, build_selection_match,
-};
+#[cfg(test)]
+pub use rules::SelectionMatch;
+pub use rules::SelectionRuleKind;
 pub use rules::SmartSelection;
 #[cfg(test)]
 pub(crate) use rules::{RulePriority, SelectionRule};
-pub use rules::{SelectionMatch, SelectionRuleKind};
 
 pub use text_selection::SelectionState;
 pub use text_selection::{

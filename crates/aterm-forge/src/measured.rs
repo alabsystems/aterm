@@ -793,12 +793,89 @@ pub struct Baseline {
 //     second at 5 / 65,413). `tools/forge-budget.tsv` is raised on the same
 //     three rows through `--allow-regress`, with this cause in its fourth
 //     column.
+// RE-MEASURED 2026-09-24 — THE X11 KEY TIMESTAMP, one instrument seam in the
+//     fork and nothing else. The X11 event processor publishes the server
+//     `time` of the key event it is dispatching, for exactly the length of the
+//     `KeyboardInput` callback, and `platform::x11::key_event_server_time`
+//     reads it — so aterm can backdate a Linux key to the X server's stamp the
+//     way macOS backdates by the NSEvent queue age (aterm-gui
+//     `platform::current_event_queue_age_ns`). TWO files of `vendor/winit` —
+//     `platform/x11.rs` (+22) and `platform_impl/linux/x11/event_processor.rs`
+//     (+7), each with its Apache §4(b) notice — so every cell that resolves
+//     winit gains exactly 29 physical lines:
+//
+//       mac-arm  441,498 -> 441,527
+//       linux    2,789,707 -> 2,789,736
+//       win      3,588,067 -> 3,588,096
+//
+//     Measured, not inferred: `targo --unverified forge budget` read exactly
+//     +29 on the six native rows and nothing else, and the numstat of
+//     `vendor/` is +29 / -0 with both paths under `vendor/winit/`.
+//     `vendor/winit/Cargo.toml` is byte-identical, so every other field is
+//     unchanged in all five cells, and the wasm modules, which never resolve
+//     winit, do not move. `tools/forge-budget.tsv` is raised on the same six
+//     rows through `--allow-regress`, with this cause in its fourth column.
+// RE-MEASURED 2026-09-24 (later the same day) — THE SAME SEAM, MADE TESTABLE,
+//     +15. A review found the stamp's lifecycle (set for exactly one dispatch,
+//     cleared after, absent elsewhere) untested: winit's own tests cannot run
+//     inside this workspace, and the store/clear pair sat inline in the event
+//     processor. It is now one `#[doc(hidden)] pub` helper in
+//     `platform/x11.rs` (+21 / -5) that also clears on unwind, called once from
+//     `event_processor.rs` (+4 / -5), so aterm-gui drives the real seam in a
+//     test. Net +15 on every cell that resolves winit:
+//
+//       mac-arm  441,527 -> 441,542
+//       linux    2,789,736 -> 2,789,751
+//       win      3,588,096 -> 3,588,111
+//
+//     Measured by `targo --unverified forge budget` (+15 on the same six
+//     native rows, nothing else) and the `vendor/` numstat (+25 / -10).
+// RE-MEASURED 2026-09-26 — THE WAKER IN A NESTED RUN LOOP, one defect fix in
+//     the fork and nothing else (design ruling 267 of the unified-messages
+//     design). While the ⌘Q confirmation (`NSAlert runModal`) stood inside the
+//     event handler, a past-due `WaitUntil` left winit's `EventLoopWaker` timer
+//     firing at its 0.1 µs interval in every common mode — 88 % CPU for as long
+//     as the dialog was up, measured live on day two of round 16. Both run-loop
+//     observers now stop the waker when they find the handler borrowed (only a
+//     nested run loop can), and the outer turn's own `cleared` re-arms it.
+//     ONE file of `vendor/winit` — `platform_impl/macos/app_state.rs` (+16 /
+//     -0, one new helper and its `// LOCAL PATCH (aterm):` marker, so the
+//     marker census moves 121 -> 122) — so every cell that resolves winit gains
+//     exactly 16 physical lines:
+//
+//       mac-arm  441,542 -> 441,558
+//       linux    2,789,751 -> 2,789,767
+//       win      3,588,111 -> 3,588,127
+//
+//     `vendor/winit/Cargo.toml` is byte-identical, so every other field is
+//     unchanged in all five cells, and the wasm modules, which never resolve
+//     winit, do not move. `tools/forge-budget.tsv` is raised on the same six
+//     rows through `--allow-regress`, with this cause in its fourth column.
+// RE-MEASURED 2026-09-27 — THE WAKER IS aterm_objc::WakeTimer (f715ad5aa,
+//     the 2026-09-26 hang: a late 0.1 µs repeating CFRunLoopTimer made
+//     CoreFoundation walk ~10⁷ intervals with the run-loop lock held). TWO
+//     files of `vendor/winit` — `platform_impl/macos/observer.rs` (+25 / -74,
+//     the CFRunLoopTimer waker replaced by the first-party timer) and
+//     `platform_impl/macos/app_state.rs` (+5 / -2, one more `// LOCAL PATCH
+//     (aterm):` marker, so the marker census moves 122 -> 123) — so every cell
+//     that resolves winit loses exactly 46 physical lines, measured by `cargo
+//     forge survey` on all six:
+//
+//       mac-arm / mac-x64      441,558 -> 441,512
+//       linux / linux-arm      2,789,767 -> 2,789,721
+//       win / win-arm          3,588,127 -> 3,588,081
+//
+//     `vendor/winit/Cargo.toml` is byte-identical and the budget stays GREEN
+//     (a shrink under every ceiling; only `--update` lowers one). The commit
+//     that made the edit did not re-pin these, and `aterm-forge`'s
+//     `the_real_tree_reproduces_the_measured_marker_floor` and the two survey
+//     totals tests caught it on the next run, as they are meant to.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
     resolved: 124,
     workspace: 77,
     third_party: 47,
-    third_party_loc: 441_498,
+    third_party_loc: 441_512,
     build_scripts: 10,
     proc_macros: 2,
     duplicate_names: 1,
@@ -809,7 +886,7 @@ pub const LINUX: Baseline = Baseline {
     resolved: 274,
     workspace: 79,
     third_party: 195,
-    third_party_loc: 2_789_707,
+    third_party_loc: 2_789_721,
     build_scripts: 32,
     proc_macros: 16,
     duplicate_names: 6,
@@ -820,7 +897,7 @@ pub const WIN: Baseline = Baseline {
     resolved: 164,
     workspace: 73,
     third_party: 91,
-    third_party_loc: 3_588_067,
+    third_party_loc: 3_588_081,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -899,7 +976,7 @@ pub const MAC_X64: Baseline = Baseline {
     resolved: 124,
     workspace: 77,
     third_party: 47,
-    third_party_loc: 441_498,
+    third_party_loc: 441_512,
     build_scripts: 10,
     proc_macros: 2,
     duplicate_names: 1,
@@ -912,7 +989,7 @@ pub const LINUX_ARM: Baseline = Baseline {
     resolved: 274,
     workspace: 79,
     third_party: 195,
-    third_party_loc: 2_789_707,
+    third_party_loc: 2_789_721,
     build_scripts: 32,
     proc_macros: 16,
     duplicate_names: 6,
@@ -925,7 +1002,7 @@ pub const WIN_ARM: Baseline = Baseline {
     resolved: 164,
     workspace: 73,
     third_party: 91,
-    third_party_loc: 3_588_067,
+    third_party_loc: 3_588_081,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -979,282 +1056,14 @@ pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] = ["bitflags"
 pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 0;
 
 // --------------------------------------------------------- dominator anchors
-
-/// One measured `dom(C) = reach(root) \ reach(root, block C)`.
-///
-/// A dominator is the only honest answer to "what does this dependency cost",
-/// and it moves for reasons a package count alone never shows — see
-/// [`MAC_ARM_DOMINATORS`] on `wgpu`. The rows are recorded measurements; since
-/// 2026-09-24 no test re-asserts them (the cell ceilings in `loc` do the
-/// bounding, and `dominator`'s tests check the shape of every real cost).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dom {
-    pub name: &'static str,
-    /// The version, when the NAME alone does not identify one package in the
-    /// cell; `None` means the name resolved once when it was measured. `Some`
-    /// is required for a duplicated name ([`MAC_ARM_DUPLICATE_NAMES`]).
-    pub version: Option<&'static str>,
-    /// Packages removed, INCLUDING the target. A leaf costs 1, never 0.
-    pub pkgs: usize,
-    /// Physical `*.rs` lines summed over those packages.
-    pub loc: u64,
-}
-
-/// The mac-arm anchors, in dominator-LOC order — the head of
-/// `dominator::ranked` when last measured (a test asserted that until
-/// 2026-09-24).
-///
-/// `wgpu` GREW here TWICE, for the same reason both times — a package two
-/// parents held in is billed to neither, and retiring one parent leaves the
-/// other holding it alone.
-///
-/// 29 packages / 398,302 LOC → 31 / 424,106 when the `a11y-accesskit` default
-/// was dropped: `accesskit_consumer` and `accesskit_macos` also depended on
-/// `hashbrown 0.16.1`, so it and `foldhash 0.2.0` were shared. Then 31 / 424,106
-/// → 33 / 464,874 when `toml_edit` left with `toml`. MEASURED, exactly:
-/// `blame indexmap --cell mac-arm` reports `dom 2 package(s) / 40,768 LOC` and
-/// its direct dependants went from `naga, toml_edit, wgpu-core` to `naga,
-/// wgpu-core` — both inside wgpu's subtree — so wgpu absorbed indexmap's whole
-/// dominator, to the line. An extraction that shrinks the surface can enlarge a
-/// dominator; that is the definition working, not a regression.
-///
-/// `ureq` is the third instance of the same shape, and the first to change this
-/// list's ORDER. It entered at rank four, 9 packages / 72,528 LOC → 12 / 89,080,
-/// when `security-framework` stopped being one of aterm-gui's direct
-/// dependencies (0f92b2f1, Keychain over `SecItem*` FFI). That retirement moved
-/// no cell TOTAL — the package never left the graph — but it left
-/// `ureq -> rustls-platform-verifier` as the sole parent of
-/// `security-framework 3.7.0` (10,503), `security-framework-sys 2.17.0` (2,213)
-/// and `core-foundation 0.10.1` (3,836), and ureq absorbed all three: 16,552
-/// LOC, to the line. It displaced `tracing` by 4,597 LOC, and pushed
-/// `objc2-app-kit` (1 / 82,976) off the head entirely.
-///
-/// So a dependency can be retired, leave the totals untouched, and still be
-/// exactly what this file exists to notice. Nothing but a dominator would have
-/// reported it.
-///
-/// `tracing` is GONE from this list, and it is the first anchor retired by
-/// being REPLACED rather than removed. Its dominator was 3 packages / 84,483
-/// LOC — `tracing` itself, `tracing-core` and `tracing-attributes` — and every
-/// event through all of it dispatched to `NoSubscriber`, because aterm installs
-/// no subscriber and `tracing-subscriber` is in no cell's graph. A 1,541-line
-/// first-party facade (`crates/aterm-tracing`, package `tracing 0.1.44`,
-/// patched in so winit, softbuffer, zbus and tiny-xlib all reach it) does the
-/// same nothing, and the whole 84,483 came off the mac-arm row: 1,582,450 →
-/// 1,497,967, exactly the dominator, with 108 → 105 packages. The tail falls to
-/// `objc2-foundation 0.3.2`.
-///
-/// `softbuffer` is the FOURTH instance of the growth shape above, the largest
-/// so far, and the one that finally cost this list its `libc` row. Retiring
-/// softbuffer on the macOS cell (2026-08-30) removed 2 packages / 27,628 LOC
-/// from the total — and moved `wgpu` from 32 / 460,964 to **38 / 660,197**,
-/// because the `objc2` 0.3.x/0.6.x stack was a JOINT hostage reachable through
-/// both and therefore billed to NEITHER. With one parent gone it transferred
-/// wholesale: 199,233 lines and 6 packages, to the line. `wgpu` now holds 43% of
-/// this cell's packages and 53% of its lines by itself.
-///
-/// The same retirement reordered the head twice over. `wgpu-hal` (8 / 251,320)
-/// rose to rank two for exactly the same reason — it is where the objc2 stack
-/// actually attaches — and `winit` (12 / 78,956) took the fifth slot.
-///
-/// `libc` is GONE from this list, and it left the SURFACE, not just the head:
-/// `blame libc --cell mac-arm` now reports `dom 0 package(s) / 0 LOC` and names
-/// its source as `crates/aterm-libc — PATCHED path package. aterm OWNS and
-/// maintains this copy.` A first-party patch target is a workspace member, so it
-/// is not third-party and cannot have a third-party dominator. Its old pin of
-/// 1 / 127,772 was the largest single stale row in this file.
-///
-/// ONE MEASUREMENT TRAP is worth recording, because it silently under-reported
-/// this by a factor of seven: `loc::package_dir` used to resolve
-/// `<name>-<version>` against the registry checkout BEFORE the workspace, which
-/// is right for a vendored fork (the pristine copy is the surface) and wrong
-/// for a first-party replacement — it measured our 1,541-line crate as
-/// upstream's 72,271-line one, and the win read as 12,212 lines. Workspace
-/// members now win, by manifest name.
-/// `wgpu` SHRANK here for the first time, and by a row that is not its own:
-/// 38 packages / 660,280 LOC → **37 / 635,044** when `vendor/indexmap` moved
-/// its `hashbrown` requirement from `"0.17"` to `"0.16"`. `hashbrown 0.17.1`
-/// was a leaf whose only parent was `indexmap`, and `indexmap`'s only parents
-/// on this cell are `naga` and `wgpu-core` — both inside wgpu's cost — so the
-/// dedup came off wgpu's dominator to the line, 25,236 for 25,236, and off no
-/// other anchor. `wgpu-hal` and `naga` do not move: neither dominated
-/// `indexmap` alone, which is the same two-parents-bill-neither shape this
-/// list keeps recording, running for once in the direction of a shrink.
-///
-/// RE-PINNED AT THE FLIP (2026-08-31): `wgpu` (37 / 635,044), `wgpu-hal`
-/// and `naga` are GONE from the graph — the campaign's prize collected in
-/// full, asserted as ABSENCE in `dominator::tests` (the libc/AccessKit
-/// shape: a zero cost would also be reported for a package forge failed to
-/// see). What leads now is the AppKit/window stack and the updater's TLS:
-/// `winit` at the top since the 2026-09-05 containment (+308, note (5)) put it
-/// 45 lines past `objc2-app-kit`, which was unchanged; before that, `winit` was
-/// up by exactly the fork's own +664 lines of edits (the headless arm + the
-/// §4(b) notices), then `rustls`, `syn`, and the 0.2-generation
-/// `objc2-foundation` (whose 0.3 twin left with wgpu-hal).
-///
-/// RE-PINNED AT THE objc2 EXIT (2026-09-05, note (6)): `objc2-app-kit` and
-/// `objc2-foundation` are GONE from the graph — the campaign's second prize,
-/// asserted as absence in `dominator::tests` like wgpu's — and `winit` is
-/// +288 for the port that took them out. `rustybuzz` and `serde` move up into
-/// the anchor list; neither moved by a line. +22 more on 2026-09-07 (note (8)):
-/// comment lines only, for the macOS 14 launch fix.
-///
-/// RE-PINNED AT THE FABRIC MOVE (2026-09-10, note (10)): ONE row entered,
-/// `sha2` (7 / 48,869), and `serde` (3 / 38,412) is what it displaced.
-/// `rustybuzz` is still here at exactly the cost it was pinned at, one rank
-/// lower. This is the first round in which the head grew rather than being
-/// collected — the campaign re-bought a chain it had once paid to retire, which
-/// is what `crates/aterm-digest` exists to keep out.
-///
-/// `astream-cap` (8 / 49,759) is NOT a row, and the reason is the provenance
-/// ruling rather than the graph. It matters for reading this list at all:
-/// sha2's dominator is NESTED inside the mint's, so these totals must never
-/// be summed blindly.
-pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
-    // RE-PINNED 2026-09-16 by the Wayland clipboard's claim-order fix, +553
-    // (the note above). Before that, 2026-09-15 by the two vendor/winit commits
-    // (c5326f2d8's Wayland clipboard, +568; b41e769b0's keypad fix, +42) and
-    // 2026-09-16 by the fork's Apache §4(b) notices, +8. The package COUNT does
-    // not move in any of them — the fork took no new edge, and its Cargo.toml is
-    // byte-identical — so this is the fork's own source growing and nothing
-    // else. winit still leads the ranking.
-    Dom {
-        name: "winit",
-        version: None,
-        pkgs: 12,
-        loc: 84_503,
-    },
-    // RE-PINNED 2026-09-01 by the `once_cell` row, and it is the first time a
-    // first-party patch target has moved an anchor in this file. `rustls` is
-    // `once_cell`'s ONLY parent on mac-arm, so the leaf sat inside rustls's
-    // dominator; retiring it takes exactly 1 package / 3,950 lines off this
-    // number and nothing else. The ORDER is unchanged — rustls stays third.
-    Dom {
-        name: "rustls",
-        version: None,
-        pkgs: 5,
-        loc: 65_413,
-    },
-    Dom {
-        name: "syn",
-        version: None,
-        pkgs: 1,
-        loc: 64_931,
-    },
-    // RE-PINNED 2026-09-10 by the fabric-in-the-workspace round, note (10).
-    // ONE row entered, not two, and which one it is was decided by the
-    // provenance ruling rather than by the graph: `astream-cap` is aterm's own
-    // code, `dominator::ranked` ranks third-party packages only, so the
-    // capability mint itself is not a row here and what it DRAGS IN is.
-    // dom(sha2) is the whole chain — sha2, digest, block-buffer,
-    // crypto-common, generic-array, typenum, cpufeatures — because astream-cap
-    // is sha2's only parent on this cell, which is also what makes the fix a
-    // single edge rather than a port.
-    Dom {
-        name: "sha2",
-        version: None,
-        pkgs: 7,
-        loc: 48_869,
-    },
-    // `serde` (3 / 38,412) is what `sha2` displaced. `rustybuzz` did not move
-    // by a line and is still here, one rank lower.
-    // `serde` (3 / 38,412) is what `sha2` displaced. `rustybuzz` did not move
-    // by a line and is still here, one rank lower.
-    Dom {
-        name: "rustybuzz",
-        version: None,
-        pkgs: 7,
-        loc: 47_712,
-    },
-];
-
-/// The linux anchor.
-///
-/// The two that used to sit beside it — `accesskit_unix` (57 packages /
-/// 241,084 LOC) and `accesskit_winit` (58 / 242,598) — are GONE from the graph,
-/// not merely cheaper: dropping the `a11y-accesskit` default removed them and
-/// the 61 packages they alone held in, which is why the linux cell fell from
-/// 301 resolved / 248 third-party to the row in [`LINUX`].
-///
-/// `sctk-adwaita` GREW here, from 7 packages / 31,776 LOC, when
-/// `crates/aterm-render` stopped depending on `ab_glyph_rasterizer`. The
-/// package did not leave the linux graph — `winit -> sctk-adwaita -> ab_glyph`
-/// still holds it, which is why linux kept it while mac, win and wasm all shed
-/// it — but it stopped being SHARED, and a package two parents hold in is
-/// billed to neither. Now sctk-adwaita is the only thing keeping it, and the
-/// dominator says so. This is the second time in two rounds that a successful
-/// extraction enlarged a dominator (see [`MAC_ARM_DOMINATORS`] on `wgpu`); it is
-/// the measure working, not drift.
-pub const LINUX_DOMINATORS: [Dom; 1] = [Dom {
-    name: "sctk-adwaita",
-    version: None,
-    pkgs: 8,
-    loc: 32_341,
-}];
-
-/// `ureq` on mac-arm, and the figure the design note recorded for it.
-///
-/// RETIRED IN FACT, 2026-09-10, and left standing as the record rather than
-/// deleted. `ureq` IS IN NO CELL'S GRAPH and is not even a Cargo.lock entry
-/// any more: `crates/aterm-http` replaced it and the stack behind it
-/// (ureq-proto, http, bytes, httparse, utf8-zero, percent-encoding,
-/// webpki-roots), and `blame ureq --cell mac-arm` answers NOT RESOLVED, naming
-/// the package as being in no surveyed cell's shipped graph. The three
-/// constants below therefore describe a graph this checkout does not have.
-///
-/// THEY WENT STALE IN SILENCE, WHICH IS THE PART WORTH RECORDING: nothing in
-/// this repository reads [`MAC_ARM_UREQ`], [`UREQ_RE_PARENTED`] or
-/// [`UREQ_DESIGN_NOTE`] — `grep -rn` over `crates/` finds no use outside this
-/// file — so the retirement moved no test, and the equality pin that is this
-/// module's whole purpose never applied to them. A pinned number with no
-/// reader is documentation, and documentation rots; the dominator anchors
-/// above are pinned by `dominator::tests` and did not.
-///
-/// The design note says 8 packages / 71,834 LOC; this checkout measures FOUR
-/// packages and 17,246 lines more, and every one of them is accounted for:
-///
-/// * `percent-encoding 2.3.2` (694 LOC), whose only parent in the mac-arm graph
-///   has always been `ureq` itself, so it must fall with ureq. That was the
-///   whole difference until 2026-08-28.
-/// * `security-framework 3.7.0` (10,503), `security-framework-sys 2.17.0`
-///   (2,213) and `core-foundation 0.10.1` (3,836) — 16,552 LOC — which ureq
-///   ABSORBED when aterm-gui stopped depending on `security-framework`
-///   directly. They did not join the graph; they stopped being shared, which
-///   bills them to their one remaining parent. The chain is
-///   `ureq -> rustls-platform-verifier -> security-framework`, and it exists
-///   because crates/aterm-gui/Cargo.toml asks ureq for `platform-verifier`
-///   deliberately (system trust roots, not a bundled bundle).
-///
-/// Both halves are pinned, and [`UREQ_RE_PARENTED`] names the three by hand, so
-/// the next person to re-measure sees the REASON rather than a number that
-/// moved.
-pub const MAC_ARM_UREQ: Dom = Dom {
-    name: "ureq",
-    version: None,
-    pkgs: 12,
-    loc: 89_080,
-};
-/// The three packages `ureq` absorbed when aterm-gui's direct
-/// `security-framework` edge went away, with their measured LOC. Subtracting
-/// these and `percent-encoding` from [`MAC_ARM_UREQ`] reproduces
-/// [`UREQ_DESIGN_NOTE`] exactly, which is what makes the delta bookkeeping
-/// rather than a different graph.
-/// The VERSION is part of each entry because `core-foundation` resolves twice
-/// on mac-arm — 0.10.1 under ureq and 0.9.4 under winit — and only the first is
-/// ureq's to pay for.
-pub const UREQ_RE_PARENTED: [(&str, &str, u64); 3] = [
-    ("security-framework", "3.7.0", 10_503),
-    ("security-framework-sys", "2.17.0", 2_213),
-    ("core-foundation", "0.10.1", 3_836),
-];
-/// The design-note figure `MAC_ARM_UREQ` exceeds by `percent-encoding` and the
-/// three names in [`UREQ_RE_PARENTED`].
-pub const UREQ_DESIGN_NOTE: Dom = Dom {
-    name: "ureq",
-    version: None,
-    pkgs: 8,
-    loc: 71_834,
-};
+//
+// RETIRED 2026-09-25: `Dom` and its five records (`MAC_ARM_DOMINATORS`,
+// `LINUX_DOMINATORS`, `MAC_ARM_UREQ`, `UREQ_RE_PARENTED`, `UREQ_DESIGN_NOTE`)
+// had no reader — no test had re-asserted them since 2026-09-24, and the
+// three ureq rows described a graph no checkout has had since ureq left on
+// 2026-09-10. The round notes above that name them are history; the live
+// measure is `aterm-forge blame <pkg> --cell <cell>`, and the cell ceilings in
+// `loc` do the bounding.
 
 /// THE TIE BETWEEN THIS FILE AND `tools/forge-budget.tsv`, read without a
 /// `cargo tree` (the TSV alone, in milliseconds).
@@ -1357,36 +1166,5 @@ pub(crate) mod ratchet_agreement {
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod ledger_agreement {
-    /// `vendor/forge.toml`'s `[forge] cells` block is a GENERATED record of
-    /// [`crate::resolve::default_cells`] — `policy::seed_from_vendor` emits it
-    /// and nothing reads it back for measurement. A judge proved the gap:
-    /// replacing a ledger row with `{ name = "TOTALLY-BOGUS", triple =
-    /// "sparc64-unknown-none", package = "does-not-exist" }` left `check`
-    /// GREEN across "5 cell(s)" and this suite at 149/0, because the two were
-    /// kept in sync only by an author's diligence. This is the comparison.
-    #[test]
-    fn the_ledger_header_and_default_cells_are_the_same_matrix() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .to_path_buf();
-        let policy = crate::policy::load(&root).expect("vendor/forge.toml loads");
-        let row = |c: &crate::model::Cell| (c.name.clone(), c.triple.clone(), c.package.clone());
-        let ledger: Vec<_> = policy.forge.cells.iter().map(row).collect();
-        let live: Vec<_> = crate::resolve::default_cells().iter().map(row).collect();
-        assert_eq!(
-            ledger, live,
-            "vendor/forge.toml's [forge] cells has drifted from \
-             resolve::default_cells(). The ledger block is generated FROM the \
-             function — regenerate it (its own header says how) or fix \
-             default_cells; a ledger row nothing measures reads as an audited \
-             cell and is not one."
-        );
     }
 }

@@ -35,11 +35,10 @@ use skrifa::{
 
 use crate::hinted::PathPen;
 
-/// How per-channel coverage maps onto the panel's subpixel order. Resolved at
-/// renderer construction from `ATERM_FONT_SUBPIXEL` (the `font_subpixel`
-/// config key's env alias, which wins) and settable live like `font_hinting`;
-/// DEFAULT [`SubpixelMode::Off`] — this whole path is opt-in while stage 1 is
-/// judged on real screens (the RFC's kill criterion).
+/// How per-channel coverage maps onto the panel's subpixel order. [`Off`](Self::Off)
+/// at renderer construction and set live from the `font_subpixel` config key like
+/// `font_hinting`; DEFAULT [`SubpixelMode::Off`] — this whole path is opt-in while
+/// stage 1 is judged on real screens (the RFC's kill criterion).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SubpixelMode {
     /// Grayscale coverage everywhere — the shipped default, byte-identical to
@@ -55,8 +54,8 @@ pub(crate) enum SubpixelMode {
 }
 
 impl SubpixelMode {
-    /// Parse one mode spelling — shared by the env alias and the
-    /// `font_subpixel` config key (via `Renderer::set_font_subpixel`).
+    /// Parse one mode spelling of the `font_subpixel` config key (via
+    /// `Renderer::set_font_subpixel`).
     /// Unrecognized = [`SubpixelMode::Off`] (the default — forgiving in the
     /// same direction as `font_hinting`, whose unrecognized spellings resolve
     /// to ITS default).
@@ -68,17 +67,10 @@ impl SubpixelMode {
         }
     }
 
-    /// Parse `ATERM_FONT_SUBPIXEL`. Unset or unrecognized = Off;
-    /// `ATERM_RASTERIZER` (the byte-stable portable path the
-    /// golden/parity tests export) forces Off, exactly like the hint seam.
-    pub(crate) fn from_env() -> Self {
-        if crate::hinted::HintMode::portable_forced() {
-            return Self::Off;
-        }
-        match std::env::var("ATERM_FONT_SUBPIXEL").ok().as_deref() {
-            Some(s) => Self::parse(s),
-            None => Self::Off,
-        }
+    /// The mode a renderer is built with: always [`SubpixelMode::Off`] (the
+    /// config setter opts in; the portable test path keeps it off).
+    pub(crate) fn initial() -> Self {
+        Self::Off
     }
 
     /// The canonical spelling the getter round-trips.

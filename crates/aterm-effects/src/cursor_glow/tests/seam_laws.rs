@@ -800,6 +800,67 @@ fn a_glyph_typed_before_the_backspaces_retreat_lands_spends_its_credit() {
     );
 }
 
+/// A superseding edit/navigation key cancels the composer home at the KEY
+/// edge. Navigation and kills can be swallowed without an observed move, so
+/// a move-only cancel would leave ordinary typing behind the pending gate.
+/// Tab deliberately preserves the in-flight newline classifier.
+#[test]
+fn a_superseding_key_cancels_a_composer_home_even_without_a_move() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let t0 = Instant::now();
+    for label in ["class change", "navigation", "kill"] {
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.note_context(true);
+        glow.tick(Some((27, 5)), t0, &c, g, &mut out);
+        assert!(glow.v2.engaged());
+        let chord = t0 + ms(100);
+        glow.note_newline_break(chord);
+        assert!(matches!(
+            glow.v2.pending_events().last(),
+            Some((rk::Event::ComposerNewline, at)) if *at == chord
+        ));
+        let next = chord + ms(10);
+        match label {
+            "class change" => glow.clear_typed(next),
+            "navigation" => glow.note_navigation(next),
+            "kill" => glow.note_kill(next, false),
+            _ => unreachable!("the case table above is exhaustive"),
+        }
+        assert!(
+            glow.v2.pending_events().iter().any(|(event, at)| {
+                matches!(event, rk::Event::CancelComposerNewline) && *at == next
+            }),
+            "{label} must cancel on the key even if no caret move follows"
+        );
+    }
+
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    glow.note_context(true);
+    glow.tick(Some((27, 5)), t0, &c, g, &mut out);
+    glow.clear_typed(t0 + ms(100));
+    assert!(
+        !glow
+            .v2
+            .pending_events()
+            .iter()
+            .any(|(event, _)| matches!(event, rk::Event::CancelComposerNewline)),
+        "an ordinary class change queues no composer-only event"
+    );
+    glow.note_newline_break(t0 + ms(200));
+    glow.note_user_gesture(t0 + ms(210));
+    assert!(
+        !glow
+            .v2
+            .pending_events()
+            .iter()
+            .any(|(event, _)| matches!(event, rk::Event::CancelComposerNewline)),
+        "a Tab gesture preserves the composer break still in flight"
+    );
+}
+
 /// The composer newline survives a typed press, its row change is
 /// Return-paired at the classifier (never the glyph's re-anchor; the
 /// chord's OWN stamp is the one it pops), and its forget edge spares the
@@ -881,6 +942,120 @@ fn a_glyph_typed_before_the_composer_newline_lands_keeps_its_credit_and_its_cell
     let spawns = glow.spawns();
     glow.tick(Some((28, 4)), echo + ms(400), &c, g, &mut out);
     assert_eq!(glow.spawns(), spawns, "a keyless +1 is refused");
+}
+
+/// **THE COMPOSER'S NEW LINE STARTS ITS WALK AGAIN, HOWEVER SOON THE NEXT
+/// GLYPH FOLLOWS THE NEWLINE** (2026-09-23 — the rainbow's odometer,
+/// `rk::ribbon::Ribbon::fresh_line`, end to end through the seam). Thirty
+/// glyphs on row 27 of an alt-screen composer, Shift+Enter (the host's arm:
+/// a typed stamp beside the newline hint, and NO `note_return`), and the
+/// next line's first glyph — once pressed 120 ms after the chord, BEFORE
+/// the box's line break landed 30 ms later (the race of the test above),
+/// once pressed after it. The break reaches v2 as the caret's own
+/// `Licence::Return` move `(27, 32) → (28, 2)` and the glyph by its echo's
+/// sweep on its press's clock; eighteen more glyphs follow. Either way row
+/// 28's line continues the colour row 27 reached, one step past its last
+/// glyph, at distance zero (`d0 = 0`): the pace of a new line, not the
+/// wrap's carried one.
+///
+/// RED on the gate as first written (dated at the move's observation): the
+/// raced glyph read as row 27's text and row 28 carried its distance,
+/// `d0 = 30`. The late glyph pins the host's newline → `Licence::Return`
+/// mapping into the gate: RED with the ribbon's `Licence::Return` clause
+/// removed, since nothing else arms it for a composer's newline.
+///
+/// THE SHAPE, CORRECTED 2026-09-23 (the audit of the gate): the break is
+/// modelled as a TOP-anchored box growing down, `(27, 32) → (28, 2)`.
+/// Claude Code's own box is bottom-anchored (its wrap was captured), and a
+/// Shift+Enter is modelled as re-laying it the same way, the caret homed on
+/// the SAME row; that shape — which armed nothing before the audit — is
+/// pinned with bytes modelled on the captured wrap chunk (not captured
+/// themselves) in `tests/composer_box_growth_wrap.rs`
+/// (`a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too`).
+#[test]
+fn a_composer_newline_starts_the_walk_again_however_soon_the_next_glyph_follows() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut out = Vec::new();
+    for (what, raced) in [
+        ("the glyph after the break", false),
+        ("the glyph before it", true),
+    ] {
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let t0 = Instant::now();
+        glow.tick(Some((27, 2)), t0, &c, g, &mut out);
+        let pre = type_echoed(
+            &mut glow,
+            27,
+            2,
+            "abcdefghijklmnopqrstuvwxyzabcd",
+            t0,
+            &c,
+            g,
+        );
+        let line = *glow
+            .v2
+            .ribbon()
+            .cohorts()
+            .iter()
+            .find(|k| k.row == 27 && !k.wake)
+            .expect("row 27's line");
+        assert_eq!(
+            (line.anchor_col, line.col1, line.d0),
+            (2, 32, 0.0),
+            "{what}: the premise, a cold thirty-cell line"
+        );
+        let t_next = line.t_at(32);
+        let chord = pre + ms(200);
+        glow.supersede_typed_press();
+        glow.note_typed(chord);
+        glow.note_newline_break(chord);
+        let (key, brk) = if raced {
+            let key = chord + ms(120);
+            (key, key + ms(30))
+        } else {
+            let brk = chord + ms(150);
+            (brk + ms(20), brk)
+        };
+        let press = |glow: &mut CursorGlow| {
+            glow.supersede_typed_press();
+            glow.note_typed(key);
+        };
+        if raced {
+            press(&mut glow);
+        }
+        glow.note_repaint_blink(brk);
+        glow.tick(Some((28, 2)), brk, &c, g, &mut out);
+        if !raced {
+            press(&mut glow);
+        }
+        let echo = key.max(brk) + ms(20);
+        glow.note_repaint_blink(echo);
+        glow.tick(Some((28, 3)), echo, &c, g, &mut out);
+        assert!(
+            v2_cols(&glow, 28).contains(&2),
+            "{what}: the glyph's cell (28, 2) is lit: {:?}",
+            v2_cols(&glow, 28)
+        );
+        type_echoed(&mut glow, 28, 3, "efghijklmnopqrstuv", echo, &c, g);
+        let new_line = *glow
+            .v2
+            .ribbon()
+            .cohorts()
+            .iter()
+            .filter(|k| k.row == 28 && !k.wake)
+            .min_by_key(|k| k.anchor_col)
+            .expect("row 28's line");
+        assert_eq!(
+            (new_line.anchor_col, new_line.t0.to_bits(), new_line.d0),
+            (2, t_next.to_bits(), 0.0),
+            "{what}: row 28 continues the colour ({} against {t_next}) and starts its walk \
+             (d0 {})",
+            new_line.t0,
+            new_line.d0
+        );
+    }
 }
 
 /// A caret-moving kill's retreat forgets only the presses banked at or

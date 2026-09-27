@@ -59,8 +59,9 @@ pub fn lookup(alias: &str) -> Option<&'static AliasEntry> {
     ALIAS_TABLE.iter().find(|e| e.alias == alias)
 }
 
-/// Number of aliases in the table. Cheap const for tests / FFI advertising.
+/// Number of aliases in the table. Test-only.
+#[cfg(test)]
 #[must_use]
-pub const fn count() -> usize {
+pub(crate) const fn count() -> usize {
     ALIAS_TABLE.len()
 }

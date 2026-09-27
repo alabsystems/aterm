@@ -1,0 +1,31 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-25 (no live capture): rows synthesized from the S4-01 capture (claude-2.1.282-question-preview.txt) and the 2.1.282 render code R2() (the options in a 30-cell column, `width:30`) · a preview option label wrapped onto a second row left of the pane, its `(Recommended)` on the second
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user0000000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /clear
+
+❯ Ask me which layout the settings page should use, with a preview of each.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Layout
+
+Which layout should the settings page use?
+
+❯ 1. Keep the settings in a       ┌──────────────────────────────────────────┐
+     left sidebar (Recommended)   │ +----------+------------------+          │
+  2. Tabs                         │ | General  | Font size: 13    |          │
+  3. Single scroll                │ | Theme    | Theme: dark      |          │
+                                  │ | Keys     |                  |          │
+                                  │ +----------+------------------+          │
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

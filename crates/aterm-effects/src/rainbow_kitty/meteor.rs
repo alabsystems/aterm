@@ -33,7 +33,7 @@
 //! * **The impact** (§6.5 layers 9-11, extended): the ring is a SHOCKWAVE,
 //!   `3.0 ch` where it was `1.3`, 420 ms where it was 180, its circumference
 //!   carrying the spectrum twice over and spinning ([`RING_R_CH`],
-//!   [`RING_MS`], [`RING_SWEEPS`]); the fan is twice the count
+//!   [`RING_MS`]); the fan is twice the count
 //!   ([`FAN_N_BASE`]); a `draw_splash` of the bed's ink at the transient
 //!   cap bursts along the landing row; and [`draw_sparks`] throws a shower
 //!   of coloured sparks that fall under gravity and fade.
@@ -140,7 +140,7 @@
 //!   **Light exists at both ends.** v1 drew *nothing* on this frame
 //!   (`emit_rainbow_jumps`'s `len < 1.0 → continue`) and that is the lag tell
 //!   v2 exists to delete.
-//! * **The meteor does not read the field (C5, D4).** It walks [`arc_t`], the
+//! * **The meteor does not read the field (C5, D4).** It walks `arc_t`, the
 //!   classic lay rate continued backwards from the caret's own stop,
 //!   **reflected and never clamped**. v1's `rainbow_field_line_lit` continued
 //!   the nearest laid cell's slope and CLAMPED it, so behind a short fresh run
@@ -256,12 +256,6 @@ pub const COLOUR_TRAIN_COV: f32 = TRANSIENT_STAR_COV_CEIL;
 
 // ---- §6.4 the arc ---------------------------------------------------------
 
-/// Cells of path per `t`-unit of the meteor's own arc — the classic walk's lay
-/// rate, continued (§6.4). Deliberately spelled as `1 / WALK_LAY_RATE` rather
-/// than as a literal 36: the ribbon's rate and the meteor's rate are ONE
-/// number, and a change to the walk must move the arc with it.
-pub const ARC_CELLS_PER_T: f32 = 1.0 / WALK_LAY_RATE;
-
 /// `tri(x) = 1 − |1 − (x mod 2)|` (§6.4) — the triangle wave that REFLECTS the
 /// continued walk instead of clamping it.
 ///
@@ -296,6 +290,7 @@ pub fn tri(x: f32) -> f32 {
 /// fold twice and run the train the wrong way along the walk.
 #[inline]
 #[must_use]
+#[cfg(test)]
 pub fn arc_t(t_land: f32, cells_behind: f32) -> f32 {
     tri(t_land - cells_behind * WALK_LAY_RATE)
 }
@@ -333,8 +328,9 @@ pub fn arc_gain(cells: f32) -> f32 {
 /// position at `dx_cells` to the RIGHT of the landing, `tri(t_land +
 /// dx/16)` — `d/16` from the landing, which is exactly what a wake laid
 /// there walks (`Ribbon::wake_origin` anchors it at the landing on the fast
-/// leg). A landing ON a band reads the band's own walk from the band's own
-/// origin instead: [`LandingWalk`].
+/// leg: a row with nothing fresh on it starts the walk's pace again, as a
+/// new line does — kept so through the odometer, 2026-09-23). A landing ON
+/// a band reads the band's own walk instead: [`LandingWalk`].
 ///
 /// THE OWNER, 2026-09-14, on v0.85.0: *"the color pallet of the landing
 /// splash is not correct and aligned with the rainbow."* Measured
@@ -351,7 +347,8 @@ pub fn arc_gain(cells: f32) -> f32 {
 ///   `dx = 0` this is `tri(t_land)`, the very number the ribbon draws for
 ///   that cell: the star is the colour of the light it lands on;
 /// * the walk runs with the COLUMN, as the band's does (`Cohort::t_at`:
-///   `t0 + walk_t(col − anchor_col)`), never with the flight — red toward
+///   the band's walk read at the column's own distance), never with the
+///   flight — red toward
 ///   the tail of a rightward flight because that is where the band is red,
 ///   and on a leftward one the band's own way still, because the band is
 ///   what is on the glass when the flight is over;
@@ -371,14 +368,21 @@ pub fn landing_field(t_land: f32, dx_cells: f32) -> f32 {
 /// cell.
 ///
 /// [`LandingWalk::at`] is `tri(t0 + walk_t(d_land + dx))` when the landing
-/// is ON a laid band — `(d_land, t0)` being the landing column's distance
-/// from the band's walk origin and the origin's `t`, the pair
-/// `Cohort::t_at` reads (`Ribbon::walk_origin_at`, carried on the move's
-/// [`Ctx::caret_walk`] and latched at the spawn edge beside `t_land`). So
-/// at `dx = 0` it is `tri(t_land)` exactly, and away from the landing it is
-/// the band's own number at that column: **`d/16` on the run's first
-/// sixteen cells from ITS origin, `d/36` after**, reflected as the band
-/// reflects. The first cut of the palette round paced the landing `d/16`
+/// is ON a laid band — `(d_land, t0)` being the band's walk's distance at
+/// the landing column and the walk's `t` at distance zero, the two numbers
+/// `Cohort::t_at` adds (`Cohort::walk_d`, `Cohort::walk_zero`;
+/// `Ribbon::walk_origin_at`, carried on the move's [`Ctx::caret_walk`] and
+/// latched at the spawn edge beside `t_land`). So at `dx = 0` it is
+/// `tri(t_land)` exactly, and away from the landing it is the band's own
+/// number at that column, bit for bit — the same two float operations on
+/// the same operands: **`d/16` within the first sixteen cells of the
+/// band's walk, `1/36` a cell after**, reflected as the band reflects.
+/// Since the odometer (2026-09-23) a band that continues a walk — a
+/// wrapped row, a relaid word, a same-row rebirth — is already `d0` cells
+/// into it at its own first column, so the pair is no longer `(col −
+/// anchor_col, t0)`; on a band that starts its walk it still is, exactly.
+///
+/// The first cut of the palette round paced the landing `d/16`
 /// from the landing cell — the band's fast leg — and called it
 /// `Cohort::t_at`'s walk; on a scrub back into a typed line, the owner's
 /// case and the slow leg almost always, that ran 2.25× the band's pace:
@@ -396,10 +400,11 @@ pub struct LandingWalk {
     /// The field at the landing cell, RAW (D4): folded once, at the read.
     pub t_land: f32,
     /// `Some((d_land, t0))` when the landing cell is on a laid band —
-    /// `d_land` the landing column's distance from the band's walk origin
-    /// (`col − anchor_col`, cells, signed) and `t0` the origin's `t` — so
-    /// `t0 + walk_t(d_land) == t_land`, the band's own equation for the
-    /// landing cell. `None` off any band.
+    /// `d_land` the band's walk's distance at the landing column
+    /// (`Cohort::walk_d`, cells, signed) and `t0` the walk's `t` at
+    /// distance zero (`Cohort::walk_zero`) — so `t0 + walk_t(d_land) ==
+    /// t_land`, the band's own equation for the landing cell. `None` off
+    /// any band.
     pub band: Option<(f32, f32)>,
 }
 
@@ -517,9 +522,6 @@ pub const UNDER_QUAD_CAP: usize = 2_304;
 
 /// Cap on one meteor's white (`out`) layer (§18).
 pub const WHITE_QUAD_CAP: usize = 1_152;
-
-/// Cap on the landing pin's quads (§18).
-pub const PIN_QUAD_CAP: usize = 12;
 
 /// Width falloff length as a share of `L`: `w(s) = w·(0.30 + 0.70·exp(−s/(0.5·L)))`
 /// (§6.5 layer 1).
@@ -839,21 +841,15 @@ pub fn fan_reach_ch(cells: f32, grade: f32) -> f32 {
 /// Ring radius at `u = 1`, in `ch`: `r(u) = 3.0 ch·(1 − (1 − u)^4)` (§6.5
 /// layer 10 wrote 1.3). **2.3× the reach, 2026-09-08** — a shockwave that
 /// expands PAST the fan and the splash, hollow, its circumference carrying
-/// the spectrum ([`RING_SWEEPS`]).
+/// the spectrum twice over.
 /// `the_landing_is_a_rainbow_shockwave_twice_the_old_reach` pins it at no
 /// less than twice 1.3.
 pub const RING_R_CH: f32 = 3.0;
 
 /// The reach the 2026-09-05 ring had, in `ch` — kept only as the number the
 /// shockwave law is measured against ("2–3× the current ring's reach").
+#[cfg(test)]
 pub const RING_R_CH_2026_09_05: f32 = 1.3;
-
-/// How many times the spectrum is walked around the shockwave — TWO, through
-/// `tri`, so the walk runs red → violet → red and the ring has no seam
-/// (ROYGBIV is not cyclic: one walk would butt violet against red). A
-/// linear mark samples `spectrum` (C1), so the ring's colour is continuous
-/// around it, not seven snapped arcs.
-pub const RING_SWEEPS: f32 = 2.0;
 
 /// The exponent of the ring's radius law (§6.5 layer 10) — `(1 − (1 − u)^4)`,
 /// so the ring is already most of the way out on the frame it is born (the
@@ -1596,6 +1592,7 @@ pub const SPARK_HOLD_U: f32 = 0.6;
 /// The widest a spark's CORE gets, px — the family's star core at the
 /// largest arm ([`SPARK_ARM_MAX_PX`]). What a census reads as "a spark" is
 /// a chromatic `out` quad no bigger than this on either axis.
+#[cfg(test)]
 pub const SPARK_PX: i32 = 3;
 
 /// The alpha under which a spark loses its halo and a pixel of arm; under
@@ -1732,18 +1729,19 @@ pub struct Meteor {
     ///
     /// The RAW walk, never clamped (D4): the classic walk runs past `1.0` on
     /// a long line (`walk_t(47) = 1.861`), and the ribbon draws that cell
-    /// through `tri` — orange. Every read here goes through [`arc_t`], which
+    /// through `tri` — orange. Every read here goes through `arc_t`, which
     /// applies the same `tri` once, so `arc_t(t_land, 0)` IS the ribbon's
     /// stop under the caret; a clamp at the lock made it violet.
     pub t_land: f32,
     /// **THE BAND'S WALK AT THE LANDING** (2026-09-14), latched beside
     /// [`Meteor::t_land`] from [`Ctx::caret_walk`]: `(d_land, t0)` — the
-    /// landing column's distance from the band's walk origin and the
-    /// origin's `t` — when the landing cell is on a laid band, `None` off
-    /// one. The seed of the landing's [`LandingWalk`]: the marks minted at
-    /// the arrival edge continue the band at the band's OWN pace where it
-    /// lands (`d/36` past a run's sixteenth cell), which `t_land` alone
-    /// cannot say. The train's own arc ([`Meteor::arc`]) does not read it.
+    /// band's walk's distance at the landing column and the walk's `t` at
+    /// distance zero (the odometer, 2026-09-23) — when the landing cell is
+    /// on a laid band, `None` off one. The seed of the landing's
+    /// [`LandingWalk`]: the marks minted at the arrival edge continue the
+    /// band at the band's OWN pace where it lands (`1/36` a cell past its
+    /// walk's sixteenth cell), which `t_land` alone cannot say. The train's
+    /// own arc ([`Meteor::arc`]) does not read it.
     pub band: Option<(f32, f32)>,
     /// Path length in cells, `L / cw` (§6.2) — the input to `flight_ms`,
     /// `shed_n` and the fan's count and reach.
@@ -1805,7 +1803,7 @@ impl Meteor {
     }
 
     /// **THE TRAIN'S OWN SPECTRUM POSITION** `cells_behind_landing` cells
-    /// short of the landing, along the path — [`arc_t`] at [`arc_gain`]'s
+    /// short of the landing, along the path — `arc_t` at [`arc_gain`]'s
     /// rate: `tri(t_land − cells·(1/36)·gain)`.
     ///
     /// Measured from the LANDING and not from the head, which is the whole
@@ -1832,6 +1830,7 @@ impl Meteor {
     /// name of the flag; the edge itself is [`Meteor::retired_at`], because a
     /// fade needs to know WHEN, not only THAT.
     #[must_use]
+    #[cfg(test)]
     pub fn retiring(&self) -> bool {
         self.retired_at.is_some()
     }
@@ -1876,6 +1875,7 @@ impl Meteor {
     /// +90 ms, never increasing"), and a law wants an accessor, not a poke at
     /// private state.
     #[must_use]
+    #[cfg(test)]
     pub fn colour_alpha(&self, now: Instant) -> f32 {
         let age = ms_since(self.t0, now);
         let t = self.t_flight.as_secs_f32() * 1000.0;
@@ -2403,7 +2403,7 @@ struct Minted {
     /// [`Ctx::caret_t`].
     caret_t: f32,
     /// [`Ctx::caret_walk`].
-    caret_walk: Option<(u16, f32)>,
+    caret_walk: Option<(f32, f32)>,
 }
 
 /// `Geom` carries no `Debug` of its own, so the frame's geometry is printed
@@ -2548,6 +2548,7 @@ impl Meteors {
     /// `ribbon::Ribbon::hand_floor_cell` gives: one name for both makes the
     /// field's doc link ambiguous, and that doc is the law.
     #[must_use]
+    #[cfg(test)]
     pub fn hand_floor_cell(&self) -> Option<(u16, u16)> {
         self.hand_floor
     }
@@ -2793,7 +2794,7 @@ impl Meteors {
     /// Meteors with a head in the air or a train on its natural finish —
     /// `trail status`'s `meteors=`, and ≤ [`FLIGHT_MAX_LIVE`] by §6.9's cap.
     /// A train on the 60 ms retire is a FINISH, not a meteor, and is not
-    /// counted; [`Meteors::at_rest`] still waits for it. A landed train and
+    /// counted; `Meteors::at_rest` still waits for it. A landed train and
     /// a chained stub (cut at the chain point, finishing on §6.8's own taus)
     /// are both trains on their natural finish and both count — the cap in
     /// [`Meteors::on_event`] is what holds the count at two, and it retires
@@ -2807,6 +2808,7 @@ impl Meteors {
     /// meteor pixel is gone by `T + 600` (§6.2 as re-ruled 2026-09-08), so
     /// this latches within 720 ms of the last flight.
     #[must_use]
+    #[cfg(test)]
     pub fn at_rest(&self) -> bool {
         self.live.is_empty() && self.landings.is_empty()
     }
@@ -3120,12 +3122,13 @@ impl Meteors {
             } else {
                 0.0
             },
-            // The band's walk origin at the landing, latched with `t_land`
+            // The band's walk at the landing, latched with `t_land`
             // (2026-09-14): the landing's marks continue the band at the
-            // band's own pace where it lands. `None` off any band.
-            band: ctx
-                .caret_walk
-                .map(|(anchor_col, t0)| (f32::from(to.1) - f32::from(anchor_col), t0)),
+            // band's own pace where it lands. `None` off any band. Since
+            // the odometer (2026-09-23) the ctx carries the walk's own pair
+            // — its distance at the landing and its zero — so nothing is
+            // re-derived here from a column.
+            band: ctx.caret_walk,
             cells,
             dir,
             landing: to,
@@ -4292,8 +4295,9 @@ fn burst_jet(
 /// through the landing cell at the station's own COLUMN, through the band's
 /// own hot ink. So the light over the landing cell is the landing cell's
 /// stop, the star is the band's gradient — redder on the red side, bluer on
-/// the blue side, at the band's own pace at that column (`d/16` on a run's
-/// first sixteen cells from its origin, `d/36` after: [`LandingWalk`]) — the
+/// the blue side, at the band's own pace at that column (`d/16` within the
+/// first sixteen cells of the band's walk, `1/36` a cell after:
+/// [`LandingWalk`]) — the
 /// jets continue it along the row in the band's direction, the crossing is
 /// the band's teal and no cyan
 /// appears that the band does not carry, and nothing slides: a column wears
@@ -10682,6 +10686,82 @@ mod tests {
         }
     }
 
+    /// **A LANDING ON A CONTINUED BAND WALKS THE BAND'S NUMBER, BIT FOR
+    /// BIT** (2026-09-23, the walk's odometer — the owner: *"I want smooth
+    /// continuous rainbow"*). A band that CONTINUES a walk — here a
+    /// same-row rebirth after a program's caret jump, the same continuation
+    /// a wrapped row takes — starts `d0` cells into the walk, not at its own
+    /// first column, so the landing's walk must be read from the walk's own
+    /// zero (`Ribbon::walk_origin_at` → [`Ctx::caret_walk`] →
+    /// [`Meteor::band`] → [`LandingWalk`]). Thirty keys on row 3 from
+    /// column 0, a `Pty` jump to column 40, twenty keys there (the rebirth
+    /// continues the run at distance 30, one step past its last cell, past
+    /// the knee), then a word hop back to column 45 of the reborn run. The
+    /// burst's field `k` cells from the landing is `tri` of the band's own
+    /// cell there, bit for bit, for `k` in −5..=5 — the same two float
+    /// operations on the same operands (`Cohort::t_at`).
+    ///
+    /// Carried as `(landing − anchor_col, t0)` — the pair before the
+    /// odometer — the reborn run's landing read `d = 5` from a restarted
+    /// origin: the fast leg's `1/16`, 2.25× the band's `1/36`, and 0.14 `t`
+    /// off it five cells out. The premise is asserted too: the reborn run
+    /// steps `WALK_LAY_RATE` from its first cell.
+    #[test]
+    fn a_landing_on_a_continued_band_walks_the_band_s_number_bit_for_bit() {
+        let cfg = config();
+        let g = owner_device_geom();
+        let (mut eng, mut t, run) = engine_with_typed_run(30, g, &cfg);
+        let mut sc = Scratch::default();
+        t += ms(100);
+        eng.on_event(mv_as((3, 30), (3, 40), Licence::Pty), t);
+        eng_tick(&mut eng, &mut sc, t, g, &cfg);
+        for col in 40..60 {
+            t += ms(100);
+            t = eng_type_at(&mut eng, &mut sc, t, col, g, &cfg);
+        }
+        let band: Vec<Option<f32>> = (0..g.cols as u16).map(|c| eng.field_at(3, c)).collect();
+        // THE PREMISE: the reborn run continues the first one's walk — its
+        // colour one step past column 29 (read before the jump: the
+        // abandoned run has drained since), and its pace, `1/36` a cell.
+        let (b29, b40) = (run[29].expect("the run"), band[40].expect("the rebirth"));
+        assert!(
+            (b40 - b29 - WALK_LAY_RATE).abs() < 1e-5,
+            "the rebirth continues the run one step on: {b29} at 29, {b40} at 40"
+        );
+        for col in 40..59 {
+            let (a, b) = (band[col].expect("lit"), band[col + 1].expect("lit"));
+            assert!(
+                (b - a - WALK_LAY_RATE).abs() < 1e-5,
+                "the reborn run steps at the walk's pace: {a} at {col}, {b} at {}",
+                col + 1
+            );
+        }
+        let to = 45_u16;
+        t += ms(120);
+        eng.on_event(mv_as((3, 60), (3, to), Licence::Nav), t);
+        eng_tick(&mut eng, &mut sc, t, g, &cfg);
+        let mut landing = None;
+        for _ in 0..80 {
+            t += ms(16);
+            eng_tick(&mut eng, &mut sc, t, g, &cfg);
+            if let Some(l) = eng.meteor.landings.first() {
+                landing = Some(*l);
+                break;
+            }
+        }
+        let l = landing.expect("the hop landed");
+        for k in -5..=5_i32 {
+            let col = usize::from(to).checked_add_signed(k as isize).expect("col");
+            let want = tri(band[col].expect("the reborn run is lit"));
+            let got = l.field(k as f32);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{k:+} cells from the landing the burst's walk is {got} where the band's is {want}"
+            );
+        }
+    }
+
     /// **THE SHOWER WEARS THE BAND'S STOP AT EACH SPARK'S OWN COLUMN.** A
     /// spark is a point mark (C1: it snaps), and what it snaps to is the
     /// landing's walk at the column it is over — `spectrum_snap(field(dx))`
@@ -11088,5 +11168,278 @@ mod tests {
             "with no floor the shower reached column {free_min} (stations {free_station}); \
              it used to reach 18"
         );
+    }
+
+    // ── Tier-1 conformance: `RainbowLandingPool` ─────────────────────────────
+
+    /// One real step on the landing pool: an arrival through either admission
+    /// site, the pool's own expiry, or a reset.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PoolStep {
+        /// A meteor flies and lands through `emit` — admission site 1.
+        Arrive,
+        /// A ringing party bar through `party` — admission site 2.
+        Ring,
+        /// `emit` at the oldest landing's own end: its `retain` expires it.
+        Expire,
+        /// `Meteors::reset`.
+        Reset,
+    }
+
+    impl PoolStep {
+        const ALL: [Self; 4] = [Self::Arrive, Self::Ring, Self::Expire, Self::Reset];
+
+        const fn action(self) -> &'static str {
+            match self {
+                Self::Arrive | Self::Ring => "Land",
+                Self::Expire => "ExpireOne",
+                Self::Reset => "Reset",
+            }
+        }
+    }
+
+    /// A real pool on a harness clock, with the arrival edge of every landing
+    /// it was handed — the identities the projection reads ordinals by.
+    struct Pool {
+        m: Meteors,
+        now: Instant,
+        arrivals: Vec<Instant>,
+        /// Consecutive flights cross the same 20 cells in alternating
+        /// directions, so every one is a same-row jump of one length.
+        at_right: bool,
+    }
+
+    /// The clock step between two arrivals the harness makes. Every landing
+    /// lives exactly 600 ms, so arrivals a microsecond apart expire a
+    /// microsecond apart — in arrival order, one per `Expire`.
+    const POOL_TICK: Duration = Duration::from_micros(1);
+
+    /// A fault injected after a real admission, given the pool as it stood
+    /// before the step.
+    type PoolPatch = fn(&mut Meteors, PoolStep, &[Landing]);
+
+    fn no_pool_patch(_: &mut Meteors, _: PoolStep, _: &[Landing]) {}
+
+    /// The model's `Buggy = 1` at one admission site: a SATURATED pool drops the
+    /// arrival (`if len < LANDING_POOL { push }`) instead of the oldest.
+    fn drop_the_arrival_at(site: PoolStep, m: &mut Meteors, step: PoolStep, before: &[Landing]) {
+        if step == site && before.len() == LANDING_POOL {
+            m.landings = before.to_vec();
+        }
+    }
+
+    fn drop_the_arrival_in_emit(m: &mut Meteors, step: PoolStep, before: &[Landing]) {
+        drop_the_arrival_at(PoolStep::Arrive, m, step, before);
+    }
+
+    fn drop_the_arrival_in_party(m: &mut Meteors, step: PoolStep, before: &[Landing]) {
+        drop_the_arrival_at(PoolStep::Ring, m, step, before);
+    }
+
+    impl Pool {
+        fn new() -> Self {
+            Self {
+                m: Meteors::new(),
+                now: Instant::now(),
+                arrivals: Vec::new(),
+                at_right: false,
+            }
+        }
+
+        /// Drive `step` on the real pool. `Ok(false)` when the real clock
+        /// cannot realise it from here: a flight spends ~70 ms in the air, and
+        /// an arrival must not outlive a resident while it flies (the model has
+        /// no clock — its `Land` expires nothing). `Err` when the real code
+        /// did something the step cannot be read as.
+        fn drive(&mut self, step: PoolStep, patch: PoolPatch) -> Result<bool, String> {
+            let cfg = config();
+            let before = self.m.landings.clone();
+            match step {
+                PoolStep::Arrive => {
+                    let (from, to) = if self.at_right {
+                        ((5, 30), (5, 10))
+                    } else {
+                        ((5, 10), (5, 30))
+                    };
+                    let t0 = self.now + POOL_TICK;
+                    let arrival = t0 + flight(20.0);
+                    if self.m.landings.iter().any(|l| l.end() <= arrival) {
+                        return Ok(false);
+                    }
+                    let spawn = self
+                        .m
+                        .on_event(&mv(from, to), t0, &ctx_at(t0, &cfg, to, 0.3))
+                        .ok_or("a 20-cell same-row jump must fly")?;
+                    if spawn.t0 + spawn.t_flight != arrival {
+                        return Err(format!("the flight lands at {:?}", spawn.t_flight));
+                    }
+                    Scratch::default().emit(&mut self.m, &ctx_at(arrival, &cfg, to, 0.3));
+                    self.at_right = !self.at_right;
+                    self.now = arrival;
+                    self.arrivals.push(arrival);
+                }
+                PoolStep::Ring => {
+                    self.now += POOL_TICK;
+                    let at = self.now;
+                    self.m.party(at, 11, true, &ctx_at(at, &cfg, (5, 40), 0.3));
+                    self.arrivals.push(at);
+                }
+                PoolStep::Expire => {
+                    let oldest = self.m.landings.first().ok_or("nothing to expire")?;
+                    self.now = self.now.max(oldest.end());
+                    Scratch::default().emit(&mut self.m, &ctx_at(self.now, &cfg, (5, 40), 0.3));
+                }
+                PoolStep::Reset => self.m.reset(),
+            }
+            patch(&mut self.m, step, &before);
+            Ok(true)
+        }
+
+        fn project(&self) -> aterm_spec::interp::State {
+            let ordinal = |l: &Landing| {
+                self.arrivals
+                    .iter()
+                    .position(|&t| t == l.pin.at)
+                    .map_or(-1, |i| i64::try_from(i).unwrap_or(i64::MAX) + 1)
+            };
+            BTreeMap::from([
+                (
+                    "resident",
+                    i64::try_from(self.m.landings.len()).unwrap_or(i64::MAX),
+                ),
+                ("newest", self.m.landings.last().map_or(0, ordinal)),
+                ("oldest", self.m.landings.first().map_or(0, ordinal)),
+                (
+                    "issued",
+                    i64::try_from(self.arrivals.len()).unwrap_or(i64::MAX),
+                ),
+            ])
+        }
+    }
+
+    /// What the walk covered, so a pass can be checked for non-vacuity.
+    #[derive(Default)]
+    struct PoolCoverage {
+        states: usize,
+        actions: std::collections::BTreeSet<&'static str>,
+        /// Admission sites driven into a FULL pool — the one state the
+        /// drop-the-arrival mutant shows in.
+        saturated_sites: std::collections::BTreeSet<&'static str>,
+    }
+
+    /// Walk `model`'s whole reachable space on a real `Meteors` (with `patch`
+    /// injected after every step). At every model state a real trace that
+    /// reached it is replayed, every step the model enables and the real clock
+    /// can realise is driven, and the projection must be exactly the model's
+    /// one successor. `Err` names the first real transition the model does not
+    /// admit.
+    fn pool_walk(
+        model: &aterm_spec::derive::Model,
+        patch: PoolPatch,
+    ) -> Result<PoolCoverage, String> {
+        let init = model.init_state();
+        if Pool::new().project() != init {
+            return Err(format!("an empty pool is not the model's Init {init:?}"));
+        }
+        let mut seen = std::collections::BTreeSet::from([init.clone()]);
+        let mut queue = std::collections::VecDeque::from([(init, Vec::<PoolStep>::new())]);
+        let mut coverage = PoolCoverage::default();
+        while let Some((state, path)) = queue.pop_front() {
+            coverage.states += 1;
+            for step in PoolStep::ALL {
+                let action = step.action();
+                let expected = model.successors(action, &state);
+                if expected.is_empty() {
+                    continue;
+                }
+                let mut pool = Pool::new();
+                for &earlier in &path {
+                    if !pool.drive(earlier, patch)? {
+                        return Err(format!("{path:?} no longer replays at {earlier:?}"));
+                    }
+                }
+                if !pool.drive(step, patch)? {
+                    continue;
+                }
+                let after = pool.project();
+                if expected != [after.clone()] {
+                    return Err(format!(
+                        "{}: real {step:?} after {path:?} took {state:?} to {after:?}, \
+                         the model's {action} to {expected:?}",
+                        model.name
+                    ));
+                }
+                coverage.actions.insert(action);
+                if action == "Land" && state["resident"] == 3 {
+                    coverage.saturated_sites.insert(match step {
+                        PoolStep::Arrive => "emit",
+                        _ => "party",
+                    });
+                }
+                if seen.insert(after.clone()) {
+                    let mut next = path.clone();
+                    next.push(step);
+                    queue.push_back((after, next));
+                }
+            }
+        }
+        Ok(coverage)
+    }
+
+    /// Tier-1 conformance for `RainbowLandingPool`
+    /// (`aterm_spec::derive::rainbow_landing_pool_model`): the landing pool is a
+    /// bounded FIFO that always holds the LATEST arrivals — over the model's
+    /// whole reachable space, on a real `Meteors`, through BOTH admission sites
+    /// (a flight's arrival edge in `emit`, a ringing bar in `party`), the real
+    /// `retain` expiry and the real `reset`. The model's `Cap` is the shipped
+    /// `LANDING_POOL`.
+    ///
+    /// NEGATIVE CONTROL: the model's `Buggy = 1` — a saturated pool drops the
+    /// arrival instead of the oldest — injected at each admission site in turn
+    /// is refused by the healthy model at `Land`; and the shipped pool is refused
+    /// by the buggy model.
+    #[test]
+    fn the_landing_pool_conforms_to_the_model() {
+        let model = aterm_spec::derive::rainbow_landing_pool_model();
+        assert_eq!(
+            model
+                .consts
+                .iter()
+                .find(|(name, _)| *name == "Cap")
+                .map(|(_, cap)| *cap),
+            Some(i64::try_from(LANDING_POOL).unwrap()),
+            "the model's capacity is the shipped pool's"
+        );
+        let coverage = pool_walk(&model, no_pool_patch).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(
+            coverage.states,
+            aterm_spec::interp::bmc(&model).expect("the healthy model holds"),
+            "the real pool must reach every state the model can"
+        );
+        assert_eq!(
+            coverage.actions,
+            model.actions.iter().map(|a| a.name).collect(),
+            "every model action must be driven on the real pool"
+        );
+        assert_eq!(
+            coverage.saturated_sites,
+            ["emit", "party"].into_iter().collect(),
+            "both admission sites must be driven into a full pool"
+        );
+
+        for (site, patch) in [
+            ("emit", drop_the_arrival_in_emit as PoolPatch),
+            ("party", drop_the_arrival_in_party),
+        ] {
+            let refused = pool_walk(&model, patch).err().unwrap_or_else(|| {
+                panic!("the healthy model must refuse a dropped arrival in {site}")
+            });
+            assert!(refused.contains("the model's Land"), "{site}: {refused}");
+        }
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let shipped = pool_walk(&buggy, no_pool_patch)
+            .err()
+            .expect("the shipped pool must not conform to the drop-the-arrival model");
+        assert!(shipped.contains("the model's Land"), "{shipped}");
     }
 }

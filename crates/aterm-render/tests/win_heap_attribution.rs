@@ -147,7 +147,7 @@ fn the_font_seal_reads_each_file_once_and_keeps_one_copy() {
 
 /// The WHOLE font stack a windowed aterm builds, in the order it builds it:
 /// the terminal engine, then the GUI chrome's faces (`tray_raster`), then the
-/// two background warms (`warm_font_coverage_index`, the font catalogue).
+/// background font-catalogue warm.
 ///
 /// Every step below is the real shipped call. The three that live in
 /// `aterm-gui` are reproduced here EXACTLY as that crate writes them (the call
@@ -213,12 +213,6 @@ fn full_font_stack_heap() {
     let semantic = heapprof::bill("semantic renderer fork", || {
         r.fork_semantic_surface(14.0, Theme::default())
     });
-
-    // aterm-gui `app_render.rs` first-present hook.
-    heapprof::bill(
-        "warm_font_coverage_index",
-        aterm_render::warm_font_coverage_index,
-    );
 
     // aterm-gui config font resolution (`native_font_catalog`).
     let batch = heapprof::bill("font_catalog::resolve_and_admit", || {

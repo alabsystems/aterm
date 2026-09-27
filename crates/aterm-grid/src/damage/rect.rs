@@ -17,6 +17,7 @@ pub struct LineDamageBounds {
 impl LineDamageBounds {
     /// Create new line damage bounds.
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn new(line: u16, left: u16, right: u16) -> Self {
         Self { line, left, right }
     }
@@ -26,6 +27,7 @@ impl LineDamageBounds {
 impl LineDamageBounds {
     /// Check if this bounds is empty (no damage).
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn is_empty(&self) -> bool {
         self.left >= self.right
     }
@@ -35,6 +37,7 @@ impl LineDamageBounds {
     /// Two rows can be merged if they are consecutive and have overlapping
     /// or adjacent column ranges.
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn can_merge_with(&self, other: &Self) -> bool {
         // Must be adjacent lines
         if self.line.abs_diff(other.line) != 1 {
@@ -49,6 +52,7 @@ impl LineDamageBounds {
     /// The result will have column bounds covering both inputs.
     /// Call `can_merge_with` first to check if merging is beneficial.
     #[inline]
+    #[cfg(test)]
     pub fn merge_with(&self, other: &Self) -> DamageRect {
         DamageRect {
             top: self.line.min(other.line),
@@ -81,6 +85,7 @@ pub struct DamageRect {
 impl DamageRect {
     /// Create a new damage rectangle.
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn new(top: u16, bottom: u16, left: u16, right: u16) -> Self {
         Self {
             top,
@@ -103,18 +108,21 @@ impl DamageRect {
 
     /// Number of rows in this rectangle.
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn height(self) -> u16 {
         self.bottom.saturating_sub(self.top)
     }
 
     /// Number of columns in this rectangle.
     #[inline]
+    #[cfg(test)]
     pub const fn width(self) -> u16 {
         self.right.saturating_sub(self.left)
     }
 
     /// Total cells in this rectangle.
     #[inline]
+    #[cfg(test)]
     pub const fn cell_count(self) -> u32 {
         self.height() as u32 * self.width() as u32
     }

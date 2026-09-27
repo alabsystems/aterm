@@ -209,24 +209,16 @@ pub(crate) fn pbpaste_owned() -> Option<String> {
 }
 
 /// Set the X11 PRIMARY selection (the select-to-copy / middle-click-paste buffer)
-/// to `text`. X11-only — PRIMARY has no macOS/Wayland-headless analogue, so this is
-/// a no-op (returns `false`) elsewhere. Distinct from the CLIPBOARD ([`pbcopy`]) so
-/// a drag-select never clobbers an explicit Ctrl+Shift+C copy.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// to `text`. Linux-only — PRIMARY has no macOS or Windows analogue, so nothing
+/// calls this elsewhere. Distinct from the CLIPBOARD ([`pbcopy`]) so a drag-select
+/// never clobbers an explicit Ctrl+Shift+C copy.
+#[cfg(target_os = "linux")]
 pub(crate) fn primary_set(text: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(wayland) = crate::clipboard_wayland::handle() {
-            return wayland.copy(crate::clipboard_wayland::WaylandSelection::Primary, text);
-        }
-        crate::clipboard_x11::X11Clipboard::get_handle()
-            .is_some_and(|c| c.set(crate::clipboard_x11::Sel::Primary, text))
+    if let Some(wayland) = crate::clipboard_wayland::handle() {
+        return wayland.copy(crate::clipboard_wayland::WaylandSelection::Primary, text);
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = text;
-        false
-    }
+    crate::clipboard_x11::X11Clipboard::get_handle()
+        .is_some_and(|c| c.set(crate::clipboard_x11::Sel::Primary, text))
 }
 
 /// Read the X11 PRIMARY selection as UTF-8 text (the middle-click-paste source), or
@@ -236,20 +228,13 @@ pub(crate) fn primary_set(text: &str) -> bool {
 /// so the GUI middle-click path must never call this on the UI thread — it probes
 /// [`primary_get_owned`] first and runs this only on its paste worker
 /// (`App::paste_primary_into`), mirroring the [`pbpaste`]/[`pbpaste_owned`] split.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 pub(crate) fn primary_get() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(wayland) = crate::clipboard_wayland::handle() {
-            return wayland.paste(crate::clipboard_wayland::WaylandSelection::Primary);
-        }
-        crate::clipboard_x11::X11Clipboard::get_handle()
-            .and_then(|c| c.get(crate::clipboard_x11::Sel::Primary))
+    if let Some(wayland) = crate::clipboard_wayland::handle() {
+        return wayland.paste(crate::clipboard_wayland::WaylandSelection::Primary);
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    crate::clipboard_x11::X11Clipboard::get_handle()
+        .and_then(|c| c.get(crate::clipboard_x11::Sel::Primary))
 }
 
 // The PRIMARY twin of `PBPASTE_STUB` (see its doc for the thread-local

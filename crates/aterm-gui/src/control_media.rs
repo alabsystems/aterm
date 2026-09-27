@@ -39,6 +39,9 @@ pub(crate) fn call_main<T>(
     proxy: &EventLoopProxy<Wake>,
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
 ) -> Result<T, &'static str> {
+    if let Some(refusal) = dialog_refusal() {
+        return Err(refusal);
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     if proxy.send_event(make(tx)).is_err() {
         return Err("event loop gone");
@@ -77,11 +80,40 @@ pub(crate) fn call_main_within<T>(
     within: std::time::Duration,
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
 ) -> Result<T, &'static str> {
+    if let Some(refusal) = dialog_refusal() {
+        return Err(refusal);
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     if proxy.send_event(make(tx)).is_err() {
         return Err("event loop gone");
     }
     recv_within(&rx, within)
+}
+
+/// WHILE A DIALOG STANDS the main thread is inside AppKit's nested modal
+/// loop (`NSAlert runModal`, `NSOpenPanel runModal` — the quit confirmation
+/// among them), where no `Wake` is handled until the person answers: a
+/// main-thread verb posted now would park its worker for the whole of the
+/// reply deadline and then run LATE, after the answer, against whatever the
+/// answer left (design ruling 267; round 16 found `window` hung 90 s behind
+/// the ⌘Q dialog). It is refused at once instead, and never posted.
+fn dialog_refusal() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        dialog_refusal_for(crate::watchdog::current())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// [`dialog_refusal`] for one breadcrumb, pure so it is testable without a
+/// dialog: only the modal park refuses.
+#[cfg(any(target_os = "macos", test))]
+fn dialog_refusal_for(breadcrumb: crate::watchdog::Breadcrumb) -> Option<&'static str> {
+    (breadcrumb == crate::watchdog::Breadcrumb::Modal)
+        .then_some("aterm is showing a dialog; answer it, then retry")
 }
 
 /// The recv half of [`call_main_within`], factored so the deadline behaviour is
@@ -446,6 +478,11 @@ pub(crate) fn cmd_image(
                 .into();
         }
     };
+    // A capture is a main-thread photograph: refused while a dialog stands,
+    // as every main-thread verb is (ruling 267).
+    if let Some(refusal) = dialog_refusal() {
+        return format!("ERR {refusal}\n").into();
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
@@ -746,6 +783,10 @@ pub(crate) fn cmd_window(
     };
     // For the reply only — the writer re-opens via the dir fd, not this string.
     let path = confined.display_path().to_string_lossy().into_owned();
+    // Refused while a dialog stands, as every main-thread verb is (ruling 267).
+    if let Some(refusal) = dialog_refusal() {
+        return format!("ERR {refusal}\n").into();
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
@@ -1292,7 +1333,7 @@ mod confined_video_reader {
         read_with_hook(sock_dir, instance, count, |_| {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn read_for_test(
         sock_dir: &std::path::Path,
         instance: &str,
@@ -1302,7 +1343,7 @@ mod confined_video_reader {
         read_with_hook(sock_dir, instance, count, hook)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn read_metered_for_test(
         sock_dir: &std::path::Path,
         instance: &str,
@@ -4970,5 +5011,28 @@ mod call_main_within_tests {
             recv_within(&rx, Duration::from_secs(5)),
             Err("main-thread reply dropped")
         );
+    }
+    /// ROUND 16, DAY TWO: behind the ⌘Q confirmation a `window` capture hung
+    /// 90 s. A main-thread verb is refused AT ONCE while the modal park is the
+    /// breadcrumb (ruling 267), and only then — every other root posts as
+    /// before.
+    #[test]
+    fn a_main_thread_verb_is_refused_while_a_dialog_stands() {
+        use crate::watchdog::Breadcrumb;
+        assert_eq!(
+            super::dialog_refusal_for(Breadcrumb::Modal),
+            Some("aterm is showing a dialog; answer it, then retry")
+        );
+        for other in [
+            Breadcrumb::Startup,
+            Breadcrumb::AboutToWait,
+            Breadcrumb::WindowEvent,
+            Breadcrumb::UserEvent,
+            Breadcrumb::NewEvents,
+            Breadcrumb::ResizeSettle,
+            Breadcrumb::UpdateHandoff,
+        ] {
+            assert_eq!(super::dialog_refusal_for(other), None, "{other:?}");
+        }
     }
 }

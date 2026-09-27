@@ -275,28 +275,10 @@ impl Value {
         matches!(self, Self::Object(_))
     }
 
-    /// Whether this is a string.
-    #[must_use]
-    pub fn is_string(&self) -> bool {
-        matches!(self, Self::String(_))
-    }
-
     /// Whether this is `null`.
     #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
-    }
-
-    /// Whether this is a number.
-    #[must_use]
-    pub fn is_number(&self) -> bool {
-        matches!(self, Self::Number(_))
-    }
-
-    /// Whether this is a boolean.
-    #[must_use]
-    pub fn is_boolean(&self) -> bool {
-        matches!(self, Self::Bool(_))
     }
 }
 

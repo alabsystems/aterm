@@ -22,7 +22,9 @@
 //! waiting for this?" — because a finer one invites per-thread tuning that no
 //! one can reason about globally.
 //!
-//! Every function is a no-op off macOS, so call sites stay platform-neutral.
+//! Call sites stay platform-neutral: on macOS a role is a QoS class, on Linux
+//! (x86_64/aarch64) the two roles at or above the UI thread are an EEVDF slice
+//! request (see "LINUX" below), and everywhere else a role is a no-op.
 //!
 //! PROVENANCE. This module is a HAND-PORT of commit `61a6c8b62`
 //! (`fix/event-loop-wake-spin-v2`, 2026-08-11), which found thread QoS to be
@@ -95,8 +97,233 @@ pub(crate) fn set_self(role: Role) {
     unsafe {
         libc::pthread_set_qos_class_self_np(qos_class(role), 0);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if let Some(slice) = linux_slice_ns(role) {
+        let _ = set_self_slice(slice);
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
     let _ = role;
+}
+
+// ---------------------------------------------------------------------------
+// LINUX: THE SAME ROLES, SPOKEN TO EEVDF.
+//
+// Until this, every function above was a no-op off macOS, so on Linux the
+// keystroke path (the UI thread, the reply writer, the PTY drain) woke with
+// exactly the latency of the compilers the user runs beside it. Linux has no
+// QoS class an unprivileged process may raise itself into, but since 6.12
+// EEVDF honours a per-task SLICE request (`sched_setattr` on a fair policy
+// with `sched_runtime` set, allowed unprivileged, range 0.1-100 ms). A shorter
+// slice is a LATENCY hint, not a bigger share: the task keeps its weight
+// (its nice, which the request carries over untouched) and so its fair share
+// of CPU, but gets an earlier virtual deadline and is picked sooner when it
+// wakes onto a busy CPU.
+//
+// MEASURED 2026-09-24 on the Linux daily driver (aarch64, 20 cores, kernel
+// 6.17, load average 65-75 from parallel agent builds): a thread sleeping
+// 1 ms and doing a little work per wake, 3000 wakes per run, overshoot at the
+// kernel's 2.8 ms default slice p99 3.1-3.7 ms / max 5.2-5.5 ms; at a 1 ms
+// slice p99 1.4-2.5 ms / max 3.0-3.7 ms; at 0.1 ms p99 1.4-1.6 ms / max
+// 2.2-2.7 ms. The UI thread is woken several times per keystroke (key event,
+// PTY output, present), so that tail is paid more than once per echo.
+//
+// `SCHED_FLAG_RESET_ON_FORK` is set so the hint stops at this thread: a
+// thread or a CHILD PROCESS it creates (a shell spawned from the UI thread,
+// and therefore every compiler the user runs in it) starts back at the
+// default slice — measured on the same kernel, both read `runtime=2800000`
+// back after the parent set 500 µs. Only the roles that rank at or above the
+// UI thread take a slice; `Background`/`Housekeeping` are left alone because
+// a Linux nice value, unlike a macOS QoS class, IS inherited by child
+// processes, and a demoted thread that launches an aterm would starve it.
+// Older kernels accept the call and ignore `sched_runtime` for a fair
+// policy, so the hint degrades to a no-op rather than an error.
+// ---------------------------------------------------------------------------
+
+/// The EEVDF slice request for `role`, in ns, or `None` for the kernel default.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    test
+))]
+const fn linux_slice_ns(role: Role) -> Option<u64> {
+    match role {
+        Role::Interactive => Some(500_000),
+        Role::Responsive => Some(1_000_000),
+        Role::Background | Role::Housekeeping => None,
+    }
+}
+
+/// `struct sched_attr` (`include/uapi/linux/sched/types.h`, VER1 — 56 bytes).
+/// Not in `libc`, which is generated from a pinned reference; declared here the
+/// way this module declares the Darwin constants.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    test
+))]
+#[repr(C)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+    sched_util_min: u32,
+    sched_util_max: u32,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_SCHED_SETATTR: libc::c_long = 314;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_SCHED_SETATTR: libc::c_long = 274;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_SCHED_GETATTR: libc::c_long = 315;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_SCHED_GETATTR: libc::c_long = 275;
+/// `SCHED_FLAG_RESET_ON_FORK`.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    test
+))]
+const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+
+/// The fair-class policies (`SCHED_OTHER`, `SCHED_BATCH`, `SCHED_IDLE`) — the
+/// only ones whose `sched_runtime` is an EEVDF slice request. A real-time or
+/// deadline thread (only reachable if someone privileged set it) is left
+/// exactly as it is.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    test
+))]
+const FAIR_POLICIES: [u32; 3] = [0, 3, 5];
+
+/// The `sched_attr` that asks for `slice_ns` while changing NOTHING ELSE about
+/// `current` — its policy, nice and priority are carried over. Writing a fresh
+/// `SCHED_OTHER`/nice-0 struct instead would silently reset a user-chosen
+/// `SCHED_BATCH`, reset a privileged negative nice, and — for an aterm started
+/// under `nice` — FAIL outright (lowering nice unprivileged is `EPERM`), so the
+/// slice would never land. `None` for a non-fair policy.
+///
+/// `None`, too, for a NEGATIVE nice. The reset-on-fork this request must carry
+/// (so the slice stops at this thread) also resets a negative nice to 0 in
+/// every thread and process the thread creates afterwards (`sched_fork`), and
+/// the thread asking is the UI thread, which spawns the shells. An aterm the
+/// user started at nice -5 (privileged, `RLIMIT_NICE`, a unit's `Nice=`) would
+/// otherwise hand every shell, and every compiler in it, nice 0 instead of the
+/// -5 it inherited before: exactly the "worse for a niced aterm" this request
+/// must never be. Such a thread already out-ranks its peers; it keeps the
+/// kernel default slice and its inheritance.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    test
+))]
+fn slice_request(current: &SchedAttr, slice_ns: u64) -> Option<SchedAttr> {
+    (FAIR_POLICIES.contains(&current.sched_policy) && current.sched_nice >= 0).then(|| SchedAttr {
+        size: std::mem::size_of::<SchedAttr>() as u32,
+        sched_policy: current.sched_policy,
+        // Only the reset-on-fork flag: no UTIL_CLAMP bits, so the clamp
+        // fields below (zero) are ignored rather than written.
+        sched_flags: SCHED_FLAG_RESET_ON_FORK,
+        sched_nice: current.sched_nice,
+        sched_priority: current.sched_priority,
+        sched_runtime: slice_ns,
+        ..SchedAttr::default()
+    })
+}
+
+/// Request `slice_ns` for the CALLING thread (tid 0): read its attributes,
+/// change only the slice ([`slice_request`]), write them back. The error is
+/// returned for the tests; `set_self` discards it for the same reason it
+/// discards macOS's — a scheduling hint must never be the reason a worker
+/// fails.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn set_self_slice(slice_ns: u64) -> std::io::Result<()> {
+    let current = sched_attr_of_self()?;
+    let Some(attr) = slice_request(&current, slice_ns) else {
+        return Ok(());
+    };
+    // SAFETY: `sched_setattr(0, &attr, 0)` reads one correctly sized, live
+    // `sched_attr` and changes only the calling thread's scheduling hint.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_SCHED_SETATTR,
+            0 as libc::c_long,
+            &raw const attr,
+            0 as libc::c_long,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The CALLING thread's `sched_attr`, read back from the kernel.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn sched_attr_of_self() -> std::io::Result<SchedAttr> {
+    let mut attr = SchedAttr::default();
+    // SAFETY: `sched_getattr(0, &mut attr, size, 0)` writes at most `size`
+    // bytes into the live, correctly sized local.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_SCHED_GETATTR,
+            0 as libc::c_long,
+            &raw mut attr,
+            std::mem::size_of::<SchedAttr>() as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    if rc == 0 {
+        Ok(attr)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The slice (ns) and flags the CALLING thread runs with — the Linux twin of
+/// `class_of_self`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    test
+))]
+pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
+    sched_attr_of_self()
+        .ok()
+        .map(|attr| (attr.sched_runtime, attr.sched_flags))
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +443,7 @@ const PRIO_DARWIN_BG: libc::c_int = 0x1000;
 /// scheduling hint must never be the reason a child fails to start. A no-op off
 /// macOS.
 #[inline]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 pub(crate) fn demote_forked_child() {
     #[cfg(target_os = "macos")]
     // SAFETY: `setpriority` on the calling process takes no pointers and is a
@@ -390,10 +618,6 @@ mod tests {
             "unclassified: probes macOS full-disk-access consent",
         ),
         (
-            "aterm-defterm-broker",
-            "Windows only (`defterm_broker_win`); `set_self` is a no-op there",
-        ),
-        (
             "aterm-document-admit",
             "unclassified: admits an opened document",
         ),
@@ -458,15 +682,18 @@ mod tests {
         ),
         (
             "aterm-x11-clipboard",
-            "X11 only; `set_self` is a no-op off macOS",
+            "X11 only; unclassified (on Linux `set_self` only shortens the \
+             slice of the keystroke-path roles)",
         ),
         (
             "aterm-x11-paste",
-            "X11 only; `set_self` is a no-op off macOS",
+            "X11 only; unclassified (on Linux `set_self` only shortens the \
+             slice of the keystroke-path roles)",
         ),
         (
             "aterm-x11-primary-paste",
-            "X11 only; `set_self` is a no-op off macOS",
+            "X11 only; unclassified (on Linux `set_self` only shortens the \
+             slice of the keystroke-path roles)",
         ),
     ];
 
@@ -771,6 +998,144 @@ mod tests {
         set_self(Role::Housekeeping);
     }
 
+    /// The Linux slice map keeps the enum's order: the keystroke path asks for
+    /// the shortest slice, the PTY drain a longer one, and nothing below the
+    /// UI thread asks at all (a Linux nice would be inherited by children).
+    #[test]
+    fn only_the_keystroke_path_roles_request_a_linux_slice() {
+        let interactive = linux_slice_ns(Role::Interactive).expect("interactive slice");
+        let responsive = linux_slice_ns(Role::Responsive).expect("responsive slice");
+        assert!(interactive < responsive);
+        // The kernel's accepted range for a fair-policy slice request.
+        for slice in [interactive, responsive] {
+            assert!((100_000..=100_000_000).contains(&slice), "{slice} ns");
+        }
+        assert_eq!(linux_slice_ns(Role::Background), None);
+        assert_eq!(linux_slice_ns(Role::Housekeeping), None);
+    }
+
+    /// The slice request changes the slice and NOTHING ELSE: a `nice`d aterm
+    /// keeps its nice (writing 0 back would be an unprivileged nice decrease —
+    /// EPERM, and the slice would never land), a `SCHED_BATCH` thread stays
+    /// batch, and a real-time thread is not touched at all. Negative control:
+    /// the struct the first cut wrote (policy 0, nice 0) differs from it.
+    #[test]
+    fn a_slice_request_carries_policy_and_nice_over() {
+        let niced = SchedAttr {
+            sched_policy: 0,
+            sched_nice: 10,
+            ..SchedAttr::default()
+        };
+        let req = slice_request(&niced, 500_000).expect("fair policy");
+        assert_eq!(req.sched_nice, 10, "a positive nice survives");
+        assert_eq!(req.sched_policy, 0);
+        assert_eq!(req.sched_runtime, 500_000);
+        assert_eq!(req.sched_flags, SCHED_FLAG_RESET_ON_FORK);
+        assert_eq!(req.size as usize, std::mem::size_of::<SchedAttr>());
+        assert_eq!(std::mem::size_of::<SchedAttr>(), 56, "sched_attr VER1");
+        let first_cut = SchedAttr {
+            size: 56,
+            sched_flags: SCHED_FLAG_RESET_ON_FORK,
+            sched_runtime: 500_000,
+            ..SchedAttr::default()
+        };
+        assert_ne!(req, first_cut, "the old request reset nice to 0");
+
+        let batch = SchedAttr {
+            sched_policy: 3,
+            ..SchedAttr::default()
+        };
+        assert_eq!(slice_request(&batch, 1_000_000).unwrap().sched_policy, 3);
+
+        let fifo = SchedAttr {
+            sched_policy: 1,
+            sched_priority: 10,
+            ..SchedAttr::default()
+        };
+        assert_eq!(slice_request(&fifo, 500_000), None, "RT is left alone");
+
+        // A negative nice would be reset to 0 in every child the thread
+        // spawns once reset-on-fork is set, so it is not touched at all.
+        let boosted = SchedAttr {
+            sched_policy: 0,
+            sched_nice: -5,
+            ..SchedAttr::default()
+        };
+        assert_eq!(
+            slice_request(&boosted, 500_000),
+            None,
+            "a negative nice keeps its inheritance"
+        );
+    }
+
+    /// The same, against the real kernel: a thread that was `nice`d to +5 (an
+    /// unprivileged INCREASE, so this needs no rights) still gets its slice
+    /// request accepted, and keeps nice +5. The first cut wrote nice 0 back,
+    /// which the kernel refuses unprivileged, so on a niced aterm the whole
+    /// call failed and the slice never landed.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn a_niced_thread_keeps_its_nice_and_still_takes_the_slice() {
+        let (rc, attr) = std::thread::spawn(|| {
+            // SAFETY: Linux nice is per-thread; `who = 0` is this thread.
+            let reniced = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 5) };
+            assert_eq!(reniced, 0, "raising our own nice is unprivileged");
+            let rc = set_self_slice(linux_slice_ns(Role::Interactive).unwrap());
+            (
+                rc.map_err(|e| e.to_string()),
+                sched_attr_of_self().expect("getattr"),
+            )
+        })
+        .join()
+        .expect("the niced thread");
+        assert_eq!(rc, Ok(()), "the slice request must not be refused");
+        assert_eq!(attr.sched_nice, 5, "the thread's nice was preserved");
+    }
+
+    /// THE SLICE, READ OFF A RUNNING THREAD, and the reset-on-fork that keeps it
+    /// from leaking into a thread (or shell) the declaring thread creates. On a
+    /// kernel older than 6.12 the request is accepted and ignored for a fair
+    /// policy; that is reported, not failed, because the hint degrading to a
+    /// no-op is the designed behaviour there.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_linux_slice_lands_on_the_declaring_thread_and_stops_there() {
+        let (declared, child) = std::thread::spawn(|| {
+            set_self(Role::Interactive);
+            let declared = slice_of_self().expect("sched_getattr on self");
+            let child = std::thread::spawn(slice_of_self)
+                .join()
+                .expect("the child thread")
+                .expect("sched_getattr on the child");
+            (declared, child)
+        })
+        .join()
+        .expect("the declaring thread");
+        let want = linux_slice_ns(Role::Interactive).unwrap();
+        if declared.0 != want {
+            eprintln!(
+                "kernel ignored the slice request (runtime {} ns): pre-6.12 EEVDF, \
+                 the hint is a no-op here",
+                declared.0
+            );
+            return;
+        }
+        assert_ne!(
+            declared.1 & SCHED_FLAG_RESET_ON_FORK,
+            0,
+            "reset-on-fork must be set"
+        );
+        assert_ne!(
+            child.0, want,
+            "a thread created by the declaring thread inherited its slice"
+        );
+    }
+
+    #[cfg(unix)]
     fn argv(command: &std::process::Command) -> Vec<String> {
         std::iter::once(command.get_program())
             .chain(command.get_args())

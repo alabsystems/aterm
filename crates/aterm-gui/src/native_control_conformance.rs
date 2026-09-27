@@ -6,7 +6,11 @@
 //! This test drives the pure classifier used by the shipping control dispatcher.
 //! The projection calls that classifier independently for every principal/target
 //! pair, so the model is bound to the actual zero-terminal routing decisions
-//! rather than to a second handwritten truth table.
+//! rather than to a second handwritten truth table. The App bind reads the two
+//! session routes through `session_route_decision`, the dispatcher's own
+//! assembly of the classifier's inputs over the App's real active handle and
+//! session store, so a slip at that call site (its two liveness bools swapped)
+//! fails there.
 
 #![cfg(test)]
 
@@ -14,7 +18,8 @@ use aterm_spec::derive::{Model, native_control_routing_model};
 use aterm_spec::interp::{State, admits};
 
 use crate::control::{
-    NativeControlDecision, NativeControlPrincipal, NativeControlTarget, native_control_decision,
+    NativeControlDecision, NativeControlPrincipal, NativeControlTarget, Scope,
+    native_control_decision, session_route_decision,
 };
 use crate::{App, WindowId};
 
@@ -57,10 +62,6 @@ impl RealRouting {
             self.allowed(NativeControlPrincipal::Owner, NativeControlTarget::App),
         );
         state.insert(
-            "owner_meta_allowed",
-            self.allowed(NativeControlPrincipal::Owner, NativeControlTarget::Meta),
-        );
-        state.insert(
             "bare_session_allowed",
             self.allowed(
                 NativeControlPrincipal::Owner,
@@ -78,12 +79,35 @@ impl RealRouting {
             "edge_app_allowed",
             self.allowed(NativeControlPrincipal::Edge, NativeControlTarget::App),
         );
-        state.insert(
-            "edge_meta_allowed",
-            self.allowed(NativeControlPrincipal::Edge, NativeControlTarget::Meta),
-        );
         state.insert("hidden_terminal_fallback", 0);
         state.insert("session_without_target", 0);
+        state
+    }
+
+    /// The same projection with the dispatcher's classic slip replayed through
+    /// the REAL classifier: its two adjacent liveness bools passed swapped. The
+    /// slip itself would sit in `session_route`, which
+    /// `real_window_focus_projects_exact_optional_terminal_capability` drives.
+    fn project_with_swapped_inputs(self, model: &Model) -> State {
+        let swapped = Self {
+            front_has_terminal: self.explicit_session_live,
+            explicit_session_live: self.front_has_terminal,
+        };
+        let mut state = self.project(model);
+        state.insert(
+            "bare_session_allowed",
+            swapped.allowed(
+                NativeControlPrincipal::Owner,
+                NativeControlTarget::BareSession,
+            ),
+        );
+        state.insert(
+            "explicit_session_allowed",
+            swapped.allowed(
+                NativeControlPrincipal::Owner,
+                NativeControlTarget::ExplicitSession,
+            ),
+        );
         state
     }
 }
@@ -160,9 +184,25 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
         ),
         NativeControlDecision::NoSuchSession,
     );
+    let before_restore = real.project(&model);
     drive(&model, &mut real, "RestoreExplicitSession", |real| {
         real.explicit_session_live = true;
     });
+
+    // Negative control: with a native front and a live explicit session the two
+    // inputs differ, so swapping them opens the bare route and closes the
+    // explicit one. The model admits neither.
+    let swapped = real.project_with_swapped_inputs(&model);
+    assert_eq!(
+        (
+            swapped["bare_session_allowed"],
+            swapped["explicit_session_allowed"]
+        ),
+        (1, 0)
+    );
+    assert_eq!(admits(&model, &before_restore, &swapped), None);
+    assert!(!model.check_invariant("BareSessionIffFrontTerminal", &swapped));
+    assert!(!model.check_invariant("ExplicitSessionIffLive", &swapped));
     drive(&model, &mut real, "FocusTerminal", |real| {
         real.front_has_terminal = true;
     });
@@ -182,13 +222,11 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
     assert!(!model.check_invariant("NoHiddenTerminalFallback", &hidden_fallback));
     assert!(!model.check_invariant("NoSessionWithoutTarget", &hidden_fallback));
 
-    // Negative control: an app/meta edge bypass fails both authority invariants.
+    // Negative control: an app edge bypass fails the authority invariant.
     let mut edge_bypass = before_native;
     edge_bypass.insert("edge_app_allowed", 1);
-    edge_bypass.insert("edge_meta_allowed", 1);
     assert_eq!(admits(&model, &real.project(&model), &edge_bypass), None);
     assert!(!model.check_invariant("EdgeAppDenied", &edge_bypass));
-    assert!(!model.check_invariant("EdgeMetaDenied", &edge_bypass));
 }
 
 /// Bind the model's focus transition to the real window resolver, not only the
@@ -199,24 +237,49 @@ fn real_window_focus_projects_exact_optional_terminal_capability() {
     let model = native_control_routing_model();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let project = |app: &App| RealRouting {
-        front_has_terminal: app.front_terminal(wid).is_some(),
-        explicit_session_live: app.pool.get(0).is_some(),
+    let route = |app: &App, line: &str| {
+        session_route_decision(line, &app.active_handle, &app.store, Scope::Owner)
+    };
+    // The two session routes as the dispatcher resolves them: a bare verb, and
+    // one naming the window's session (local id 0) explicitly.
+    let project = |app: &App| {
+        let mut state = RealRouting {
+            front_has_terminal: app.front_terminal(wid).is_some(),
+            explicit_session_live: app.pool.get(0).is_some(),
+        }
+        .project(&model);
+        let allowed = |line| i64::from(route(app, line) == NativeControlDecision::ResolveSession);
+        state.insert("bare_session_allowed", allowed("text"));
+        state.insert("explicit_session_allowed", allowed("@0 text"));
+        state
     };
 
-    let terminal = project(&app).project(&model);
+    let terminal = project(&app);
     assert_eq!(terminal, model.init_state());
+    // A terminal front with a retired explicit session: the bare route resolves
+    // and the explicit one does not.
+    assert_eq!(route(&app, "text"), NativeControlDecision::ResolveSession);
+    assert_eq!(
+        route(&app, "@99 text"),
+        NativeControlDecision::NoSuchSession
+    );
 
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-    let native = project(&app).project(&model);
+    let native = project(&app);
     assert_transition(&model, &terminal, &native, "FocusNative");
     assert!(app.windows[&wid].active_terminal.is_none());
     assert!(
         app.pool.get(0).is_some(),
         "hidden shell remains explicitly addressable"
     );
+    // The reverse: a native front with a live explicit session.
+    assert_eq!(route(&app, "text"), NativeControlDecision::NoActiveTerminal);
+    assert_eq!(
+        route(&app, "@0 text"),
+        NativeControlDecision::ResolveSession
+    );
 
     assert!(app.close_settings_tabs());
-    let terminal_again = project(&app).project(&model);
+    let terminal_again = project(&app);
     assert_transition(&model, &native, &terminal_again, "FocusTerminal");
 }

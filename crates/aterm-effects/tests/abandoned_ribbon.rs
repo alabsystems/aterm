@@ -41,10 +41,10 @@
 //! Every scenario below was RED on main at the assertion its comment names.
 
 use aterm_core::render::GlowQuad;
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::rainbow_kitty::ribbon::{
-    FLOW_TOTAL_S, PHRASE_REST_MIN_S, RETRACT_DUR_S, RETRACT_FADE_S, SWOOSH_TOTAL_S,
+    FLOW_TOTAL_S, PHRASE_REST_MIN_S, RETRACT_DUR_S, RETRACT_FADE_S, SWOOSH_TOTAL_S, WALK_LAY_RATE,
 };
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
@@ -104,35 +104,71 @@ struct Host {
     blink_seen: u64,
     /// The clock of the last typed key, for the grace-window guards.
     last_key: Instant,
+    /// The content-scroll state the last frame saw (`app_render.rs`'s
+    /// `sync_cursor_effect_scroll`), so a fold on the screen's last row
+    /// translates the ribbon with the text (2026-09-23).
+    scroll: Option<ContentScrollState>,
 }
 
 impl Host {
     /// A fresh host with the caret parked at 0-based `(row, 0)` and the
     /// anchor seeded by one frame.
     fn at_row(row: u16) -> Self {
-        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        Self::sized(ROWS as u16, COLS as u16, row)
+    }
+
+    /// A fresh `rows × cols` host with the caret parked at 0-based `(row,
+    /// 0)` and the anchor seeded by one frame.
+    fn sized(rows: u16, cols: u16, row: u16) -> Self {
+        let mut term = Terminal::new(rows, cols);
         term.process(format!("\x1b[{};1H", row + 1).as_bytes());
         let now = Instant::now();
         let mut h = Self {
             term,
             glow: CursorGlow::default(),
             cfg: cfg(),
-            g: geom(),
+            g: Geom {
+                rows: usize::from(rows),
+                cols: usize::from(cols),
+                win_w: cols * CW as u16,
+                win_h: rows * CH as u16,
+                ..geom()
+            },
             now,
             out: Vec::new(),
             row_buf: Vec::new(),
             blink_seen: 0,
             last_key: now,
+            scroll: None,
         };
         h.frame();
         h
     }
 
-    /// EXACTLY LOCK A, then the tick: sample the cursor, the repaint blink,
-    /// the caret row's probe, and the rows the resident ribbon occupies —
-    /// all from the terminal AFTER the last `process` — then advance the
-    /// engine one frame.
+    /// EXACTLY LOCK A, then the tick: the host's scroll sync
+    /// (`sync_cursor_effect_scroll`, as `tests/codex_particle_replay.rs`
+    /// drives it), then sample the cursor, the repaint blink, the caret
+    /// row's probe, and the rows the resident ribbon occupies — all from
+    /// the terminal AFTER the last `process` — then advance the engine one
+    /// frame.
     fn frame(&mut self) {
+        let scroll = self.term.content_scroll_state();
+        match ContentScrollState::delta_since(self.scroll, scroll) {
+            ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => {}
+            ContentScrollDelta::Translate(rows) => {
+                self.glow.note_scroll(rows);
+                self.glow.drop_row_probe();
+            }
+            ContentScrollDelta::Bands { first_seq, count } => {
+                for i in 0..u64::from(count) {
+                    let m = scroll.band(first_seq + i);
+                    self.glow.note_band_move(m.top, m.bottom, m.delta);
+                }
+                self.glow.drop_row_probe();
+            }
+            ContentScrollDelta::Invalidate => self.glow.curtain(self.now),
+        }
+        self.scroll = Some(scroll);
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));
         let epoch = self.term.repaint_blink_epoch();
@@ -322,9 +358,9 @@ fn hello(row: u16) -> Host {
 /// rainbow vanishes suddenly … a beautiful animation where the previous
 /// row's rainbow flows in the direction of typing"*). The row the hand
 /// wrapped off no longer holds still through its grace: `leave_row` marks
-/// it flowing (`Cohort::flow`) and it slides into the fold point from its
-/// own last key over `FLOW_SLIDE_S`, then fades — gone by `FLOW_TOTAL_S` =
-/// 1.34 s, moving throughout. The row scope is untouched: no key on row 6
+/// it flowing (`Cohort::flow`) and it drifts into the fold point from its
+/// own last key, fading as it goes — gone by `FLOW_TOTAL_S` (1.50 s since
+/// the drift of 2026-09-23), moving throughout. The row scope is untouched: no key on row 6
 /// renews it, and the bound below is the flow's own span.
 #[test]
 fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_the_second() {
@@ -367,12 +403,13 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
         "row 5 must go dark while the hand is still typing on row 6 — a global hold          keeps it at full light for as long as any key is live",
     );
     // THE BOUND (re-pinned 2026-09-21, the fold flow): the row's own flow,
-    // `FLOW_TOTAL_S` = 1.34 s from the wrap key (one key's cadence after
-    // the row's last key), and not a frame later than one key's cadence
-    // past it (the read is once per key, 90 ms apart). Until 2026-09-21
-    // this read `RETRACT_DUR_S + RETRACT_FADE_S ..= SWOOSH_TOTAL_S + 0.1`
-    // (0.64 .. 1.79 s): the folded row held still for its 0.90 s grace and
-    // then left through the swoosh — the owner's "vanishes suddenly".
+    // `FLOW_TOTAL_S` (1.50 s since the drift of 2026-09-23) from the wrap
+    // key (one key's cadence after the row's last key), and not a frame
+    // later than one key's cadence past it (the read is once per key, 90 ms
+    // apart). Until 2026-09-21 this read `RETRACT_DUR_S + RETRACT_FADE_S
+    // ..= SWOOSH_TOTAL_S + 0.1` (0.64 .. 1.79 s): the folded row held still
+    // for its 0.90 s grace and then left through the swoosh — the owner's
+    // "vanishes suddenly".
     assert!(
         (FLOW_TOTAL_S..=FLOW_TOTAL_S + 0.09 + 0.1).contains(&dark),
         "row 5 went out at +{dark:.2} s after the caret left it; the bound is the \
@@ -398,6 +435,374 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
         "the live row holds the keys typed on it: {:?}",
         h.live(6)
     );
+}
+
+/// `(col, t)` of every live (not leaving) cell on `row`, by column.
+fn walk_on(h: &Host, row: u16) -> Vec<(u16, f32)> {
+    let mut v: Vec<(u16, f32)> = h
+        .glow
+        .v2_ribbon()
+        .expect("rainbow kitty owns the frame")
+        .cells()
+        .iter()
+        .filter(|c| c.row == row && !c.leaving())
+        .map(|c| (c.col, c.t))
+        .collect();
+    v.sort_unstable_by_key(|&(col, _)| col);
+    v
+}
+
+/// Row 5 typed to the pane's right edge (80 keys at 90 ms; the 80th glyph
+/// stands at column 79 under a pending wrap), and the walk's pace at the
+/// row's end — asserted to be `WALK_LAY_RATE`, the premise both fold laws
+/// below stand on: 80 cells from the row's first is far past the walk's
+/// `d/16` fast phase.
+fn typed_to_the_margin() -> (Host, f32) {
+    let mut h = Host::at_row(5);
+    for i in 0..COLS {
+        h.key(&[b'a' + (i % 26) as u8], 1);
+    }
+    assert_eq!(h.term.cursor().row, 5, "eighty keys: the caret is on row 5");
+    let above = walk_on(&h, 5);
+    assert!(above.len() >= 60, "row 5 is laid under the text: {above:?}");
+    let n = above.len();
+    let (c_prev, t_prev) = above[n - 2];
+    let (c_last, t_last) = above[n - 1];
+    let pace = (t_last - t_prev) / f32::from(c_last - c_prev);
+    assert!(
+        (pace - WALK_LAY_RATE).abs() < 1e-4,
+        "the premise: row 5 lays at WALK_LAY_RATE at its end — {t_prev} @{c_prev}, \
+         {t_last} @{c_last}"
+    );
+    (h, pace)
+}
+
+/// **THE SCREENSHOT OF 2026-09-23, flavour (a): a plain shell fold keeps the
+/// walk's PACE.** The owner, on v0.91.0: *"fix this rainbow cursor issue
+/// where the spectrum is smooshed on the next line. I want smooth continuous
+/// rainbow"* — a paragraph wrapped, and the new row's first ~22 cells carried
+/// the whole arc. His was Claude Code's composer
+/// (`tests/composer_box_growth_wrap.rs`, law 3b); this is the same defect
+/// with no composer at all: 80 keys fill row 5 to the pane's right edge and
+/// the terminal itself wraps the 81st onto column 0 of row 6, where the hand
+/// types 30 more.
+///
+/// Row 5's walk ran 80 cells from its first, so at its end it was laying at
+/// `WALK_LAY_RATE` a cell ([`typed_to_the_margin`]'s premise). Row 6's
+/// cohort is minted by `join_cohort` on the continued `t`, so the new row
+/// must continue the PACE too: every adjacent step on row 6, from column 0
+/// through column 29 (past the walk's sixteen-cell fast phase), is the step
+/// row 5 ended on, to 1e-4.
+///
+/// RED on the unmodified tree by the mechanism: the new cohort's
+/// `anchor_col` is its own first column, and `Cohort::t_at` reads
+/// `t0 + walk_t(col − anchor_col)` — the walk's distance restarts at zero,
+/// so row 6's first sixteen cells step `1/16` a cell, 2.25× row 5's `1/36`:
+/// one full sweep of the arc squeezed into the sixteen cells after the fold.
+#[test]
+fn a_shell_fold_continues_the_walk_at_the_pace_the_row_above_had_reached() {
+    let (mut h, pace) = typed_to_the_margin();
+    for i in 0..30u16 {
+        h.key(&[b'a' + (i % 26) as u8], 1);
+    }
+    assert_eq!(h.term.cursor().row, 6, "the fold: the caret is on row 6");
+    let below = walk_on(&h, 6);
+    assert!(
+        below.len() >= 24 && below[0].0 == 0,
+        "row 6 is laid from column 0 past the walk's fast phase: {below:?}"
+    );
+    for w in below.windows(2) {
+        let (c0, t0) = w[0];
+        let (c1, t1) = w[1];
+        assert!(
+            c1 == c0 + 1 && (t1 - t0 - pace).abs() < 1e-4,
+            "row 6's step from column {c0} to {c1} is {} — row 5 laid at {pace} a cell \
+             at its end; the walk restarted its pace at the fold: {below:?}",
+            t1 - t0
+        );
+    }
+}
+
+/// **THE FOLD'S SEAM IS ONE STEP, NOT A REPEATED STOP** (2026-09-23, found
+/// while pinning the pace law above). On the frame the 81st key folds onto
+/// row 6, BOTH its cell `(6,0)` and the 80th key's pending-wrap cell
+/// `(5,79)` are laid — and row 6's first cell must be row 5's last glyph
+/// continued ONE step, `t(5,79) + WALK_LAY_RATE`: the colour crosses the
+/// fold exactly as it crosses any two adjacent cells on a row.
+///
+/// RED on the unmodified tree by a SECOND mechanism, independent of the
+/// pace: `(6,0)` is laid FIRST on that tick (pool order), so `join_cohort`
+/// mints row 6's cohort from row 5's `t_at(col1)` while `col1` is still 79
+/// — and then `(5,79)` joins row 5's cohort at that same `t_at(79)`. The
+/// two glyphs either side of the fold carry the SAME stop (measured `2.75`
+/// and `2.75`): a zero step. The walk odometer alone (`Cohort::d0`) does
+/// not change `t0`, and left this law red; `Ribbon::seat_fold_successor`
+/// closes it by re-seating row 6's cohort when the glyph above it lands.
+#[test]
+fn a_shell_fold_s_first_cell_is_the_row_above_s_last_glyph_continued_one_step() {
+    let (mut h, pace) = typed_to_the_margin();
+    h.key(b"a", 1);
+    assert_eq!(h.term.cursor().row, 6, "the fold: the caret is on row 6");
+    let above = walk_on(&h, 5);
+    let below = walk_on(&h, 6);
+    let (c_last, t_last) = *above.last().expect("row 5 is laid");
+    let (c_first, t_first) = *below.first().expect("row 6's first cell is laid");
+    assert_eq!(
+        (c_last, c_first),
+        (COLS as u16 - 1, 0),
+        "the fold's two glyphs are laid: row 5 {above:?}, row 6 {below:?}"
+    );
+    let want = t_last + pace;
+    assert!(
+        (t_first - want).abs() < 1e-4,
+        "the colour crosses the fold one step at a time: row 6's first cell is \
+         {t_first}, row 5's last glyph ({t_last} @{c_last}) continued one step is {want}"
+    );
+}
+
+/// Whether a cohort on `row` is flowing (`Cohort::flow`: the fold drift).
+fn flowing(h: &Host, row: u16) -> bool {
+    h.glow
+        .v2_ribbon()
+        .expect("rainbow kitty owns the frame")
+        .cohorts()
+        .iter()
+        .any(|k| k.row == row && k.flow.is_some())
+}
+
+/// Frames at 16 ms, the hand parked, until `row` is dark: the ms from
+/// `since` to the first frame with no light on it — `None` if it is still
+/// lit after 3 s. `flowed` is set if any frame on the way found a cohort on
+/// the row flowing.
+fn dark_after(h: &mut Host, row: u16, since: Instant, flowed: &mut bool) -> Option<u64> {
+    let end = h.now + Duration::from_millis(3000);
+    while h.now < end {
+        h.now += Duration::from_millis(16);
+        h.frame();
+        *flowed |= flowing(h, row);
+        if !h.lit(row) {
+            return Some(h.now.saturating_duration_since(since).as_millis() as u64);
+        }
+    }
+    None
+}
+
+/// **A BACKSPACE BACK UP THROUGH A SHELL FOLD HOLDS THE ROW UNDER THE PARKED
+/// HAND** (2026-09-25, the second review of the drift). Row 5 typed to the
+/// margin, `x` folds onto `(6, 0)` — row 5 starts its drift — then two
+/// Backspaces 90 ms apart: the first erases the `x` (`\b ESC[K`), the
+/// second goes up through the fold (the shell's `ESC[A ESC[80G ESC[K`, the
+/// caret at `(5, 79)`), and the hand parks on row 5. The row the hand came
+/// back to must stop flowing on the frame the echo lands and stay lit at
+/// least as long after that Backspace as a row that never folded does after
+/// the same Backspace (the control) — whether the echo lands with its key
+/// (the engine then replays the erase ON row 5 and its hold re-wets it) or
+/// a frame later (the erase is replayed at `(6, 0)`, and only the hand's
+/// arrival on row 5 can take it back, `Ribbon::take_row_back`), and
+/// whether the run begins at once or after the phrase rest (the first
+/// Backspace, on row 6, then mints a phrase and adopts row 6 alone, so the
+/// second's erase ON row 5 holds a phrase row 5's cohort is not in).
+///
+/// Measured by the review on the tree before the take-back: the control
+/// dark +1680 ms after its Backspace; the fold with the echo in the key's
+/// frame dark +1680 (+1360 with the hold's re-wet removed), a frame late
+/// still flowing and dark +1152 — about 0.53 s early, under the parked
+/// caret. RED without the take-back for the late echo, and for both echo
+/// shapes after the rest (row 5 flowing at the echo's frame).
+#[test]
+fn a_backspace_back_up_through_a_shell_fold_holds_the_row_under_the_parked_hand() {
+    for pause_ms in [0u64, 1000] {
+        // The control: a row that never folded, the same Backspace after
+        // the same idle since the row's last key.
+        let control = {
+            let mut h = Host::at_row(5);
+            for i in 0..79u8 {
+                h.key(&[b'a' + i % 26], 1);
+            }
+            h.now += Duration::from_millis(180 + pause_ms);
+            let bs = h.now;
+            h.glow.note_backspace(h.now);
+            h.term.process(b"\x08\x1b[K");
+            h.frame();
+            let mut flowed = false;
+            let dark =
+                dark_after(&mut h, 5, bs, &mut flowed).expect("the control goes dark inside 3 s");
+            assert!(!flowed, "the control never flows");
+            dark
+        };
+        for late in [false, true] {
+            let what = format!(
+                "{} ms pause, echo {}",
+                pause_ms,
+                if late { "a frame late" } else { "with its key" }
+            );
+            let (mut h, _) = typed_to_the_margin();
+            h.key(b"x", 1);
+            assert_eq!(h.term.cursor().row, 6, "{what}: `x` folds onto row 6");
+            let bs1 = h.now + Duration::from_millis(90 + pause_ms);
+            while h.now + Duration::from_millis(16) < bs1 {
+                h.now += Duration::from_millis(16);
+                h.frame();
+            }
+            assert!(
+                flowing(&h, 5) && h.lit(5),
+                "{what}: the premise: row 5 is flowing, and lit, when the hand comes back"
+            );
+            let rest = h.glow.v2_ribbon().expect("the ribbon").rest_s();
+            assert!(
+                pause_ms == 0 || (90 + pause_ms) as f32 >= rest * 1000.0,
+                "{what}: the premise: the run begins past the {rest} s rest"
+            );
+            h.now = bs1;
+            h.glow.note_backspace(h.now);
+            h.term.process(b"\x08\x1b[K");
+            h.frame();
+            assert_eq!(
+                (h.term.cursor().row, h.term.cursor().col),
+                (6, 0),
+                "{what}: the first Backspace erased the `x`"
+            );
+            h.now += Duration::from_millis(90);
+            let bs2 = h.now;
+            h.glow.note_backspace(h.now);
+            if late {
+                h.frame();
+                h.now += Duration::from_millis(16);
+            }
+            h.term.process(b"\x1b[A\x1b[80G\x1b[K");
+            h.frame();
+            assert_eq!(
+                (h.term.cursor().row, h.term.cursor().col),
+                (5, 79),
+                "{what}: the second Backspace went up through the fold"
+            );
+            assert!(
+                !flowing(&h, 5),
+                "{what}: row 5 still flows on the frame the hand came back to it"
+            );
+            let mut flowed = false;
+            let dark = dark_after(&mut h, 5, bs2, &mut flowed);
+            assert!(!flowed, "{what}: row 5 flowed again under the parked hand");
+            let dark = dark.expect("row 5 goes dark inside 3 s");
+            assert!(
+                dark >= control,
+                "{what}: row 5 went dark +{dark} ms after the hand came back to it; the \
+                 never-folded control holds to +{control} ms"
+            );
+        }
+    }
+}
+
+/// Row `row` of a `rows × cols` host typed to the pane's right edge, one
+/// key per frame at 90 ms: `(host, t, pace)` — the stop of the column
+/// BEFORE the margin (the margin glyph's own key is held under the pending
+/// wrap, and comes with the fold's sweep) and the walk's pace there, read
+/// off its last two cells.
+fn typed_to_the_margin_of(rows: u16, cols: u16, row: u16) -> (Host, f32, f32) {
+    let mut h = Host::sized(rows, cols, row);
+    for i in 0..cols {
+        h.key(&[b'a' + (i % 26) as u8], 1);
+    }
+    assert_eq!(h.term.cursor().row, row, "the caret is still on row {row}");
+    let above = walk_on(&h, row);
+    let n = above.len();
+    assert!(
+        n >= usize::from(cols) - 2 && above[n - 1].0 == cols - 2,
+        "row {row} is laid up to the column before the margin: {above:?}"
+    );
+    let (c_prev, t_prev) = above[n - 2];
+    let (c_last, t_last) = above[n - 1];
+    (h, t_last, (t_last - t_prev) / f32::from(c_last - c_prev))
+}
+
+/// **THE FOLD'S SEAM HOLDS WHEN TWO KEYS' ECHOES SHARE A FRAME** (2026-09-23,
+/// the audit of `Ribbon::seat_fold_successor`). The sibling of
+/// [`a_shell_fold_s_first_cell_is_the_row_above_s_last_glyph_continued_one_step`],
+/// which types one key per frame: here the fold key and the key after it
+/// reach the glass together — pressed 6 ms apart and echoed on one frame
+/// (a fast hand), or the fold key's echo lagging 40 ms until the next
+/// key's lands with it (a slow link). The frame then replays the LATER
+/// key's `Typed` at the frame's caret, `(r + 1, 2)`, which lays `(r + 1,
+/// 1)` first and mints the new row's run there from the row above's end
+/// one column short of the glyph still to come — and the seat that fixes
+/// the one-key shape only looked at a successor anchored at the pane's
+/// first column. The new row's first cell must still be the row above's
+/// last glyph continued ONE step, and its second one more: at 80 columns
+/// mid-screen, at 80 columns on the screen's LAST row (the fold scrolls
+/// the screen, and the host's scroll sync carries the ribbon), and at 12
+/// columns, where the walk is still on its `1/16` fast leg.
+///
+/// RED before 2026-09-23 (measured by the audit, and here): every fold
+/// stepped BACKWARD one stop, `−1/36` (`−1/16` at 12 columns) — row `r +
+/// 1`'s first two cells took the stops of row `r`'s last two.
+#[test]
+fn a_fold_s_seam_holds_when_two_keys_echoes_land_on_one_frame() {
+    for (rows, cols, row) in [(24u16, 80u16, 5u16), (24, 80, 23), (24, 12, 5)] {
+        for lagged in [false, true] {
+            let what = format!(
+                "{cols} columns on row {row}, {}",
+                if lagged {
+                    "the fold key's echo lagging to the next key's"
+                } else {
+                    "two keys 6 ms apart on one frame"
+                }
+            );
+            let (mut h, t_before, pace) = typed_to_the_margin_of(rows, cols, row);
+            // The margin glyph continues the row one step.
+            let t_last = t_before + pace;
+            h.now += Duration::from_millis(90);
+            h.last_key = h.now;
+            h.glow.note_typed_cells(h.now, 1);
+            if lagged {
+                // The fold key's echo is late: two frames with nothing new.
+                h.now += Duration::from_millis(16);
+                h.frame();
+                h.now += Duration::from_millis(16);
+                h.frame();
+                h.now += Duration::from_millis(8);
+            } else {
+                h.term.process(b"a");
+                h.now += Duration::from_millis(6);
+            }
+            h.last_key = h.now;
+            h.glow.note_typed_cells(h.now, 1);
+            h.term.process(if lagged { b"ab" } else { b"b" });
+            h.frame();
+            // The fold scrolled the screen on the last row: the row the
+            // glyphs were typed on is one up now.
+            let (above_row, below_row) = if row + 1 == rows {
+                (row - 1, row)
+            } else {
+                (row, row + 1)
+            };
+            assert_eq!(h.term.cursor().row, below_row, "{what}: the fold");
+            for _ in 0..4u16 {
+                h.key(b"c", 1);
+            }
+            let above = walk_on(&h, above_row);
+            let below = walk_on(&h, below_row);
+            let &(c_above, t_above) = above.last().expect("the row above is laid");
+            assert!(
+                c_above == cols - 1 && (t_above - t_last).abs() < 1e-4,
+                "{what}: the margin glyph continues its row one step, {t_last}: {above:?}"
+            );
+            assert!(
+                below.len() >= 4 && below[0].0 == 0 && below[1].0 == 1,
+                "{what}: the new row is laid from its first column: {below:?}"
+            );
+            // Four cells: at 12 columns they are distance 12..=15, still
+            // on the fast leg the margin's pace was read on.
+            for (k, &(col, t)) in below.iter().take(4).enumerate() {
+                let want = t_last + (k as f32 + 1.0) * pace;
+                assert!(
+                    (t - want).abs() < 1e-4,
+                    "{what}: the new row's column {col} is {t} — the margin glyph {t_last} \
+                     continued {} steps of {pace} is {want}: above {above:?}, below {below:?}",
+                    k + 1
+                );
+            }
+        }
+    }
 }
 
 /// **THE SCREENSHOT, flavour (b): Claude Code's box-growth wrap, then typing
@@ -428,8 +833,8 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
 /// no longer melted where its text WAS; it is TRANSLATED to row 5 under
 /// its text on the frame the box grew, with every clock intact and nothing
 /// retired, and — the text having left the caret's row, which is the fold
-/// — it FLOWS there: it slides into the fold point over `FLOW_SLIDE_S` and
-/// fades over `RETRACT_FADE_S`, gone by `FLOW_TOTAL_S`, while the hand
+/// — it FLOWS there: it drifts into the fold point and fades as it goes,
+/// gone by `FLOW_TOTAL_S`, while the hand
 /// types on the caret row. The park's own laws are unchanged: the wrap's
 /// verdict is still held and flushed by the next key, which lays the
 /// landing. The owner's vanish (2026-09-21) was this fixture's old
@@ -1063,7 +1468,26 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
     h.program(b"\x1b[6;1HHELLO WORLD");
     let status = h.glow.v2_status().expect("v2 owns the frame");
     assert_eq!(status.retired, 11);
-    let line = aterm_effects::cursor_glow::TrailStatus {
+    let line = trail_line(&h);
+    // `ribbon_followed=` (2026-09-21) rides beside it: the cells the
+    // follow pass carried WITH their text — none here, the text was
+    // overwritten in place. `ribbon_follow_missed=` (2026-09-23) is the
+    // tail's new last field, appended as every v2 row is (nothing in front
+    // of it moves): no text arrived elsewhere, so nothing was missed.
+    assert!(
+        line.ends_with(" ribbon_retired=11 ribbon_followed=0 ribbon_follow_missed=0"),
+        "the three content counts are the last fields: {line}"
+    );
+    assert!(
+        line.contains(" v2_meteors=0 v2_bridged=0 ribbon_retired=11 ribbon_followed=0"),
+        "{line}"
+    );
+}
+
+/// `trail status`'s line for `h`, as the control socket prints it
+/// (`TrailStatus::line_v2`).
+fn trail_line(h: &Host) -> String {
+    aterm_effects::cursor_glow::TrailStatus {
         style_raw: "rainbow kitty",
         style: GlowStyle::RainbowKitty,
         config_enabled: true,
@@ -1103,16 +1527,56 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
         inserts: aterm_effects::cursor_glow::InsertTally::default(),
         in_flight: aterm_effects::cursor_glow::InFlightTally::default(),
     }
-    .line_v2(Some(status));
-    // `ribbon_followed=` (2026-09-21) rides beside it, last: the cells the
-    // follow pass carried WITH their text — none here, the text was
-    // overwritten in place.
-    assert!(
-        line.ends_with(" ribbon_retired=11 ribbon_followed=0"),
-        "the two content counts are the last fields: {line}"
-    );
-    assert!(
-        line.contains(" v2_meteors=0 v2_bridged=0 ribbon_retired=11 ribbon_followed=0"),
-        "{line}"
-    );
+    .line_v2(h.glow.v2_status())
+}
+
+/// `ribbon_follow_missed=`, read from the engine's status.
+fn follow_missed(h: &Host) -> u64 {
+    h.glow.v2_status().map_or(0, |s| s.follow_missed)
+}
+
+/// **THE MISSED-FOLLOW COUNT REACHES `trail status`** (2026-09-23, the
+/// review: the counter had no positive control above the witness unit —
+/// replacing the engine's accumulation with a no-op left the whole suite
+/// green, so `ribbon_follow_missed=0` could read forever while composer
+/// rows melted). `hello world` typed on row 5, then one PTY batch blanks
+/// the row and writes `hel   world` on row 4: eight of its ten glyphs
+/// ARRIVED a row up at their own columns, but around a hole — not one
+/// block — so the follow pass names nothing and counts the ten gone cells
+/// missed, once, on the engine's status and on `trail status`'s last field.
+/// The controls, each from the same `hello world`: the whole line arriving
+/// is FOLLOWED (eleven cells, the space with them) and misses nothing, and
+/// other text a row up arrived nothing and misses nothing.
+///
+/// RED with `Engine::follow_rows`' accumulation replaced by a no-op (the
+/// review's mutant): `ribbon_follow_missed=0`.
+#[test]
+fn a_line_that_arrives_a_row_up_around_a_hole_is_counted_missed_on_trail_status() {
+    for (now, missed, followed) in [
+        ("hel   world", 10, 0),
+        ("hello world", 0, 11),
+        ("jumpy frogs", 0, 0),
+    ] {
+        let mut h = hello(5);
+        h.idle(64);
+        let (missed0, followed0) = (follow_missed(&h), h.followed());
+        assert_eq!((missed0, followed0), (0, 0), "the premise: nothing yet");
+        h.program(format!("\x1b[6;1H\x1b[2K\x1b[5;1H{now}").as_bytes());
+        assert_eq!(
+            (follow_missed(&h), h.followed()),
+            (missed, followed),
+            "`{now}` a row up: (missed, followed)"
+        );
+        h.idle(300);
+        assert_eq!(
+            follow_missed(&h),
+            missed,
+            "`{now}` a row up: counted once, not per frame"
+        );
+        let line = trail_line(&h);
+        assert!(
+            line.ends_with(&format!(" ribbon_follow_missed={missed}")),
+            "`{now}` a row up: the count is trail status's last field: {line}"
+        );
+    }
 }

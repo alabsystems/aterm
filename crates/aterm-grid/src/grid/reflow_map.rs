@@ -112,26 +112,22 @@ fn remap_copied_extra(
         },
     };
 
-    // HashMap first: preserves multi-codepoint ZWJ sequences, hyperlinks,
-    // combining marks, underline colors, and all other structured extras.
-    if let Some(extra) = old_extras.get(coord) {
-        extras_ctx
-            .new_extras
-            .set(CellCoord::new(dest_row, dest_col), extra.clone());
-        return;
-    }
-
-    // Ring-buffer fallback: the production write path stores non-BMP complex
-    // chars and RGB colors exclusively in ring buffers (ComplexCharRing,
-    // RgbColorRing) for performance. Without this fallback, emoji and RGB
-    // colors written via the hot path are silently lost on column reflow.
-    // (#7447)
-    let complex = old_extras.complex_codepoint_for(coord.row, coord.col);
+    // Structured extras and rings can BOTH contribute to one cell: the parser
+    // keeps an emoji's base in the complex ring and its ZWJ/skin-tone suffix in
+    // the map's combining marks. Returning after copying the map loses the base
+    // when reflow retires the rings. Preserve full stored strings, supplement
+    // missing bases, and resolve RGB ring-first as the live renderer does.
+    let stored = old_extras.get(coord);
+    let complex = if stored.and_then(CellExtra::complex_char).is_none() {
+        old_extras.complex_codepoint_for(coord.row, coord.col)
+    } else {
+        None
+    };
     let fg = old_extras.fg_rgb_for(coord.row, coord.col);
     let bg = old_extras.bg_rgb_for(coord.row, coord.col);
 
-    if complex.is_some() || fg.is_some() || bg.is_some() {
-        let mut extra = CellExtra::default();
+    if stored.is_some() || complex.is_some() || fg.is_some() || bg.is_some() {
+        let mut extra = stored.cloned().unwrap_or_default();
         if let Some(c) = complex {
             use std::sync::Arc;
             let mut buf = [0u8; 4];
@@ -238,6 +234,44 @@ pub(super) fn chunk_cells_to_rows(
 mod tests {
     use super::*;
     use crate::{Cell, CellFlags, PageStore, Row};
+
+    #[test]
+    fn copied_extra_preserves_full_strings_and_resolves_ring_colors() {
+        let mut old = CellExtras::new();
+        let coord = CellCoord::new(0, 1);
+        old.set_complex_char_ring(0, 1, '👩', 2, 8);
+        old.set_rgb_ring_range(0, 1, 2, Some([1, 2, 3]), Some([4, 5, 6]), 2, 8);
+        let stored = old.get_or_create(coord);
+        stored.set_complex_char(Some(std::sync::Arc::from("👩‍💻")));
+        stored.set_fg_rgb(Some([90, 91, 92]));
+        stored.set_bg_rgb(Some([93, 94, 95]));
+        stored.set_hyperlink(Some(std::sync::Arc::from("https://example.com")));
+        stored.set_underline_color(Some([7, 8, 9]));
+        let mut remapped = CellExtras::new();
+        remap_copied_extra(
+            &mut ExtrasCopyCtx {
+                source: ExtrasSource::Row(0),
+                old_extras: Some(&old),
+                new_extras: &mut remapped,
+            },
+            1,
+            1,
+            3,
+        );
+        let copied = remapped.get(CellCoord::new(1, 3)).unwrap();
+        assert_eq!(copied.complex_char().map(AsRef::as_ref), Some("👩‍💻"));
+        assert_eq!(copied.fg_rgb(), Some([1, 2, 3]));
+        assert_eq!(copied.bg_rgb(), Some([4, 5, 6]));
+        assert_eq!(
+            copied.hyperlink().map(AsRef::as_ref),
+            Some("https://example.com")
+        );
+        assert_eq!(copied.underline_color(), Some([7, 8, 9]));
+        // Map-only copying is the historical negative control: it keeps the
+        // old map colors although the ring is what the live renderer sees.
+        assert_ne!(old.get(coord).unwrap().fg_rgb(), copied.fg_rgb());
+        assert_ne!(old.get(coord).unwrap().bg_rgb(), copied.bg_rgb());
+    }
 
     // =========================================================================
     // adjust_chunk_boundary

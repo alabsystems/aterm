@@ -6,8 +6,8 @@
 //! system, over a local Unix-domain socket ([`Broker::serve`], same-machine), plain
 //! TCP ([`Broker::serve_tcp`] — plaintext, trusted network only), or — with the
 //! `aead` feature — an XChaCha20-Poly1305-sealed TCP transport
-//! ([`Broker::serve_tcp_sealed`], confidential + authenticated). With the `cap`
-//! feature a broker opened by [`Broker::open_guarded`] enforces signed capabilities on
+//! (`Broker::serve_tcp_sealed`, confidential + authenticated). With the `cap`
+//! feature a broker opened by `Broker::open_guarded` enforces signed capabilities on
 //! its accept path — presented as a proof of possession over a per-connection nonce
 //! (`Hello` → `Nonce` → `Attach` → `Mark`), so the capability's tag never crosses the
 //! wire, and held on a bounded per-connection keyring. The same Frame protocol rides
@@ -52,8 +52,8 @@
 //! deps — the optional `cap` / `aead` features pull the vetted in-tree crypto crates.
 //!
 //! Honest boundary: delivery to the socket is ordered, gapless, and AT-LEAST-ONCE
-//! (the consumer's cursor or a durable group commit makes it effectively exactly-once);
-//! the queue/inbox/state verb semantics of the doctrine's four verbs are later tracks.
+//! (the consumer's cursor or a durable group commit makes it effectively exactly-once;
+//! [`drain`] / [`take`] / [`ack`] are that inbox loop as library helpers).
 
 pub mod brecord;
 pub mod broker;

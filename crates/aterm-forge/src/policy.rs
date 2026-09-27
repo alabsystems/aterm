@@ -14,28 +14,30 @@
 //! LICENSE files, upstream provenance) that no compiler enforces.
 //!
 //! `vendor/forge.toml` is the checked-in record of that: one `[[fork]]` block
-//! per patch entry, plus a `[forge]` header pinning the measurement methods so a
-//! number in a report can be re-derived years later.
+//! per vendored patch entry, plus a `[forge]` header pinning the measurement
+//! methods so a number in a report can be re-derived years later. `cargo forge
+//! check` holds the ledger to the tree (`[OB-17]`): it must parse, its header
+//! must name the cell matrix forge measures, and its fork blocks must be the
+//! vendored patches exactly — path, version and license as the tree has them,
+//! `apache_notice` as `[OB-7]` reads that license, and the census class as
+//! `aterm_census::scan_set::REVIEWED_VENDORED_CRATES` records it.
 //!
 //! # THE COMMENTS ARE THE RECORD
 //!
 //! A fork's REASON to exist is not a key in this file — it is the comment block
 //! above it. That is deliberate: a reason is prose, and prose crammed into a
-//! TOML string loses its line breaks and its editability. It also means every
-//! read/write of this file MUST preserve comments, which is exactly why the
-//! parser is `aterm-toml`'s document model and not a hand-rolled reader:
-//! [`Policy::render`] returns the parsed document byte-for-byte, so a future
-//! `--update` that adds a key cannot silently eat the paragraph explaining why
-//! `winit` is forked.
+//! TOML string loses its line breaks and its editability. Nothing in forge
+//! writes this file: it is edited by hand, and read with `aterm-toml`'s
+//! document model rather than a hand-rolled reader.
 //!
 //! # Fail-closed, both ways
 //!
 //! An UNKNOWN KEY is an error naming the key (the discipline
 //! `aterm_census::scan_set` already applies to the vendored-crate registry): a
 //! typo'd `apache_notices = true` must never read as "obligation not claimed".
-//! A MISSING FILE is *not* an error — Stage 0 ships before the file does, and
-//! [`load`] returns an empty [`Policy`] so the gate can report "no ledger yet"
-//! instead of failing to run.
+//! A MISSING FILE is *not* a parse error — [`load`] returns an empty
+//! [`Policy`] — and `[OB-17]` decides what absence means: nothing, while no
+//! vendored fork is patched in; a FAIL naming the file once one is.
 //!
 //! # Version drift silently un-uses a patch
 //!
@@ -49,11 +51,8 @@
 //! registry-sourced copies of the same name that coexist with it.
 
 use crate::model::Cell;
-use aterm_census::scan_set::{
-    PatchTargetKind, REVIEWED_VENDORED_CRATES, VendoredMode, classify_patch_target,
-};
+use aterm_census::scan_set::{PatchTargetKind, classify_patch_target};
 use aterm_toml::edit::{DocumentMut, Item, TableLike};
-use std::fmt::Write as _;
 use std::path::Path;
 
 /// The ledger's path, relative to the workspace root.
@@ -70,9 +69,6 @@ pub const LOC_METHOD: &str = "rs-physical-all-files-v1";
 /// resolve is feature-unified across all workspace members and over-counts the
 /// macOS root by 28% (271 nodes against cargo tree's 212).
 pub const GRAPH_METHOD: &str = "cargo-tree-normal-no-dedupe-locked-offline-v1";
-
-/// Comment width used by the emitted seed body.
-const WRAP: usize = 92;
 
 // ---------------------------------------------------------------------------
 // The model
@@ -94,14 +90,6 @@ pub enum CensusMode {
 }
 
 impl CensusMode {
-    /// The ledger spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Scanned => "scanned",
-            Self::BuildDepOnly => "build-dep-only",
-        }
-    }
-
     fn parse(s: &str, ctx: &str) -> Result<Self, String> {
         match s {
             "scanned" => Ok(Self::Scanned),
@@ -122,7 +110,7 @@ pub struct Fork {
     /// The crates.io package this fork replaces (== the patch table key).
     pub name: String,
     /// The upstream version the fork keeps, so the existing `^` requirements
-    /// still resolve. Cross-checked against `Cargo.lock` by [`seed_from_vendor`].
+    /// still resolve. Held to the vendored manifest by `cargo forge check`'s `[OB-17]`.
     pub version: String,
     /// Repo-relative directory (`vendor/winit`).
     pub path: String,
@@ -131,7 +119,8 @@ pub struct Fork {
     /// `true` when this fork's license leaves no non-Apache option, so the
     /// Apache-2.0 §4(b) "carry prominent notices stating that You changed the
     /// files" obligation binds every file aterm modified. `cargo forge attest`
-    /// is what checks the notices; this flag is what says they are owed.
+    /// decides that from the license and checks the notices; `[OB-7]`'s verdict
+    /// is what this flag must agree with (`cargo forge check` `[OB-17]`).
     pub apache_notice: bool,
     /// The lock-order census's classification.
     pub census_mode: CensusMode,
@@ -149,32 +138,11 @@ pub struct ForgeHeader {
     pub cells: Vec<Cell>,
 }
 
-/// The parsed ledger. `doc` is retained so [`Policy::render`] can return the
-/// file byte-for-byte — see the module docs on why comment preservation is not
-/// optional here.
+/// The parsed ledger.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     pub forge: ForgeHeader,
     pub forks: Vec<Fork>,
-    doc: Option<DocumentMut>,
-}
-
-impl Policy {
-    /// `true` when no ledger file exists yet (Stage 0 ships before it does).
-    pub fn is_absent(&self) -> bool {
-        self.doc.is_none()
-    }
-
-    /// The document as text, byte-identical to what [`load`] read. `None` when
-    /// no file was read.
-    pub fn render(&self) -> Option<String> {
-        self.doc.as_ref().map(std::string::ToString::to_string)
-    }
-
-    /// The block for one package name.
-    pub fn fork(&self, name: &str) -> Option<&Fork> {
-        self.forks.iter().find(|f| f.name == name)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +150,7 @@ impl Policy {
 // ---------------------------------------------------------------------------
 
 /// Read `<root>/vendor/forge.toml`. An ABSENT file is an empty [`Policy`], not
-/// an error: Stage 0 of forge ships before the ledger it will write.
+/// an error: whether absence is a finding is `[OB-17]`'s call.
 pub fn load(root: &Path) -> Result<Policy, String> {
     let path = root.join(POLICY_PATH);
     match std::fs::read_to_string(&path) {
@@ -196,19 +164,21 @@ pub fn load(root: &Path) -> Result<Policy, String> {
     }
 }
 
-/// Parse a ledger body. Split out from [`load`] so the round-trip and the
-/// fail-closed key rules are testable without a filesystem.
+/// Parse a ledger body. Split out from [`load`] so the fail-closed key rules
+/// are testable without a filesystem.
 pub fn parse(text: &str) -> Result<Policy, String> {
     let doc: DocumentMut = text.parse().map_err(|e| {
         format!("{POLICY_PATH} is not valid TOML: {e} — fix the syntax; forge will not guess")
     })?;
 
+    // `[[carved]]` rows are the carve ledger, read by `cargo forge check`'s
+    // `[OB-13]`; this reader only admits the key.
     for (key, _) in doc.as_table().iter() {
-        if key != "forge" && key != "fork" {
+        if key != "forge" && key != "fork" && key != "carved" {
             return Err(format!(
                 "{POLICY_PATH}: unknown top-level table `{key}` — this file holds exactly \
-                 `[forge]` (the method header) and `[[fork]]` blocks. Delete it, or move the \
-                 note into a `#` comment: comments are preserved verbatim, keys are not free"
+                 `[forge]` (the method header), `[[fork]]` blocks and `[[carved]]` rows. \
+                 Delete it, or move the note into a `#` comment: keys are not free"
             ));
         }
     }
@@ -245,11 +215,7 @@ pub fn parse(text: &str) -> Result<Policy, String> {
         }
     }
 
-    Ok(Policy {
-        forge,
-        forks,
-        doc: Some(doc),
-    })
+    Ok(Policy { forge, forks })
 }
 
 fn header(item: &Item) -> Result<ForgeHeader, String> {
@@ -571,8 +537,8 @@ impl PatchEntry {
 /// against the vendored manifest and `Cargo.lock`.
 ///
 /// Measurement, not judgement: drift is RECORDED here (so `cargo forge budget`
-/// can count live entries and `cargo forge attest` can report on them) and
-/// REFUSED in [`seed_from_vendor`], which is the authoring path.
+/// can count live entries and `cargo forge check` can hold the fork ledger to
+/// them); `[OB-12]` is where a patch that does not take is refused.
 pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
@@ -738,311 +704,6 @@ fn patched_manifest(
     Ok((get("name")?, get("version")?, get("license")?))
 }
 
-// ---------------------------------------------------------------------------
-// Seeding the ledger from the real tree
-// ---------------------------------------------------------------------------
-
-/// Produce a complete `vendor/forge.toml` body from the live tree: the real
-/// `[patch.crates-io]` table, the real vendored manifests, and the real census
-/// registry. RETURNS the text — writing it is the caller's decision, because a
-/// hand-edited ledger's comments are the record and forge will not overwrite
-/// them behind anyone's back.
-///
-/// Refuses (naming the fix) when a patch is not in effect: a vendored version
-/// that has drifted from what the lock resolved means the fork is not being
-/// compiled, and a ledger asserting obligations over dead code is worse than no
-/// ledger.
-pub fn seed_from_vendor(root: &Path) -> Result<String, String> {
-    let all = patch_entries(root)?;
-    // FIRST-PARTY patch targets are not forks and must not be seeded. The
-    // ledger's own parser refuses a `path` outside `vendor/` — correctly, it
-    // records vendored forks — so a seeder that emitted one would produce a
-    // file its own reader rejects. They are named in a comment instead, so the
-    // ledger's silence about them is a stated fact rather than an omission.
-    let (patches, first_party): (Vec<PatchEntry>, Vec<PatchEntry>) =
-        all.into_iter().partition(PatchEntry::is_vendored);
-    if patches.is_empty() {
-        return Err(format!(
-            "{}: no VENDORED `[patch.crates-io]` entries — there are no forks to record. \
-             Delete {POLICY_PATH} rather than seeding an empty ledger",
-            root.join("Cargo.toml").display()
-        ));
-    }
-
-    let mut s = String::new();
-    s.push_str("# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 Andrew Yates\n#\n");
-    s.push_str(&comment(
-        "# ",
-        "# ",
-        "vendor/forge.toml — THE FORK LEDGER. One [[fork]] block per [patch.crates-io] entry \
-         in the workspace root manifest: what aterm vendored, at which upstream version, \
-         under which license, and how the lock-order census classifies it.",
-    ));
-    s.push_str("#\n");
-    s.push_str(&comment(
-        "# ",
-        "# ",
-        "THE COMMENTS ARE THE RECORD. A fork's reason to exist is not a key here — it is the \
-         comment block above it. forge round-trips this file with aterm-toml precisely so that \
-         no future write can eat one. Unknown KEYS are refused by name (fail-closed, the way \
-         aterm-census's vendored-crate registry is); unknown COMMENTS are kept verbatim.",
-    ));
-    s.push_str("#\n");
-    s.push_str(&comment(
-        "# ",
-        "# ",
-        "Every version below is cross-checked against Cargo.lock: a vendored version that \
-         drifts from the requirement the graph asks for silently un-uses the patch, and the \
-         only trace is one line in the lock.",
-    ));
-    s.push_str("#\n");
-    s.push_str(&comment(
-        "# ",
-        "# ",
-        "Regenerate this skeleton with aterm_forge::policy::seed_from_vendor and DIFF it \
-         against the checked-in file. Never overwrite: the diff is the review.",
-    ));
-    if !first_party.is_empty() {
-        s.push_str("#\n");
-        s.push_str(&comment(
-            "# ",
-            "# ",
-            &format!(
-                "NOT RECORDED HERE, deliberately: {} — [patch.crates-io] entr{} pointing at a \
-                 FIRST-PARTY workspace member. This ledger records what aterm VENDORED, and a \
-                 crate aterm wrote is not a redistribution of anyone's work: it has no \
-                 upstream version, no upstream license to retain and no §4(b) obligation, so \
-                 a [[fork]] block for it could only state falsehoods. The patch is still \
-                 checked — `cargo forge attest` [OB-1]/[OB-2] and `cargo forge check` \
-                 [OB-12] cover that it exists and that it is live in every cell.",
-                first_party
-                    .iter()
-                    .map(|p| format!("`{}` → {}", p.name, p.path))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if first_party.len() == 1 { "y" } else { "ies" }
-            ),
-        ));
-    }
-    s.push_str("\n[forge]\n");
-    s.push_str(&comment(
-        "# ",
-        "# ",
-        "The methods every number in a forge report was produced by, recorded so a report can \
-         be re-derived years later and so a change of method lands as a diff instead of as a \
-         silent shift in the ratchet.",
-    ));
-    s.push_str(&comment(
-        "# ",
-        "#   ",
-        &format!(
-            "loc_method \"{LOC_METHOD}\": physical lines over every *.rs under the package \
-             root, that package's own tests and examples included. It measures the source \
-             aterm would OWN on vendoring, not the code that reaches codegen.",
-        ),
-    ));
-    s.push_str(&comment(
-        "# ",
-        "#   ",
-        &format!(
-            "graph_method \"{GRAPH_METHOD}\": cargo tree -p <package> -e normal --target \
-             <triple> --prefix depth --no-dedupe --locked --offline. Deliberately NOT cargo \
-             metadata --filter-platform, whose resolve is feature-unified across every \
-             workspace member and over-counts the macOS root by 28%.",
-        ),
-    ));
-    let _ = writeln!(s, "loc_method = \"{LOC_METHOD}\"");
-    let _ = writeln!(s, "graph_method = \"{GRAPH_METHOD}\"");
-    s.push_str(&comment(
-        "# ",
-        "# ",
-        "The measurement matrix: resolution needs no toolchain, so every cell is mandatory and \
-         offline. A cell that cannot resolve is named and skipped, never passed.",
-    ));
-    s.push_str("cells = [\n");
-    for c in crate::resolve::default_cells() {
-        let _ = writeln!(
-            s,
-            "    {{ name = \"{}\", triple = \"{}\", package = \"{}\" }},",
-            c.name, c.triple, c.package
-        );
-    }
-    s.push_str("]\n");
-
-    for p in &patches {
-        if !p.is_live() {
-            return Err(drift_message(p));
-        }
-        let (mode, namespace, note) = census_classification(&p.name, &p.path)?;
-        let notice = apache_notice_binds(&p.license);
-
-        let _ = writeln!(
-            s,
-            "\n# --- {} {} {}",
-            p.name,
-            p.manifest_version,
-            "-".repeat(72usize.saturating_sub(p.name.len() + p.manifest_version.len()))
-        );
-        s.push_str(&comment("# census review: ", "#   ", note));
-        if notice {
-            s.push_str(&comment(
-                "# LICENSE: ",
-                "#   ",
-                &format!(
-                    "{} — no non-Apache option, so Apache-2.0 §4(b) binds: every file aterm \
-                     modified must carry a prominent notice stating that it changed it. \
-                     apache_notice = true is the assertion; `cargo forge attest` is what \
-                     checks the notices are actually there.",
-                    p.license
-                ),
-            ));
-        } else if p.license.to_ascii_uppercase().contains("APACHE-2.0") {
-            s.push_str(&comment(
-                "# LICENSE: ",
-                "#   ",
-                &format!(
-                    "{} — dual-licensed, so a copy distributed under the non-Apache option \
-                     carries no §4(b) modification-notice obligation. Set apache_notice = \
-                     true here the day that election changes.",
-                    p.license
-                ),
-            ));
-        } else {
-            s.push_str(&comment(
-                "# LICENSE: ",
-                "#   ",
-                &format!(
-                    "{} — no Apache-2.0 term applies, so there is no §4(b) \
-                     modification-notice obligation. The retained LICENSE file and the \
-                     copyright notice still are obligations; `cargo forge attest` checks \
-                     those.",
-                    p.license
-                ),
-            ));
-        }
-        if !p.shadowed_by.is_empty() {
-            s.push_str(&comment(
-                "# PATCH LIVENESS: ",
-                "#   ",
-                &format!(
-                    "the fork is live at {}, but the lock ALSO carries registry {} {} — the \
-                     fix is not everywhere the name is. Anything resolving that other major \
-                     runs unpatched.",
-                    p.manifest_version,
-                    p.name,
-                    p.shadowed_by.join(", ")
-                ),
-            ));
-        }
-        s.push_str("[[fork]]\n");
-        let _ = writeln!(s, "name = \"{}\"", p.name);
-        let _ = writeln!(s, "version = \"{}\"", p.manifest_version);
-        let _ = writeln!(s, "path = \"{}\"", p.path);
-        let _ = writeln!(s, "license = \"{}\"", p.license);
-        let _ = writeln!(s, "apache_notice = {notice}");
-        let _ = writeln!(s, "census.mode = \"{}\"", mode.as_str());
-        if let Some(ns) = namespace {
-            let _ = writeln!(s, "census.namespace = \"{ns}\"");
-        }
-    }
-    Ok(s)
-}
-
-/// `true` when the license expression leaves no non-Apache option, so the
-/// Apache-2.0 §4(b) modification-notice obligation binds every changed file.
-/// A dual `MIT OR Apache-2.0` fork can be distributed under MIT, which carries
-/// no such clause.
-fn apache_notice_binds(license: &str) -> bool {
-    let l = license.to_ascii_uppercase();
-    l.contains("APACHE-2.0") && !l.contains("MIT") && !l.contains("BSD") && !l.contains("ZLIB")
-}
-
-fn drift_message(p: &PatchEntry) -> String {
-    match &p.lock_version {
-        None => format!(
-            "`[patch.crates-io] {name}` is NOT in effect: Cargo.lock has no path copy of \
-             `{name}` at all, so every dependent resolves the registry crate and the vendored \
-             fix in `{path}` compiles into nothing. Fix: run `cargo update -p {name}` (or \
-             `cargo metadata --offline`) to re-resolve, and if the lock still refuses, the \
-             vendored version {ver} no longer satisfies the requirement the graph asks for — \
-             set `{path}/Cargo.toml` back to the version upstream published",
-            name = p.name,
-            path = p.path,
-            ver = p.manifest_version
-        ),
-        Some(lock) => format!(
-            "`[patch.crates-io] {name}` has DRIFTED: `{path}/Cargo.toml` says version = \
-             \"{ver}\" but Cargo.lock resolved the patched `{name}` at \"{lock}\". One of the \
-             two is stale, and a drift here silently un-uses the patch. Fix: set the vendored \
-             version back to \"{lock}\", or run `cargo update -p {name}` to re-resolve the \
-             lock against \"{ver}\"",
-            name = p.name,
-            path = p.path,
-            ver = p.manifest_version,
-            lock = lock
-        ),
-    }
-}
-
-/// The census's classification of one vendored crate, read from
-/// [`REVIEWED_VENDORED_CRATES`] rather than restated — one definition of the
-/// vendor registry, fail-closed both ways exactly as the census is.
-fn census_classification(
-    name: &str,
-    path: &str,
-) -> Result<(CensusMode, Option<&'static str>, &'static str), String> {
-    let Some(v) = REVIEWED_VENDORED_CRATES.iter().find(|v| v.package == name) else {
-        return Err(format!(
-            "`{name}` is patched in from `{path}` but is NOT registered in \
-             aterm_census::scan_set::REVIEWED_VENDORED_CRATES — an unreviewed vendored crate \
-             is a hard error there and here. Review it and add a VendoredCrate entry (mode \
-             Scanned with a namespace if it links into the GUI process, BuildDepOnly with a \
-             written justification if it only runs inside a build script)"
-        ));
-    };
-    if v.path != path {
-        return Err(format!(
-            "`{name}` is patched in from `{path}` but REVIEWED_VENDORED_CRATES registers it \
-             at `{}` — a stale review. Update the registry entry's `path`",
-            v.path
-        ));
-    }
-    Ok(match &v.mode {
-        VendoredMode::Scanned {
-            namespace, audit, ..
-        } => (CensusMode::Scanned, Some(namespace), *audit),
-        VendoredMode::BuildDepOnly { justification } => {
-            (CensusMode::BuildDepOnly, None, *justification)
-        }
-    })
-}
-
-/// Word-wrap `text` into `#` comment lines: `first` opens the block, `cont`
-/// opens every continuation line.
-fn comment(first: &str, cont: &str, text: &str) -> String {
-    let mut out = String::new();
-    let mut line = String::from(first);
-    let mut any = false;
-    for word in text.split_whitespace() {
-        if any && line.chars().count() + 1 + word.chars().count() > WRAP {
-            out.push_str(line.trim_end());
-            out.push('\n');
-            line = String::from(cont);
-            any = false;
-        }
-        if any {
-            line.push(' ');
-        }
-        line.push_str(word);
-        any = true;
-    }
-    if any {
-        out.push_str(line.trim_end());
-        out.push('\n');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,36 +749,32 @@ census.mode = "build-dep-only"
 "#;
 
     #[test]
-    fn round_trip_is_byte_identical_including_every_comment() {
-        let p = parse(SAMPLE).expect("sample parses");
-        let back = p.render().expect("a parsed policy renders");
-        assert_eq!(
-            back, SAMPLE,
-            "the document round-trip must not move a single byte"
-        );
-        assert!(back.contains("THIS PARAGRAPH is why the fork exists"));
-    }
-
-    #[test]
     fn a_missing_file_is_an_empty_policy_not_an_error() {
         let p = load(std::path::Path::new("/nonexistent/aterm-forge-test-root"))
             .expect("an absent ledger is not an error");
         assert!(p.forks.is_empty());
-        assert!(p.is_absent());
-        assert!(p.render().is_none());
+        assert!(p.forge.cells.is_empty());
     }
 
     #[test]
     fn forks_are_modeled_including_census_and_notice() {
         let p = parse(SAMPLE).unwrap();
         assert_eq!(p.forks.len(), 2);
-        let winit = p.fork("winit").expect("winit block");
+        let winit = p
+            .forks
+            .iter()
+            .find(|f| f.name == "winit")
+            .expect("winit block");
         assert_eq!(winit.version, "0.30.13");
         assert_eq!(winit.license, "Apache-2.0");
         assert!(winit.apache_notice);
         assert_eq!(winit.census_mode, CensusMode::Scanned);
         assert_eq!(winit.census_namespace.as_deref(), Some("winit"));
-        let pc = p.fork("pkg-config").expect("pkg-config block");
+        let pc = p
+            .forks
+            .iter()
+            .find(|f| f.name == "pkg-config")
+            .expect("pkg-config block");
         assert!(!pc.apache_notice, "apache_notice defaults to false");
         assert_eq!(pc.census_mode, CensusMode::BuildDepOnly);
         assert_eq!(pc.census_namespace, None);
@@ -1183,15 +840,6 @@ census.mode = "build-dep-only"
         );
         let e = parse(&dup).unwrap_err();
         assert!(e.contains("winit"), "{e}");
-    }
-
-    #[test]
-    fn apache_notice_binds_only_without_a_permissive_option() {
-        assert!(apache_notice_binds("Apache-2.0"));
-        assert!(apache_notice_binds("Apache-2.0 WITH LLVM-exception"));
-        assert!(!apache_notice_binds("MIT OR Apache-2.0"));
-        assert!(!apache_notice_binds("Apache-2.0 OR MIT"));
-        assert!(!apache_notice_binds("MIT"));
     }
 
     // --- tests that walk the REAL tree (the house norm) ---------------------
@@ -1372,54 +1020,5 @@ census.mode = "build-dep-only"
             forks, 1,
             "the vendored winit is a path package with no source/checksum"
         );
-    }
-
-    #[test]
-    fn the_seed_body_parses_back_as_a_policy_over_the_real_tree() {
-        let root = repo_root();
-        let body = seed_from_vendor(&root).expect("the real tree seeds");
-        let p = parse(&body).expect("the emitted body is a valid ledger");
-        // FIVE, not ten: the five first-party targets are deliberately not
-        // seeded. The ledger parser refuses a `path` outside `vendor/`, so a
-        // seeder that emitted one would write a file its own reader rejects —
-        // which is exactly how this landed before the partition.
-        assert_eq!(p.forks.len(), 5);
-        for name in ["tracing", "profiling", "cfg-if", "arrayvec", "log"] {
-            assert!(
-                p.forks.iter().all(|f| f.name != name),
-                "a first-party replacement is not a vendored fork: {name}"
-            );
-        }
-        assert!(body.contains("NOT RECORDED HERE"), "{body}");
-        // Named INDIVIDUALLY, not counted: the failure this guards against is a
-        // seeder that omits one silently, and a length check would pass while
-        // the omitted crate's patch entry went unrecorded and unexplained.
-        for path in [
-            "crates/aterm-tracing",
-            "crates/aterm-profiling",
-            "crates/aterm-cfg-if",
-            "crates/aterm-arrayvec",
-            "crates/aterm-log-shim",
-        ] {
-            assert!(
-                body.contains(path),
-                "the seed must SAY which patch entries it left out, and why; \
-                 `{path}` is missing:\n{body}"
-            );
-        }
-        let winit = p.fork("winit").expect("winit");
-        assert!(winit.apache_notice, "winit is Apache-2.0 only");
-        assert_eq!(winit.census_namespace.as_deref(), Some("winit"));
-        let pc = p.fork("pkg-config").expect("pkg-config");
-        assert_eq!(pc.census_mode, CensusMode::BuildDepOnly);
-        assert!(!pc.apache_notice, "pkg-config is dual MIT OR Apache-2.0");
-        // The seed carries the census's own review notes as comments.
-        assert!(body.contains("# census review:"), "{body}");
-        assert!(
-            !body.contains("PATCH LIVENESS"),
-            "no fork is shadowed today, so the seed must not claim one is:\n{body}"
-        );
-        // And the round-trip of the emitted body is byte-identical too.
-        assert_eq!(p.render().unwrap(), body);
     }
 }

@@ -67,7 +67,6 @@
 //! // tree, and every `ty_model!`-authored one). The interpreter always runs, so
 //! // coverage is unconditional and the returned [`Covered`] is a log line, not
 //! // a decision:
-//! aterm_spec::verify::check_scalar(&m, "Thing Tier-0");
 //! aterm_spec::verify::prove_and_catch_scalar(&m, "Thing non-vacuity");
 //!
 //! // FUNCTION-VALUED derived model — the interpreter cannot evaluate it, so
@@ -81,8 +80,8 @@
 //! let Some(ty) = aterm_spec::verify::ty_escalation("Thing .tla check") else { return };
 //! ```
 //!
-//! The LEGACY hard-require forms ([`ty`], [`trust_ir`], [`ay`]) still exist for
-//! gates that must never run tool-less (none in-tree today outside migration).
+//! The LEGACY hard-require form [`ay`] still exists for a gate that must never
+//! run tool-less (the `ay` certificate test is the one in-tree caller).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -759,33 +758,9 @@ const PENDING_STUB_HEAD: u64 = 256;
 /// The self-identifying line atpkg writes into every pending-program stub.
 const PENDING_STUB_MARKER: &[u8] = b"atpkg pending-program stub";
 
-/// Locate the Trust `ty` model-checker for `label`, or PANIC with the install hint.
-/// Verification is ALWAYS required — no env var, no skip. A conformance test that
-/// cannot reach `ty` FAILS rather than reporting a false `ok`.
-#[must_use]
-pub fn ty(label: &str) -> PathBuf {
-    require(
-        "ty",
-        "aterm pkg install ty   (or `aterm pkg install --default-set`)",
-        find_ty(),
-        label,
-    )
-}
-
-/// Locate the Trust `trust-ir` `spec-link` tool for `label`, or PANIC with a build
-/// hint. Always required — see [`ty`].
-#[must_use]
-pub fn trust_ir(label: &str) -> PathBuf {
-    require(
-        "trust-ir",
-        "aterm pkg install trust-ir   (or `aterm pkg install --default-set`)",
-        find_trust_ir(),
-        label,
-    )
-}
-
-/// Locate the Trust `ay` solver for `label`, or PANIC with a build hint.
-/// Always required — see [`ty`] (the same fail-closed gate, no skip path).
+/// Locate the Trust `ay` solver for `label`, or PANIC with the install hint.
+/// Verification is ALWAYS required — no env var, no skip. A test that cannot
+/// reach `ay` FAILS rather than reporting a false `ok`.
 #[must_use]
 pub fn ay(label: &str) -> PathBuf {
     require(
@@ -1295,8 +1270,9 @@ fn assert_same_space_explored(m: &Model, interp_states: usize, evidence: &str, l
 /// (panics on failure or on tier disagreement). Function-valued models skip
 /// the interpreter (inapplicable by construction) and REQUIRE the `ty` tier;
 /// with no `ty` they report [`NotRun`] loudly AND return it, so the caller has
-/// to state a policy. Scalar callers want [`check_scalar`], which discharges
-/// that obligation once rather than at every site.
+/// to state a policy. A scalar model never reports [`NotRun`] (the interpreter
+/// always runs), which [`prove_and_catch_scalar`] asserts once rather than at
+/// every site.
 // Skip: a tiered verification DRIVER — shells out to `ty`, renders output,
 // and its asserts are deliberate harness aborts. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1364,8 +1340,8 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
 /// invariant at `Buggy=0` and finds a counterexample at `Buggy=1` (panics
 /// otherwise), and `ty` additionally does the same wherever installed (panics
 /// on failure or tier disagreement). Function-valued models (`fn_vars`
-/// non-empty: EvictFull, TierResidency, Recording, Coalesce — the only four in
-/// tree) skip the interpreter (inapplicable by construction) and REQUIRE the
+/// non-empty: EvictFull, TierResidency, Recording — the only three in tree)
+/// skip the interpreter (inapplicable by construction) and REQUIRE the
 /// `ty` tier; with no `ty` they report [`NotRun`] loudly AND return it. Scalar
 /// callers want [`prove_and_catch_scalar`].
 // Skip: same tiered-driver class as `check_model_tiered`.
@@ -1449,32 +1425,16 @@ pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun>
     }
 }
 
-/// Discharge a SCALAR model's Tier-0 obligation, asserting the scalar shape that
+/// Prove-and-catch a SCALAR model's obligation, asserting the scalar shape that
 /// makes the `_tiered` form's `Err` half unreachable: the interpreter runs for
 /// every model with no `fn_vars`, so coverage is unconditional and the returned
-/// [`Covered`] is a log line rather than a decision.
-///
-/// This states, ONCE, the assertion the ~21 scalar call sites used to make
-/// implicitly by dropping the old `Discharge` with a bare statement — the same
-/// guard [`deadlock_free_and_catches_tiered`] already writes out. Asserting the
-/// shape up front rather than unwrapping the result is what makes it
-/// machine-independent: a model that later grows an `fn_vars` entry fails here
-/// on every machine, instead of passing on developer boxes that happen to have
-/// `ty` installed and failing only on a fresh clone.
-// Skip: thin policy wrapper over `check_model_tiered` (same verification-tooling
-// tier); its assert is a deliberate harness abort.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn check_scalar(m: &Model, label: &str) -> Covered {
-    assert_scalar(m, label, "check_scalar");
-    match check_model_tiered(m, label) {
-        Ok(c) => c,
-        Err(n) => unreachable!("{label}: scalar model {} reported {n:?}", m.name),
-    }
-}
-
-/// Prove-and-catch a SCALAR model's obligation. See [`check_scalar`] for why the
-/// scalar shape is asserted rather than the result unwrapped.
-// Skip: same thin-policy-wrapper class as `check_scalar`.
+/// [`Covered`] is a log line rather than a decision. Asserting the shape up
+/// front rather than unwrapping the result is what makes it machine-independent:
+/// a model that later grows an `fn_vars` entry fails here on every machine,
+/// instead of passing on developer boxes that happen to have `ty` installed and
+/// failing only on a fresh clone.
+// Skip: thin policy wrapper over `prove_and_catch_tiered` (same
+// verification-tooling tier); its assert is a deliberate harness abort.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn prove_and_catch_scalar(m: &Model, label: &str) -> Covered {
     assert_scalar(m, label, "prove_and_catch_scalar");
@@ -2642,7 +2602,7 @@ mod tests {
     }
 
     /// A SCALAR model can never report [`NotRun`] — that is the fact
-    /// [`check_scalar`]/[`prove_and_catch_scalar`] convert into an unconditional
+    /// [`prove_and_catch_scalar`] converts into an unconditional
     /// `Covered`, and the reason ~21 call sites are allowed to ignore the
     /// toolchain's presence. Pinned here rather than reasoned about: if the
     /// interpreter tier ever grew a bail-out, this goes red instead of those
@@ -2658,7 +2618,7 @@ mod tests {
         );
     }
 
-    /// The four committed-dead `ConfigCatalogSnapshot` mutants are verified
+    /// The five committed-dead `ConfigCatalogSnapshot` mutants are verified
     /// negative controls: dial present, fire at Buggy=1, caught at Buggy=1.
     #[test]
     fn audit_accepts_config_catalog_snapshot_mutants() {
@@ -2671,9 +2631,10 @@ mod tests {
                     "AdmitStaleKitty",
                     "AdmitStaleTheme",
                     "AdmitStaleSparkle",
+                    "PublishLiveUnadmitted",
                 ],
             ),
-            Ok(4)
+            Ok(5)
         );
     }
 
@@ -2728,6 +2689,7 @@ mod tests {
                 "AdmitStaleKitty",
                 "AdmitStaleTheme",
                 "AdmitStaleSparkle",
+                "PublishLiveUnadmitted",
             ],
         );
         assert!(

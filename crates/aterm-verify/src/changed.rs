@@ -4,9 +4,10 @@
 //! CHANGE-SCOPED SELECTION (`--changed`): the missing middle between a bare
 //! `targo check` and a whole-tree run.
 //!
-//! A PRE-FLIGHT, NEVER AN ADMISSION. `.githooks/pre-push` checks a receipt
-//! ([`crate::receipt`]) and admits only a whole-tree run's, because the cone
-//! below is not everything a change can break: a crate's TESTS read files no
+//! A PRE-FLIGHT, NEVER AN ADMISSION. Only a whole-tree run's receipt
+//! ([`crate::receipt`]) says `merge-contract yes` — the one the release
+//! cutter's receipt report counts as gated — because the cone below is not
+//! everything a change can break: a crate's TESTS read files no
 //! dependency edge names. `aterm-census` reads `aterm-gui`'s `app_render.rs`,
 //! `aterm-release` reads `tools/` and `CHANGELOG.md`, `atpkg-keys` reads
 //! `tools/atpkg-index.sh`; a lexical scan on 2026-09-23 found 56 of the 93
@@ -81,11 +82,6 @@ impl Members {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.0.iter().any(|m| m.name == name)
     }
 
     #[must_use]
@@ -667,7 +663,7 @@ mod tests {
             "tools/grep_guard.sh",
             "scripts/verify-kani-proofs.sh",
             "README.md",
-            ".githooks/pre-push",
+            ".gitignore",
         ] {
             assert_eq!(owning_member(p, &mf, &names), None, "{p} owned nothing");
         }

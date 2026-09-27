@@ -468,17 +468,6 @@ impl<T, const N: usize> ArrayVec<T, N> {
         self.len = final_len;
     }
 
-    /// Set the length without dropping or initializing elements.
-    ///
-    /// # Safety
-    ///
-    /// `len` must be `<= N` and the first `len` slots must be initialized.
-    /// This is upstream `arrayvec`'s `set_len` signature and contract.
-    pub const unsafe fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= N, "ArrayVec::set_len past capacity");
-        self.len = len;
-    }
-
     /// Append every element of `other`, cloning each.
     ///
     /// A deliberate SUPERSET: upstream `arrayvec` keeps its `extend_from_slice`
@@ -749,6 +738,7 @@ impl<T> fmt::Debug for CapacityError<T> {
 // program that compiled against upstream's still compiles; programs that would
 // have failed under `default-features = false` now succeed. The `T: Any` bound
 // is upstream's, kept so the two impls select identically.
+
 impl<T: core::any::Any> core::error::Error for CapacityError<T> {}
 
 // ── Hash ────────────────────────────────────────────────────────────────────
@@ -855,11 +845,6 @@ impl<T, const N: usize> IntoIter<T, N> {
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
         self.vec.as_slice()
-    }
-
-    /// The not-yet-yielded elements, in order, mutably.
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
-        self.vec.as_mut_slice()
     }
 }
 
@@ -1001,7 +986,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
-        struct Tracked(#[allow(dead_code)] i32);
+        struct Tracked(i32);
 
         impl Drop for Tracked {
             fn drop(&mut self) {
@@ -1020,8 +1005,10 @@ mod tests {
             av.push(Tracked(5));
 
             let mut call_count = 0;
-            av.retain(|_| {
+            av.retain(|t| {
                 call_count += 1;
+                // Visited in order, each element intact when the predicate sees it.
+                assert_eq!(t.0, call_count);
                 if call_count == 3 {
                     panic!("predicate panic");
                 }

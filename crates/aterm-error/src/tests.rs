@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for aterm-error: derive macro + Context trait + ad-hoc macros.
+//! Tests for aterm-error's derive macro.
 
-use crate::{Context, Error};
+use crate::Error;
 
 // ── Derive macro tests ──────────────────────────────────────────────────────
 
@@ -54,7 +54,6 @@ enum IoWrapperError {
     Io(#[from] std::io::Error),
 
     #[error("other: {0}")]
-    #[allow(dead_code)]
     Other(String),
 }
 
@@ -63,6 +62,11 @@ fn test_derive_from_impl() {
     let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
     let wrapped: IoWrapperError = io_err.into();
     assert_eq!(wrapped.to_string(), "I/O error: gone");
+    assert_eq!(
+        IoWrapperError::Other("x".into()).to_string(),
+        "other: x",
+        "a variant without #[from] still gets its own Display arm"
+    );
 }
 
 #[test]
@@ -122,50 +126,6 @@ fn test_derive_transparent_source_delegates() {
     assert!(source.is_some());
 }
 
-// ── Context trait tests ─────────────────────────────────────────────────────
-
-#[test]
-fn test_context_result_ok_passes_through() {
-    let result: Result<i32, std::io::Error> = Ok(42);
-    let contextualized = result.context("should not fail");
-    assert_eq!(contextualized.unwrap(), 42);
-}
-
-#[test]
-fn test_context_result_err_wraps() {
-    let result: Result<i32, std::io::Error> =
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
-    let err = result.context("failed to read config").unwrap_err();
-    assert_eq!(err.to_string(), "failed to read config");
-    // The original error is the source
-    let source = std::error::Error::source(&*err).unwrap();
-    assert_eq!(source.to_string(), "missing");
-}
-
-#[test]
-fn test_with_context_lazy_evaluation() {
-    let result: Result<i32, std::io::Error> = Err(std::io::Error::other("fail"));
-    let err = result
-        .with_context(|| format!("context for {}", "test"))
-        .unwrap_err();
-    assert_eq!(err.to_string(), "context for test");
-}
-
-#[test]
-fn test_context_option_some_passes_through() {
-    let opt: Option<i32> = Some(99);
-    let result = opt.context("should have value");
-    assert_eq!(result.unwrap(), 99);
-}
-
-#[test]
-fn test_context_option_none_produces_error() {
-    let opt: Option<i32> = None;
-    let err = opt.context("missing value").unwrap_err();
-    assert_eq!(err.to_string(), "missing value");
-    assert!(std::error::Error::source(&*err).is_none());
-}
-
 // ── Clone/PartialEq derive combinations ─────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -174,7 +134,6 @@ enum CloneableError {
     Code(u32),
 
     #[error("message: {0}")]
-    #[allow(dead_code)]
     Message(String),
 }
 
@@ -184,6 +143,9 @@ fn test_derive_with_clone_and_eq() {
     let cloned = err.clone();
     assert_eq!(err, cloned);
     assert_eq!(cloned.to_string(), "code 404");
+    let message = CloneableError::Message("gone".into());
+    assert_ne!(err, message);
+    assert_eq!(message.clone().to_string(), "message: gone");
 }
 
 // ── Debug format in error messages ──────────────────────────────────────────
@@ -271,60 +233,4 @@ fn test_derive_struct_transparent() {
     let err: WrappedIoError = io_err.into();
     assert_eq!(err.to_string(), "boom");
     assert!(std::error::Error::source(&err).is_some());
-}
-
-// ── Ad-hoc error macro tests ────────────────────────────────────────────────
-
-#[test]
-fn test_err_macro_creates_error() {
-    let e = err!("port {} is invalid", 0);
-    assert_eq!(e.to_string(), "port 0 is invalid");
-}
-
-#[test]
-fn test_bail_macro_returns_early() {
-    fn might_fail(ok: bool) -> crate::Result<()> {
-        if !ok {
-            bail!("something went wrong");
-        }
-        Ok(())
-    }
-    assert!(might_fail(true).is_ok());
-    let err = might_fail(false).unwrap_err();
-    assert_eq!(err.to_string(), "something went wrong");
-}
-
-#[test]
-fn test_ensure_macro_passes_when_true() {
-    fn check(n: i32) -> crate::Result<()> {
-        ensure!(n > 0, "n must be positive, got {}", n);
-        Ok(())
-    }
-    assert!(check(1).is_ok());
-    let err = check(-1).unwrap_err();
-    assert_eq!(err.to_string(), "n must be positive, got -1");
-}
-
-#[test]
-fn test_result_type_alias() {
-    fn parse_port(s: &str) -> crate::Result<u16> {
-        let port: u16 = s
-            .parse()
-            .map_err(|e: std::num::ParseIntError| err!("{e}"))?;
-        ensure!(port > 0, "port must be nonzero");
-        Ok(port)
-    }
-    assert_eq!(parse_port("8080").unwrap(), 8080);
-    assert!(parse_port("abc").is_err());
-    assert!(parse_port("0").is_err());
-}
-
-#[test]
-fn test_context_with_box_error_result() {
-    fn inner() -> crate::Result<i32> {
-        let result: Result<i32, std::io::Error> = Err(std::io::Error::other("disk full"));
-        result.context("backup failed")
-    }
-    let err = inner().unwrap_err();
-    assert_eq!(err.to_string(), "backup failed");
 }

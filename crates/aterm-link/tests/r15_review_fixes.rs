@@ -402,7 +402,7 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
 }
 
 /// X3. A REPLY ADDRESSED TO SOMEBODY ELSE DOES NOT CANCEL MY `expired`. A asks
-/// B twice with `dl=4000`; B answers X — to C. Y (no reply anywhere) is the
+/// B twice with `dl=10000`; B answers X — to C. Y (no reply anywhere) is the
 /// control that proves the sweep ran.
 #[test]
 fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
@@ -422,16 +422,21 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     let expired_lane = format!("/f/{FLEET}/in/{}/{a}/{}/expired", w.node, w.node);
     let a_lane = format!("/f/{FLEET}/in/{}/{a}/>", w.node);
 
+    // The deadline is 10 s, and the scenario must land inside it: two asks, a
+    // misrouted answer and its delivery through the bridge and broker, each
+    // post waiting on the bus ack. At 4 s against a 3.5 s precondition that
+    // was a race the bridge and broker could lose under a loaded gate, failing
+    // the test on a correct tree (the load-sensitive test audit of 2026-09-27).
     let t0 = Instant::now();
     let x = off_of(
         w.verb(&format!(
-            "@{a} post to=@{b} kind=ask dl=4000 --wait=30000 q-x"
+            "@{a} post to=@{b} kind=ask dl=10000 --wait=30000 q-x"
         ))
         .header(),
     );
     let y = off_of(
         w.verb(&format!(
-            "@{a} post to=@{b} kind=ask dl=4000 --wait=30000 q-y"
+            "@{a} post to=@{b} kind=ask dl=10000 --wait=30000 q-y"
         ))
         .header(),
     );
@@ -448,7 +453,7 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     });
     let delivered_at = t0.elapsed();
     assert!(
-        delivered_at < Duration::from_millis(3_500),
+        delivered_at < Duration::from_millis(9_500),
         "must land before X's deadline: {delivered_at:?}"
     );
     until_within(PERIODIC_DEADLINE, "expired re=Y on A's lane", || {

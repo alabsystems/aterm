@@ -29,16 +29,17 @@ use crate::{
 };
 
 /// The `messages` verb's usage line.
-pub const READ_USAGE: &str = "usage: messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]";
+pub(crate) const READ_USAGE: &str =
+    "usage: messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]";
 /// The `notice post` usage line.
-pub const POST_USAGE: &str =
+pub(crate) const POST_USAGE: &str =
     "usage: notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..3600>] <title>[ -- <detail>]";
 /// The longest `hold=` a wire post may ask for, in seconds.
-pub const MAX_WIRE_HOLD_SECS: u32 = 3600;
+pub(crate) const MAX_WIRE_HOLD_SECS: u32 = 3600;
 /// The most detail bytes a wire post carries.
-pub const WIRE_DETAIL_BYTES: usize = 2048;
+pub(crate) const WIRE_DETAIL_BYTES: usize = 2048;
 /// The default page of a `messages` read.
-pub const DEFAULT_READ_N: usize = 64;
+pub(crate) const DEFAULT_READ_N: usize = 64;
 
 /// `messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]`.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -61,7 +62,7 @@ impl ReadQuery {
     /// [`LOG_CAP`] (everything above the id), and without it
     /// [`DEFAULT_READ_N`].
     #[must_use]
-    pub fn page(&self) -> usize {
+    pub(crate) fn page(&self) -> usize {
         self.n.unwrap_or(if self.since.is_some() {
             LOG_CAP
         } else {
@@ -75,7 +76,7 @@ impl ReadQuery {
     /// skips a record, however many arrived between two reads (design
     /// ruling 198 — the `exits since=` idiom).
     #[must_use]
-    pub fn select<'a>(&self, log: &'a MessageLog) -> Vec<&'a LogRecord> {
+    pub(crate) fn select<'a>(&self, log: &'a MessageLog) -> Vec<&'a LogRecord> {
         let picked = log
             .records()
             .filter(|r| self.since.is_none_or(|s| r.id > s))
@@ -170,7 +171,7 @@ pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
 /// the row SHOWS its load words; no ETA, elapsed or frame state ever reaches
 /// the line — motion is the glass's (design ruling 175).
 #[must_use]
-pub fn message_row(
+pub(crate) fn message_row(
     rec: &LogRecord,
     live: Option<&Live>,
     glass_row: Option<usize>,
@@ -182,7 +183,14 @@ pub fn message_row(
         Some(l) => (&l.msg.title, &l.msg.detail, &l.msg.actions, l.repeats),
         None => (&rec.title, &rec.detail, &rec.actions, rec.repeats),
     };
-    let labels: Vec<&str> = actions.iter().map(Intent::label).collect();
+    // A retired record offers no intent whose moment passed (ruling 265, the
+    // page's rule; ruling 267 for the wire): `Stop paste` on a paste that
+    // finished is not an action anyone can take.
+    let labels: Vec<&str> = actions
+        .iter()
+        .filter(|intent| live.is_some() || !intent.ends_with_row())
+        .map(Intent::label)
+        .collect();
     let ago_ms = now_unix_ms.saturating_sub(rec.stamp.unix_ms);
     let mut row = format!(
         "message {} at={} ago_ms={ago_ms} tag={} sev={} origin={} state={state} glass={} rep={repeats} key={} title={} detail={} actions={}",
@@ -213,8 +221,13 @@ pub fn message_row(
             row.push_str(" level=");
             row.push_str(&progress_word(Some(fill)));
         } else if let Some(fill) = l.msg.meter.as_ref().and_then(|m| m.fill_permille) {
+            // The percent the band paints, floored (ruling 265): `11/40` is
+            // `27%` on the glass and `progress=27/100` here — never a
+            // rounded 28 beside it. `appstatus` keeps its nearest percent,
+            // the status bars' byte-identical grammar.
             row.push_str(" progress=");
-            row.push_str(&progress_word(Some(fill)));
+            row.push_str(&(fill.min(1000) / 10).to_string());
+            row.push_str("/100");
         } else if l.is_busy() {
             row.push_str(" busy=1");
         }
@@ -332,22 +345,24 @@ pub fn activity_rows_compat(
 // ---------------------------------------------------------------------------
 
 /// The `notice` verb's usage line: a missing or unknown sub-form.
-pub const NOTICE_USAGE: &str = "usage: notice <post|progress|done|dismiss|act> \u{2026}";
+pub(crate) const NOTICE_USAGE: &str = "usage: notice <post|progress|done|dismiss|act> \u{2026}";
 /// The `notice progress` usage line.
-pub const PROGRESS_USAGE: &str = "usage: notice progress <key> [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]";
+pub(crate) const PROGRESS_USAGE: &str = "usage: notice progress <key> [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]";
 /// The `notice done` usage line.
-pub const DONE_USAGE: &str = "usage: notice done <key> [ok|warn|withdraw] [<words>]";
+pub(crate) const DONE_USAGE: &str = "usage: notice done <key> [ok|warn|withdraw] [<words>]";
 /// The `notice dismiss` usage line.
-pub const DISMISS_USAGE: &str = "usage: notice dismiss <id>";
+pub(crate) const DISMISS_USAGE: &str = "usage: notice dismiss <id>";
 /// The `notice act` usage line.
-pub const ACT_USAGE: &str = "usage: notice act <id> <label|index|details>";
+pub(crate) const ACT_USAGE: &str = "usage: notice act <id> <label|index|details>";
 /// A key outside the wire's rule (design ruling 167).
-pub const KEY_REFUSAL: &str = "notice: keys are 1-40 of a-z 0-9 . _ - (they live as wire.<key>)";
+pub(crate) const KEY_REFUSAL: &str =
+    "notice: keys are 1-40 of a-z 0-9 . _ - (they live as wire.<key>)";
 /// A tag of aterm's own lanes (design ruling 171).
-pub const LANE_REFUSAL: &str = "notice: the toolchain, update and harness tags are aterm's own";
+pub(crate) const LANE_REFUSAL: &str =
+    "notice: the toolchain, update and harness tags are aterm's own";
 /// [`apply`] handed an `act`: a press is the HOST's to perform
 /// ([`press_target`], then its own press path).
-pub const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
+pub(crate) const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
 
 /// The tags `notice` refuses: `appstatus` is what aterm has been doing on its
 /// own initiative, so a script can never appear there as aterm's install or
@@ -355,20 +370,33 @@ pub const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
 const LANE_TAGS: [&str; 3] = ["toolchain", "update", "harness"];
 
 /// The refusal for a glass title fault: `notice: <fault>`, one static string
-/// per fault [`glass_title_fault`] names.
-fn title_refusal(fault: &'static str) -> &'static str {
-    match fault {
-        "a glass title over six words" => "notice: a glass title over six words",
-        "a glass title over 48 characters" => "notice: a glass title over 48 characters",
-        "a clause in a glass title" => "notice: a clause in a glass title",
-        "a sentence for a glass title" => "notice: a sentence for a glass title",
-        _ => "notice: a glass title out of form",
+/// per fault [`glass_title_fault`] names, in the script author's words: what
+/// is wrong with the title and where the rest goes (` -- `), never the band's
+/// internal name (audit 2026-09-24, design ruling 213).
+fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
+    match (fault, tail) {
+        ("a glass title over six words", true) => {
+            "notice: title over 6 words; put the rest after --"
+        }
+        ("a glass title over six words", false) => "notice: title over 6 words",
+        ("a glass title over 48 characters", true) => {
+            "notice: title over 48 characters; put the rest after --"
+        }
+        ("a glass title over 48 characters", false) => "notice: title over 48 characters",
+        ("a clause in a glass title", true) => {
+            "notice: title has a clause (\u{2014}, ;, :); put it after --"
+        }
+        ("a clause in a glass title", false) => "notice: title has a clause (\u{2014}, ;, :)",
+        ("a sentence for a glass title", _) => "notice: title ends with a period",
+        _ => "notice: title out of form",
     }
 }
 
-/// `Err(refusal)` when `title` may not stand on the glass.
-fn title_form(title: &str) -> Result<(), &'static str> {
-    glass_title_fault(title).map_or(Ok(()), |f| Err(title_refusal(f)))
+/// `Err(refusal)` when `title` may not stand on the glass. `tail`: the verb
+/// takes ` -- <more>` after its title (`post`, `progress`), so the refusal
+/// says where the rest goes; `done`'s words take none.
+fn title_form(title: &str, tail: bool) -> Result<(), &'static str> {
+    glass_title_fault(title).map_or(Ok(()), |f| Err(title_refusal(f, tail)))
 }
 
 /// The key rule: `[a-z0-9._-]{1,40}`, stored as `wire.<key>`.
@@ -503,7 +531,7 @@ impl PostRequest {
             return Err(POST_USAGE);
         }
         if severity >= Severity::Warn {
-            title_form(&title)?;
+            title_form(&title, true)?;
         }
         let mut end = detail.len().min(WIRE_DETAIL_BYTES);
         while !detail.is_char_boundary(end) {
@@ -529,7 +557,7 @@ impl PostRequest {
     /// glass — the owner's *"'FYI CYA' bullshit messages need to go to the
     /// log and not interrupt the user"* (design ruling 163).
     #[must_use]
-    pub fn is_record(&self) -> bool {
+    pub(crate) fn is_record(&self) -> bool {
         self.severity <= Severity::Info
     }
 
@@ -538,7 +566,7 @@ impl PostRequest {
     /// is [`Hold::LogOnly`] whatever `hold=` said; a row holds
     /// [`Hold::Default`] or `For(hold=)`.
     #[must_use]
-    pub fn into_message(self) -> Message {
+    pub(crate) fn into_message(self) -> Message {
         let hold = if self.is_record() {
             Hold::LogOnly
         } else {
@@ -602,7 +630,7 @@ fn parse_done(v: &str) -> Option<(u64, u64)> {
 pub struct ProgressRequest {
     /// The FULL key, `wire.<key>`.
     pub key: String,
-    /// `system` by default; never aterm's own lanes.
+    /// `script` by default (ruling 265); never aterm's own lanes.
     pub tag: Tag,
     /// The fill, the amount, or busy.
     pub indicator: WireIndicator,
@@ -627,7 +655,7 @@ impl ProgressRequest {
             return Err(PROGRESS_USAGE);
         }
         let key = wire_key(key)?;
-        let mut tag = tags::SYSTEM;
+        let mut tag = tags::SCRIPT;
         let mut indicator = None;
         let mut unit = None;
         let mut load = None;
@@ -672,7 +700,7 @@ impl ProgressRequest {
         if title.is_empty() {
             return Err(PROGRESS_USAGE);
         }
-        title_form(&title)?;
+        title_form(&title, true)?;
         Ok(Self {
             key,
             tag,
@@ -689,8 +717,18 @@ impl ProgressRequest {
     #[must_use]
     pub fn meter(&self) -> Meter {
         let m = match self.indicator {
+            // A PERCENT IS AN AMOUNT TOO (design ruling 265): a thousand
+            // steps of the key's own series, so the estimator reads its rate
+            // and the row says how long is left, as `done=` does — `pct=`
+            // gave no time at all through a steady 20 s job.
             WireIndicator::Fill(p) => Meter {
                 fill_permille: Some(p),
+                amount: Some(Amount {
+                    series: Amount::series_of(&self.key),
+                    done: u64::from(p),
+                    total: 1000,
+                    unit: Unit::Steps,
+                }),
                 ..Meter::default()
             },
             WireIndicator::Amount { done, total, unit } => Meter {
@@ -719,7 +757,7 @@ impl ProgressRequest {
     /// `Hold::Live { STALE_WIRE }`, revealed only after [`PROGRESS_GRACE`]
     /// (a job done inside it never flashes), with its meter; no actions.
     #[must_use]
-    pub fn into_message(self) -> Message {
+    pub(crate) fn into_message(self) -> Message {
         let meter = self.meter();
         Message::new(self.tag, Severity::Info, self.title)
             .key(&self.key)
@@ -728,13 +766,18 @@ impl ProgressRequest {
                 stale_after: STALE_WIRE,
             })
             .reveal_after(PROGRESS_GRACE)
+            // A load on the first line is the row's DECLARATION (ruling
+            // 267): its slot is reserved at that load's words, not at the
+            // widest of all four, so `disk busy` shows wherever it fits.
+            // A different load later widens the slot once (ruling 221).
+            .loads(self.load)
             .meter(meter)
     }
 
     /// The in-place change a later line makes: the title and the meter,
     /// nothing else — tag, severity, hold and actions never.
     #[must_use]
-    pub fn restatement(&self) -> Restatement {
+    pub(crate) fn restatement(&self) -> Restatement {
         Restatement {
             title: Some(self.title.clone()),
             meter: Some(Some(self.meter())),
@@ -800,7 +843,7 @@ impl DoneRequest {
         };
         let words = clip(words.trim(), TITLE_CAP);
         if !words.is_empty() {
-            title_form(&words)?;
+            title_form(&words, false)?;
         }
         Ok(Self {
             key,
@@ -1268,14 +1311,27 @@ fn apply_done(
         return Applied::quiet("OK done=- how=gone".to_string());
     };
     if let Some(words) = d.words {
-        center.restate(
-            id,
-            Restatement {
-                title: Some(words),
+        // DELIVERED WORDS ARE THE FINISHED WORDS (design ruling 265): `done
+        // build ok Built aterm` declares how `Building aterm` ends, so its
+        // echo reads `✓ Built aterm` as every reporter's does (a re-title
+        // left `Built aterm` with no past tense to say, and its echo kept a
+        // `100%`), and its record is `Built aterm`. A failure's or a
+        // withdrawal's words re-title the row, as before, and are declared
+        // its finished words too: the script SAID how it ended, so its
+        // record keeps them (`Indexing skipped`), never
+        // `Indexing ended` / `Indexing stopped` over them (ruling 266).
+        let restatement = match d.how {
+            DoneHow::Ok => Restatement {
+                finished: Some(Some(words)),
                 ..Restatement::default()
             },
-            now,
-        );
+            DoneHow::Warn | DoneHow::Withdraw => Restatement {
+                title: Some(words.clone()),
+                finished: Some(Some(words)),
+                ..Restatement::default()
+            },
+        };
+        center.restate(id, restatement, now);
     }
     match d.how {
         DoneHow::Ok => center.resolve(id, Outcome::Ok, now),
@@ -1316,7 +1372,7 @@ fn apply_dismiss(
 /// actions.len()`, a FULL label equal to [`Intent::label`] (exact,
 /// case-sensitive), or `Details` → [`ActionIndex::DETAILS`].
 #[must_use]
-pub fn resolve_press(row: &Live, press: &Press) -> Option<ActionIndex> {
+pub(crate) fn resolve_press(row: &Live, press: &Press) -> Option<ActionIndex> {
     match press {
         Press::Index(i) => (usize::from(*i) < row.msg.actions.len()).then_some(ActionIndex(*i)),
         Press::Label(label) => row
@@ -1332,7 +1388,7 @@ pub fn resolve_press(row: &Live, press: &Press) -> Option<ActionIndex> {
 
 /// The press as the caller spelled it — for `no action <press>`.
 #[must_use]
-pub fn press_words(press: &Press) -> String {
+pub(crate) fn press_words(press: &Press) -> String {
     match press {
         Press::Index(i) => i.to_string(),
         Press::Label(label) => label.clone(),
@@ -1701,7 +1757,7 @@ mod tests {
         let rec = c.log().get(m.id).unwrap();
         let row = message_row(rec, c.live(m.id), None, 5_100, &pct_encode);
         assert!(
-            row.ends_with(" key=- title=Installing detail= actions=- progress=43/100"),
+            row.ends_with(" key=- title=Installing detail= actions=- progress=42/100"),
             "{row}"
         );
         assert!(row.contains(" state=live glass=- "), "{row}");
@@ -1897,7 +1953,7 @@ mod tests {
         };
         assert_eq!(
             (p.indicator, p.tag, p.load, p.stats.as_str()),
-            (WireIndicator::Busy, tags::SYSTEM, None, "")
+            (WireIndicator::Busy, tags::SCRIPT, None, "")
         );
         for (line, want) in [
             ("progress b busy Working", WireIndicator::Busy),
@@ -2049,7 +2105,13 @@ mod tests {
             "Build failed.",
         ] {
             let fault = glass_title_fault(title).unwrap();
-            assert_eq!(title_refusal(fault), format!("notice: {fault}"));
+            for tail in [true, false] {
+                let refusal = title_refusal(fault, tail);
+                assert_ne!(refusal, "notice: title out of form", "{fault}");
+                assert!(refusal.starts_with("notice: title "), "{refusal}");
+                assert!(!refusal.contains("glass"), "no band jargon: {refusal}");
+                assert_eq!(refusal.contains(" --"), tail && !title.ends_with('.'));
+            }
         }
     }
 
@@ -2177,31 +2239,31 @@ mod tests {
         for (line, want) in [
             (
                 "post system sev=warn one two three four five six seven",
-                "notice: a glass title over six words",
+                "notice: title over 6 words; put the rest after --",
             ),
             (
                 "post system sev=error Deploy failed: connection refused",
-                "notice: a clause in a glass title",
+                "notice: title has a clause (\u{2014}, ;, :); put it after --",
             ),
             (
                 "progress k Building the whole of the aterm workspace now",
-                "notice: a glass title over six words",
+                "notice: title over 6 words; put the rest after --",
             ),
             (
                 "progress k Supercalifragilisticexpialidocious-builds everywhere",
-                "notice: a glass title over 48 characters",
+                "notice: title over 48 characters; put the rest after --",
             ),
             (
                 "progress k Building aterm.",
-                "notice: a sentence for a glass title",
+                "notice: title ends with a period",
             ),
             (
                 "done k ok Built; shipped",
-                "notice: a clause in a glass title",
+                "notice: title has a clause (\u{2014}, ;, :)",
             ),
             (
                 "done k warn one two three four five six seven",
-                "notice: a glass title over six words",
+                "notice: title over 6 words",
             ),
         ] {
             assert_eq!(NoticeRequest::parse(line), Err(want), "{line}");
@@ -2252,11 +2314,11 @@ mod tests {
         // mark, tag character or noncharacter survives into a row.
         assert_eq!(
             NoticeRequest::parse("post system sev=warn Build:\u{2060} failed"),
-            Err("notice: a clause in a glass title")
+            Err("notice: title has a clause (\u{2014}, ;, :); put it after --")
         );
         assert_eq!(
             NoticeRequest::parse("post system sev=warn Build failed.\u{2060}"),
-            Err("notice: a sentence for a glass title")
+            Err("notice: title ends with a period")
         );
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
             "post system sev=warn De\u{061c}ploy\u{00ad} fa\u{e0041}il\u{fdd0}ed\u{ffff}\u{1fffe}\u{206a}\u{fff9}",
@@ -2286,7 +2348,7 @@ mod tests {
         assert_eq!(p.title, "Fetching sources");
         assert_eq!(
             NoticeRequest::parse("post system sev=warn one\ttwo\tthree\tfour\tfive\tsix\tseven"),
-            Err("notice: a glass title over six words"),
+            Err("notice: title over 6 words; put the rest after --"),
             "a tab is a word gap to the title form too"
         );
     }
@@ -2344,7 +2406,11 @@ mod tests {
         let id = id_of(&a);
         let row = c.live(id).unwrap();
         assert!(row.is_busy(), "no indicator word is busy");
-        assert_eq!(row.msg.tag, tags::SYSTEM);
+        assert_eq!(
+            row.msg.tag,
+            tags::SCRIPT,
+            "a script's row is not aterm's own system"
+        );
         assert_eq!(row.msg.origin, Origin::Wire);
         assert_eq!(row.msg.severity, Severity::Info);
         assert_eq!(
@@ -2365,7 +2431,7 @@ mod tests {
         assert_eq!((b.reply.as_str(), b.note), ("OK message=1", false));
         assert_eq!(c.log().len(), logged, "a restate logs nothing");
         let row = c.live(id).unwrap();
-        assert_eq!(row.msg.tag, tags::SYSTEM, "the tag is the first line's");
+        assert_eq!(row.msg.tag, tags::SCRIPT, "the tag is the first line's");
         let m = row.msg.meter.as_ref().unwrap();
         assert_eq!(
             (m.fill_permille, m.busy, m.stats.as_str()),
@@ -3113,10 +3179,10 @@ mod tests {
             rows,
             vec![
                 format!(
-                    "message {busy} at=1000 ago_ms=2000 tag=system sev=info origin=wire state=live glass=0 rep=1 key=wire.fetch title=Fetching%20the%20index detail= actions=- busy=1 load=network"
+                    "message {busy} at=1000 ago_ms=2000 tag=script sev=info origin=wire state=live glass=0 rep=1 key=wire.fetch title=Fetching%20the%20index detail= actions=- busy=1 load=network"
                 ),
                 format!(
-                    "message {fill} at=1000 ago_ms=2000 tag=system sev=info origin=wire state=live glass=1 rep=1 key=wire.build title=Building%20aterm detail= actions=- progress=43/100"
+                    "message {fill} at=1000 ago_ms=2000 tag=script sev=info origin=wire state=live glass=1 rep=1 key=wire.build title=Building%20aterm detail= actions=- progress=42/100"
                 ),
                 format!(
                     "message {rec} at=1000 ago_ms=2000 tag=fabric sev=info origin=wire state=recorded glass=- rep=1 key=- title=peer%20said%20hi detail=line actions=- since_ms=2000"

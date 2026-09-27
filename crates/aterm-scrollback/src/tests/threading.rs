@@ -17,7 +17,6 @@ mod sync_check {
     pub struct Probe<T>(pub std::marker::PhantomData<T>);
 
     impl<T: Sync> Probe<T> {
-        #[allow(dead_code)]
         pub fn is_sync_check(&self) -> bool {
             true
         }

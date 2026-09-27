@@ -147,6 +147,7 @@ unsafe extern "C" {
     fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
     fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
     fn SecItemUpdate(query: CFDictionaryRef, attributes_to_update: CFDictionaryRef) -> OSStatus;
+    #[cfg(test)]
     fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
     fn SecCopyErrorMessageString(status: OSStatus, reserved: *mut c_void) -> CFStringRef;
 }
@@ -443,16 +444,9 @@ pub(crate) fn set_generic_password(
 /// Remove the generic-password item under (`service`, `account`).
 ///
 /// `Err` with [`Error::code`] == [`ERR_SEC_ITEM_NOT_FOUND`] when there was
-/// nothing to remove.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the differential oracle's cleanup \
-    path; aterm itself never revokes a stored drive token, but a delete that is \
-    not exercised is a delete that is not known to work"
-    )
-)]
+/// nothing to remove. The differential oracle's cleanup path, so test-only:
+/// aterm itself never revokes a stored drive token.
+#[cfg(test)]
 pub(crate) fn delete_generic_password(service: &str, account: &str) -> Result<(), Error> {
     let (_service, _account, key) = generic_password_key(service, account)?;
     let query = cf_dictionary(&key).ok_or(Error::from_code(ERR_SEC_PARAM))?;

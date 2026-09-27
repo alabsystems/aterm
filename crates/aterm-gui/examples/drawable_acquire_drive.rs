@@ -172,16 +172,13 @@ while True:
                 }
             }
             command
-                .env("ATERM_CONTROL_SOCK", phase.join("ctl.sock"))
-                // A scratch HOME keeps every lane off the machine: the reroute stubs
-                // and the package store live under it (no environment veto exists).
+                // A scratch HOME keeps every lane off the machine: the reroute stubs,
+                // the package store and the state root live under it (no environment
+                // veto or override exists).
                 .env("HOME", phase.join("home"))
                 .env("XDG_RUNTIME_DIR", phase.join("run"))
                 .env("XDG_CONFIG_HOME", phase.join("cfg"))
                 .env("XDG_STATE_HOME", phase.join("state"))
-                .env("ATERM_STATE_HOME", phase.join("state"))
-                .env("ATERM_LINES", "22")
-                .env("ATERM_COLUMNS", "76")
                 .env("SHELL", "/bin/sh")
                 .env("ENV", "")
                 .current_dir(&phase)
@@ -261,6 +258,7 @@ while True:
             return 1;
         }
         let program = root.join("program.py");
+        let sock = root.join("ctl.sock");
         let driver = thread::spawn(move || {
             let result = Driver::new(root, ctl, probe.clone(), synchronous, close_while_blocked)
                 .and_then(Driver::run);
@@ -275,8 +273,15 @@ while True:
                 }
             }
         });
-        // Like src/main.rs, this callable receives argv[1..], with no argv0.
+        // Like src/main.rs, this callable receives argv[1..], with no argv0. The
+        // socket and the grid are launch flags, before the `-e` payload.
         aterm_gui::main_entry(vec![
+            "--control-sock".into(),
+            sock.into_os_string(),
+            "--lines".into(),
+            "22".into(),
+            "--columns".into(),
+            "76".into(),
             "-e".into(),
             "/usr/bin/python3".into(),
             "-S".into(),

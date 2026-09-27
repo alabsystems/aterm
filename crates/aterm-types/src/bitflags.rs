@@ -36,7 +36,7 @@ macro_rules! bitflags {
             bits: $T,
         }
 
-        #[allow(dead_code, non_upper_case_globals)]
+        #[allow(non_upper_case_globals)]
         impl $Name {
             $(
                 $(#[$inner])*
@@ -62,13 +62,6 @@ macro_rules! bitflags {
             #[must_use]
             pub const fn from_bits_truncate(bits: $T) -> Self {
                 Self { bits: bits & Self::__all_bits() }
-            }
-
-            /// Create from raw bits, retaining all bits (even unknown ones).
-            #[inline]
-            #[must_use]
-            pub const fn from_bits_retain(bits: $T) -> Self {
-                Self { bits }
             }
 
             /// Create from raw bits, returning `None` if unknown bits are set.
@@ -250,7 +243,7 @@ mod tests {
 
     /// Every constructor and operator, as the bits it must produce. A generated
     /// flag type is only as sound as these: `!` and `from_bits_truncate` must
-    /// drop undefined bits, and only `from_bits_retain` may keep them.
+    /// drop undefined bits.
     #[test]
     fn operations_produce_expected_bits() {
         use TestFlags as F;
@@ -271,7 +264,6 @@ mod tests {
             ("not A", !F::A, 0b0000_0110),
             ("not empty", !F::empty(), 0b0000_0111),
             ("from_bits_truncate", F::from_bits_truncate(0xFF), 0x07),
-            ("from_bits_retain", F::from_bits_retain(0xFF), 0xFF),
             ("|=", assigned(F::A, |f| *f |= F::B), 3),
             ("&=", assigned(F::AB, |f| *f &= F::A), 1),
             ("^", F::AB ^ F::A, 2),

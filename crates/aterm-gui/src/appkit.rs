@@ -387,6 +387,9 @@ pub(crate) mod consts {
     /// the paste sheet's "Paste". It was a bare `1000` at both sites with the
     /// name only in a comment.
     pub(crate) const NS_ALERT_FIRST_BUTTON_RETURN: isize = 1000;
+    /// `NSAlertSecondButtonReturn`: the second button added — the destructive
+    /// button of an owner-gesture alert, whose FIRST (default) button is Cancel.
+    pub(crate) const NS_ALERT_SECOND_BUTTON_RETURN: isize = 1001;
 
     // ---- W13: the `chrome` introspection reader's constants ----
     //

@@ -233,16 +233,20 @@ impl App {
             return Err("semantic action is disabled".to_string());
         }
         // The Security panel's buttons open System Settings, raise consent
-        // dialogs, clear saved answers and move copies of the app to the Trash.
-        // They are the owner's, pressed in the window; a program in a session
-        // must not be able to press them for the owner.
+        // dialogs, clear saved answers and move copies of the app to the Trash,
+        // and `app act` — a semantic press by name — never presses them. `key`
+        // still drives the page like a hand, by design, so the fence for the
+        // three that change this Mac is their alert (default Cancel, which no
+        // control verb can answer), and what the two Open buttons record never
+        // replaces the owner's answer to the access card.
         if node_action
             .as_str()
             .starts_with(crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX)
         {
             return Err(
-                "the macOS access buttons in Settings ▸ Security are owner gestures and are not \
-                 reachable from the control surface"
+                "`app act` does not press the macOS access buttons in Settings ▸ Security: they \
+                 are owner gestures, and the three that change this Mac ask the owner in an \
+                 alert first"
                     .to_string(),
             );
         }
@@ -463,8 +467,6 @@ impl App {
                 view,
                 &ViewCx {
                     viewport: ui_viewport,
-                    config_revision: self.native_config_service.snapshot().revision,
-                    update_revision: self.native_updater_service.snapshot().revision,
                     animation_phase_ms,
                     motion: self.native_view_motion_cx(wid, view),
                     terminal_font_px: self.win_font_px(wid),
@@ -728,6 +730,12 @@ fn semantic_controls_lines(compiled: &CompiledUi) -> Vec<String> {
     lines
 }
 
+/// [`semantic_tree_lines`] for the page tests that pin what a driver reads.
+#[cfg(test)]
+pub(crate) fn semantic_tree_lines_for_test(compiled: &CompiledUi) -> Vec<String> {
+    semantic_tree_lines(compiled)
+}
+
 fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
     let mut lines = compiled
         .semantics
@@ -735,7 +743,12 @@ fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
         .map(|node| {
             let parent = node.parent.as_ref().map_or("-", UiKey::as_str);
             let action = node.action.as_ref().map_or("-", ActionId::as_str);
-            format!(
+            // THE TREE IS THE ACCESSIBILITY DUMP (ruling 267): the projection
+            // every platform's reader is built from, so a driver checks what
+            // a reader hears here — the description after the name and a
+            // disclosure's state, each only where the control has one (every
+            // other line is byte-for-byte what it was).
+            let mut line = format!(
                 "node key={:?} parent={:?} role={:?} label={:?} value={} action={} state={} rect={:.1},{:.1},{:.1},{:.1}",
                 node.key.as_str(),
                 parent,
@@ -748,7 +761,14 @@ fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
                 node.rect.y,
                 node.rect.width,
                 node.rect.height,
-            )
+            );
+            if let Some(expanded) = node.state.and_then(|state| state.expanded) {
+                line.push_str(&format!(" expanded={expanded}"));
+            }
+            if let Some(description) = &node.description {
+                line.push_str(&format!(" description={description:?}"));
+            }
+            line
         })
         .collect::<Vec<_>>();
     lines.extend(editor_viewport_inspection_lines(compiled));
@@ -1235,9 +1255,11 @@ mod tests {
                         }],
                     }),
                     preedit: String::new(),
+                    preedit_caret: None,
                     status: Some("Unknown config key…".to_string()),
                     semantic_status: Some(semantic_status.to_string()),
                     minibuffer: None,
+                    minibuffer_caret: None,
                     cursor_label: Some("Ln 9, Col 15".to_string()),
                     dirty: true,
                     saving: false,
@@ -1533,6 +1555,14 @@ mod tests {
     #[test]
     fn document_open_uses_host_grant_and_native_tab_path() {
         let mut app = App::headless_for_test();
+        // Pin the window SHORT so the reader's layout decision is this test's,
+        // not the default font's: the mode control takes its compact form below
+        // 440 logical px of height, and the headless window's height is rows x
+        // the default face's cell height (JetBrains Mono's taller line on a
+        // non-macOS build put 24 rows above the breakpoint).
+        if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+            window.rows = 12;
+        }
         let dir =
             std::env::temp_dir().join(format!("aterm-control-document-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

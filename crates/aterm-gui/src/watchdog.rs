@@ -64,7 +64,7 @@
 //! So the sampler now runs in EVERY build. What changes with the build is the
 //! threshold, not the existence of the guard:
 //!
-//! * debug builds, or any build with `$ATERM_WATCHDOG` set —
+//! * debug builds (and a `dev-seams` build with `$ATERM_WATCHDOG` set) —
 //!   [`STALL_THRESHOLD`] (500 ms). Tight, for catching a regression while
 //!   developing it.
 //! * a shipped release binary — [`RELEASE_STALL_THRESHOLD`] (5 s). A main
@@ -73,9 +73,12 @@
 //!   font scan from ever writing an alarming line, while still turning a
 //!   PERMANENT wedge into a named log line within seconds instead of never.
 //!
-//! `ATERM_WATCHDOG=off` disables the sampler entirely; `ATERM_WATCHDOG=abort`
-//! still `process::abort()`s on a detected stall (CI / repro). Everything else
-//! logs at error level and keeps going. [`beat`] is one monotonic clock read and
+//! `$ATERM_WATCHDOG` is a DEVELOPMENT seam ([`aterm_types::dev_seam!`]): in a
+//! build that compiles seams, `=off` disables the sampler and `=abort`
+//! `process::abort()`s on a detected stall (CI / repro). A shipped binary reads
+//! none of it — the guard is on, at the coarse bar, and it logs; nothing in the
+//! environment can switch the user's freeze guard off. Everything else logs at
+//! error level and keeps going. [`beat`] is one monotonic clock read and
 //! a handful of relaxed atomic writes in every build either way (negligible on
 //! the hot event path, and the clock read is what buys the turn census below),
 //! and the sampler is one thread asleep 99.99% of the time.
@@ -116,8 +119,35 @@
 //! point's span is never booked — an idle wait, a modal dialog and the
 //! update-handoff park are designed freezes, and pricing them would be the same
 //! noise the sampler's park-point exemption exists to avoid.
+//!
+//! ## Where the thread IS, not which root ran last (2026-09-26)
+//!
+//! 0.93.0 froze after the process had been stopped for 26.6 hours: on resume,
+//! CoreFoundation walked winit's 0.1 µs waker timer forward one interval at a
+//! time (`aterm_objc::wake_timer` has the mechanism and its fix). The sampler
+//! caught it within five seconds — and wrote `while inside \`NewEvents\``,
+//! because that was the last root entered. `new_events` had returned; no aterm
+//! frame was on the stack. Three things close that gap:
+//!
+//! * **Locus.** Every root is entered through [`enter`], whose guard marks it
+//!   RETURNED when the handler ends, so a stall after the handler reads
+//!   "since \`NewEvents\` returned — outside every aterm handler".
+//! * **CPU.** Each sample reads the main thread's CPU time
+//!   ([`crate::main_thread_probe::cpu_time`]). A thread parked in the OS event
+//!   wait uses none, so a frozen heartbeat on a thread that is ON-CPU for a
+//!   whole threshold is a spin even at the idle park point `AboutToWait`,
+//!   which the heartbeat rule alone must exempt ([`Breadcrumb::spin_is_a_stall`]).
+//! * **Stack.** Each report is followed by the main thread's stack
+//!   ([`crate::main_thread_probe::stack`]): `image + offset` frames with the
+//!   executable's load address and UUID, the same facts a hang report gives,
+//!   in `aterm.log` of a stripped release.
+//!
+//! And the trigger itself gets a line: a sampler wake more than
+//! [`PROCESS_GAP`] late on a clock that stops while the Mac sleeps means the
+//! whole process was not running ([`process_gap`]); that is logged and the
+//! sampler starts over, so the gap is never charged to the main thread.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How often the sampler thread wakes to inspect the heartbeat: HALF the bar
@@ -140,7 +170,7 @@ fn sample_interval() -> Duration {
 }
 
 /// How long the heartbeat may stay frozen at a WORK breadcrumb before it counts
-/// as a stall, in a DEBUG build or under an explicit `$ATERM_WATCHDOG`. The
+/// as a stall, in a DEBUG build or under the `$ATERM_WATCHDOG` seam. The
 /// sampler wakes at half this ([`sample_interval`]), so a genuine wedge is
 /// caught within ~750 ms while a single slow-but-progressing frame never trips.
 const STALL_THRESHOLD: Duration = Duration::from_millis(500);
@@ -182,12 +212,21 @@ static BREADCRUMB: AtomicU8 = AtomicU8::new(Breadcrumb::Startup as u8);
 /// that never announced it. Written through [`phase`], read by the sampler.
 static PHASE: AtomicU8 = AtomicU8::new(Phase::None as u8);
 
+/// Whether the root named by [`BREADCRUMB`] has RETURNED — its handler is off
+/// the stack and the main thread is back in AppKit / CoreFoundation, between
+/// aterm's handlers. [`beat`] clears it (a root was just entered); the guard
+/// [`enter`] hands out sets it when the handler returns. The 2026-09-26 line
+/// said "while inside `NewEvents`" for a thread whose `new_events` had long
+/// returned and that was spinning in CoreFoundation's timer catch-up; this is
+/// the bit that tells those apart.
+static RETURNED: AtomicBool = AtomicBool::new(false);
+
 /// The main-loop roots the watchdog can pin a stall to. `#[repr(u8)]` so it round
 /// trips through the [`BREADCRUMB`] atomic with no allocation and no symbols — the
 /// NAME survives into a stripped-release log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Breadcrumb {
+pub(crate) enum Breadcrumb {
     /// Before the event loop runs (synchronous launch). Park point: startup does
     /// heavy main-thread work by design and must not trip the guard.
     Startup = 0,
@@ -243,7 +282,7 @@ impl Breadcrumb {
     /// (`deadline_owner=frame_cap`, `wake_owner=session_status`), so a reader
     /// never has to know that one field spells its owners differently from its
     /// neighbours. Stable like [`Breadcrumb::name`] — it is a wire label.
-    pub fn metric_name(self) -> &'static str {
+    pub(crate) fn metric_name(self) -> &'static str {
         match self {
             Breadcrumb::Startup => "startup",
             Breadcrumb::AboutToWait => "about_to_wait",
@@ -257,7 +296,7 @@ impl Breadcrumb {
     }
 
     /// Stable, symbol-free name for the log line.
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Breadcrumb::Startup => "Startup",
             Breadcrumb::AboutToWait => "AboutToWait",
@@ -268,6 +307,21 @@ impl Breadcrumb {
             Breadcrumb::UpdateHandoff => "UpdateHandoff",
             Breadcrumb::Modal => "Modal",
         }
+    }
+
+    /// Whether a main thread that is ON-CPU with a frozen heartbeat at this
+    /// root is a stall. True everywhere except the designed freezes that do
+    /// real work — startup (GPU, shaders, fonts), a modal dialog's AppKit
+    /// loop and the update handoff — and in particular true at the idle park,
+    /// [`Breadcrumb::AboutToWait`]: a thread parked in the OS event wait uses
+    /// no CPU, so one that burns it there is spinning somewhere aterm's
+    /// heartbeat cannot see (the 2026-09-26 timer catch-up could have landed
+    /// there as easily as after `NewEvents`).
+    fn spin_is_a_stall(self) -> bool {
+        !matches!(
+            self,
+            Breadcrumb::Startup | Breadcrumb::UpdateHandoff | Breadcrumb::Modal
+        )
     }
 
     /// A root where a frozen heartbeat is EXPECTED (idle park / pre-loop startup),
@@ -295,6 +349,23 @@ fn is_stall_at(bc: Breadcrumb, frozen: Duration, threshold: Duration) -> bool {
     !bc.is_park_point() && frozen >= threshold
 }
 
+/// A stall the sampler decided to report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Hit {
+    /// The root the heartbeat last named.
+    root: Breadcrumb,
+    /// How long the stall has lasted: since the heartbeat last advanced, or,
+    /// for a spin at a park point, since the main thread went on-CPU.
+    frozen: Duration,
+    /// The main thread was ON-CPU across the samples leading here — a spin,
+    /// not a park on a lock.
+    busy: bool,
+}
+
+/// The share of a sample interval the main thread must spend on-CPU for the
+/// interval to count as busy. A parked thread uses ~0; a spinning one ~100.
+const BUSY_PERCENT: u128 = 80;
+
 /// The sampler's detection state machine, split out of the background thread so
 /// its behaviour (fire once per contiguous stall, re-arm on progress, never fire
 /// at a park point) is testable against a SYNTHETIC clock — no real sleeps, no
@@ -317,6 +388,11 @@ struct Sampler {
     /// The bar this sampler judges against — [`STALL_THRESHOLD`] for the dev
     /// lane, [`RELEASE_STALL_THRESHOLD`] for a shipped binary.
     threshold: Duration,
+    /// The previous sample's `(instant, main-thread CPU time)`.
+    cpu_sample: Option<(Instant, Duration)>,
+    /// Since when every sample found the main thread on-CPU for at least
+    /// [`BUSY_PERCENT`] of the interval with no heartbeat in between.
+    busy_since: Option<Instant>,
 }
 
 impl Sampler {
@@ -328,49 +404,151 @@ impl Sampler {
             last_report: None,
             reports: 0,
             threshold,
+            cpu_sample: None,
+            busy_since: None,
         }
     }
 
-    /// Fold one sample. Returns `Some(bc)` when this sample should be REPORTED:
+    /// Start over at `now`: the process was not running for a while (see
+    /// [`process_gap`]), and nothing measured across that gap is about the
+    /// main thread.
+    fn resync(&mut self, now: Instant, beat: u64) {
+        *self = Self::with_threshold(now, beat, self.threshold);
+    }
+
+    /// The heartbeat rule alone, with no CPU reading — what every sample was
+    /// before 2026-09-26, and what a platform without the probe still gets.
+    #[cfg(test)]
+    fn poll(&mut self, now: Instant, cur_beat: u64, bc: Breadcrumb) -> Option<Breadcrumb> {
+        self.poll_with(now, cur_beat, bc, None).map(|hit| hit.root)
+    }
+
+    /// Fold one sample. Returns a [`Hit`] when this sample should be REPORTED:
     /// once when a contiguous stall crosses the threshold, and then once per
     /// [`STALL_REPEAT_INTERVAL`] for as long as it lasts. A main thread that
     /// never comes back is the case this guard exists for, and one line an hour
     /// ago is not the same evidence as a line saying it is still frozen now.
-    fn poll(&mut self, now: Instant, cur_beat: u64, bc: Breadcrumb) -> Option<Breadcrumb> {
+    ///
+    /// Two rules. A frozen heartbeat at a WORK root past the threshold is a
+    /// stall whatever the thread is doing (parked on a lock, or spinning). A
+    /// frozen heartbeat at a park point is expected — unless `cpu` shows the
+    /// main thread ON-CPU for a whole threshold there, which a parked thread
+    /// never is ([`Breadcrumb::spin_is_a_stall`]).
+    fn poll_with(
+        &mut self,
+        now: Instant,
+        cur_beat: u64,
+        bc: Breadcrumb,
+        cpu: Option<Duration>,
+    ) -> Option<Hit> {
+        self.fold_cpu(now, cpu);
         if cur_beat != self.last_beat {
             // Progress: the main thread is alive. Reset the stall clock + re-arm.
             self.last_beat = cur_beat;
             self.last_advance = now;
-            self.reported = false;
-            self.last_report = None;
-            self.reports = 0;
+            self.clear_reports();
+            self.busy_since = None;
             return None;
         }
         if bc.is_park_point() {
-            // Idle / startup park: a frozen heartbeat is expected here. Keep the
-            // clock reset so leaving idle starts a fresh span.
-            self.last_advance = now;
-            self.reported = false;
-            self.last_report = None;
-            self.reports = 0;
-            return None;
+            let spinning = self
+                .busy_since
+                .filter(|_| bc.spin_is_a_stall())
+                .map(|since| now.saturating_duration_since(since));
+            match spinning {
+                Some(spun) => {
+                    if spun < self.threshold || !self.report_due(now) {
+                        return None;
+                    }
+                    return Some(Hit {
+                        root: bc,
+                        frozen: spun,
+                        busy: true,
+                    });
+                }
+                None => {
+                    // Idle / startup park: a frozen heartbeat is expected here.
+                    // Keep the clock reset so leaving idle starts a fresh span.
+                    self.last_advance = now;
+                    self.clear_reports();
+                    return None;
+                }
+            }
         }
         let frozen = now.saturating_duration_since(self.last_advance);
-        if !is_stall_at(bc, frozen, self.threshold) {
+        if !is_stall_at(bc, frozen, self.threshold) || !self.report_due(now) {
             return None;
         }
+        Some(Hit {
+            root: bc,
+            frozen,
+            busy: self.busy_since.is_some(),
+        })
+    }
+
+    /// Track whether the main thread stayed on-CPU between samples.
+    fn fold_cpu(&mut self, now: Instant, cpu: Option<Duration>) {
+        let Some(cpu) = cpu else {
+            self.cpu_sample = None;
+            self.busy_since = None;
+            return;
+        };
+        if let Some((then, was)) = self.cpu_sample {
+            let wall = now.saturating_duration_since(then).as_nanos();
+            let used = cpu.saturating_sub(was).as_nanos();
+            if wall > 0 && used * 100 >= wall * BUSY_PERCENT {
+                self.busy_since.get_or_insert(then);
+            } else {
+                self.busy_since = None;
+            }
+        }
+        self.cpu_sample = Some((now, cpu));
+    }
+
+    /// Whether a stall that is past the threshold is due a line now, and
+    /// count it if so.
+    fn report_due(&mut self, now: Instant) -> bool {
         let due = match self.last_report {
             None => !self.reported,
             Some(at) => now.saturating_duration_since(at) >= STALL_REPEAT_INTERVAL,
         };
-        if !due {
-            return None;
+        if due {
+            self.reported = true;
+            self.last_report = Some(now);
+            self.reports = self.reports.saturating_add(1);
         }
-        self.reported = true;
-        self.last_report = Some(now);
-        self.reports = self.reports.saturating_add(1);
-        Some(bc)
+        due
     }
+
+    fn clear_reports(&mut self) {
+        self.reported = false;
+        self.last_report = None;
+        self.reports = 0;
+    }
+}
+
+/// How late a sampler wake must be before it means the whole PROCESS was not
+/// running. `Instant` does not advance while the Mac sleeps, so lateness on it
+/// is time the system was awake and this process was not scheduled: stopped
+/// (SIGSTOP), paused under a debugger, suspended, or starved.
+const PROCESS_GAP: Duration = Duration::from_secs(30);
+
+/// The lateness of a sampler wake that asked to sleep `requested` and was gone
+/// `observed`, when it is a [`PROCESS_GAP`].
+fn process_gap(requested: Duration, observed: Duration) -> Option<Duration> {
+    let late = observed.saturating_sub(requested);
+    (late >= PROCESS_GAP).then_some(late)
+}
+
+/// The line for a [`process_gap`].
+fn gap_message(late: Duration) -> String {
+    format!(
+        "this process was not running for {}s while the system was awake — stopped \
+         (SIGSTOP), paused under a debugger, suspended, or starved. Every timer it had \
+         armed came due at once; the 2026-09-26 freeze was CoreFoundation walking one \
+         such timer forward after 26.6 hours of this.",
+        late.as_secs()
+    )
 }
 
 /// A main-loop turn at or over this is COUNTED as long. One 30 fps frame budget
@@ -541,7 +719,7 @@ static TURNS: TurnLedger = TurnLedger::new();
 
 /// A read of [`TURNS`] for the `metrics` verb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TurnCensus {
+pub(crate) struct TurnCensus {
     /// The most recently booked turn.
     pub last_ns: u64,
     /// The worst booked turn since the last reset.
@@ -564,7 +742,7 @@ pub struct TurnCensus {
 /// fresh count against a stale location, and any announced [`Phase`] is cleared
 /// with it: the work a phase names belongs to the root that announced it.
 #[inline]
-pub fn beat(bc: Breadcrumb) {
+pub(crate) fn beat(bc: Breadcrumb) {
     beat_at(bc, crate::metrics::now_ns());
 }
 
@@ -592,13 +770,36 @@ fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) 
     // reason the breadcrumb is — the sampler must never read a fresh count
     // against a stale word.
     phase.store(Phase::None as u8, Ordering::Relaxed);
+    RETURNED.store(false, Ordering::Relaxed);
     HEARTBEAT.fetch_add(1, Ordering::Relaxed);
     booked
 }
 
+/// Enter a winit root: [`beat`] now, and mark the root RETURNED when the
+/// guard drops at the end of the handler, so a stall that happens after the
+/// handler is gone — in AppKit or CoreFoundation, between aterm's handlers —
+/// is not reported as being inside it. Every `ApplicationHandler` root holds
+/// one for its whole body.
+#[must_use = "the root lasts only as long as the guard lives"]
+pub(crate) fn enter(bc: Breadcrumb) -> RootGuard {
+    beat(bc);
+    RootGuard { _private: () }
+}
+
+/// The RAII half of [`enter`].
+pub(crate) struct RootGuard {
+    _private: (),
+}
+
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        RETURNED.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The turn census, for the `metrics` verb.
 #[must_use]
-pub fn turn_census() -> TurnCensus {
+pub(crate) fn turn_census() -> TurnCensus {
     TURNS.snapshot()
 }
 
@@ -607,13 +808,13 @@ pub fn turn_census() -> TurnCensus {
 /// emptying the mailbox. The strain host drains it on the main thread (the only
 /// writer is the same thread's [`beat`]), and alone decides whether a hardware
 /// key was near enough to make it a hitch.
-pub fn take_freeze() -> Option<(u64, u64, Breadcrumb)> {
+pub(crate) fn take_freeze() -> Option<(u64, u64, Breadcrumb)> {
     TURNS.take_freeze()
 }
 
 /// Clear the turn census. Called by [`crate::metrics::reset`], so the census is a
 /// window stat like every other `max_` on that line.
-pub fn reset_turn_census() {
+pub(crate) fn reset_turn_census() {
     TURNS.reset();
 }
 
@@ -627,7 +828,7 @@ pub fn reset_turn_census() {
 /// `metrics_now_ms` reads at the same instant — so "how long ago" is one
 /// subtraction, the rule every other `_at_ms` on the line already follows.
 #[must_use]
-pub fn turn_census_fields_text() -> String {
+pub(crate) fn turn_census_fields_text() -> String {
     let c = turn_census();
     let ms = |ns: u64| ns as f64 / 1e6;
     format!(
@@ -646,7 +847,7 @@ pub fn turn_census_fields_text() -> String {
 /// Field-for-field JSON twin of [`turn_census_fields_text`] — a leading comma, so
 /// it splices straight in before the closing brace.
 #[must_use]
-pub fn turn_census_fields_json() -> String {
+pub(crate) fn turn_census_fields_json() -> String {
     let c = turn_census();
     let ms = |ns: u64| ns as f64 / 1e6;
     format!(
@@ -664,8 +865,8 @@ pub fn turn_census_fields_json() -> String {
 }
 
 /// The breadcrumb the main thread last stamped.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn current() -> Breadcrumb {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn current() -> Breadcrumb {
     Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed))
 }
 
@@ -677,20 +878,21 @@ pub fn current() -> Breadcrumb {
 /// before the dialog. Must be held on the main thread across the `runModal`
 /// send and nothing else; a guard that outlives its dialog is a park that
 /// never ends, which is exactly the wedge the sampler exists to name.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[must_use = "the park lasts only as long as the guard lives"]
-pub fn park_modal() -> ModalPark {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn park_modal() -> ModalPark {
     let previous = current();
     beat(Breadcrumb::Modal);
     ModalPark { previous }
 }
 
 /// The RAII half of [`park_modal`].
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub struct ModalPark {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct ModalPark {
     previous: Breadcrumb,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Drop for ModalPark {
     fn drop(&mut self) {
         beat(self.previous);
@@ -713,7 +915,7 @@ impl Drop for ModalPark {
 /// phase that is current when it reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Phase {
+pub(crate) enum Phase {
     /// Nothing announced: the root is all the line says.
     None = 0,
     /// `App::ensure_pixel_backend` — a headless run's FIRST pixel demand
@@ -734,8 +936,15 @@ pub enum Phase {
     /// `from_parts`, after the join, compiles the shader and builds the
     /// pipelines. On the macOS Metal arm `GpuContext::new` only NAMES the
     /// preferred device and keeps nothing of it but the name — on the
-    /// system-default pick (`ATERM_GPU_POWER=high`, or no low-power GPU
-    /// listed) that naming IS `MTLCreateSystemDefaultDevice` — while
+    /// system-default pick that naming IS `MTLCreateSystemDefaultDevice`.
+    /// That pick is taken only where `MTLCopyAllDevices`' listing cannot
+    /// decide (`aterm_gpu`'s `choose_listed`, since 2026-09-26): two or more
+    /// display GPUs listed and `ATERM_GPU_POWER=high` (a dual-GPU Mac under
+    /// that seam), two or more and none low-power, or none; everywhere else
+    /// — an Apple-silicon Mac's one GPU, a dual-GPU Mac's low-power one by
+    /// default — the device is read out of the listing, which (measured on
+    /// Apple silicon) asks the display server nothing and (per the SDK
+    /// header `Device::preferred` quotes) switches no mux. Meanwhile
     /// `MetalArmLive` mints the device (calling `Device::preferred` again:
     /// on that pick, a second `MTLCreateSystemDefaultDevice`), its queue and
     /// `cell.metal` at the first armed frame — inside [`Phase::ImageCapture`]
@@ -787,7 +996,10 @@ pub enum Phase {
     /// work. The device is
     /// `Device::preferred`'s pick: the low-power GPU of a dual-GPU Mac,
     /// unless `ATERM_GPU_POWER=high` asks for the system default, which on
-    /// such a Mac is the discrete GPU. On that pick the naming in
+    /// such a Mac is the discrete GPU (its listing shows two display GPUs,
+    /// so under `high` `Device::preferred` does not answer from the listing
+    /// — it does that only for a single display GPU — and makes the call
+    /// below). On that pick the naming in
     /// [`Phase::PixelBackendRedeem`]'s device leg is aterm's FIRST call that
     /// can set off the switch — `MTLCreateSystemDefaultDevice`, the call
     /// Apple documents as switching a dual-GPU Mac to the discrete GPU — and,
@@ -829,7 +1041,7 @@ impl Phase {
     }
 
     /// Stable, symbol-free wording for the log line.
-    pub fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Phase::None => "",
             Phase::PixelBackendRedeem => {
@@ -865,7 +1077,7 @@ impl Phase {
 /// the root's, and a phase that beat would hide the very stall it exists to
 /// name.
 #[must_use = "the announcement lasts only as long as the guard lives"]
-pub fn phase(p: Phase) -> PhaseGuard {
+pub(crate) fn phase(p: Phase) -> PhaseGuard {
     announce(&PHASE, p)
 }
 
@@ -884,7 +1096,7 @@ fn announce(cell: &'static AtomicU8, p: Phase) -> PhaseGuard {
 }
 
 /// The phase the main thread last announced (none between roots).
-pub fn current_phase() -> Phase {
+pub(crate) fn current_phase() -> Phase {
     phase_in(&PHASE)
 }
 
@@ -895,7 +1107,7 @@ fn phase_in(cell: &AtomicU8) -> Phase {
 
 /// The RAII half of [`phase`]: the cell it wrote, what it wrote there, and
 /// what stood before.
-pub struct PhaseGuard {
+pub(crate) struct PhaseGuard {
     cell: &'static AtomicU8,
     written: Phase,
     previous: Phase,
@@ -919,45 +1131,88 @@ impl Drop for PhaseGuard {
     }
 }
 
+/// Where the main thread was when a stall was reported, as far as the
+/// heartbeat can tell: inside the root it last entered, or back in AppKit /
+/// CoreFoundation after that root RETURNED ([`RETURNED`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Locus {
+    /// The root's handler is still on the stack.
+    Inside,
+    /// The root's handler returned; no aterm handler is running.
+    Returned,
+}
+
 /// The stall line, assembled from the sampler's facts alone so its wording is
 /// testable without a thread or a logger: the FIRST report of a contiguous
 /// stall names the root and the announced phase and says what the class of
-/// hazard is; every later one says the same stall is still there.
-fn stall_message(reports: u32, frozen: Duration, bc: Breadcrumb, phase: Phase) -> String {
-    let phase = phase.clause();
-    if reports == 1 {
-        format!(
-            "MAIN-THREAD STALL: no heartbeat for {frozen:?} while inside `{}`{phase} — \
+/// hazard is; every later one says the same stall is still there. A stall
+/// after the root RETURNED says so instead of naming the root as the place
+/// (the 2026-09-26 line named `NewEvents` for a spin in CoreFoundation), and
+/// `busy` says the main thread was on-CPU — a spin, not a park.
+fn stall_message(
+    reports: u32,
+    frozen: Duration,
+    bc: Breadcrumb,
+    phase: Phase,
+    locus: Locus,
+    busy: bool,
+) -> String {
+    let cpu = if busy {
+        ", ON-CPU the whole time (a spin, not a park)"
+    } else {
+        ""
+    };
+    match (locus, reports) {
+        (Locus::Inside, 1) => format!(
+            "MAIN-THREAD STALL: no heartbeat for {frozen:?} while inside `{}`{}{cpu} — \
              the UI is not responding. Either unbounded work under a contended lock \
              (the L0 freeze hazard) or a park that will never end (a lock or lazy-init \
              cycle). This line names the main-loop root without symbols; a hang report \
              is not required to find it.",
-            bc.name()
-        )
-    } else {
-        format!(
+            bc.name(),
+            phase.clause()
+        ),
+        (Locus::Inside, _) => format!(
             "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} inside \
-             `{}`{phase} — this is a wedge, not a slow frame.",
+             `{}`{}{cpu} — this is a wedge, not a slow frame.",
+            bc.name(),
+            phase.clause()
+        ),
+        (Locus::Returned, 1) => format!(
+            "MAIN-THREAD STALL: no heartbeat for {frozen:?} since `{}` returned{cpu} — \
+             the main thread is outside every aterm handler, in AppKit or CoreFoundation's \
+             own run-loop work (a timer, source or observer; the 2026-09-26 freeze was \
+             CoreFoundation's catch-up for a late timer), and the UI is not responding. \
+             The stack line that follows names the frame.",
             bc.name()
-        )
+        ),
+        (Locus::Returned, _) => format!(
+            "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} since `{}` \
+             returned{cpu} — the main thread is still outside aterm's handlers.",
+            bc.name()
+        ),
     }
 }
 
-/// Whether the watchdog sampler should run. EVERY build, unless explicitly
-/// switched off with `ATERM_WATCHDOG=off` — see the module header for why a
-/// release binary is the build that needs this most.
+/// The `$ATERM_WATCHDOG` development seam's value; `None` in every shipped binary.
+fn seam() -> Option<String> {
+    aterm_types::dev_seam!("ATERM_WATCHDOG").map(|v| v.to_string_lossy().trim().to_string())
+}
+
+/// Whether the watchdog sampler should run. EVERY build, unless a development
+/// build switches it off with `ATERM_WATCHDOG=off` — see the module header for
+/// why a release binary is the build that needs this most.
 fn enabled() -> bool {
-    !std::env::var("ATERM_WATCHDOG").is_ok_and(|v| {
-        let v = v.trim();
+    !seam().is_some_and(|v| {
         v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("0") || v.is_empty()
     })
 }
 
 /// The bar this build judges a stall against: tight when a developer is
-/// watching (debug, or an explicit `$ATERM_WATCHDOG`), coarse in a shipped
-/// binary where the reader is a user's `aterm.log`.
+/// watching (debug, or the `$ATERM_WATCHDOG` seam), coarse in a shipped binary
+/// where the reader is a user's `aterm.log`.
 fn threshold() -> Duration {
-    if cfg!(debug_assertions) || std::env::var_os("ATERM_WATCHDOG").is_some() {
+    if cfg!(debug_assertions) || seam().is_some() {
         STALL_THRESHOLD
     } else {
         RELEASE_STALL_THRESHOLD
@@ -965,9 +1220,9 @@ fn threshold() -> Duration {
 }
 
 /// Whether a detected stall should `process::abort()` (repro / CI) rather than
-/// just log. Opt-in via `ATERM_WATCHDOG=abort`.
+/// just log. A development build's `ATERM_WATCHDOG=abort`.
 fn abort_on_stall() -> bool {
-    std::env::var("ATERM_WATCHDOG").is_ok_and(|v| v.eq_ignore_ascii_case("abort"))
+    seam().is_some_and(|v| v.eq_ignore_ascii_case("abort"))
 }
 
 /// Spawn the background stall sampler. Call once from `main` just before
@@ -980,12 +1235,15 @@ fn abort_on_stall() -> bool {
 /// aterm's kernel wakeups at rest.) No self-terminate handshake is needed — the
 /// process is exiting when this thread would otherwise notice, and it is a
 /// daemon by nature.
-pub fn start() {
+pub(crate) fn start() {
     if !enabled() {
         return;
     }
     let abort = abort_on_stall();
     let threshold = threshold();
+    // The main thread is the caller; the probe reads its CPU time every
+    // sample and its stack at a report.
+    crate::main_thread_probe::register();
     let builder = std::thread::Builder::new().name("aterm-watchdog".into());
     // A spawn failure is non-fatal: the app runs fine without the tripwire.
     let _ = builder.spawn(move || {
@@ -997,22 +1255,49 @@ pub fn start() {
         let mut sampler =
             Sampler::with_threshold(Instant::now(), HEARTBEAT.load(Ordering::Relaxed), threshold);
         loop {
+            let asleep = Instant::now();
             std::thread::sleep(sample);
             let now = Instant::now();
+            // A wake far later than asked, on a clock that stops while the
+            // Mac sleeps, is the whole process not running. Say so — it is
+            // the trigger no other line records — and start over: none of the
+            // gap was the main thread's doing.
+            if let Some(late) = process_gap(sample, now.saturating_duration_since(asleep)) {
+                aterm_log::warn!("{}", gap_message(late));
+                sampler.resync(now, HEARTBEAT.load(Ordering::Relaxed));
+                continue;
+            }
             let cur = HEARTBEAT.load(Ordering::Relaxed);
             let bc = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed));
-            if let Some(hit) = sampler.poll(now, cur, bc) {
-                let frozen = now.saturating_duration_since(sampler.last_advance);
-                // The phase is read AT the report, just after the sample
-                // that decided it. If the main thread beat in that instant it
-                // reads none or the next root's; either way it was announced
-                // in the root the main thread is in now (a beat clears it).
-                // A nested phase that ended before the report reads as the
-                // phase around it.
+            let cpu = crate::main_thread_probe::cpu_time();
+            if let Some(hit) = sampler.poll_with(now, cur, bc, cpu) {
+                // The phase and the locus are read AT the report, just after
+                // the sample that decided it. If the main thread beat in that
+                // instant they read the next root's; either way they describe
+                // the root the main thread is in now (a beat clears both). A
+                // nested phase that ended before the report reads as the phase
+                // around it.
+                let locus = if RETURNED.load(Ordering::Relaxed) {
+                    Locus::Returned
+                } else {
+                    Locus::Inside
+                };
                 aterm_log::error!(
                     "{}",
-                    stall_message(sampler.reports, frozen, hit, current_phase())
+                    stall_message(
+                        sampler.reports,
+                        hit.frozen,
+                        hit.root,
+                        current_phase(),
+                        locus,
+                        hit.busy
+                    )
                 );
+                // Where the thread IS, not just which root ran last: the frame
+                // a hang report would have named, in the log, in every build.
+                if let Some(frames) = crate::main_thread_probe::stack() {
+                    aterm_log::error!("MAIN-THREAD STALL stack: {}", frames.join(" | "));
+                }
                 if abort {
                     std::process::abort();
                 }
@@ -1224,6 +1509,8 @@ mod tests {
             Duration::from_millis(5045),
             Breadcrumb::UserEvent,
             Phase::PixelBackendRedeem,
+            Locus::Inside,
+            false,
         );
         assert!(
             line.starts_with(
@@ -1245,6 +1532,8 @@ mod tests {
             Duration::from_secs(1),
             Breadcrumb::ResizeSettle,
             Phase::None,
+            Locus::Inside,
+            false,
         );
         assert!(
             bare.contains("inside `ResizeSettle` — the UI is not responding"),
@@ -1255,6 +1544,8 @@ mod tests {
             Duration::from_secs(103),
             Breadcrumb::NewEvents,
             Phase::ImageCapture,
+            Locus::Inside,
+            false,
         );
         assert!(
             again.starts_with(
@@ -1296,14 +1587,17 @@ mod tests {
         struct Capture {
             fired: Arc<AtomicBool>,
             saw_name: Arc<std::sync::Mutex<String>>,
+            saw_stack: Arc<std::sync::Mutex<String>>,
         }
         impl aterm_log::Log for Capture {
-            fn enabled(&self, _m: &aterm_log::Metadata<'_>) -> bool {
+            fn enabled(&self, _m: &aterm_log::Metadata) -> bool {
                 true
             }
             fn log(&self, record: &aterm_log::Record<'_>) {
                 let line = format!("{}", record.args());
-                if line.contains("MAIN-THREAD STALL") {
+                if line.starts_with("MAIN-THREAD STALL stack:") {
+                    *self.saw_stack.lock().unwrap() = line;
+                } else if line.contains("MAIN-THREAD STALL") {
                     self.fired.store(true, Ordering::SeqCst);
                     *self.saw_name.lock().unwrap() = line;
                 }
@@ -1313,10 +1607,12 @@ mod tests {
 
         let fired = Arc::new(AtomicBool::new(false));
         let saw = Arc::new(std::sync::Mutex::new(String::new()));
+        let stack = Arc::new(std::sync::Mutex::new(String::new()));
         // Leak the logger to obtain the `&'static` `set_logger` requires.
         let cap: &'static Capture = Box::leak(Box::new(Capture {
             fired: fired.clone(),
             saw_name: saw.clone(),
+            saw_stack: stack.clone(),
         }));
         let _ = aterm_log::set_logger(cap);
         aterm_log::set_max_level(aterm_log::LevelFilter::Trace);
@@ -1341,6 +1637,17 @@ mod tests {
             "the stall line must NAME the breadcrumb; got: {}",
             saw.lock().unwrap()
         );
+        // `start` registered THIS thread as the one to probe, so the stack line
+        // that follows the stall line is this test's own, asleep.
+        #[cfg(target_os = "macos")]
+        {
+            let stack = stack.lock().unwrap().clone();
+            eprintln!("{stack}");
+            assert!(
+                stack.contains("load address 0x") && stack.contains(" | #1 "),
+                "a stall line is followed by the main thread's stack; got: {stack}"
+            );
+        }
     }
 
     /// THE ATTRIBUTION RULE (2026-09-15 responsiveness audit). A turn that ended
@@ -1749,7 +2056,7 @@ mod tests {
         // `enabled()` reads the environment, which is process-global and shared
         // with every other test in this binary — so assert the DECISION, not by
         // mutating the env. With nothing set, it must be on.
-        if std::env::var_os("ATERM_WATCHDOG").is_none() {
+        if seam().is_none() {
             assert!(
                 enabled(),
                 "a shipped build must arm the stall watchdog: silence is what \
@@ -1873,6 +2180,171 @@ mod tests {
         assert_eq!(
             s.reports, 1,
             "a separate wedge must announce itself in full, not as a continuation"
+        );
+    }
+
+    /// THE 2026-09-26 FREEZE, AS THE SAMPLER SEES IT NOW. The last root entered
+    /// was `NewEvents`; it returned; the main thread then spun in
+    /// CoreFoundation's timer catch-up, on-CPU, for minutes. The heartbeat rule
+    /// already fired at the threshold; the line must now say the thread is
+    /// OUTSIDE aterm and spinning, not "inside `NewEvents`".
+    #[test]
+    fn the_2026_09_26_spin_is_named_as_outside_aterm_and_on_cpu() {
+        let _serial = beat_serial();
+        {
+            let _root = enter(Breadcrumb::NewEvents);
+            assert!(!RETURNED.load(Ordering::Relaxed), "inside the handler");
+        }
+        assert!(RETURNED.load(Ordering::Relaxed), "the handler returned");
+        assert_eq!(current(), Breadcrumb::NewEvents);
+
+        let t0 = Instant::now();
+        let mut s = Sampler::with_threshold(t0, 9, RELEASE_STALL_THRESHOLD);
+        let mut hit = None;
+        for tick in 1..=4u32 {
+            // Spinning: all of every 2.5 s interval on-CPU.
+            let at = t0 + Duration::from_millis(2_500) * tick;
+            let cpu = Duration::from_millis(2_500) * tick;
+            hit = hit.or(s.poll_with(at, 9, Breadcrumb::NewEvents, Some(cpu)));
+        }
+        let hit = hit.expect("a frozen work root past the bar is a stall");
+        assert!(hit.busy, "on-CPU across the samples: a spin, not a park");
+        let line = stall_message(
+            1,
+            hit.frozen,
+            hit.root,
+            Phase::None,
+            Locus::Returned,
+            hit.busy,
+        );
+        assert!(
+            line.starts_with(
+                "MAIN-THREAD STALL: no heartbeat for 5s since `NewEvents` returned, ON-CPU"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("outside every aterm handler"), "{line}");
+        assert!(!line.contains("while inside"), "{line}");
+        let again = stall_message(
+            2,
+            Duration::from_secs(65),
+            hit.root,
+            Phase::None,
+            Locus::Returned,
+            true,
+        );
+        assert!(
+            again.starts_with("MAIN-THREAD STALL CONTINUES: still no heartbeat after 65s since `NewEvents` returned"),
+            "{again}"
+        );
+        // A modal restores the OUTER root as still running.
+        {
+            let _root = enter(Breadcrumb::UserEvent);
+            drop(park_modal());
+            assert!(
+                !RETURNED.load(Ordering::Relaxed),
+                "back inside the outer root"
+            );
+        }
+    }
+
+    /// A spin at the IDLE park point is a stall; a quiet park is not, however
+    /// long; and the designed freezes that do real work (startup, a modal, the
+    /// handoff) stay exempt even on-CPU.
+    #[test]
+    fn a_spin_at_the_idle_park_is_a_stall_and_a_quiet_park_is_not() {
+        let t0 = Instant::now();
+        let step = Duration::from_millis(250);
+        let run = |bc: Breadcrumb, busy: bool| {
+            let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
+            let mut hits = Vec::new();
+            for tick in 1..=12u32 {
+                let cpu = if busy {
+                    step * tick
+                } else {
+                    Duration::from_millis(1) * tick
+                };
+                if let Some(hit) = s.poll_with(t0 + step * tick, 3, bc, Some(cpu)) {
+                    hits.push((tick, hit));
+                }
+            }
+            hits
+        };
+        let spun = run(Breadcrumb::AboutToWait, true);
+        assert_eq!(spun.len(), 1, "one report per contiguous spin: {spun:?}");
+        let (tick, hit) = spun[0];
+        assert!(hit.busy && hit.root == Breadcrumb::AboutToWait);
+        assert!(hit.frozen >= STALL_THRESHOLD, "{hit:?}");
+        assert_eq!(
+            tick, 3,
+            "busy from the first interval, the bar crossed at the third sample"
+        );
+        assert!(
+            run(Breadcrumb::AboutToWait, false).is_empty(),
+            "idle is not a stall"
+        );
+        for designed in [
+            Breadcrumb::Startup,
+            Breadcrumb::Modal,
+            Breadcrumb::UpdateHandoff,
+        ] {
+            assert!(
+                run(designed, true).is_empty(),
+                "{designed:?} does real work by design"
+            );
+        }
+        // With no CPU reading at all, the park point keeps its old exemption.
+        let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
+        for tick in 1..=12u32 {
+            assert!(
+                s.poll_with(t0 + step * tick, 3, Breadcrumb::AboutToWait, None)
+                    .is_none()
+            );
+        }
+    }
+
+    /// The trigger gets a line, and is not charged to the main thread: a
+    /// 26.6 h gap in the sampler's own sleep reads as the process not running,
+    /// ordinary scheduling jitter does not, and after a resync a work root
+    /// needs a full threshold of its own before it is a stall.
+    #[test]
+    fn a_process_gap_is_named_and_restarts_the_stall_clock() {
+        let sample = RELEASE_STALL_THRESHOLD / 2;
+        assert_eq!(
+            process_gap(sample, sample + Duration::from_secs(95_674)),
+            Some(Duration::from_secs(95_674))
+        );
+        assert_eq!(process_gap(sample, sample + Duration::from_secs(3)), None);
+        assert_eq!(process_gap(sample, Duration::ZERO), None);
+        let line = gap_message(Duration::from_secs(95_674));
+        assert!(
+            line.starts_with("this process was not running for 95674s while the system was awake"),
+            "{line}"
+        );
+
+        let t0 = Instant::now();
+        let mut s = Sampler::with_threshold(t0, 5, RELEASE_STALL_THRESHOLD);
+        let back = t0 + Duration::from_secs(95_676);
+        s.resync(back, 5);
+        assert!(
+            s.poll_with(
+                back + Duration::from_secs(1),
+                5,
+                Breadcrumb::UserEvent,
+                None
+            )
+            .is_none(),
+            "the gap is not a stall of the main thread"
+        );
+        assert!(
+            s.poll_with(
+                back + Duration::from_secs(6),
+                5,
+                Breadcrumb::UserEvent,
+                None
+            )
+            .is_some(),
+            "a real wedge after the gap still reports"
         );
     }
 }

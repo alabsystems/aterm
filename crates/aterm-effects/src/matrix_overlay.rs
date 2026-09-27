@@ -138,6 +138,7 @@ impl ExternalRainCell {
 
     /// Add semantic/style flags.
     #[must_use]
+    #[cfg(test)]
     pub const fn with_flags(mut self, flags: u32) -> Self {
         self.flags |= flags;
         self
@@ -397,12 +398,6 @@ impl ExternalRainOverlay {
         self.rain.advance_ms(dt_ms);
     }
 
-    /// Note a terminal content-sequence observation without forcing a cell
-    /// rescan. [`Self::sync_snapshot`] calls this automatically.
-    pub fn note_activity(&mut self, content_seq: u64) {
-        self.rain.note_activity(content_seq);
-    }
-
     /// Note one user keystroke.
     pub fn note_keystroke(&mut self) {
         self.rain.note_keystroke();
@@ -599,12 +594,6 @@ impl ExternalRainOverlay {
         self.atlas.as_deref()
     }
 
-    /// Current frame fingerprint.
-    #[must_use]
-    pub fn fingerprint(&self) -> u64 {
-        self.fingerprint
-    }
-
     /// Whether the host should keep its shared animation ticker armed.
     #[must_use]
     pub fn is_active(&self) -> bool {
@@ -612,12 +601,6 @@ impl ExternalRainOverlay {
             && !self.reduced_motion
             && self.visibility != RainVisibility::Hidden
             && self.rain.is_active()
-    }
-
-    /// Atlas generation for upload caching.
-    #[must_use]
-    pub fn atlas_version(&self) -> u64 {
-        self.rain.atlas_version()
     }
 
     fn validate_snapshot(

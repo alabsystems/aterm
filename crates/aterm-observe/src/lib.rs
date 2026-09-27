@@ -19,10 +19,8 @@
 //! reaches into the core enum directly.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
-use aterm_core::terminal::{RowMatch, RowRange, WatcherSpec};
+use aterm_core::terminal::RowMatch;
 
 /// Re-export the regex compile error so dependents (e.g. `aterm-agent`) can name
 /// it without taking a direct `aterm-regex` dependency — the regex boundary stays
@@ -30,33 +28,6 @@ use aterm_core::terminal::{RowMatch, RowRange, WatcherSpec};
 /// names moved from `regex::Error` to [`aterm_regex::Error`].
 pub mod regex_compile_error {
     pub use aterm_regex::Error;
-}
-
-/// Count of row evaluations abandoned because the pattern exhausted its scan
-/// budget on that row. Process-wide, monotonic, and read back with
-/// [`regex_budget_exhaustions`].
-///
-/// It exists because the interesting failure happens *behind a `bool`*. A
-/// watcher matcher is handed to the core as an opaque `Arc<dyn RowMatch>` whose
-/// only method answers yes or no, so a row the engine refused to finish
-/// scanning has nowhere to say so — and the caller would see an `await` that
-/// simply never latches, which is indistinguishable from output that never
-/// arrived. A counter is the smallest thing that makes the difference visible
-/// without a logging dependency this crate does not have (`aterm-core` and
-/// `aterm-regex`, that is the whole list) and without changing the core's
-/// vocabulary-free `RowMatch` contract.
-static ROW_MATCH_BUDGET_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
-
-/// How many row evaluations have been abandoned on the scan budget since the
-/// process started.
-///
-/// Zero is the normal state, and any non-zero value means some watcher is armed
-/// with a pattern too expensive to run over the output it is watching: its rows
-/// were reported as non-matches without ever being fully read, so an `await` on
-/// it may never latch. See [`REGEX_STEP_LIMIT`] for the budget itself.
-#[must_use]
-pub fn regex_budget_exhaustions() -> u64 {
-    ROW_MATCH_BUDGET_EXHAUSTIONS.load(Ordering::Relaxed)
 }
 
 /// A pre-compiled regular-expression row matcher — the one place the regex engine
@@ -67,35 +38,16 @@ pub struct RegexRowMatch {
     re: aterm_regex::Regex,
 }
 
-impl RegexRowMatch {
-    /// Has this matcher ever abandoned a row on the scan budget?
-    ///
-    /// Sticky, and shared with the compiled pattern rather than with this
-    /// wrapper, so it survives the `Arc<dyn RowMatch>` the core holds — a
-    /// caller that kept its own handle to the concrete type can ask.
-    #[must_use]
-    pub fn budget_exhausted(&self) -> bool {
-        self.re.step_limit_exceeded()
-    }
-}
-
 impl RowMatch for RegexRowMatch {
     #[inline]
     fn matches(&self, row: &str) -> bool {
-        match self.re.try_is_match(row) {
-            Ok(hit) => hit,
-            // FAIL CLOSED. The alternative — latching the watcher on a row the
-            // engine never finished reading — would fire an agent's
-            // `await match <re>` on evidence that was never gathered, and a
-            // false latch releases a turn early. "Not yet" is the answer that
-            // stays correct if the budget was the only thing in the way, so the
-            // row is reported as a non-match and the fact that it was refused
-            // rather than rejected is recorded where it can be read back.
-            Err(_) => {
-                ROW_MATCH_BUDGET_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-        }
+        // FAIL CLOSED on a refused match (the engine's budget ran out). The
+        // alternative — latching the watcher on a row the engine never finished
+        // reading — would fire an agent's `await match <re>` on evidence that was
+        // never gathered, and a false latch releases a turn early. "Not yet" is
+        // the answer that stays correct if the budget was the only thing in the
+        // way, so the row is reported as a non-match.
+        self.re.try_is_match(row).unwrap_or(false)
     }
 }
 
@@ -169,7 +121,7 @@ const REGEX_STEP_LIMIT: u64 = 1 << 22;
 /// multi-megabyte NFA; and the matcher carries [`REGEX_STEP_LIMIT`], which
 /// bounds the *scan* — the cost of running the admitted program over a row,
 /// which the size ceiling alone does not bound. A row that exhausts it is
-/// reported as a non-match and counted in [`regex_budget_exhaustions`]. This
+/// reported as a non-match. This
 /// mirrors the search verb (`aterm-search`); the live PTY-driven watcher path
 /// shares the same choke point.
 ///
@@ -190,42 +142,11 @@ pub fn row_matcher(pattern: &str) -> Result<Arc<dyn RowMatch>, aterm_regex::Erro
     Ok(Arc::new(RegexRowMatch { re }))
 }
 
-/// `IdleFor(dur)` — latch after `dur` of no content mutation (quiescence).
-#[must_use]
-pub fn idle_for(dur: Duration) -> WatcherSpec {
-    WatcherSpec::IdleFor { dur }
-}
-
-/// `SeqAdvanced(after)` — latch once the content clock passes `after`.
-#[must_use]
-pub fn seq_advanced(after: u64) -> WatcherSpec {
-    WatcherSpec::SeqAdvanced { after }
-}
-
-/// `BlockComplete` — latch on a completed/prompt-ready shell-integration block.
-#[must_use]
-pub fn block_complete() -> WatcherSpec {
-    WatcherSpec::BlockComplete
-}
-
-/// The whole visible surface (every row) — the common [`RowRange`] for row
-/// matching.
-#[must_use]
-pub fn anywhere() -> RowRange {
-    RowRange::All
-}
-
-/// The inclusive visible-row span `start..=end`.
-#[must_use]
-pub fn rows(start: usize, end: usize) -> RowRange {
-    RowRange::Span { start, end }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_core::terminal::{ClockReading, Terminal};
-    use std::time::Instant;
+    use aterm_core::terminal::{ClockReading, RowRange, Terminal};
+    use std::time::{Duration, Instant};
 
     fn clock_at(base: Instant, off_ms: u64) -> ClockReading {
         ClockReading {
@@ -241,7 +162,7 @@ mod tests {
         let base = Instant::now();
         let mut t = Terminal::new(24, 80);
         let m = row_matcher(r"PROMPT-READY").expect("compile");
-        let id = t.watch_rows(m, anywhere(), base).expect("arm");
+        let id = t.watch_rows(m, RowRange::All, base).expect("arm");
         assert!(t.watch_poll(id).is_none(), "pending before the row appears");
 
         t.process_at(b"working...\r\n", clock_at(base, 10));
@@ -265,7 +186,7 @@ mod tests {
         let mut t = Terminal::new(24, 80);
         t.process_at(b"ALREADY-HERE\r\n", clock_at(base, 5));
         let m = row_matcher("ALREADY-HERE").expect("compile");
-        let id = t.watch_rows(m, anywhere(), base).expect("arm");
+        let id = t.watch_rows(m, RowRange::All, base).expect("arm");
         assert!(
             t.watch_poll(id).is_some(),
             "an already-matching row latches at arm time"
@@ -281,7 +202,7 @@ mod tests {
         let mut t = Terminal::new(24, 80);
         t.process_at(b"Done.\r\n", clock_at(base, 5));
         let m = row_matcher("esc to interrupt").expect("compile");
-        let id = t.watch_rows_gone(m, anywhere(), base).expect("arm");
+        let id = t.watch_rows_gone(m, RowRange::All, base).expect("arm");
         assert!(
             t.watch_poll(id).is_some(),
             "no matching row at arm => latched at arm time"
@@ -300,7 +221,7 @@ mod tests {
             clock_at(base, 5),
         );
         let m = row_matcher("esc to interrupt").expect("compile");
-        let id = t.watch_rows_gone(m, anywhere(), base).expect("arm");
+        let id = t.watch_rows_gone(m, RowRange::All, base).expect("arm");
         assert!(
             t.watch_poll(id).is_none(),
             "the footer is on screen => pending"
@@ -380,9 +301,7 @@ mod tests {
     ///
     /// The refusal must be a NON-match rather than a latch: latching on a row
     /// the engine never finished reading would release an agent's `await` on
-    /// evidence that was never gathered. And it must not be silent, which is
-    /// what [`regex_budget_exhaustions`] is for — the counter is the only way
-    /// the condition can escape a `dyn RowMatch` that returns `bool`.
+    /// evidence that was never gathered.
     #[test]
     fn row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget() {
         let pattern = "(?:x?){1020}z";
@@ -391,15 +310,6 @@ mod tests {
             "under the length gate"
         );
         let matcher = row_matcher(pattern).expect("compiles: the size ceiling admits this one");
-        let concrete = RegexRowMatch {
-            re: aterm_regex::RegexBuilder::new(pattern)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .step_limit(REGEX_STEP_LIMIT)
-                .build()
-                .expect("compiles"),
-        };
-
-        let before = regex_budget_exhaustions();
         let row = "x".repeat(4096);
         let started = std::time::Instant::now();
         assert!(
@@ -411,30 +321,16 @@ mod tests {
             "the row took {:?}; the step budget is not bounding the scan",
             started.elapsed()
         );
-        assert!(
-            regex_budget_exhaustions() > before,
-            "failing closed must be counted, or an `await` that never latches is unexplainable"
-        );
-
-        assert!(
-            !concrete.budget_exhausted(),
-            "a fresh matcher has nothing to report"
-        );
-        assert!(!concrete.matches(&row));
-        assert!(
-            concrete.budget_exhausted(),
-            "and a refused row is on its record"
-        );
 
         // A row it CAN finish still answers normally — the budget refuses the
         // expensive input, not the pattern.
         assert!(row_matcher(pattern).expect("compiles").matches("xxxz"));
     }
 
-    /// Ordinary watcher patterns over ordinary rows never touch the budget.
+    /// Ordinary watcher patterns over ordinary rows never touch the budget: a
+    /// row the budget refused would read as a non-match.
     #[test]
     fn ordinary_patterns_never_reach_the_scan_budget() {
-        let before = regex_budget_exhaustions();
         let row = "PROMPT-READY 66390b5c8f user@example.com 192.168.0.1 ERROR ".repeat(70);
         for pattern in [
             r"PROMPT-READY",
@@ -448,11 +344,6 @@ mod tests {
                 "{pattern:?} must match a full-width row of its own content"
             );
         }
-        assert_eq!(
-            regex_budget_exhaustions(),
-            before,
-            "no real pattern comes within three orders of magnitude of the budget"
-        );
     }
 
     /// RFC R2 purity, made a checkable invariant: a regex ENGINE must NOT appear

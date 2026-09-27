@@ -687,7 +687,7 @@ pub struct SoundEvent {
     pub tone: Tone,
     /// Whether this gesture may feed the ambient BED layer (the continuous
     /// per-style texture). Rides the per-event seam like `gain`, so the
-    /// host's `trail_sound_bed` setting (default OFF) takes effect on the
+    /// host's `trail_sound_bed` setting (default ON) takes effect on the
     /// next keystroke. With every event carrying `false` the bed is never
     /// energised, so the bed mixer contributes EXACTLY ZERO samples
     /// structurally (its level-floor early-out, grains included — not a
@@ -754,7 +754,7 @@ pub struct EventMeta {
     /// boundary. `0` = unknown; see [`TrailSynth::clock_s`].
     pub at_ms: u32,
     /// WHAT KIND OF GLYPH landed (§16 row 8), filled at the keyed seam only —
-    /// the twelve-way keyboard table of [`glyph_class`], produced by
+    /// the sixteen-way keyboard table of [`glyph_class`], produced by
     /// [`typed_glyph_class`] and nowhere else:
     ///
     /// | class | glyphs | name |
@@ -763,25 +763,54 @@ pub struct EventMeta {
     /// | `1` | `?` | `QMARK` |
     /// | `2` | `!` | `BANG` |
     /// | `3` | `0`..`9` | `DIGIT` |
-    /// | `4` | `.` `,` `;` `:` | `STOP` |
+    /// | `4` | `.` | `STOP` |
     /// | `5` | `(` `[` `{` | `OPEN` |
     /// | `6` | `)` `]` `}` | `CLOSE` |
     /// | `7` | `'` `"` `` ` `` | `QUOTE` |
-    /// | `8` | `-` `_` `~` `\` `\|` | `LINE` |
+    /// | `8` | `_` `~` `\` `\|` | `LINE` |
     /// | `9` | `/` | `RISE` |
     /// | `10` | `+` `=` `*` `%` `^` `<` `>` | `MATH` |
     /// | `11` | `@` `#` `$` `&` | `SIGIL` |
+    /// | `12` | `,` | `COMMA` |
+    /// | `13` | `;` | `SEMI` |
+    /// | `14` | `:` | `COLON` |
+    /// | `15` | `-` | `DASH` |
     ///
     /// Classes `0..=3` keep the meaning they had under the five-way split;
     /// `4` NARROWED from "any punctuation" to the four stops when the table
     /// grew on the owner's request of 2026-09-10 ("a sound effect for the
     /// shift key and shifted keys and for numbers and punctuation"). Read by
     /// `v2_typed` for the class voices (§10.4): a digit is a wood bar whose
-    /// sparkle counts, every other mark a knock with one literal gesture per
-    /// bucket. Still LOSSY — twelve classes beside eight rank buckets cannot
-    /// reconstruct text — and ASCII-only on purpose: the voices this picks
-    /// are keyboard-shaped taste, not Unicode categories. An echo-born cue
-    /// has no key behind it and must carry `0`, exactly as it must carry
+    /// sparkle counts, every other mark a staccato pluck with one literal
+    /// gesture per bucket.
+    ///
+    /// **`4` NARROWED AGAIN, to `.` alone, and `8` lost `-`** (2026-09-21), on
+    /// the owner's ruling of 2026-09-20: *"I want musical phrasing to
+    /// organically feel like it comes from punctuation choice."* A phrase
+    /// cannot come from the CHOICE of mark while the synth is told only "a
+    /// stop", so `,` `;` `:` and `-` each take an id of their own. The ids
+    /// are APPENDED — `0..=11` are numerically what they were, because the
+    /// value is the wire format of a side-car `u8`. The split itself moved
+    /// no sound (one commit, pinned field for field); the phrasing landed
+    /// on it the same day, and since then each of the five is its own
+    /// gesture — [`glyph_class`]'s constants say which, and
+    /// `the_split_classes_are_told_apart_and_an_unnamed_id_is_still_the_letter`
+    /// and `punctuation_phrases_the_line` pin them.
+    ///
+    /// WHAT THIS FIELD SAYS ABOUT THE TEXT, stated honestly: sixteen
+    /// classes, of which EIGHT name exactly one character — `?` `!` and `/`
+    /// already did under the twelve-way table, and `.` `,` `;` `:` `-` do
+    /// now: each is individually distinguishable to whoever reads this
+    /// side-car. Every other class is
+    /// a bucket of three or more glyphs, every letter is `0`, and there is
+    /// still NO CHARACTER here and none beside it: [`Self::rank`] is
+    /// unchanged by the split, folds case away and puts punctuation in
+    /// eight buckets. So the stream is still LOSSY — it cannot reconstruct
+    /// prose, a word, or a password's letters and digits — but it is no
+    /// longer true that punctuation is only ever a bucket, and this doc no
+    /// longer says so. ASCII-only on purpose: the voices this picks are
+    /// keyboard-shaped taste, not Unicode categories. An echo-born cue has
+    /// no key behind it and must carry `0`, exactly as it must carry
     /// `shifted: false`.
     pub glyph_class: u8,
     /// THE TYPED GLYPH'S ALPHABET RANK (§3.1's R2), filled at the keyed seam
@@ -895,11 +924,12 @@ pub fn typed_glyph_rank(typed: Option<char>) -> u8 {
     }
 }
 
-/// [`EventMeta::glyph_class`]'s names — the twelve buckets of the ONE class
-/// table. The host seam (`app_input::typed_glyph_class`), the offline
+/// [`EventMeta::glyph_class`]'s names — the sixteen buckets of the ONE class
+/// table (twelve until 2026-09-21, when `,` `;` `:` and `-` took ids of their
+/// own, APPENDED: `0..=11` are numerically unchanged). The host seam (`app_input::typed_glyph_class`), the offline
 /// `keyboard_song_ab` bench and the engine's own tests all call
 /// [`typed_glyph_class`], so no consumer can carry a second copy of this
-/// table that disagrees about what a glyph is: a synth that heard a knock
+/// table that disagrees about what a glyph is: a synth that heard a pluck
 /// where the host meant a digit would not be the synth the host was
 /// driving. The values are the wire format of a `u8` field and are part of
 /// §16 row 8's identity column (`0` = letter/unknown), so they are stated as
@@ -910,19 +940,27 @@ pub mod glyph_class {
     pub const LETTER: u8 = 0;
     /// `?` — the question that rises.
     pub const QMARK: u8 = 1;
-    /// `!` — the bang.
+    /// `!` — the bang: struck FORTE by class (since 2026-09-21 a tine, not
+    /// a pluck), and it lands on a C or a G.
     pub const BANG: u8 = 2;
     /// `0`..`9` — the wood bar that counts.
     pub const DIGIT: u8 = 3;
-    /// `.` `,` `;` `:` — the stops: a knock and a breath.
+    /// `.` — the full stop. Until 2026-09-21 this was all four stops (`,`
+    /// `;` `:` are now [`COMMA`], [`SEMI`] and [`COLON`]) and every one of
+    /// them was "a pluck and a breath". Since that day the dot that ENDS
+    /// something — the first of its space-delimited token, and not one
+    /// behind a digit — is steered to a C and rings as a tine with the
+    /// breath behind it; every other dot (`foo.bar`, `3.14`, `..`) is the
+    /// bare pluck, and does not breathe.
     pub const STOP: u8 = 4;
-    /// `(` `[` `{` — the brackets that open (not a knock: they open).
+    /// `(` `[` `{` — the brackets that open (not a pluck: they open).
     pub const OPEN: u8 = 5;
     /// `)` `]` `}` — the brackets that close.
     pub const CLOSE: u8 = 6;
     /// `'` `"` `` ` `` — the quotes.
     pub const QUOTE: u8 = 7;
-    /// `-` `_` `~` `\` `|` — a line drawn.
+    /// `_` `~` `\` `|` — a line drawn. Until 2026-09-21 `-` was here too;
+    /// it is now [`DASH`], a tie, and no longer zips.
     pub const LINE: u8 = 8;
     /// `/` — the slash that rises.
     pub const RISE: u8 = 9;
@@ -931,10 +969,25 @@ pub mod glyph_class {
     pub const MATH: u8 = 10;
     /// `@` `#` `$` `&` — every other ASCII mark.
     pub const SIGIL: u8 = 11;
+    /// `,` — the comma. APPENDED 2026-09-21 (owner, 2026-09-20: *"I want
+    /// musical phrasing to organically feel like it comes from punctuation
+    /// choice"*). A half cadence: the token's first lands on a D or a G, a
+    /// pluck 2 dB under a letter with a short breath; any later one is the
+    /// bare pluck.
+    pub const COMMA: u8 = 12;
+    /// `;` — the semicolon. Appended with [`COMMA`], and shaped as it is;
+    /// a deceptive turn, onto an E or an A.
+    pub const SEMI: u8 = 13;
+    /// `:` — the colon. Appended with [`COMMA`], and shaped as it is; an
+    /// announcement, onto a G with its fifth opening under it.
+    pub const COLON: u8 = 14;
+    /// `-` — the dash. Appended with [`COMMA`]. A TIE: it sounds the note
+    /// before it, held a little longer than a letter.
+    pub const DASH: u8 = 15;
 }
 
 /// [`EventMeta::glyph_class`] for a typed character — the ONE producer of the
-/// twelve-way class table ([`glyph_class`]), beside [`typed_glyph_rank`] for
+/// sixteen-way class table ([`glyph_class`]), beside [`typed_glyph_rank`] for
 /// the same reason: three consumers read it (the host seam, the bench, these
 /// tests) and a class stamped from two disagreeing copies is not a class.
 ///
@@ -952,11 +1005,15 @@ pub fn typed_glyph_class(typed: Option<char>) -> u8 {
         Some('?') => QMARK,
         Some('!') => BANG,
         Some(c) if c.is_ascii_digit() => DIGIT,
-        Some('.' | ',' | ';' | ':') => STOP,
+        Some('.') => STOP,
+        Some(',') => COMMA,
+        Some(';') => SEMI,
+        Some(':') => COLON,
         Some('(' | '[' | '{') => OPEN,
         Some(')' | ']' | '}') => CLOSE,
         Some('\'' | '"' | '`') => QUOTE,
-        Some('-' | '_' | '~' | '\\' | '|') => LINE,
+        Some('-') => DASH,
+        Some('_' | '~' | '\\' | '|') => LINE,
         Some('/') => RISE,
         Some('+' | '=' | '*' | '%' | '^' | '<' | '>') => MATH,
         // `@ # $ &` — the four ASCII marks no bucket above names.
@@ -3264,11 +3321,11 @@ struct Bed {
 // Ambient-bed TOURNAMENT — candidate variants behind the audition seam
 // ---------------------------------------------------------------------------
 
-/// One AMBIENT-BED TOURNAMENT candidate. Beds ship off-by-default behind
-/// `trail_sound_bed`, and the redesign of the low drone runs as a judged
-/// tournament: each candidate is a complete alternative continuous-bed
-/// design, rendered and measured by `examples/bed_audition.rs` against the
-/// real melody.
+/// One AMBIENT-BED TOURNAMENT candidate. Beds sit behind `trail_sound_bed`
+/// (default ON since the owner's 2026-09-09 ruling), and the redesign of the
+/// low drone runs as a judged tournament: each candidate is a complete
+/// alternative continuous-bed design, rendered and measured by
+/// `examples/bed_audition.rs` against the real melody.
 ///
 /// Selection is an ENGINE-LEVEL seam ([`TrailSynth::set_bed_variant`]), not a
 /// host setting: no config path reaches it, the default is [`Current`]
@@ -3304,8 +3361,9 @@ pub enum BedVariant {
     /// below ~4× the palette anchor — no low fundamental at all) fading in
     /// and out on slow incommensurate LFOs; air, not floor.
     Shimmer,
-    /// C4 — SILENCE: no bed. The shipping DEFAULT experience (the
-    /// `trail_sound_bed` gate is off) as an explicit tournament entrant, so
+    /// C4 — SILENCE: no bed. The `trail_sound_bed = false` experience (the
+    /// shipped default until the owner's 2026-09-09 ruling) as an explicit
+    /// tournament entrant, so
     /// "keep no bed" is judged with the same artifacts as every challenger.
     /// Contributes literally zero samples
     /// (`silence_candidate_contributes_exact_zero_bed_samples`).
@@ -3325,6 +3383,7 @@ impl BedVariant {
     /// Every tournament entrant, C0..C5 — the audition harness and the
     /// variant proofs iterate this so a new candidate is automatically
     /// rendered and law-checked.
+    #[cfg(test)]
     pub const ALL: [BedVariant; 6] = [
         BedVariant::Current,
         BedVariant::ChordDrift,
@@ -3442,6 +3501,26 @@ pub struct TrailSynth {
     /// 1.2 dB, which is larger than anything the echo does.
     #[cfg(test)]
     pub(crate) echo_trim: f32,
+    /// TEST-ONLY: spawn the music box's capital RING on its DRAWN phase
+    /// instead of locked to the strike's 2f — the negative control for the
+    /// 2026-09-20 phase lock (`rainbow_kitty_v2`'s ring pin). The draw count
+    /// is identical either way (`v2_spawn_ph0` always draws four), so the two
+    /// takes differ by the ring's phase and nothing else.
+    #[cfg(test)]
+    pub(crate) ring_unlocked: bool,
+    /// TEST-ONLY: leave a forte strike's modulator where `spawn` put it — on
+    /// the DRAWN angle to its carrier — instead of locked
+    /// (`rainbow_kitty_v2`'s `v2_lock_hammer`): the negative control for the
+    /// 2026-09-20 crest and peak pins. The lock draws nothing, so the two
+    /// takes differ by that one angle.
+    #[cfg(test)]
+    pub(crate) hammer_unlocked: bool,
+    /// TEST-ONLY: leave the bare Shift's ting at full level under the capital
+    /// it announced (`rainbow_kitty_v2`'s `v2_duck_ting`) — the negative
+    /// control for the 2026-09-20 ting + capital crest pin. The duck draws
+    /// nothing, so the two takes differ by the ting's level and nothing else.
+    #[cfg(test)]
+    pub(crate) ting_unducked: bool,
     inv_sr: f32,
     rng: u32,
     voices: [Voice; MAX_VOICES],
@@ -3531,7 +3610,10 @@ pub struct TrailSynth {
     /// that are ADMITTED (a lift the governor thinned made no sound, so it may
     /// not spend a step of the rotation), and never rewound: on the MODIFIER's
     /// own clock, which is a third clock again — the theme walks on accents,
-    /// the bass on words, the lift on shifts.
+    /// the bass on words, the lift on shifts. (The music box advances this
+    /// same cursor and, since 2026-09-20, reads it as an index into its own
+    /// `rainbow_kitty_v2::TING_PICK` — a pick of the live chord's tones —
+    /// rather than into the rotation.)
     shift_step: u8,
     /// THE WHITESPACE RUN'S LENGTH SO FAR, in spaces after the head (0 at the
     /// head, 1 at the second space …). Follows the TEXT like [`Self::space_run`]
@@ -3669,7 +3751,7 @@ pub struct TrailSynth {
     /// f32 second-count loses millisecond resolution after ~10 hours — a
     /// terminal runs for days. **It only advances while the host renders**;
     /// a host that pauses its output queue must call
-    /// [`Self::resume_after`] with the pause it skipped, or stamp `at_ms`.
+    /// `Self::resume_after` with the pause it skipped, or stamp `at_ms`.
     clock_s: f64,
     /// **THE v2 LATCH** (§9.7, §16 row 10): `true` from the first v2 trail
     /// event on. Two consumers, one bit: it arms the bus limiter in
@@ -3916,6 +3998,12 @@ impl TrailSynth {
         Self {
             #[cfg(test)]
             echo_trim: 1.0,
+            #[cfg(test)]
+            ring_unlocked: false,
+            #[cfg(test)]
+            hammer_unlocked: false,
+            #[cfg(test)]
+            ting_unducked: false,
             inv_sr: 1.0 / sample_rate.max(8_000.0),
             rng: seed | 1,
             voices: [Voice::default(); MAX_VOICES],
@@ -4149,6 +4237,7 @@ impl TrailSynth {
     /// it. The v1 governor's clocks are advanced too, because a pause is a
     /// pause for them as well. Non-finite or negative input is ignored: a
     /// clock never runs back. Never called by any pinned path.
+    #[cfg(test)]
     pub fn resume_after(&mut self, paused_s: f32) {
         if !paused_s.is_finite() || paused_s <= 0.0 {
             return;
@@ -4393,7 +4482,7 @@ impl TrailSynth {
                 _ => self.space_run = false,
             }
             // The ENERGY feed is what `ev.bed` gates (the `trail_sound_bed`
-            // setting, default OFF): un-fed, the bed's level never leaves its
+            // setting, default ON): un-fed, the bed's level never leaves its
             // exact-zero floor, so the bed mixer emits zero samples and spawns
             // zero grains — structurally, not via a zero gain. Flipping the
             // setting OFF mid-breath simply starves the feed: the live bed
@@ -6553,8 +6642,8 @@ impl TrailSynth {
         // exactly three places — `tick_bed` (which just ran, above), the
         // quiet early-out, and `push` — and none of them runs inside the
         // sample loop; no palette bed body touches it either. So the decision
-        // is made once here instead of 512 times, which is what the shipping
-        // `trail_sound_bed = false` default was paying for a layer whose
+        // is made once here instead of 512 times, which is what a
+        // `trail_sound_bed = false` setting was paying for a layer whose
         // level is EXACTLY 0.0.
         let bed_on = self.bed.level >= 1e-4;
         // §9.7's limiter coefficients: per-sample steps of its two time
@@ -9621,12 +9710,20 @@ mod tests {
     }
 
     /// **THE GLYPH CLASS IS ONE TABLE** (§16 row 8) for the host seam, the
-    /// `keyboard_song_ab` bench and the engine — the twelve keyboard buckets
+    /// `keyboard_song_ab` bench and the engine — the sixteen keyboard buckets
     /// of [`glyph_class`], stated glyph by glyph so a bucket cannot quietly
     /// gain or lose a mark. TOTAL over ASCII punctuation (every one of the 32
     /// marks lands in a named bucket, `@ # $ &` in `SIGIL`), `LETTER` for
     /// every letter, the space, `None` and every non-ASCII glyph, and nothing
-    /// above `SIGIL` for any `char` at all.
+    /// above `DASH` for any `char` at all.
+    ///
+    /// RE-PINNED 2026-09-21 from twelve buckets to sixteen, on the owner's
+    /// ruling of 2026-09-20 — *"I want musical phrasing to organically feel
+    /// like it comes from punctuation choice"* — which needs the synth to be
+    /// told WHICH stop was chosen: `STOP` is `.` alone, `, ; :` are `COMMA`,
+    /// `SEMI`, `COLON`, and `-` left `LINE` for `DASH`. The ids are the wire
+    /// format of a `u8`, so they are pinned NUMERICALLY below: `0..=11` are
+    /// what they were and `12..=15` are appended, never renumbered.
     #[test]
     fn the_glyph_class_table_is_one_for_host_bench_and_engine() {
         use glyph_class::*;
@@ -9636,15 +9733,28 @@ mod tests {
         for c in '0'..='9' {
             assert_eq!(typed_glyph_class(Some(c)), DIGIT, "{c:?}");
         }
-        let table: [(&str, u8); 8] = [
-            (".,;:", STOP),
+        // THE WIRE FORMAT: appended, never renumbered.
+        assert_eq!(
+            [
+                LETTER, QMARK, BANG, DIGIT, STOP, OPEN, CLOSE, QUOTE, LINE, RISE, MATH, SIGIL,
+                COMMA, SEMI, COLON, DASH,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "a class id moved: 0..=11 are the twelve-way table's, 12..=15 appended"
+        );
+        let table: [(&str, u8); 12] = [
+            (".", STOP),
             ("([{", OPEN),
             (")]}", CLOSE),
             ("'\"`", QUOTE),
-            ("-_~\\|", LINE),
+            ("_~\\|", LINE),
             ("/", RISE),
             ("+=*%^<>", MATH),
             ("@#$&", SIGIL),
+            (",", COMMA),
+            (";", SEMI),
+            (":", COLON),
+            ("-", DASH),
         ];
         let mut named = 2; // `?` and `!`
         for (glyphs, class) in table {
@@ -9662,7 +9772,7 @@ mod tests {
         assert_eq!(named, marks.len(), "a mark is in two buckets, or in none");
         for c in marks {
             assert!(
-                (QMARK..=SIGIL).contains(&typed_glyph_class(Some(c))),
+                (QMARK..=DASH).contains(&typed_glyph_class(Some(c))),
                 "{c:?} fell out of the mark buckets"
             );
         }
@@ -9677,7 +9787,7 @@ mod tests {
         for u in 0u32..0x3000 {
             if let Some(c) = char::from_u32(u) {
                 assert!(
-                    typed_glyph_class(Some(c)) <= SIGIL,
+                    typed_glyph_class(Some(c)) <= DASH,
                     "{c:?} classed out of range"
                 );
             }
@@ -10932,8 +11042,8 @@ mod tests {
         }
     }
 
-    /// BEDS ARE OFF BY DEFAULT: events carrying `bed: false` — what every
-    /// host event carries under the `trail_sound_bed` default — never
+    /// BED-OFF EVENTS ARE SILENT: events carrying `bed: false` — what every
+    /// host event carries with the `trail_sound_bed` setting off — never
     /// energise the bed layer, so
     /// the bed mixer contributes exactly ZERO samples (structurally: the
     /// level floor never lifts, grains never arm — not a gain-0 render),
@@ -14730,6 +14840,61 @@ mod tests {
         }
     }
 
+    /// …AND THE MUSIC BOX'S TING, UNDER THE FORTE CAPITAL (2026-09-20; owner:
+    /// *"I want shifted characters to sound more like FORTE in a piano"*, *"I
+    /// want the shift key press to sound like a high "ting""*). [`WALK_VOICES`]
+    /// is the twelve v1 voices, so the slot law above never read the music
+    /// box — the 2026-09-20 review caught the design's clause ("≥ 1.7 dB
+    /// under the capital on every slot") standing on no pin. Same fixture,
+    /// same five seeds, both spellings of the voice. The law is the 1.7 dB,
+    /// asserted on EVERY reading, not the seed-mean (the music box has no
+    /// beating twin to average out). MEASURED: seed-mean −12.05 dB at settle
+    /// 0 and −8.78..−9.69 on settles 1-12; worst single reading −8.08.
+    ///
+    /// The settle-0 capital is a session's first key — a WORD HEAD, the
+    /// owner's +5.6 dB accent under forte's hammer — and the ting is −4.5 dB
+    /// re the walk-mean key by fit, so ≈ −12 there is the two rulings added
+    /// together, not a whisper: v1's −12 floor is stated against a +2.6 dB
+    /// capital. The floor here is −13.5 on the seed-mean — it catches a ting
+    /// that fell out of its window (`rainbow_kitty_v2::TING_LEVEL`, ±1 dB)
+    /// and no more than that.
+    #[test]
+    fn the_music_box_ting_stays_under_the_forte_capital_on_every_slot() {
+        const UNDER_DB: f32 = -1.7;
+        const HEARD_DB: f32 = -13.5;
+        for (voice, style) in [
+            (SoundVoice::RainbowKittyV2, GlowStyle::Lumen),
+            (SoundVoice::Style, GlowStyle::RainbowKitty),
+        ] {
+            let mut worst = f32::MIN;
+            for settle in 0..=12 {
+                let mut mean = 0.0f32;
+                for seed in WALK_SEEDS {
+                    let cap = walk_peak_seeded(voice, style, settle, SoundKind::Typed, true, seed);
+                    let ting =
+                        walk_peak_seeded(voice, style, settle, SoundKind::Shift, false, seed);
+                    let db = 20.0 * (ting / cap).log10();
+                    assert!(
+                        db <= UNDER_DB,
+                        "{voice:?}/{style:?} after {settle} keys, seed {seed:#x}: the ting is \
+                         {db:+.2} dB re the capital it announces — not {UNDER_DB} under it"
+                    );
+                    worst = worst.max(db);
+                    mean += db;
+                }
+                mean /= WALK_SEEDS.len() as f32;
+                println!("music-box ting re capital, {voice:?} settle {settle}: {mean:+.2} dB");
+                assert!(
+                    mean >= HEARD_DB,
+                    "{voice:?}/{style:?} after {settle} keys: the ting is {mean:+.2} dB re its \
+                     capital over {} seeds — a whisper",
+                    WALK_SEEDS.len()
+                );
+            }
+            println!("music-box ting re capital, {voice:?}: worst single reading {worst:+.2} dB");
+        }
+    }
+
     /// THE LADDER HOLDS THROUGH THE NEW FAMILY, relatively and for EVERY
     /// voice in the roster: a correction (felt layer included) stays under
     /// the keystroke it undoes, the comma stays at or under the letters it
@@ -14772,6 +14937,18 @@ mod tests {
         /// under the lowest voice and a refit that drifted the ting back
         /// toward the whisper would fail before the bench's −4.5 dB edge.
         const LIFT_LADDER_FLOOR: f32 = 0.56;
+        /// **THE MUSIC BOX'S OWN FLOOR, 2026-09-20** (owner: *"I want the
+        /// shift key press to sound like a high "ting" like how the space
+        /// bar is a low tone and it needs to sound musical"*). Its ting is a
+        /// 200 ms bell now, where every v1 palette's is still the 85 ms one,
+        /// and a note that rings 2.4× as long is as present 1.5 dB lower:
+        /// the bench's target for it moved −3.0 → −4.5 dB re the walk-mean
+        /// Typed, and `rainbow_kitty_v2::TING_LEVEL` was fitted to it, on
+        /// the window's centre (−4.54). Against THIS test's
+        /// isolated session-first key — 1.4 dB hotter than the walk mean —
+        /// that reads 0.504. −6 dB is the floor the 2026-09-20 design states
+        /// for it; the v1 voices keep −5.
+        const MUSIC_BOX_LADDER_FLOOR: f32 = 0.50;
         fn peak(voice: SoundVoice, kind: SoundKind) -> f32 {
             let mut s = TrailSynth::new(48_000.0, 0x5EED_1234);
             let mut e = voiced(voice, GlowStyle::RainbowKitty, kind);
@@ -14801,10 +14978,17 @@ mod tests {
                 "{voice:?}: the comma must not rise over the letters \
                  (space {space} vs typed {typed})"
             );
+            // `Style` under the rainbow kitty look IS the music box, and so
+            // is the picker's own name for it.
+            let floor = if matches!(voice, SoundVoice::Style | SoundVoice::RainbowKittyV2) {
+                MUSIC_BOX_LADDER_FLOOR
+            } else {
+                LIFT_LADDER_FLOOR
+            };
             assert!(
-                shift <= typed * LIFT_LADDER_CEIL && shift >= typed * LIFT_LADDER_FLOOR,
+                shift <= typed * LIFT_LADDER_CEIL && shift >= typed * floor,
                 "{voice:?}: the ting is heard as a note beside the key, never over it \
-                 (shift {shift} vs typed {typed}: window [{LIFT_LADDER_FLOOR}, \
+                 (shift {shift} vs typed {typed}: window [{floor}, \
                  {LIFT_LADDER_CEIL}]; backspace {back}, space {space})"
             );
         }

@@ -1,0 +1,15 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, Zpe() (WebFetch: a bare select, NO key-hint footer), on the measured 2.1.280/2.1.281 box geometry · a Fetch box, footerless, its refusal marked `(esc)`
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Fetch
+
+   url: https://docs.rs/x
+   prompt: Summarize the API
+   Claude wants to fetch docs.rs
+
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docs.rs
+   3. No, and tell Claude what to do differently (esc)

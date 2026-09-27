@@ -36,7 +36,9 @@ use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::rainbow_kitty::TypedClass;
-use aterm_effects::rainbow_kitty::ribbon::{FLOW_TOTAL_S, RETIRE_MELT_S, WALK_FAST_CELLS};
+use aterm_effects::rainbow_kitty::ribbon::{
+    FLOW_TAIL_S, FLOW_TOTAL_S, HOT_EDGE_CELLS_MAX, RETIRE_MELT_S, WALK_FAST_CELLS, WALK_LAY_RATE,
+};
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
@@ -126,22 +128,22 @@ fn rule() -> String {
 }
 
 /// One ordinary key's echo, as captured: the glyph `ch` on 1-based column
-/// `c` of the text row, addressed from home, the status row touched, the
-/// caret put after it — inside a hide/show bracket.
-fn glyph_bytes(ch: char, c: usize) -> Vec<u8> {
+/// `c` of 1-based `row` (the text row), addressed from home, the status row
+/// touched, the caret put after it — inside a hide/show bracket.
+fn glyph_bytes(row: usize, ch: char, c: usize) -> Vec<u8> {
     format!(
-        "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}C\x1b[{}B{ch}\x1b[30;1H\x1b[{TEXT_ROW};{}H\x1b[?25h{SYNC_END}",
+        "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}C\x1b[{}B{ch}\x1b[30;1H\x1b[{row};{}H\x1b[?25h{SYNC_END}",
         c - 1,
-        TEXT_ROW - 1,
+        row - 1,
         c + 1
     )
     .into_bytes()
 }
 
 /// A Space's echo: the caret moves and nothing is written.
-fn space_bytes(c: usize) -> Vec<u8> {
+fn space_bytes(row: usize, c: usize) -> Vec<u8> {
     format!(
-        "{SYNC_BEGIN}\x1b[?25l\x1b[{TEXT_ROW};{}H\x1b[?25h{SYNC_END}",
+        "{SYNC_BEGIN}\x1b[?25l\x1b[{row};{}H\x1b[?25h{SYNC_END}",
         c + 1
     )
     .into_bytes()
@@ -175,6 +177,9 @@ struct Host {
     blink_seen: u64,
     /// The 1-based column the next glyph lands on.
     col: usize,
+    /// The 1-based row the next glyph lands on: the text row, or the row a
+    /// top-anchored box grew down onto.
+    row: usize,
 }
 
 impl Host {
@@ -204,6 +209,7 @@ impl Host {
             row_buf: Vec::new(),
             blink_seen: 0,
             col: 3,
+            row: TEXT_ROW,
         };
         h.frame();
         h
@@ -274,9 +280,9 @@ impl Host {
     /// An ordinary key on the text row: a glyph's echo or a Space's move.
     fn key(&mut self, ch: char) {
         let bytes = if ch == ' ' {
-            space_bytes(self.col)
+            space_bytes(self.row, self.col)
         } else {
-            glyph_bytes(ch, self.col)
+            glyph_bytes(self.row, ch, self.col)
         };
         self.press(ch, &bytes);
         self.col += 1;
@@ -381,6 +387,34 @@ impl Host {
         (den > 0.0).then(|| num / den)
     }
 
+    /// **THE HOT EDGE'S FAR TAIL** on `row` this frame, from column
+    /// `from_col` on: the light (width times summed channels) of the
+    /// additive quads riding the row's top MORE than `HOT_EDGE_CELLS_MAX`
+    /// behind the caret, where even the longest head's own falloff is dark
+    /// and only the new line's seam (`Ribbon::seam`) draws.
+    fn far_tail(&self, row: u16, from_col: u16) -> f32 {
+        let cw = CW as f32;
+        let from_x = f32::from(self.g.origin_x) + f32::from(from_col) * cw;
+        let head_x = f32::from(self.g.origin_x) + f32::from(self.term.cursor().col) * cw;
+        let y_lo = f32::from(self.g.origin_y) + (f32::from(row) - 0.5) * CH as f32;
+        let y_hi = y_lo + CH as f32;
+        self.out
+            .iter()
+            .filter(|q| {
+                let (x, y) = (f32::from(q.x), f32::from(q.y));
+                q.w > 0
+                    && y >= y_lo
+                    && y < y_hi
+                    && x >= from_x
+                    && x < head_x - (HOT_EDGE_CELLS_MAX + 1.0) * cw
+            })
+            .map(|q| {
+                let lum = (q.color >> 16 & 0xFF) + (q.color >> 8 & 0xFF) + (q.color & 0xFF);
+                f32::from(q.w) * lum as f32
+            })
+            .sum()
+    }
+
     /// The leftmost lit pixel on the row, or `None`.
     fn left_edge(&self, row: u16) -> Option<u16> {
         self.row_quads(row).map(|q| q.x).min()
@@ -412,6 +446,7 @@ impl Host {
             t: self.now.saturating_duration_since(start).as_secs_f32(),
             cov: self.coverage(row),
             centroid: self.centroid(row),
+            left: self.left_edge(row),
             resident: self.cells(row).len(),
         }
     }
@@ -423,6 +458,9 @@ struct Sample {
     t: f32,
     cov: f32,
     centroid: Option<f32>,
+    /// The row's leftmost lit pixel — the band's far edge on a row above
+    /// the caret.
+    left: Option<u16>,
     resident: usize,
 }
 
@@ -459,12 +497,18 @@ fn max_rise(curve: &[Sample]) -> f32 {
 /// `RISE_TOL`).
 const RISE_TOL: f32 = 2e-3;
 
-/// The largest frame-to-frame LEFTWARD move of the centroid, px.
-fn worst_left_step(curve: &[Sample]) -> f32 {
+/// The largest step the band's FAR EDGE took AWAY from the fold (left)
+/// between two frames that each still hold at least `floor` of the light,
+/// px — `0` when it only ever moved toward it. Below that share the last
+/// slabs' alpha bytes round in and out of zero (measured: a 7 px step back
+/// at 2 % of the light), which is not the band moving.
+fn worst_far_edge_step(curve: &[Sample], floor: f32) -> u16 {
     curve
         .windows(2)
-        .filter_map(|w| Some(w[0].centroid? - w[1].centroid?))
-        .fold(0.0, f32::max)
+        .filter(|w| w[0].cov >= floor && w[1].cov >= floor)
+        .filter_map(|w| Some(w[0].left?.saturating_sub(w[1].left?)))
+        .max()
+        .unwrap_or(0)
 }
 
 fn fmt(curve: &[Sample]) -> String {
@@ -473,11 +517,12 @@ fn fmt(curve: &[Sample]) -> String {
         .step_by(6)
         .map(|s| {
             format!(
-                "{:.2}:{:.3}/{}@{}",
+                "{:.2}:{:.3}/{}@{}L{}",
                 s.t,
                 s.cov,
                 s.resident,
-                s.centroid.map_or(-1.0, |c| c.round())
+                s.centroid.map_or(-1.0, |c| c.round()),
+                s.left.map_or(-1, i32::from)
             )
         })
         .collect::<Vec<_>>()
@@ -614,10 +659,19 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
         at(0.5).cov > 0.0 && at(0.5).resident > 0,
         "the followed row is still lit at +0.5 s: {shown}"
     );
+    // THE BAND FLOWS TOWARD THE FOLD (the drift, 2026-09-23): its far
+    // edge only ever moves toward the fold point. The light-weighted
+    // centroid is not the law any more: late in the far-first fade every
+    // stop sits near its OWN colour floor, and those floors differ by hue,
+    // so the weighted centre can drift back a few cells (measured 834 ->
+    // 793 px between +0.6 and +0.9 s here) while the band itself only ever
+    // slides toward the fold — the rigid slide's pitch is pinned in
+    // `ribbon.rs`'s drift test.
+    let far: Vec<(f32, Option<u16>)> = curve.iter().map(|s| (s.t, s.left)).collect();
     assert!(
-        worst_left_step(&curve) <= 0.5,
-        "the light's centroid moves monotonically toward the fold (right), never left \
-         by more than half a pixel: {shown}"
+        worst_far_edge_step(&curve, 0.05 * curve[0].cov) <= 1,
+        "the band's far edge moves only toward the fold (right) while it holds 5 % of its \
+         light: {far:?}"
     );
     let last_lit = curve.iter().rposition(|s| s.cov > 0.0).expect("lit");
     let (c0, c1) = (
@@ -655,17 +709,21 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
         "the flow is over by FLOW_TOTAL_S + a frame: dark at {dark}, empty at {empty}: {shown}"
     );
     assert!(
-        dark >= 0.9 * FLOW_TOTAL_S,
-        "…and not sooner than the flow's own span: dark at {dark}"
+        dark >= FLOW_TOTAL_S - FLOW_TAIL_S,
+        "…and not before the flow's last breath (its body thins out of the row's centre only \
+         then): dark at {dark}"
     );
 }
 
 /// **(3) THE NEW ROW'S WALK HAS NO STEP.** After the wrap and a few more
 /// keys, the continuation row's cells — the relaid `WH`, the reused `Y`,
 /// and the keys typed since — carry a `t` that is monotone at the walk's
-/// pace (no backward step; adjacent forward steps at most a sixteenth),
-/// and the relaid word's first cell has exactly the `t` its column had on
-/// the old row.
+/// pace (no backward step; every adjacent step the [`WALK_LAY_RATE`] the
+/// old row had reached — tightened 2026-09-23 from "at most a sixteenth",
+/// the allowance the owner's smoosh passed through; (3b) pins the pace on
+/// a row long enough to cross the fast leg's whole sixteen), and the
+/// relaid word's first cell has exactly the `t` its column had on the old
+/// row.
 ///
 /// RED on the unmodified tree by the mechanism: the wrap key's glyph
 /// minted a cohort at its own column and the relaid word walked UP from
@@ -700,9 +758,9 @@ fn the_new_rows_cells_carry_a_monotone_walk_and_the_relaid_word_keeps_the_t_it_h
             "a backward step from {t0} at column {c0} to {t1} at column {c1}: {ts:?}"
         );
         assert!(
-            t1 - t0 <= 1.0 / WALK_FAST_CELLS + 1e-4,
-            "a step wider than the walk's pace from {t0} at column {c0} to {t1} at column \
-             {c1}: {ts:?}"
+            (t1 - t0 - WALK_LAY_RATE).abs() < 1e-4,
+            "a step off the walk's pace from {t0} at column {c0} to {t1} at column {c1} — \
+             the old row laid at WALK_LAY_RATE: {ts:?}"
         );
     }
     let (_, t_first) = ts[0];
@@ -711,6 +769,108 @@ fn the_new_rows_cells_carry_a_monotone_walk_and_the_relaid_word_keeps_the_t_it_h
         "the relaid word's first cell has exactly the t its column had on the old row: \
          {t_first} against {t_w}: {ts:?}"
     );
+}
+
+/// The keys after the wrap for the PACE law: long enough that the
+/// continuation row is laid well past [`WALK_FAST_CELLS`] from its first
+/// cell (columns 2..=45, 44 cells), so a walk that restarted its fast phase
+/// at the fold is caught over the whole of it AND past its end.
+const AFTER_LONG: &str = " ATERM claude code how is the rainbow now";
+
+/// **(3b) THE NEW ROW KEEPS THE PACE THE OLD ROW HAD** (2026-09-23 — the
+/// owner, on v0.91.0 with Claude Code v2.1.280's composer wrapped onto a
+/// third row: *"fix this rainbow cursor issue where the spectrum is
+/// smooshed on the next line. I want smooth continuous rainbow"*; his row
+/// `of using the accoutn to ▮`, ~22 cells, carried the WHOLE arc from
+/// violet back round to red). The sibling of (3), which bounds each step
+/// at a sixteenth — the very allowance that lets the smoosh through.
+///
+/// The old row was typed 86 cells from its first, so its walk had long
+/// left the `d/16` fast phase and was laying at [`WALK_LAY_RATE`] a cell
+/// (asserted here as the premise, off the old row's own `W`/`H` cells).
+/// After the wrap and 41 more keys the continuation row's cells must
+/// CONTINUE that walk — the colour AND the pace: every laid column `c`
+/// from the relaid `W` at 2 carries `t_w + (c − 2) · WALK_LAY_RATE`, so the
+/// relaid `H` has exactly the `t` it had on the old row (column 87), and
+/// every adjacent step is the old row's step, to 1e-4.
+///
+/// RED on the unmodified tree by the mechanism: the relay minted its cohort
+/// at the word's first column with `t0 = t_w` and `anchor_col = 2`, and
+/// `Cohort::t_at` reads `t0 + walk_t(col − anchor_col)` — the walk's
+/// distance restarted at zero, so the first sixteen cells of the new row
+/// ran at `1/16` a cell, 2.25× the `1/36` the old row had reached: a full
+/// sweep of the arc in sixteen cells.
+#[test]
+fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
+    let (mut h, _, _, t_w) = typed_to_the_wrap();
+    // THE PREMISE: the old row's pace at its end, read off its own cells.
+    let old = |h: &Host, col: u16| {
+        h.ribbon()
+            .cells()
+            .iter()
+            .find(|c| c.row == OLD_ROW && c.col == col && !c.leaving())
+            .map(|c| c.t)
+            .unwrap_or_else(|| panic!("the old row's cell at {col}"))
+    };
+    let (t_space, t_h) = (old(&h, 85), old(&h, 87));
+    let old_pace = t_h - t_w;
+    assert!(
+        (old_pace - WALK_LAY_RATE).abs() < 1e-4 && (t_w - t_space - WALK_LAY_RATE).abs() < 1e-4,
+        "the premise: the old row lays at WALK_LAY_RATE at its end — {t_space} @85, \
+         {t_w} @86, {t_h} @87"
+    );
+    h.wrap(LINE1);
+    h.next_frame();
+    h.type_str(AFTER_LONG);
+    h.next_frame();
+    h.idle(100);
+    let rib = h.ribbon();
+    let last = 4 + AFTER_LONG.len() as u16;
+    let ts: Vec<(u16, f32)> = (2..=last)
+        .map(|col| {
+            let t = rib.field_at(OLD_ROW, col).unwrap_or_else(|| {
+                panic!(
+                    "column {col} of the new row is laid: {:?}",
+                    h.cells(OLD_ROW)
+                )
+            });
+            (col, t)
+        })
+        .collect();
+    assert!(
+        ts.len() as f32 > WALK_FAST_CELLS + 4.0,
+        "the new row is laid past the walk's fast phase: {} cells",
+        ts.len()
+    );
+    // The pace: every step is the old row's step.
+    for w in ts.windows(2) {
+        let (c0, t0) = w[0];
+        let (c1, t1) = w[1];
+        assert!(
+            (t1 - t0 - old_pace).abs() < 1e-4,
+            "the new row's step from column {c0} to {c1} is {} — the old row laid at \
+             {old_pace} a cell at its end; the walk restarted its pace at the fold: {ts:?}",
+            t1 - t0
+        );
+    }
+    // The seam: the colour is continuous — the relaid word keeps the
+    // colours it had on the old row.
+    let (_, t_first) = ts[0];
+    let (_, t_second) = ts[1];
+    assert!(
+        (t_first - t_w).abs() < 1e-4 && (t_second - t_h).abs() < 1e-4,
+        "the relaid `WH` keeps the t it had on the old row: `W` {t_first} against \
+         {t_w}, `H` {t_second} against {t_h}: {ts:?}"
+    );
+    // …and so every column is the old walk continued.
+    for &(col, t) in &ts {
+        let want = t_w + f32::from(col - 2) * WALK_LAY_RATE;
+        assert!(
+            (t - want).abs() < 1e-3,
+            "column {col} of the new row is {t}, the old row's walk continued is {want}: \
+             {ts:?}"
+        );
+    }
 }
 
 /// **(5) THE NEGATIVE CONTROL: A TRUE RE-LAYOUT STILL MELTS.** The same
@@ -859,5 +1019,427 @@ fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
              {run:?}\ncontrol {ctl:?}\ncells {:?}",
             h.cells(OLD_ROW)
         );
+    }
+}
+
+/// **(6b) AN UNWRAP TAKES THE SEAM OFF THE LINE THE HAND CAME BACK TO**
+/// (2026-09-25, the review of the drift). The wrap armed the new-line seam
+/// on the caret's row (the follow pass carried line 1 up off it); the
+/// Backspace that unwraps repaints the box a row lower and the follow pass
+/// carries line 1 back DOWN onto the caret's row — which no longer holds a
+/// continued line at all. The caret's row never changed, so nothing that
+/// clears the seam ran, and as the Backspace run reached line 1's own band
+/// the seam's floor lit its whole tail from column 2 (measured 42,427
+/// lum·px in one frame, against ~10 with the seam cleared). The far tail
+/// under the Backspace run after the round trip stays at the level of the
+/// same run on a line that never wrapped (the control). RED before the
+/// carried-back run cleared the seam.
+///
+/// Read from column 12 on: for the first two Backspaces the hand's hot edge
+/// is still the continuation word's (`WHY` at 2..4, whose `Y` stands over
+/// line 1's `Y` and is the newest cell on the row), and its own falloff
+/// reaches back to column 2 (1,888 lum·px) — the head's, not the seam's,
+/// and the same with the seam cleared. The seam, left armed, lit the whole
+/// tail from column 2 to the head's falloff, so what it drew past column 12
+/// is still almost all of it.
+#[test]
+fn an_unwrap_takes_the_seam_off_the_line_the_hand_came_back_to() {
+    const TAIL_FROM: u16 = 12;
+    // Eight Backspaces from `from_col` at the hand's cadence, the frames
+    // run until `until`; the worst frame's far tail on the caret's row.
+    fn backspaces(h: &mut Host, from_col: usize, n: usize, until: Instant) -> f32 {
+        let (mut k, mut worst) = (0usize, 0.0f32);
+        while h.next_frame <= until {
+            let due = h.last_key + Duration::from_millis(KEY_MS);
+            if k < n && h.next_frame > due {
+                h.advance_to(due);
+                h.now = due;
+                h.last_key = due;
+                h.glow.note_backspace(due);
+                let col = from_col - 1 - k;
+                h.term
+                    .process(format!("\x1b[{TEXT_ROW};{col}H\x1b[K").as_bytes());
+                k += 1;
+            }
+            h.next_frame();
+            worst = worst.max(h.far_tail(OLD_ROW, TAIL_FROM));
+        }
+        worst
+    }
+    let line = format!("{LINE1} WH");
+    let from_col = 3 + line.chars().count();
+    // The control: the same line and the same Backspace run, no round trip.
+    let (mut c, _, _, _) = typed_to_the_wrap();
+    let until = c.now + Duration::from_millis(1600);
+    let ctl = backspaces(&mut c, from_col, 8, until);
+    for idle in [40u64, 100, 300] {
+        let (mut h, _, _, _) = typed_to_the_wrap();
+        h.wrap(LINE1);
+        h.next_frame();
+        let wrapped = h.last_key;
+        h.idle(idle);
+        let t = h.now.max(h.last_key + Duration::from_millis(KEY_MS));
+        h.advance_to(t);
+        h.now = t;
+        h.last_key = t;
+        h.glow.note_backspace(t);
+        let before = h.followed();
+        h.term.process(&unwrap_bytes(&line));
+        h.next_frame();
+        assert!(
+            h.followed() > before,
+            "unwrap {idle} ms after the wrap: the follow pass carried line 1 back down"
+        );
+        let got = backspaces(&mut h, from_col, 8, wrapped + Duration::from_millis(1600));
+        assert!(
+            got <= 2.0 * ctl + 200.0,
+            "unwrap {idle} ms after the wrap: the new-line seam stayed on the line the hand \
+             came back to — its far tail reads {got} lum·px in a frame, where the line that \
+             never wrapped reads {ctl}"
+        );
+    }
+}
+
+/// Every cohort on `row`: `(anchor_col, t0, d0, col0..col1, abandoned)` —
+/// the diagnostic the walk laws below print on failure.
+fn cohorts_on(h: &Host, row: u16) -> Vec<(u16, f32, f32, u16, u16, bool)> {
+    h.ribbon()
+        .cohorts()
+        .iter()
+        .filter(|k| k.row == row)
+        .map(|k| (k.anchor_col, k.t0, k.d0, k.col0, k.col1, k.abandoned))
+        .collect()
+}
+
+/// **(7) A WRAP WHOSE OLD ROW MELTS STILL CONTINUES THE WALK ON THE NEXT
+/// ROW** (2026-09-23, the audit of the walk odometer — the owner: *"fix
+/// this rainbow cursor issue where the spectrum is smooshed on the next
+/// line. I want smooth continuous rainbow"*). (5)'s shape — the box grows
+/// with OTHER text a row up, so nothing follows and the old band melts in
+/// `RETIRE_MELT_S` — and the hand typing on at 60 ms, so its first keys
+/// land while the melting cells are still resident and their run's bounds
+/// still span the row. A run with no standing cell is not a band a key can
+/// join (`Ribbon::join_cohort`): the continuation row must CONTINUE the
+/// walk the old row had, colour and pace — every column `c` from the
+/// relaid `W` at 2 carries `t_w + (c − 2) · WALK_LAY_RATE`, exactly (3b)'s
+/// law for a wrap that followed — and never restart at red on the `1/16`
+/// fast leg.
+///
+/// RED before 2026-09-23 (the audit measured it at 60, 90 and 130 ms
+/// keys): the keys joined the melting run and read its walk column by
+/// column from its own anchor — the row above's colours again, from red,
+/// sixteen cells to the whole arc: the smoosh, with the odometer in place.
+#[test]
+fn after_a_wrap_whose_old_row_melts_the_next_row_continues_the_walk_at_its_pace() {
+    let (mut h, _, _, t_w) = typed_to_the_wrap();
+    let other: String = LINE1
+        .chars()
+        .map(|c| match c {
+            'a'..='z' => (((c as u8 - b'a' + 13) % 26) + b'a') as char,
+            'A'..='Z' => (((c as u8 - b'A' + 13) % 26) + b'A') as char,
+            c => c,
+        })
+        .collect();
+    h.wrap(&other);
+    h.next_frame();
+    assert_eq!(
+        h.followed(),
+        0,
+        "the premise: nothing followed, the old row melts"
+    );
+    h.type_str(AFTER_LONG);
+    h.next_frame();
+    h.idle(100);
+    let rib = h.ribbon();
+    let last = 4 + AFTER_LONG.len() as u16;
+    let ts: Vec<(u16, f32)> = (2..=last)
+        .map(|col| {
+            let t = rib.field_at(OLD_ROW, col).unwrap_or_else(|| {
+                panic!(
+                    "column {col} of the new row is laid: {:?}",
+                    h.cells(OLD_ROW)
+                )
+            });
+            (col, t)
+        })
+        .collect();
+    for &(col, t) in &ts {
+        let want = t_w + f32::from(col - 2) * WALK_LAY_RATE;
+        assert!(
+            (t - want).abs() < 1e-3,
+            "column {col} of the row after a melted wrap is {t}, the old row's walk \
+             continued is {want}: {ts:?}\ncohorts {:?}",
+            cohorts_on(&h, OLD_ROW)
+        );
+    }
+}
+
+/// The line typed before a composer newline: thirty letters from the text
+/// row's first column (1-based 3), a cold walk past its knee.
+const LINE_A: &str = "abcdefghijklmnopqrstuvwxyzabcd";
+
+/// **SHIFT+ENTER IN THE BOTTOM-ANCHORED BOX** (modelled on the captured wrap
+/// chunk, not captured itself: Ink lays the box out the same way whether
+/// its second text row comes from a soft wrap or a hard newline): the rule
+/// repainted one row up (row 26), `line` rewritten on row 27, the text row
+/// 28 cleared, and the caret homed to the box's inset `(28, 3)` — the SAME
+/// row it was on.
+fn newline_up_bytes(line: &str) -> Vec<u8> {
+    format!(
+        "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}B{}\r\x1b[1B\u{276f}\u{a0}{line}\x1b[K\r\x1b[1B\x1b[K\x1b[30;1H\x1b[{TEXT_ROW};3H\x1b[?25h{SYNC_END}",
+        RULE_ROW - 2,
+        rule()
+    )
+    .into_bytes()
+}
+
+/// **…AND IN A TOP-ANCHORED BOX** (the control): the box grows DOWN — the
+/// text row keeps `line`, the new line opens on row 29, the status moves
+/// to row 30 — and the caret changes row, `(28, 33) → (29, 3)`.
+fn newline_down_bytes() -> Vec<u8> {
+    format!(
+        "{SYNC_BEGIN}\x1b[?25l\x1b[29;1H  \x1b[K\x1b[30;1H  auto mode on\x1b[K\x1b[29;3H\x1b[?25h{SYNC_END}"
+    )
+    .into_bytes()
+}
+
+/// **(8) CLAUDE CODE'S SHIFT+ENTER STARTS THE WALK AGAIN, WHICHEVER WAY THE
+/// BOX GROWS** (2026-09-23, the audit of `Ribbon::fresh_line`). Thirty keys
+/// from the text row's first column, Shift+Enter as the host hands it over
+/// (`app_input`: the composer-newline hint and the typed stamp; the hint
+/// sends a separate key-time `ComposerNewline` event, not `note_return`), the
+/// box's repaint, and twenty keys on the new line. The new line continues
+/// the colour one step past the old line's end and starts its walk: `d0 =
+/// 0`, `1/16` a cell for its first sixteen cells — in Claude Code's
+/// bottom-anchored box (its repaint here is `newline_up_bytes`, MODELLED
+/// on the captured wrap chunk: a Shift+Enter's own bytes were not
+/// captured), where the old line is carried a row UP and the caret stays
+/// on its row, exactly as in the top-anchored control, where the caret
+/// moves down a row.
+///
+/// RED before 2026-09-23 in the bottom-anchored box (the audit measured
+/// it): the newline's `Licence::Return` move was same-row, the gate's row
+/// clause refused it, and the new line carried the old walk's distance —
+/// `d0 = 30`, stepping `1/36` from its first cell. The control was green.
+#[test]
+fn a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too() {
+    for bottom in [true, false] {
+        let what = if bottom {
+            "bottom-anchored (Claude Code)"
+        } else {
+            "top-anchored (the control)"
+        };
+        let mut h = Host::new();
+        h.type_str(LINE_A);
+        h.next_frame();
+        let old = *h
+            .ribbon()
+            .cohorts()
+            .iter()
+            .find(|k| k.row == OLD_ROW && k.anchor_col == 2)
+            .expect("the old line's run");
+        assert_eq!(
+            old.col1, 32,
+            "{what}: the premise, thirty cells from column 2"
+        );
+        let t_next = old.t_at(32);
+        // Shift+Enter: the newline hint and the typed stamp at the key.
+        let t = h.last_key + Duration::from_millis(KEY_MS);
+        h.advance_to(t);
+        h.now = t;
+        h.last_key = t;
+        h.glow.note_newline_break(t);
+        h.glow.note_typed_glyph(t, 1, true, TypedClass::Glyph);
+        if bottom {
+            h.term.process(&newline_up_bytes(LINE_A));
+            h.col = 3;
+        } else {
+            h.term.process(&newline_down_bytes());
+            h.row = TEXT_ROW + 1;
+            h.col = 3;
+        }
+        h.next_frame();
+        let row = if bottom { OLD_ROW } else { OLD_ROW + 1 };
+        let c = h.term.cursor();
+        assert_eq!(
+            (c.row, c.col),
+            (row, 2),
+            "{what}: the caret at the new line's inset"
+        );
+        h.type_str(&LINE_A[..20]);
+        h.next_frame();
+        h.idle(100);
+        let line = h
+            .ribbon()
+            .cohorts()
+            .iter()
+            .filter(|k| k.row == row && k.anchor_col == 2 && k.born > t)
+            .max_by_key(|k| k.born)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{what}: the new line is a run of its own: {:?}",
+                    cohorts_on(&h, row)
+                )
+            });
+        assert!(
+            line.d0 == 0.0 && (line.t0 - t_next).abs() < 1e-5,
+            "{what}: the new line continues the colour ({} against {t_next}) and starts its \
+             walk (d0 {}): {:?}",
+            line.t0,
+            line.d0,
+            cohorts_on(&h, row)
+        );
+        let ts: Vec<(u16, f32)> = (2..=18u16)
+            .map(|col| {
+                let t = h
+                    .ribbon()
+                    .field_at(row, col)
+                    .unwrap_or_else(|| panic!("{what}: column {col} of the new line is laid"));
+                (col, t)
+            })
+            .collect();
+        for w in ts.windows(2) {
+            let ((c0, t0), (c1, t1)) = (w[0], w[1]);
+            assert!(
+                (t1 - t0 - 1.0 / WALK_FAST_CELLS).abs() < 1e-4,
+                "{what}: the new line's step from column {c0} to {c1} is {} — a new line walks \
+                 the fast leg: {ts:?}",
+                t1 - t0
+            );
+        }
+    }
+}
+
+/// **(9) …HOWEVER SOON THE NEW LINE'S FIRST KEY FOLLOWS THE SHIFT+ENTER**
+/// (2026-09-24, the review of the landing). (8)'s gesture with the first
+/// key of the new line pressed BEFORE the frame that observes the box's
+/// repaint: in mode 1 the repaint lands at the chord and the key is pressed
+/// half-way to the next frame; in mode 2 Ink is slower than the hand — the
+/// key 20 or 45 ms after the chord, the repaint processed after the key.
+/// Either way the key's echo is swept on the key's own press clock, which
+/// is EARLIER than the instant the host observed the newline's move. The
+/// gate the move armed (`Ribbon::fresh_line`) was dated at that observation,
+/// and a same-row home records no row the hand left, so the gate refused
+/// the key: the new line minted on the old walk's distance.
+///
+/// RED before the fix in the bottom-anchored box, measured by the review:
+/// `d0 = 30` and every step `1/36` (`0.0278`) in both modes, both lags;
+/// the top-anchored control (a cross-row move) restarted. The gate is now
+/// dated at the chord's press, ignores that chord's own stamp, and waits
+/// for the observed home before its first real echo can spend it.
+#[test]
+fn a_shift_enter_newline_starts_the_walk_again_however_soon_the_first_key_follows() {
+    for bottom in [true, false] {
+        for (mode, lag_ms) in [(1u8, 0u64), (2, 20), (2, 45)] {
+            let when = if mode == 1 {
+                "half-way to the next frame".to_string()
+            } else {
+                format!("{lag_ms} ms after the chord")
+            };
+            let what = format!(
+                "{}, mode {mode}, key {when}",
+                if bottom {
+                    "bottom-anchored (Claude Code)"
+                } else {
+                    "top-anchored (the control)"
+                }
+            );
+            let mut h = Host::new();
+            h.type_str(LINE_A);
+            h.next_frame();
+            let old = *h
+                .ribbon()
+                .cohorts()
+                .iter()
+                .find(|k| k.row == OLD_ROW && k.anchor_col == 2)
+                .expect("the old line's run");
+            assert_eq!(old.col1, 32, "{what}: the premise, thirty cells");
+            let t_next = old.t_at(32);
+            // Shift+Enter: the newline hint and the typed stamp at the key.
+            let t = h.last_key + Duration::from_millis(KEY_MS);
+            h.advance_to(t);
+            h.now = t;
+            h.last_key = t;
+            h.glow.note_newline_break(t);
+            h.glow.note_typed_glyph(t, 1, true, TypedClass::Glyph);
+            let repaint = if bottom {
+                newline_up_bytes(LINE_A)
+            } else {
+                newline_down_bytes()
+            };
+            if mode == 1 {
+                h.term.process(&repaint);
+            }
+            // The new line's first key: half-way to the next frame (mode
+            // 1), or `lag_ms` after the chord (mode 2).
+            let k = if mode == 1 {
+                t + (h.next_frame - t) / 2
+            } else {
+                t + Duration::from_millis(lag_ms)
+            };
+            h.advance_to(k);
+            h.now = k;
+            h.last_key = k;
+            h.glow.note_typed_glyph(k, 1, false, TypedClass::Glyph);
+            if mode == 2 {
+                h.term.process(&repaint);
+            }
+            h.row = if bottom { TEXT_ROW } else { TEXT_ROW + 1 };
+            h.col = 3;
+            h.next_frame();
+            let row = if bottom { OLD_ROW } else { OLD_ROW + 1 };
+            let c = h.term.cursor();
+            assert_eq!(
+                (c.row, c.col),
+                (row, 2),
+                "{what}: the caret at the new line's inset"
+            );
+            h.term.process(&glyph_bytes(h.row, 'a', h.col));
+            h.col += 1;
+            h.next_frame();
+            h.type_str(&LINE_A[1..20]);
+            h.next_frame();
+            h.idle(100);
+            let line = h
+                .ribbon()
+                .cohorts()
+                .iter()
+                .filter(|q| q.row == row && q.anchor_col == 2 && q.born > t)
+                .max_by_key(|q| q.born)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{what}: the new line is a run of its own: {:?}",
+                        cohorts_on(&h, row)
+                    )
+                });
+            assert!(
+                line.d0 == 0.0 && (line.t0 - t_next).abs() < 1e-5,
+                "{what}: the new line continues the colour ({} against {t_next}) and starts \
+                 its walk (d0 {}): {:?}",
+                line.t0,
+                line.d0,
+                cohorts_on(&h, row)
+            );
+            let ts: Vec<(u16, f32)> = (2..=18u16)
+                .map(|col| {
+                    let t = h
+                        .ribbon()
+                        .field_at(row, col)
+                        .unwrap_or_else(|| panic!("{what}: column {col} of the new line is laid"));
+                    (col, t)
+                })
+                .collect();
+            for w in ts.windows(2) {
+                let ((c0, t0), (c1, t1)) = (w[0], w[1]);
+                assert!(
+                    (t1 - t0 - 1.0 / WALK_FAST_CELLS).abs() < 1e-4,
+                    "{what}: the new line's step from column {c0} to {c1} is {} — a new line \
+                     walks the fast leg: {ts:?}",
+                    t1 - t0
+                );
+            }
+        }
     }
 }

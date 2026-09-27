@@ -64,15 +64,47 @@
 //! uniform period at every seam (no doubled line, machine-checked by
 //! `tests/shade_phase.rs`).
 
+mod icons;
+mod symbols;
+
+pub use icons::{IconMetrics, band_icon_coverage, band_icon_width};
+
+/// Whether `ch` is a LAST-RESORT symbol this module can draw without a font:
+/// the media controls (⏩⏪⏫⏬⏭⏮⏯ ⏴⏵⏶⏷ ⏸⏹⏺), the common Geometric Shapes
+/// (■□▪▫ ▲△▶▷▼▽◀◁ ►◄ ◆◇ ●○◐◑◒◓ ◢◣◤◥ …), the check marks and crosses
+/// (✓✔✕✖✗✘), and ⚪⚫ ⬤ ⭘. (Claude Code's `⎿` connector is NOT here: it
+/// must join a `│` above it, so it is in the pre-emptive [`covers`] family.)
+///
+/// DISJOINT from [`covers`] and deliberately NOT a pre-emptive family: these
+/// are consulted only as the LAST tier of the resolution chain
+/// ([`crate::font_chain::Tier::Synthetic`]), after every real face has missed,
+/// so a font that has the glyph always draws it and only `.notdef` tofu is
+/// replaced. See `procedural/symbols.rs` for the measured miss that motivated
+/// it (U+23F5 in the Claude Code / Codex footer, covered by no face on a bare
+/// Linux host).
+pub fn covers_symbol(ch: char) -> bool {
+    symbols::covers(ch)
+}
+
+/// The last-resort coverage bitmap for a [`covers_symbol`] char: row-major
+/// `span * cell_w` × `cell_h` bytes (`span` is the glyph's cell count, clamped
+/// to `1..=2`; a wide emoji-presentation symbol is centred across both cells),
+/// 8-bit anti-aliased coverage. `None` outside the symbol set or for a
+/// degenerate cell.
+pub fn symbol_coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> Option<Vec<u8>> {
+    symbols::coverage(ch, cell_w, cell_h, span)
+}
+
 /// Whether `ch` is in a range this module draws (box drawing U+2500–257F,
 /// block elements U+2580–259F, braille U+2800–28FF, legacy sextants /
 /// wedges / eighth blocks U+1FB00–1FB8B, Powerline separators U+E0B0–E0BF —
 /// centred solid/outline triangles, rounded half-circles, and the four corner
-/// ("angled") triangles + outlines).
+/// ("angled") triangles + outlines), and the `⎿` tree connector U+23BF, which
+/// is a box-drawing stroke in all but block name and must tile with `│`.
 pub fn covers(ch: char) -> bool {
     matches!(
         u32::from(ch),
-        0x2500..=0x259F | 0x2800..=0x28FF | 0x1FB00..=0x1FB8B | 0xE0B0..=0xE0BF
+        0x23BF | 0x2500..=0x259F | 0x2800..=0x28FF | 0x1FB00..=0x1FB8B | 0xE0B0..=0xE0BF
     )
 }
 
@@ -128,6 +160,7 @@ pub fn coverage_phased(
             usize::from(phase_x),
             usize::from(phase_y),
         ),
+        0x23BF => symbols::draw_dentistry_bottom_right(&mut c),
         0x2500..=0x257F => draw_box(&mut c, &m, cp),
         0x2580..=0x259F => draw_block(&mut c, cp),
         0x2800..=0x28FF => draw_braille(&mut c, cp),

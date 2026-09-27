@@ -20,7 +20,7 @@
 //! | --- | --- | --- |
 //! | macOS / iOS | `SecTrustEvaluateWithError` ([`apple`]) | end-entity, from a stapled OCSP response only (network fetch is off) |
 //! | Windows | `CertGetCertificateChain` + `CertVerifyCertificateChainPolicy` ([`windows`]) | end-entity, may retrieve over the network |
-//! | Linux, BSD | the distro's on-disk CA store, verified by `rustls`'s own webpki ([`unix`]) | **none** |
+//! | Linux, BSD | the distro's on-disk CA store, verified by `rustls`'s own webpki (`unix`) | **none** |
 //! | wasm32, Android, anything else | nothing — construction fails ([`unsupported`]) | n/a |
 //!
 //! Every one of those rows describes what `rustls-platform-verifier` did too,
@@ -81,21 +81,17 @@ mod windows;
 #[cfg(windows)]
 use windows as imp;
 
-// COMPILED ON EVERY UNIX, INCLUDING APPLE — where it is not the selected arm.
-// Two reasons, both about not shipping a module nobody has ever compiled: a
-// Mac-only `cargo build` still type-checks it, and `unix::tests` drives its
-// store discovery, its tolerant PEM path and its chain math natively against
-// `/etc/ssl/cert.pem`, which is the same shape of bundle a Linux box has. What
-// that still leaves unproven is named in `unix`'s own header.
-#[cfg(all(unix, not(target_os = "android")))]
-#[cfg_attr(
-    all(target_vendor = "apple", not(test)),
-    expect(
-        dead_code,
-        reason = "on Apple this module is compiled for its type-checking and \
-        its tests, but `apple` is the arm that runs"
-    )
-)]
+// ALSO COMPILED IN APPLE TEST BUILDS — where it is not the selected arm, and
+// where `unix::tests` drives its store discovery, its tolerant PEM path and its
+// chain math natively against `/etc/ssl/cert.pem`, the same shape of bundle a
+// Linux box has. A shipped Apple build does not carry it (it is not the arm
+// that runs there); the Linux cells of `xtask gate cells` type-check it for
+// the triples that do. What that still leaves unproven is named in `unix`'s
+// own header.
+#[cfg(any(
+    all(unix, not(target_vendor = "apple"), not(target_os = "android")),
+    all(test, target_vendor = "apple")
+))]
 mod unix;
 #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
 use unix as imp;
@@ -166,21 +162,25 @@ impl std::error::Error for EkuError {}
 ///
 /// This is NOT a trust verdict and must never be counted as one: it is reported
 /// before any chain evaluation happens.
+#[cfg(any(target_vendor = "apple", windows))]
 fn bad_encoding() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
 }
 
 /// The certificate is valid but not for the name we asked for.
+#[cfg(any(target_vendor = "apple", windows))]
 fn name_mismatch() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)
 }
 
 /// No chain to a trusted anchor could be built.
+#[cfg(any(target_vendor = "apple", windows))]
 fn unknown_issuer() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
 }
 
 /// The issuer says this certificate is revoked.
+#[cfg(any(target_vendor = "apple", windows))]
 fn revoked() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked)
 }

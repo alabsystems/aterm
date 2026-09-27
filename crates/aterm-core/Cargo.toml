@@ -56,15 +56,11 @@ aterm-error = { workspace = true }
 # dev-dependency below for aterm-core's own test build (Phase 0 gate + conformance).
 aterm-spec = { workspace = true, optional = true }
 aterm-log = { workspace = true }
-aterm-alloc = { workspace = true }
-aterm-bits = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-codec = { workspace = true }
-aterm-rle = { workspace = true }
-aterm-tempfile = { workspace = true }
 aterm-types = { workspace = true }
 serde = { workspace = true, optional = true }
-aterm-provenance = { workspace = true, features = ["internal-mint"] }
+aterm-provenance = { workspace = true }
 aterm-grapheme = { workspace = true }
 # Path (not `workspace = true`) so we can set default-features = false here without
 # forcing it on every workspace consumer; disk-tier is re-enabled by default via this
@@ -72,7 +68,6 @@ aterm-grapheme = { workspace = true }
 aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat"] }
 aterm-parser = { workspace = true }
 aterm-scrollback = { workspace = true }
-aterm-ffi-types = { workspace = true }
 aterm-policy = { workspace = true }
 aterm-vi = { workspace = true }
 aterm-selection = { workspace = true }
@@ -80,7 +75,6 @@ aterm-selection = { workspace = true }
 # with is_regex = true), surfaced by the GUI introspection `search` verb (SEARCH-1).
 aterm-search = { workspace = true, features = ["regex"] }
 aterm-shell-integration = { workspace = true }
-aterm-containment = { workspace = true }
 # Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
 # the engine's Instant/SystemTime reads don't panic "time not implemented".
 aterm-time = { workspace = true }

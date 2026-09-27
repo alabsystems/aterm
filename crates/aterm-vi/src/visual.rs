@@ -4,7 +4,7 @@
 
 //! Visual selection mode for vi mode (v/V/Ctrl+V).
 
-use super::{ViMode, ViPoint, ViVisualType};
+use super::{ViMode, ViVisualType};
 
 impl ViMode {
     /// Toggle visual selection mode.
@@ -33,51 +33,6 @@ impl ViMode {
                 self.visual_type = Some(vtype);
             }
         }
-    }
-
-    /// Whether visual selection is currently active.
-    #[must_use]
-    pub fn visual_is_active(&self) -> bool {
-        self.visual_type.is_some()
-    }
-
-    /// Get the visual selection type, if active.
-    #[must_use]
-    pub fn visual_type(&self) -> Option<ViVisualType> {
-        self.visual_type
-    }
-
-    /// Get the visual selection range as `(start, end)` in document order.
-    ///
-    /// Returns `None` if visual selection is not active. For line-wise
-    /// selection, `start.col` is 0 and `end.col` is `cols - 1`.
-    #[must_use]
-    pub fn visual_range(&self, cols: u16) -> Option<(ViPoint, ViPoint)> {
-        let anchor = self.visual_anchor?;
-        let vtype = self.visual_type?;
-        let cursor = self.cursor.point;
-
-        let (mut start, mut end) = if anchor <= cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        };
-
-        match vtype {
-            ViVisualType::Char => {}
-            ViVisualType::Line => {
-                start.col = 0;
-                end.col = cols.saturating_sub(1);
-            }
-            ViVisualType::Block => {
-                let min_col = start.col.min(end.col);
-                let max_col = start.col.max(end.col);
-                start.col = min_col;
-                end.col = max_col;
-            }
-        }
-
-        Some((start, end))
     }
 
     /// Cancel visual selection mode without exiting vi mode.

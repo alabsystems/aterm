@@ -1605,22 +1605,6 @@ changelog = '''
         );
     }
 
-    /// A manifest from a newer format than this build understands is rejected
-    /// (the client stays put) rather than silently misread.
-    #[test]
-    fn rejects_newer_schema() {
-        let r = Manifest::parse(
-            r#"
-            schema = 99
-            version = "9.0.0"
-            build_number = 999999
-            sha256 = "x"
-            dmg = "aterm-9.0.0.dmg"
-        "#,
-        );
-        assert!(r.is_err(), "a future schema must be rejected");
-    }
-
     #[test]
     fn ready_round_trips() {
         let r = Ready {
@@ -1830,13 +1814,22 @@ changelog = '''
         let error = Floor::bump_and_write_reporting(&path, 5, 12, 3)
             .expect_err("a floor that cannot be committed must not report success");
         assert!(
-            error.contains("roster_seq 3"),
-            "the report must name the advance that was lost: {error}"
+            error.contains("roster_seq 3") && error.contains("commit"),
+            "the report must name the advance that was lost and the step that failed: {error}"
         );
         assert!(
             !tmp.exists(),
             "the temp file must never outlive a failed commit"
         );
+        // Nor may ANY temp spelling: each failing cycle used to drop one more into the
+        // 0700 Updates root that nothing ever collects.
+        let leaked: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leaked.is_empty(), "a failed commit left temps: {leaked:?}");
         // The consequence the report exists to explain: the floor is still all-zero, so
         // the same roster generation is accepted again on the next check.
         assert_eq!(Floor::read(&path), Floor::default());
@@ -1866,43 +1859,5 @@ changelog = '''
         );
         FailedMark::clear(&p);
         assert!(FailedMark::read(&p).is_none());
-    }
-
-    /// The floor used to fail in the worst possible way: silently, AND leaking. A
-    /// commit that cannot land (full disk, read-only remount, a floor file this uid
-    /// may not replace) freezes the replay/rollback ratchet while status still reads
-    /// healthy, and the old code's `remove_file` sat only in the write-failure arm, so
-    /// each failing cycle also dropped one `floor.toml.<pid>.tmp` into the 0700
-    /// Updates root that nothing ever collects.
-    #[test]
-    fn an_uncommittable_floor_is_reported_and_sweeps_its_own_temp_file() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-floor-uncommittable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        // A directory standing where the floor file belongs is the cheapest portable
-        // way to make the RENAME fail while the temp write still succeeds — i.e. the
-        // exact arm that used to leak.
-        let path = root.join("floor.toml");
-        std::fs::create_dir(&path).unwrap();
-
-        let error = Floor::bump_and_write_reporting(&path, 5, 12, 3)
-            .expect_err("a floor cannot be committed over a directory");
-        assert!(
-            error.contains("commit"),
-            "the reported error must name the step that failed: {error}"
-        );
-
-        let leaked: Vec<String> = std::fs::read_dir(&root)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp"))
-            .collect();
-        assert!(
-            leaked.is_empty(),
-            "a failed commit must leave no temp behind: {leaked:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

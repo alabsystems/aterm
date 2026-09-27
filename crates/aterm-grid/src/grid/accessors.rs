@@ -12,9 +12,11 @@ use aterm_types::index::Dimensions;
 
 use super::Grid;
 use crate::Damage;
+use crate::StyleTable;
 use crate::extra_collection::CellRenderData;
 use crate::{CellCoord, CellExtra, CellExtras};
-use crate::{ExtendedStyle, Style, StyleId, StyleTable};
+#[cfg(test)]
+use crate::{ExtendedStyle, StyleId};
 
 /// Bridge-compatible grid dimensions (#3828).
 ///
@@ -558,25 +560,9 @@ impl Grid {
 
     /// Get mutable access to the style table.
     #[inline]
+    #[cfg(test)]
     pub fn styles_mut(&mut self) -> &mut StyleTable {
         self.storage.styles_mut()
-    }
-
-    /// L1 cache probe: check if the given style matches the last interned style.
-    ///
-    /// Returns `Some(StyleId)` on cache hit (refcount incremented), `None` on miss.
-    /// Callers should fall back to `intern_extended_style` on miss.
-    #[inline]
-    pub fn try_intern_style_l1(&mut self, style: &Style) -> Option<StyleId> {
-        self.storage.styles_mut().try_intern_l1(style)
-    }
-
-    /// L2 indexed-color cache probe without constructing ExtendedStyle.
-    #[inline]
-    pub fn try_intern_style_l2_indexed(&mut self, style: &Style, fg_index: u8) -> Option<StyleId> {
-        self.storage
-            .styles_mut()
-            .try_intern_l2_indexed(style, fg_index)
     }
 
     /// Intern an extended style with color type information.
@@ -584,6 +570,7 @@ impl Grid {
     /// This preserves the original color type (default/indexed/rgb) for
     /// later conversion back to `PackedColors` format.
     #[inline]
+    #[cfg(test)]
     pub fn intern_extended_style(&mut self, ext_style: ExtendedStyle) -> StyleId {
         self.storage.styles_mut().intern_extended(ext_style)
     }
@@ -604,6 +591,7 @@ impl Grid {
     /// whether the expensive per-row `line_size` lookup is needed.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn has_any_double_width(&self) -> bool {
         self.storage.any_double_width
     }
@@ -709,31 +697,10 @@ impl Grid {
         self.storage.extras().bg_rgb_for(row, col)
     }
 
-    /// Look up Kitty graphics placeholder data for a cell.
-    ///
-    /// Returns `Some` if this cell is a Kitty Unicode placeholder (U+10EEEE)
-    /// with image/placement coordinate metadata. The renderer uses this to
-    /// draw the corresponding sub-region of a Kitty image at this cell.
-    #[must_use]
-    #[inline]
-    pub fn kitty_placeholder_at(
-        &self,
-        row: u16,
-        col: u16,
-    ) -> Option<&crate::extra::KittyPlaceholderData> {
-        self.storage
-            .cell_extra(row, col)
-            .and_then(|e| e.kitty_placeholder())
-    }
-
     /// Remove extras for a single cell and clear its HAS_EXTRAS flag.
     ///
     /// Returns `true` if an entry was present and removed.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "API for explicit extras removal; callers pending #5551"
-    )]
     pub(crate) fn remove_cell_extra(&mut self, row: u16, col: u16) -> bool {
         self.storage.remove_cell_extra(row, col)
     }
@@ -753,6 +720,7 @@ impl Grid {
     /// Bidirectional: sets the flag on cells with extras entries, clears it
     /// on cells without. Called after bulk extras operations (checkpoint
     /// restore, compaction) where per-cell flag maintenance was deferred.
+    #[cfg(test)]
     pub fn sync_extras_flags_for_row(&mut self, row: u16, cols: u16) {
         self.storage.sync_extras_flags_for_row(row, cols);
     }
@@ -1211,12 +1179,13 @@ impl Grid {
     /// Grid mutation — e.g. `Terminal::set_memory_budget`, which drives the
     /// store's budget enforcer directly — so the content generation still
     /// advances past the shrunk retained set (matching `set_scrollback_line_limit`).
+    #[cfg(test)]
     pub fn mark_content_full(&mut self) {
         self.storage.mark_content_full();
     }
 
     /// Check if the grid needs a full redraw (Kani proofs + FFI bridge tests).
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     pub fn needs_full_redraw(&self) -> bool {
         self.storage.damage.is_full()

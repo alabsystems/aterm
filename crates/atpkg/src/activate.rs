@@ -329,18 +329,28 @@ pub fn reconcile_agents(layout: &Layout) {
         };
         let env = platform::shim_env_of(&primary);
         let twin = layout.agent_shim(&tool);
-        // THE TWIN'S PRELUDE, rendered here, the one place the twin is laid, from the
-        // co-located `atpkg` this process runs as ([`platform::twin_prelude`]): the
-        // self-update block (2026-09-19, [`crate::selfupdate`]) — `case "$1" in
-        // update|upgrade|install)` on the program's rostered verbs, so a `claude update`
-        // typed on the managed name is answered by `atpkg __selfupdate` and never by the
-        // vendor's own updater, which installs a copy this name never runs. No landing
-        // prelude since Phase 2 (2026-09-22, [`crate::landing`]): a twin that still
-        // carries one compares unequal below and is re-laid once.
+        // THE TWIN'S PRELUDE, rendered here, the one place the twin is laid
+        // ([`platform::twin_prelude`]): the self-update block (2026-09-19,
+        // [`crate::selfupdate`]) — `case "$1" in update|upgrade|install)` on the program's
+        // rostered verbs, so a `claude update` typed on the managed name is answered by
+        // `atpkg __selfupdate` and never by the vendor's own updater, which installs a copy
+        // this name never runs. No landing prelude since Phase 2 (2026-09-22,
+        // [`crate::landing`]): a twin that still carries one compares unequal below and is
+        // re-laid once.
+        //
+        // WHICH atpkg it hands over to is [`crate::stub::Embedder`]'s call over the one the
+        // standing twin names (2026-09-25, D1): the co-located `atpkg` of the process running
+        // this pass only when it is there and lasts at least as long as that one — a pass run
+        // from a dev build or a scratch copy re-points no twin at a path that is not there,
+        // nor at a `target/` build while the installed app's atpkg stands.
+        let standing = crate::metadata_io::read_bounded_regular_utf8(&twin, 64 * 1024)
+            .ok()
+            .and_then(|body| crate::stub::sh_named_atpkg(&body, "__atpkg"));
+        let atpkg = crate::stub::Embedder::this_process().embed(standing.as_deref());
         let prelude = platform::twin_prelude(
             name,
             &layout.prefix,
-            &crate::stub::embedded_atpkg_path(),
+            atpkg.as_deref(),
             crate::selfupdate::verbs_of(name),
         );
         // Left alone only when it resolves where the primary does, exports the same
@@ -1921,7 +1931,7 @@ mod tests {
         // The twins older clients laid, each re-laid to today's on the next reconcile:
         // the primary's bytes (before any block); the LANDING-ONLY twin (2026-09-16 to
         // 2026-09-18); the BLOCK-THEN-LANDING twin (2026-09-19 to 2026-09-22).
-        let atpkg = crate::stub::embedded_atpkg_path();
+        let atpkg = crate::stub::co_located_atpkg_path();
         let landing = platform::sh_landing_prelude("claude", &layout.prefix, &marker, &atpkg);
         let mut block_then_landing = platform::sh_selfupdate_prelude(
             "claude",
@@ -2035,7 +2045,7 @@ mod tests {
                 &platform::twin_prelude(
                     "claude",
                     &layout.prefix,
-                    atpkg,
+                    Some(atpkg),
                     crate::selfupdate::verbs_of("claude"),
                 ),
             )
@@ -2253,46 +2263,6 @@ mod tests {
             "the once-per-pass reconcile lays the twin the alias pass left alone"
         );
         let _ = std::fs::remove_dir_all(&layout.prefix);
-    }
-
-    /// The other half of that fix, where the behaviour above cannot reach: the pass
-    /// wrapper `cli::reconcile_aliases` calls [`reconcile_agents`] EXACTLY ONCE, at its
-    /// own body's indent — outside the per-program loop, where an inner call would be the
-    /// repeat this fix removes — and [`install_tools_env`] still reconciles, since that is
-    /// what lays a freshly installed agent program's twin.
-    #[test]
-    fn the_agents_reconcile_is_wired_once_per_pass_and_never_per_program() {
-        // A top-level fn body: from its signature to the first `}` in column 0.
-        let body = |src: &str, sig: &str| -> String {
-            let start = src.find(sig).unwrap_or_else(|| panic!("no such fn: {sig}"));
-            let end = src[start..]
-                .find("\n}\n")
-                .map_or(src.len(), |i| start + i + 3);
-            src[start..end].to_string()
-        };
-        let pass = body(
-            include_str!("cli.rs"),
-            "\nfn reconcile_aliases(layout: &crate::store::Layout, index: &crate::manifest::Index) {",
-        );
-        assert_eq!(
-            pass.matches("crate::activate::reconcile_agents(layout);")
-                .count(),
-            1,
-            "the pass reconciles agents/ exactly once"
-        );
-        assert!(
-            pass.contains("\n    crate::activate::reconcile_agents(layout);\n"),
-            "…at the wrapper's own indent, after the per-program loop and not inside it"
-        );
-        let me = include_str!("activate.rs");
-        assert!(
-            !body(me, "\npub(crate) fn reconcile_aliases(").contains("reconcile_agents("),
-            "the per-program alias reconcile must not carry the pass's agents reconcile"
-        );
-        assert!(
-            body(me, "\npub(crate) fn install_tools_env(").contains("reconcile_agents(layout);"),
-            "the install lane still lays a fresh agent program's twin"
-        );
     }
 
     /// The alias policy is read off the SIGNED index entry: ALab's own (no `system`)

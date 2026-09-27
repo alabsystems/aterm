@@ -19,8 +19,28 @@
 
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+#[path = "support/launch_isolation.rs"]
+mod launch_isolation;
+
+/// One private HOME/XDG/TMPDIR root for every launch in this binary. Without it a
+/// verb that dials (`aterm ctl …`) finds the LIVE aterm on the machine running the
+/// suite and sends it the probe line — measured 2026-09-25: every run typed
+/// `--aterm-front-door-routing-probe` into the owner's session and waited on it.
+fn isolated(cmd: &mut Command) -> &mut Command {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("aterm-front-door-{}", std::process::id()));
+        launch_isolation::prepare(&root).expect("prepare an isolated root");
+        root
+    });
+    launch_isolation::apply(cmd, root);
+    cmd
+}
 
 /// How long a verb gets to answer. GENEROUS — `--help` returns in milliseconds —
 /// because the only failure this bound must catch is the verb NOT EXITING, and
@@ -49,11 +69,8 @@ fn on_a_terminal(args: &[&str]) -> String {
     // here — nothing else holds or closes them.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aterm"))
+    let mut child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")))
         .args(args)
-        // PRESENCE of this variable forces the window route on its own, which
-        // would silently restore the very bypass this test exists to forbid.
-        .env_remove("ATERM_HEADLESS")
         .stdin(Stdio::from(slave.try_clone().expect("dup pty slave")))
         .stdout(Stdio::from(slave.try_clone().expect("dup pty slave")))
         .stderr(Stdio::from(slave.try_clone().expect("dup pty slave")))
@@ -101,9 +118,8 @@ fn on_a_terminal(args: &[&str]) -> String {
 /// The same invocation with stdio PIPED — the route the broken build happened to
 /// get right, kept here only so the parity test below can compare the two.
 fn through_a_pipe(args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_aterm"))
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")))
         .args(args)
-        .env_remove("ATERM_HEADLESS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -132,7 +148,7 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
     for verb in aterm_cli::Verb::ALL {
         let out = on_a_terminal(&[verb.name(), PROBE]);
         assert!(
-            !out.contains(&format!("aterm: unknown option {}", verb.name())),
+            !out.contains(&format!("aterm: unknown command {}", verb.name())),
             "`aterm {}` fell through to the SESSION parser at a terminal — the verb is \
              routed below the mode fork, not by the front door; output was {out:?}",
             verb.name()
@@ -175,7 +191,7 @@ fn every_verb_answers_the_same_with_or_without_a_terminal() {
 fn ship_is_a_front_door_verb_at_a_terminal() {
     let out = on_a_terminal(&["ship", "--help"]);
     assert!(
-        !out.contains("unknown option"),
+        !out.contains("unknown option") && !out.contains("aterm: unknown command ship"),
         "`aterm ship` fell through to a parser that does not know the verb — the \
          exact regression this test exists for; output was {out:?}"
     );
@@ -185,4 +201,18 @@ fn ship_is_a_front_door_verb_at_a_terminal() {
         out.contains("aterm-release") || out.contains("not set up to publish"),
         "`aterm ship` must reach the release tool at a terminal; output was {out:?}"
     );
+}
+
+/// A roster tool that is not installed says so, at a terminal and through a pipe —
+/// never a parser's "unknown command".
+#[test]
+fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
+    for out in [on_a_terminal(&["ty"]), through_a_pipe(&["ty"])] {
+        assert!(
+            out.contains("ty is not installed (fix: aterm pkg install ty)"),
+            "{out:?}"
+        );
+        assert!(!out.contains("unknown option"), "{out:?}");
+        assert!(!out.contains("unknown command"), "{out:?}");
+    }
 }

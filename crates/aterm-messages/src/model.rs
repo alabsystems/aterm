@@ -148,13 +148,13 @@ pub struct Tag(Cow<'static, str>);
 
 impl Tag {
     /// The longest tag admitted.
-    pub const MAX_LEN: usize = 24;
+    pub(crate) const MAX_LEN: usize = 24;
 
     /// Validate a wire word into a tag.
     ///
     /// # Errors
     /// [`TagError`] names the first reason the word is not a tag.
-    pub fn try_new(s: &str) -> Result<Self, TagError> {
+    pub(crate) fn try_new(s: &str) -> Result<Self, TagError> {
         if s.is_empty() {
             return Err(TagError::Empty);
         }
@@ -219,11 +219,14 @@ pub mod tags {
     pub const HARNESS: Tag = Tag::word("harness");
     /// Everything the host reports about itself.
     pub const SYSTEM: Tag = Tag::word("system");
+    /// A script's `notice progress` row that named no tag (design ruling
+    /// 265): a script's work is not aterm's own `system`.
+    pub const SCRIPT: Tag = Tag::word("script");
 
-    /// The thirteen, in reporter order.
+    /// The fourteen, in reporter order.
     pub const ALL: &[&Tag] = &[
         &CONFIG, &CRASH, &TOOLCHAIN, &UPDATE, &PACKAGES, &PRIVACY, &SESSION, &WINDOW, &RENDER,
-        &A11Y, &FABRIC, &HARNESS, &SYSTEM,
+        &A11Y, &FABRIC, &HARNESS, &SYSTEM, &SCRIPT,
     ];
 }
 
@@ -281,6 +284,53 @@ pub enum Decision {
     FileAccess,
 }
 
+/// THE OWNER'S WORD on a live agent upgrade, pressed on its row: the three
+/// words `aterm harness upgrade <tab> --now|--defer|--skip` writes, as the
+/// band says them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpgradeWord {
+    /// Move the agent at its next turn end (`--now`).
+    Now,
+    /// Not for a day (`--defer`).
+    NotToday,
+    /// Stay on the running build until a newer one than this target comes
+    /// (`--skip`).
+    Skip,
+}
+
+impl UpgradeWord {
+    /// Every word, in the order a row or a menu offers them.
+    pub const ALL: [UpgradeWord; 3] = [Self::Now, Self::NotToday, Self::Skip];
+
+    /// The codec's word: `now`, `not-today`, `skip`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Now => "now",
+            Self::NotToday => "not-today",
+            Self::Skip => "skip",
+        }
+    }
+
+    /// [`Self::as_str`] read back.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.as_str() == word)
+    }
+
+    /// The full label — the capsule's, the tab menu's and a screen reader's.
+    /// "Skip version", not "Skip this version": a label is at most 16 chars
+    /// (invariant 23).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Now => "Upgrade now",
+            Self::NotToday => "Not today",
+            Self::Skip => "Skip version",
+        }
+    }
+}
+
 /// Plain-data INTENTS the HOST performs (`ATERM_DESIGN` §2.2: the engine
 /// REQUESTS, the frontend PERFORMS). Every variant is codec-able (strings and
 /// ints only) so the log can re-offer it from Settings ▸ Messages. Labels are
@@ -325,7 +375,67 @@ pub enum Intent {
     },
     /// Open a new window (the GPU-lost remedy).
     NewWindow,
+    /// Drop the rest of a large paste still on its way to a session's
+    /// program (design ruling 231): the part the program already took stays,
+    /// a bracketed paste is closed, and input typed after the paste goes
+    /// through. The row's own work, so the one decision a progress row
+    /// carries.
+    StopPaste {
+        /// The session the paste is going to.
+        session: u64,
+    },
+    /// Show tab `tab` (1-based) of window `window`, raising it: the strain
+    /// row's navigation to the program it names (design ruling 243). The
+    /// band is app-wide, so the row names the window the tab is in and a
+    /// press from any window's band lands on that one (ruling 247). A
+    /// navigation, never consequential.
+    ///
+    /// scope-waiver: "app-wide" describes where this addressed navigation
+    /// may be shown. Each intent carries its destination window and tab;
+    /// duplicating the data neither multiplies an enforced budget nor changes
+    /// that destination. This variant owns no scope-enforcing state.
+    ShowTab {
+        /// The tab's number in its window, 1-based.
+        tab: u16,
+        /// The host's id of the window the tab is in.
+        window: u64,
+    },
+    /// THE OWNER'S WORD on the live agent upgrade in tab `tab` — the row's
+    /// press of what `aterm harness upgrade <tab> --now|--defer|--skip`
+    /// writes, written by the host in-process, on the same path. `to` is
+    /// the build the row was drawn for: the host writes the word only while
+    /// the tab's upgrade still moves to it, so a press on a row that moved
+    /// on lands on nothing. Not [`Intent::ends_with_row`]: a record keeps
+    /// it, and Settings ▸ Messages offers it while that upgrade stands.
+    AgentUpgrade {
+        /// The tab the agent runs in (`s-<hex>`).
+        tab: String,
+        /// The target build the row named.
+        to: String,
+        /// Which word.
+        word: UpgradeWord,
+    },
 }
+
+/// `Show tab N` for tabs 1–9, the only numbers a tab strip shows by number
+/// (labels are static: the reader and the capsule share one table).
+const SHOW_TAB: [&str; 10] = [
+    "Show tab",
+    "Show tab 1",
+    "Show tab 2",
+    "Show tab 3",
+    "Show tab 4",
+    "Show tab 5",
+    "Show tab 6",
+    "Show tab 7",
+    "Show tab 8",
+    "Show tab 9",
+];
+
+/// The short form: `Tab N`.
+const TAB_N: [&str; 10] = [
+    "Tab", "Tab 1", "Tab 2", "Tab 3", "Tab 4", "Tab 5", "Tab 6", "Tab 7", "Tab 8", "Tab 9",
+];
 
 impl Intent {
     /// The full capsule label — the words a screen reader says.
@@ -347,12 +457,15 @@ impl Intent {
             Self::ApplyUpdate { .. } => "Install now",
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "New window",
+            Self::StopPaste { .. } => "Stop paste",
+            Self::ShowTab { tab, .. } => SHOW_TAB[usize::from(*tab).min(10) % 10],
+            Self::AgentUpgrade { word, .. } => word.label(),
         }
     }
 
     /// The short capsule form the width law falls back to.
     #[must_use]
-    pub fn short(&self) -> &'static str {
+    pub(crate) fn short(&self) -> &'static str {
         match self {
             Self::Details => "\u{203a}",
             Self::OpenSettings { route } => match route.as_str() {
@@ -370,14 +483,34 @@ impl Intent {
             Self::ApplyUpdate { .. } => "Install",
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "Window",
+            Self::StopPaste { .. } => "Stop",
+            Self::ShowTab { tab, .. } => TAB_N[usize::from(*tab).min(10) % 10],
+            Self::AgentUpgrade { word, .. } => match word {
+                UpgradeWord::Now => "Now",
+                // A day off, in the eight cells a short form has.
+                UpgradeWord::NotToday => "Tomorrow",
+                UpgradeWord::Skip => "Skip",
+            },
         }
     }
 
     /// ONLY `NotNow` closes its row: every other intent leaves the row for a
     /// supersede or a fold (the R16 rule, design §1.4).
     #[must_use]
-    pub const fn closes_row(&self) -> bool {
+    pub(crate) const fn closes_row(&self) -> bool {
         matches!(self, Self::NotNow { .. })
+    }
+
+    /// An intent that acts on the LIVE row itself — a decision, a stop, the
+    /// tab a strain row named — and so ends with it: a retired record never
+    /// offers it again (design ruling 265; the wire's `messages` rows too,
+    /// ruling 267).
+    #[must_use]
+    pub const fn ends_with_row(&self) -> bool {
+        matches!(
+            self,
+            Self::NotNow { .. } | Self::StopPaste { .. } | Self::ShowTab { .. }
+        )
     }
 
     /// `NotNow`: a row carrying one is a DECISION row.
@@ -388,10 +521,13 @@ impl Intent {
 
     /// A CONSEQUENTIAL intent — a press that changes the machine or the
     /// window rather than opening a page: `ApplyUpdate`, `OpenSystemPane`,
-    /// `NewWindow`. The glass paints these, and only
+    /// `NewWindow`, `StopPaste` (it drops bytes; ruling 231), and an agent
+    /// upgrade's `Upgrade now` (the agent is ended and resumed on the newer
+    /// build at its next turn end). The glass paints these, and only
     /// these, as the accent-filled Primary chip; a navigation
     /// (`OpenSettings`, `OpenPath`, `OpenConfigEditor`) or a decline
-    /// (`NotNow`) is the quiet Secondary chip, so a toolchain row's
+    /// (`NotNow`, an upgrade's `Not today` and `Skip version`) is the quiet
+    /// Secondary chip, so a toolchain row's
     /// `Packages` no longer shouts and the launch pass never stacks two
     /// accent chips (Phase 1 review ruling 18, 2026-09-22). `Details` is
     /// neither: it wears its own role.
@@ -399,14 +535,30 @@ impl Intent {
     pub const fn is_consequential(&self) -> bool {
         matches!(
             self,
-            Self::ApplyUpdate { .. } | Self::OpenSystemPane { .. } | Self::NewWindow
+            Self::ApplyUpdate { .. }
+                | Self::OpenSystemPane { .. }
+                | Self::NewWindow
+                | Self::StopPaste { .. }
+                | Self::AgentUpgrade {
+                    word: UpgradeWord::Now,
+                    ..
+                }
         )
+    }
+
+    /// A press that STOPS the row's own work in flight (`StopPaste`, design
+    /// ruling 232): the one decision a progress row may carry. The glass
+    /// rule ([`Intent::is_consequential`]) paints it as the accent chip;
+    /// the attention rule keeps the row Progress.
+    #[must_use]
+    pub const fn stops_work(&self) -> bool {
+        matches!(self, Self::StopPaste { .. })
     }
 
     /// The log/carry form: `details`, `open-settings:/packages`,
     /// `open-config-editor:<line|->`, `open-path:<esc>`,
     /// `open-system-pane:<pane>`, `apply-update:<build>`, `not-now:file-access`,
-    /// `new-window`.
+    /// `new-window`, `agent-upgrade:<word>:<to>:<tab>` (`:` escaped in both).
     #[must_use]
     pub fn encode(&self) -> String {
         match self {
@@ -423,6 +575,14 @@ impl Intent {
                 Decision::FileAccess => "not-now:file-access".to_string(),
             },
             Self::NewWindow => "new-window".to_string(),
+            Self::StopPaste { session } => format!("stop-paste:{session}"),
+            Self::ShowTab { tab, window } => format!("show-tab:{tab}:{window}"),
+            Self::AgentUpgrade { tab, to, word } => format!(
+                "agent-upgrade:{}:{}:{}",
+                word.as_str(),
+                escape_field(to),
+                escape_field(tab)
+            ),
         }
     }
 
@@ -454,21 +614,49 @@ impl Intent {
             "apply-update" => Some(Self::ApplyUpdate {
                 build: payload.parse().ok()?,
             }),
+            "stop-paste" => Some(Self::StopPaste {
+                session: payload.parse().ok()?,
+            }),
+            "show-tab" => {
+                let (tab, window) = payload.split_once(':')?;
+                Some(Self::ShowTab {
+                    tab: tab.parse().ok().filter(|t| *t > 0)?,
+                    window: window.parse().ok()?,
+                })
+            }
             "not-now" => match payload.split_once(':').unwrap_or((payload, "")) {
                 ("file-access", "") => Some(Self::NotNow {
                     decision: Decision::FileAccess,
                 }),
                 _ => None,
             },
+            "agent-upgrade" => {
+                let (word, rest) = payload.split_once(':')?;
+                let (to, tab) = rest.split_once(':')?;
+                let (to, tab) = (unescape_payload(to), unescape_payload(tab));
+                (!to.is_empty() && !tab.is_empty()).then_some(())?;
+                Some(Self::AgentUpgrade {
+                    tab,
+                    to,
+                    word: UpgradeWord::parse(word)?,
+                })
+            }
             _ => None,
         }
     }
 }
 
+/// [`escape_payload`] with the codec's own separator escaped too: a field
+/// between two `:`s.
+fn escape_field(s: &str) -> String {
+    escape_payload(s).replace(':', "%3A")
+}
+
 /// Every intent variant once, with a representative payload — the label
 /// table's test walks it, and so does the codec's.
 #[must_use]
-pub fn every_intent() -> Vec<Intent> {
+#[cfg(test)]
+pub(crate) fn every_intent() -> Vec<Intent> {
     vec![
         Intent::Details,
         Intent::OpenSettings {
@@ -502,6 +690,24 @@ pub fn every_intent() -> Vec<Intent> {
             decision: Decision::FileAccess,
         },
         Intent::NewWindow,
+        Intent::StopPaste { session: 3 },
+        Intent::ShowTab { tab: 2, window: 7 },
+        Intent::AgentUpgrade {
+            tab: "s-b5cf2faabac5ce5127bd".into(),
+            to: "2.1.282".into(),
+            word: UpgradeWord::Now,
+        },
+        Intent::AgentUpgrade {
+            tab: "s-b5cf2faabac5ce5127bd".into(),
+            to: "0.157.1".into(),
+            word: UpgradeWord::NotToday,
+        },
+        // A hostile field: the codec's separator and a control character.
+        Intent::AgentUpgrade {
+            tab: "s-a:b".into(),
+            to: "2.1.282:%\t".into(),
+            word: UpgradeWord::Skip,
+        },
     ]
 }
 
@@ -638,7 +844,7 @@ impl Hold {
 ///
 /// THE INDICATOR IS THE METER'S STATE, never the hold's (design ruling 139,
 /// the merge's M4): a fill draws the bar (glide, glint, stall), `busy` the
-/// comet and the spinner, and neither draws no indicator at all — the row
+/// comet, and neither draws no indicator at all — the row
 /// is still. A [`Hold::Live`] row that is WORK carries a fill or `busy`
 /// (its reporter sets it: [`Message::in_flight`] or [`Meter::busy`]); a
 /// Live row blocked on the person carries neither and stands still.
@@ -656,10 +862,10 @@ pub struct Meter {
     /// The resource the current phase loads, DECLARED by the reporter for the
     /// phase's duration, and only for a very heavy phase (design §10.6).
     pub load: Option<Load>,
-    /// Work in flight with no known fraction: the comet along the row and
-    /// the braille spinner in its glyph cell, on the engine's frame grid
-    /// ([`crate::animate`]). Never with a fill (normalized clears it).
-    /// Volatile: never persisted and never on the wire; carried across the
+    /// Work in flight with no known fraction: the comet along the row, on
+    /// the engine's frame grid ([`crate::animate`]); the row's glyph cell
+    /// keeps its own icon (no spinner beside the comet, ruling 251). Never
+    /// with a fill (normalized clears it). Volatile: never persisted and never on the wire; carried across the
     /// handoff ([`crate::carry::CarriedMessage::busy`]); never spoken as a
     /// word (the row is a progress indicator with no value).
     pub busy: bool,
@@ -705,6 +911,17 @@ impl Meter {
     /// gauge has no ETA) and no busy.
     #[must_use]
     pub fn normalized(self) -> Self {
+        self.normalized_measured(false)
+    }
+
+    /// [`Self::normalized`], with `measured` naming a fill measured finer
+    /// than its count by an amount not at hand: a CARRIED row's (ruling
+    /// 263) — the parent's fill already agreed with its count, and the carry
+    /// ships no amount — is kept inside the count's span as a measured one
+    /// is, never snapped back to the count's floor (`3 of 10 programs` at
+    /// 36 % stays 36 %, not 30 %, across a handoff).
+    #[must_use]
+    pub(crate) fn normalized_measured(self, measured: bool) -> Self {
         let level = self.level && self.fill_permille.is_some();
         let amount = self
             .amount
@@ -717,6 +934,23 @@ impl Meter {
             .fill_permille
             .map(|p| p.min(1000))
             .or_else(|| amount.map(Amount::permille));
+        // A COUNT a determinate row shows and its fill agree (design ruling
+        // 259). With no amount the fill is only the reporter's figure, so
+        // the count IS it: `3 of 4 tabs` is 75 %, never 80 %. With an amount
+        // the fill is measured finer than the count (a pass's programs by
+        // phase: 36 % while the fourth of ten installs), and it is kept
+        // inside the count's own span — never under `3 of 10`'s 30 %, never at
+        // `4 of 10`'s 40 % before the count says four. A measured level is a
+        // gauge, not a count; a busy row (no fill) stays a comet.
+        let counted = (!level)
+            .then(|| count_span(&self.stats))
+            .flatten()
+            .filter(|_| fill_permille.is_some());
+        let fill_permille = match (counted, amount.is_some() || measured) {
+            (Some((lo, _)), false) => Some(lo),
+            (Some((lo, hi)), true) => fill_permille.map(|p| p.clamp(lo, hi)),
+            (None, _) => fill_permille,
+        };
         Self {
             fill_permille,
             stats: clip(&self.stats, STATS_CAP),
@@ -726,6 +960,37 @@ impl Meter {
             level,
         }
     }
+}
+
+/// The fill span a WHOLE-NUMBER COUNT in the stats' first clause allows —
+/// `3 of 4 tabs` → `(750, 1000)`, `(A/B, (A+1)/B)` in permille, the whole bar
+/// once the count is complete (design ruling 259) — or `None` when the first
+/// clause is no such count (`1.2M of 3.4M lines`, a pair of sizes, words),
+/// its total is zero, or it counts past its total.
+fn count_span(stats: &str) -> Option<(u16, u16)> {
+    let (done, total) = count_of(stats)?;
+    let at = |n: u64| {
+        let (n, t) = (u128::from(n.min(total)), u128::from(total));
+        u16::try_from((n * 1000 + t / 2) / t).unwrap_or(1000)
+    };
+    Some((at(done), at(done + 1)))
+}
+
+/// `(A, B)` of a whole-number count `A of B unit` in the stats' first clause.
+fn count_of(stats: &str) -> Option<(u64, u64)> {
+    let clause = stats.split(crate::PIECE_SEP).next()?.trim();
+    let mut words = clause.split(' ');
+    let (Some(done), Some("of"), Some(total), Some(unit)) =
+        (words.next(), words.next(), words.next(), words.next())
+    else {
+        return None;
+    };
+    let whole = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+    if !whole(done) || !whole(total) || !unit.starts_with(char::is_alphabetic) {
+        return None;
+    }
+    let (done, total) = (done.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+    (total > 0 && done <= total).then_some((done, total))
 }
 
 /// The continuous quantity behind a determinate fill: `done` of `total`
@@ -754,7 +1019,7 @@ impl Amount {
 
     /// `done / total` in permille, rounded to nearest; 0 with no total.
     #[must_use]
-    pub fn permille(self) -> u16 {
+    pub(crate) fn permille(self) -> u16 {
         if self.total == 0 {
             return 0;
         }
@@ -764,8 +1029,10 @@ impl Amount {
     }
 }
 
-/// What an [`Amount`] counts. Only bytes can read "stalled": a count of
-/// items or steps may honestly sit still while one item takes long.
+/// What an [`Amount`] counts. Bytes read "stalled" ten seconds after they
+/// stop; a count of items or steps may honestly sit still while one item
+/// takes long, so it reads "stalled" only past several of its own gaps
+/// between advances (design ruling 265).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Unit {
     /// Bytes moved.
@@ -774,16 +1041,33 @@ pub enum Unit {
     Items,
     /// Steps of a fixed plan.
     Steps,
+    /// [`Unit::Steps`] at a phase of the plan that HOLDS the fill with no
+    /// meter of its own — a toolchain program verifying or linking,
+    /// whose share sits at 500‰ or 990‰ until the phase ends (design ruling
+    /// 266). The same count as `Steps` (the estimator keeps its readings
+    /// across the switch), but its silence here is the plan, not a stall: it
+    /// never reads "stalled", and the count's patience restarts when the
+    /// phase ends. Never on the wire (its word is `steps`).
+    HeldSteps,
 }
 
 impl Unit {
     /// The wire's word for it: `bytes`, `items` or `steps`.
     #[must_use]
-    pub const fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Bytes => "bytes",
             Self::Items => "items",
-            Self::Steps => "steps",
+            Self::Steps | Self::HeldSteps => "steps",
+        }
+    }
+
+    /// What the count IS, for the estimator: a held step is a step.
+    #[must_use]
+    pub(crate) const fn count(self) -> Self {
+        match self {
+            Self::HeldSteps => Self::Steps,
+            other => other,
         }
     }
 
@@ -820,7 +1104,7 @@ impl Load {
     /// The loads a script may declare over the wire (`notice progress …
     /// load=`): a machine's memory is aterm's to measure, never a script's
     /// to claim.
-    pub const WIRE: [Load; 3] = [Self::Network, Self::Disk, Self::Cpu];
+    pub(crate) const WIRE: [Load; 3] = [Self::Network, Self::Disk, Self::Cpu];
 
     /// The band's words for it.
     #[must_use]
@@ -837,7 +1121,7 @@ impl Load {
     /// `load=`: `network`, `disk`, `cpu` or `memory`
     /// ([`Load::words`] stays the band's).
     #[must_use]
-    pub const fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Network => "network",
             Self::Disk => "disk",
@@ -854,8 +1138,82 @@ impl Load {
 
     /// [`Load::parse`] over the wire's words only ([`Load::WIRE`]).
     #[must_use]
-    pub fn parse_wire(s: &str) -> Option<Self> {
+    pub(crate) fn parse_wire(s: &str) -> Option<Self> {
         Self::WIRE.into_iter().find(|l| l.word() == s)
+    }
+}
+
+/// A set of [`Load`]s: the kinds a row may show over its life, which size its
+/// reserved load slot (design ruling 221). Empty is the undeclared row, whose
+/// slot is sized for every load's words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Loads(u8);
+
+impl Loads {
+    /// No load.
+    pub(crate) const NONE: Self = Self(0);
+    /// Every load.
+    pub const ALL: Self = Self(0b1111);
+
+    const fn bit(l: Load) -> u8 {
+        match l {
+            Load::Network => 1,
+            Load::Disk => 2,
+            Load::Cpu => 4,
+            Load::Memory => 8,
+        }
+    }
+
+    /// This set with `l` in it.
+    #[must_use]
+    pub(crate) const fn with(self, l: Load) -> Self {
+        Self(self.0 | Self::bit(l))
+    }
+
+    /// Both sets together.
+    #[must_use]
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// `true` for the empty set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether `l` is in the set.
+    #[must_use]
+    pub(crate) const fn contains(self, l: Load) -> bool {
+        self.0 & Self::bit(l) != 0
+    }
+
+    /// The set as one byte (the layout fingerprint's).
+    #[must_use]
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The loads in the set, in [`Load::ALL`]'s order.
+    pub(crate) fn iter(self) -> impl Iterator<Item = Load> {
+        Load::ALL.into_iter().filter(move |&l| self.contains(l))
+    }
+
+    /// The set a row RESERVES once it shows `l` (design ruling 221): its
+    /// declaration with `l` in it, or — undeclared — every load, as before.
+    #[must_use]
+    pub(crate) const fn reserved_with(self, l: Load) -> Self {
+        if self.is_empty() {
+            Self::ALL
+        } else {
+            self.with(l)
+        }
+    }
+}
+
+impl FromIterator<Load> for Loads {
+    fn from_iter<I: IntoIterator<Item = Load>>(iter: I) -> Self {
+        iter.into_iter().fold(Self::NONE, Self::with)
     }
 }
 
@@ -949,9 +1307,29 @@ pub struct Message {
     /// The words the row FINISHES with — what its Complete echo paints in
     /// the title's place (`Installed aterm vX` for `Finishing aterm vX`).
     /// `None`: [`Message::finished_title`] derives them from the title's
-    /// leading present participle ([`crate::words::finished_form`]). Never
-    /// logged: the record keeps the words the reporter resolved with.
+    /// leading present participle ([`crate::words::finished_form`]). The
+    /// log keeps them too (design ruling 259): a live row that delivered is
+    /// LOGGED under its finished words, its live title the first detail
+    /// line; and an ask's declared words (`Asked for Full Disk Access`) are
+    /// the title it is logged under once it is answered or folds.
     pub finished: Option<String>,
+    /// The loads the row may show over its life (design ruling 221), declared
+    /// by its reporter: its reserved load slot is sized to their words, not to
+    /// every load's. Empty (the default) reserves for every load.
+    pub loads: Loads,
+    /// The load this work IS (design ruling 246): a download's network, a
+    /// removal's disk, a build's CPU. Its words say nothing the title does not
+    /// (`Downloading … · network busy`), so they show only while the machine
+    /// is measurably slowing other work ([`crate::MessageCenter::set_slowing`]);
+    /// a load outside it (a download's extraction making the disk busy) shows
+    /// as before. `None`: every declared load shows.
+    pub primary: Option<Load>,
+    /// A RECORD ABOUT A PREVIOUS RUN (design ruling 259): `aterm crashed
+    /// last time`. It ranks one severity class below its own on the glass
+    /// ([`crate::glass::rank`]), so a past run's news never takes the row
+    /// of something happening now. Set by the builder that knows it
+    /// ([`Message::retrospective`]); never inferred from the words.
+    pub retrospective: bool,
 }
 
 impl Message {
@@ -972,7 +1350,35 @@ impl Message {
             excerpt: true,
             reveal_after: None,
             finished: None,
+            loads: Loads::NONE,
+            primary: None,
+            retrospective: false,
         }
+    }
+
+    /// The loads this row may show over its life (design ruling 221): its
+    /// load slot is reserved at the widest of their words.
+    #[must_use]
+    pub fn loads(mut self, loads: impl IntoIterator<Item = Load>) -> Self {
+        self.loads = loads.into_iter().collect();
+        self
+    }
+
+    /// The load this work IS ([`Message::primary`]): its words show only
+    /// while other work is measurably slowed. It joins the declared loads.
+    #[must_use]
+    pub fn primary_load(mut self, l: Load) -> Self {
+        self.primary = Some(l);
+        self.loads = self.loads.with(l);
+        self
+    }
+
+    /// A record about a PREVIOUS RUN ([`Message::retrospective`], ruling 259):
+    /// it ranks one severity class lower on the glass.
+    #[must_use]
+    pub fn retrospective(mut self) -> Self {
+        self.retrospective = true;
+        self
     }
 
     /// The band paints the title alone: `detail[0]` does not change what the
@@ -997,9 +1403,18 @@ impl Message {
     /// the title's participle read finished, else the title itself.
     #[must_use]
     pub fn finished_title(&self) -> String {
+        self.finished_words().unwrap_or_else(|| self.title.clone())
+    }
+
+    /// The row's words in the past tense, when there are any: the declared
+    /// finished words, else the title's participle read finished. `None` for
+    /// a free-text title (a wire script's `Uploading the backup`), whose
+    /// Complete echo still needs a word saying it finished (ruling 247).
+    #[must_use]
+    pub fn finished_words(&self) -> Option<String> {
         match &self.finished {
-            Some(w) => w.clone(),
-            None => crate::words::finished_form(&self.title).unwrap_or_else(|| self.title.clone()),
+            Some(w) => Some(w.clone()),
+            None => crate::words::finished_form(&self.title),
         }
     }
 
@@ -1011,7 +1426,7 @@ impl Message {
     }
 
     /// Declares the row's indicator: work in flight. With no fraction yet
-    /// that is a BUSY meter ([`Meter::busy`]: the comet and the spinner); a
+    /// that is a BUSY meter ([`Meter::busy`]: the comet); a
     /// meter the builder already set keeps its fill and stats, and is busy
     /// only while it has no fill.
     #[must_use]
@@ -1095,7 +1510,7 @@ impl Message {
 
     /// The origin.
     #[must_use]
-    pub fn origin(mut self, o: Origin) -> Self {
+    pub(crate) fn origin(mut self, o: Origin) -> Self {
         self.origin = o;
         self
     }
@@ -1115,7 +1530,8 @@ impl Message {
         self.detail.truncate(DETAIL_LINES_CAP);
         self.actions.retain(|i| *i != Intent::Details);
         self.actions.truncate(MAX_ACTIONS);
-        self.meter = self.meter.map(Meter::normalized);
+        let carried = self.origin == Origin::Carried;
+        self.meter = self.meter.map(|m| m.normalized_measured(carried));
         self.key = self
             .key
             .as_deref()
@@ -1177,7 +1593,7 @@ mod tests {
     /// the glyph set admits the band's glyphs and nothing else.
     #[test]
     fn tags_and_glyphs_are_closed_sets() {
-        assert_eq!(tags::ALL.len(), 13, "thirteen reporter families");
+        assert_eq!(tags::ALL.len(), 14, "fourteen reporter families");
         for tag in tags::ALL {
             let again = Tag::try_new(tag.as_str()).expect("a vocabulary word validates");
             assert_eq!(&again, *tag);
@@ -1260,15 +1676,22 @@ mod tests {
                 matches!(intent, Intent::NotNow { .. }),
                 "{intent:?}"
             );
-            // The accent chip marks a CONSEQUENTIAL press only: the three
+            // The accent chip marks a CONSEQUENTIAL press only: the five
             // that change the machine or the window. Every navigation and
-            // the decline are quiet — `Packages` and `Software Update`
-            // included.
+            // every decline are quiet — `Packages` and `Software Update`
+            // included, and an upgrade's `Not today` and `Skip version`.
             assert_eq!(
                 intent.is_consequential(),
                 matches!(
                     intent,
-                    Intent::ApplyUpdate { .. } | Intent::OpenSystemPane { .. } | Intent::NewWindow
+                    Intent::ApplyUpdate { .. }
+                        | Intent::OpenSystemPane { .. }
+                        | Intent::NewWindow
+                        | Intent::StopPaste { .. }
+                        | Intent::AgentUpgrade {
+                            word: UpgradeWord::Now,
+                            ..
+                        }
                 ),
                 "{intent:?}"
             );
@@ -1483,6 +1906,9 @@ mod tests {
             excerpt: true,
             reveal_after: None,
             finished: Some("\u{1b}Done".into()),
+            loads: Loads::NONE,
+            primary: None,
+            retrospective: false,
         }
         .normalized();
         assert_eq!(literal.finished.as_deref(), Some("Done"));

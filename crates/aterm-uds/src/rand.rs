@@ -18,7 +18,7 @@
 //!
 //! WHERE B4 ACTUALLY RUNS, corrected 2026-08-31: this said "fails the pre-push
 //! gate". It does not — `.githooks/pre-push` was demoted to ADVISORY on
-//! 2026-08-24 and executes nothing. `grep_guard.sh` is a whole-tree stage of
+//! 2026-08-24 and deleted on 2026-09-25; there is no git hook. `grep_guard.sh` is a whole-tree stage of
 //! `tools/verify.sh` (`aterm_verify::stages::grep_guards`, unconditional in
 //! every mode including `--changed`), so the guard is real and the merge
 //! contract carries it; no hook does.

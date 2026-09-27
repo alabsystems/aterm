@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use crate::activate::install_tools;
 use crate::activate::{Aliases, activate_channel, install_tombstone_shim, install_tools_env};
-use crate::apply::{Group, TxnOutcome, plan_groups, transact};
+use crate::apply::{Group, TxnOutcome, plan_groups, transact_holding};
 use crate::gate::{ApplyDecision, decide};
 use crate::install::StageError;
 use crate::manifest::{Channel, Index, parse_pkg};
@@ -441,8 +441,12 @@ pub enum FlowError {
     /// `atpkg unlink`.
     Linked(String),
     /// The vendor-direct lane did not install a vendor program: its verdict line
-    /// (unreachable, refused, failed, or a head it will not move to), versions only.
+    /// (refused, failed, or a head it will not move to), versions only.
     Vendor(String),
+    /// The vendor's release channel was not reached — the same verdict line, its own
+    /// variant so the verb can add the re-run follow-up the index lane's
+    /// [`FlowError::Unreachable`] has always had.
+    VendorUnreachable(String),
 }
 
 // Hand-rendered through `Formatter::write_str` + direct `Display::fmt`/`Debug::fmt`
@@ -453,13 +457,12 @@ impl std::fmt::Display for FlowError {
         match self {
             FlowError::NoIndex => f.write_str("no signature-valid index at/above the floor"),
             FlowError::Unreachable(why) => {
-                f.write_str("could not reach the toolchain index (")?;
-                f.write_str(why)?;
                 // No "…the toolchain retries automatically" tail: that is true only of
                 // the windowed app's 6-hour loop, and this Display reaches foreground
                 // CLI verbs where nothing retries anything. The CLI edge appends the
                 // honest per-verb re-run instead (`print_unreachable_followup`).
-                f.write_str(") — this is a network problem, not a signature problem")
+                f.write_str("could not reach the toolchain index: ")?;
+                f.write_str(why)
             }
             FlowError::NotReachable(p, roster) => {
                 f.write_str(p)?;
@@ -519,12 +522,7 @@ impl std::fmt::Display for FlowError {
             }
             FlowError::AppBundleRefused(p) => {
                 f.write_str(p)?;
-                f.write_str(
-                    "'s app-bundle is not installed by atpkg — aterm updates itself in-session \
-                     through its own notarization-gated updater (see `aterm ctl update status`); \
-                     the app-apply gate fails closed here because notarization is unproven on \
-                     the CLI path",
-                )
+                f.write_str(" updates itself, not through atpkg (`aterm update status`)")
             }
             FlowError::VendorRefused(why) => {
                 f.write_str("artifact row refused: ")?;
@@ -573,9 +571,9 @@ impl std::fmt::Display for FlowError {
                 f.write_str(p)?;
                 f.write_str(" is dev-linked; run `aterm pkg unlink ")?;
                 f.write_str(p)?;
-                f.write_str("` to manage it from the registry")
+                f.write_str("` to release it")
             }
-            FlowError::Vendor(line) => f.write_str(line),
+            FlowError::Vendor(line) | FlowError::VendorUnreachable(line) => f.write_str(line),
         }
     }
 }
@@ -1265,6 +1263,9 @@ pub(crate) fn land_artifact(
     // publisher who repaired the asset under the same pin is exactly the case the
     // cooldown exists to let through, so the memo goes with the verdict it held.
     crate::store::clear_stage_refusal(&build_dir);
+    // 6a. Provenance cleared BEFORE activation, as a group member's is (`stage_fetched`,
+    // [`crate::provenance::heal_staged`]); the door-end heal is the backstop.
+    let _ = crate::provenance::heal_staged(layout, &build_dir);
 
     // 6b. Sysroot-bundle wiring BEFORE activation (self-contained = no-op).
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
@@ -1614,6 +1615,37 @@ pub fn apply_channel_with(
     installed: &BTreeMap<String, u64>,
     excluded: &[String],
 ) -> Result<ChannelApplyReport, FlowError> {
+    apply_channel_gated(
+        fetcher,
+        layout,
+        index,
+        channel,
+        triple,
+        installed,
+        excluded,
+        &crate::quiet::FlipGate::NOW,
+    )
+}
+
+/// [`apply_channel_with`] under `flip`, the unattended lanes' form: the coherence group
+/// holding the Trust toolchain stages its new builds and holds its flip while that
+/// toolchain is in use ([`crate::quiet`], [`TxnOutcome::Deferred`]). Every other group,
+/// and every group under [`crate::quiet::FlipGate::NOW`], applies exactly as
+/// [`apply_channel_with`] does.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "apply_channel_with's inputs plus the flip gate the unattended lanes hand in"
+)]
+pub fn apply_channel_gated(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    index: &TrustedIndex,
+    channel: &str,
+    triple: &str,
+    installed: &BTreeMap<String, u64>,
+    excluded: &[String],
+    flip: &crate::quiet::FlipGate<'_>,
+) -> Result<ChannelApplyReport, FlowError> {
     // The channel as THIS target sees it (`pin_by_target` laid over `pin`): every decide,
     // plan and fetch below reads this view, never the raw platform-agnostic pin.
     let ch = index
@@ -1653,10 +1685,21 @@ pub fn apply_channel_with(
             installed,
             excluded,
             &mut resolved_assets,
+            flip,
         ) {
             applied.extend(group_applied);
             results.push((acted, outcome));
         }
+    }
+    // A HELD FLIP NO GROUP HOLDS ANY LONGER is over: the toolchain's group was skipped
+    // whole this pass (dev-linked, or nothing of it installed any more), so no outcome
+    // above ended its record, and a record left standing would keep the window's park
+    // looking at it. A group that held it again or aborted it keeps it.
+    if !results.iter().any(|(g, o)| {
+        g.members.iter().any(|m| m == crate::seam::SEAM_PROGRAM)
+            && matches!(o, TxnOutcome::Deferred { .. } | TxnOutcome::Aborted { .. })
+    }) {
+        crate::quiet::clear(layout);
     }
     // (Shell.d hook refresh runs at the main.rs CLI edge, not here — see the note in
     // `install` — to keep apply_channel's unit tests hermetic w.r.t. the real ~/.aterm.)
@@ -1764,6 +1807,7 @@ fn apply_group(
     installed: &BTreeMap<String, u64>,
     excluded: &[String],
     resolved_assets: &mut BTreeMap<String, String>,
+    flip: &crate::quiet::FlipGate<'_>,
 ) -> Option<(Group, TxnOutcome, BTreeMap<String, AppliedMember>)> {
     // `update` touches INSTALLED groups only: skip a group with no installed member (that
     // would be a fresh `install`, not an update). A coherence group with even ONE member
@@ -1896,6 +1940,7 @@ fn apply_group(
             &present,
             installed,
             resolved_assets,
+            flip,
         );
         return Some((present, outcome, applied));
     }
@@ -1909,6 +1954,7 @@ fn apply_group(
         group,
         installed,
         resolved_assets,
+        flip,
     );
     Some((group.clone(), outcome, applied))
 }
@@ -1950,6 +1996,7 @@ pub fn bootstrap_group(
     let ch = index
         .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
+    // A fresh tuple supersedes no live toolchain: nothing to wait for.
     Ok(apply_group_txn(
         fetcher,
         layout,
@@ -1960,6 +2007,7 @@ pub fn bootstrap_group(
         group,
         installed,
         resolved_assets,
+        &crate::quiet::FlipGate::NOW,
     ))
 }
 
@@ -2014,6 +2062,51 @@ fn apply_group_txn(
     group: &Group,
     installed: &BTreeMap<String, u64>,
     resolved_assets: &mut BTreeMap<String, String>,
+    flip: &crate::quiet::FlipGate<'_>,
+) -> (TxnOutcome, BTreeMap<String, AppliedMember>) {
+    let (outcome, applied) = apply_group_txn_inner(
+        fetcher,
+        layout,
+        index,
+        ch,
+        channel,
+        triple,
+        group,
+        installed,
+        resolved_assets,
+        flip,
+    );
+    // THE DEFERRAL'S RECORD ENDS with every outcome that is not another wait or a failed
+    // attempt at the flip: the group moved, was held for another reason (a pin, an
+    // unpublished triple), was tombstoned, or had nothing to move. An abort keeps it — the
+    // next pass tries the same flip, and the ceiling still counts from the first wait.
+    if group.members.iter().any(|m| m == crate::seam::SEAM_PROGRAM)
+        && !matches!(
+            outcome,
+            TxnOutcome::Deferred { .. } | TxnOutcome::Aborted { .. }
+        )
+    {
+        crate::quiet::clear(layout);
+    }
+    (outcome, applied)
+}
+
+/// [`apply_group_txn`]'s body.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "apply_group_txn's inputs, passed through whole"
+)]
+fn apply_group_txn_inner(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    index: &TrustedIndex,
+    ch: &Channel,
+    channel: &str,
+    triple: &str,
+    group: &Group,
+    installed: &BTreeMap<String, u64>,
+    resolved_assets: &mut BTreeMap<String, String>,
+    flip: &crate::quiet::FlipGate<'_>,
 ) -> (TxnOutcome, BTreeMap<String, AppliedMember>) {
     // Per member, from the COMPLETENESS-aware view ([`installed_for_decide`]): on the raw
     // shim view a member whose `<build>.ready` is missing or the other slice's is UpToDate
@@ -2213,9 +2306,129 @@ fn apply_group_txn(
         );
     }
 
+    // FLIP WHEN QUIET ([`crate::quiet`], gap #12(b)) — strictly after decide() and every
+    // consumer gate above, suppression-only like them. An unattended pass whose group holds
+    // the Trust toolchain asks, before it extracts anything, whether the toolchain it would
+    // supersede is in use: leased by a run, run from, or not known. In use, and short of the
+    // ceiling, the group STAGES — every member it would move has its signed archive in
+    // `staging/`, digest-checked, so the flip needs no network — records the wait, and
+    // flips nothing. A revoked build never waits (`decide` flips a forced group at once),
+    // and a person's pass never asks ([`crate::quiet::FlipPolicy::Now`]).
+    let quiet = QuietGate::new(ch, group, installed, &install_members, flip);
+    let forced = any_tombstone || !all_current_valid;
+    let mut at_ceiling = false;
+    // A wait that could not be recorded: nothing would bound it, so the group flips now
+    // ([`crate::quiet::note_deferred`]), and the last look does not hold it again.
+    let mut unrecorded = false;
+    if let Some(q) = &quiet {
+        let busy = crate::quiet::probe(layout, &q.live, flip.running);
+        match crate::quiet::decide(
+            flip.policy,
+            forced,
+            busy.is_quiet(),
+            crate::quiet::since_of(layout, &q.label),
+            flip.now,
+        ) {
+            crate::quiet::Verdict::Flip => {}
+            crate::quiet::Verdict::FlipAtCeiling { since } => {
+                at_ceiling = true;
+                println!(
+                    "atpkg: installing the Trust toolchain update ({}) after waiting {}, \
+                     though {}; a command already running finishes on the old build",
+                    q.moves_words(),
+                    waited_words(flip.now.saturating_sub(since)),
+                    busy.clause()
+                );
+            }
+            crate::quiet::Verdict::Defer { since } => {
+                for m in &install_members {
+                    let mut why = String::new();
+                    let Some(fetched) = fetch_member(
+                        fetcher,
+                        layout,
+                        index,
+                        ch,
+                        m,
+                        triple,
+                        resolved_assets,
+                        &mut why,
+                    ) else {
+                        return (
+                            TxnOutcome::Aborted {
+                                failed: (*m).clone(),
+                                during_flip: false,
+                                why,
+                            },
+                            BTreeMap::new(),
+                        );
+                    };
+                    // A fresh download is checked against its signed digest NOW, so what
+                    // waits in `staging/` is a verified archive; a carried one already was.
+                    // A mismatch is the stage's own failure, recorded the stage's way — the
+                    // refusal memo that keeps the next passes off the wire
+                    // ([`digest_refusal_note`]), the archive and its partial reclaimed.
+                    if !fetched.carried && !carried_archive(&fetched.dl, &fetched.artifact) {
+                        let err = StageError::Sha256Mismatch {
+                            expected: fetched.artifact.sha256.clone(),
+                            got: crate::tree::file_sha256(&fetched.dl).unwrap_or_default(),
+                        };
+                        record_digest_refusal(
+                            &layout.build_dir(m, fetched.pinned),
+                            &fetched.artifact,
+                            &err,
+                        );
+                        reclaim_after_failed_stage(&fetched.dl, &err);
+                        eprintln!(
+                            "{}",
+                            stage_failure_note(m, fetched.pinned, &err.to_string())
+                        );
+                        return (
+                            TxnOutcome::Aborted {
+                                failed: (*m).clone(),
+                                during_flip: false,
+                                why: format!("staging {} failed: {err}", fetched.artifact.asset),
+                            },
+                            BTreeMap::new(),
+                        );
+                    }
+                }
+                if crate::quiet::note_deferred(
+                    layout,
+                    &q.label,
+                    since,
+                    flip.now,
+                    &busy,
+                    &q.moves(resolved_assets),
+                ) {
+                    return (
+                        TxnOutcome::Deferred {
+                            members: install_members.iter().map(|m| (*m).clone()).collect(),
+                            why: busy.clause(),
+                            since,
+                        },
+                        BTreeMap::new(),
+                    );
+                }
+                unrecorded = true;
+                println!(
+                    "atpkg: the Trust toolchain update ({}) is installed now, though {}: its \
+                     wait could not be recorded in {}; a command already running finishes on \
+                     the old build",
+                    q.moves_words(),
+                    busy.clause(),
+                    crate::quiet::record_path(layout).display()
+                );
+            }
+        }
+    }
+
     // Per-group transaction. `staged` is filled by the stage closure and read by flip/rollback.
     let staged: RefCell<BTreeMap<String, Staged>> = RefCell::new(BTreeMap::new());
-    let outcome = transact(
+    // The pass's resolved assets, shared for the transaction: the stage closure records each
+    // member's archive in them, and the last look reads them back into the record of a wait
+    // it holds (the archives that wait needs spared, [`crate::quiet::held_archives`]).
+    let assets: RefCell<BTreeMap<String, String>> = RefCell::new(std::mem::take(resolved_assets));
+    let outcome = transact_holding(
         &decisions,
         &mut |m| {
             let mut why = String::new();
@@ -2227,7 +2440,7 @@ fn apply_group_txn(
                 m,
                 triple,
                 installed.get(m).copied(),
-                resolved_assets,
+                &mut assets.borrow_mut(),
                 &mut why,
             ) {
                 Some(s) => {
@@ -2240,6 +2453,32 @@ fn apply_group_txn(
                     why
                 }),
             }
+        },
+        // THE LAST LOOK, between the last extract and the first flip: a build that started
+        // while a multi-gigabyte tree was being extracted holds the flip after all. Not
+        // once the ceiling has spoken.
+        &mut || {
+            let q = quiet.as_ref().filter(|_| !at_ceiling && !unrecorded)?;
+            let busy = crate::quiet::probe(layout, &q.live, flip.running);
+            let crate::quiet::Verdict::Defer { since } = crate::quiet::decide(
+                flip.policy,
+                forced,
+                busy.is_quiet(),
+                crate::quiet::since_of(layout, &q.label),
+                flip.now,
+            ) else {
+                return None;
+            };
+            // Held only when the wait is recorded: an unrecorded one would have no ceiling.
+            crate::quiet::note_deferred(
+                layout,
+                &q.label,
+                since,
+                flip.now,
+                &busy,
+                &q.moves(&assets.borrow()),
+            )
+            .then(|| (busy.clause(), since))
         },
         &mut |m| {
             // The flip is the group lane's link phase (label-only, per the schema).
@@ -2255,6 +2494,7 @@ fn apply_group_txn(
             }
         },
     );
+    *resolved_assets = assets.into_inner();
     // On abort, DISCARD the builds this transaction staged. They were never left active (a
     // stage-phase abort flipped nothing; a flip-phase abort re-pointed every shim back to the
     // prior build via rollback), so leaving a complete-but-inactive build on disk would make
@@ -2272,7 +2512,14 @@ fn apply_group_txn(
     // or activating builds in this store while this transaction runs — without that lock, a
     // concurrent process could have just activated one of these very builds, and this
     // discard would leave its shims dangling on a deleted tree.
-    if matches!(outcome, TxnOutcome::Aborted { .. }) {
+    // A HELD FLIP ([`TxnOutcome::Deferred`] from the last look) discards the same way: its
+    // trees were never flipped, and a complete inactive build above the live one is what
+    // this discard exists to prevent. The archives stay (below), so the flip that follows
+    // re-stages without a download.
+    if matches!(
+        outcome,
+        TxnOutcome::Aborted { .. } | TxnOutcome::Deferred { .. }
+    ) {
         for s in staged.borrow().values() {
             // NEVER delete a build that was already LIVE when this transaction re-staged it.
             // [`crate::gc::live_builds`] calls exactly that build live and protects it;
@@ -2304,7 +2551,10 @@ fn apply_group_txn(
     // whenever the user asks; and all of this runs under the store-wide writer lock. A
     // member that FAILED already reclaimed its own archive inside `stage_member`, so this
     // loop can only ever remove — it never resurrects a bad asset.
-    if !matches!(outcome, TxnOutcome::Aborted { .. }) {
+    if !matches!(
+        outcome,
+        TxnOutcome::Aborted { .. } | TxnOutcome::Deferred { .. }
+    ) {
         for program in staged.borrow().keys() {
             if let Some(asset) = resolved_assets.get(program)
                 && let Ok(dl) = staged_download_path(layout, program, asset)
@@ -2339,6 +2589,90 @@ fn apply_group_txn(
         }
     }
     (outcome, applied)
+}
+
+/// What [`apply_group_txn`] reads to hold a toolchain flip for quiet ([`crate::quiet`]):
+/// built only when the gate applies — an unattended pass ([`crate::quiet::FlipPolicy::
+/// WhenQuiet`]) moving the Trust compiler itself off a live build.
+struct QuietGate {
+    /// The group's name, the record's key.
+    label: String,
+    /// Member → the live build the flip would move off (what is probed).
+    live: BTreeMap<String, u64>,
+    /// Member → the build it would move onto.
+    to: BTreeMap<String, u64>,
+}
+
+impl QuietGate {
+    fn new(
+        ch: &Channel,
+        group: &Group,
+        installed: &BTreeMap<String, u64>,
+        install_members: &[&String],
+        flip: &crate::quiet::FlipGate<'_>,
+    ) -> Option<Self> {
+        // The COMPILER must be one of the members that move: a pass that moves only a
+        // sibling leaves every build in flight on the trustc it started with. And it must
+        // have a LIVE build to move off (2026-09-26 review): a trust the tuple re-stages
+        // from a tombstone or pulls back in supersedes no compiler anything could be
+        // running, and holding it kept a disabled toolchain disabled behind a SIBLING's
+        // process for up to four hours.
+        let applies = flip.policy == crate::quiet::FlipPolicy::WhenQuiet
+            && install_members
+                .iter()
+                .any(|m| *m == crate::seam::SEAM_PROGRAM)
+            && installed.contains_key(crate::seam::SEAM_PROGRAM);
+        applies.then(|| Self {
+            label: group
+                .group
+                .clone()
+                .unwrap_or_else(|| group.members.join("+")),
+            live: group
+                .members
+                .iter()
+                .filter_map(|m| installed.get(m).map(|b| (m.clone(), *b)))
+                .collect(),
+            to: install_members
+                .iter()
+                .filter_map(|m| ch.pin.get(*m).map(|b| ((*m).clone(), *b)))
+                .collect(),
+        })
+    }
+
+    /// The moves, as the record says them.
+    fn moves_words(&self) -> String {
+        crate::quiet::Deferral {
+            from: self.live.clone(),
+            to: self.to.clone(),
+            ..Default::default()
+        }
+        .moves()
+    }
+
+    /// The record's moves: the builds, and each moving member's staged archive as the pass
+    /// resolved it (`resolved`, member → asset file name) — the archives every gc spares
+    /// while the wait stands ([`crate::quiet::held_archives`]).
+    fn moves(&self, resolved: &BTreeMap<String, String>) -> crate::quiet::Moves {
+        crate::quiet::Moves {
+            from: self.live.clone(),
+            to: self.to.clone(),
+            assets: self
+                .to
+                .keys()
+                .filter_map(|m| resolved.get(m).map(|asset| (m.clone(), asset.clone())))
+                .collect(),
+        }
+    }
+}
+
+/// `4 h 10 min`, `55 min`: how long a flip waited, for the ceiling line.
+fn waited_words(secs: i64) -> String {
+    let mins = secs.max(0) / 60;
+    match (mins / 60, mins % 60) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
 }
 
 /// Is `dl` a COMPLETE, already-verified copy of `artifact`'s compressed asset — an
@@ -3004,10 +3338,21 @@ pub fn rollback(
                 && build_can_be_rolled_onto(layout, program, b)
         })
         .ok_or_else(|| {
-            FlowError::Rollback(format!(
-                "no retained build below {current} that satisfies the floor/yank gate \
-                 and still holds the tools it was installed with"
-            ))
+            // What stays and why nothing older can run — the gate's name is not a fact a
+            // person can act on (audit, 2026-09-25). `lower` is sorted ascending, so its
+            // last entry is the newest retained build below current, and it is the one
+            // the arms describe.
+            FlowError::Rollback(match lower.last() {
+                None => {
+                    format!("no older {program} build is kept \u{2014} {program} {current} stays")
+                }
+                Some(&b) if b < floor_for_program || crate::gate::is_yanked(ch, program, b) => {
+                    format!("{program} {b} is revoked \u{2014} {program} {current} stays")
+                }
+                Some(&b) => format!(
+                    "{program} {b} has nothing in bin/ to run \u{2014} {program} {current} stays"
+                ),
+            })
         })?;
     // 7. Re-point via the tested primitive (symlinks only; no tree mutation). reloc:None —
     //    a self-contained bundle needs no pre-activation wiring to re-run.
@@ -3112,6 +3457,8 @@ pub fn apply_program(
         installed,
         excluded,
         &mut resolved_assets,
+        // `aterm pkg update <program>` is a person's verb: it flips at once.
+        &crate::quiet::FlipGate::NOW,
     ) {
         applied.extend(group_applied);
         results.push((acted, o));
@@ -3361,6 +3708,52 @@ fn stage_member(
     resolved_assets: &mut BTreeMap<String, String>,
     why: &mut String,
 ) -> Option<Staged> {
+    let fetched = fetch_member(
+        fetcher,
+        layout,
+        index,
+        ch,
+        program,
+        triple,
+        resolved_assets,
+        why,
+    )?;
+    stage_fetched(layout, index, ch, program, prior_build, why, fetched)
+}
+
+/// A group member's signed archive in `staging/<program>/` — downloaded this pass, or
+/// carried from an earlier one ([`carried_archive`]) — with what staging it needs: the
+/// half of [`stage_member`] that moves bytes over the network, and the whole of what a
+/// deferred flip does before it waits ([`crate::quiet`]: stage now, flip when quiet).
+struct Fetched {
+    pinned: u64,
+    pkg: crate::manifest::PkgManifest,
+    artifact: crate::manifest::Artifact,
+    dl: PathBuf,
+    reloc: Option<String>,
+    /// Whether the archive was an earlier attempt's, already matched against its signed
+    /// digest ([`carried_archive`]) — a fresh download has not been hashed yet.
+    carried: bool,
+}
+
+/// [`stage_member`]'s first half: resolve the member's signed manifest, admit its row and
+/// fetch its archive into `staging/` (or find the one an earlier attempt carried). `None`,
+/// `why` filled, on any failure — the same exits, in the same order, as before the split.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fetch half of stage_member takes its inputs, minus the prior build only the \
+              stage half reads"
+)]
+fn fetch_member(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    index: &TrustedIndex,
+    ch: &Channel,
+    program: &str,
+    triple: &str,
+    resolved_assets: &mut BTreeMap<String, String>,
+    why: &mut String,
+) -> Option<Fetched> {
     // `why` is the sentence the abort carries (2026-09-15): every `None` below names its
     // step, so `aborted: stage` on the record is never the whole story again.
     let (pinned, repo, pkg) = match verified_pkg_or_miss(fetcher, index, ch, program) {
@@ -3405,18 +3798,12 @@ fn stage_member(
             // A kind/protocol pair this lane cannot stage is a PUBLISHING fact, not a
             // machine fault, and it aborts a whole tuple — so name it rather than leaving
             // the operator to guess at "ABORTED at <program> during stage".
-            *why = format!(
-                "{program}'s row ({}/{}) is not one a coherence group stages",
+            let note = format!(
+                "this aterm cannot install this kind of package ({}/{})",
                 artifact.kind, artifact.protocol
             );
-            eprintln!(
-                "{}",
-                stage_failure_note(
-                    program,
-                    pinned,
-                    "its kind/protocol pair has no staging lane in this client",
-                )
-            );
+            eprintln!("{}", stage_failure_note(program, pinned, &note));
+            *why = note;
             return None;
         }
     };
@@ -3492,6 +3879,37 @@ fn stage_member(
         // The transfer is over — stop the poller before the phase moves on.
         drop(download_watch);
     }
+    let artifact = artifact.clone();
+    Some(Fetched {
+        pinned,
+        pkg,
+        artifact,
+        dl,
+        reloc,
+        carried,
+    })
+}
+
+/// [`stage_member`]'s second half: verify and extract a [`Fetched`] archive into its build
+/// dir and write its sidecars. NO activation.
+fn stage_fetched(
+    layout: &Layout,
+    index: &TrustedIndex,
+    ch: &Channel,
+    program: &str,
+    prior_build: Option<u64>,
+    why: &mut String,
+    fetched: Fetched,
+) -> Option<Staged> {
+    let Fetched {
+        pinned,
+        pkg,
+        artifact,
+        dl,
+        reloc,
+        carried: _,
+    } = fetched;
+    let artifact = &artifact;
     crate::progress::note_phase(program, crate::progress::Phase::Verify);
     let build_dir = layout.build_dir(program, pinned);
     // Capture "this build is ALREADY live" BEFORE the stage swaps a new tree into it, and
@@ -3510,20 +3928,13 @@ fn stage_member(
     // The signed `shim_env` rides beside the build (design S7) so the flip — and a
     // rollback that has no manifest in hand — lays this build's shims with it.
     if let Err(e) = crate::shim_env::write_sidecar(&build_dir, &pkg.shim_env()) {
-        *why = format!("the shim_env sidecar for {program} could not be written: {e}");
         // A store the process cannot write is the likeliest reading of this exit, and it
         // aborts the tuple exactly like a bad signature would — so the log must be able to
         // tell the two apart (2026-09-13).
-        eprintln!(
-            "{}",
-            stage_failure_note(
-                program,
-                pinned,
-                "the signed shim_env sidecar could not be written beside the build",
-            )
-        );
+        let note = format!("its environment file could not be written beside the build: {e}");
+        eprintln!("{}", stage_failure_note(program, pinned, &note));
         let _ = std::fs::remove_file(&dl);
-        *why = format!("the shim_env sidecar for {program} could not be written: {e}");
+        *why = note;
         return None;
     }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
@@ -3549,6 +3960,11 @@ fn stage_member(
     // This member's bytes are good, whatever an earlier pass recorded about them (the
     // singleton lane's reasoning, member by member).
     crate::store::clear_stage_refusal(&build_dir);
+    // PROVENANCE BEFORE THE FLIP (gap #35, measured — [`crate::provenance::heal_staged`]):
+    // the tag a tracked writer left is cleared while nothing runs from this tree, because
+    // clearing it after the flip moves the ctimes a starting tippy pins, and that tippy
+    // refuses the toolchain mid-run. The door-end heal stays the backstop.
+    let _ = crate::provenance::heal_staged(layout, &build_dir);
     // The archive of a member that STAGED stays until the transaction knows the whole
     // tuple's fate (`carried_archive`): a sibling's abort discards this tree, and the
     // archive is what spares the retry the download.
@@ -4189,6 +4605,7 @@ mod tests {
 
     /// As [`fixture_with_kind`], but with explicit `bin/ay` content + tar mode (the
     /// resolve-check rollback tests ship a native-object magic that cannot spawn).
+    #[cfg(unix)]
     fn fixture_with(dir: &Path, kind: &str, ay_content: &[u8], ay_mode: &[u8; 8]) -> Fake {
         fixture_from(dir, kind, make_archive_with(dir, ay_content, ay_mode), None)
     }
@@ -4569,11 +4986,13 @@ mod tests {
         // The same archive bytes under a signed tree_root that cannot match: the sha256 gate
         // passes, so the download really lands in `staging/` and the failure is late.
         let tampered = fixture_from(&dir, "binary", make_archive(&dir), Some(&"a".repeat(64)));
+        #[cfg(unix)]
         let retained = layout
             .prefix
             .join("staging")
             .join("ay")
             .join("ay-18.tar.zst");
+        #[cfg(unix)]
         let mut identity: Option<(u64, u64)> = None;
         for _ in 0..3 {
             let err = install(&tampered, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
@@ -5520,37 +5939,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bdir);
     }
 
-    /// The retired `kind = "vendor-fetch"` spelling is refused at PARSE — the flow sees
-    /// `RetiredKind`, whose words name the split (never a dispatch, never a download) —
-    /// and nothing is staged.
-    #[test]
-    fn the_retired_vendor_fetch_kind_is_a_parse_refusal() {
-        let req = InstallRequest {
-            channel: "stable",
-            program: "ay",
-            triple: TRIPLE,
-            installed: None,
-        };
-        let dir = scratch("vendor-fetch-retired");
-        let fake = fixture_vendor(
-            &dir,
-            "kind = \"vendor-fetch\"\nurl = \"https://github.com/x/y.tar.zst\"\npayload = \"tar-zst\"\n",
-        );
-        let lay = layout(&dir);
-        let err = install(&fake, &lay, &anchor(), &req, fl(0), 0).unwrap_err();
-        assert!(matches!(err, FlowError::RetiredKind(_)), "{err:?}");
-        let words = err.to_string();
-        assert!(
-            words.starts_with("manifest refused: kind = \"vendor-fetch\" is retired"),
-            "{words}"
-        );
-        assert!(words.contains("kind = \"binary\""), "{words}");
-        assert!(words.contains("protocol = \"https\""), "{words}");
-        assert!(!lay.staging_dir("ay").exists());
-        assert!(crate::ops::which(&lay, "ay").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// The OS-installer protocols are DELETED (design 2026-09-22 §5.3(b)): a signed row
     /// naming `pkg`, `system-pm` or `softwareupdate` is refused by name at admission —
     /// before the disk preflight, before any byte moves — and nothing is staged or shimmed.
@@ -5710,7 +6098,9 @@ mod tests {
     /// documented "cannot spawn" arm — so [`bundle_resolve_check`] errors. (A garbage
     /// EXECUTABLE Mach-O is no good as a fixture: macOS reports the exec-format failure
     /// as a NORMAL exit 126, which the check's run-to-completion contract accepts.)
+    #[cfg(unix)]
     const BROKEN_NATIVE_BIN: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0];
+    #[cfg(unix)]
     const NO_EXEC_MODE: &[u8; 8] = b"0000644\0";
 
     // THE resolve-failure unwind (fresh install): a sysroot-bundle whose exposed binary
@@ -6304,6 +6694,444 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Unix seconds the quiet-flip tests start from.
+    const QUIET_T0: i64 = 1_790_000_000;
+
+    /// A store whose `rustc` tuple is live at trust@4800 + ay@17 — what an unattended pass
+    /// would supersede with [`group_fixture`]'s trust@4821 + ay@18.
+    fn live_toolchain(layout: &Layout) -> std::collections::BTreeMap<String, u64> {
+        seed_build(layout, "trust", 4800, true);
+        seed_build(layout, "ay", 17, true);
+        std::collections::BTreeMap::from([("trust".to_string(), 4800u64), ("ay".to_string(), 17)])
+    }
+
+    /// One unattended pass over `fake` at `now`, under the injected process table.
+    fn quiet_pass(
+        fake: &dyn Fetcher,
+        layout: &Layout,
+        installed: &std::collections::BTreeMap<String, u64>,
+        now: i64,
+        running: &dyn Fn() -> Option<Vec<PathBuf>>,
+    ) -> ChannelApplyReport {
+        let index = resolve_verified_index(fake, layout, &anchor(), fl(0), 0).unwrap();
+        let gate = crate::quiet::FlipGate {
+            policy: crate::quiet::FlipPolicy::WhenQuiet,
+            now,
+            running,
+        };
+        apply_channel_gated(
+            fake,
+            layout,
+            &index,
+            "stable",
+            TRIPLE,
+            installed,
+            &[],
+            &gate,
+        )
+        .unwrap()
+    }
+
+    /// A WAIT NOTHING CAN RECORD IS NO WAIT (review of 2026-09-26). The ceiling is measured
+    /// from the record's `since`, read back by the next pass; with the record unwritable,
+    /// every pass began the wait again and a busy machine held the toolchain for good. Such a
+    /// pass installs the update at once, busy or not, and the last look does not hold it.
+    #[test]
+    fn a_busy_toolchain_whose_wait_cannot_be_recorded_flips_at_once() {
+        let dir = scratch("quiet-unrecorded");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        // The record's own path is a directory: the write's rename over it fails.
+        std::fs::create_dir_all(crate::quiet::record_path(&layout)).unwrap();
+        let targo = layout.build_dir("trust", 4800).join("bin/targo");
+        let busy = || Some(vec![targo.clone()]);
+
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
+        assert_eq!(
+            report.groups[0].1,
+            TxnOutcome::Applied(vec!["ay".into(), "trust".into()]),
+            "an unrecordable wait flips now"
+        );
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("trust").copied(),
+            Some(4821)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STAGE NOW, FLIP WHEN QUIET (gap #12(b)). An unattended pass meets a build running from
+    /// the live toolchain: every member it would move has its signed archive in `staging/`,
+    /// nothing is extracted, nothing flips, and the wait is recorded. A second pass, still
+    /// busy, downloads nothing and keeps the FIRST deferral's clock. The pass that finds the
+    /// toolchain quiet flips the tuple from those archives, with no download, and the record
+    /// goes.
+    #[test]
+    fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
+        let dir = scratch("quiet-stage");
+        let fake = Counting::of(group_fixture(&dir));
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        let targo = layout.build_dir("trust", 4800).join("bin/targo");
+        let busy = || Some(vec![PathBuf::from("/usr/bin/login"), targo.clone()]);
+
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
+        let TxnOutcome::Deferred {
+            members,
+            why,
+            since,
+        } = &report.groups[0].1
+        else {
+            panic!("a busy toolchain holds the flip: {:?}", report.groups[0].1);
+        };
+        assert_eq!(members, &["ay".to_string(), "trust".to_string()]);
+        assert_eq!(*since, QUIET_T0);
+        assert!(why.contains("is running from it"), "{why}");
+        assert!(report.applied.is_empty());
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("trust").copied(),
+            Some(4800),
+            "nothing flipped"
+        );
+        assert!(
+            !layout.build_dir("trust", 4821).exists(),
+            "nothing extracted while the toolchain is in use"
+        );
+        for asset in ["trust-4821.tar.zst", "ay-18.tar.zst"] {
+            let program = asset.split('-').next().unwrap();
+            assert!(
+                layout.staging_dir(program).join(asset).is_file(),
+                "{asset} is staged"
+            );
+            assert_eq!(fake.count(asset), 1);
+            assert_eq!(
+                report.resolved_assets.get(program).map(String::as_str),
+                Some(asset),
+                "the pass-end gc spares what waits"
+            );
+        }
+        let record = crate::quiet::read(&layout).expect("the wait is recorded");
+        assert_eq!(record.since, QUIET_T0);
+        assert_eq!(
+            record.moves(),
+            "ay build 17 \u{2192} 18, trust build 4800 \u{2192} 4821"
+        );
+
+        // Still busy an hour on: no download, the first deferral's clock kept.
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 3600, &busy);
+        assert!(
+            matches!(report.groups[0].1, TxnOutcome::Deferred { since, .. } if since == QUIET_T0),
+            "{:?}",
+            report.groups[0].1
+        );
+        assert_eq!(
+            fake.count("trust-4821.tar.zst"),
+            1,
+            "the staged archive is reused"
+        );
+        assert_eq!(
+            crate::quiet::read(&layout).unwrap().checked,
+            QUIET_T0 + 3600
+        );
+        // The record names each staged archive, and a gc that resolved none of them — a
+        // person's `atpkg gc`, an install's or the seed's pass-end sweep — keeps them for the
+        // flip, so the flip below still downloads nothing (2026-09-26).
+        assert_eq!(
+            record.assets,
+            std::collections::BTreeMap::from([
+                ("ay".to_string(), "ay-18.tar.zst".to_string()),
+                ("trust".to_string(), "trust-4821.tar.zst".to_string()),
+            ])
+        );
+        let gc = crate::gc::run(&layout);
+        assert_eq!(gc.held_staging.len(), 2, "{:?}", gc.held_staging);
+
+        // Quiet: the tuple flips from the staged archives, and the record goes.
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 7200, &|| {
+            Some(vec![PathBuf::from("/usr/bin/login")])
+        });
+        assert_eq!(
+            report.groups[0].1,
+            TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
+        );
+        assert_eq!(fake.count("trust-4821.tar.zst"), 1, "no second download");
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("trust").copied(),
+            Some(4821)
+        );
+        assert_eq!(crate::quiet::read(&layout), None, "the wait is over");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DOWNLOAD THAT FAILS ITS SIGNED DIGEST while the flip waits is the stage's failure,
+    /// said and recorded the stage's way: the pass aborts, the bad archive goes, and the
+    /// refusal memo keeps the next pass from paying the download to be told again.
+    #[test]
+    fn a_staged_archive_that_fails_its_digest_aborts_and_is_remembered() {
+        let dir = scratch("quiet-poison");
+        let fake = Counting::of(group_fixture(&dir));
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        poison(&dir.join("trust-4821.tar.zst"));
+        let targo = layout.build_dir("trust", 4800).join("bin/targo");
+        let busy = || Some(vec![targo.clone()]);
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
+        let TxnOutcome::Aborted { failed, why, .. } = &report.groups[0].1 else {
+            panic!("a poisoned archive aborts: {:?}", report.groups[0].1);
+        };
+        assert_eq!(failed, "trust");
+        assert!(why.contains("sha256"), "{why}");
+        assert!(
+            !layout
+                .staging_dir("trust")
+                .join("trust-4821.tar.zst")
+                .exists()
+        );
+        assert!(
+            crate::store::stage_refusal(&layout.build_dir("trust", 4821)).is_some(),
+            "the refusal is remembered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A LEASE HOLDS THE FLIP TOO, with no process in sight: a merge-contract run between
+    /// two stages. And an unreadable process table is priced as in use.
+    #[test]
+    fn a_lease_or_an_unreadable_table_holds_the_flip() {
+        let dir = scratch("quiet-lease");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        let lease = crate::lease::take(
+            &layout.prefix,
+            &crate::lease::Subject::build("trust", 4800).unwrap(),
+            "aterm-verify (pid 7) \u{2014} the merge contract in /w",
+            crate::lease::DEFAULT_WAIT,
+        )
+        .unwrap();
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| Some(Vec::new()));
+        let TxnOutcome::Deferred { why, .. } = &report.groups[0].1 else {
+            panic!(
+                "a leased toolchain holds the flip: {:?}",
+                report.groups[0].1
+            );
+        };
+        assert_eq!(
+            why,
+            "trust build 4800 is in use by aterm-verify (pid 7) \u{2014} the merge contract in /w"
+        );
+        drop(lease);
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 60, &|| None);
+        let TxnOutcome::Deferred { why, .. } = &report.groups[0].1 else {
+            panic!("unknown is in use: {:?}", report.groups[0].1);
+        };
+        assert!(why.contains("cannot be told"), "{why}");
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("trust").copied(),
+            Some(4800)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE WAIT IS BOUNDED: at four hours from the first deferral the flip lands however
+    /// busy the toolchain is. A PERSON NEVER WAITS: a pass without the unattended policy
+    /// flips at once over the same busy toolchain.
+    #[test]
+    fn the_ceiling_flips_a_busy_toolchain_and_a_person_never_waits() {
+        {
+            let dir = scratch("quiet-ceiling");
+            let fake = group_fixture(&dir);
+            let layout = layout(&dir);
+            let installed = live_toolchain(&layout);
+            let targo = layout.build_dir("trust", 4800).join("bin/targo");
+            let busy = || Some(vec![targo.clone()]);
+            let first = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
+            assert!(matches!(first.groups[0].1, TxnOutcome::Deferred { .. }));
+            let late = quiet_pass(
+                &fake,
+                &layout,
+                &installed,
+                QUIET_T0 + crate::quiet::CEILING_SECS - 1,
+                &busy,
+            );
+            assert!(matches!(late.groups[0].1, TxnOutcome::Deferred { .. }));
+            let ceiling = quiet_pass(
+                &fake,
+                &layout,
+                &installed,
+                QUIET_T0 + crate::quiet::CEILING_SECS,
+                &busy,
+            );
+            assert!(
+                matches!(ceiling.groups[0].1, TxnOutcome::Applied(_)),
+                "{:?}",
+                ceiling.groups[0].1
+            );
+            assert_eq!(crate::quiet::read(&layout), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        let dir = scratch("quiet-person");
+        let fake = group_fixture(&dir);
+        let person = layout(&dir);
+        let installed = live_toolchain(&person);
+        let index = resolve_verified_index(&fake, &person, &anchor(), fl(0), 0).unwrap();
+        // `apply_channel_with` is `FlipGate::NOW`: what `aterm pkg update` runs.
+        let report =
+            apply_channel_with(&fake, &person, &index, "stable", TRIPLE, &installed, &[]).unwrap();
+        assert!(matches!(report.groups[0].1, TxnOutcome::Applied(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A HELD FLIP NO GROUP HOLDS ANY LONGER IS OVER: a pass that skips the toolchain's
+    /// group whole — nothing of it installed any more — ends the record, so the window's
+    /// park stops looking at a flip nobody will make.
+    #[test]
+    fn a_held_flip_no_group_holds_is_ended_by_the_next_pass() {
+        let dir = scratch("quiet-orphan");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        let targo = layout.build_dir("trust", 4800).join("bin/targo");
+        let busy = || Some(vec![targo.clone()]);
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &busy);
+        assert!(matches!(report.groups[0].1, TxnOutcome::Deferred { .. }));
+        assert!(crate::quiet::read(&layout).is_some());
+        let nothing = std::collections::BTreeMap::new();
+        let report = quiet_pass(&fake, &layout, &nothing, QUIET_T0 + 60, &busy);
+        assert!(report.groups.is_empty(), "{:?}", report.groups);
+        assert_eq!(crate::quiet::read(&layout), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ONLY THE COMPILER'S MOVE WAITS: trust is already at its pin and only a sibling moves,
+    /// so a build running from the live trust keeps its compiler whatever flips — the pass
+    /// flips at once.
+    #[test]
+    fn a_pass_that_moves_only_a_sibling_of_the_compiler_never_waits() {
+        let dir = scratch("quiet-sibling");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        seed_build(&layout, "trust", 4821, true);
+        seed_build(&layout, "ay", 17, true);
+        let installed = std::collections::BTreeMap::from([
+            ("trust".to_string(), 4821u64),
+            ("ay".to_string(), 17),
+        ]);
+        let targo = layout.build_dir("trust", 4821).join("bin/targo");
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
+            Some(vec![targo.clone()])
+        });
+        assert_eq!(report.groups[0].1, TxnOutcome::Applied(vec!["ay".into()]));
+        assert_eq!(crate::quiet::read(&layout), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NOTHING LIVE, NOTHING TO WAIT FOR: trust has no live build here — a tombstone the
+    /// pass is re-staging, or a member the tuple pulls back in — so its install supersedes
+    /// no compiler anything could be running, and the pass flips at once however busy a
+    /// SIBLING is. Held, a disabled toolchain stayed disabled for up to four hours behind
+    /// a process that was not using it (2026-09-26 review).
+    #[test]
+    fn a_compiler_with_no_live_build_never_waits() {
+        let dir = scratch("quiet-no-live");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        seed_build(&layout, "ay", 17, true);
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        let ay = layout.build_dir("ay", 17).join("bin/ay");
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
+            Some(vec![ay.clone()])
+        });
+        assert_eq!(
+            report.groups[0].1,
+            TxnOutcome::Applied(vec!["ay".into(), "trust".into()]),
+            "{:?}",
+            report.groups[0].1
+        );
+        assert_eq!(crate::quiet::read(&layout), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REVOKED BUILD NEVER WAITS: the live ay@17 is yanked, so the tuple force-upgrades at
+    /// once, busy toolchain or not.
+    #[test]
+    fn a_revoked_live_build_flips_at_once_however_busy() {
+        let dir = scratch("quiet-revoked");
+        let fake = group_fixture_yanking_ay17(&dir);
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        let targo = layout.build_dir("trust", 4800).join("bin/targo");
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
+            Some(vec![targo.clone()])
+        });
+        assert!(
+            matches!(report.groups[0].1, TxnOutcome::Applied(_)),
+            "{:?}",
+            report.groups[0].1
+        );
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("ay").copied(),
+            Some(18)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE LAST LOOK: quiet when the pass began, but a build started while the tree was
+    /// being extracted — the flip is held after all, the extracted trees go (no complete
+    /// inactive build is left above the live one), and the archives stay for the flip that
+    /// follows.
+    #[test]
+    fn a_build_started_during_the_extract_holds_the_flip_after_all() {
+        let dir = scratch("quiet-last-look");
+        let fake = Counting::of(group_fixture(&dir));
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        let targo = layout.build_dir("trust", 4800).join("bin/targo");
+        let looks = std::cell::Cell::new(0u32);
+        let table = || {
+            looks.set(looks.get() + 1);
+            Some(if looks.get() == 1 {
+                Vec::new()
+            } else {
+                vec![targo.clone()]
+            })
+        };
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &table);
+        assert!(
+            matches!(report.groups[0].1, TxnOutcome::Deferred { .. }),
+            "{:?}",
+            report.groups[0].1
+        );
+        assert_eq!(
+            looks.get(),
+            2,
+            "one look before the stage, one before the flip"
+        );
+        assert!(
+            !layout.build_dir("trust", 4821).exists(),
+            "the extracted tree went"
+        );
+        assert!(!layout.build_dir("ay", 18).exists());
+        assert!(
+            layout
+                .staging_dir("trust")
+                .join("trust-4821.tar.zst")
+                .is_file()
+        );
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("trust").copied(),
+            Some(4800)
+        );
+        assert!(crate::quiet::read(&layout).is_some());
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0 + 60, &|| {
+            Some(Vec::new())
+        });
+        assert!(matches!(report.groups[0].1, TxnOutcome::Applied(_)));
+        assert_eq!(fake.count("trust-4821.tar.zst"), 1, "the archive was kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// [`group_fixture`]'s signed release, re-published with the `rustc` tuple pinned ONLY
     /// through a `pin_by_target` overlay for [`TRIPLE`]: the platform-agnostic `pin` names
     /// `trust@4820` (a build with no manifest this fetcher serves, i.e. another target's
@@ -6544,6 +7372,110 @@ mod tests {
         assert_eq!(
             crate::ops::which(&layout, "trust").unwrap(),
             tool_bin(&layout.build_dir("trust", 4821), "trust")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The heals [`observe_heals`] saw, as `(root, live)`.
+    #[cfg(unix)]
+    type SeenHeals = std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, bool)>>>;
+
+    /// Every heal the stand-in runs from here on, as `(root, live)`: `live` when a `current`
+    /// link — the program's own, or the channel's — already named the root AT THAT MOMENT.
+    #[cfg(unix)]
+    fn observe_heals(
+        layout: &Layout,
+        channel: &'static str,
+    ) -> (SeenHeals, crate::provenance::test_bind::ObserveGuard) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (l, s) = (layout.clone(), std::rc::Rc::clone(&seen));
+        let guard = crate::provenance::test_bind::observe(move |roots| {
+            for root in roots {
+                let names = |link: PathBuf| std::fs::read_link(link).is_ok_and(|t| &t == root);
+                let program = root.parent().and_then(Path::file_name);
+                let live = program
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|p| names(l.program_current(p)))
+                    || names(l.channel_current(channel));
+                s.borrow_mut().push((root.clone(), live));
+            }
+        });
+        (seen, guard)
+    }
+
+    /// PROVENANCE BEFORE THE FLIP (gap #35, 2026-09-26): every member a group stages has
+    /// its tree healed while no `current` link names it yet — cleared after the flip, the
+    /// tag's removal moved the ctimes a starting tippy pins, and the tippy refused the
+    /// toolchain mid-run ([`crate::provenance::heal_staged`] has the measurement). Each heal
+    /// is observed as it runs; after the pass, both members are live.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_heals_every_staged_tree_before_its_flip() {
+        let dir = scratch("group-heal-before-flip");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        let (seen, _observing) = observe_heals(&layout, "stable");
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            report.groups[0].1,
+            TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
+        );
+        let seen = seen.borrow();
+        for (program, build) in [("ay", 18u64), ("trust", 4821)] {
+            let staged = layout.build_dir(program, build);
+            assert_eq!(
+                seen.iter()
+                    .filter(|(root, _)| *root == staged)
+                    .collect::<Vec<_>>(),
+                vec![&(staged.clone(), false)],
+                "{program}'s staged tree is healed once, before its flip: {seen:?}"
+            );
+            assert_eq!(
+                std::fs::read_link(layout.program_current(program)).unwrap(),
+                staged,
+                "and it is live now"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for one program's install: its staged tree is healed before activation.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_heals_its_staged_tree_before_activation() {
+        let dir = scratch("install-heal-before-flip");
+        let fake = fixture(&dir);
+        let layout = layout(&dir);
+        let (seen, _observing) = observe_heals(&layout, "stable");
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        assert_eq!(report.build, 18);
+        let staged = layout.build_dir("ay", 18);
+        assert_eq!(
+            *seen.borrow(),
+            vec![(staged.clone(), false)],
+            "healed once, before it was live"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.channel_current("stable")).unwrap(),
+            staged
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7542,8 +8474,11 @@ mod tests {
         .unwrap();
         let err = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0)
             .expect_err("no landable build below current");
+        // The refusal names the build that cannot run and what stays — a fact a person
+        // can act on, not the gate's mechanism (audit, 2026-09-25).
         assert!(
-            err.to_string().contains("still holds the tools"),
+            err.to_string()
+                .contains("ay 17 has nothing in bin/ to run \u{2014} ay 18 stays"),
             "the refusal says WHY, not just that the gate failed: {err}"
         );
         assert_eq!(
@@ -7673,7 +8608,12 @@ mod tests {
         let layout = layout(&dir);
         seed_build(&layout, "ay", 18, true); // only 18 present
         let err = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap_err();
-        assert!(matches!(err, FlowError::Rollback(_)), "got {err:?}");
+        // What stays, and why: no older build is kept — the gate's mechanism is not the
+        // sentence (audit, 2026-09-25).
+        assert!(
+            matches!(&err, FlowError::Rollback(m) if m == "no older ay build is kept \u{2014} ay 18 stays"),
+            "got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8197,7 +9137,7 @@ mod tests {
         );
         let rendered = err.to_string();
         assert!(
-            rendered.contains("network problem") && !rendered.contains("signature-valid"),
+            rendered.contains("could not reach") && !rendered.contains("signature-valid"),
             "the message must point at the network: {rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -8277,7 +9217,7 @@ mod tests {
         let rendered = err.to_string();
         assert!(
             rendered.contains("rate limit")
-                && rendered.contains("network problem")
+                && rendered.contains("could not reach")
                 && !rendered.contains("signature-valid"),
             "the message names the rate limit and points at the network: {rendered}"
         );

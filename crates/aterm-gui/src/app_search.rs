@@ -349,6 +349,11 @@ pub(crate) struct FindOrigin {
 /// hit is one match, and its `end_col` runs past the width by exactly the part
 /// that continues on the rows below. Both consumers — the selection the current
 /// match arms and the highlight-all tint — divide by the width to get there.
+/// What the find bar, the title and a screen reader say of a search that found
+/// nothing while the history was away for a rewrap (design ruling 237) — the
+/// long form; the bar shortens it to fit (`find_bar::status_seg`).
+pub(crate) const HISTORY_AWAY_NONE: &str = "none yet, history rewrapping";
+
 #[derive(Default)]
 pub(crate) struct SearchState {
     pub(crate) query: String,
@@ -420,7 +425,15 @@ pub(crate) struct SearchState {
     /// deeper than the configured index cap), so a "no matches" means "none in the
     /// searched history", not "none anywhere". Copied from [`aterm_search::SearchResults`]
     /// `incomplete` each recompute so the find bar can qualify a zero-match honestly.
+    /// Also set while a width change's rewrap holds the session's history detached
+    /// (design ruling 234): the search reached only the screen.
     pub(crate) truncated: bool,
+    /// The search ran while a width change's rewrap held the session's history
+    /// detached (design ruling 237): the text may well be there, the history is
+    /// simply away. Implies [`Self::truncated`], and says more than it: a
+    /// zero-match here is `none yet`, never `no matches`, because the search runs
+    /// again by itself at the re-attach (`App::rerun_searches_of`).
+    pub(crate) history_away: bool,
     /// Absolute search origin used for Emacs-style point anchoring. At the live
     /// bottom this is the terminal cursor; in a scrolled viewport it is the
     /// visible edge in the active search direction.
@@ -467,6 +480,9 @@ impl SearchState {
     pub(crate) fn window_title(&self) -> String {
         if self.query.is_empty() {
             "aterm — find:".to_string()
+        } else if self.matches.is_empty() && self.history_away {
+            // Ruling 237: the history is away, not empty of the text.
+            format!("aterm — find: {} ({HISTORY_AWAY_NONE})", self.query)
         } else if self.matches.is_empty() {
             format!(
                 "aterm — find: {} (no matches{})",
@@ -617,6 +633,7 @@ impl SearchState {
         mix(u8::from(self.is_regex));
         mix(u8::from(self.regex_error));
         mix(u8::from(self.truncated));
+        mix(u8::from(self.history_away));
         mix(u8::from(self.results_dirty));
         if let Some((row, start, end)) = self.point_match {
             for byte in row.to_le_bytes() {
@@ -633,6 +650,11 @@ impl SearchState {
 #[cfg(test)]
 thread_local! {
     static POINT_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test seam: while set, every find recompute on this thread reads as
+    /// torn (`consistent == false`), as both full-history passes do when
+    /// output moves `content_seq` under them — which the real search only
+    /// reaches by racing a live writer.
+    pub(crate) static FORCE_TORN_SEARCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn match_position(matches: &[(i32, u16, u32)], point: (i32, u16, u32)) -> Result<usize, usize> {
@@ -1004,12 +1026,28 @@ impl App {
     }
 
     fn search_recompute_from_anchor_in(&mut self, wid: crate::WindowId, strict: bool) {
-        let Some(term) = self
+        let Some((term, session)) = self
             .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
+            .map(|terminal| (terminal.term.clone(), terminal.session))
         else {
             return;
         };
+        // THE SEARCH'S HONESTY (design rulings 234, 237): while a width
+        // change's rewrap holds this session's history detached, the search
+        // reaches only the screen — so its count is a floor (`truncated`, the
+        // `+`), and nothing found is `none yet, history rewrapping`
+        // (`history_away`), never `no matches` at any width.
+        // The person searching is waiting on the rewrap, so its row is
+        // wanted; when it re-attaches, the search runs again by itself.
+        let rewrapping = self.rewrap_in_flight(session);
+        if rewrapping
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.search.as_ref().is_some_and(|s| !s.query.is_empty()))
+        {
+            self.note_history_wanted(session);
+        }
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1127,9 +1165,21 @@ impl App {
                 }
             }
         };
+        #[cfg(test)]
+        let consistent = consistent && !FORCE_TORN_SEARCH.with(std::cell::Cell::get);
         if !consistent {
             if let Some(search) = ws.search.as_mut() {
                 search.results_dirty = true;
+                // The kept result is stale, but whether the history is away is a
+                // fact about NOW (ruling 240): the re-attach's own rerun can come
+                // back torn under streaming output, and nothing runs it again by
+                // itself, so a `history_away` left from the rewrap would keep
+                // saying `rewrapping` with nothing running. The floor stays a
+                // floor (`truncated` is only ever raised here), and the stale
+                // mark returns with the plain ladder.
+                let away = rewrapping && !query.is_empty();
+                search.history_away = away;
+                search.truncated |= away;
             }
             self.search_apply_current_in(wid);
             return;
@@ -1143,7 +1193,8 @@ impl App {
             s.match_content_seq = content_seq;
             s.results_dirty = false;
             s.regex_error = regex_error;
-            s.truncated = truncated;
+            s.truncated = truncated || (rewrapping && !query.is_empty());
+            s.history_away = rewrapping && !query.is_empty();
             if let Some(point) = point_match {
                 s.install_point_match(point);
             } else {
@@ -1763,22 +1814,17 @@ impl App {
         self.search_close_in(wid, true);
     }
 
-    /// Leave find mode NEUTRALLY (non-keystroke plumbing paths): clear the highlight +
-    /// restore the title, leaving the viewport wherever it is. The user-facing exits are
-    /// [`Self::search_accept`] (⏎) and [`Self::search_cancel`] (⎋/^G).
-    #[allow(
-        dead_code,
-        reason = "neutral close seam is exercised by renderer lifecycle tests"
-    )]
+    /// Leave find mode NEUTRALLY on the frontmost window: clear the highlight +
+    /// restore the title, leaving the viewport wherever it is. The user-facing exits
+    /// are [`Self::search_accept`] (⏎) and [`Self::search_cancel`] (⎋/^G); this is
+    /// the tests' neutral exit.
+    #[cfg(test)]
     pub(crate) fn search_exit(&mut self) {
         self.search_close(true);
     }
 
-    /// Shared find-close core: drop the overlay state (+ its clickable-indicator
-    /// geometry), optionally clear the selection highlight (accept keeps it on the
-    /// match), and restore the newest title owned by the remaining authority. An
-    /// armed close warning stays untouched; otherwise the canonical Smart Title
-    /// cache is restored.
+    /// [`Self::search_close_in`] on the frontmost window, for the tests.
+    #[cfg(test)]
     fn search_close(&mut self, clear_selection: bool) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -1786,6 +1832,12 @@ impl App {
         self.search_close_in(wid, clear_selection);
     }
 
+    /// Shared find-close core: drop the overlay state (+ its clickable-indicator
+    /// geometry), optionally clear the selection highlight (accept keeps it on the
+    /// match), and restore the newest title owned by the remaining authority. An
+    /// armed close warning stays untouched; otherwise the canonical Smart Title
+    /// cache is restored.
+    ///
     /// `pub(crate)` for `sync_window`: a tab/pane switch tears the find bar down and
     /// must go through THIS seam rather than nulling `ws.search` itself, or the title
     /// stays stuck under Search authority showing a find that is no longer on screen.
@@ -3143,22 +3195,162 @@ mod tests {
         assert!(term_lock(&term).text_selection().has_selection());
     }
 
-    /// Tier-1 conformance for the derived `EmacsSearchNavigation` model.  This
-    /// drives the real terminal snapshot/search, shipping `SearchState::step`,
-    /// selection overlay, and cancel/accept paths, then projects their state onto
-    /// the model after every transition.  The model's deliberate PTY-leak/linear-
-    /// repeat mutant is checked as a negative control so this binding cannot pass
-    /// vacuously.
-    #[test]
-    fn emacs_navigation_conforms_to_derived_transition_model() {
-        let _serial = crate::control::search_cap_test_guard();
-        let model = aterm_spec::derive::emacs_search_navigation_model();
-        let mut state = model.init_state();
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let term = app.front_terminal(wid).expect("terminal").term.clone();
+    /// A fault injected into the real app right after a real step, named by
+    /// the model action that step ends on.
+    #[cfg(unix)]
+    type NavPatch = fn(&mut App, WindowId, &str);
 
-        let mut content = String::new();
+    /// The shipped host, untouched.
+    #[cfg(unix)]
+    fn no_nav_patch(_: &mut App, _: WindowId, _: &str) {}
+
+    /// `EmacsSearchNavigation`'s `Buggy = 1`, one member per law, each as the
+    /// net effect it would have on the real app at its own action.
+    #[cfg(unix)]
+    fn nav_member(member: &str, app: &mut App, wid: WindowId, action: &str) {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        match (member, action) {
+            // The chord reaches the PTY: one byte through the session's own sink.
+            ("leak", "OpenBackward") => {
+                let sink = app.windows[&wid]
+                    .active_terminal
+                    .as_ref()
+                    .expect("session")
+                    .sink
+                    .clone();
+                sink.write_frame(b"\x12")
+                    .expect("the observer pipe accepts a byte");
+            }
+            // The step off the last hit lands one PAST it instead of wrapping.
+            ("past the end", "RepeatForward") => {
+                let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
+                if search.current == 0 {
+                    search.current = search.matches.len();
+                }
+            }
+            // Streaming output leaves the stale hit highlighted.
+            ("stale selection", "Output") => {
+                let mut terminal = term_lock(&term);
+                let sel = terminal.text_selection_mut();
+                sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+                sel.update_selection(0, 3, SelectionSide::Right);
+                sel.complete_selection();
+            }
+            // ⎋ leaves the viewport where the search moved it.
+            ("viewport kept", "Cancel") => term_lock(&term).scroll_to_bottom(),
+            // ⏎ drops the hit it accepted.
+            ("hit dropped", "Accept") => term_lock(&term).text_selection_mut().clear(),
+            _ => {}
+        }
+    }
+
+    /// One run of the navigation trace: the real app, the model state it must
+    /// match, and every PTY byte the observer pipe has seen so far.
+    #[cfg(unix)]
+    struct NavRun<'m> {
+        app: App,
+        wid: WindowId,
+        pipe: [i32; 2],
+        pty_bytes: usize,
+        model: &'m aterm_spec::derive::Model,
+        state: aterm_spec::interp::State,
+        patch: NavPatch,
+    }
+
+    #[cfg(unix)]
+    impl NavRun<'_> {
+        /// Drive one real step, inject the patch, advance the model through
+        /// `actions`, and require every projected variable to be the model's.
+        fn step(
+            &mut self,
+            actions: &[&'static str],
+            drive: impl FnOnce(&mut App, WindowId),
+        ) -> Result<(), String> {
+            let action = *actions.last().expect("a step is at least one action");
+            drive(&mut self.app, self.wid);
+            (self.patch)(&mut self.app, self.wid, action);
+            for &each in actions {
+                let next = self.model.successors(each, &self.state);
+                let [next] = next.as_slice() else {
+                    return Err(format!(
+                        "the model's {each} is not one successor from {:?}: {next:?}",
+                        self.state
+                    ));
+                };
+                self.state = next.clone();
+            }
+            self.pty_bytes += drained(self.pipe).len();
+            let term = self
+                .app
+                .front_terminal(self.wid)
+                .expect("terminal")
+                .term
+                .clone();
+            let mut real = vec![
+                (
+                    "active",
+                    i64::from(self.app.windows[&self.wid].search.is_some()),
+                ),
+                (
+                    "selection",
+                    i64::from(term_lock(&term).text_selection().has_selection()),
+                ),
+                ("pty_writes", i64::from(self.pty_bytes > 0)),
+            ];
+            if let Some(search) = self.app.windows[&self.wid].search.as_ref() {
+                real.extend([
+                    ("hits", i64::try_from(search.matches.len()).unwrap()),
+                    ("current", i64::try_from(search.current).unwrap()),
+                    (
+                        "forward",
+                        i64::from(search.direction == SearchDirection::Forward),
+                    ),
+                    ("dirty", i64::from(search.results_dirty)),
+                ]);
+            }
+            for (var, value) in real {
+                if self.state[var] != value {
+                    return Err(format!(
+                        "real {action}: {var} = {value}, the model's {action} says {} ({:?})",
+                        self.state[var], self.state
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Drive the navigation trace on a real headless App whose PTY is an
+    /// observer pipe, with `patch` injected after every real step. Every chord
+    /// goes through the host seam a physical ⌘S/⌘R takes
+    /// (`terminal_emacs_search_pressed`, then the physical release), with
+    /// Kitty event-type reporting ON so a release that leaked would be encoded.
+    #[cfg(unix)]
+    fn emacs_navigation_trace(
+        model: &aterm_spec::derive::Model,
+        patch: NavPatch,
+    ) -> Result<(), String> {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
+        let (app, pipe) = app_observing_pty();
+        let mut run = NavRun {
+            app,
+            wid: WindowId(0),
+            pipe,
+            pty_bytes: 0,
+            model,
+            state: model.init_state(),
+            patch,
+        };
+        let term = run
+            .app
+            .front_terminal(run.wid)
+            .expect("terminal")
+            .term
+            .clone();
+        let mut content = String::from("\x1b[>2u");
         for line in 0..80 {
             let marker = if matches!(line, 7 | 39 | 71) {
                 " NEEDLE"
@@ -3172,111 +3364,129 @@ mod tests {
             terminal.process(content.as_bytes());
             terminal.scroll_display(9);
         }
-        let origin_offset = term_lock(&term).grid().display_offset();
         assert!(
-            origin_offset > 0,
-            "fixture must start away from the live bottom"
+            term_lock(&term).grid().display_offset() > 0,
+            "the fixture must start away from the live bottom"
         );
-
-        let assert_active_projection =
-            |app: &App, state: &aterm_spec::interp::State, expected_hits: usize| {
-                let search = app.windows[&wid].search.as_ref().expect("active search");
-                assert_eq!(state["active"], 1);
-                assert_eq!(state["hits"], expected_hits as i64);
-                assert_eq!(state["current"], search.current as i64);
-                assert_eq!(
-                    state["forward"] == 1,
-                    search.direction == SearchDirection::Forward
-                );
-                assert_eq!(
-                    state["selection"] == 1,
-                    term_lock(&term).text_selection().has_selection(),
-                );
-                assert_eq!(state["dirty"] == 1, search.results_dirty);
-                assert_eq!(state["pty_writes"], 0);
-                assert!(state["nav_work"] <= 1);
-            };
-        let fire = |state: &mut aterm_spec::interp::State, action| {
-            assert!(model.fire(action, state), "{action}: {state:?}");
-            for invariant in &model.invariants {
-                assert!(
-                    model.check_invariant(invariant.name, state),
-                    "{} after {action}: {state:?}",
-                    invariant.name,
-                );
+        let chord = |forward: bool| {
+            let key = PhysicalKey::Code(if forward {
+                KeyCode::KeyS
+            } else {
+                KeyCode::KeyR
+            });
+            move |app: &mut App, wid: WindowId| {
+                app.terminal_emacs_search_pressed(wid, key, forward);
+                app.release_physical_press(wid, key);
             }
         };
+        let publish = |app: &mut App, wid: WindowId| {
+            set_query(app, wid, "NEEDLE");
+            app.search_recompute();
+        };
+        const THREE_HITS: [&str; 3] = ["PublishHit"; 3];
 
-        app.search_enter_direction(false);
-        fire(&mut state, "OpenBackward");
-        set_query(&mut app, wid, "NEEDLE");
-        app.search_recompute();
-        assert_eq!(app.windows[&wid].search.as_ref().unwrap().matches.len(), 3);
-        for _ in 0..3 {
-            fire(&mut state, "PublishHit");
-        }
-        assert_active_projection(&app, &state, 3);
+        run.step(&["OpenBackward"], chord(false))?;
+        run.step(&THREE_HITS, publish)?;
+        run.step(&["RepeatForward"], chord(true))?;
+        run.step(&["RepeatBackward"], chord(false))?;
+        run.step(&["Output"], |app, _| {
+            term_lock(&term).process(b"\r\nstreamed non-match");
+            app.search_refresh_for_output(0);
+        })?;
+        run.step(&["RefreshRepeatForward"], chord(true))?;
 
-        app.search_repeat(true);
-        fire(&mut state, "RepeatForward");
-        assert_active_projection(&app, &state, 3);
-        app.search_repeat(false);
-        fire(&mut state, "RepeatBackward");
-        assert_active_projection(&app, &state, 3);
-
-        term_lock(&term).process(b"\r\nstreamed non-match");
-        app.search_refresh_for_output(0);
-        fire(&mut state, "Output");
-        assert_active_projection(&app, &state, 3);
-        app.search_repeat(true);
-        fire(&mut state, "RefreshRepeatForward");
-        assert_active_projection(&app, &state, 3);
-
-        // Read the PARKED anchor before cancelling — ⎋ removes the entry. The number
-        // this produces is the same 9 the deleted `origin_offset + (base_y_now −
-        // origin_base_y)` produced on this fixture (no splice, no resize), which is
-        // the point: the anchor generalises the delta rather than replacing it.
-        let expected_cancel_offset = {
-            let origin = app.find_origins.get(&(0, wid)).expect("parked find origin");
+        // ⎋ restores the viewport the open captured: read the PARKED anchor
+        // before cancelling (⎋ removes it), then project the real restore onto
+        // the model's `viewport == origin`.
+        let origin_offset = {
+            let origin = run
+                .app
+                .find_origins
+                .get(&(0, run.wid))
+                .expect("parked find origin");
             let base_now = i64::try_from(term_lock(&term).grid().base_y()).unwrap();
             usize::try_from(base_now - i64::try_from(origin.top_visible_absolute_row).unwrap())
                 .unwrap()
         };
-        app.search_cancel();
-        fire(&mut state, "Cancel");
-        assert!(app.windows[&wid].search.is_none());
-        assert!(!term_lock(&term).text_selection().has_selection());
-        assert_eq!(
-            term_lock(&term).grid().display_offset(),
-            expected_cancel_offset
-        );
-        assert_eq!(state["active"], 0);
-        assert_eq!(state["last_exit"], 1);
-
-        // The accept branch keeps the current hit selected after closing.
-        app.search_enter_direction(false);
-        fire(&mut state, "OpenBackward");
-        set_query(&mut app, wid, "NEEDLE");
-        app.search_recompute();
-        for _ in 0..3 {
-            fire(&mut state, "PublishHit");
+        run.step(&["Cancel"], |app, _| app.search_cancel())?;
+        let restored = term_lock(&term).grid().display_offset() == origin_offset;
+        if restored != (run.state["viewport"] == run.state["origin"]) {
+            return Err(format!(
+                "real Cancel: viewport restored = {restored}, the model's Cancel says {} ({:?})",
+                run.state["viewport"] == run.state["origin"],
+                run.state
+            ));
         }
-        assert_active_projection(&app, &state, 3);
-        app.search_accept();
-        fire(&mut state, "Accept");
-        assert!(app.windows[&wid].search.is_none());
-        assert!(term_lock(&term).text_selection().has_selection());
-        assert_eq!(state["last_exit"], 2);
 
+        // ⏎ keeps the hit it accepted.
+        run.step(&["OpenBackward"], chord(false))?;
+        run.step(&THREE_HITS, publish)?;
+        run.step(&["Accept"], |app, _| app.search_accept())?;
+
+        unsafe {
+            libc::close(run.pipe[0]);
+            libc::close(run.pipe[1]);
+        }
+        Ok(())
+    }
+
+    /// Tier-1 conformance for the derived `EmacsSearchNavigation` model. The
+    /// trace drives the real chord seam, the real snapshot search, the real
+    /// streaming-output refresh, and the real ⎋/⏎ exits on a headless App,
+    /// and after EVERY step requires the real search (active, hits, ordinal,
+    /// direction, staleness), the real selection, and the real PTY observer
+    /// to be the model's state — the viewport restore at ⎋ included.
+    ///
+    /// NEGATIVE CONTROL: each of the model's `Buggy = 1` members, injected into
+    /// the same real trace at its own step, is refused by the healthy model AT
+    /// that action; and the shipped host is refused by the buggy model.
+    #[cfg(unix)]
+    #[test]
+    fn emacs_navigation_conforms_to_derived_transition_model() {
+        let _serial = crate::control::search_cap_test_guard();
+        let model = aterm_spec::derive::emacs_search_navigation_model();
+        emacs_navigation_trace(&model, no_nav_patch).unwrap_or_else(|why| panic!("{why}"));
+
+        let members: [(&str, NavPatch, &str); 5] = [
+            (
+                "leak",
+                |a, w, x| nav_member("leak", a, w, x),
+                "OpenBackward",
+            ),
+            (
+                "past the end",
+                |a, w, x| nav_member("past the end", a, w, x),
+                "RepeatForward",
+            ),
+            (
+                "stale selection",
+                |a, w, x| nav_member("stale selection", a, w, x),
+                "Output",
+            ),
+            (
+                "viewport kept",
+                |a, w, x| nav_member("viewport kept", a, w, x),
+                "Cancel",
+            ),
+            (
+                "hit dropped",
+                |a, w, x| nav_member("hit dropped", a, w, x),
+                "Accept",
+            ),
+        ];
+        for (member, patch, at) in members {
+            let Err(refused) = emacs_navigation_trace(&model, patch) else {
+                panic!("the healthy model must refuse the {member} member");
+            };
+            assert!(
+                refused.contains(&format!("the model's {at} ")),
+                "the {member} member must be refused at {at}: {refused}"
+            );
+        }
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
-        let mut mutant = buggy.init_state();
-        assert!(buggy.fire("OpenForward", &mut mutant));
-        assert!(!buggy.check_invariant("NoPtyLeak", &mutant));
-        for _ in 0..3 {
-            assert!(buggy.fire("PublishHit", &mut mutant));
-        }
-        assert!(buggy.fire("RepeatForward", &mut mutant));
-        assert!(!buggy.check_invariant("RepeatWorkBounded", &mutant));
+        let shipped = emacs_navigation_trace(&buggy, no_nav_patch)
+            .expect_err("the shipped host must not conform to the Buggy = 1 model");
+        assert!(shipped.contains("the model's"), "{shipped}");
     }
 
     /// Codex-style protected footer refreshes rebuild absolute coordinates without

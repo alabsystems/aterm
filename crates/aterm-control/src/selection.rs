@@ -31,7 +31,11 @@ const NO_SESSION: &str = "ERR no such session\n";
 /// blocks `cmd_blocks` reports (oldest-first, optional last-N), one JSON object
 /// per block with the absolute rows, exit code, state, cwd and commandline. An
 /// absent optional row is JSON `null`; the cwd/commandline are JSON strings (not
-/// percent-encoded — JSON carries spaces natively).
+/// percent-encoded — JSON carries spaces natively). `"cmdcol"` (after `"cmd"`,
+/// `null` with it) is the COLUMN the shell's `133;B` marked its input to start
+/// at: where the prompt ended on the `cmd` row, so a reader can tell the prompt
+/// from what was typed after it (the live agent upgrade's relaunch line is
+/// never typed after a person's typeahead, `harness::upgrade_drive`).
 pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     use aterm_core::terminal::BlockState;
     let Some(items) = host.with_terminal(sid, |t: &Terminal| {
@@ -54,11 +58,12 @@ pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String 
                 .exit_code
                 .map_or_else(|| "null".to_string(), |c| c.to_string());
             items.push(format!(
-                "{{\"id\":{},{},\"exit\":{exit},\"prompt\":{},\"cmd\":{},\"out\":{},\"end\":{},{},{}}}",
+                "{{\"id\":{},{},\"exit\":{exit},\"prompt\":{},\"cmd\":{},\"cmdcol\":{},\"out\":{},\"end\":{},{},{}}}",
                 b.id,
                 json_str_field("state", state),
                 b.prompt_start_row,
                 opt_row(b.command_start_row),
+                opt_row(b.command_start_col.map(u64::from)),
                 opt_row(b.output_start_row),
                 opt_row(b.end_row),
                 json_str_field("cwd", b.working_directory.as_deref().unwrap_or("")),

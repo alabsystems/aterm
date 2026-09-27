@@ -279,6 +279,7 @@ impl Row {
     ///
     /// Returns `true` if the write succeeded, `false` if out of bounds.
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn write_wide_char(
         &mut self,
         col: u16,

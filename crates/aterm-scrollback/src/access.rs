@@ -4,7 +4,7 @@
 
 //! Shared interface for scrollback storage backends.
 //!
-//! [`ScrollbackAccess`] unifies the 19 methods that both [`Scrollback`] and
+//! [`ScrollbackAccess`] unifies the methods that both [`Scrollback`] and
 //! [`DiskBackedScrollback`] implement with compatible signatures, replacing 38
 //! match arms in [`ScrollbackStorage`] with a single `inner()`/`inner_mut()`
 //! dispatch pair.
@@ -65,9 +65,6 @@ pub trait ScrollbackAccess: sealed::Sealed {
     fn memory_budget(&self) -> usize;
 
     // --- Metrics ---
-
-    /// Get the hot+warm memory usage (bytes).
-    fn memory_used(&self) -> usize;
 
     /// Get reclaimable storage bytes used for budget enforcement.
     fn budgeted_memory_used(&self) -> usize;
@@ -190,10 +187,6 @@ impl ScrollbackAccess for Scrollback {
         self.memory_budget()
     }
 
-    fn memory_used(&self) -> usize {
-        self.memory_used()
-    }
-
     fn budgeted_memory_used(&self) -> usize {
         self.budgeted_memory_used()
     }
@@ -282,10 +275,6 @@ impl ScrollbackAccess for DiskBackedScrollback {
 
     fn memory_budget(&self) -> usize {
         self.memory_budget()
-    }
-
-    fn memory_used(&self) -> usize {
-        self.memory_used()
     }
 
     fn budgeted_memory_used(&self) -> usize {

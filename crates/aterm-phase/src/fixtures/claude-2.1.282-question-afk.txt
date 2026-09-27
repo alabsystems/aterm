@@ -1,0 +1,34 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-25 (no live capture): rows synthesized from the S6-01 capture (claude-2.1.282-question-tabs-incident.txt) and the 2.1.282 render code Lme() (a height-1 row, flex-end; its text observed in the E5a experiment) · the AFK countdown row right-aligned under the footer
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user0000000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /clear
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this input (copy every string verbatim, change nothing, add nothing): {"questions": [{"question": "On a row
+  with a progress bar, how should its primary button (e.g. Stop paste) look?", "header": "Button", "multiSelect": false, "options": [{"label": "Outlined on meters (Recommended)",
+  "description": "An accent ring with no solid fill on rows that carry a progress bar, so the bar is the only solid accent and 0–100% reads cleanly. Rows without a meter keep
+  solid buttons."}, {"label": "Solid everywhere", "description": "Keep today's solid accent button on every row, including over a progress bar."}]}, {"question": "Should the idle
+  cursor fade to grey?", "header": "Grey cursor", "multiSelect": false, "options": [{"label": "Fade to grey (Recommended)", "description": "Grey when idle."}, {"label": "Keep
+  accent", "description": "Accent always."}]}, {"question": "Which glyph fallback should win?", "header": "Glyphs", "multiSelect": false, "options": [{"label": "Procedural
+  (Recommended)", "description": "Draw box glyphs procedurally."}, {"label": "Font", "description": "Use the font's glyphs."}]}, {"question": "Where should the band sit?",
+  "header": "Placement", "multiSelect": false, "options": [{"label": "Bottom (Recommended)", "description": "Below the grid."}, {"label": "Top", "description": "Above the
+  grid."}]}]}  After the tool returns, reply with only the word DONE.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Button  ☐ Grey cursor  ☐ Glyphs  ☐ Placement  ✔ Submit  →
+
+│ On a row with a progress bar, how should its primary button (e.g. Stop paste) look?
+
+❯ 1. Outlined on meters (Recommended)
+     An accent ring with no solid fill on rows that carry a progress bar, so the bar is the only solid accent and 0–100% reads cleanly. Rows without a meter keep solid buttons.
+  2. Solid everywhere
+     Keep today's solid accent button on every row, including over a progress bar.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+                                                                                                                                              auto-continue in 16s · any key to stay

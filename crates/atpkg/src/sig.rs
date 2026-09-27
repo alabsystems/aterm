@@ -73,8 +73,11 @@
 //! 4. parse the roster — only from `VerifiedRoster`, which has no public constructor.
 //! 5. roster `schema` newer than we understand ⇒ refuse rather than misread.
 //! 6. `roster_seq` below the durable floor ⇒ [`Reject::Rollback`]. THE replay ratchet.
-//! 7. roster `valid_until` lapsed ⇒ [`Reject::Stale`]. The only defence a brand-new
-//!    install has, since it carries no floor.
+//! 7. roster `valid_until` lapsed ⇒ [`Reject::Stale`]. Still enforced, but every
+//!    roster this tooling mints stamps 9999-12-31 by owner decision
+//!    (`crates/atpkg-keys/src/roster_ops.rs`), so it never lapses: a brand-new
+//!    install, which carries no floor, has no replay defence at first contact, and
+//!    revocation is the answer to a stolen key.
 //! 8. revoked and expired machines leave the candidate set — BEFORE any artifact
 //!    crypto, so a revoked machine's valid signature is never checked.
 //! 9. verify `index.toml` under the survivors. **CRYPTO #2.**
@@ -284,14 +287,12 @@ impl Anchor {
 /// machine's `not_after`) keeps authorizing under the frozen reading forever, because
 /// nothing here re-reads a clock. Every current caller mints one, uses it within a
 /// single CLI command, and drops it. A future long-lived holder (a daemonized atpkg, a
-/// cache) MUST call [`Self::still_fresh`] with a current clock before each authorization
-/// batch — that is the revalidation hook this contract names, and it re-runs exactly the
-/// admission-time freshness gate.
+/// cache) MUST re-admit from the published roster with a current clock before each
+/// authorization batch.
 #[derive(Debug, Clone)]
 pub struct TrustedRoster {
     roster: Roster,
     now_unix: i64,
-    master_index: usize,
 }
 
 /// **Steps 1–7.** Verify the roster's exact bytes under the pinned master, parse it only
@@ -316,7 +317,6 @@ pub fn admit_roster(
     #[cfg(test)]
     MASTER_VERIFIES.with(|c| c.set(c.get() + 1));
     let verified: VerifiedRoster = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
-    let master_index = verified.master_index();
     // STEPS 4–5 — parse ONLY from the verified wrapper (no public constructor), which
     // also applies the reject-newer schema gate.
     let roster = Roster::parse(&verified).map_err(from_roster)?;
@@ -325,11 +325,7 @@ pub fn admit_roster(
     roster
         .admit(anchor.roster_floor, now_unix)
         .map_err(from_roster)?;
-    Ok(TrustedRoster {
-        roster,
-        now_unix,
-        master_index,
-    })
+    Ok(TrustedRoster { roster, now_unix })
 }
 
 #[cfg(test)]
@@ -347,26 +343,6 @@ impl TrustedRoster {
     #[must_use]
     pub fn seq(&self) -> u64 {
         self.roster.roster_seq
-    }
-
-    /// Which master keyset member verified it. Index 0 is the master this build considers
-    /// current; anything else means a master rotation is in flight or stalled, which is
-    /// worth SAYING (doctor prints it) and is never a rejection.
-    #[must_use]
-    pub fn master_index(&self) -> usize {
-        self.master_index
-    }
-
-    /// Re-run the roster's own freshness gate at a LATER clock reading — the
-    /// revalidation hook the freeze contract on this type names (see the type doc).
-    ///
-    /// The floor argument is `0` because this generation already cleared the caller's
-    /// floor at admission and a floor can only have RISEN to at most this sequence via
-    /// this very generation's own ratchet; what lapses with time is `valid_until`, and
-    /// that is what this re-checks. `Err(Reject::Stale)` means the frozen `now_unix` has
-    /// been outlived: drop this value and re-admit from the published roster.
-    pub fn still_fresh(&self, now_unix: i64) -> Result<(), Reject> {
-        self.roster.admit(0, now_unix).map_err(from_roster)
     }
 
     /// **Steps 8–9.** Verify one artifact's exact bytes under this roster's LIVE machines.
@@ -488,13 +464,6 @@ impl TrustedIndex {
         // through to the plain anti-rollback comparison — which is exactly the
         // pre-roster behaviour.
         self.index.roster_seq.unwrap_or(0)
-    }
-
-    /// The roster generation behind it, for a caller that must authorize something else
-    /// under the very same generation.
-    #[must_use]
-    pub fn roster(&self) -> &TrustedRoster {
-        &self.roster
     }
 
     /// Verify a `pkg-<program>-<build>.toml`'s raw bytes under the SAME roster generation
@@ -1183,7 +1152,6 @@ mod tests {
         let anchor = armed(0);
         let roster = admit(&anchor, &roster()).expect("master-signed, fresh, above the floor");
         assert_eq!(roster.seq(), 3);
-        assert_eq!(roster.master_index(), 0);
 
         let raw = index_body("m3", 3, 41);
         let sig = sign(&M3_SEED, &raw);
@@ -1871,28 +1839,6 @@ mod tests {
             "a failed persist left its temp behind: {litter:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// THE FREEZE CONTRACT'S REVALIDATION HOOK: a held `TrustedRoster` authorizes under
-    /// the clock captured at admission, so a long-lived holder must be able to ask "has
-    /// my frozen clock been outlived?" — and get `Stale` once the roster's own window
-    /// has lapsed, from the same gate admission ran.
-    #[test]
-    fn a_cached_trusted_roster_can_be_revalidated_against_a_later_clock() {
-        let trusted = admit(&armed(0), &roster()).unwrap();
-        // Within the window (the fixture's valid_until is 2027-02-01): still fresh.
-        assert_eq!(trusted.still_fresh(NOW), Ok(()));
-        // A later clock past the window: the frozen reading has been outlived, and the
-        // holder must drop this value and re-admit — even though `authorize` itself
-        // would still happily verify under the stale freeze (which is the hazard).
-        assert_eq!(trusted.still_fresh(1_900_000_000), Err(Reject::Stale));
-        let raw = index_body("m3", 3, 41);
-        assert!(
-            trusted
-                .authorize_index(raw.clone(), &sign(&M3_SEED, &raw))
-                .is_ok(),
-            "precondition: the frozen clock alone would never notice the lapse"
-        );
     }
 
     #[test]

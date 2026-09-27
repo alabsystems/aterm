@@ -20,8 +20,10 @@
 //!
 //! The observed state is projected onto the model's `<<epoch, snapped, snap_seq,
 //! torn>>` and checked against its actual invariants. A NEGATIVE CONTROL (a forced
-//! retro-mutation of the captured seq) is shown to VIOLATE the model invariant, so
-//! the pass is never vacuous. Pure Rust + real engine code, so it always runs.
+//! retro-mutation of the captured seq) is shown to VIOLATE `NoTornRead`, so the
+//! pass is never vacuous. The run-ahead stamp (`SeqIsStaleOrCurrent`'s mutant) is
+//! driven on the real engine: a host bump, then a real epoch advance that
+//! collides with it. Pure Rust + real engine code, so it always runs.
 
 use std::collections::BTreeMap;
 
@@ -124,6 +126,65 @@ fn real_cell_frame_seq_is_monotone_isolated_and_stale_detectable() {
         !m.check_invariant("NoTornRead", &torn_state),
         "negative control: a torn read MUST fail NoTornRead (so the pass is non-vacuous)"
     );
+}
+
+/// Project one held snapshot stamp against the live epoch.
+fn seq_state(epoch: u64, snap_seq: u64) -> BTreeMap<&'static str, i64> {
+    [
+        ("epoch", i64::try_from(epoch).expect("epoch fits i64")),
+        ("snapped", 1),
+        ("snap_seq", i64::try_from(snap_seq).expect("seq fits i64")),
+        ("torn", 0),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The model's `snap_seq` is the ENGINE stamp (`engine_fill_seq`), and its
+/// `Buggy = 1` run-ahead capture is a HOST-bumped `snapshot_seq` read in its
+/// place. The engine cannot produce a run-ahead stamp itself (the epoch latch only
+/// lags), so this drives the one real way a scratch gets one — the ghost-paint
+/// bump every host mutator performs after writing cells — and then the real
+/// engine advance that turns it into a collision.
+#[test]
+fn host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is() {
+    let m = read_image_seq_model();
+    let (rows, cols) = (6usize, 24usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"hello");
+    let mut snap = term.cell_frame(rows, cols);
+    let live = term.damage_epoch();
+    assert_eq!(snap.snapshot_seq, live, "the engine stamps the live epoch");
+    assert_eq!(snap.engine_fill_seq, snap.snapshot_seq);
+
+    // A host mutator writes cells and bumps the stamp, as the discipline requires.
+    snap.snapshot_seq = snap.snapshot_seq.wrapping_add(1);
+    assert!(
+        !m.check_invariant("SeqIsStaleOrCurrent", &seq_state(live, snap.snapshot_seq)),
+        "the host-bumped seq, read as the engine's stamp, IS the Buggy=1 capture"
+    );
+    assert!(m.check_invariant(
+        "SeqIsStaleOrCurrent",
+        &seq_state(live, snap.engine_fill_seq)
+    ));
+
+    // One real engine advance lands the live epoch on the bumped seq.
+    term.take_damage();
+    term.process(b"\r\nnewer output");
+    let live_after = term.damage_epoch();
+    assert_eq!(live_after, snap.snapshot_seq, "the two clocks collide");
+    assert!(
+        live_after <= snap.snapshot_seq,
+        "read as the engine's stamp, the bumped seq passes a stale frame as current"
+    );
+    assert!(
+        live_after > snap.engine_fill_seq,
+        "the engine stamp still sees the frame is behind"
+    );
+    assert!(m.check_invariant(
+        "SeqIsStaleOrCurrent",
+        &seq_state(live_after, snap.engine_fill_seq)
+    ));
 }
 
 /// A no-op `process()` (input that leaves the grid undamaged) does NOT advance the

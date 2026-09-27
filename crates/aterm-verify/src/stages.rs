@@ -38,7 +38,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::Tippy => tippy(ctx, &mut r),
         StageId::Formatting => formatting(ctx, &mut r),
         StageId::GrepGuards => grep_guards(ctx, &mut r),
-        StageId::ReleaseTooling => release_tooling(ctx, &mut r),
+        StageId::DeliveryTooling => delivery_tooling(ctx, &mut r),
         StageId::AtpkgTooling => atpkg_tooling(ctx, &mut r),
         StageId::TrustGateVerdict => trust_gate_verdict(ctx, &mut r),
         StageId::TrustContractProbe => trust_contract_probe(ctx, &mut r),
@@ -61,9 +61,12 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::ObjcAlertDrive => objc_alert_drive(ctx, &mut r),
         StageId::ObjcSwizzleDrive => objc_swizzle_drive(ctx, &mut r),
         StageId::ObjcBoundDrive => objc_bound_drive(ctx, &mut r),
+        StageId::WindowServerTests => window_server_tests(ctx, &mut r),
+        StageId::ForegroundHandback => foreground_handback(ctx, &mut r),
         StageId::DifferentialOracle => differential_oracle(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
         StageId::CrossCells => cross_cells(ctx, &mut r),
+        StageId::CodexLiveUpgrade => codex_live_upgrade(ctx, &mut r),
     }
     r
 }
@@ -218,6 +221,69 @@ pub fn sealed_lane_args() -> Vec<String> {
         "--test",
         "two_nodes_sealed",
         "--no-fail-fast",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// The module every window-server row is declared in, spelled the way libtest
+/// matches it: a test's full path contains this exactly when the test sits in a
+/// `mod window_server` block (`menu::macos::tests::window_server::…`).
+/// `tools/grep_guard.sh` B9e holds the other half — every test in such a block
+/// is `#[ignore]`d with the lane's reason, and no test outside one is.
+pub const WINDOW_SERVER_TEST_FILTER: &str = "::window_server::";
+
+/// `targo --unverified test -p aterm-gui --lib --no-fail-fast -- --ignored
+///  ::window_server::`
+///
+/// THE WINDOW-SERVER LANE (2026-09-26). AGENTS.md's "Concurrent sessions" rule
+/// 5: a unit test that opens a WindowServer connection makes WindowServer's
+/// main thread run a synchronous TCC preflight of the test binary, and on
+/// 2026-08-17 and 2026-09-01 that preflight outran WindowServer's 40 s watchdog
+/// and took every window on the machine with it. Measured on 2026-09-26 by
+/// reading tccd's log after each run: once `aterm_gpu`'s device selection
+/// stopped asking the display server (B9d), the unit tests that still did so
+/// were four AppKit rows in aterm-gui — menus with separators and tool tips,
+/// and the toolbar delegate's `NSToolbarItem`. They are `#[ignore]`d out of the parallel test
+/// run and of every plain `targo test -p aterm-gui`, and this is the one argv
+/// that runs them: `--ignored` so that only ignored tests run, the filter so
+/// only the lane's, `--lib` because they are library unit tests. It runs in the
+/// driver lane, beside the objc drivers that already hold real windows, so the
+/// binary WindowServer vets is in `target-drivers/` and not in the main
+/// `target/debug/deps` whose million entries were the watchdog's timeout.
+#[must_use]
+pub fn window_server_tests_args() -> Vec<String> {
+    [
+        "--unverified",
+        "test",
+        "-p",
+        "aterm-gui",
+        "--lib",
+        "--no-fail-fast",
+        "--",
+        "--ignored",
+        WINDOW_SERVER_TEST_FILTER,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// `targo --unverified test --no-run -q -p aterm-gui --lib` — the window-server
+/// stage's compile, run early by the driver-builds row. The same package, target
+/// and features as [`window_server_tests_args`], so that stage's own child finds
+/// it built and only RUNS.
+#[must_use]
+pub fn window_server_tests_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "test",
+        "--no-run",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--lib",
     ]
     .into_iter()
     .map(String::from)
@@ -449,11 +515,20 @@ fn kani_cmd(
 /// derives that symlink OUTSIDE the store, which is tree_root-attested and immutable.
 /// No build tree is probed: `$HOME/trust/first-party` was retired 2026-08-29, and a
 /// stale checkout there shadowed the store until 2026-09-24.
+///
+/// The store's `current` is RESOLVED when it is there (2026-09-24): it is a link
+/// every `aterm pkg update` re-points, the Kani stage runs the script once per
+/// crate in [`KANI_CRATES`] with this one value, and a driver started through the
+/// unresolved spelling finds its siblings by that spelling — so an update landing
+/// between two crates (or inside one) split the floor across two trust-mc builds.
+/// The build-numbered directory cannot move; an absent store stays the unresolved
+/// place the remedy fills, for the diagnostic.
 #[must_use]
 pub fn trust_mc_sysroot(env: &crate::EnvSnapshot) -> std::path::PathBuf {
     env.trust_mc_sysroot.clone().unwrap_or_else(|| {
-        crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
-            .join("store/trust-mc/current")
+        let live = crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
+            .join("store/trust-mc/current");
+        std::fs::canonicalize(&live).unwrap_or(live)
     })
 }
 
@@ -1082,7 +1157,7 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 /// of the whole `-p aterm` graph rather than a handful of small ones, and below
 /// the driver lane's eight because the driver lane's binaries gate the
 /// EXCLUSIVE smokes at the tail while this one only has to beat the test
-/// stage's first conformance suite. The lane's own `ATERM_VERIFY_TIMINGS` row
+/// stage's first conformance suite. The lane's own `--timings` row
 /// is what to tune it from.
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
@@ -1272,17 +1347,30 @@ fn build(ctx: &Ctx, r: &mut Report) {
 
 /// The test stage's two children, compile then run, with trustdoc bound when
 /// `bind`. Only the COMPILE is [`Cmd::demoted`]. The run executes the paint and
-/// spin guards, and a QoS clamp would reach the aterm they launch.
+/// spin guards, and a QoS clamp would reach the aterm they launch. The run
+/// carries [`TRAIL_LAWS_FULL`].
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     let cmd = |args: Vec<String>| {
         let c = targo(ctx, args);
         if bind { with_trustdoc(ctx, c) } else { c }
     };
+    let (k, v) = TRAIL_LAWS_FULL;
     [
         cmd(test_compile_args(&ctx.scope)).demoted(),
-        cmd(test_run_args(&ctx.scope)),
+        cmd(test_run_args(&ctx.scope)).env(k, v),
     ]
 }
+
+/// **THE RAINBOW TRAIL LAWS RUN THEIR FULL GRID IN THE GATE** (2026-09-25).
+/// `aterm-effects`' case-family laws (`tests/trail_host/mod.rs`) run each
+/// family's SPINE in a debug build — the cases either side of every stated
+/// threshold — and every case of the family's grid in a release build or
+/// with this variable set. Their LIMIT rules are written against the full
+/// grid (`holds_but`: every case a rule names must read bad and every other
+/// must hold), so the test run sets it and the gate enforces the rules
+/// whole, not only a release run by hand. Read at run time, so the compile
+/// child needs no copy of it and nothing is rebuilt.
+pub const TRAIL_LAWS_FULL: (&str, &str) = ("TRAIL_LAWS_FULL", "1");
 
 fn test(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
@@ -1652,13 +1740,25 @@ fn grep_guards(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 3.5) RELEASE TOOLING — the hermetic shell suites over the scripts a release
-//    runs through, each a decision of its own. A missing suite is a
-//    cannot-run, never a skip.
+// 3.5) DELIVERY TOOLING — the offline shell suites over the scripts that build,
+//    sign, install and publish the app, each a decision of its own. A missing
+//    suite is a cannot-run, never a skip.
+//
+//    "RELEASE TOOLING" UNTIL 2026-09-26, and renamed because the name stopped
+//    being true. Five suites joined that day that no verify stage, xtask verb,
+//    hook or Rust test had ever invoked (the unit-test audit's orphans), and two
+//    of them are not release tooling: `test-dev-sign-id.sh` pins the "aterm dev"
+//    signing identity that only `tools/dev-app.sh` uses, and `test-cargo-pin.sh`
+//    pins the cargo gate `dev-app.sh` shares with `install.sh`'s source lane.
+//    A dev build is not a release, so a row titled "release" that ran them
+//    would misname what it had decided. What all nine share is the thing the
+//    new name says: the path the app takes from a checkout to someone's
+//    machine — a local dev bundle, the installer, a cut, the site.
 // ---------------------------------------------------------------------------
 
-/// The release-tooling suites, in the order the stage runs them. Every one is
-/// offline and stubbed (its header says so) and takes seconds.
+/// The delivery-tooling suites, in the order the stage runs them. Every one is
+/// offline — the network never gets a packet — and self-contained under its own
+/// mktemp dir (its header says how); all but one take seconds.
 ///
 /// * `test-install-channel.sh` keeps tools/install.sh aligned with the in-app
 ///   updater's head pointer, tag grammar and exact asset identity, and pins the
@@ -1678,19 +1778,59 @@ fn grep_guards(ctx: &Ctx, r: &mut Report) {
 ///   mac.zip and the signed appcast pair), the suite's DMG-only fixtures stopped
 ///   electing anything, and with no gate running it nothing said so.
 ///
+/// FIVE MORE JOINED ON 2026-09-26, every one of them wired into nothing until
+/// then (measured on 8c644d49e: no stage, xtask verb, hook or Rust test named
+/// them). Each passed when run by hand that day — one only after 391420169
+/// repaired it for macOS 27, which is the point: it had gone red with nothing
+/// to say so.
+///
+/// * `test-install-guard.sh` — install.sh's whole-file execution guard (a
+///   truncated `curl … | bash` runs nothing) and its `--dry-run` zero-mutation
+///   contract, under stubbed `curl`/`gh` and a scratch HOME.
+/// * `test-cargo-pin.sh` — the cargo gate `tools/dev-app.sh` and install.sh's
+///   source-build lane share: a build runs only under the cargo that honours
+///   rust-toolchain.toml (the atpkg store's `targo`, else rustup's proxy), with
+///   every cargo, rustup and store a fake that refuses to build.
+/// * `test-check-release-shape.sh` — tools/check-release-shape.sh, the
+///   cutter-independent look at a published release's asset set, over inline
+///   release JSON (the LEAN shape and public v0.63.0's FAT one).
+/// * `test-site-sync.sh` — publish/post-promote, the hook that brings the site
+///   up to date after a promote: a local bare repo cloned over `file://`, and
+///   stub `gh`, `curl`, `firebase` and site scripts. The slow one (about a
+///   minute); it overlaps the build like the rest of this `Lane::Pure` row.
+/// * `test-dev-sign-id.sh` — tools/dev-sign-id.sh, through its `--keychain`
+///   seam: a scratch keychain FILE under ~/Library/Keychains (the only location
+///   that exercises the partition-list step the script exists for), never put
+///   on the search list, deleted on exit; measured dialog-free. A PASS of 0
+///   checks off macOS, where the script has nothing to do.
+///
 /// A suite no gate runs is a test that passes forever.
-pub const RELEASE_SUITES: [&str; 4] = [
+pub const DELIVERY_SUITES: [&str; 9] = [
     "test-install-channel.sh",
     "test-publish-export.sh",
     "test-release-preflight.sh",
     "test-after-cut.sh",
+    "test-install-guard.sh",
+    "test-cargo-pin.sh",
+    "test-check-release-shape.sh",
+    "test-site-sync.sh",
+    "test-dev-sign-id.sh",
 ];
 
-fn release_tooling(ctx: &Ctx, r: &mut Report) {
-    for name in RELEASE_SUITES {
+/// One delivery suite's command. With a `SIGTERM` grace, because each suite
+/// cleans up in an EXIT trap that a `SIGKILL` would skip — for
+/// `test-dev-sign-id.sh` that is a scratch keychain in the owner's real
+/// `~/Library/Keychains` ([`Cmd::term_grace`] has the measurement).
+#[must_use]
+pub fn delivery_suite_cmd(ctx: &Ctx, name: &str) -> Cmd {
+    Cmd::new(ctx.tools_dir().join(name)).term_grace(exec::TERM_GRACE)
+}
+
+fn delivery_tooling(ctx: &Ctx, r: &mut Report) {
+    for name in DELIVERY_SUITES {
         let t = ctx.tools_dir().join(name);
         if is_executable_file(&t) {
-            run_labeled(ctx, r, name, &Cmd::new(&t));
+            run_labeled(ctx, r, name, &delivery_suite_cmd(ctx, name));
         } else {
             r.cannot_run(format!(
                 "{name} missing or not executable ({})",
@@ -1709,7 +1849,7 @@ fn release_tooling(ctx: &Ctx, r: &mut Report) {
 //    that sign the toolchain index could land unmeasured (the audit finding).
 //    test-atpkg-pack-one-compiler.sh pins the sysroot-bundle pack's one-compiler
 //    contract (atpkg-pack-bundle.sh): keyless and offline, everything under one
-//    mktemp dir. Same posture as release_tooling: a missing suite is a
+//    mktemp dir. Same posture as delivery_tooling: a missing suite is a
 //    cannot-run, never a skip.
 //
 //    test-atpkg-mirror-extras.sh runs atpkg-mirror-public.sh itself (DRY_RUN, a
@@ -2106,7 +2246,12 @@ fn proof_inventory(ctx: &Ctx, r: &mut Report) {
 //    inside the stages that drive them, and the smokes' builds inside the
 //    exclusive section. Every driver stage still runs its own build argv (a
 //    fingerprint no-op after this) and drives only what that build left, so no
-//    stage takes its binary on this row's word.
+//    stage takes its binary on this row's word. Since 2026-09-26 that includes,
+//    on macOS, the one `aterm` binary the live lanes drive
+//    ([`live_aterm_build_args`]): their stages sit at the very end of the
+//    serial tail, so a compile left to them would be paid after every other
+//    stage had finished. Off macOS both lanes are named skips, so nothing
+//    builds it.
 // ---------------------------------------------------------------------------
 
 /// The eight objc driver examples with the package each lives in, in the order
@@ -2147,8 +2292,9 @@ pub fn objc_driver_prebuild_args() -> Vec<String> {
 }
 
 /// The driver-builds row's children, labelled: the redraw harness, the two
-/// smoke binaries, and (on macOS, where the drivers exist) the eight objc
-/// drivers.
+/// smoke binaries, and (on macOS, where they run) the one `aterm` binary the
+/// live lanes drive (since 2026-09-26), the eight objc drivers and the
+/// window-server rows' test binary.
 #[must_use]
 pub fn driver_build_cmds(ctx: &Ctx) -> Vec<(String, Cmd)> {
     let mut v = vec![
@@ -2163,8 +2309,17 @@ pub fn driver_build_cmds(ctx: &Ctx) -> Vec<(String, Cmd)> {
     ];
     if cfg!(target_os = "macos") {
         v.push((
+            "driver prebuild: targo build -p aterm --bin aterm (the live lanes' aterm)".to_string(),
+            live_aterm_build_cmd(ctx),
+        ));
+        v.push((
             "driver prebuild: targo build --example (the 8 objc drivers)".to_string(),
             driver_build_cmd(ctx, objc_driver_prebuild_args()),
+        ));
+        v.push((
+            "driver prebuild: targo test --no-run -p aterm-gui --lib (the window-server rows)"
+                .to_string(),
+            driver_build_cmd(ctx, window_server_tests_build_args()),
         ));
     }
     v
@@ -2818,6 +2973,352 @@ fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 5k) WINDOW-SERVER UNIT TESTS — the library unit tests that open a
+//    WindowServer connection, taken out of every parallel test run and run
+//    here, by name of module, in the driver lane. See
+//    [`window_server_tests_args`] for the incident and the measurement.
+// ---------------------------------------------------------------------------
+
+/// The window-server stage's child: [`window_server_tests_args`] in the driver
+/// lane. Not demoted — it RUNS the rows; their compile is the driver-builds
+/// row's ([`window_server_tests_build_args`]).
+#[must_use]
+pub fn window_server_tests_cmd(ctx: &Ctx) -> Cmd {
+    in_lane(
+        ctx,
+        Lane::DriverTarget,
+        targo(ctx, window_server_tests_args()),
+    )
+}
+
+/// Did the window-server run select NOTHING? `true` only on libtest's own word
+/// for it — a `running 0 tests` header and no header with a count above zero.
+/// A transcript that says neither (a stub driver) decides nothing here, and the
+/// exit code stands alone.
+///
+/// Without this a lane that stopped matching — the modules renamed, the
+/// `#[ignore]` dropped so the rows moved back into the parallel run, the filter
+/// respelled — would print `test result: ok. 0 passed` and read as green, and
+/// four tests would be run by nobody: the never-run shape this repo retires.
+#[must_use]
+pub fn window_server_run_selected_nothing(transcript: &str) -> bool {
+    let counts: Vec<u64> = transcript
+        .lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix("running ")?;
+            let (n, what) = rest.split_once(' ')?;
+            what.starts_with("test").then(|| n.parse().ok())?
+        })
+        .collect();
+    !counts.is_empty() && counts.iter().all(|&n| n == 0)
+}
+
+fn window_server_tests(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, as the objc stages do.
+    if ctx.selftest {
+        r.skip("window-server unit tests (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip(
+            "window-server unit tests (macOS only: the rows are AppKit's, declared inside \
+             `cfg(target_os = \"macos\")`)",
+        );
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("window-server unit tests (no targo)");
+        return;
+    }
+    let label = format!("targo test -p aterm-gui --lib -- --ignored {WINDOW_SERVER_TEST_FILTER}");
+    let out = exec::run(&window_server_tests_cmd(ctx), ctx.exec_env());
+    r.raw(out.output.as_str());
+    if out.ok && window_server_run_selected_nothing(&out.output) {
+        r.record(
+            Outcome::Fail(Severity::GateFailed),
+            format!(
+                "{label}: libtest selected NO test — no ignored test's path contains \
+                 `{WINDOW_SERVER_TEST_FILTER}`, so the rows that need a live WindowServer ran nowhere"
+            ),
+        );
+        return;
+    }
+    r.decide_child(&out, &label);
+}
+
+// ---------------------------------------------------------------------------
+// 5l) LIVE ATERM LANES (2026-09-26) — the two shell lanes that drive a PRIVATE
+//    headless instance of THE one binary, `aterm`, the way a person's tab does:
+//    `tools/test-foreground-handback.sh` (a real shell's job control, and the
+//    modes a killed foreground program leaves armed) and
+//    `tools/test-codex-live-upgrade.sh` (the harness host moving a REAL Codex
+//    from the managed store's older build to its current one, in a sandbox
+//    with every network denied but one loopback port).
+//
+//    Until that day no stage, xtask verb, hook or Rust test invoked either,
+//    and by hand both said nothing useful: each looks for
+//    `<root>/target/debug/aterm`, which no gate lane writes (the workspace
+//    build puts it in `target/` only when nothing redirected it, and then
+//    under a build that may still be linking), and each answered its absence
+//    with a code that is not a failure — `2` from the handback lane, `77`
+//    ("SKIP") from the Codex one. Measured on 8c644d49e, run by hand from a
+//    checkout: exit 2 and exit 77, i.e. no evidence either way.
+//
+//    So each lane's stage builds the binary itself — `-p aterm --bin aterm`
+//    into the driver lane's dir, a fingerprint no-op after the driver builds
+//    row, which compiles it at t0 — runs the lane only if that build
+//    succeeded, and HANDS the lane that binary the way its header takes it
+//    (`--binary <path>` / the first argument), so neither can fall back to a
+//    stale `target/`. And a lane's not-run answer is never a pass
+//    ([`live_aterm_outcome`]).
+//
+//    TWO STAGES, TWO TIERS. The handback lane is the per-commit ladder's last
+//    driver-lane row (`StageId::ForegroundHandback`, ~20 s): its verdict is
+//    the tree's. The Codex lane is `--full`'s last row, run alone
+//    (`StageId::CodexLiveUpgrade`, ~10 min): it reads this machine's managed
+//    store (no older Codex, no run) and the vendor's current Codex (whose
+//    release-specific internals it asserts), so in the per-commit contract it
+//    decided a different thing on each machine and on each night. It sat in
+//    the per-commit row for one day; `plan.rs` has the whole reasoning. Neither
+//    is removed by a narrowing, for the drivers' reason: the claim is about
+//    the shipped binary.
+// ---------------------------------------------------------------------------
+
+/// `targo --unverified build -q -p aterm --bin aterm` — the one binary both
+/// lanes drive, spelled as the Codex lane's header spells its own build (plus
+/// the driver lane's `-q`).
+#[must_use]
+pub fn live_aterm_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm",
+        "--bin",
+        "aterm",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// The label of each live stage's first child — the build its lane depends on.
+pub const LIVE_ATERM_BUILD_LABEL: &str =
+    "targo build -p aterm --bin aterm (the aterm the live lanes drive)";
+
+/// The handback lane. Takes the binary as `--binary <path>`; exits `0` iff no
+/// row FAILed, `1` when one did, `2` when the lane could not run.
+pub const FOREGROUND_HANDBACK_SUITE: &str = "test-foreground-handback.sh";
+
+/// The Codex branch of the live agent upgrade. Takes the binary as its first
+/// argument; exits `0` pass, `1` a check failed, `77` skipped. macOS only.
+pub const CODEX_LIVE_UPGRADE_SUITE: &str = "test-codex-live-upgrade.sh";
+
+/// Both live lanes, the roster the fixtures seed from: the handback lane is
+/// `StageId::ForegroundHandback`'s, the Codex lane `StageId::CodexLiveUpgrade`'s
+/// (`--full` only).
+pub const LIVE_ATERM_SUITES: [&str; 2] = [FOREGROUND_HANDBACK_SUITE, CODEX_LIVE_UPGRADE_SUITE];
+
+/// The build of that binary, in the driver lane. Compile-only, so demoted; the
+/// lanes themselves RUN code and keep the inherited tier.
+#[must_use]
+pub fn live_aterm_build_cmd(ctx: &Ctx) -> Cmd {
+    driver_build_cmd(ctx, live_aterm_build_args())
+}
+
+/// The binary the lanes are handed: this lane's own `debug/aterm`, which each
+/// live stage's first child writes. Never `<root>/target/debug/aterm` — the
+/// lanes' own default, and the path these rows exist to keep them off.
+#[must_use]
+pub fn live_aterm_binary(ctx: &Ctx) -> std::path::PathBuf {
+    debug_bin(&ctx.root, Some(drivers_dir(ctx).as_os_str()), "aterm")
+}
+
+/// One lane's command, with the binary passed the way that lane's header takes
+/// it. Anything else a lane needs it makes for itself: a private socket, a
+/// scratch HOME, and (the Codex lane) `env -i` around the instance it starts.
+///
+/// With a `SIGTERM` grace ([`Cmd::term_grace`]): each lane tears down in an
+/// EXIT trap — the handback lane its private instance and temp tree, the Codex
+/// lane its `/tmp/cxlive.*` tree and, by walking pids, the Codex daemons and
+/// background terminals that left the lane's process group on purpose — and a
+/// `SIGKILL` of the group would skip it and leave them running.
+#[must_use]
+pub fn live_aterm_suite_cmd(ctx: &Ctx, name: &str) -> Cmd {
+    let cmd = Cmd::new(ctx.tools_dir().join(name)).term_grace(exec::TERM_GRACE);
+    let bin = live_aterm_binary(ctx);
+    if name == FOREGROUND_HANDBACK_SUITE {
+        cmd.arg("--binary").arg(bin)
+    } else {
+        cmd.arg(bin)
+    }
+}
+
+/// The reason a lane gave for not running: the text after the LAST `SKIP: `
+/// (the Codex lane's `skip()`) or `NOT RUN: ` (the handback lane's
+/// `not_run()`) line it printed — each prints exactly one, then exits.
+fn not_run_reason(transcript: &str) -> Option<&str> {
+    transcript
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("SKIP: ")
+                .or_else(|| l.strip_prefix("NOT RUN: "))
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// How the ladder reads a live lane's exit. A FUNCTION, and tested, because of
+/// the not-run codes: the handback lane's `2` and the Codex lane's `77` are
+/// what each answered when it had no binary, and a gate that read either as
+/// green would pass a lane that drove nothing — the state these rows replace.
+///
+/// The two codes are read differently because the two lanes sit in different
+/// tiers. The handback lane's `2` is COULD NOT RUN, the redraw harness's
+/// reading of its own `2`: the per-commit run decided nothing, which is neither
+/// a pass nor a finding about the tree. That reading is honest only because
+/// the lane now keeps `2` for exactly that — no binary, an unknown argument, a
+/// socket path too long, no python3 — and answers an instance that exits or
+/// never answers with a FAIL row and `1` (until 2026-09-26 it answered that
+/// with `2` too, so a tree whose `aterm --headless` crashed at startup read as
+/// a broken machine; the control-socket smoke has always called it a FAIL). The Codex lane's `77`, once the binary
+/// is handed over, means a prerequisite of THIS MACHINE's is absent — no older
+/// managed Codex to upgrade from, no python3 — and in `--full` that is what the
+/// trust-mc floor's absent prover is: a NAMED SKIP, counted, printed with the
+/// lane's own reason so the verdict names the remedy, and forfeiting the run's
+/// contract claim. Never a pass either way. Any other code is a finding — a
+/// lane that dies mid-way died on something the shipped binary did, or on its
+/// own script, and both belong to the tree.
+#[must_use]
+pub fn live_aterm_outcome(name: &str, code: Option<i32>, transcript: &str) -> (Outcome, String) {
+    let handback = name == FOREGROUND_HANDBACK_SUITE;
+    let not_run = if handback { 2 } else { 77 };
+    match code {
+        Some(0) => (Outcome::Ok, name.to_string()),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("{name}: a check failed against the live aterm — its rows above say which"),
+        ),
+        Some(2) if handback => (
+            Outcome::Fail(Severity::CouldNotRun),
+            format!(
+                "{name}: NOT RUN — {} (exit 2, never a pass)",
+                not_run_reason(transcript).unwrap_or("the lane could not run and did not say why")
+            ),
+        ),
+        Some(77) if !handback => (
+            Outcome::Skip,
+            format!(
+                "{name}: NOT RUN — {} (exit 77: this machine lacks a prerequisite; a named skip, \
+                 never a pass)",
+                not_run_reason(transcript).unwrap_or("the lane skipped without saying why")
+            ),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("{name}: unexpected exit {c} (the lane answers only 0, 1 and {not_run})"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            format!("{name}: no exit status — killed by a signal, or never spawned"),
+        ),
+    }
+}
+
+/// Why a live lane runs on macOS only — the reason its off-macOS skip names.
+///
+/// The Codex lane cannot run anywhere else. The handback lane has simply never
+/// RUN anywhere else, and one of its rows is known to be macOS's answer rather
+/// than the tree's: it boots `/bin/bash` and expects `bracketed_paste=false`
+/// after the handback, because macOS's `/bin/bash` is 3.2, which has no 2004 —
+/// while bash 5.1 and later arm bracketed paste by default, which is what a
+/// Linux host's `/bin/bash` is. So off macOS that row would FAIL on every
+/// commit, and the rest of the lane (`/bin/zsh`, `tput`, the kill notices it
+/// matches) is unmeasured there. A named skip says so; running it would claim
+/// coverage nobody has seen.
+#[must_use]
+pub fn live_aterm_macos_only(name: &str) -> &'static str {
+    if name == FOREGROUND_HANDBACK_SUITE {
+        "the lane has been measured nowhere else, and its bash row expects macOS's \
+         /bin/bash 3.2, which has no bracketed paste, where bash 5.1+ arms it by default"
+    } else {
+        "the instance runs under sandbox-exec, and the ps stand-in reads sysctl's kinfo_proc"
+    }
+}
+
+/// The per-commit live row: the foreground handback.
+fn foreground_handback(ctx: &Ctx, r: &mut Report) {
+    live_aterm_stage(ctx, r, FOREGROUND_HANDBACK_SUITE);
+}
+
+/// The `--full` live row: the Codex live upgrade.
+fn codex_live_upgrade(ctx: &Ctx, r: &mut Report) {
+    live_aterm_stage(ctx, r, CODEX_LIVE_UPGRADE_SUITE);
+}
+
+/// One live lane's stage, in order: the suite exists, a selftest runs nothing,
+/// the platform, a toolchain, the build of the binary, the binary, the lane.
+fn live_aterm_stage(ctx: &Ctx, r: &mut Report, name: &str) {
+    let t = ctx.tools_dir().join(name);
+    if !is_executable_file(&t) {
+        r.cannot_run(format!(
+            "{name} missing or not executable ({})",
+            t.display()
+        ));
+        return;
+    }
+    // SELFTEST before the platform check, so the `--selftest` ladder reads the
+    // same on every host: one row for the build, one for the lane.
+    if ctx.selftest {
+        r.skip(format!("{LIVE_ATERM_BUILD_LABEL} (selftest: not executed)"));
+        r.skip(format!("{name} (selftest: not executed)"));
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip(format!(
+            "{name} (macOS only: {})",
+            live_aterm_macos_only(name)
+        ));
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        // Counted and named, as the atpkg pack's: with no toolchain nothing can
+        // build the binary, and the lane's coverage is absent from the run.
+        r.skip(format!(
+            "{name} (no targo — nothing can build the aterm it drives)"
+        ));
+        return;
+    }
+    if !run_labeled(ctx, r, LIVE_ATERM_BUILD_LABEL, &live_aterm_build_cmd(ctx)) {
+        // Not a skip: nothing was absent, and the build's FAIL above is the
+        // decision. Running the lane anyway would drive whatever binary an
+        // earlier run left, which is the stale path this row exists to close.
+        r.raw(format!(
+            "  not run: {name} — the aterm build above failed, so the lane has no fresh binary to drive"
+        ));
+        return;
+    }
+    let bin = live_aterm_binary(ctx);
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "{name}: the just-built aterm is missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    let out = exec::run(&live_aterm_suite_cmd(ctx, name), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = live_aterm_outcome(name, out.code, &out.output);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
+    r.record(outcome, label);
+}
+
+// ---------------------------------------------------------------------------
 // 6) --full ONLY: differential oracle
 // ---------------------------------------------------------------------------
 fn differential_oracle(ctx: &Ctx, r: &mut Report) {
@@ -3062,6 +3563,9 @@ mod tests {
             differential_args(),
             redraw_conformance_build_args(),
             objc_driver_prebuild_args(),
+            window_server_tests_build_args(),
+            window_server_tests_args(),
+            live_aterm_build_args(),
         ] {
             assert_eq!(
                 argv.first().map(String::as_str),
@@ -3069,6 +3573,115 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    /// THE WINDOW-SERVER LANE RUNS EXACTLY ITS ROWS, FROM THE DRIVER LANE
+    /// (2026-09-26). The argv is pinned whole, because each word is load
+    /// bearing: `--ignored` is what makes it run the rows every other `targo
+    /// test` skips, the filter is what keeps it to them, `--lib` is where they
+    /// are. Its compile is the driver-builds row's, over the same package and
+    /// target, so the stage finds the binary built. And the filter names
+    /// something: aterm-gui's sources declare the module and the lane's ignore
+    /// (read from the tree, as the hardware-verdict test above reads the
+    /// fields it parses), so a rename that emptied the selection fails here
+    /// before a gate runs nothing and reports green.
+    #[test]
+    fn the_window_server_lane_runs_exactly_its_ignored_rows_from_the_driver_lane() {
+        assert_eq!(
+            window_server_tests_args(),
+            [
+                "--unverified",
+                "test",
+                "-p",
+                "aterm-gui",
+                "--lib",
+                "--no-fail-fast",
+                "--",
+                "--ignored",
+                "::window_server::",
+            ]
+        );
+        let unit = |a: &[String]| -> Vec<String> {
+            a.iter()
+                .take_while(|w| *w != "--")
+                .filter(|w| ["-p", "aterm-gui", "--lib"].contains(&w.as_str()))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            unit(&window_server_tests_build_args()),
+            unit(&window_server_tests_args()),
+            "the prebuild compiles the unit the stage runs"
+        );
+        let mut c = ctx(Scope::workspace());
+        c.env.cargo_target_dir = Some("/caller/target".into());
+        let dir = |cmd: &Cmd| {
+            cmd.envs
+                .iter()
+                .find(|(k, _)| k.to_str() == Some("CARGO_TARGET_DIR"))
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        let run = window_server_tests_cmd(&c);
+        assert_eq!(run.argv()[1..], window_server_tests_args()[..]);
+        assert_eq!(
+            dir(&run),
+            Some(drivers_dir(&c)),
+            "never the caller's target dir"
+        );
+        let prebuilt = driver_build_cmds(&c)
+            .into_iter()
+            .find(|(_, cmd)| cmd.argv()[1..] == window_server_tests_build_args()[..]);
+        if cfg!(target_os = "macos") {
+            let (_, build) = prebuilt.expect("the driver-builds row compiles the rows");
+            assert_eq!(dir(&build), dir(&run), "one binary, one dir");
+        } else {
+            assert!(prebuilt.is_none(), "the rows are macOS-only");
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-gui/src");
+        let (mut modules, mut rows) = (0, 0);
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("aterm-gui source dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("aterm-gui source");
+                    modules += text.matches("mod window_server {").count();
+                    rows += text.matches("#[ignore = \"WINDOW-SERVER LANE:").count();
+                }
+            }
+        }
+        assert!(
+            modules >= 1 && rows >= 1,
+            "aterm-gui declares {modules} `mod window_server` block(s) and {rows} lane-ignored \
+             row(s): the window-server stage would select nothing"
+        );
+    }
+
+    /// The stage's vacuity rule reads libtest's own header, and only that: a
+    /// `running 0 tests` with nothing above zero is a selection that matched
+    /// nothing; cargo's capitalised `Running unittests …` line is not a header;
+    /// and a transcript that says nothing (a stub driver) decides nothing.
+    #[test]
+    fn a_window_server_run_that_selected_nothing_is_read_from_libtests_header() {
+        let empty = "     Running unittests src/lib.rs (target-drivers/debug/deps/aterm_gui-0)\n\n\
+                     running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; \
+                     5945 filtered out; finished in 0.00s\n";
+        assert!(window_server_run_selected_nothing(empty));
+        let four = "\nrunning 4 tests\ntest menu::macos::tests::window_server::a ... ok\n\
+                    test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 5941 filtered out\n";
+        assert!(!window_server_run_selected_nothing(four));
+        assert!(!window_server_run_selected_nothing("\nrunning 1 test\n"));
+        assert!(
+            !window_server_run_selected_nothing(""),
+            "a stub says nothing either way"
+        );
+        assert!(
+            !window_server_run_selected_nothing("     Running unittests src/lib.rs (x)\n"),
+            "cargo's own line is not libtest's header"
+        );
     }
 
     /// The sealed rung's GUI build and its suite share ONE owned target dir and
@@ -3779,6 +4392,29 @@ mod tests {
     }
 
     #[test]
+    fn the_test_run_runs_the_trail_laws_full_grid() {
+        // Without it the trail laws run only each family's spine in the
+        // gate's debug build, and a LIMIT rule the full grid breaks is seen
+        // only by a release run by hand.
+        let c = ctx(Scope::workspace());
+        for bind in [false, true] {
+            let [compile, run] = test_cmds(&c, bind);
+            let (k, v) = TRAIL_LAWS_FULL;
+            assert!(
+                run.envs
+                    .iter()
+                    .any(|(ek, ev)| ek.to_string_lossy() == k && ev.to_string_lossy() == v),
+                "the test run carries {k}={v}: {:?}",
+                run.envs
+            );
+            assert!(
+                !env_names(&compile).iter().any(|n| n == k),
+                "the compile needs no copy of {k}"
+            );
+        }
+    }
+
+    #[test]
     fn the_regex_lane_carries_the_marker_that_arms_the_regex_tests() {
         // Without `ATERM_SEARCH_REGEX_LANE` the aterm-search suite still runs
         // and still passes — green, with no regex coverage. The marker IS the
@@ -3876,6 +4512,18 @@ mod tests {
             prefix.join("store/trust-mc/current")
         );
         assert_eq!(ay_bin_dir(&env), prefix.join("bin"));
+        // A store that is there answers its BUILD-NUMBERED directory, which no
+        // `aterm pkg update` can re-point under the three runs of the floor.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(prefix.join("store/trust-mc/41/bin")).expect("mkdir");
+            std::os::unix::fs::symlink("41", prefix.join("store/trust-mc/current")).expect("ln");
+            assert_eq!(
+                trust_mc_sysroot(&env),
+                std::fs::canonicalize(prefix.join("store/trust-mc/41")).expect("real"),
+                "the live link is resolved once, not handed to the script as `current`"
+            );
+        }
 
         let env = EnvSnapshot {
             trust_mc_sysroot: Some(PathBuf::from("/explicit/sysroot")),
@@ -3946,8 +4594,12 @@ mod tests {
     #[test]
     fn a_missing_helper_script_can_never_pass() {
         let c = ctx(Scope::workspace());
-        let script_stages: [fn(&Ctx, &mut Report); 4] =
-            [grep_guards, release_tooling, start_compare, license_headers];
+        let script_stages: [fn(&Ctx, &mut Report); 4] = [
+            grep_guards,
+            delivery_tooling,
+            start_compare,
+            license_headers,
+        ];
         for stage in script_stages {
             let mut r = Report::new("s");
             stage(&c, &mut r);
@@ -3961,16 +4613,16 @@ mod tests {
         }
     }
 
-    /// Each release suite is a decision of its own, run from the tree the gate
+    /// Each delivery suite is a decision of its own, run from the tree the gate
     /// verifies: a red suite fails the stage under its own name while its
     /// siblings still run, and a missing one is a cannot-run. The first pass,
-    /// over three green suites, is the negative control: the stage decides
-    /// three `ok`s, so the red and missing rows below are the suites' doing.
+    /// over every suite green, is the negative control: the stage decides one
+    /// `ok` per suite, so the red and missing rows below are the suites' doing.
     #[cfg(unix)]
     #[test]
-    fn every_release_suite_runs_and_decides_on_its_own() {
+    fn every_delivery_suite_runs_and_decides_on_its_own() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = crate::mktemp_dir("atv-release-suites").expect("mktemp");
+        let tmp = crate::mktemp_dir("atv-delivery-suites").expect("mktemp");
         let tools = tmp.join("tools");
         std::fs::create_dir_all(&tools).expect("mkdir");
         let suite = |name: &str, body: &str| {
@@ -3978,14 +4630,14 @@ mod tests {
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         };
-        for name in RELEASE_SUITES {
+        for name in DELIVERY_SUITES {
             suite(name, "exit 0");
         }
         let mut c = ctx(Scope::workspace());
         c.root = tmp.clone();
         let decide = |c: &Ctx| {
-            let mut r = Report::new("release tooling");
-            release_tooling(c, &mut r);
+            let mut r = Report::new("delivery tooling");
+            delivery_tooling(c, &mut r);
             r.outcomes()
                 .map(|(o, l)| (o, l.to_string()))
                 .collect::<Vec<_>>()
@@ -3994,16 +4646,23 @@ mod tests {
         let green = decide(&c);
         assert_eq!(
             green,
-            RELEASE_SUITES
+            DELIVERY_SUITES
                 .iter()
                 .map(|n| (Outcome::Ok, (*n).to_string()))
                 .collect::<Vec<_>>()
         );
+        // Each is its own suite, and a killed one is sent SIGTERM first so its
+        // EXIT trap cleans up (dev-sign-id's keychain is the reason).
+        for name in DELIVERY_SUITES {
+            let cmd = delivery_suite_cmd(&c, name);
+            assert_eq!(cmd.argv(), [tools.join(name).display().to_string()]);
+            assert_eq!(cmd.term_grace, Some(exec::TERM_GRACE), "{name}");
+        }
 
         suite("test-publish-export.sh", "echo widened >&2; exit 1");
         std::fs::remove_file(tools.join("test-release-preflight.sh")).expect("rm");
         let mixed = decide(&c);
-        assert_eq!(mixed.len(), RELEASE_SUITES.len(), "{mixed:?}");
+        assert_eq!(mixed.len(), DELIVERY_SUITES.len(), "{mixed:?}");
         assert_eq!(
             mixed[0],
             (Outcome::Ok, "test-install-channel.sh".to_string())
@@ -4022,6 +4681,12 @@ mod tests {
                 .starts_with("test-release-preflight.sh missing or not executable"),
             "{mixed:?}"
         );
+        // …and every suite after them still ran, the five that joined on
+        // 2026-09-26 included: one red row never hides the rest of the roster.
+        assert!(
+            mixed[3..].iter().all(|(o, _)| *o == Outcome::Ok),
+            "{mixed:?}"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -4030,9 +4695,9 @@ mod tests {
     /// tree does not carry is not found by the same check.
     #[cfg(unix)]
     #[test]
-    fn every_release_suite_is_an_executable_file_in_this_tree() {
+    fn every_delivery_suite_is_an_executable_file_in_this_tree() {
         let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
-        for name in RELEASE_SUITES {
+        for name in DELIVERY_SUITES {
             assert!(is_executable_file(&tools.join(name)), "tools/{name}");
         }
         assert!(!is_executable_file(&tools.join("test-no-such-suite.sh")));
@@ -4592,11 +5257,200 @@ mod tests {
             "nothing but the verb, the packages and the examples: {combined:?}"
         );
         if cfg!(target_os = "macos") {
-            assert_eq!(children.len(), 3);
-            assert_eq!(children[2], combined);
+            assert_eq!(children.len(), 5);
+            // The live lanes' `aterm`, on macOS only: both lanes are named
+            // skips anywhere else (`live_aterm_macos_only`), so a build there
+            // would compile a binary nothing drives.
+            assert_eq!(children[2], live_aterm_build_args());
+            assert_eq!(children[3], combined);
+            // …and the window-server rows' test binary, the one driver-lane
+            // stage whose build is a `test --no-run` rather than a `build`.
+            assert_eq!(children[4], window_server_tests_build_args());
         } else {
-            assert_eq!(children.len(), 2, "no objc drivers exist off macOS");
+            assert_eq!(
+                children.len(),
+                2,
+                "no objc drivers or window-server rows exist off macOS, and no live lane runs"
+            );
         }
+    }
+
+    /// A LIVE LANE'S NOT-RUN CODE IS NEVER A PASS. Before 2026-09-26 the two
+    /// lanes were run by hand or not at all, and by hand each answered the
+    /// missing `<root>/target/debug/aterm` with its not-run code — the handback
+    /// lane `2`, the Codex lane `77` ("SKIP") — which a gate reading "nonzero is
+    /// a failure, zero a pass" would get half right and one reading "only 1 is
+    /// a failure" would pass. The handback lane's `2` is COULD NOT RUN; the
+    /// Codex lane's `77`, in the `--full` tier it lives in, is a NAMED SKIP with
+    /// the lane's own reason (counted, and forfeiting the run's contract claim,
+    /// as the trust-mc floor's absent prover is). Each code only for the lane
+    /// that declares it: the other lane's code is a finding.
+    #[test]
+    fn a_live_lanes_not_run_code_is_never_a_pass_and_quotes_the_lanes_reason() {
+        use crate::Outcome;
+        let fh = FOREGROUND_HANDBACK_SUITE;
+        let cx = CODEX_LIVE_UPGRADE_SUITE;
+        assert_eq!(
+            live_aterm_outcome(fh, Some(0), "39 ok, 0 FAIL, 1 skip"),
+            (Outcome::Ok, fh.to_string())
+        );
+        assert_eq!(
+            live_aterm_outcome(cx, Some(0), "PASS"),
+            (Outcome::Ok, cx.to_string())
+        );
+        for name in LIVE_ATERM_SUITES {
+            assert_eq!(
+                live_aterm_outcome(name, Some(1), "").0,
+                Outcome::Fail(Severity::GateFailed),
+                "{name}"
+            );
+            assert_eq!(
+                live_aterm_outcome(name, None, "").0,
+                Outcome::Fail(Severity::CouldNotRun),
+                "{name}: a signal decided nothing"
+            );
+        }
+        // The Codex lane's reason is the label, so the verdict names the remedy.
+        let transcript = "managed Codex 0.157.1\nSKIP: the store holds no Codex older than 0.157.1 to upgrade from\n";
+        assert_eq!(
+            live_aterm_outcome(cx, Some(77), transcript),
+            (
+                Outcome::Skip,
+                "test-codex-live-upgrade.sh: NOT RUN — the store holds no Codex older than 0.157.1 \
+                 to upgrade from (exit 77: this machine lacks a prerequisite; a named skip, never a \
+                 pass)"
+                    .to_string()
+            )
+        );
+        let (outcome, label) = live_aterm_outcome(cx, Some(77), "");
+        assert_eq!(outcome, Outcome::Skip);
+        assert!(
+            label.contains("the lane skipped without saying why"),
+            "{label}"
+        );
+        let (outcome, label) = live_aterm_outcome(
+            fh,
+            Some(2),
+            "NOT RUN: no aterm binary at /x (targo --unverified build -p aterm)\n",
+        );
+        assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
+        assert_eq!(
+            label,
+            "test-foreground-handback.sh: NOT RUN — no aterm binary at /x (targo --unverified \
+             build -p aterm) (exit 2, never a pass)"
+        );
+        // A boot failure is the lane's FAIL row and exit 1 — a finding.
+        assert_eq!(
+            live_aterm_outcome(
+                fh,
+                Some(1),
+                "FAIL  boot: /bin/zsh — the headless instance exited before it answered\n"
+            )
+            .0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+        // Each lane's not-run code is its own; the other's is a finding.
+        assert_eq!(
+            live_aterm_outcome(fh, Some(77), "").0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+        assert_eq!(
+            live_aterm_outcome(cx, Some(2), "").0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+    }
+
+    /// THE BINARY IS HANDED OVER, in the spelling each lane's own argument
+    /// parsing reads, and it is the driver lane's `debug/aterm` whatever the
+    /// caller exported — never `<root>/target/debug/aterm`, the lanes' default
+    /// and the path a previous run (or a build still linking) owns. The second
+    /// half reads the two scripts, so a lane that renames its flag reddens this
+    /// rather than silently falling back to its default.
+    #[test]
+    fn each_live_lane_is_handed_the_driver_lanes_aterm_in_the_spelling_its_header_takes() {
+        for caller in [None, Some("/elsewhere"), Some("relative")] {
+            let mut c = ctx(Scope::workspace());
+            c.env.cargo_target_dir = caller.map(Into::into);
+            let bin = live_aterm_binary(&c);
+            assert_eq!(bin, drivers_dir(&c).join("debug").join("aterm"));
+            assert!(
+                !bin.starts_with(c.root.join("target")),
+                "the lanes' own default is exactly the stale path: {}",
+                bin.display()
+            );
+            let build = live_aterm_build_cmd(&c);
+            assert_eq!(build.argv()[1..], live_aterm_build_args()[..]);
+            assert!(build.demoted, "the build only compiles");
+            let lane = |cmd: &Cmd| {
+                cmd.envs
+                    .iter()
+                    .find(|(k, _)| k.to_str() == Some("CARGO_TARGET_DIR"))
+                    .map(|(_, v)| PathBuf::from(v))
+            };
+            // Both live stages — the handback in every tier, the Codex lane in
+            // `--full` — are in the lane whose dir that build writes.
+            c.mode = Mode::Full;
+            for id in [StageId::ForegroundHandback, StageId::CodexLiveUpgrade] {
+                let spec = crate::plan::plan(&c)
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .expect("the live lanes are planned whole-tree under --full");
+                assert_eq!(
+                    lane(&build),
+                    lane_dir(&c, spec.lane),
+                    "{id:?}, caller {caller:?}"
+                );
+            }
+
+            let fh = live_aterm_suite_cmd(&c, FOREGROUND_HANDBACK_SUITE);
+            assert_eq!(fh.program, c.tools_dir().join(FOREGROUND_HANDBACK_SUITE));
+            assert_eq!(
+                fh.argv()[1..],
+                ["--binary".to_string(), bin.display().to_string()]
+            );
+            let cx = live_aterm_suite_cmd(&c, CODEX_LIVE_UPGRADE_SUITE);
+            assert_eq!(cx.program, c.tools_dir().join(CODEX_LIVE_UPGRADE_SUITE));
+            assert_eq!(cx.argv()[1..], [bin.display().to_string()]);
+            for cmd in [&fh, &cx] {
+                assert!(
+                    !cmd.demoted,
+                    "the lanes RUN code and keep the inherited tier"
+                );
+                assert!(cmd.envs.is_empty(), "nothing but the binary is handed over");
+                assert_eq!(
+                    cmd.term_grace,
+                    Some(exec::TERM_GRACE),
+                    "a killed lane is sent SIGTERM first, so its EXIT trap tears down"
+                );
+            }
+        }
+        let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
+        let read = |name: &str| std::fs::read_to_string(tools.join(name)).expect(name);
+        let fh = read(FOREGROUND_HANDBACK_SUITE);
+        assert!(
+            fh.contains("--binary) BIN=$2; shift 2 ;;"),
+            "the handback lane's flag"
+        );
+        // …its not-run code, which only `not_run` spells, and the teardown
+        // that turns any other 2 into a finding.
+        assert!(
+            fh.contains("    NOT_RUN=1\n    exit 2\n}"),
+            "the lane's not_run()"
+        );
+        assert_eq!(fh.matches("exit 2").count(), 1, "2 is spelled once");
+        assert!(
+            fh.contains("if [[ $status -eq 2 && -z $NOT_RUN ]]; then\n        status=1"),
+            "the teardown's stray-2 mapping"
+        );
+        let cx = read(CODEX_LIVE_UPGRADE_SUITE);
+        assert!(
+            cx.contains(r#"A="${1:-$ROOT/target/debug/aterm}""#),
+            "the Codex lane's first argument"
+        );
+        assert!(cx.contains("exit 77; }"), "…and its not-run code");
+        // Negative control: the same check does not find a spelling a lane
+        // does not read.
+        assert!(!cx.contains("--binary)"));
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //! bottom rows (cell from `visible_row - display_offset`, extras from raw
 //! `visible_row`). Both are pinned here at the render AND text level.
 
-use aterm_core::prelude::Terminal;
 use aterm_core::render::RenderInput;
+use aterm_core::terminal::Terminal;
 
 /// Push `top` onto row 0, then 10 filler lines so it lands in RAM scrollback.
 fn scrolled_off(top: &[u8]) -> Terminal {

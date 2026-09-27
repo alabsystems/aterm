@@ -33,23 +33,12 @@ macro_rules! stable_id {
         #[serde(transparent)]
         pub(crate) struct $name(u64);
 
-        #[allow(
-            dead_code,
-            reason = "stable wire/restore accessors are consumed incrementally by native host surfaces"
-        )]
         impl $name {
             /// The stable integer representation used by restore and control
             /// serialization.  It is never a vector index.
             #[must_use]
             pub(crate) const fn get(self) -> u64 {
                 self.0
-            }
-
-            /// Reconstitute an identity at a validated restore boundary.  Live
-            /// allocation goes through [`IdAllocator`] or [`ViewStore`].
-            #[must_use]
-            pub(crate) const fn from_stored(raw: u64) -> Self {
-                Self(raw)
             }
         }
 
@@ -64,6 +53,27 @@ macro_rules! stable_id {
 stable_id!(TabId);
 stable_id!(ViewId);
 stable_id!(AppInstanceId);
+
+/// Reconstitute an identity at a validated restore boundary.  Live allocation
+/// goes through [`IdAllocator`] or [`ViewStore`]. Only the macOS tab strip
+/// reconstitutes a [`TabId`], and no shipping code an [`AppInstanceId`]; the
+/// tests mint both directly.
+macro_rules! from_stored {
+    ($name:ident) => {
+        impl $name {
+            #[must_use]
+            pub(crate) const fn from_stored(raw: u64) -> Self {
+                Self(raw)
+            }
+        }
+    };
+}
+
+from_stored!(ViewId);
+#[cfg(any(target_os = "macos", test))]
+from_stored!(TabId);
+#[cfg(test)]
+from_stored!(AppInstanceId);
 
 /// The stable-id space has been exhausted.  This is explicit even though a
 /// process cannot realistically create `u64::MAX` tabs or views.
@@ -91,8 +101,6 @@ impl<I> Default for IdAllocator<I> {
 
 pub(crate) trait StableId: Copy {
     fn from_raw(raw: u64) -> Self;
-    #[allow(dead_code, reason = "used by persisted-id reservation")]
-    fn raw(self) -> u64;
 }
 
 macro_rules! stable_id_impl {
@@ -100,10 +108,6 @@ macro_rules! stable_id_impl {
         impl StableId for $name {
             fn from_raw(raw: u64) -> Self {
                 Self(raw)
-            }
-
-            fn raw(self) -> u64 {
-                self.0
             }
         }
     };
@@ -119,18 +123,6 @@ impl<I: StableId> IdAllocator<I> {
         let raw = self.next;
         self.next = raw.checked_add(1).ok_or(IdExhausted)?;
         Ok(I::from_raw(raw))
-    }
-
-    /// Advance past a restored identity so future allocation cannot collide
-    /// with it.  Multiple calls and out-of-order restore are harmless.
-    #[allow(dead_code, reason = "used by persisted-id restoration")]
-    fn reserve(&mut self, id: I) -> Result<(), IdExhausted> {
-        let Some(after) = id.raw().checked_add(1) else {
-            self.next = u64::MAX;
-            return Err(IdExhausted);
-        };
-        self.next = self.next.max(after);
-        Ok(())
     }
 }
 
@@ -191,23 +183,6 @@ impl ViewStore {
         Ok(id)
     }
 
-    /// Restore a previously persisted identity.  Duplicate ids fail closed and
-    /// do not replace the live view.  Future ids advance past the restored one.
-    #[allow(
-        dead_code,
-        reason = "stable-id restore schema lands after the live host"
-    )]
-    pub(crate) fn restore(&mut self, id: ViewId, view: View) -> Result<(), RestoreIdError> {
-        if self.views.contains_key(&id) {
-            return Err(RestoreIdError::Duplicate);
-        }
-        self.ids
-            .reserve(id)
-            .map_err(|_| RestoreIdError::Exhausted)?;
-        self.views.insert(id, view);
-        Ok(())
-    }
-
     #[must_use]
     pub(crate) fn get(&self, id: ViewId) -> Option<&View> {
         self.views.get(&id)
@@ -227,28 +202,11 @@ impl ViewStore {
         self.views.iter().map(|(id, view)| (*id, *view))
     }
 
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code, reason = "inspection and restore capacity query")]
     pub(crate) fn len(&self) -> usize {
         self.views.len()
     }
-
-    #[must_use]
-    #[allow(dead_code, reason = "inspection and restore capacity query")]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.views.is_empty()
-    }
-}
-
-/// Restore-time stable-id rejection.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(
-    dead_code,
-    reason = "public error surface for persisted ViewId restore"
-)]
-pub(crate) enum RestoreIdError {
-    Duplicate,
-    Exhausted,
 }
 
 /// Split orientation in content coordinates.
@@ -779,23 +737,6 @@ impl<T: Copy + Eq> SplitTree<T> {
         let mut out = Vec::with_capacity(self.len());
         layout_into(self, sanitize_rect(bounds), divider, min_leaf, &mut out);
         out
-    }
-
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "generic primitive retained for PaneTree compatibility and standalone geometry tests"
-    )]
-    pub(crate) fn leaf_at(
-        &self,
-        point: LogicalPoint,
-        bounds: LogicalRect,
-        divider: f32,
-        min_leaf: f32,
-    ) -> Option<T> {
-        self.layout(bounds, divider, min_leaf)
-            .into_iter()
-            .find_map(|leaf| leaf.rect.contains(point).then_some(leaf.value))
     }
 
     #[must_use]
@@ -1783,13 +1724,11 @@ impl TabSet {
     }
 
     #[must_use]
-    #[allow(dead_code, reason = "native-only window lifecycle query")]
     pub(crate) fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
 
     #[must_use]
-    #[allow(dead_code, reason = "stable control/restore identity query")]
     pub(crate) fn active_id(&self) -> Option<TabId> {
         self.active
     }
@@ -1805,7 +1744,6 @@ impl TabSet {
         self.active_index().and_then(|index| self.tabs.get(index))
     }
 
-    #[allow(dead_code, reason = "native presentation refresh mutation seam")]
     pub(crate) fn active_mut(&mut self) -> Option<&mut Tab> {
         let index = self.active_index()?;
         self.tabs.get_mut(index)
@@ -1961,42 +1899,13 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_duplicates_and_advances_allocator() {
-        let mut store = ViewStore::default();
-        let restored = ViewId::from_stored(41);
-        store
-            .restore(restored, View::Terminal(TerminalView { session: 7 }))
-            .expect("restore");
-        assert_eq!(
-            store.restore(restored, View::Terminal(TerminalView { session: 8 })),
-            Err(RestoreIdError::Duplicate)
-        );
-        let next = store.insert_terminal(9).expect("id after restore");
-        assert_eq!(next.get(), 42);
-        assert_eq!(
-            store
-                .get(restored)
-                .copied()
-                .and_then(View::terminal_session),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn split_tree_layout_hit_and_neighbor_share_logical_rects() {
+    fn split_tree_layout_and_neighbor_share_logical_rects() {
         let mut tree = SplitTree::leaf(1u64);
         assert!(tree.split_leaf(1, SplitAxis::Horizontal, 2));
         assert!(tree.split_leaf(2, SplitAxis::Vertical, 3));
         let bounds = LogicalRect::new(0.0, 0.0, 801.0, 601.0);
         let leaves = tree.layout(bounds, 1.0, 1.0);
         assert_eq!(leaves.len(), 3);
-        for leaf in &leaves {
-            let centre = LogicalPoint {
-                x: leaf.rect.origin.x + leaf.rect.size.width * 0.5,
-                y: leaf.rect.origin.y + leaf.rect.size.height * 0.5,
-            };
-            assert_eq!(tree.leaf_at(centre, bounds, 1.0, 1.0), Some(leaf.value));
-        }
         assert_eq!(
             tree.neighbor(3, FocusDirection::Up, bounds, 1.0, 1.0),
             Some(2)

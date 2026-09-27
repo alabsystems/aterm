@@ -78,14 +78,6 @@ impl Item {
         }
     }
 
-    /// The array of tables, mutably.
-    pub fn as_array_of_tables_mut(&mut self) -> Option<&mut ArrayOfTables> {
-        match self {
-            Item::ArrayOfTables(a) => Some(a),
-            _ => None,
-        }
-    }
-
     /// Either table spelling — `[header]` or `{ inline }` — behind one trait.
     #[must_use]
     pub fn as_table_like(&self) -> Option<&dyn TableLike> {
@@ -147,22 +139,11 @@ impl Item {
         self.as_value().and_then(Value::as_bool)
     }
 
-    /// The date-time, if this entry is one.
-    #[must_use]
-    pub fn as_datetime(&self) -> Option<&crate::Datetime> {
-        self.as_value().and_then(Value::as_datetime)
-    }
-
     /// The array, if this entry is one. An array of TABLES is a different
     /// thing — see [`Item::as_array_of_tables`].
     #[must_use]
     pub fn as_array(&self) -> Option<&super::Array> {
         self.as_value().and_then(Value::as_array)
-    }
-
-    /// The array, mutably.
-    pub fn as_array_mut(&mut self) -> Option<&mut super::Array> {
-        self.as_value_mut().and_then(Value::as_array_mut)
     }
 
     /// Is this entry a value (rather than a table or an array of tables)?
@@ -212,11 +193,6 @@ impl Item {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Item> {
         self.as_table_like()?.get(key)
-    }
-
-    /// Look one level down, mutably.
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Item> {
-        self.as_table_like_mut()?.get_mut(key)
     }
 
     /// The byte range this entry occupied in the document it was parsed from.
@@ -310,10 +286,6 @@ impl KeyMap {
         self.entries.iter().map(|(k, v)| (k, v))
     }
 
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&Key, &mut Item)> {
-        self.entries.iter_mut().map(|(k, v)| (&*k, v))
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -363,17 +335,6 @@ impl Table {
         Self::default()
     }
 
-    /// Formatting around the header line.
-    #[must_use]
-    pub fn decor(&self) -> &Decor {
-        &self.decor
-    }
-
-    /// Mutable formatting around the header line.
-    pub fn decor_mut(&mut self) -> &mut Decor {
-        &mut self.decor
-    }
-
     /// Does this table lack an authored `[header]`?
     #[must_use]
     pub fn is_implicit(&self) -> bool {
@@ -385,59 +346,15 @@ impl Table {
         self.implicit = implicit;
     }
 
-    /// Did this table come from a dotted key?
-    #[must_use]
-    pub fn is_dotted(&self) -> bool {
-        self.dotted
-    }
-
-    /// Declare this table printed inline in its parent's key line.
-    pub fn set_dotted(&mut self, dotted: bool) {
-        self.dotted = dotted;
-    }
-
-    /// This table's position among the document's headers.
-    #[must_use]
-    pub fn position(&self) -> Option<usize> {
-        self.position
-    }
-
-    /// Move this table among the document's headers.
-    pub fn set_position(&mut self, position: usize) {
-        self.position = Some(position);
-    }
-
     /// Byte range of the `[header]` line in the source.
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()
     }
 
-    /// Number of direct entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    /// Has this table no direct entries?
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.items.len() == 0
-    }
-
     /// Entries in authored order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Item)> {
         self.items.iter().map(|(k, v)| (k.get(), v))
-    }
-
-    /// Entries in authored order, values mutable.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut Item)> {
-        self.items.iter_mut().map(|(k, v)| (k.get(), v))
-    }
-
-    /// Entries in authored order, with the full [`Key`] (spelling and decor).
-    pub fn iter_keys(&self) -> impl Iterator<Item = (&Key, &Item)> {
-        self.items.iter()
     }
 
     /// The entry for `key`.
@@ -449,12 +366,6 @@ impl Table {
     /// The entry for `key`, mutably.
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Item> {
         self.items.get_mut(key)
-    }
-
-    /// The entry for `key` together with its authored key spelling.
-    #[must_use]
-    pub fn get_key_value(&self, key: &str) -> Option<(&Key, &Item)> {
-        self.items.get_key_value(key)
     }
 
     /// Is `key` present?
@@ -547,22 +458,6 @@ impl ArrayOfTables {
     /// Elements in document order.
     pub fn iter(&self) -> impl Iterator<Item = &Table> {
         self.values.iter()
-    }
-
-    /// Elements in document order, mutably.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Table> {
-        self.values.iter_mut()
-    }
-
-    /// The element at `index`.
-    #[must_use]
-    pub fn get(&self, index: usize) -> Option<&Table> {
-        self.values.get(index)
-    }
-
-    /// The element at `index`, mutably.
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut Table> {
-        self.values.get_mut(index)
     }
 
     /// Append an element.

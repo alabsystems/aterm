@@ -1141,18 +1141,36 @@ mod tests {
     /// `#[cfg(not(target_arch = "wasm32"))]` that is redundant to the compiler
     /// and load-bearing to this gate. Both this entry and that marker go away
     /// together if the census learns to evaluate cfg predicates.
+    ///
+    /// # `aterm-containment` LEFT the closure, 2026-09-24
+    ///
+    /// 6e79521a0 deleted `aterm-core`'s unused edges (`unused_crate_dependencies`
+    /// and a grep agreed nothing used them), `aterm-core -> aterm-containment`
+    /// among them, and nothing else a web module reaches depends on it, so the
+    /// derived closure shrank and this pin did not — main's gate was red here.
+    /// `aterm-alloc` and `aterm-bits` lost the same edge from `aterm-core` but
+    /// stay: other crates in the closure still reach them.
+    ///
+    /// # `aterm-tempfile` and `aterm-ffi-types` LEFT the closure, 2026-09-25
+    ///
+    /// `aterm-tempfile` left with aterm-grid's unused normal edge (it served
+    /// only a never-constructed disk-spill budget), and `aterm-ffi-types` with
+    /// aterm-selection's unused edge (its unused C-ABI mirror types).
     #[test]
     fn derived_wasm_closure_matches_the_pinned_canary() {
         const PINNED: &[&str] = &[
             "crates/aterm-alloc/src",
             "crates/aterm-bits/src",
             "crates/aterm-codec/src",
-            "crates/aterm-containment/src",
             "crates/aterm-core/src",
+            // Entered the closure 2026-09-24: aterm-shell-integration names
+            // its per-build script folder by a SHA-256 of the script set, so
+            // no other build can rewrite what this one's tabs source.
+            // Dependency-free, lock-free and thread-free — pure arithmetic.
+            "crates/aterm-digest/src",
             "crates/aterm-effects-web/src",
             "crates/aterm-effects/src",
             "crates/aterm-error/src",
-            "crates/aterm-ffi-types/src",
             "crates/aterm-gpu-web/src",
             "crates/aterm-gpu/src",
             "crates/aterm-grapheme/src",
@@ -1188,7 +1206,6 @@ mod tests {
             "crates/aterm-selection/src",
             "crates/aterm-shell-integration/src",
             "crates/aterm-sixel/src",
-            "crates/aterm-tempfile/src",
             // Entered the closure when the first-party clock replaced
             // `web-time`: aterm-core, -types, -effects, -gpu and -predict all
             // sample time through it, and on wasm it IS the shim that keeps

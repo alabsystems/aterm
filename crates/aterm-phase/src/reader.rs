@@ -11,11 +11,11 @@
 //! program's reader ([`ScreenReader`]):
 //!
 //! * [`ClaudeReader`] — this crate's Claude Code grammar, behind the trait;
-//! * [`CodexReader`] — a stub from the ONE Codex screen measured (its
-//!   folder-trust gate, codex 0.156.1): it sees a numbered choice box and
-//!   reports it as a prompt with no option roles, so nothing approves by
-//!   it and every Codex box is escalated. Nothing else is read: any other
-//!   Codex screen is `idle` with [`Reading::phase_authoritative`] `false`;
+//! * [`CodexReader`] — Codex's grammar ([`crate::codex`], measured on codex
+//!   0.156.1): its boxes with their roles, the status row and the streaming
+//!   answer as busy, a turn's end row as idle or a question, its `■` walls
+//!   and interrupt. A screen whose last message's head has scrolled away
+//!   with no end in sight is `idle` NOT authoritatively;
 //! * [`GenericReader`] — any other program: never a prompt, a question or a
 //!   wall, always `idle`, never authoritative. The screen alone says
 //!   nothing program-neutral about whether a build or a REPL is working;
@@ -25,17 +25,17 @@
 //! worker, an answer pressed into a `prompt` — requires
 //! [`Reading::phase_authoritative`]: a reader's default is not evidence.
 //!
-//! [`read`] is the whole reading in one call ([`Reading`]).
+//! [`read`] is the whole reading in one call ([`Reading`]);
+//! [`Program::supervisable`] is which programs the supervisor hosts.
 
-use crate::anchors::{ANCHORS, Anchor};
+use crate::anchors::{ANCHORS, Anchor, CODEX_ANCHORS, guard_regex};
+use crate::codex;
 use crate::phase::{
-    Phase, busy_signal, context_left, has_composer_frame, leading_spaces, survey_open, worker_phase,
+    Phase, busy_signal, composer_draft, context_left, has_composer_frame, survey_open, worker_phase,
 };
-use crate::prompt::{
-    Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select, parse_prompt_v2,
-};
-use crate::turn::{continuation_suggestion, goal_active, said_tail};
-use crate::wall::{Wall, wall};
+use crate::prompt::{PromptKind, PromptV2, parse_prompt_v2};
+use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
+use crate::wall::{Wall, memory_wall, wall};
 
 /// The program a reader is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,24 @@ impl Program {
             Program::Generic => "generic",
         }
     }
+
+    /// Whether the supervisor hosts this program: one whose reader is
+    /// MEASURED — Claude Code, and Codex since its reader passed its
+    /// captures ([`crate::codex::fixtures`]). Never the generic reader.
+    #[must_use]
+    pub fn supervisable(self) -> bool {
+        matches!(self, Program::Claude | Program::Codex)
+    }
+
+    /// This program's reader.
+    #[must_use]
+    pub fn reader(self) -> &'static dyn ScreenReader {
+        match self {
+            Program::Claude => &ClaudeReader,
+            Program::Codex => &CodexReader,
+            Program::Generic => &GenericReader,
+        }
+    }
 }
 
 /// Everything one screen says, from one program's reader.
@@ -65,13 +83,16 @@ pub struct Reading {
     pub phase: Phase,
     /// Whether [`Self::phase`] is the reader's evidence rather than its
     /// default: `false` for the generic reader always, and for the Codex
-    /// reader outside its choice box — each says `idle` there because it
-    /// cannot tell working from waiting, not because it saw either. A policy
-    /// that acts on `idle` (a continuation) or on `prompt` requires it.
+    /// reader where nothing on the screen says whether a turn runs — each
+    /// says `idle` there because it cannot tell working from waiting, not
+    /// because it saw either. A policy that acts on `idle` (a continuation)
+    /// or on `prompt` requires it.
     pub phase_authoritative: bool,
-    /// The wall the last turn ended on — `None` while a box is up or the
-    /// worker is (hard) busy. A turn that ended on `API Error: 529` reads
-    /// [`Phase::Idle`] with a wall here.
+    /// The wall the last turn ended on — `None` while a box is up, and while
+    /// the worker is (hard) busy only a HEALTH wall
+    /// ([`ScreenReader::health_wall`]: Claude Code's critical-memory banner,
+    /// which it draws under a running spinner). A turn that ended on `API
+    /// Error: 529` reads [`Phase::Idle`] with a wall here.
     pub wall: Option<Wall>,
     /// The box, when [`Self::phase`] is [`Phase::Prompt`].
     pub prompt: Option<PromptV2>,
@@ -83,6 +104,18 @@ pub struct Reading {
     pub goal_active: bool,
     /// The worker's last words ([`crate::turn::said_tail`]).
     pub said_tail: Option<String>,
+    /// A PERSON stopped the last turn (Esc): the next message is theirs
+    /// ([`crate::turn::interrupted`], [`crate::codex::interrupted`]).
+    pub interrupted: bool,
+    /// No turn yet ([`ScreenReader::fresh`]: [`crate::turn::fresh`],
+    /// [`crate::codex::fresh`]): an idle point here ended nothing — a
+    /// session nobody has asked anything is not a worker stopped short.
+    pub fresh: bool,
+    /// The composer as `(caret row, lines)`, the caret row's text first —
+    /// typed text or the dim placeholder, which only the cursor tells apart
+    /// (at column 2 of the caret row: the placeholder, for both programs);
+    /// `None` with no composer on the screen (a box, a shell).
+    pub composer: Option<(usize, Vec<String>)>,
 }
 
 /// A program's screen grammar.
@@ -91,11 +124,44 @@ pub trait ScreenReader: Sync {
     fn phase(&self, rows: &[String]) -> Phase;
     fn prompt(&self, rows: &[String]) -> Option<PromptV2>;
     fn wall(&self, rows: &[String]) -> Option<Wall>;
+    /// A wall that says the PROGRAM, not the turn, is stuck — read even
+    /// while the worker is hard busy, where [`Self::wall`] is not asked (a
+    /// retry notice under a live spinner is not a wall yet; a process past
+    /// saving is one however busy its spinner looks). `None` by default:
+    /// only a reader that knows its program's own such banner has one.
+    fn health_wall(&self, _rows: &[String]) -> Option<Wall> {
+        None
+    }
     fn survey(&self, rows: &[String]) -> bool;
+    /// THE AGENT'S OWN BACKGROUND WORK, AND NOTHING ELSE, KEEPS THIS SCREEN
+    /// BUSY: its turn is over, the composer drawn, and what runs on is work
+    /// it started (a dynamic workflow, a background agent, a shell, a Codex
+    /// background terminal) — `Some(what runs)`. `None` for a live turn, an
+    /// idle screen, a box, or a program with no such read (the default).
+    fn background_wait(&self, _rows: &[String]) -> Option<&'static str> {
+        None
+    }
     fn context(&self, rows: &[String]) -> Option<u8>;
     fn suggestion(&self, rows: &[String], cursor_col: usize) -> Option<String>;
     fn goal_active(&self, rows: &[String]) -> bool;
     fn said_tail(&self, rows: &[String]) -> Option<String>;
+    fn interrupted(&self, rows: &[String]) -> bool;
+    /// No turn yet: the program's launch card on the screen and, under it,
+    /// no message and nothing said — nobody has asked the session anything.
+    fn fresh(&self, rows: &[String]) -> bool;
+    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)>;
+    /// The glyph the composer's caret row starts with (`❯` Claude Code, `›`
+    /// Codex): what a guard on typed text anchors to. `None`: no composer.
+    fn caret(&self) -> Option<char>;
+    /// An Enter that arrives within a burst of typed text is taken as a
+    /// NEWLINE, not a submit (Codex's paste guard, measured): typed text is
+    /// submitted by a `turn` that settles first, never by an Enter right
+    /// behind the text.
+    fn paste_guard(&self) -> bool;
+    /// A guard (the wire's regex: spaces as `.`) matching the row a RUNNING
+    /// turn shows, and only that row — its leaving ends the turn (`await
+    /// gone`). `None`: nothing on this program's screen says a turn runs.
+    fn busy_guard(&self) -> Option<String>;
     /// The strings this program's guards name.
     fn anchors(&self) -> &'static [Anchor];
     /// Whether `phase`, read from `rows`, is evidence ([`Reading::
@@ -110,8 +176,13 @@ pub trait ScreenReader: Sync {
             .then(|| self.prompt(rows))
             .flatten();
         let hard_busy = phase == Phase::Busy && busy_signal(rows).is_some_and(|b| !b.soft);
-        let wall = if phase == Phase::Prompt || hard_busy {
+        // Never under a box (its answer is the human's, and the banner's
+        // place under one is not measured); under a hard busy only a health
+        // wall; otherwise every wall.
+        let wall = if phase == Phase::Prompt {
             None
+        } else if hard_busy {
+            self.health_wall(rows)
         } else {
             self.wall(rows)
         };
@@ -126,6 +197,9 @@ pub trait ScreenReader: Sync {
             suggestion: cursor_col.and_then(|c| self.suggestion(rows, c)),
             goal_active: self.goal_active(rows),
             said_tail: self.said_tail(rows),
+            interrupted: self.interrupted(rows),
+            fresh: self.fresh(rows),
+            composer: self.composer(rows),
         }
     }
 }
@@ -147,8 +221,14 @@ impl ScreenReader for ClaudeReader {
     fn wall(&self, rows: &[String]) -> Option<Wall> {
         wall(rows)
     }
+    fn health_wall(&self, rows: &[String]) -> Option<Wall> {
+        memory_wall(rows)
+    }
     fn survey(&self, rows: &[String]) -> bool {
         survey_open(rows)
+    }
+    fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
+        crate::phase::background_wait(rows)
     }
     fn context(&self, rows: &[String]) -> Option<u8> {
         context_left(rows)
@@ -162,6 +242,30 @@ impl ScreenReader for ClaudeReader {
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         said_tail(rows)
     }
+    fn interrupted(&self, rows: &[String]) -> bool {
+        interrupted(rows)
+    }
+    fn fresh(&self, rows: &[String]) -> bool {
+        crate::turn::fresh(rows)
+    }
+    /// Inside its frame only: a `❯` row with no frame around it is the
+    /// transcript's (a user's message), never the composer — a box replaces
+    /// the frame.
+    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
+        has_composer_frame(rows)
+            .then(|| composer_draft(rows))
+            .flatten()
+    }
+    fn caret(&self) -> Option<char> {
+        Some('❯')
+    }
+    fn paste_guard(&self) -> bool {
+        false
+    }
+    /// The busy footer's `esc to interrupt`, under the spinner.
+    fn busy_guard(&self) -> Option<String> {
+        Some(guard_regex(crate::anchor("busy.interrupt")))
+    }
     fn anchors(&self) -> &'static [Anchor] {
         ANCHORS
     }
@@ -170,7 +274,7 @@ impl ScreenReader for ClaudeReader {
     }
 }
 
-/// Codex: a numbered choice box and nothing else (module header).
+/// Codex: [`crate::codex`]'s grammar (module header).
 #[derive(Debug, Clone, Copy)]
 pub struct CodexReader;
 
@@ -179,39 +283,64 @@ impl ScreenReader for CodexReader {
         Program::Codex
     }
     fn phase(&self, rows: &[String]) -> Phase {
-        if codex_box(rows).is_some() {
-            Phase::Prompt
-        } else {
-            Phase::Idle
-        }
+        codex::phase(rows).0
     }
     fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
-        codex_prompt(rows)
+        codex::prompt(rows)
     }
-    fn wall(&self, _: &[String]) -> Option<Wall> {
-        None
+    fn wall(&self, rows: &[String]) -> Option<Wall> {
+        codex::wall(rows)
     }
     fn survey(&self, _: &[String]) -> bool {
         false
     }
-    fn context(&self, _: &[String]) -> Option<u8> {
-        None
+    fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
+        codex::background_wait(rows)
     }
+    fn context(&self, rows: &[String]) -> Option<u8> {
+        codex::context_left(rows)
+    }
+    /// Codex draws no suggestion for the next message: its composer's dim
+    /// text is a stock placeholder (`Ask Codex to do anything`), measured.
     fn suggestion(&self, _: &[String], _: usize) -> Option<String> {
         None
     }
     fn goal_active(&self, _: &[String]) -> bool {
         false
     }
-    fn said_tail(&self, _: &[String]) -> Option<String> {
-        None
+    fn said_tail(&self, rows: &[String]) -> Option<String> {
+        codex::said_tail(rows)
+    }
+    fn interrupted(&self, rows: &[String]) -> bool {
+        codex::interrupted(rows)
+    }
+    fn fresh(&self, rows: &[String]) -> bool {
+        codex::fresh(rows)
+    }
+    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
+        codex::composer_draft(rows)
+    }
+    fn caret(&self) -> Option<char> {
+        Some('›')
+    }
+    /// Measured on 0.156.1 ([`crate::codex`], "TYPING INTO THE COMPOSER").
+    fn paste_guard(&self) -> bool {
+        true
+    }
+    /// The status row's tail, `esc to interrupt)` (`• Working (6s • esc to
+    /// interrupt)`): the question dialog's footer names the same hint with
+    /// no parenthesis, and must not read as a turn running.
+    fn busy_guard(&self) -> Option<String> {
+        Some(format!(
+            "{}\\)",
+            guard_regex(crate::anchors::anchor_text("codex.busy.interrupt"))
+        ))
     }
     fn anchors(&self) -> &'static [Anchor] {
-        &[]
+        CODEX_ANCHORS
     }
-    /// Only its choice box is read; every other screen is `idle` by default.
-    fn phase_authoritative(&self, _: &[String], phase: &Phase) -> bool {
-        *phase == Phase::Prompt
+    fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
+        codex::phase(rows).1
     }
 }
 
@@ -247,6 +376,24 @@ impl ScreenReader for GenericReader {
     fn said_tail(&self, _: &[String]) -> Option<String> {
         None
     }
+    fn interrupted(&self, _: &[String]) -> bool {
+        false
+    }
+    fn fresh(&self, _: &[String]) -> bool {
+        false
+    }
+    fn composer(&self, _: &[String]) -> Option<(usize, Vec<String>)> {
+        None
+    }
+    fn caret(&self) -> Option<char> {
+        None
+    }
+    fn paste_guard(&self) -> bool {
+        false
+    }
+    fn busy_guard(&self) -> Option<String> {
+        None
+    }
     fn anchors(&self) -> &'static [Anchor] {
         &[]
     }
@@ -271,8 +418,10 @@ const NOT_AGENTS: &[&str] = &[
 /// name or any other one (a Claude Code started as `node`, `ssh` to a host
 /// running one, a session adopted with no name), the screen: Claude Code's
 /// composer frame or one of its boxes (the trust dialog replaces the frame)
-/// → Claude; a Codex choice box → Codex; else Generic. The frame test is
-/// `aterm-agent`'s `harness::profile::identify` frame test, ported.
+/// → Claude; a Codex choice box, or Codex's composer empty or under its
+/// status row (`codex::is_codex_screen`) → Codex; else Generic. A Codex
+/// with no name and a draft in its composer, no turn running, reads
+/// Generic until it next runs or shows a box.
 ///
 /// `program` must name the session's FOREGROUND process — the one drawing
 /// the screen. The session's root shell names every Claude Code started
@@ -290,12 +439,30 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
     {
         return &GenericReader;
     }
-    if has_composer_frame(rows) || parse_prompt_v2(rows).is_some() {
+    // A footerless box of no kind aterm-phase names (a setup dialog) is
+    // drawn the same by any program's menu — a shell script's `❯ 1. dev`
+    // under a rule and a title — so it names Claude Code only where the
+    // program's name already did (the harness round-3 review of 2026-09-24).
+    let names_claude = |p: PromptV2| p.kind != PromptKind::Other || crate::prompt::footed(rows, &p);
+    if has_composer_frame(rows) || parse_prompt_v2(rows).is_some_and(names_claude) {
         &ClaudeReader
-    } else if codex_box(rows).is_some() {
+    } else if codex::codex_box(rows).is_some() || codex::is_codex_screen(rows) {
         &CodexReader
     } else {
         &GenericReader
+    }
+}
+
+/// How a program that was restarted resumes the conversation it lost — the
+/// words Claude Code's own critical-memory banner ends on (`… restart and
+/// resume with claude --continue`), for a supervisor's escalation and the
+/// server's own attention to repeat. `None` for a program with no such
+/// command this crate knows. The words are a command, not a screen anchor.
+#[must_use]
+pub fn resume_hint(program: Program) -> Option<&'static str> {
+    match program {
+        Program::Claude => Some("claude --continue"),
+        Program::Codex | Program::Generic => None,
     }
 }
 
@@ -325,7 +492,8 @@ pub fn program_of(program: &str) -> Option<Program> {
 /// The script runtimes an agent runs AS without renaming itself — an
 /// npm/bun install of Claude Code starts under `node` or `bun`: a program so
 /// named may be identified as an agent by its SCREEN (Claude Code's frame, a
-/// Codex box). A shell, a pager or `cat` showing a captured screen may not.
+/// Codex box or composer: [`identify`]). A shell, a pager or `cat` showing a
+/// captured screen may not.
 pub const AGENT_RUNTIMES: &[&str] = &["node", "bun", "deno"];
 
 /// Whether `program` is one of [`AGENT_RUNTIMES`].
@@ -340,107 +508,18 @@ fn program_word(program: &str) -> String {
     base.trim_start_matches('-').to_lowercase()
 }
 
-/// A Codex numbered choice box, as `(first option row, footer row)`: a row in
-/// column 0 `› 1. <label>` (the cursor), the rest of the options under it,
-/// and within three rows of the last one a hint row — `enter continue · esc
-/// quit` (codex 0.156.1) or `Press enter to continue` (codex 0.155.1, from
-/// `aterm-agent`'s profile tests). Measured on the trust gate only.
-fn codex_box(rows: &[String]) -> Option<(usize, usize)> {
-    let first = rows.iter().rposition(|r| {
-        r.strip_prefix('›')
-            .is_some_and(|rest| codex_option(&format!("  {rest}")).is_some())
-    })?;
-    let mut last = first;
-    while last + 1 < rows.len() && codex_option(&rows[last + 1]).is_some() {
-        last += 1;
-    }
-    let footer = (last + 1..(last + 4).min(rows.len())).find(|&i| {
-        let t = rows[i].trim().to_lowercase();
-        t.starts_with("enter ") || t.starts_with("press enter") || t.contains(" · esc ")
-    })?;
-    Some((first, footer))
-}
-
-/// `› 1. Trust and continue` / `  2. Quit` → `(1, "Trust and continue")`.
-fn codex_option(row: &str) -> Option<(u8, String)> {
-    let t = row.trim_start();
-    let t = t.strip_prefix('›').map_or(t, str::trim_start);
-    let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() || digits.len() > 2 {
-        return None;
-    }
-    let rest = t[digits.len()..].strip_prefix(". ")?;
-    Some((digits.parse().ok()?, rest.trim().to_string()))
-}
-
-/// A Codex box as a [`PromptV2`] of kind [`PromptKind::Other`]: its title
-/// (the first row of the block above the options, up to a row in column 0),
-/// its options with NO roles ([`Role::Other`]), chosen by digit, and the
-/// footer's `esc quit` as an exit. What the options do is not measured, so
-/// nothing may approve by them.
-fn codex_prompt(rows: &[String]) -> Option<PromptV2> {
-    let (first, footer) = codex_box(rows)?;
-    let top = (0..first)
-        .rev()
-        .find(|&i| {
-            let r = &rows[i];
-            !r.trim().is_empty() && leading_spaces(r) == 0
-        })
-        .map_or(0, |i| i + 1);
-    let title_row = (top..first).find(|&i| !rows[i].trim().is_empty())?;
-    let options = (first..footer)
-        .filter_map(|i| {
-            codex_option(&rows[i]).map(|(n, label)| Opt {
-                n: Some(n),
-                label,
-                role: Role::Other,
-                focused: rows[i].starts_with('›'),
-                row: i,
-            })
-        })
-        .collect();
-    let hint = rows[footer].trim().to_lowercase();
-    let cancel = hint
-        .split(" · ")
-        .find_map(|item| item.strip_prefix("esc "))
-        .map(|verb| Cancel {
-            key: "esc".to_string(),
-            verb: verb.to_string(),
-            effect: if verb.starts_with("quit") || verb.starts_with("exit") {
-                CancelEffect::Exit
-            } else {
-                CancelEffect::Back
-            },
-        });
-    Some(PromptV2 {
-        kind: PromptKind::Other,
-        title: rows[title_row].trim().to_string(),
-        command_rows: Vec::new(),
-        description_rows: 0,
-        gutter: false,
-        command: String::new(),
-        description: String::new(),
-        notes: Vec::new(),
-        auto_deny: None,
-        path: None,
-        options,
-        select: Select::Digits,
-        cancel,
-        span: (title_row, footer),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prompt::fixtures::{
-        BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION, TRUST, bash_one_row,
-        composer, rows, screen,
+        BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION, MEMORY_BANNER_BUSY,
+        MEMORY_BANNER_IDLE, TRUST, bash_one_row, composer, rows, screen,
     };
+    use crate::prompt::{CancelEffect, PromptKind, Role, Select};
     use crate::wall::WallKind;
 
-    /// codex 0.155.1's trust gate, MEASURED (copied from `aterm-agent`'s
-    /// `harness/profile_tests.rs` `CODEX_SCREEN`).
+    /// codex 0.155.1's trust gate, MEASURED (carried over from the
+    /// supervisor's screen profile when `ada0c5abf` deleted it).
     fn codex_0_155_trust() -> Vec<String> {
         rows(&[
             "> You are in /Users//x/aterm",
@@ -506,18 +585,31 @@ mod tests {
     }
 
     /// A reader's default is not evidence: the generic reader's `idle` and
-    /// the Codex reader's `idle` outside its box are not authoritative; the
-    /// Codex box and every Claude reading are.
+    /// the Codex reader's `idle` where nothing says whether a turn runs (the
+    /// last message's head scrolled away, no end row) are not
+    /// authoritative; the Codex box, its status row and every Claude reading
+    /// are.
     #[test]
     fn a_default_idle_is_not_authoritative() {
+        let headless = rows(&[
+            "  the tail of an answer whose head scrolled away",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-5 · ~/src",
+        ]);
+        let r = read(Some("codex"), &headless, None);
+        assert_eq!(r.phase, Phase::Idle);
+        assert!(!r.phase_authoritative);
         let working = rows(&[
             "• Working (12s • esc to interrupt)",
             "",
             "› Ask Codex to do anything",
+            "",
+            "  gpt-5 · ~/src",
         ]);
         let r = read(Some("codex"), &working, None);
-        assert_eq!(r.phase, Phase::Idle);
-        assert!(!r.phase_authoritative);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
         assert!(read(Some("codex"), &screen(CODEX_TRUST), None).phase_authoritative);
         let g = read(Some("zsh"), &shell_asking(), None);
         assert_eq!(g.phase, Phase::Idle);
@@ -547,37 +639,99 @@ mod tests {
         );
     }
 
-    /// Codex's trust gate (both measured builds) is a prompt whose options
-    /// carry NO role — nothing may approve by them — with the cursor on the
-    /// first and `esc quit` read as an exit. Any other Codex screen is idle.
+    /// Codex's trust gate (both measured builds) is a trust prompt: its
+    /// folder, `Trust and continue` / `Yes, continue` as the trust and
+    /// `Quit` / `No, quit` as the exit, the cursor on the first, and `esc
+    /// quit` read as an exit. Claude Code's reader on the same screen sees
+    /// nothing — why the dispatch.
     #[test]
-    fn the_codex_reader_escalates_its_boxes_and_approves_nothing() {
+    fn the_codex_reader_reads_its_trust_gate_by_role() {
         let r = screen(CODEX_TRUST);
         let reading = read(Some("codex"), &r, None);
         assert_eq!(reading.phase, Phase::Prompt);
         let p = reading.prompt.expect("the box");
-        assert_eq!(p.kind, PromptKind::Other);
+        assert_eq!(p.kind, PromptKind::Trust);
         assert_eq!(p.title, "Folder access");
+        assert!(p.path.as_deref().is_some_and(|f| f.ends_with("/lv/work3")));
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
         assert_eq!(labels, vec!["Trust and continue", "Quit"]);
-        assert!(p.options.iter().all(|o| o.role == Role::Other));
+        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
+        assert_eq!(roles, vec![Role::Trust, Role::Exit]);
         assert!(p.options[0].focused && !p.options[1].focused);
-        assert_eq!(p.select, Select::Digits);
+        // Its cursor and Enter choose (`enter continue`); a digit changes
+        // nothing on it (measured under the host, 2026-09-24).
+        assert_eq!(p.select, Select::ArrowsEnter);
         assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Exit));
 
         let old = codex_0_155_trust();
         let p = CodexReader.prompt(&old).expect("the 0.155.1 box");
+        assert_eq!(p.kind, PromptKind::Trust);
         assert!(
             p.title.starts_with("Do you trust the contents"),
             "{}",
             p.title
         );
-        assert_eq!(p.options.len(), 2);
+        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
+        assert_eq!(roles, vec![Role::Trust, Role::Exit]);
         assert_eq!(p.cancel, None, "`Press enter to continue` names no Esc");
 
         assert_eq!(CodexReader.phase(&shell_asking()), Phase::Idle);
         // Claude's own reader reads the Codex gate as idle: why the dispatch.
         assert_eq!(ClaudeReader.phase(&r), Phase::Idle, "the control");
+    }
+
+    /// What a supervisor TYPING into a program needs of its reader: the
+    /// composer on the screen (Claude Code's only inside its frame — a `❯`
+    /// row under a box is the transcript's), the caret glyph a guard anchors
+    /// to, whether an Enter right behind typed text is taken as a newline
+    /// (Codex's paste guard), and the row whose leaving ends a turn — Codex's
+    /// status row, never its question footer's same hint. NEGATIVE CONTROLS:
+    /// the generic reader has none of them; `Program::reader` is each one.
+    #[test]
+    fn each_reader_says_how_to_type_into_its_program() {
+        use crate::codex::fixtures as cx;
+        let matches = |guard: &str, row: &str| {
+            let re = guard.replace("\\)", ")").replace('.', " ");
+            row.contains(&re)
+        };
+        let claude = Program::Claude.reader();
+        let codex = Program::Codex.reader();
+        assert_eq!(claude.program(), Program::Claude);
+        assert_eq!(codex.program(), Program::Codex);
+        assert_eq!(Program::Generic.reader().program(), Program::Generic);
+        assert_eq!((claude.caret(), codex.caret()), (Some('❯'), Some('›')));
+        assert!(codex.paste_guard() && !claude.paste_guard());
+        let idle = {
+            let mut r = rows(&["⏺ Done.", ""]);
+            r.extend(composer("  ? for shortcuts"));
+            r
+        };
+        assert!(claude.composer(&idle).is_some(), "the framed composer");
+        assert_eq!(
+            claude.composer(&screen(BOX_BASH_TOUCH)),
+            None,
+            "a box replaces the frame: no composer"
+        );
+        let busy = codex.busy_guard().expect("codex's busy row");
+        let status_row = screen(cx::BUSY)
+            .into_iter()
+            .find(|r| r.starts_with("• ") && r.contains("esc to interrupt"))
+            .expect("the status row");
+        assert!(matches(&busy, &status_row), "{busy} / {status_row}");
+        let question_footer = screen(cx::QUESTION)
+            .into_iter()
+            .rfind(|r| r.contains("esc to interrupt"))
+            .expect("the question's footer");
+        assert!(
+            !matches(&busy, &question_footer),
+            "the question's footer is no running turn: {question_footer}"
+        );
+        assert!(claude.busy_guard().is_some());
+        let g = GenericReader;
+        assert_eq!(
+            (g.caret(), g.busy_guard(), g.paste_guard()),
+            (None, None, false)
+        );
     }
 
     /// One read, whole: the 529 end of turn is idle WITH its wall; the
@@ -609,5 +763,75 @@ mod tests {
         assert_eq!(b.phase, Phase::Prompt);
         assert_eq!(b.prompt.map(|p| p.kind), Some(PromptKind::Trust));
         assert_eq!(b.wall, None);
+    }
+
+    /// The 2026-09-24 incident's screen: the spinner still running, so the
+    /// worker reads BUSY — and the reading carries Claude Code's
+    /// critical-memory banner as a memory wall all the same, the one wall a
+    /// hard busy keeps (`ScreenReader::health_wall`). Idle it is the same
+    /// wall. NEGATIVE CONTROLS: the banner row blanked, leaving only the
+    /// draft that quotes it, reads no wall; a box on the screen reads none
+    /// however placed the banner is; and no reader but Claude Code's has one.
+    #[test]
+    fn the_memory_banner_is_a_wall_even_under_a_busy_spinner() {
+        let busy = screen(MEMORY_BANNER_BUSY);
+        for program in [Some("claude"), None] {
+            let r = read(program, &busy, None);
+            assert_eq!(r.program, Program::Claude);
+            assert_eq!(r.phase, Phase::Busy, "{program:?}");
+            assert!(busy_signal(&busy).is_some_and(|b| !b.soft), "hard busy");
+            assert_eq!(
+                r.wall.map(|w| w.kind),
+                Some(WallKind::Memory),
+                "{program:?}"
+            );
+        }
+        let idle = read(Some("claude"), &screen(MEMORY_BANNER_IDLE), None);
+        assert_eq!(idle.phase, Phase::Idle);
+        assert_eq!(idle.wall.map(|w| w.kind), Some(WallKind::Memory));
+
+        let at = memory_wall(&busy).expect("the banner row").row;
+        let mut quoted = busy.clone();
+        quoted[at] = String::new();
+        let r = read(Some("claude"), &quoted, None);
+        assert_eq!(r.phase, Phase::Busy);
+        assert_eq!(r.wall, None, "only the draft's quote is left");
+
+        // A box with the banner placed right above the composer's rule: the
+        // banner is there to read (the control), the reading carries none.
+        let mut boxed = bash_one_row();
+        let top = boxed
+            .iter()
+            .rposition(|row| row.starts_with('─'))
+            .expect("rules")
+            - 2;
+        let width = boxed[top].chars().count();
+        let banner = busy[at].trim_start();
+        boxed.insert(top, format!("{banner:>w$}", w = width - 2));
+        assert!(memory_wall(&boxed).is_some(), "the control");
+        let r = read(Some("claude"), &boxed, None);
+        assert_eq!(r.phase, Phase::Prompt);
+        assert_eq!(r.wall, None);
+
+        // The generic reader (`cat` of the screen) and Codex's have no
+        // health wall.
+        assert_eq!(read(Some("zsh"), &busy, None).wall, None);
+        assert_eq!(CodexReader.health_wall(&busy), None);
+        assert_eq!(GenericReader.health_wall(&busy), None);
+        assert_eq!(ClaudeReader.health_wall(&busy).map(|w| w.row), Some(at));
+    }
+
+    #[test]
+    fn only_claude_code_has_a_resume_hint() {
+        assert_eq!(resume_hint(Program::Claude), Some("claude --continue"));
+        assert_eq!(resume_hint(Program::Codex), None);
+        assert_eq!(resume_hint(Program::Generic), None);
+        // The banner's own last words are the hint.
+        let banner = memory_wall(&screen(MEMORY_BANNER_BUSY)).expect("the banner");
+        assert!(
+            banner
+                .message
+                .ends_with(resume_hint(Program::Claude).unwrap())
+        );
     }
 }

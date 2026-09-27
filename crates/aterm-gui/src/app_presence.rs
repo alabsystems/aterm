@@ -167,6 +167,9 @@ impl App {
         // screen itself, so the band, the rim, `status agent=` and `EVENT
         // agent` all say the same thing.
         let (agent_seq, agent) = self.session_status.agent_reading(session);
+        // The published input stall (`input_stall::InputWatches`): the fact
+        // the frozen program's unmoving screen cannot carry.
+        let input_stall = self.session_status.input_stall(session).cloned();
         Some(Facts {
             role,
             attention,
@@ -179,6 +182,7 @@ impl App {
             mail,
             link,
             turn,
+            input_stall,
         })
     }
 
@@ -281,7 +285,29 @@ impl App {
     /// Start the 300 ms edge ripple on `wid` — unless motion is reduced, where
     /// the amplitude is 0 and the ripple never starts (the same image).
     pub(crate) fn start_presence_ripple(&mut self, wid: WindowId, now: Instant) {
-        let focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
+        self.start_ripple(wid, now, false);
+    }
+
+    /// Start the CHOICE PULSE on `wid`: the same 300 ms edge flash, gated the
+    /// same way (reduced motion or serious mode ⇒ it never starts), painted in
+    /// the story tone and shown even on a window with no rim — the supervisor
+    /// answered a question box in the session this window's front tab shows
+    /// (`App::tell_story` with [`StoryVerb::Chose`]).
+    pub(crate) fn start_presence_pulse(&mut self, wid: WindowId, now: Instant) {
+        // The pulse IS a rim flash: `[presence] rim = false` (the View menu's
+        // Presence Rim) means no rim is ever painted, this one included.
+        if self.presence_rim_on {
+            self.start_ripple(wid, now, true);
+        }
+    }
+
+    fn start_ripple(&mut self, wid: WindowId, now: Instant, chose: bool) {
+        // A CHOICE PULSE is not held to the window's OS key focus — the same
+        // reasoning as `chose_chime`'s "no focus test": its point is to show
+        // that a question in a window the person is NOT in was answered. Only
+        // reduced motion and serious mode stop it. The turn-submit ripple
+        // keeps the unfocused-window rule every decorative motion has.
+        let focused = chose || self.windows.get(&wid).is_some_and(|ws| ws.focused);
         let focused = self.motion_focus(wid, focused);
         let animate = self
             .motion_policy(focused)
@@ -294,6 +320,7 @@ impl App {
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.presence.ripple_at = Some(now);
+            ws.presence.ripple_chose = chose;
             if let Some(w) = &ws.os_window {
                 w.request_redraw();
             }
@@ -339,6 +366,17 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             let v = &mut ws.presence;
             if v.level != level || v.rim != rim || v.words != words {
+                // New words re-arm their own clock ([`words_step`]): a
+                // minutes row's +60 s must not hold back a seconds row that
+                // replaced it. The earlier of the two wins, so a figure
+                // already due is never pushed back.
+                if v.words != words {
+                    let next = words.as_ref().map(|w| now + words_step(w));
+                    v.words_due = match (v.words_due, next) {
+                        (Some(old), Some(new)) => Some(old.min(new)),
+                        (_, next) => next,
+                    };
+                }
                 v.level = level;
                 v.rim = rim;
                 v.words = words;
@@ -367,7 +405,7 @@ impl App {
     /// mid-handoff for the same reason `sync_message_band_rows` is, and yielding
     /// to the last terminal row the same way.
     pub(crate) fn sync_presence_rows(&mut self, wid: WindowId) -> bool {
-        if self.pending_update_handoff.is_some() || self.incoming_handoff_pending {
+        if self.update_handoff_parked() || self.incoming_handoff_pending {
             return false;
         }
         let Some(ws) = self.windows.get(&wid) else {
@@ -511,19 +549,14 @@ impl App {
             {
                 fold(d);
             }
-            if let Some(words) = &v.words {
-                // A clause that prints SECONDS anywhere (`12s`, `3m12s`,
-                // `since 3m12s`, `held 1m00s, resumed 40s ago`) moves every
-                // second; one that prints only minutes, hours or days moves
-                // once a minute.
-                let fine = words.since.iter().any(|c| prints_seconds(c));
-                fold(
-                    now + if fine {
-                        Duration::from_secs(1)
-                    } else {
-                        Duration::from_secs(60)
-                    },
-                );
+            // The words' own clock ([`words_step`]), and only for a band on
+            // screen: an occluded, minimized or headless window's `since` text
+            // is read by nobody, so it arms nothing (the idle law's
+            // hidden-window rule, audit 2026-09-24). A row not yet ticked is
+            // due now; a window revealed after its figure moved catches up at
+            // once.
+            if v.words.is_some() && crate::messages_host::band_on_screen(ws) {
+                fold(v.words_due.map_or(now, |d| d.max(now)));
             }
         }
         // A cooperative lease's lapse: nothing posts for it, so it is a
@@ -583,13 +616,16 @@ impl App {
             });
             if ripple_done && let Some(ws) = self.windows.get_mut(&wid) {
                 ws.presence.ripple_at = None;
+                ws.presence.ripple_chose = false;
                 out.push(wid);
             }
-            let row_up = self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.presence.words.is_some());
-            if row_up {
+            // The words' own clock: recomposed only when their figure moved
+            // (`words_due`), never at whatever rate another owner wakes the
+            // loop (audit 2026-09-24).
+            let row_due = self.windows.get(&wid).is_some_and(|ws| {
+                ws.presence.words.is_some() && ws.presence.words_due.is_none_or(|d| d <= now)
+            });
+            if row_due {
                 let before = self.windows.get(&wid).map(|ws| ws.presence.seed);
                 // The belt under the wakes' braces: while a row is up, its
                 // session's facts are re-read at the tick (leaf locks; the
@@ -600,6 +636,13 @@ impl App {
                     self.refresh_presence_session(session, false);
                 }
                 self.refresh_presence_window(wid);
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.presence.words_due = ws
+                        .presence
+                        .words
+                        .as_ref()
+                        .map(|words| now + words_step(words));
+                }
                 if self.windows.get(&wid).map(|ws| ws.presence.seed) != before
                     && !out.contains(&wid)
                 {
@@ -618,20 +661,26 @@ impl App {
         // The quiet frame answers before the tones are derived: the four
         // contrast-floored tones cost ~1.9 µs (measured, `adv8`), and every
         // composed frame of every window took it for a `None` (round 19's
-        // review, C1). A rim pays it; a quiet window pays the match.
-        if matches!(v.rim, Rim::None) {
+        // review, C1). A rim pays it; a quiet window pays the match. A
+        // running CHOICE PULSE is the one ripple a rim-less window paints.
+        let step = v.ripple_step(now);
+        let pulse = v.ripple_chose && step.is_some() && self.presence_rim_on;
+        if matches!(v.rim, Rim::None) && !pulse {
             return None;
         }
         let tones = crate::chrome_band::presence_tones(self.chrome_palette_theme());
         let (accent, mut wash_a, scale) = match v.rim {
-            Rim::None => return None,
+            Rim::None => (tones.story, 0u8, 16u8),
             Rim::Drive => (tones.drive, 0u8, 16u8),
             Rim::Wait => (tones.wait, 0, 16),
             Rim::Stop { hold: false } => (tones.stop, 0, 16),
             Rim::Stop { hold: true } => (tones.stop, HOLD_WASH_ALPHA, 32),
         };
+        // The pulse speaks in the story tone whatever rim it crosses: the
+        // rim's own colour returns with the steady frame after it.
+        let accent = if pulse { tones.story } else { accent };
         let mut border_a = RIM_BORDER_ALPHA;
-        if let Some(step) = v.ripple_step(now) {
+        if let Some(step) = step {
             // One edge flash, decaying over nine frames: the border to full and
             // a wash that fades out — the pixels change, the fact does not.
             border_a = 255;
@@ -937,8 +986,68 @@ impl App {
         for wid in &windows {
             self.refresh_presence_window(*wid);
         }
+        if verb == StoryVerb::Chose {
+            // The supervisor answered a question box without the human: a
+            // pulse on every window whose FRONT tab shows that session (a
+            // background tab has the story dot, and a rim flash would name
+            // the wrong tab), and one chime — bell-class, so it plays for a
+            // background tab too.
+            let fronts: Vec<WindowId> = self
+                .windows
+                .keys()
+                .copied()
+                .filter(|wid| self.focused_session_id(*wid) == Some(session))
+                .collect();
+            for wid in fronts {
+                self.start_presence_pulse(wid, now);
+            }
+            self.chose_chime(now);
+        }
         self.refresh_tab_chrome_windows(windows);
         Ok(seq)
+    }
+
+    /// THE CHOICE CHIME: one short, quiet pip (the output voice's `Shimmer`,
+    /// which every palette voices at a whisper) when the supervisor answers a
+    /// question box by policy. Gate order is load-bearing, as the bell's is
+    /// (`on_bell`): serious mode, then the Music effects master
+    /// (`trail_sounds` — the chime is a SYNTH voice, and the Sound box promises
+    /// that muting that master silences every synth voice; only the OS bell is
+    /// outside it), then `choice_sound`, then the rate limiter LAST —
+    /// `try_fire` consumes its token, so a muted chime must not spend it. No
+    /// focus test, unlike the trail's own cues: the point is to hear that a
+    /// background session's question was answered. The audio host is already
+    /// inert headless and in tests (`TrailAudio::new(false)`), and a zero
+    /// volume pushes nothing and spends no token.
+    pub(crate) fn chose_chime(&mut self, now: Instant) {
+        let allowed = chose_chime_allowed(
+            self.serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::TerminalSound),
+            self.config.trail_sounds_or_default(),
+            self.config.choice_sound_or_default(),
+        );
+        // A zero volume is a mute too, so it is read before the token as well.
+        let gain = self.config.trail_sound_volume();
+        if !allowed || gain <= 0.0 || !self.chose_chime_gate.try_fire(now) {
+            return;
+        }
+        self.trail_audio
+            .push(aterm_effects::trail_sound::SoundEvent {
+                style: self.glow_style(),
+                voice: self.config.trail_sound_voice(),
+                kind: aterm_effects::trail_sound::SoundGesture::Output(
+                    aterm_effects::trail_sound::OutputGesture::Shimmer,
+                ),
+                // Centred: a choice is about the session, not a column.
+                pan: 0.0,
+                heat: 0.0,
+                hue: 0.0,
+                gain,
+                shifted: false,
+                tone: aterm_effects::tone::Tone::Technical,
+                // Punctuation, not weather: never feeds the ambient bed.
+                bed: false,
+            });
     }
 
     /// Forget a retired session's slot, and every window's watermark for it.
@@ -947,6 +1056,29 @@ impl App {
         for ws in self.windows.values_mut() {
             ws.presence.watermarks.remove(&session);
         }
+    }
+}
+
+/// Whether the choice chime may speak at all, before its rate limiter: serious
+/// mode allows terminal sound, the Music effects master is on, AND
+/// `choice_sound` is on. Pure, so the gate is testable where the audio host is
+/// inert.
+pub(crate) const fn chose_chime_allowed(
+    serious_allows_sound: bool,
+    music_effects: bool,
+    choice_sound: bool,
+) -> bool {
+    serious_allows_sound && music_effects && choice_sound
+}
+
+/// How often a row's words move: every second while any `since` clause
+/// prints SECONDS (`12s`, `3m12s`, `since 3m12s`, `held 1m00s, resumed 40s
+/// ago`), once a minute when it prints only minutes, hours or days.
+fn words_step(words: &crate::presence::Words) -> Duration {
+    if words.since.iter().any(|c| prints_seconds(c)) {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(60)
     }
 }
 
@@ -2105,6 +2237,8 @@ mod tests {
             let ws = app.windows.get_mut(&wid).unwrap();
             ws.presence.words = Some(w);
             ws.presence.rows = 1;
+            ws.band_on_screen_for_test = true;
+            ws.presence.words_due = Some(now + words_step(ws.presence.words.as_ref().unwrap()));
         }
         let d = app.presence_deadline(now).expect("a row is up");
         assert!(
@@ -2119,6 +2253,104 @@ mod tests {
         assert!(!prints_seconds("1d 22h"));
         assert!(!prints_seconds("3 turns"));
         assert!(!prints_seconds("\u{2192} 19:30"));
+    }
+
+    /// THE WORDS KEEP THEIR OWN CLOCK (audit 2026-09-24): another owner's
+    /// wake before the words are due recomposes nothing, and a band nobody
+    /// can see — occluded, minimized, headless — arms no text tick at all.
+    #[test]
+    fn the_since_tick_keeps_its_own_clock_and_skips_a_hidden_band() {
+        let (mut app, wid, _sid, _ctx) = app_with_stub();
+        let now = Instant::now();
+        let w = driven_words(now);
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.presence.words = Some(w.clone());
+            ws.presence.rows = 1;
+            ws.band_on_screen_for_test = true;
+        }
+        assert_eq!(
+            app.presence_deadline(now),
+            Some(now),
+            "a row not yet ticked is due at once"
+        );
+        app.windows.get_mut(&wid).unwrap().presence.words_due = Some(now + Duration::from_secs(1));
+        // A wake at 30 fps (the band's motion) before the figure moves.
+        for ms in [33, 66, 99] {
+            assert!(
+                app.presence_tick(now + Duration::from_millis(ms))
+                    .is_empty()
+            );
+        }
+        let ws = app.windows.get(&wid).unwrap();
+        assert_eq!(ws.presence.words.as_ref(), Some(&w), "nothing recomposed");
+        assert_eq!(ws.presence.words_due, Some(now + Duration::from_secs(1)));
+        // Hidden: the text tick is no wake.
+        app.windows.get_mut(&wid).unwrap().occluded = true;
+        assert_eq!(
+            app.presence_deadline(now),
+            None,
+            "a hidden band arms nothing"
+        );
+        app.windows.get_mut(&wid).unwrap().occluded = false;
+        assert_eq!(
+            app.presence_deadline(now),
+            Some(now + Duration::from_secs(1)),
+            "revealed, it arms again"
+        );
+    }
+
+    /// Review 2026-09-24: words that change OUTSIDE the tick (a wake, a tab
+    /// switch) re-arm their clock — a minutes row's +60 s due must not freeze
+    /// the seconds row that replaced it.
+    #[test]
+    fn new_words_from_a_wake_rearm_their_own_clock() {
+        let (mut app, wid, sid, _ctx) = app_with_stub();
+        let then = Instant::now() - Duration::from_secs(192);
+        let mut slot = Slot::new(then);
+        slot.absorb(
+            Facts {
+                role: Some("worker:claude-satcomp".into()),
+                agent_seq: 1,
+                agent: agent(AgentPhase::Busy, Some(41)),
+                hand: Hand::DrivenTurn {
+                    id: 41,
+                    holder: Some("manager".into()),
+                },
+                ..Facts::default()
+            },
+            then,
+        );
+        app.presence.slots.insert(sid, slot);
+        let now = Instant::now();
+        let minutes = presence::Words {
+            since: vec!["2h05m".into()],
+            ..presence::Words::default()
+        };
+        assert_eq!(words_step(&minutes), Duration::from_secs(60));
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.presence.words = Some(minutes);
+            ws.presence.rows = 1;
+            ws.band_on_screen_for_test = true;
+            ws.presence.words_due = Some(now + Duration::from_secs(60));
+        }
+        app.refresh_presence_window(wid);
+        let ws = app.windows.get(&wid).unwrap();
+        let words = ws.presence.words.as_ref().expect("a busy row");
+        assert!(
+            words.since.iter().any(|c| prints_seconds(c)),
+            "the wake's words print seconds: {:?}",
+            words.since
+        );
+        let due = ws.presence.words_due.expect("armed");
+        assert!(
+            due <= Instant::now() + Duration::from_secs(1),
+            "the seconds row is due within a second, not at the minutes row's +{:?}",
+            due.saturating_duration_since(now)
+        );
+        let d = app.presence_deadline(now).expect("a row is up");
+        assert!(d <= Instant::now() + Duration::from_secs(1));
     }
 
     /// R6: the limited figure counts DOWN to the reset (design §1, the mock),
@@ -2445,6 +2677,8 @@ mod tests {
             Some(9)
         ));
         assert_eq!(crate::fabric::fabric_state(), "connected");
+        // The belt runs at the words' own clock, for a band on screen.
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
         let now = Instant::now();
         for _ in 0..3 {
             if let Some(d) = app.presence_deadline(now) {
@@ -3113,5 +3347,252 @@ mod tests {
             app.presence_status_tail(sid_a)
         );
         let _ = ia;
+    }
+
+    /// The chime's gate is a conjunction: serious mode allowing sound, the Music
+    /// effects master, and `choice_sound` — any one off is silence.
+    #[test]
+    fn the_choice_chime_speaks_only_when_every_gate_is_open() {
+        for serious in [false, true] {
+            for music in [false, true] {
+                for choice in [false, true] {
+                    assert_eq!(
+                        super::chose_chime_allowed(serious, music, choice),
+                        serious && music && choice,
+                        "serious={serious} music={music} choice={choice}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `ctl story chose <policy>` plays ONE chime — the output voice's
+    /// `Shimmer`, centred, at the synth volume, never feeding the bed — and a
+    /// second choice inside the two-second floor plays none. A story that is
+    /// not a choice plays nothing.
+    #[test]
+    fn a_chose_story_plays_one_shimmer_chime_under_its_rate_limit() {
+        crate::fabric::with_link_reset(
+            a_chose_story_plays_one_shimmer_chime_under_its_rate_limit_body,
+        );
+    }
+
+    fn a_chose_story_plays_one_shimmer_chime_under_its_rate_limit_body() {
+        use aterm_effects::trail_sound::{OutputGesture, SoundGesture};
+        let (mut app, _wid, sid, _ctx) = app_with_stub();
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        assert!(app.tell_story(sid, StoryVerb::Approval, "").is_ok());
+        assert!(
+            app.trail_audio.take_captured_for_test().is_empty(),
+            "an approval is no choice: no chime"
+        );
+        assert!(app.tell_story(sid, StoryVerb::Chose, "recommended").is_ok());
+        let pushed = app.trail_audio.take_captured_for_test();
+        assert_eq!(pushed.len(), 1, "one chime");
+        let chime = &pushed[0];
+        assert!(
+            matches!(chime.kind, SoundGesture::Output(OutputGesture::Shimmer)),
+            "the whisper-level output pip"
+        );
+        assert!(!chime.bed && chime.pan == 0.0);
+        assert!(
+            (chime.gain - app.config.trail_sound_volume()).abs() < f32::EPSILON,
+            "scaled by the synth volume"
+        );
+        assert!(app.tell_story(sid, StoryVerb::Chose, "recommended").is_ok());
+        assert!(
+            app.trail_audio.take_captured_for_test().is_empty(),
+            "a second choice inside the floor is not a cascade"
+        );
+    }
+
+    /// A muted chime never spends the limiter's token (the bell's gate-order
+    /// law): with `choice_sound = false`, with the Music effects master off, at
+    /// zero volume, or in serious mode, a `chose` story plays nothing AND leaves the
+    /// two-second token in place for the next chime that may speak.
+    #[test]
+    fn a_muted_choice_chime_does_not_spend_its_rate_limit() {
+        crate::fabric::with_link_reset(a_muted_choice_chime_does_not_spend_its_rate_limit_body);
+    }
+
+    fn a_muted_choice_chime_does_not_spend_its_rate_limit_body() {
+        for mute in 0..4 {
+            let (mut app, _wid, sid, _ctx) = app_with_stub();
+            app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+            match mute {
+                0 => app.config.choice_sound = Some(false),
+                1 => app.config.trail_sounds = Some(false),
+                2 => app.config.trail_sound_volume = Some(0.0),
+                _ => app.serious_mode = true,
+            }
+            assert!(app.tell_story(sid, StoryVerb::Chose, "recommended").is_ok());
+            assert!(
+                app.trail_audio.take_captured_for_test().is_empty(),
+                "muted ({mute}) plays nothing"
+            );
+            assert!(
+                app.chose_chime_gate.try_fire(Instant::now()),
+                "the muted chime ({mute}) left its token unspent"
+            );
+        }
+    }
+
+    /// `ctl story chose <policy>`: the band tells it with its own glyph and the
+    /// spoken sentence names the HARNESS, not a watcher; the quiet summary
+    /// counts it as a choice, apart from approvals; any pulse it starts is a
+    /// choice pulse.
+    #[test]
+    fn a_chose_story_is_told_by_the_harness_with_its_own_glyph() {
+        crate::fabric::with_link_reset(
+            a_chose_story_is_told_by_the_harness_with_its_own_glyph_body,
+        );
+    }
+
+    fn a_chose_story_is_told_by_the_harness_with_its_own_glyph_body() {
+        let (mut app, wid, sid, _ctx) = app_with_stub();
+        assert_eq!(app.tell_story(sid, StoryVerb::Chose, "recommended"), Ok(1));
+        let (text, rim) = line(&app, wid);
+        assert!(text.contains("\u{25c6} chose"), "{text}");
+        assert!(text.contains("recommended"), "{text}");
+        assert_eq!(rim, "none", "a story has no rim");
+        let chrome = app.presence_chrome_line();
+        assert!(
+            chrome.ends_with(" sentence=\"chose by harness, recommended\""),
+            "{chrome}"
+        );
+        let v = app.presence_view(wid).expect("a window");
+        assert_eq!(
+            v.ripple_chose,
+            v.ripple_at.is_some(),
+            "a pulse started by a choice is marked as one (and none starts under reduced motion)"
+        );
+        // An approval told the same way is still the WATCHER's.
+        assert_eq!(app.tell_story(sid, StoryVerb::Approval, ""), Ok(2));
+        assert!(
+            app.presence_chrome_line()
+                .ends_with(" sentence=\"approved by watcher\""),
+            "{}",
+            app.presence_chrome_line()
+        );
+    }
+
+    /// THE CHOICE PULSE paints on a window with NO rim — the one ripple a quiet
+    /// window shows — in the story tone, decays over the ripple's life, and
+    /// leaves nothing behind: the overlay is `None` after it and the tick
+    /// clears both the stamp and the mark. With the presence rim switched off
+    /// it paints nothing.
+    #[test]
+    fn the_choice_pulse_paints_on_a_rimless_window_and_then_goes_quiet() {
+        let (mut app, wid, _sid, _ctx) = app_with_stub();
+        let now = Instant::now();
+        assert!(app.presence_overlay(wid, now).is_none(), "quiet before");
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.presence.ripple_at = Some(now);
+            ws.presence.ripple_chose = true;
+        }
+        let tones = crate::chrome_band::presence_tones(app.chrome_palette_theme());
+        let first = app.presence_overlay(wid, now).expect("the pulse paints");
+        assert_eq!(first.accent, pack(tones.story), "the story tone");
+        assert_eq!(first.border_a, 255, "the edge flashes to full");
+        let late = app
+            .presence_overlay(wid, now + presence::RIPPLE - Duration::from_millis(1))
+            .expect("still running");
+        assert!(late.wash_a < first.wash_a, "the wash decays");
+        assert_ne!(app.presence_fp(wid, now), 0, "a running pulse repaints");
+        // The rim switched off: the pulse is a rim flash, so none is painted.
+        app.presence_rim_on = false;
+        assert!(
+            app.presence_overlay(wid, now).is_none(),
+            "rim off, no pulse"
+        );
+        app.presence_rim_on = true;
+        let after = now + presence::RIPPLE;
+        assert!(app.presence_overlay(wid, after).is_none(), "quiet after");
+        app.presence_tick(after);
+        let v = app.presence_view(wid).expect("window");
+        assert!(
+            v.ripple_at.is_none() && !v.ripple_chose,
+            "the tick retires it"
+        );
+        // A turn-submit ripple on a rim-less window still paints nothing: only
+        // a choice pulse is allowed past the quiet test.
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .presence
+            .ripple_at = Some(after);
+        assert!(app.presence_overlay(wid, after).is_none());
+    }
+
+    /// REVIEW FINDING [8]: the choice pulse is promised on EVERY window whose
+    /// front tab is the answered session — the window the person is not in
+    /// included. It was gated on the window's OS key focus like decorative
+    /// motion, so a background window got the chime and no pulse. NEGATIVE
+    /// CONTROLS: the turn-submit ripple on the same unfocused window still
+    /// does not start, and reduced motion still stops the pulse.
+    #[test]
+    fn a_choice_pulses_a_window_that_is_not_the_key_window() {
+        crate::fabric::with_link_reset(a_choice_pulses_a_window_that_is_not_the_key_window_body);
+    }
+
+    fn a_choice_pulses_a_window_that_is_not_the_key_window_body() {
+        let (mut app, wid, sid, _ctx) = app_with_stub();
+        app.system_reduce_motion = false;
+        app.windows.get_mut(&wid).expect("window").focused = false;
+        let now = Instant::now();
+        app.start_presence_ripple(wid, now);
+        assert!(
+            app.presence_view(wid)
+                .expect("a window")
+                .ripple_at
+                .is_none(),
+            "a turn-submit ripple stays still on an unfocused window"
+        );
+        assert!(app.tell_story(sid, StoryVerb::Chose, "recommended").is_ok());
+        let v = app.presence_view(wid).expect("a window");
+        assert!(
+            v.ripple_at.is_some() && v.ripple_chose,
+            "the choice pulse starts on a window that is not the key window"
+        );
+        // Reduced motion: none.
+        let (mut app, wid, sid, _ctx) = app_with_stub();
+        app.system_reduce_motion = true;
+        app.windows.get_mut(&wid).expect("window").focused = false;
+        assert!(app.tell_story(sid, StoryVerb::Chose, "recommended").is_ok());
+        assert!(
+            app.presence_view(wid)
+                .expect("a window")
+                .ripple_at
+                .is_none(),
+            "reduced motion stops the pulse"
+        );
+    }
+
+    /// A window that holds the answered session only in a BACKGROUND tab gets
+    /// no rim pulse — the flash would name the wrong tab — though the chime
+    /// still plays (bell-class: the point is to hear a background answer).
+    #[test]
+    fn a_background_tab_choice_pulses_no_rim() {
+        crate::fabric::with_link_reset(a_background_tab_choice_pulses_no_rim_body);
+    }
+
+    fn a_background_tab_choice_pulses_no_rim_body() {
+        let (mut app, wid, sid, _ctx) = app_with_stub();
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        let other = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(other));
+        assert_ne!(app.focused_session_id(wid), Some(sid), "sid is now behind");
+        assert!(app.tell_story(sid, StoryVerb::Chose, "recommended").is_ok());
+        let v = app.presence_view(wid).expect("a window");
+        assert!(
+            v.ripple_at.is_none() && !v.ripple_chose,
+            "no rim for a background tab"
+        );
+        assert_eq!(
+            app.trail_audio.take_captured_for_test().len(),
+            1,
+            "the chime plays for a background tab"
+        );
     }
 }

@@ -22,6 +22,10 @@
 //! 3. **Flip-all** — only once every member staged, flip each. If a flip fails partway,
 //!    **roll back** the already-flipped members and abort.
 //!
+//! Between 2 and 3, [`transact_holding`] asks a HOLD once: an unattended pass whose group
+//! holds the Trust toolchain flips nothing while that toolchain is in use
+//! ([`TxnOutcome::Deferred`], [`crate::quiet`]).
+//!
 //! The production adapter wires stage = download + [`crate::install::verify_and_stage`],
 //! flip = [`crate::activate::activate_channel`] + [`crate::activate::install_shims`], and
 //! rollback = re-point to the retained previous build.
@@ -108,6 +112,19 @@ pub enum TxnOutcome {
         build: u64,
         triple: String,
     },
+    /// The group holds the Trust toolchain and its FLIP WAITS FOR QUIET ([`crate::quiet`]):
+    /// an unattended pass found the toolchain it would supersede in use — leased by a run,
+    /// run from, or not known — so the listed members' new builds were STAGED (their signed
+    /// archives downloaded and checked, or their trees extracted and then set aside when a
+    /// build started during the extract) and NOTHING was flipped. `why` is what was using
+    /// it; `since` is when this wait began, what the four-hour ceiling counts from. Never
+    /// over a revoked build, and never on a person's pass. Built by [`crate::flow`]'s group
+    /// transaction, or by [`transact_holding`] through its hold.
+    Deferred {
+        members: Vec<String>,
+        why: String,
+        since: i64,
+    },
     /// A member failed; the whole group was aborted. `during_flip` distinguishes a
     /// stage-phase abort (nothing was flipped) from a flip-phase abort (already-flipped
     /// members were rolled back). `why` is the failing step's own sentence — until
@@ -128,6 +145,21 @@ pub enum TxnOutcome {
 pub fn transact(
     decisions: &[(String, ApplyDecision)],
     stage: &mut dyn FnMut(&str) -> Result<(), String>,
+    flip: &mut dyn FnMut(&str) -> bool,
+    rollback: &mut dyn FnMut(&str),
+) -> TxnOutcome {
+    transact_holding(decisions, stage, &mut || None, flip, rollback)
+}
+
+/// [`transact`] with a HOLD asked once, after every member staged and before the first
+/// flip: `Some((why, since))` ends the transaction [`TxnOutcome::Deferred`] with nothing
+/// flipped — the caller discards what it staged, as an abort does, and keeps the archives.
+/// Asked at the last moment on purpose: a build that started while the stage extracted a
+/// multi-gigabyte tree is seen ([`crate::quiet`]).
+pub fn transact_holding(
+    decisions: &[(String, ApplyDecision)],
+    stage: &mut dyn FnMut(&str) -> Result<(), String>,
+    hold: &mut dyn FnMut() -> Option<(String, i64)>,
     flip: &mut dyn FnMut(&str) -> bool,
     rollback: &mut dyn FnMut(&str),
 ) -> TxnOutcome {
@@ -163,7 +195,16 @@ pub fn transact(
         }
     }
 
-    // 4. Only after all staged: flip each. A flip failure rolls back the already-flipped.
+    // 4. The hold, once, between the last stage and the first flip.
+    if let Some((why, since)) = hold() {
+        return TxnOutcome::Deferred {
+            members: installs.into_iter().cloned().collect(),
+            why,
+            since,
+        };
+    }
+
+    // 5. Only after all staged: flip each. A flip failure rolls back the already-flipped.
     let mut flipped: Vec<&String> = Vec::new();
     for name in &installs {
         if flip(name) {
@@ -390,6 +431,66 @@ repo = "aterm"
             vec!["ay"],
             "the already-flipped member is rolled back"
         );
+    }
+
+    /// The hold is asked once, after the last stage and before the first flip; holding
+    /// flips nothing and names the members that were staged.
+    #[test]
+    fn a_hold_after_the_stage_flips_nothing() {
+        use std::cell::RefCell;
+        let decs = vec![
+            d("ay", ApplyDecision::UpToDate),
+            d("trust", ApplyDecision::Install),
+            d("trust-ir", ApplyDecision::Install),
+        ];
+        let order = RefCell::new(Vec::new());
+        let out = transact_holding(
+            &decs,
+            &mut |n| {
+                order.borrow_mut().push(format!("stage:{n}"));
+                Ok(())
+            },
+            &mut || {
+                order.borrow_mut().push("hold".to_string());
+                Some(("a build is running".to_string(), 7))
+            },
+            &mut |n| {
+                order.borrow_mut().push(format!("flip:{n}"));
+                true
+            },
+            &mut |_| {},
+        );
+        assert_eq!(
+            out,
+            TxnOutcome::Deferred {
+                members: vec!["trust".into(), "trust-ir".into()],
+                why: "a build is running".into(),
+                since: 7,
+            }
+        );
+        assert_eq!(
+            order.into_inner(),
+            ["stage:trust", "stage:trust-ir", "hold"],
+            "staged, asked once, flipped nothing"
+        );
+        // A hold that lets go flips as before; a tombstone never reaches the hold.
+        let out = transact_holding(
+            &decs,
+            &mut |_| Ok(()),
+            &mut || None,
+            &mut |_| true,
+            &mut |_| {},
+        );
+        assert!(matches!(out, TxnOutcome::Applied(_)));
+        let revoked = vec![d("trust", ApplyDecision::Tombstone)];
+        let out = transact_holding(
+            &revoked,
+            &mut |_| Ok(()),
+            &mut || panic!("a tombstoned group is never held"),
+            &mut |_| true,
+            &mut |_| {},
+        );
+        assert!(matches!(out, TxnOutcome::Tombstoned(_)));
     }
 
     #[test]

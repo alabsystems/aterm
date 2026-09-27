@@ -383,6 +383,7 @@ impl PetWorld {
         self.stamp
     }
     #[must_use]
+    #[cfg(test)]
     pub fn coverage(&self) -> PetPane {
         self.coverage
     }
@@ -501,8 +502,6 @@ impl PetWorld {
             rows,
             cols,
         };
-        self.cells.fill(PetCell::Unknown);
-        self.glyphs.fill(None);
         // A frame with no selection at all answers `false` for every cell (a
         // `TextSelection` in state `None` contains nothing, clipped or not), and
         // that is the overwhelmingly common frame. Ask once instead of walking
@@ -512,6 +511,13 @@ impl PetWorld {
             let local_r = self.coverage.row + r;
             let frame_r = pane.row + local_r;
             let Some(row) = input.cells.get(frame_r) else {
+                // Present rows overwrite every covered cell below, including
+                // their implicit blank tails. Only a missing row needs clearing;
+                // all readers are fenced by coverage, so untouched buffer space
+                // outside this observation cannot become stale geometry.
+                let start = r * MAX_WORLD_COLS;
+                self.cells[start..start + cols].fill(PetCell::Unknown);
+                self.glyphs[start..start + cols].fill(None);
                 continue;
             };
             // The row's sidecars, fetched once and walked with a cursor as the
@@ -930,18 +936,13 @@ impl PetWorld {
     /// Conservative swept rectangle: it can refuse a diagonal whose corners
     /// happen to be free, but cannot skip ink between sampled waypoints.
     #[must_use]
+    #[cfg(test)]
     pub fn corridor_clear(&self, from: PetRect, to: PetRect, margin: f32) -> bool {
         from.valid() && to.valid() && self.clear(from.union(to), margin)
     }
 
-    /// The same swept-body test for a resident travelling behind text.
-    #[must_use]
-    pub fn under_text_corridor_clear(&self, from: PetRect, to: PetRect, margin: f32) -> bool {
-        from.valid() && to.valid() && self.under_text_clear(from.union(to), margin)
-    }
-
-    /// [`Self::under_text_corridor_clear`] for a body LEAVING the caret's
-    /// escort seat.
+    /// The swept-body test for a resident travelling behind text, for a body
+    /// LEAVING the caret's escort seat.
     ///
     /// A swept corridor always contains the body it departs from, and
     /// [`STATION_LEAD`] seats the escort one cell past the caret — inside
@@ -1609,6 +1610,103 @@ mod tests {
             let rect = PetRect::new(1.0, 1.0, f32::from(rows) - 2.0, f32::from(cols) - 2.0);
             assert_eq!(world.clear(rect, 0.0), !ink);
             assert_eq!(world.under_text_clear(rect, 0.0), !ink);
+        }
+    }
+
+    #[test]
+    fn reused_observations_match_fresh_maps_after_coverage_changes() {
+        let mut reused = PetWorld::default();
+        // Seed the whole backing buffer with ink, shrink to blank, then move
+        // the bounded window across partially/wholly missing rows. A present
+        // sparse row is blank; an absent row must forget the previous ink.
+        // A refused observation must also hide every retained cell.
+        for (rows, cols, caret, present_rows, ink, coherent) in [
+            (64, 256, (0, 0), 64, true, true),
+            (8, 20, (0, 0), 8, false, true),
+            (100, 300, (99, 299), 50, true, true),
+            (100, 300, (0, 0), 0, false, true),
+            (57, 151, (0, 0), 57, false, true),
+            (12, 40, (0, 0), 12, true, false),
+            (64, 256, (63, 255), 64, false, true),
+        ] {
+            let mut term = Terminal::new(rows, cols);
+            if ink {
+                term.process(&vec![b'x'; usize::from(rows) * usize::from(cols)]);
+            }
+            term.process(format!("\x1b[{};{}H", caret.0 + 1, caret.1 + 1).as_bytes());
+            let (mut input, mut facts) = snapshot(&mut term);
+            if !ink {
+                for row in &mut input.cells {
+                    row.clear();
+                }
+            }
+            input.cells.truncate(present_rows);
+            if !coherent {
+                facts.stamp.content_seq = facts.stamp.content_seq.wrapping_add(1);
+            }
+            let pane = PetPane::full(&input);
+            let mut fresh = PetWorld::default();
+            assert_eq!(reused.observe(&input, &facts, pane), coherent);
+            assert_eq!(fresh.observe(&input, &facts, pane), coherent);
+            assert_eq!(reused.stamp(), fresh.stamp());
+            assert_eq!(reused.coverage(), fresh.coverage());
+            assert_eq!(reused.examined_cells(), fresh.examined_cells());
+            let anchor_state = |world: &PetWorld| {
+                world.anchors().map(|anchor| {
+                    anchor.map(|a| {
+                        (
+                            a.surface,
+                            a.block_id,
+                            a.absolute_row,
+                            a.row,
+                            a.col,
+                            a.state,
+                            a.exit_code,
+                        )
+                    })
+                })
+            };
+            assert_eq!(anchor_state(&reused), anchor_state(&fresh));
+            // Include the row/column immediately outside the pane as well as
+            // cells outside a sliding coverage window. Those must stay unknown
+            // even when their old backing slots still hold clear or ink cells.
+            for row in 0..=pane.rows {
+                for col in 0..=pane.cols {
+                    assert_eq!(
+                        (
+                            reused.cell(row, col),
+                            reused.ink_at(row, col),
+                            reused.locomotion_ink_at(row, col),
+                        ),
+                        (
+                            fresh.cell(row, col),
+                            fresh.ink_at(row, col),
+                            fresh.locomotion_ink_at(row, col),
+                        ),
+                        "{rows}x{cols}, present_rows={present_rows}, at ({row},{col})"
+                    );
+                    // Both prefix planes and caret forgiveness must agree for
+                    // individual cells and a body crossing several rows/columns.
+                    for (height, width) in [(1.0, 1.0), (3.0, 5.0)] {
+                        let rect = PetRect::new(row as f32, col as f32, height, width);
+                        assert_eq!(
+                            (
+                                reused.clearance(rect, 0.0),
+                                reused.under_text_clearance(rect, 0.0),
+                                reused.clearance_past_caret(rect, 0.0),
+                                reused.under_text_clearance_past_caret(rect, 0.0),
+                            ),
+                            (
+                                fresh.clearance(rect, 0.0),
+                                fresh.under_text_clearance(rect, 0.0),
+                                fresh.clearance_past_caret(rect, 0.0),
+                                fresh.under_text_clearance_past_caret(rect, 0.0),
+                            ),
+                            "{rows}x{cols}, present_rows={present_rows}, rect={rect:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

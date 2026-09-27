@@ -136,6 +136,29 @@ pub fn backends(px: f32, theme: Theme) -> Option<(Renderer, aterm_gpu::GpuRender
     Some(font_settled(cpu, gpu))
 }
 
+/// [`backends`], with BOTH renderers built on the font file at `font` — passed as
+/// the family, exactly the window's `--font` / `font_family` seam
+/// (`from_system_with_family`), so no environment variable is involved.
+pub fn backends_with_font(
+    font: &std::path::Path,
+    px: f32,
+    theme: Theme,
+) -> Option<(Renderer, aterm_gpu::GpuRenderer)> {
+    let family = font.to_str()?;
+    let gpu = match aterm_gpu::GpuRenderer::new_with_family(Some(family), px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return None;
+        }
+    };
+    let Some(cpu) = Renderer::from_system_with_family(Some(family), px, theme) else {
+        eprintln!("SKIP: {family} does not load");
+        return None;
+    };
+    Some(font_settled(cpu, gpu))
+}
+
 /// Block both renderers on their lazy fallback-chain parses, so every later
 /// render routes glyphs through a FINAL chain.
 ///

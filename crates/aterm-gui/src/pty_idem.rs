@@ -180,6 +180,7 @@ impl Realm {
     /// The namespace a connection's marks live in.
     pub(crate) fn of(scope: crate::control::Scope) -> Self {
         match scope {
+            #[cfg(any(unix, test))]
             crate::control::Scope::Bridge => Self::Bridge,
             crate::control::Scope::Owner | crate::control::Scope::Edge(_) => Self::Local,
         }

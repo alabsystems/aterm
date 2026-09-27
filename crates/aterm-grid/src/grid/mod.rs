@@ -14,6 +14,7 @@ mod construct;
 mod content_queries;
 mod cursor_ops;
 mod erase;
+mod history_carry;
 mod invariants;
 mod line_ops;
 mod pin_methods;
@@ -27,9 +28,6 @@ mod scroll_unscroll;
 mod scrollback_access;
 mod scrollback_offload;
 mod scrollback_reflow;
-// Disk cold-tier spill (mmap-backed); dropped on wasm (no libc/zstd-sys).
-#[cfg(feature = "disk-tier")]
-pub mod scrollback_budget;
 mod search_content;
 pub mod state;
 mod tab_ops;
@@ -61,11 +59,7 @@ mod proofs_kani_tabs;
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(test, feature = "testing"))]
-#[allow(
-    dead_code,
-    reason = "test-only grid write helpers; most callers are #[cfg(test)] only (#6799)"
-)]
+#[cfg(test)]
 mod write_test_helpers;
 
 // Re-export crate types visible to all grid submodules so moved files
@@ -103,6 +97,9 @@ pub(in crate::grid) use crate::test_counters::{
     take_row_to_line_cells, take_row_to_line_ops,
 };
 
+pub use history_carry::{
+    HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
+};
 pub(crate) use scroll_convert::ScrolledRowExtras;
 pub use scroll_materialize::{MaterializedRow, materialize_from_line};
 pub use scrollback_offload::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
@@ -111,7 +108,7 @@ pub use visible_row_view::{CellDataView, VisibleRowView};
 /// Convert i32 result to u16 after clamping to non-negative.
 ///
 /// Used for cursor math where we clamp to [0, max] range.
-#[cfg(any(test, feature = "fuzz", fuzzing, feature = "testing"))]
+#[cfg(any(test, feature = "fuzz", fuzzing))]
 #[inline]
 fn clamp_u16(val: i32) -> u16 {
     val.max(0).try_into().unwrap_or(u16::MAX)
@@ -152,17 +149,6 @@ impl Grid {
         self.storage.row_mut(visible_row)
     }
 
-    /// Get a contiguous slice of all cells in a row (#7861).
-    ///
-    /// Returns the row's backing `&[Cell]` slice in a single ring-buffer
-    /// lookup. Callers can iterate the slice directly, avoiding per-cell
-    /// bounds checks from `Row::get()`.
-    #[must_use]
-    #[inline]
-    pub fn row_cells_slice(&self, visible_row: u16) -> Option<&[Cell]> {
-        self.row(visible_row).map(Row::as_slice)
-    }
-
     /// Get a cell at the given position.
     #[must_use]
     pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
@@ -170,6 +156,7 @@ impl Grid {
     }
 
     /// Get a mutable cell at the given position.
+    #[cfg(test)]
     pub fn cell_mut(&mut self, row: u16, col: u16) -> Option<&mut Cell> {
         self.row_mut(row).and_then(|r| r.get_mut(col))
     }
@@ -185,12 +172,6 @@ impl Grid {
     pub fn is_wide_continuation_at(&self, row: u16, col: u16) -> bool {
         self.row(row)
             .is_some_and(|r| r.is_cell_wide_continuation(col))
-    }
-
-    /// Get a mutable row and its effective column count in a single ring-buffer lookup.
-    #[inline]
-    pub fn row_mut_with_effective_cols(&mut self, visible_row: u16) -> Option<(&mut Row, u16)> {
-        self.storage.row_mut_with_effective_cols(visible_row)
     }
 
     /// Set the BCE (Background Color Erase) cursor template cell.
@@ -209,12 +190,5 @@ impl Grid {
     pub fn set_cursor_template(&mut self, template: Cell, bg_rgb: Option<[u8; 3]>) {
         self.storage.cursor_template = template;
         self.storage.cursor_template_bg_rgb = bg_rgb;
-    }
-
-    /// Get the current BCE cursor template cell.
-    #[must_use]
-    #[inline]
-    pub fn cursor_template(&self) -> Cell {
-        self.storage.cursor_template
     }
 }

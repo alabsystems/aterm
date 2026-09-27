@@ -195,8 +195,7 @@ mod tests {
         // every assertion above (mutation-checked -- inserting
         // `if x != y { return false; }` into the fold leaves the whole suite
         // green) while leaking the first differing byte through timing. The
-        // property lives in the SHAPE of the code, so pin the source, the way
-        // `crates/xtask/src/gate.rs` pins the pre-push hook's markers.
+        // property lives in the SHAPE of the code, so pin the source.
         let src = include_str!("lib.rs");
         let body = src
             .split("pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {")

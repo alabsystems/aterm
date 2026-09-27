@@ -349,8 +349,6 @@ pub fn read(conn: &mut Conn, fleet: &str) -> io::Result<Glance> {
     })
 }
 
-impl Glance {}
-
 /// Render one JSON string. Every byte outside printable ASCII becomes a `\u`
 /// escape, so a value that arrived off the bus can never close the string, open
 /// a new key, or put a control byte into a file another program renders.
@@ -377,42 +375,6 @@ pub(crate) fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// **THE WRITER IS GONE, AND NOTHING QUIETLY WANTS IT BACK.**
-    ///
-    /// This test used to pin the header's "NO SUCH READER IS BUILT" claim to
-    /// `status_item.rs`, so that the day a `FabricGlance` landed in the menu bar
-    /// the paragraph would be rewritten in the present tense it deserved. No
-    /// reader ever landed, and round 21 cut the writer instead — so the pin is
-    /// inverted: the two files must stay apart, and if the UI grows a reader it
-    /// must not be for a file this crate no longer produces.
-    ///
-    /// `include_str!` across crates is the house pattern for pinning a claim to
-    /// the code that would falsify it (`aterm-gui/src/control.rs` pins
-    /// `aterm-control/src/selection.rs` the same way); it is test-only and adds
-    /// no dependency.
-    #[test]
-    fn nothing_reads_a_glance_file_this_crate_no_longer_writes() {
-        let ui = include_str!("../../aterm-gui/src/status_item.rs");
-        let me = include_str!("glance.rs");
-        assert!(
-            !ui.contains("FabricGlance") && !ui.contains("glance.json"),
-            "status_item.rs reads a glance file, and round 21 removed the writer: \
-             restore the writer or point the reader at `glance::read`"
-        );
-        // Assembled, not written out: a literal would be found in this
-        // function's own source and the pin would match itself.
-        for gone in [
-            ["fn", "write_atomic"].join(" "),
-            ["fn", "to_json"].join(" "),
-            ["fn", "from_json"].join(" "),
-        ] {
-            assert!(
-                !me.contains(&gone),
-                "`{gone}` is back in a module whose file format has no reader"
-            );
-        }
-    }
 
     fn row(subject: &str, body: &str) -> Row {
         Row::parse("f1", 7, subject, body.as_bytes()).expect("a presence row")

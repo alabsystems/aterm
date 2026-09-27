@@ -6,7 +6,7 @@
 //! …fish`, the dot-source for pwsh — is in the dialect of the shell it is typed into.
 //!
 //! `$SHELL` is the LOGIN shell, not the one in front of the user: aterm spawns the
-//! configured `shell` (`ATERM_SHELL`, the config key) without re-pointing `$SHELL`, so a
+//! configured `shell` (`--shell`, the config key) without re-pointing `$SHELL`, so a
 //! fish tab on a zsh-login machine used to be told `. ~/.aterm/shell.d/00-atpkg.zsh` "here
 //! picks the managed copy up" — a line fish cannot source (`${__atpkg_p//…}` is not fish)
 //! — while the window's status row, keyed on the spawn shell, said the fish line in the
@@ -102,6 +102,7 @@ fn parent_exe_name() -> Option<String> {
 /// suffix comes off the basename. `comm` remains the fallback only because it is
 /// world-readable where the link is not (`/proc/1/exe` is `EACCES` for a non-root reader).
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -160,11 +161,13 @@ fn exe_name_of_procargs2(buf: &[u8]) -> Option<String> {
 }
 
 /// The bytes of the native-endian `c_int` argc a `KERN_PROCARGS2` buffer leads with.
+#[cfg(any(target_os = "macos", test))]
 const PROCARGS2_ARGC_BYTES: usize = 4;
 
 /// The exec path a `KERN_PROCARGS2` buffer leads with: the first NUL-terminated string
 /// after the argc, which this does not read. `None` when there is no NUL or the path is
 /// not UTF-8.
+#[cfg(any(target_os = "macos", test))]
 fn procargs2_exec_path(buf: &[u8]) -> Option<&str> {
     let rest = buf.get(PROCARGS2_ARGC_BYTES..)?;
     let end = rest.iter().position(|&b| b == 0)?;
@@ -254,6 +257,7 @@ fn split_nul_list(bytes: &[u8]) -> Vec<String> {
 /// NUL-terminated `KEY=value` strings until an empty string or the end. Pure, so the
 /// layout is tested on built buffers as well as on a live read.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
     let argc = i32::from_ne_bytes(buf.get(..PROCARGS2_ARGC_BYTES)?.try_into().ok()?);
     let exec_path = procargs2_exec_path(buf)?.to_string();
@@ -583,7 +587,9 @@ mod tests {
 
     /// The env that puts the copy above into its waiting mode, and the name of the case it
     /// runs there: one test, so the copy does nothing but park until it is killed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const OUTLIVER_ENV: &str = "ATPKG_CALLER_SHELL_OUTLIVER";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const OUTLIVER_PROBE: &str = "caller_shell::tests::probe_parks_until_killed";
 
     /// The copy's whole job: exist, under its own name, until the parent kills it.
@@ -671,6 +677,7 @@ mod tests {
 
     /// The probe half of the test above: printed by the SAME test function when run as
     /// the child, so the harness needs no extra binary.
+    #[cfg(unix)]
     const PROBE_ENV: &str = "ATPKG_CALLER_SHELL_PROBE";
 
     #[cfg(unix)]

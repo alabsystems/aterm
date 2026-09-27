@@ -43,6 +43,9 @@ const MAX_SOCK_PATH: usize = 100;
 /// exit path (Drop runs on panic too).
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: String,
@@ -106,14 +109,15 @@ fn boot(tag: &str) -> Option<Instance> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
+        .args(launch_isolation::control_sock(&tmp))
         // Wide enough that the fixture's longest row (the 529 notice) is
         // not wrapped by the terminal: Claude Code lays out its own rows, so
         // a terminal wrap to column 0 is not a shape it draws.
-        .env("ATERM_COLUMNS", "200")
+        .args(["--lines", "40", "--columns", "200"])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -125,6 +129,7 @@ fn boot(tag: &str) -> Option<Instance> {
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,

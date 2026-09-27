@@ -598,7 +598,7 @@ impl Terminal {
     /// The column-aligned text of ONE WINDOW of a logical line: rows `first..=last`,
     /// which the caller has already clamped to the line's own span.
     ///
-    /// Same alignment contract as [`Self::logical_line_text`] — every row but the last
+    /// Same alignment contract as `Self::logical_line_text` — every row but the last
     /// contributes exactly `cols` columns — so the same `g / cols`, `g % cols` arithmetic
     /// maps a column of the result back to a cell, relative to `first`.
     ///
@@ -662,6 +662,7 @@ impl Terminal {
     /// `None` only when `row` addresses no line at all (the same condition
     /// [`Self::get_line_text`] returns `None` for).
     #[must_use]
+    #[cfg(test)]
     pub fn logical_line_text(&self, row: i32) -> Option<(String, i32, i32)> {
         let own = self.get_line_text(row, None)?;
         let (first, last) = self.logical_line_span(row);

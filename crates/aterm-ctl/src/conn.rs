@@ -154,13 +154,7 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         return print_usage();
     }
     let self_sid = env::var(super::SELF_SID_ENV).ok().filter(|s| !s.is_empty());
-    let (path, origin) = super::resolve_target(
-        sock,
-        pid,
-        env::var(super::SOCK_ENV).ok(),
-        env::var(super::NO_SOCK_ENV).ok(),
-        self_sid.clone(),
-    )?;
+    let (path, origin) = super::resolve_target(sock, pid, self_sid.clone())?;
     let wire = ConnWire { path, origin };
     match rest.first().map(String::as_str) {
         None => cmd_status(&wire, self_sid.as_deref()),
@@ -190,9 +184,8 @@ fn print_usage() -> io::Result<ExitCode> {
 /// One resolved control-socket target the subverbs frame their requests on.
 struct ConnWire {
     path: String,
-    /// How `path` was chosen — `--sock`/`--pid`/an explicit
-    /// `$ATERM_CONTROL_SOCK` pin it — which decides what a connect failure on
-    /// it may offer instead (`super::connect_error`).
+    /// How `path` was chosen — `--sock`/`--pid` pin it — which decides what a
+    /// connect failure on it may offer instead (`super::connect_error`).
     origin: super::TargetOrigin,
 }
 
@@ -1206,20 +1199,14 @@ mod tests {
         );
     }
 
-    /// The help page carries the §6.1 contract surfaces: every subverb, the
-    /// selector rule, and the ready-to-paste `aterm ctl … turn` drive hint.
+    /// The help page documents every subverb the dispatch completes
+    /// (`CONN_SUBVERBS` is the completion table, so a new subverb fails here
+    /// until the page names it).
     #[test]
-    fn usage_text_names_subverbs_selectors_and_the_drive_hint() {
+    fn usage_documents_every_subverb() {
         for sub in CONN_SUBVERBS.split_whitespace() {
             assert!(CONN_USAGE.contains(sub), "usage must document `{sub}`");
         }
-        assert!(CONN_USAGE.contains("@self"));
-        assert!(CONN_USAGE.contains("ATERM_PARENT_SESSION_ID"));
-        assert!(CONN_USAGE.contains("Titles are NOT selectors"));
-        assert!(
-            CONN_USAGE.contains("aterm ctl @<sid> turn"),
-            "the drive hint must be ready to paste"
-        );
     }
 
     /// The fish completion offers the conn subverbs on the FRONT DOOR script

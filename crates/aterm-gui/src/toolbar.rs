@@ -105,24 +105,23 @@
 //! [`install_window_toolbar`] / [`set_window_tabs`] and a unit [`ToolbarHandle`]
 //! keep the workspace building everywhere, exactly like `menu.rs`.
 
-// macOS-only window chrome: on Linux the install/handle/chrome helpers are no-op
-// stubs and intentionally unused there.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// macOS-only window chrome: off macOS the install/handle/chrome helpers are
+// no-op stubs, and the label/cell helpers only AppKit reads are gated to macOS
+// (and the tests).
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::native_strip_container;
 #[cfg(target_os = "macos")]
-pub use macos::{
+pub(crate) use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
-    install_window_toolbar, read_tab_chrome, read_tab_menus, rename_editor_edit,
-    rename_editor_text, set_active_tab_color, set_strip_dark, set_update_available,
-    set_window_tabs,
+    install_window_toolbar, read_tab_chrome, read_tab_menus, reflow_window_tabs,
+    rename_editor_edit, rename_editor_text, set_active_tab_color, set_strip_dark, set_window_tabs,
 };
 
 #[cfg(not(target_os = "macos"))]
-pub use non_macos::{
+pub(crate) use non_macos::{
     ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_active_tab_color,
-    set_strip_dark, set_update_available, set_window_tabs,
+    set_strip_dark, set_window_tabs,
 };
 
 use crate::tab_bar::TabStripMetadata;
@@ -252,6 +251,7 @@ pub(crate) fn format_tab_chrome(
 
 /// Route-aware hover/help text, augmented with state that must never be visual-only.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 fn tab_help(
     title: &str,
     tooltip: Option<&str>,
@@ -292,6 +292,7 @@ fn tab_help(
 }
 
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 fn tab_display_label(title: &str, index: usize, available_width: f64) -> String {
     // The shortcut remains in hover help and accessibility at every size. Render it
     // inline only when doing so cannot steal the canonical tab identity. This estimate
@@ -306,13 +307,16 @@ fn tab_display_label(title: &str, index: usize, available_width: f64) -> String 
 }
 
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 fn tab_close_accessibility_label(title: &str) -> String {
     format!("Close {title} Tab")
 }
 
 // Below 64 pt, equal two-tab cells cannot preserve the measured 55 pt active
 // "Settings" identity after gutters. Enter the active-priority layout first.
+#[cfg(any(target_os = "macos", test))]
 const PREFERRED_MIN_TAB_WIDTH: f64 = 64.0;
+#[cfg(any(target_os = "macos", test))]
 const TAB_CELL_GUTTER: f64 = 1.0;
 
 /// Lay out a native tab band without ever overlapping the trailing New Tab action.
@@ -327,6 +331,7 @@ const TAB_CELL_GUTTER: f64 = 1.0;
 /// the selected identity gets the useful share and inactive tabs compress while
 /// remaining ordered/reachable.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f64)> {
     if count == 0 {
         return Vec::new();
@@ -634,7 +639,7 @@ mod shared_tests {
 /// of what the active tab's title is.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
-pub fn format_window_title(titles: &[String], active: usize) -> Option<String> {
+pub(crate) fn format_window_title(titles: &[String], active: usize) -> Option<String> {
     let n = titles.len();
     if n == 0 {
         return None;
@@ -698,25 +703,12 @@ mod non_macos {
     /// What [`install_window_toolbar`] returns off macOS: a REAL handle wrapping the
     /// interior-mutable [`TabChrome`] model (so [`set_window_tabs`] can update it
     /// through the shared `&self` the seam hands out, exactly like the macOS handle's
-    /// `RefCell<Vec<TabView>>`) plus the window's [`WindowId`] and the `Wake` proxy
-    /// the future header bar's affordances would relay through. `App` keeps it in its
-    /// `_toolbars` map for the window's life, identical to the macOS path.
-    pub struct ToolbarHandle {
+    /// `RefCell<Vec<TabView>>`). `App` keeps it in its `_toolbars` map for the
+    /// window's life, identical to the macOS path.
+    pub(crate) struct ToolbarHandle {
         /// The live tab-chrome model — updated by [`set_window_tabs`], read by
         /// [`read_tab_chrome`]. `RefCell` because the seam exposes only `&self`.
         chrome: RefCell<TabChrome>,
-        /// The window this chrome belongs to, kept so a future header bar addresses
-        /// the RIGHT window's tab affordances (the macOS handle holds it for the same
-        /// reason). Not yet read on Linux — there is no native control to drive — so
-        /// allow it to be dead until the GTK4 header bar lands.
-        #[allow(dead_code)]
-        window: WindowId,
-        /// The `Wake` channel a future header bar's tab clicks / "+" button would
-        /// relay through (select / close / new-tab), mirroring the macOS handle's
-        /// retained targets. Held now so the seam already owns everything a real
-        /// control needs; unused until that control exists.
-        #[allow(dead_code)]
-        proxy: EventLoopProxy<Wake>,
     }
 
     /// Install the non-macOS window "toolbar": there is no native control to attach,
@@ -734,11 +726,12 @@ mod non_macos {
     /// libraries** (`libgtk-4-dev` / `gtk4` pkg-config) and a `gtk4`/`glib` crate
     /// dependency, NONE of which are available on the macOS build host — so it is
     /// intentionally NOT built here. The seam (this handle + model) is the buildable
-    /// scaffolding that header bar slots behind without touching `App`.
-    pub fn install_window_toolbar(
+    /// scaffolding that header bar slots behind without touching `App`; `_proxy`
+    /// and `_wid` are the one uniform seam signature the macOS strip reads.
+    pub(crate) fn install_window_toolbar(
         window: &Window,
-        proxy: &EventLoopProxy<Wake>,
-        wid: WindowId,
+        _proxy: &EventLoopProxy<Wake>,
+        _wid: WindowId,
     ) -> Option<ToolbarHandle> {
         // Seed the title from the initial (empty) model. A fresh window has no synced
         // tabs yet, so `format_window_title` yields `None` and we fall back to the
@@ -748,8 +741,6 @@ mod non_macos {
         window.set_title(&title);
         Some(ToolbarHandle {
             chrome: RefCell::new(TabChrome::default()),
-            window: wid,
-            proxy: proxy.clone(),
         })
     }
 
@@ -767,7 +758,7 @@ mod non_macos {
     /// there is no native context menu to capture them at pop time — but part of
     /// the one uniform seam signature; the future header bar's right-click path
     /// would snapshot the clicked chip's id exactly like the macOS strip does.
-    pub fn set_window_tabs(
+    pub(crate) fn set_window_tabs(
         handle: &ToolbarHandle,
         titles: &[String],
         _ids: &[crate::tab_model::TabId],
@@ -794,7 +785,7 @@ mod non_macos {
     /// this through `AppRt::read_toolbar_chrome`, so automation sees this live model
     /// on every supported host even before Linux grows a native header-bar widget.
     #[must_use]
-    pub fn read_tab_chrome(handle: &ToolbarHandle) -> Option<String> {
+    pub(crate) fn read_tab_chrome(handle: &ToolbarHandle) -> Option<String> {
         let chrome = handle.chrome.borrow();
         format_tab_chrome(
             &chrome.titles,
@@ -811,7 +802,7 @@ mod non_macos {
     /// `session_chrome::tab_menu_chrome_line`, so the Linux `chrome` mirror is
     /// byte-shaped like the macOS live-strip read.
     #[must_use]
-    pub fn read_tab_menus(handle: &ToolbarHandle) -> Vec<String> {
+    pub(crate) fn read_tab_menus(handle: &ToolbarHandle) -> Vec<String> {
         let chrome = handle.chrome.borrow();
         if !super::tab_menu_introspection_visible(chrome.titles.len()) {
             return Vec::new();
@@ -824,21 +815,14 @@ mod non_macos {
             .collect()
     }
 
-    /// Off macOS the ↻ Software-Update affordance has no native control yet (it lands
-    /// with the deferred GTK4 header bar — see [`install_window_toolbar`]), so toggling
-    /// its REST/ALERT state is a no-op. Kept so the cross-platform `AppRt` seam
-    /// (`set_toolbar_update_available`) has one uniform signature everywhere.
-    #[allow(dead_code)]
-    pub fn set_update_available(_handle: &ToolbarHandle, _available: bool) {}
-
     /// Off macOS there is no native strip (and no `NSAppearance`), so pinning the
-    /// strip's light/dark appearance to the theme is a no-op. Same one-uniform-
-    /// signature rationale as [`set_update_available`].
-    pub fn set_strip_dark(_handle: &ToolbarHandle, _dark: bool) {}
+    /// strip's light/dark appearance to the theme is a no-op, kept so the
+    /// cross-platform `AppRt` seam has one uniform signature everywhere.
+    pub(crate) fn set_strip_dark(_handle: &ToolbarHandle, _dark: bool) {}
 
     /// Off macOS there is no native strip; the selected-tab color override is
     /// carried by the in-grid strip instead (`tab_bar::strip_colors_with_active`).
-    pub fn set_active_tab_color(_handle: &ToolbarHandle, _color: Option<[u8; 3]>) {}
+    pub(crate) fn set_active_tab_color(_handle: &ToolbarHandle, _color: Option<[u8; 3]>) {}
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -1328,7 +1312,26 @@ mod macos {
         window_center_x: f64,
     }
 
+    /// [`plan_strip`]'s answer: every chip's cell plus the measurements its content
+    /// is placed against.
+    struct StripPlan {
+        cells: Vec<(f64, f64)>,
+        metrics: StripMetrics,
+        strip_h: f64,
+    }
+
     impl StripMetrics {
+        /// The content geometry of chip `index` of `n` whose cell starts at `cell_x`:
+        /// ONE tab is the window's title, not a switcher.
+        fn geometry(&self, index: usize, n: usize, active: usize, cell_x: f64) -> TabGeometry {
+            TabGeometry {
+                center_y: self.center_y,
+                solo: n == 1,
+                solo_center_x: self.window_center_x - cell_x,
+                separator: TabGeometry::separates(index, active),
+            }
+        }
+
         /// The geometry a container with no reachable window falls back to: its own
         /// centre, no measured lights.
         ///
@@ -1421,7 +1424,7 @@ mod macos {
     /// What [`install_window_toolbar`] returns: the retained backing objects. AppKit
     /// references a toolbar item's view and a toolbar's delegate only WEAKLY, so they
     /// must outlive the window — `App` holds this in a field.
-    pub struct ToolbarHandle {
+    pub(crate) struct ToolbarHandle {
         /// The `NSToolbarDelegate` that vends the strip's single custom-view item. The
         /// toolbar references its delegate only weakly, so retain it here.
         _delegate: aterm_objc::Retained<ToolbarDelegate>,
@@ -2030,6 +2033,13 @@ mod macos {
         /// decode against that SAME snapshot — an index into the live model
         /// could name a different peer.
         menu_conn: RefCell<Vec<(aterm_session::SessionId, ConnVerb)>>,
+        /// The AGENT UPGRADE rows of that same pop-time snapshot (gap #21),
+        /// in encounter order: the session and the build each row named and
+        /// its word — what a `tabMenuUpgrade:` click decodes its item `tag`
+        /// against, so a click after a mid-track refresh still names the
+        /// pane and the build the owner saw (the harness refuses it if the
+        /// upgrade has moved on).
+        menu_upgrade: RefCell<Vec<(String, String, aterm_messages::UpgradeWord)>>,
     }
 
     aterm_objc::declare_class! {
@@ -2546,6 +2556,35 @@ mod macos {
                     verb,
                 });
             }
+
+            /// `tabMenuUpgrade:` — the action wired to every AGENT UPGRADE
+            /// row of this tab's context menu (gap #21). The item's `tag` is
+            /// an INDEX into the pop-time row snapshot (`menu_upgrade`), the
+            /// `tabMenuConnection:` discipline: the word and the build it is
+            /// for are arguments no `MenuAction` tag carries. An out-of-range
+            /// tag is inert.
+            @sel(tabMenuUpgrade:)
+            fn tab_menu_upgrade(&self, sender: Id) {
+                if sender.is_null() {
+                    return;
+                }
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
+                // action sender; `-tag` is `-(NSInteger)`, side-effect free.
+                let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                let ivars = self.ivars();
+                let Ok(i) = usize::try_from(tag) else { return };
+                let row = ivars.menu_upgrade.borrow().get(i).cloned();
+                let Some((sid, to, word)) = row else { return };
+                // `None` cannot happen from a real click (see `tabMenuAction:`).
+                let Some(tab) = ivars.menu_tab.get() else { return };
+                let _ = ivars.proxy.send_event(Wake::TabMenuUpgrade {
+                    window: ivars.window,
+                    tab,
+                    sid,
+                    to,
+                    word,
+                });
+            }
         }
     }
 
@@ -2935,6 +2974,7 @@ mod macos {
                 tooltip: RefCell::new(tooltip.map(str::to_string)),
                 menu_entries: RefCell::new(Vec::new()),
                 menu_conn: RefCell::new(Vec::new()),
+                menu_upgrade: RefCell::new(Vec::new()),
             };
             // Two-step, for the reason `ChromeButton::build` gives: `alloc_init`
             // sends `-init` and an `NSView` subclass's designated initializer is
@@ -3434,6 +3474,17 @@ mod macos {
                 })
                 .collect();
             let mut conn_index: isize = 0;
+            // And for the AGENT UPGRADE rows, the same way (gap #21).
+            *self.ivars().menu_upgrade.borrow_mut() = entries
+                .iter()
+                .filter_map(|e| match e {
+                    TabMenuEntry::Upgrade { sid, to, word, .. } => {
+                        Some((sid.clone(), to.clone(), *word))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut upgrade_index: isize = 0;
             // SAFETY: `+[NSMenu new]` is `+(id)` and returns a +1 the `Obj`
             // adopts; the menu is released when this frame ends, after the
             // synchronous tracking session `popUpContextMenu:` runs.
@@ -3512,6 +3563,19 @@ mod macos {
                             appkit::send_v_isize(item.id(), sel!(setTag:), conn_index);
                             conn_index += 1;
                             appkit::send_v_bool(item.id(), sel!(setEnabled:), *enabled);
+                            appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
+                            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+                        }
+                        TabMenuEntry::Upgrade { label, .. } => {
+                            // Tag = index into the pop-time `menu_upgrade`
+                            // snapshot filled above, in the same filtered
+                            // order as this counter.
+                            let Some(item) = item_with(label, sel!(tabMenuUpgrade:)) else {
+                                continue;
+                            };
+                            appkit::send_v_isize(item.id(), sel!(setTag:), upgrade_index);
+                            upgrade_index += 1;
+                            appkit::send_v_bool(item.id(), sel!(setEnabled:), true);
                             appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
@@ -3908,7 +3972,7 @@ mod macos {
     ///
     /// Best-effort: off the main thread or with no AppKit `NSWindow`, the chrome is
     /// simply not installed (`None`) — never a panic.
-    pub fn install_window_toolbar(
+    pub(crate) fn install_window_toolbar(
         window: &winit::window::Window,
         proxy: &EventLoopProxy<Wake>,
         wid: WindowId,
@@ -4127,7 +4191,7 @@ mod macos {
     /// every retained [`TabView`] re-resolves its label ink and redraws its pill.
     /// Idempotent; called wherever the theme/config pins are re-synced
     /// (`set_strip_dark`'s call sites) so a config edit applies live.
-    pub fn set_active_tab_color(handle: &ToolbarHandle, color: Option<[u8; 3]>) {
+    pub(crate) fn set_active_tab_color(handle: &ToolbarHandle, color: Option<[u8; 3]>) {
         let packed = color.map_or(0, |c| {
             0xFF00_0000 | (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
         });
@@ -4143,7 +4207,7 @@ mod macos {
         unsafe { appkit::send_v_bool(handle.container.id(), sel!(setNeedsDisplay:), true) };
     }
 
-    pub fn set_strip_dark(handle: &ToolbarHandle, dark: bool) {
+    pub(crate) fn set_strip_dark(handle: &ToolbarHandle, dark: bool) {
         // SAFETY: `+[NSAppearance appearanceNamed:]` is `+(id)(NSAppearanceName)`
         // and returns a +0 built-in appearance (or nil) for a system name;
         // `appkit::appearance_name` reads AppKit's own `NSAppearanceName*`
@@ -4187,7 +4251,7 @@ mod macos {
     /// the traffic lights MEASURED on the live window ([`strip_metrics`]), so the strip
     /// sits on the stoplights' own centre line instead of on whatever row the toolbar
     /// happened to hand us.
-    pub fn set_window_tabs(
+    pub(crate) fn set_window_tabs(
         handle: &ToolbarHandle,
         titles: &[String],
         ids: &[TabId],
@@ -4238,62 +4302,15 @@ mod macos {
             return;
         }
 
-        // Measure the live window ONCE per refresh: the stoplights' centre line (what
-        // every vertical slot aligns to), their trailing edge (what the band must clear),
-        // and the window's own centre (what a solo title centres on).
-        // SAFETY: `container` is the live retained strip view; `-bounds` is a
-        // side-effect-free `-(NSRect)` getter.
-        let (metrics, strip_h) = unsafe {
-            (
-                strip_metrics(container),
-                appkit::send_rect(container, sel!(bounds))
-                    .size
-                    .height
-                    .max(STRIP_HEIGHT),
-            )
-        };
-
-        // Compute the tab band: from the leading pad — never tucked under the traffic
-        // lights — to the trailing right-pinned "+", so a chip never draws under either.
-        let left = STRIP_LEADING_PAD.max(metrics.lights_right + LIGHTS_CLEARANCE);
-        let cluster = TAB_GAP + PLUS_WIDTH + TRAILING_PAD;
-        // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
-        let total_w = unsafe { appkit::send_rect(container, sel!(frame)) }
-            .size
-            .width
-            .max(left + cluster + 1.0);
-        let band_w = (total_w - left - cluster).max(1.0);
+        let StripPlan {
+            cells,
+            metrics,
+            strip_h,
+        } = plan_strip(handle, titles.len(), active);
         let n = titles.len();
         let active = active.min(n.saturating_sub(1));
-
-        // Keep the "+" on the measured line too, and re-pin it to the live width — its
-        // autoresizing mask only carries it between refreshes.
-        // SAFETY: main-thread geometry setter on the retained live button.
-        unsafe {
-            appkit::send_v_rect(
-                handle.plus.as_id(),
-                sel!(setFrame:),
-                rect(
-                    total_w - TRAILING_PAD - PLUS_WIDTH,
-                    0.0,
-                    PLUS_WIDTH,
-                    strip_h,
-                ),
-            );
-        }
-        handle.plus.set_center_y(metrics.center_y);
-
-        let cells = native_tab_cells(band_w, n, active)
-            .into_iter()
-            .map(|(x, width)| (left + x, width))
-            .collect::<Vec<_>>();
         // ONE tab is the window's title, not a switcher (see the fn doc).
-        let geometry_at = |index: usize, cell_x: f64| TabGeometry {
-            center_y: metrics.center_y,
-            solo: n == 1,
-            solo_center_x: metrics.window_center_x - cell_x,
-            separator: TabGeometry::separates(index, active),
-        };
+        let geometry_at = |index: usize, cell_x: f64| metrics.geometry(index, n, active, cell_x);
 
         // DIFF PATH: same tab COUNT and same GEOMETRY (every live frame matches its
         // computed cell — i.e. the container width is unchanged) ⇒ update the existing
@@ -4377,11 +4394,124 @@ mod macos {
         sync_rename_overlay(handle, ids);
     }
 
+    /// Where a strip of `n` chips with `active` selected sits in the container as it
+    /// is sized NOW: each chip's `(x, width)` cell, the measured stoplight line, and
+    /// the strip height. Also re-pins the "+" to the live width, whose autoresizing
+    /// mask only carries it between layouts. The one measurement both
+    /// [`set_window_tabs`] and [`reflow_window_tabs`] lay chips out from, so a width
+    /// change re-flowed in place lands on exactly the cells a later refresh's diff
+    /// path compares against.
+    fn plan_strip(handle: &ToolbarHandle, n: usize, active: usize) -> StripPlan {
+        let container = handle.container.id();
+        // Measure the live window ONCE per layout: the stoplights' centre line (what
+        // every vertical slot aligns to), their trailing edge (what the band must clear),
+        // and the window's own centre (what a solo title centres on).
+        // SAFETY: `container` is the live retained strip view; `-bounds` is a
+        // side-effect-free `-(NSRect)` getter.
+        let (metrics, strip_h) = unsafe {
+            (
+                strip_metrics(container),
+                appkit::send_rect(container, sel!(bounds))
+                    .size
+                    .height
+                    .max(STRIP_HEIGHT),
+            )
+        };
+
+        // Compute the tab band: from the leading pad — never tucked under the traffic
+        // lights — to the trailing right-pinned "+", so a chip never draws under either.
+        let left = STRIP_LEADING_PAD.max(metrics.lights_right + LIGHTS_CLEARANCE);
+        let cluster = TAB_GAP + PLUS_WIDTH + TRAILING_PAD;
+        // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
+        let total_w = unsafe { appkit::send_rect(container, sel!(frame)) }
+            .size
+            .width
+            .max(left + cluster + 1.0);
+        let band_w = (total_w - left - cluster).max(1.0);
+        let active = active.min(n.saturating_sub(1));
+
+        // Keep the "+" on the measured line too, and re-pin it to the live width — its
+        // autoresizing mask only carries it between layouts.
+        // SAFETY: main-thread geometry setter on the retained live button.
+        unsafe {
+            appkit::send_v_rect(
+                handle.plus.as_id(),
+                sel!(setFrame:),
+                rect(
+                    total_w - TRAILING_PAD - PLUS_WIDTH,
+                    0.0,
+                    PLUS_WIDTH,
+                    strip_h,
+                ),
+            );
+        }
+        handle.plus.set_center_y(metrics.center_y);
+
+        let cells = native_tab_cells(band_w, n, active)
+            .into_iter()
+            .map(|(x, width)| (left + x, width))
+            .collect::<Vec<_>>();
+        StripPlan {
+            cells,
+            metrics,
+            strip_h,
+        }
+    }
+
+    /// Re-flow the live chips to the container's CURRENT width, in place, from the
+    /// state they already hold (count, selection, titles, metadata). Called on every
+    /// window resize: the chips carry no autoresizing of their own, so without this
+    /// a narrowed window kept the wider layout — the last chip slid under the "+" —
+    /// until some unrelated title or chrome refresh happened to rebuild the strip.
+    /// Cheap and idempotent: a width the chips already fill is a frame compare per
+    /// chip and nothing else, so it may run on every step of a live drag.
+    pub fn reflow_window_tabs(handle: &ToolbarHandle) {
+        if MainThread::new().is_none() {
+            return;
+        }
+        let tabs = handle.tabs.borrow();
+        let n = tabs.len();
+        if n == 0 {
+            return;
+        }
+        let active = tabs.iter().position(|tab| tab.is_active()).unwrap_or(0);
+        let StripPlan {
+            cells,
+            metrics,
+            strip_h,
+        } = plan_strip(handle, n, active);
+        let mut moved = false;
+        for (i, (tab, &(cx, cw))) in tabs.iter().zip(&cells).enumerate() {
+            // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter on a live
+            // retained chip.
+            let f = unsafe { appkit::send_rect(tab.as_id(), sel!(frame)) };
+            let reframe = f.origin.x != cx || f.size.width != cw || f.size.height != strip_h;
+            if reframe {
+                // SAFETY: main-thread geometry setter on a live retained chip.
+                unsafe {
+                    appkit::send_v_rect(tab.as_id(), sel!(setFrame:), rect(cx, 0.0, cw, strip_h));
+                }
+                moved = true;
+            }
+            tab.set_geometry(metrics.geometry(i, n, active, cx));
+            if reframe {
+                // `set_geometry` re-lays only when the geometry itself moved; a new
+                // width with the same centre line still needs the content re-placed.
+                tab.relayout();
+            }
+        }
+        if moved {
+            let ids: Vec<TabId> = tabs.iter().map(|tab| tab.tab_id()).collect();
+            drop(tabs);
+            sync_rename_overlay(handle, &ids);
+        }
+    }
+
     /// Read the title chrome's complete introspection line for the `chrome` verb, or
     /// `None` only when there are no tabs. It reports canonical undecorated titles,
     /// selection, independent states, and full tooltips from the live [`TabView`]s;
     /// the `+` remains a separate action rather than pretending to be a tab.
-    pub fn read_tab_chrome(handle: &ToolbarHandle) -> Option<String> {
+    pub(crate) fn read_tab_chrome(handle: &ToolbarHandle) -> Option<String> {
         MainThread::new()?;
         let tabs = handle.tabs.borrow();
         if tabs.is_empty() {
@@ -4401,7 +4531,7 @@ mod macos {
     /// listing IS the on-screen menu. Empty only when there are no tab chips;
     /// a single title-identity chip remains inspectable like [`read_tab_chrome`].
     #[must_use]
-    pub fn read_tab_menus(handle: &ToolbarHandle) -> Vec<String> {
+    pub(crate) fn read_tab_menus(handle: &ToolbarHandle) -> Vec<String> {
         if MainThread::new().is_none() {
             return Vec::new();
         }
@@ -4414,15 +4544,6 @@ mod macos {
             .map(|(i, t)| t.menu_line(i))
             .collect()
     }
-
-    /// RETIRED: the titlebar "Update" capsule is gone — the owner asked for the update
-    /// affordance to live in the VERSION menu (one-click apply; see
-    /// `crate::menu::update_version_menu`), which also killed the old
-    /// tooltip-says-install-but-click-opened-details mismatch. A documented no-op
-    /// (mirroring the off-macOS stub) so the cross-platform
-    /// `Apprt::set_toolbar_update_available` seam — owned by concurrent work in
-    /// `platform.rs` — keeps one uniform signature; remove them together.
-    pub fn set_update_available(_handle: &ToolbarHandle, _available: bool) {}
 
     /// The mutable state the rename relay needs at callback time.
     pub(crate) struct RenameIvars {
@@ -4648,14 +4769,14 @@ mod macos {
     /// Whether a native editor COULD be installed here — the strip needs a live
     /// window to host the field. Deliberately side-effect free, so menu
     /// validation can ask without opening an editor.
-    pub fn can_present_tab_rename(handle: &ToolbarHandle) -> bool {
+    pub(crate) fn can_present_tab_rename(handle: &ToolbarHandle) -> bool {
         // SAFETY: `-window` is a side-effect-free `-(id)` getter on the live
         // retained container view.
         MainThread::new().is_some()
             && !unsafe { appkit::send_id(handle.container.id(), sel!(window)) }.is_null()
     }
 
-    pub fn begin_tab_rename(
+    pub(crate) fn begin_tab_rename(
         handle: &ToolbarHandle,
         tab: TabId,
         session: u64,
@@ -4791,7 +4912,7 @@ mod macos {
     /// Remove the inline rename editor and hand key focus back to the terminal.
     /// Idempotent. Latches the relay's `done` flag FIRST, so the end-of-editing
     /// AppKit fires while we dismantle the field cannot post a second outcome.
-    pub fn end_tab_rename(handle: &ToolbarHandle) {
+    pub(crate) fn end_tab_rename(handle: &ToolbarHandle) {
         let Some(editor) = handle.rename.borrow_mut().take() else {
             return;
         };
@@ -4822,7 +4943,7 @@ mod macos {
     /// The field's `stringValue` is the ONE home of the in-progress text, so this
     /// is how a command that must run "outside" an open editor (⌘W, ⌘T, a split)
     /// keeps what the user typed instead of discarding it.
-    pub fn rename_editor_text(handle: &ToolbarHandle) -> Option<String> {
+    pub(crate) fn rename_editor_text(handle: &ToolbarHandle) -> Option<String> {
         let rename = handle.rename.borrow();
         let editor = rename.as_ref()?;
         // SAFETY: `-stringValue` is a plain `-(NSString *)` main-thread value
@@ -4835,7 +4956,7 @@ mod macos {
     /// Hand one editing command to the live rename field's field editor. macOS
     /// resolves a menu key equivalent BEFORE the first responder sees the key, so
     /// without this ⌘V would paste into the PTY behind an open editor.
-    pub fn rename_editor_edit(
+    pub(crate) fn rename_editor_edit(
         handle: &ToolbarHandle,
         action: crate::platform::RenameEditorEdit,
     ) -> bool {
@@ -5243,134 +5364,6 @@ mod macos {
             }
         }
 
-        /// THE THREE-ARGUMENT SELECTOR, on the REAL class, driven by FOUNDATION.
-        ///
-        /// D1 is the finding that `declare_class!` could not express a method
-        /// with more than one argument at all. This is the proof that it now
-        /// can, end to end and on the shipped class rather than a probe:
-        /// `NSInvocation` builds the call FROM THE REGISTERED ENCODING — it
-        /// reads `numberOfArguments`, the argument types and the return type out
-        /// of `NSMethodSignature` — so a wrong encoding fails here rather than
-        /// in a user's toolbar.
-        ///
-        /// Both answers are checked: the strip identifier yields a real
-        /// `NSToolbarItem` carrying the container view, and any other identifier
-        /// yields nil. A method stuck at "always build one" would pass half of
-        /// this.
-        #[test]
-        fn foundation_invokes_the_three_argument_toolbar_selector() {
-            let container = a_view();
-            let delegate =
-                ToolbarDelegate::new(crate::appkit::test_witness(), container.clone_retained())
-                    .expect("delegate");
-            autoreleasepool(|_| {
-                // SAFETY: every send is cast to the exact prototype named
-                // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
-                // `+invocationWithMethodSignature:` is `-(id)(id)`;
-                // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
-                // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
-                // at the pointer; `-invokeWithTarget:` is `-(void)(id)`;
-                // `-getReturnValue:` is `-(void)(void *)` and writes
-                // `methodReturnLength` bytes, asserted to be pointer-sized.
-                unsafe {
-                    let selector = sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:);
-                    let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
-                    let sig = sig_for(
-                        delegate.as_id(),
-                        sel!(methodSignatureForSelector:),
-                        selector,
-                    );
-                    assert!(!sig.is_null(), "no signature for the declared method");
-                    // Foundation's own reading of the registered arity: self,
-                    // _cmd and THREE arguments.
-                    assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 5);
-                    assert_eq!(
-                        appkit::send_usize(sig, sel!(methodReturnLength)),
-                        size_of::<Id>()
-                    );
-
-                    let call = |ident: &str| -> Id {
-                        let inv = appkit::send_id_id(
-                            class(c"NSInvocation").as_id(),
-                            sel!(invocationWithMethodSignature:),
-                            sig,
-                        );
-                        assert!(!inv.is_null());
-                        let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
-                        set_sel(inv, sel!(setSelector:), selector);
-                        let set_arg: unsafe extern "C-unwind" fn(
-                            Id,
-                            Sel,
-                            *mut std::ffi::c_void,
-                            isize,
-                        ) = msg();
-                        // index 2 = the (nil) NSToolbar, 3 = the identifier,
-                        // 4 = the BOOL.
-                        let mut toolbar = Id::NIL;
-                        set_arg(
-                            inv,
-                            sel!(setArgument:atIndex:),
-                            std::ptr::from_mut(&mut toolbar).cast(),
-                            2,
-                        );
-                        let ns = appkit::nsstring(ident).expect("NSString");
-                        let mut ident_arg = ns.id();
-                        set_arg(
-                            inv,
-                            sel!(setArgument:atIndex:),
-                            std::ptr::from_mut(&mut ident_arg).cast(),
-                            3,
-                        );
-                        let mut inserting = Bool::YES;
-                        set_arg(
-                            inv,
-                            sel!(setArgument:atIndex:),
-                            std::ptr::from_mut(&mut inserting).cast(),
-                            4,
-                        );
-                        appkit::send_v_id(inv, sel!(invokeWithTarget:), delegate.as_id());
-                        let mut out = Id::NIL;
-                        let get_ret: unsafe extern "C-unwind" fn(Id, Sel, *mut std::ffi::c_void) =
-                            msg();
-                        get_ret(
-                            inv,
-                            sel!(getReturnValue:),
-                            std::ptr::from_mut(&mut out).cast(),
-                        );
-                        out
-                    };
-
-                    let item = call(STRIP_ITEM_ID);
-                    assert!(
-                        !item.is_null(),
-                        "the strip identifier did not yield a toolbar item"
-                    );
-                    assert_eq!(
-                        appkit::nsstring_to_rust(appkit::send_id(item, sel!(itemIdentifier))),
-                        STRIP_ITEM_ID
-                    );
-                    assert_eq!(
-                        appkit::nsstring_to_rust(appkit::send_id(item, sel!(label))),
-                        "Tabs"
-                    );
-                    assert_eq!(
-                        appkit::send_id(item, sel!(view)),
-                        container.id(),
-                        "the item is not carrying the delegate's container view"
-                    );
-                    assert!(
-                        !appkit::send_bool(item, sel!(isBordered)),
-                        "the Liquid Glass bezel was not opted out of"
-                    );
-
-                    assert!(
-                        call("aterm.notthestrip").is_null(),
-                        "an unknown identifier built an item anyway"
-                    );
-                }
-            });
-        }
-
         /// The two `NSArray`-returning methods answer `@[STRIP_ITEM_ID]`, +0.
         ///
         /// D5's rule — an object-returning method not named new/alloc/copy owes
@@ -5705,6 +5698,154 @@ mod macos {
                 "AppKit no longer defers responder deallocation — re-read this \
                  test's note and the `S3` entry in aterm-objc's crate docs"
             );
+        }
+
+        /// THE WINDOW-SERVER ROW (2026-09-26). Invoking the delegate's
+        /// three-argument selector for the strip identifier makes it build a
+        /// real `NSToolbarItem` around the container view, and that opens a
+        /// WindowServer connection: run alone, this test drew WindowServer's
+        /// synchronous `kTCCServiceListenEvent` preflight of the aterm-gui test
+        /// binary (tccd's log, measured) — the WindowServer watchdog's trigger
+        /// (AGENTS.md, "Concurrent sessions" rule 5). Every other row in this
+        /// module drew none. It is therefore `#[ignore]`d out of every parallel
+        /// test run, and the merge contract's `window-server unit tests` stage
+        /// runs it (`-- --ignored ::window_server::`) in the driver lane, beside
+        /// `objc_toolbar_drive`, which holds the same strip in a real window.
+        mod window_server {
+            use super::*;
+
+            /// THE THREE-ARGUMENT SELECTOR, on the REAL class, driven by FOUNDATION.
+            ///
+            /// D1 is the finding that `declare_class!` could not express a method
+            /// with more than one argument at all. This is the proof that it now
+            /// can, end to end and on the shipped class rather than a probe:
+            /// `NSInvocation` builds the call FROM THE REGISTERED ENCODING — it
+            /// reads `numberOfArguments`, the argument types and the return type out
+            /// of `NSMethodSignature` — so a wrong encoding fails here rather than
+            /// in a user's toolbar.
+            ///
+            /// Both answers are checked: the strip identifier yields a real
+            /// `NSToolbarItem` carrying the container view, and any other identifier
+            /// yields nil. A method stuck at "always build one" would pass half of
+            /// this.
+            #[test]
+            #[ignore = "WINDOW-SERVER LANE: builds AppKit objects that open a WindowServer connection; run by the merge contract's `window-server unit tests` stage (AGENTS.md, Concurrent sessions rule 5)"]
+            fn foundation_invokes_the_three_argument_toolbar_selector() {
+                let container = a_view();
+                let delegate =
+                    ToolbarDelegate::new(crate::appkit::test_witness(), container.clone_retained())
+                        .expect("delegate");
+                autoreleasepool(|_| {
+                    // SAFETY: every send is cast to the exact prototype named
+                    // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
+                    // `+invocationWithMethodSignature:` is `-(id)(id)`;
+                    // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
+                    // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
+                    // at the pointer; `-invokeWithTarget:` is `-(void)(id)`;
+                    // `-getReturnValue:` is `-(void)(void *)` and writes
+                    // `methodReturnLength` bytes, asserted to be pointer-sized.
+                    unsafe {
+                        let selector =
+                            sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:);
+                        let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
+                        let sig = sig_for(
+                            delegate.as_id(),
+                            sel!(methodSignatureForSelector:),
+                            selector,
+                        );
+                        assert!(!sig.is_null(), "no signature for the declared method");
+                        // Foundation's own reading of the registered arity: self,
+                        // _cmd and THREE arguments.
+                        assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 5);
+                        assert_eq!(
+                            appkit::send_usize(sig, sel!(methodReturnLength)),
+                            size_of::<Id>()
+                        );
+
+                        let call = |ident: &str| -> Id {
+                            let inv = appkit::send_id_id(
+                                class(c"NSInvocation").as_id(),
+                                sel!(invocationWithMethodSignature:),
+                                sig,
+                            );
+                            assert!(!inv.is_null());
+                            let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
+                            set_sel(inv, sel!(setSelector:), selector);
+                            let set_arg: unsafe extern "C-unwind" fn(
+                                Id,
+                                Sel,
+                                *mut std::ffi::c_void,
+                                isize,
+                            ) = msg();
+                            // index 2 = the (nil) NSToolbar, 3 = the identifier,
+                            // 4 = the BOOL.
+                            let mut toolbar = Id::NIL;
+                            set_arg(
+                                inv,
+                                sel!(setArgument:atIndex:),
+                                std::ptr::from_mut(&mut toolbar).cast(),
+                                2,
+                            );
+                            let ns = appkit::nsstring(ident).expect("NSString");
+                            let mut ident_arg = ns.id();
+                            set_arg(
+                                inv,
+                                sel!(setArgument:atIndex:),
+                                std::ptr::from_mut(&mut ident_arg).cast(),
+                                3,
+                            );
+                            let mut inserting = Bool::YES;
+                            set_arg(
+                                inv,
+                                sel!(setArgument:atIndex:),
+                                std::ptr::from_mut(&mut inserting).cast(),
+                                4,
+                            );
+                            appkit::send_v_id(inv, sel!(invokeWithTarget:), delegate.as_id());
+                            let mut out = Id::NIL;
+                            let get_ret: unsafe extern "C-unwind" fn(
+                                Id,
+                                Sel,
+                                *mut std::ffi::c_void,
+                            ) = msg();
+                            get_ret(
+                                inv,
+                                sel!(getReturnValue:),
+                                std::ptr::from_mut(&mut out).cast(),
+                            );
+                            out
+                        };
+
+                        let item = call(STRIP_ITEM_ID);
+                        assert!(
+                            !item.is_null(),
+                            "the strip identifier did not yield a toolbar item"
+                        );
+                        assert_eq!(
+                            appkit::nsstring_to_rust(appkit::send_id(item, sel!(itemIdentifier))),
+                            STRIP_ITEM_ID
+                        );
+                        assert_eq!(
+                            appkit::nsstring_to_rust(appkit::send_id(item, sel!(label))),
+                            "Tabs"
+                        );
+                        assert_eq!(
+                            appkit::send_id(item, sel!(view)),
+                            container.id(),
+                            "the item is not carrying the delegate's container view"
+                        );
+                        assert!(
+                            !appkit::send_bool(item, sel!(isBordered)),
+                            "the Liquid Glass bezel was not opted out of"
+                        );
+
+                        assert!(
+                            call("aterm.notthestrip").is_null(),
+                            "an unknown identifier built an item anyway"
+                        );
+                    }
+                });
+            }
         }
     }
 }

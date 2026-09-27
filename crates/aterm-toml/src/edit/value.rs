@@ -90,15 +90,6 @@ impl Value {
         matches!(self, Value::Boolean(_))
     }
 
-    /// The date-time, if this is one.
-    #[must_use]
-    pub fn as_datetime(&self) -> Option<&Datetime> {
-        match self {
-            Value::Datetime(v) => Some(v.value()),
-            _ => None,
-        }
-    }
-
     /// Is this a date-time?
     #[must_use]
     pub fn is_datetime(&self) -> bool {
@@ -108,14 +99,6 @@ impl Value {
     /// The array, if this is one.
     #[must_use]
     pub fn as_array(&self) -> Option<&Array> {
-        match self {
-            Value::Array(a) => Some(a),
-            _ => None,
-        }
-    }
-
-    /// The array, mutably.
-    pub fn as_array_mut(&mut self) -> Option<&mut Array> {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
@@ -135,20 +118,6 @@ impl Value {
             Value::InlineTable(t) => Some(t),
             _ => None,
         }
-    }
-
-    /// The inline table, mutably.
-    pub fn as_inline_table_mut(&mut self) -> Option<&mut InlineTable> {
-        match self {
-            Value::InlineTable(t) => Some(t),
-            _ => None,
-        }
-    }
-
-    /// Is this an inline table?
-    #[must_use]
-    pub fn is_inline_table(&self) -> bool {
-        matches!(self, Value::InlineTable(_))
     }
 
     /// Formatting around the value.
@@ -204,16 +173,6 @@ impl Value {
             Value::Array(_) => "array",
             Value::InlineTable(_) => "inline table",
         }
-    }
-
-    /// Set the leading whitespace, returning the value — the builder spelling
-    /// used when assembling a document by hand.
-    #[must_use]
-    pub fn decorated(mut self, prefix: impl Into<RawString>, suffix: impl Into<RawString>) -> Self {
-        let decor = self.decor_mut();
-        decor.set_prefix(prefix);
-        decor.set_suffix(suffix);
-        self
     }
 }
 
@@ -303,11 +262,6 @@ impl Array {
         self.values.iter()
     }
 
-    /// Elements in order, mutably.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Value> {
-        self.values.iter_mut()
-    }
-
     /// The element at `index`.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&Value> {
@@ -319,32 +273,10 @@ impl Array {
         self.values.push(value.into());
     }
 
-    /// Formatting around the brackets.
-    #[must_use]
-    pub fn decor(&self) -> &Decor {
-        &self.decor
-    }
-
-    /// Mutable formatting around the brackets.
-    pub fn decor_mut(&mut self) -> &mut Decor {
-        &mut self.decor
-    }
-
     /// Byte range of `[` through `]` in the source, when it was parsed.
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()
-    }
-
-    /// Does this array print a comma after its last element?
-    #[must_use]
-    pub fn trailing_comma(&self) -> bool {
-        self.trailing_comma
-    }
-
-    /// Declare whether a trailing comma is printed.
-    pub fn set_trailing_comma(&mut self, yes: bool) {
-        self.trailing_comma = yes;
     }
 }
 
@@ -397,63 +329,10 @@ impl InlineTable {
         self.items.len() == 0
     }
 
-    /// Entries in authored order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.items
-            .iter()
-            .filter_map(|(k, v)| Some((k.get(), v.as_value()?)))
-    }
-
     /// The entry for `key`.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.items.get(key)?.as_value()
-    }
-
-    /// The entry for `key`, mutably.
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        self.items.get_mut(key)?.as_value_mut()
-    }
-
-    /// Set `key`.
-    pub fn insert(&mut self, key: &str, value: Value) -> Option<Value> {
-        self.items
-            .insert(Key::new(key), Item::Value(value))
-            .and_then(|i| match i {
-                Item::Value(v) => Some(v),
-                _ => None,
-            })
-    }
-
-    /// Delete `key`.
-    pub fn remove(&mut self, key: &str) -> Option<Value> {
-        self.items.remove(key).and_then(|i| match i {
-            Item::Value(v) => Some(v),
-            _ => None,
-        })
-    }
-
-    /// Formatting around the braces.
-    #[must_use]
-    pub fn decor(&self) -> &Decor {
-        &self.decor
-    }
-
-    /// Mutable formatting around the braces.
-    pub fn decor_mut(&mut self) -> &mut Decor {
-        &mut self.decor
-    }
-
-    /// Byte range of `{` through `}` in the source, when it was parsed.
-    #[must_use]
-    pub fn span(&self) -> Option<Range<usize>> {
-        self.span.clone()
-    }
-
-    /// Did this table come from a dotted key inside another inline table?
-    #[must_use]
-    pub fn is_dotted(&self) -> bool {
-        self.dotted
     }
 
     /// Every leaf reachable through dotted children, with its full key path.

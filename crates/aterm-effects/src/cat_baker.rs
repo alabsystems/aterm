@@ -186,11 +186,6 @@ impl CatBaker {
         }
     }
 
-    /// Whether the baker is in the free-overlay exact-size tile mode.
-    pub fn free_tiles(&self) -> bool {
-        self.free_tiles
-    }
-
     /// Wholesale clear + version bump (config reload / toggle / metric change).
     /// A no-op when already empty, so the per-frame master-off `reset()` path
     /// costs nothing.
@@ -220,6 +215,7 @@ impl CatBaker {
     /// that ticks several panes into ONE presented frame proves the two-bake
     /// budget stayed per-FRAME instead of multiplying with the pane count.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn frame_clock(&self) -> u64 {
         self.clock
     }
@@ -1379,6 +1375,7 @@ impl BakeKeyV4 {
     }
 }
 
+#[cfg(test)]
 struct SlotV4 {
     key: BakeKeyV4,
     tile: Tile,
@@ -1392,6 +1389,7 @@ struct SlotV4 {
 /// [`MAX_ATLAS_BYTES`] bound is enforced by the procedural baker's slot sizing; here
 /// the slot COUNT ceiling caps residency.
 #[derive(Default)]
+#[cfg(test)]
 pub struct CatBakerV4 {
     slots: Vec<SlotV4>,
     clock: u64,
@@ -1399,32 +1397,25 @@ pub struct CatBakerV4 {
     version: u64,
 }
 
+#[cfg(test)]
 impl CatBakerV4 {
     /// Per-tick prologue: advance the LRU clock and reset the per-frame bake budget.
+    #[cfg(test)]
     pub fn begin_frame(&mut self) {
         self.clock = self.clock.wrapping_add(1);
         self.bakes_left = MAX_BAKES_PER_FRAME;
     }
 
-    /// Monotonic version, bumped on every bake (folded into a frame fingerprint — a
-    /// rebake must re-upload).
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
     /// Number of resident tiles (`≤ MAX_SLOTS`).
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.slots.len()
-    }
-
-    /// Whether the cache holds no tiles.
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
     }
 
     /// Look `key` up, baking on a miss when the per-frame budget allows. `None` =
     /// budget exhausted this frame (retry next frame — the entrance tolerates the
     /// delay, §5.5). The returned tile is `key.w + PATCH_STRIP` wide, art in `[0, w)`.
+    #[cfg(test)]
     pub fn get(&mut self, key: &BakeKeyV4) -> Option<&Tile> {
         if let Some(i) = self.slots.iter().position(|s| s.key == *key) {
             self.slots[i].last_used = self.clock;

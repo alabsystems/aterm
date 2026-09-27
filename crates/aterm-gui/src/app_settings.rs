@@ -59,12 +59,6 @@ fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
     *PRESENCE.get_or_init(aterm_containment::consent::tccutil_presence)
 }
 
-/// Whether `/usr/bin/trash` is a file, read once: it ships with the OS.
-fn trash_tool_once() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| std::path::Path::new(crate::consent_retire::TRASH_TOOL).is_file())
-}
-
 impl App {
     /// Enumerate every live Settings presentation in `wid`, including leaves
     /// that are not currently focused. Generic split/restore operations may
@@ -338,11 +332,6 @@ impl App {
     ///   the rows published in the same pass already read *asking…* rather than
     ///   showing a press that appears to have done nothing.
     pub(crate) fn sync_settings_consent_posture(&mut self) {
-        // There is no TCC off macOS and no consent surface to describe, so the
-        // block is simply absent there rather than rendering an empty card.
-        if !cfg!(target_os = "macos") || self.headless {
-            return;
-        }
         if self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::Settings)
@@ -350,18 +339,41 @@ impl App {
         {
             return;
         }
+        // EVERY Settings view: a window can hold more than one (a split, a
+        // reopened tab), and a request left on the one not chosen would wait.
+        let views = self
+            .windows
+            .keys()
+            .copied()
+            .flat_map(|wid| {
+                self.settings_tabs_in_window(wid)
+                    .into_iter()
+                    .map(move |(_, _, _, view)| (wid, view))
+            })
+            .collect::<Vec<_>>();
+        // Every view shares the process's record of the owner's declines, and
+        // every confirmed press is performed now. Both run on every host: a
+        // headless view's arms reach no OS, and `begin_*` refuse there.
+        let quiet = std::sync::Arc::clone(&self.owner_quiet);
+        for (_, view) in &views {
+            if let Some(crate::native_app::AppViewState::Settings(state)) =
+                self.native_runtime.view_state_mut(*view)
+            {
+                state.arm_owner_quiet(std::sync::Arc::clone(&quiet));
+            }
+        }
+        self.drain_settings_gesture_requests(&views);
+        // There is no TCC off macOS and no consent surface to describe, so the
+        // block is simply absent there rather than rendering an empty card.
+        if !cfg!(target_os = "macos") || self.headless {
+            return;
+        }
         // Only a view actually ON the Security page carries the block, and this
         // runs on every event-loop park. Reading the route first keeps the cost
         // of an open-but-elsewhere Settings tab at one enum compare per window
         // instead of a probe read and a row clone.
-        let targets = self
-            .windows
-            .keys()
-            .copied()
-            .filter_map(|wid| {
-                self.settings_tab_in_window(wid)
-                    .map(|(_, _, _, view)| (wid, view))
-            })
+        let targets = views
+            .into_iter()
             .filter(|(_, view)| {
                 matches!(
                     self.native_runtime.view_state(*view),
@@ -373,37 +385,21 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        // THE GESTURE DRAIN. `WarmupState` and its bounded automatic-apply hold
-        // are `App`-owned (§3.5) and a Settings reducer cannot reach `App`, so
-        // the press is recorded on the view and performed here. `begin_consent_
-        // warmup` re-checks every gate itself — the master switch, the mode, and
-        // headless — so a stale request cannot smuggle a worker past config.
-        let mut requested = false;
-        let mut opened = false;
-        let mut retire = None;
-        for (_, view) in &targets {
-            if let Some(crate::native_app::AppViewState::Settings(state)) =
-                self.native_runtime.view_state_mut(*view)
-            {
-                requested |= state.take_consent_warmup_request();
-                opened |= state.take_consent_open_request();
-                retire = retire.or(state.take_claimant_retire_request());
-            }
-        }
-        if requested {
-            let _ = self.begin_consent_warmup();
-        }
-        if let Some(plan) = retire {
-            let _ = self.begin_claimant_retire(plan);
-        }
-        // The page's Open Privacy & Security… is the card's Open Settings by
-        // another door: the same `opened` marker, and the same watch for the ✓.
-        if opened {
-            self.note_macos_access_settings_opened(std::time::Instant::now());
-        }
         let access = self.macos_access_projection();
         let gestures = crate::native_settings::ConsentGestures::for_instance(self.headless);
-        for (wid, view) in targets {
+        self.publish_macos_access(&targets, &access, gestures);
+    }
+
+    /// Hand the Security block's projection, and the gesture arms, to each of
+    /// `targets` (the Settings views on that page), repainting a view whose
+    /// block changed.
+    fn publish_macos_access(
+        &mut self,
+        targets: &[(crate::WindowId, crate::tab_model::ViewId)],
+        access: &crate::native_settings::MacosAccess,
+        gestures: crate::native_settings::ConsentGestures,
+    ) {
+        for &(wid, view) in targets {
             let changed = match self.native_runtime.view_state_mut(view) {
                 Some(crate::native_app::AppViewState::Settings(state)) => {
                     state.arm_consent_gestures(gestures);
@@ -422,6 +418,73 @@ impl App {
                     os_window.request_redraw();
                 }
             }
+        }
+    }
+
+    /// THE GESTURE DRAIN for [`Self::sync_settings_consent_posture`], over the
+    /// Settings views it found (all of them, every window).
+    fn drain_settings_gesture_requests(
+        &mut self,
+        views: &[(crate::WindowId, crate::tab_model::ViewId)],
+    ) {
+        // THE GESTURE DRAIN. `WarmupState`, its bounded automatic-apply hold and
+        // the retire worker are `App`-owned (§3.5, §3.7) and a Settings reducer
+        // cannot reach `App`, so the press is recorded on the view and performed
+        // here — from EVERY Settings view, whatever page it shows now. A press the
+        // owner confirmed on Security is performed at this park even if the view
+        // has since navigated away, never later when some other path brings it
+        // back. `begin_consent_warmup` and `begin_claimant_retire` re-check every
+        // gate themselves, so a stale request cannot smuggle a worker past config.
+        let mut requested_by = Vec::new();
+        let mut opened = false;
+        let mut retire = None;
+        for &(wid, view) in views {
+            if let Some(crate::native_app::AppViewState::Settings(state)) =
+                self.native_runtime.view_state_mut(view)
+            {
+                if state.take_consent_warmup_request() {
+                    requested_by.push((wid, view));
+                }
+                opened |= state.take_consent_open_request();
+                retire = retire.or(state.take_claimant_retire_request());
+            }
+        }
+        // Every yes still waiting is taken up here — started, or refused and
+        // said so — so no view reads it as under way after this park.
+        self.owner_quiet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .settle_confirmed();
+        // A confirmed warm-up that starts nothing says why, in each view it was
+        // confirmed from; one already walking is under way, which says itself.
+        if !requested_by.is_empty()
+            && let Some(why) = self.begin_consent_warmup().refusal()
+        {
+            for (wid, view) in requested_by {
+                let noted = match self.native_runtime.view_state_mut(view) {
+                    Some(crate::native_app::AppViewState::Settings(state)) => {
+                        state.note_warmup_refused(why)
+                    }
+                    _ => false,
+                };
+                // Written outside the reducer, so the window is told to draw it.
+                if noted && let Some(window) = self.windows.get_mut(&wid) {
+                    window.last_present = None;
+                    if let Some(os_window) = window.os_window.as_ref() {
+                        os_window.request_redraw();
+                    }
+                }
+            }
+        }
+        if let Some(plan) = retire {
+            // The refusal, if any, is shown by the block's status row
+            // (`MacosAccess::retire_status`) until the next press starts.
+            self.claimant_retire_refusal = self.begin_claimant_retire(plan).err();
+        }
+        // The page's Open Privacy & Security… is the card's Open Settings by
+        // another door: the same `opened` marker, and the same watch for the ✓.
+        if opened {
+            self.note_macos_access_settings_opened(std::time::Instant::now());
         }
     }
 
@@ -463,14 +526,34 @@ impl App {
             warmup_offered,
             warmup_live,
             warmup_rows,
-            // A reset is reported only by the gesture that ran it; the host
-            // never invents one, and a successor process inherits none.
+            // A reset is reported only by the gesture that ran it, and the view
+            // keeps that report across these republishes
+            // (`replace_macos_access`); the host never invents one, and a
+            // successor process inherits none.
             reset: None,
             claimants: claimants.map(|(census, _age)| census),
-            trash_tool: trash_tool_once(),
+            trash_tool: crate::consent_retire::trash_tool_present(),
             retire_live: self.claimant_retire.is_live(),
             retired: self.claimant_retire.report(),
+            retire_status: self.claimant_retire_status(),
         }
+    }
+
+    /// The Security block's *Move to Trash* status row: under way, refused before
+    /// it started, or the last move's summary.
+    fn claimant_retire_status(&self) -> Option<String> {
+        if self.claimant_retire.is_live() {
+            return Some("Moving copies of aterm to the Trash\u{2026}".to_string());
+        }
+        if let Some(why) = self.claimant_retire_refusal {
+            return Some(format!("Nothing was moved: {why}."));
+        }
+        let report = self.claimant_retire.report()?;
+        let moved = report
+            .iter()
+            .filter(|(_, outcome)| *outcome == aterm_containment::consent::Retired::Moved)
+            .count();
+        Some(crate::consent_retire::summary(moved, report.len()))
     }
 
     /// Locate the native Settings presentation targeted by compatibility control
@@ -2249,6 +2332,9 @@ impl App {
         if search.regex_error {
             status.push("bad regex".to_string());
         } else if search.query.is_empty() {
+        } else if search.matches.is_empty() && search.history_away {
+            // Ruling 237: the painter's long form, at every width.
+            status.push(crate::app_search::HISTORY_AWAY_NONE.to_string());
         } else if search.matches.is_empty() {
             status.push(if search.truncated {
                 "no matches (partial history)".to_string()
@@ -2260,7 +2346,9 @@ impl App {
                 "match {} of {}{}",
                 search.current + 1,
                 search.matches.len(),
-                if search.truncated {
+                if search.history_away {
+                    " (partial history, rewrapping)"
+                } else if search.truncated {
                     " (partial history)"
                 } else {
                     ""
@@ -2346,6 +2434,9 @@ impl App {
             let capsules: Vec<crate::accesskit_tree::BandCapsule> = layout
                 .capsules
                 .iter()
+                // A blanked capsule (an echo's spent `Stop paste`, ruling 235)
+                // keeps its cells and has nothing to say.
+                .filter(|c| !c.full_label.is_empty())
                 .map(|c| crate::accesskit_tree::BandCapsule {
                     label: c.full_label,
                     col: c.col,
@@ -2369,24 +2460,22 @@ impl App {
                     let busy = live.activity() == 2;
                     // The work's own clock — the one the band's elapsed words
                     // read — so the description never disagrees with the paint:
-                    // where a determinate row's ETA slot shows that clock (its
-                    // estimate hidden), the reader hears how long it has run.
+                    // a busy row says how long it has run; a determinate row
+                    // says what is LEFT, and nothing while its estimate is
+                    // hidden (its slot is blank then, ruling 241).
                     let ran = now.saturating_duration_since(live.started_at);
                     let time_words = if busy {
                         aterm_messages::progress::elapsed_spoken(ran)
                     } else {
-                        match live.track.eta(now) {
-                            aterm_messages::Eta::Hidden if layout.eta.is_some() => {
-                                aterm_messages::progress::clock_spoken(ran)
-                            }
-                            eta => aterm_messages::progress::eta_spoken(eta),
-                        }
+                        aterm_messages::progress::eta_spoken(live.track.eta(now))
                     };
                     let stats = live
                         .msg
                         .meter
                         .as_ref()
-                        .map(|m| m.stats.clone())
+                        // Unpadded: the right-alignment that keeps the
+                        // painted digits in place is not something to read.
+                        .map(|m| m.stats.trim().to_string())
                         .filter(|s| !s.is_empty());
                     let labels = layout
                         .capsules
@@ -2461,9 +2550,9 @@ impl App {
                         // activate on it opens the page, like a press anywhere on it.
                         activates: true,
                         bar_row: Some(bar_row),
-                        // The node IS the link: its painted `Messages ›` capsule is
-                        // not a second control, and the tree publishes capsule
-                        // children only under the three message-row slots.
+                        // The node IS the link: its words are the whole row (ruling
+                        // 259), and the tree publishes capsule children only
+                        // under the three message-row slots.
                         capsules: Vec::new(),
                     });
                 }
@@ -3396,6 +3485,234 @@ mod tests {
         assert_eq!(app.pool.sessions.len(), sessions);
     }
 
+    /// The block's status row: the last move's summary, and a refusal ahead of
+    /// it until the next press starts.
+    #[test]
+    fn the_trash_status_row_reports_the_last_move_and_a_refusal_ahead_of_it() {
+        use aterm_containment::consent::Retired;
+        let mut app = App::headless_for_test();
+        assert_eq!(app.claimant_retire_status(), None, "no press yet");
+        app.claimant_retire.set_report_for_test(vec![
+            (
+                std::path::PathBuf::from("/A/x.app.rollback"),
+                Retired::Moved,
+            ),
+            (std::path::PathBuf::from("/A/y.app"), Retired::InUse),
+        ]);
+        assert_eq!(
+            app.claimant_retire_status().as_deref(),
+            Some("Moved 1 of 2 copies to the Trash; the other stayed where it was.")
+        );
+        app.claimant_retire_refusal =
+            Some("a move is already under way, or its worker could not start");
+        assert_eq!(
+            app.claimant_retire_status().as_deref(),
+            Some("Nothing was moved: a move is already under way, or its worker could not start.")
+        );
+    }
+
+    /// A finished move reaches the projection: the worker's report arrives, the
+    /// wake folds it (and invalidates the census), and the projection carries
+    /// the per-copy outcomes and the status row. Publishing it to a view is
+    /// `a_published_move_renders_on_the_security_page`.
+    #[test]
+    fn a_finished_move_reaches_the_projection() {
+        let mut app = App::headless_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(app.claimant_retire.start(
+            "x".to_string(),
+            vec![std::path::PathBuf::from("/A/x.app.rollback")],
+            move || {
+                let _ = tx.send(());
+            },
+        ));
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker finished");
+        // A second press refused while that move ran is superseded by the move
+        // ending: the status is the move's, not a refusal that is no longer so.
+        app.claimant_retire_refusal =
+            Some("a move is already under way, or its worker could not start");
+        let before = app.consent.census_generation_for_test();
+        app.on_claimant_retired();
+        assert_eq!(
+            app.claimant_retire_refusal, None,
+            "the move's end supersedes it"
+        );
+        assert!(
+            !app.claimant_retire.take_arrival(),
+            "the wake folded the arrival"
+        );
+        assert_eq!(
+            app.consent.census_generation_for_test(),
+            before + 1,
+            "and invalidated the census, since the disk changed"
+        );
+        let access = app.macos_access_projection();
+        assert_eq!(
+            access.retired,
+            Some(vec![(
+                std::path::PathBuf::from("/A/x.app.rollback"),
+                aterm_containment::consent::Retired::NotOffered
+            )]),
+            "the inert census offers nothing, so it stayed"
+        );
+        assert_eq!(access.retire_status.as_deref(), Some("Nothing was moved."));
+
+        app.claimant_retire.set_report_for_test(vec![(
+            std::path::PathBuf::from("/A/x.app.rollback"),
+            aterm_containment::consent::Retired::Moved,
+        )]);
+        let moved = app.macos_access_projection();
+        assert_eq!(
+            moved.retire_status.as_deref(),
+            Some("Moved 1 copy to the Trash."),
+            "a move that happened reaches the projection too"
+        );
+        assert_eq!(
+            moved.retired,
+            Some(vec![(
+                std::path::PathBuf::from("/A/x.app.rollback"),
+                aterm_containment::consent::Retired::Moved
+            )])
+        );
+    }
+
+    /// The publish step hands a real projection to a Security view, and the
+    /// view renders the move: its status row and its per-copy line.
+    #[test]
+    fn a_published_move_renders_on_the_security_page() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (_, view) = app.active_native_view(wid).expect("Settings view");
+        app.claimant_retire.set_report_for_test(vec![(
+            std::path::PathBuf::from("/A/x.app.rollback"),
+            aterm_containment::consent::Retired::Moved,
+        )]);
+        let access = app.macos_access_projection();
+        app.publish_macos_access(
+            &[(wid, view)],
+            &access,
+            crate::native_settings::ConsentGestures::inert(),
+        );
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("a Settings view");
+        };
+        let published = state.macos_access_for_test().expect("published");
+        let copy = crate::native_settings::macos_access_copy(published);
+        assert_eq!(
+            copy.retire_status.as_deref(),
+            Some("Moved 1 copy to the Trash.")
+        );
+        assert_eq!(
+            copy.retired,
+            vec!["Moved to the Trash: /A/x.app.rollback.".to_string()]
+        );
+    }
+
+    /// A confirmed warm-up that the host cannot start says why, in the view it
+    /// was confirmed from, in place of the line that said it was asking. A
+    /// headless instance starts no worker, so the press is refused at the park.
+    #[test]
+    fn a_confirmed_warm_up_that_starts_nothing_says_why() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (_, view) = app.active_native_view(wid).expect("Settings view");
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state_mut(view)
+        else {
+            panic!("a Settings view");
+        };
+        state.record_consent_warmup_for_test();
+        app.sync_settings_consent_posture();
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state_mut(view)
+        else {
+            panic!("a Settings view");
+        };
+        assert!(!state.take_consent_warmup_request(), "drained");
+        let why = crate::consent_warmup::StartOutcome::Refused
+            .refusal()
+            .expect("a refusal");
+        assert_eq!(
+            state.feedback.as_deref(),
+            Some(format!("Nothing was asked: {why}.").as_str())
+        );
+    }
+
+    /// The real park step drains a confirmed press from EVERY Settings view in
+    /// a window — also one that has since left the Security page — and hands
+    /// every view the process's one record of the owner's declines.
+    #[test]
+    fn the_park_drains_every_settings_view_and_shares_the_decline_record() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (instance, first) = app.active_native_view(wid).expect("Settings view");
+        let second = app
+            .split_active_with_native(
+                wid,
+                crate::tab_model::SplitAxis::Horizontal,
+                instance,
+                crate::native_app::AppViewState::Settings(Box::new(
+                    crate::native_settings::SettingsViewState::new(&app.config),
+                )),
+            )
+            .expect("second Settings presentation");
+        for (view, route) in [
+            (first, crate::native_settings::SettingsRoute::Security),
+            (second, crate::native_settings::SettingsRoute::Appearance),
+        ] {
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                app.native_runtime.view_state_mut(view)
+            else {
+                panic!("a Settings view");
+            };
+            state.record_claimant_retire_for_test(vec![std::path::PathBuf::from(
+                "/A/x.app.rollback",
+            )]);
+            state.navigate(route);
+        }
+        assert_eq!(app.settings_tabs_in_window(wid).len(), 2);
+        app.owner_quiet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .confirm_both_for_test();
+        app.sync_settings_consent_posture();
+        assert!(
+            !app.owner_quiet
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_confirmed_for_test(),
+            "the park settles every yes it takes up"
+        );
+        for view in [first, second] {
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                app.native_runtime.view_state_mut(view)
+            else {
+                panic!("a Settings view");
+            };
+            assert_eq!(state.take_claimant_retire_request(), None, "drained");
+            assert!(
+                std::sync::Arc::ptr_eq(state.owner_quiet_for_test(), &app.owner_quiet),
+                "every view holds the process's record"
+            );
+        }
+        assert_eq!(
+            app.claimant_retire_refusal,
+            Some("this instance has no window to ask the owner in"),
+            "drained, then refused here because a headless instance starts no worker"
+        );
+        assert_eq!(
+            app.claimant_retire_status().as_deref(),
+            Some("Nothing was moved: this instance has no window to ask the owner in."),
+            "the status a windowed instance's block would publish for such a refusal"
+        );
+    }
+
     #[test]
     fn settings_presentation_split_discovery_focus_and_close_preserve_terminal_siblings() {
         let mut app = App::headless_for_test();
@@ -4090,6 +4407,9 @@ mod a11y_message_wiring_tests {
             bytes_done: done * 1024 * 1024,
             bytes_total: 480 * 1024 * 1024,
         };
+        // A person asked (Check for Updates): the download is their wait and
+        // takes the row (design ruling 220).
+        app.note_update_check_asked(true);
         app.note_update_progress(&downloading(120));
         assert_eq!(
             app.message_band_rows, 0,
@@ -4600,12 +4920,13 @@ mod a11y_message_wiring_tests {
         assert_eq!(later.text, first.text, "the countdown is never announced");
     }
 
-    /// SPEECH FOLLOWS THE CLOCK A HIDDEN ESTIMATE PAINTS (review round 3,
-    /// 2026-09-24): until a download's estimate latches, its ETA slot shows the
-    /// work's elapsed clock, and the description says the same thing whole —
-    /// "running for N seconds" — where it said nothing; the name is the title.
+    /// A HIDDEN ESTIMATE IS NOT SPOKEN (ruling 241, withdrawing review
+    /// round 3's "running for N seconds"): until a download's estimate
+    /// latches its ETA slot is blank, so the description says no time at all
+    /// — it leads with the stats, read without the paint's alignment
+    /// padding; the name is the title.
     #[test]
-    fn the_clock_a_hidden_estimate_paints_is_described() {
+    fn a_hidden_estimate_is_not_described() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.prepare_terminal_capture_grid(wid).unwrap();
@@ -4626,9 +4947,9 @@ mod a11y_message_wiring_tests {
         assert_eq!(app.message_band_rows, 1);
         let row = message(&app, wid, ChromeMessage::BandRow0);
         let description = row.detail.clone().unwrap_or_default();
-        assert!(
-            description.starts_with("running for ") && description.contains(" seconds"),
-            "one read, no estimate: the clock leads the description: {description:?}"
+        assert_eq!(
+            description, "10 MB / 200 MB; Details \u{203a}",
+            "one read, no estimate: no time words, the stats lead unpadded"
         );
         assert_eq!(row.text, "Downloading aterm v0.91.0");
     }

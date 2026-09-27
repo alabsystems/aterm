@@ -28,15 +28,15 @@
 //! [`MenuAction`] enum and a no-op [`install`] still exist so the workspace builds
 //! everywhere and `Wake::MenuAction { action }` is a valid variant on every target.
 
-// macOS-only menu bar: on Linux `install` is a no-op stub, so the action
-// enum/dispatch helpers here are intentionally unused there.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// macOS-only menu bar: off macOS `install` is a no-op stub, and the helpers
+// only the AppKit menu reads are gated to macOS (and the tests).
 
 /// Pure arbitration behind AppKit's synchronous `applicationShouldTerminate:`
 /// callback. AppKit is answered immediately, while the real quit decision is
 /// deferred onto the event loop where `App` owns document durability. A stable
 /// generation makes delayed/duplicate callbacks harmless.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 enum NativeTerminateDecision {
     Dispatch(u64),
     DeferExisting,
@@ -45,6 +45,8 @@ enum NativeTerminateDecision {
 
 #[derive(Clone, Copy, Debug)]
 struct NativeTerminateArbiter {
+    /// Minted by [`Self::request`], which only the macOS `terminate:` relay calls.
+    #[cfg(any(target_os = "macos", test))]
     next_generation: u64,
     pending: Option<u64>,
     exiting: bool,
@@ -53,12 +55,14 @@ struct NativeTerminateArbiter {
 impl NativeTerminateArbiter {
     const fn new() -> Self {
         Self {
+            #[cfg(any(target_os = "macos", test))]
             next_generation: 1,
             pending: None,
             exiting: false,
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn request(&mut self) -> NativeTerminateDecision {
         if self.exiting {
             return NativeTerminateDecision::AllowExit;
@@ -72,10 +76,12 @@ impl NativeTerminateArbiter {
         NativeTerminateDecision::Dispatch(generation)
     }
 
+    #[cfg(any(unix, test))]
     fn is_current(self, generation: u64) -> bool {
         !self.exiting && self.pending == Some(generation)
     }
 
+    #[cfg(any(unix, test))]
     fn cancel(&mut self, generation: u64) -> bool {
         if self.pending != Some(generation) || self.exiting {
             return false;
@@ -118,10 +124,12 @@ fn with_native_terminate<R>(f: impl FnOnce(&mut NativeTerminateArbiter) -> R) ->
     f(&mut state)
 }
 
+#[cfg(unix)]
 pub(crate) fn native_termination_is_current(generation: u64) -> bool {
     with_native_terminate(|state| state.is_current(generation))
 }
 
+#[cfg(unix)]
 pub(crate) fn cancel_native_termination(generation: u64) -> bool {
     with_native_terminate(|state| state.cancel(generation))
 }
@@ -130,6 +138,7 @@ pub(crate) fn cancel_current_native_termination() -> bool {
     with_native_terminate(NativeTerminateArbiter::cancel_current)
 }
 
+#[cfg(unix)]
 pub(crate) fn complete_native_termination(generation: u64) -> bool {
     with_native_terminate(|state| state.complete(generation))
 }
@@ -147,7 +156,7 @@ pub(crate) fn complete_current_native_termination() -> bool {
 /// are routed through here too, rather than via `nil`-target responder selectors,
 /// so the WHOLE menu has one uniform, auditable dispatch path that lands in `App`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuAction {
+pub(crate) enum MenuAction {
     // App menu
     /// About aterm — open the About route in the native Settings tab.
     About,
@@ -402,7 +411,7 @@ impl MenuAction {
     /// (0 is the `NSMenuItem` default tag, reserved so an untagged item never
     /// looks like a real action).
     #[must_use]
-    pub fn tag(self) -> isize {
+    pub(crate) fn tag(self) -> isize {
         match self {
             MenuAction::About => 1,
             MenuAction::Preferences => 2,
@@ -483,7 +492,8 @@ impl MenuAction {
     /// or `None` for an unknown/zero tag (defensive — the action selector ignores
     /// a tag it can't decode rather than dispatching the wrong command).
     #[must_use]
-    pub fn from_tag(tag: isize) -> Option<MenuAction> {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn from_tag(tag: isize) -> Option<MenuAction> {
         Some(match tag {
             1 => MenuAction::About,
             2 => MenuAction::Preferences,
@@ -586,6 +596,7 @@ pub(crate) fn canonical_invoke_name(name: &str) -> &str {
 /// currently whole-tab surfaces, so advertising these while one is active would
 /// promise a split/session operation the host cannot perform.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
     matches!(
         action,
@@ -649,6 +660,7 @@ pub(crate) fn set_rename_surface_available(available: bool) {
     RENAME_SURFACE_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn rename_surface_available() -> bool {
     RENAME_SURFACE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -693,6 +705,7 @@ pub(crate) fn set_front_hold(hold: FrontHold, reason: &str) {
     FRONT_HOLD.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn front_hold() -> FrontHold {
     match FRONT_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
         1 => FrontHold::Local,
@@ -702,6 +715,7 @@ pub(crate) fn front_hold() -> FrontHold {
 }
 
 /// The published hold's reason token (empty with no hold).
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn front_hold_reason() -> String {
     FRONT_HOLD_REASON
         .lock()
@@ -713,6 +727,7 @@ pub(crate) fn front_hold_reason() -> String {
 /// projection, like its enabled bit: the row's help sentence, except the halt
 /// pair under a FLEET hold, which says the fleet's reason and that the hold
 /// cannot be lifted here. Stamped by `validateMenuItem:` on macOS.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_item_tip(action: MenuAction) -> String {
     if matches!(action, MenuAction::HoldSession | MenuAction::LiftHold)
         && front_hold() == FrontHold::Fleet
@@ -735,6 +750,7 @@ pub(crate) fn set_presence_toggles(band: bool, rim: bool) {
 }
 
 /// The checkmark a checkable native row shows, or `None` for a plain command.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
     match action {
         MenuAction::TogglePresenceBand => {
@@ -814,6 +830,7 @@ mod headless_os_ui_tests {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn native_menu_action_enabled(action: MenuAction) -> bool {
     if matches!(action, MenuAction::RenameSession | MenuAction::SetRole)
         && !rename_surface_available()
@@ -1002,12 +1019,89 @@ impl MenuAction {
         }
     }
 
+    /// Whether firing this action writes INPUT BYTES to a session's PTY — the
+    /// question the unread-input gate (`crate::input_stall::is_input_writing`)
+    /// asks of `invoke <action>`. EXHAUSTIVE for the reason
+    /// [`Self::invoke_authority`] is: a new action that pastes must be
+    /// classified here, not default to "writes nothing" and slip past the gate.
+    /// Only `Paste` writes input (the OS clipboard into the front tab's PTY);
+    /// the rest move view, window or tab state, the pasteboard, or config.
+    #[must_use]
+    pub(crate) const fn writes_pty_input(self) -> bool {
+        match self {
+            MenuAction::Paste => true,
+            MenuAction::About
+            | MenuAction::SoftwareUpdate
+            | MenuAction::Version
+            | MenuAction::ApplyUpdate
+            | MenuAction::Preferences
+            | MenuAction::Quit
+            | MenuAction::NewWindow
+            | MenuAction::NewTab
+            | MenuAction::OpenMarkdown
+            | MenuAction::OpenEditor
+            | MenuAction::ReopenClosedTab
+            | MenuAction::ReopenClosedView
+            | MenuAction::MoveTabToNewWindow
+            | MenuAction::MoveTabToNextWindow
+            | MenuAction::ViewSessionInNewWindow
+            | MenuAction::NewControlledWindow
+            | MenuAction::NewControlledTab
+            | MenuAction::NewControllerWindow
+            | MenuAction::NewControllerTab
+            | MenuAction::CloseTab
+            | MenuAction::Copy
+            | MenuAction::SelectAll
+            | MenuAction::Find
+            | MenuAction::FindNext
+            | MenuAction::FindPrev
+            | MenuAction::ToggleFullScreen
+            | MenuAction::FontIncrease
+            | MenuAction::FontDecrease
+            | MenuAction::FontActualSize
+            | MenuAction::SplitVertical
+            | MenuAction::SplitHorizontal
+            | MenuAction::ToggleMatrixRain
+            | MenuAction::FavouriteKitty
+            | MenuAction::NextKitty
+            | MenuAction::ToggleSeriousMode
+            | MenuAction::ToggleSettings
+            | MenuAction::TogglePresenceBand
+            | MenuAction::TogglePresenceRim
+            | MenuAction::Packages
+            | MenuAction::Messages
+            | MenuAction::OpenPalette
+            | MenuAction::CopySessionId
+            | MenuAction::CopyCwd
+            | MenuAction::ConnectToSession
+            | MenuAction::ShowConnectionMap
+            | MenuAction::ConfigureConnection
+            | MenuAction::DisconnectSession
+            | MenuAction::Fleet
+            | MenuAction::Inbox
+            | MenuAction::LedgerForSession
+            | MenuAction::HoldSession
+            | MenuAction::LiftHold
+            | MenuAction::FabricStatus
+            | MenuAction::FabricOn
+            | MenuAction::FabricOff
+            | MenuAction::RenameSession
+            | MenuAction::SetRole
+            | MenuAction::Minimize
+            | MenuAction::Zoom
+            | MenuAction::NextTab
+            | MenuAction::PrevTab
+            | MenuAction::Help => false,
+        }
+    }
+
     /// The row's HELP: one sentence a human reads as the item's tooltip (the
     /// native `NSMenuItem` tool tip) and a screen reader hears as the palette
     /// row's description — the accessibility label SPEC19 §9 asks for on every
     /// item. Exhaustive, so a new action cannot ship without one. Plain
     /// sentences: no command text, no mail body, nothing a session wrote.
     #[must_use]
+    #[cfg(any(unix, a11y_tree, test))]
     pub(crate) const fn help(self) -> &'static str {
         match self {
             MenuAction::About => "Open About aterm: the build, version and signing details.",
@@ -1192,7 +1286,7 @@ impl MenuAction {
 /// Modifier mask of a menu item's visual key-equivalent. Platform-neutral; the macOS
 /// builder maps it to `NSEventModifierFlags`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MenuMods {
+pub(crate) enum MenuMods {
     /// No modifier (or no key-equivalent at all when `key` is empty).
     None,
     /// ⌘
@@ -1207,7 +1301,7 @@ pub enum MenuMods {
 // macOS reads the live NSMenu for `chrome`, so these fields are read only off macOS + in
 // tests (the serialiser/builder consume them there) — allow the per-target "never read".
 #[derive(Clone, Copy, Debug)]
-pub enum MenuEntry {
+pub(crate) enum MenuEntry {
     Separator,
     Item {
         label: &'static str,
@@ -1264,7 +1358,7 @@ impl MenuEntry {
 }
 
 /// A top-level menu (App / File / …) and its entries.
-pub struct MenuSection {
+pub(crate) struct MenuSection {
     pub title: &'static str,
     pub entries: &'static [MenuEntry],
 }
@@ -1746,6 +1840,7 @@ const VERSION_MENU: &[MenuEntry] = &[
 /// fallback. In-window overlay surfaces (the palette rows) must use plain `↑`
 /// instead — the own-rendered text stack has no color-emoji face (verified coverage).
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
     let base = if crate::build_info::IS_RELEASE_BUILD {
         format!("v{}", crate::build_info::version_display())
@@ -1841,6 +1936,7 @@ pub(crate) fn staged_apply_label(
 /// badge the instant it lands, instead of leaving an arrow up for the full realized
 /// TTL that reads as "the update never resolved".
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn bar_title_attention(staged_present: bool, _realized: bool) -> bool {
     staged_present
 }
@@ -1859,7 +1955,7 @@ pub(crate) fn bar_title_attention(staged_present: bool, _realized: bool) -> bool
 ///
 /// A `#[test]` asserts every [`MenuAction`] appears here exactly once (the tab-context
 /// copies excepted), submenus included.
-pub const MENU_MODEL: &[MenuSection] = &[
+pub(crate) const MENU_MODEL: &[MenuSection] = &[
     MenuSection {
         title: "aterm",
         entries: APP_MENU,
@@ -1907,8 +2003,8 @@ pub const MENU_MODEL: &[MenuSection] = &[
 /// comma-separated list of rows a human sees), and then on the very next line as its
 /// own section titled `"<parent> ▸ <label>"` with its rows. One level deep, which is
 /// all the model allows.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-pub fn menu_chrome_lines() -> Vec<String> {
+#[cfg(any(not(target_os = "macos"), test))]
+pub(crate) fn menu_chrome_lines() -> Vec<String> {
     let mut out = Vec::with_capacity(MENU_MODEL.len() + 1);
     for section in MENU_MODEL {
         out.extend(chrome_lines_for(section.title, section.entries));
@@ -1919,7 +2015,7 @@ pub fn menu_chrome_lines() -> Vec<String> {
 /// One section's line(s): the section itself, then each submenu's own line, in the
 /// order the submenus appear. Shared with nothing on macOS (the live reader walks the
 /// `NSMenu`), but the SHAPE it prints is the contract that reader byte-matches.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 fn chrome_lines_for(title: &str, entries: &[MenuEntry]) -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut nested: Vec<String> = Vec::new();
@@ -1943,7 +2039,7 @@ fn chrome_lines_for(title: &str, entries: &[MenuEntry]) -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{
+pub(crate) use macos::{
     MenuHandle, choose_local_file, confirm, confirm_owner, defer_quit_for_terminate, install,
     notify, open_file_in_workspace, open_help_url, update_version_menu,
 };
@@ -1973,7 +2069,7 @@ pub(crate) fn mark_process_headless() {
 /// another app) must refuse because this process is headless — saying so on
 /// stderr, which is the only surface a headless instance has. Every such
 /// helper in the macOS module asks this FIRST; a unit test pins that.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn os_ui_refused(what: &str) -> bool {
     let refused = PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed);
     if refused {
@@ -1987,27 +2083,29 @@ pub(crate) fn os_ui_refused(what: &str) -> bool {
 /// Off macOS there is no NSWorkspace, and "Open Log" spawns nothing in its place: the
 /// Settings page names the file's path in the log's feedback instead. `false`.
 #[cfg(not(target_os = "macos"))]
-pub fn open_file_in_workspace(_path: &std::path::Path) -> bool {
+pub(crate) fn open_file_in_workspace(_path: &std::path::Path) -> bool {
     false
 }
 
 /// Non-macOS no-op handle: there is no platform menu off macOS. Held by `App` in
 /// the same field on every target so the struct shape is platform-independent.
 #[cfg(not(target_os = "macos"))]
-pub type MenuHandle = ();
+pub(crate) type MenuHandle = ();
 
 /// Non-macOS stub: no platform menu bar exists, so installing one is a no-op that
 /// installs nothing (`None`). Returns `Option<MenuHandle>` so the `resumed` call
 /// site (`self._menu = menu::install(..)`) is identical on every target.
 #[cfg(not(target_os = "macos"))]
-pub fn install(_proxy: &winit::event_loop::EventLoopProxy<crate::Wake>) -> Option<MenuHandle> {
+pub(crate) fn install(
+    _proxy: &winit::event_loop::EventLoopProxy<crate::Wake>,
+) -> Option<MenuHandle> {
     None
 }
 
 /// Non-macOS stub: no native menu bar, so there is no Version menu to retitle/rebuild.
 /// The palette's Version-section rows are the cross-platform mirror of this state.
 #[cfg(not(target_os = "macos"))]
-pub fn update_version_menu(
+pub(crate) fn update_version_menu(
     _handle: &MenuHandle,
     _staged: Option<(u64, &str)>,
     _trouble: Option<&ApplyTrouble>,
@@ -2019,7 +2117,7 @@ pub fn update_version_menu(
 /// macOS panel's exact semantics — one existing local file, aliases resolved, no
 /// type restriction, cancel is `None`. See [`crate::file_picker_win`].
 #[cfg(windows)]
-pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
     crate::file_picker_win::choose(title, prompt)
 }
 
@@ -2029,7 +2127,7 @@ pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf
 /// one asks [`local_file_picker_available`] first, so the row greys out instead
 /// of accepting a dead click.
 #[cfg(not(any(target_os = "macos", windows)))]
-pub fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
 }
 
@@ -2047,17 +2145,17 @@ pub fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathB
 /// Windows answers with a live probe rather than a `cfg!` — see
 /// [`crate::file_picker_win::available`].
 #[cfg(target_os = "macos")]
-pub fn local_file_picker_available() -> bool {
+pub(crate) fn local_file_picker_available() -> bool {
     true
 }
 
 #[cfg(windows)]
-pub fn local_file_picker_available() -> bool {
+pub(crate) fn local_file_picker_available() -> bool {
     crate::file_picker_win::available()
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-pub fn local_file_picker_available() -> bool {
+pub(crate) fn local_file_picker_available() -> bool {
     false
 }
 
@@ -2069,7 +2167,7 @@ pub fn local_file_picker_available() -> bool {
 /// rejections; silence there is the same class of defect as the dead button
 /// the picker itself was added to fix.
 #[cfg(windows)]
-pub fn notify(title: &str, body: &str) {
+pub(crate) fn notify(title: &str, body: &str) {
     crate::win_alert_ok(title, body);
 }
 
@@ -2077,7 +2175,7 @@ pub fn notify(title: &str, body: &str) {
 /// caller's own `eprintln!` is the channel there, and a Linux GUI launch does
 /// keep its stderr.
 #[cfg(not(any(target_os = "macos", windows)))]
-pub fn notify(_title: &str, _body: &str) {}
+pub(crate) fn notify(_title: &str, _body: &str) {}
 
 /// Help, off macOS: the project page in the default browser, through the SAME
 /// helper a Ctrl-clicked link goes through (`open_url_external` —
@@ -2088,7 +2186,7 @@ pub fn notify(_title: &str, _body: &str) {}
 /// nothing at all. There is no bundled `Help.html` to prefer here: the macOS arm
 /// reads it out of the `.app`'s `Contents/Resources`, which no other target has.
 #[cfg(not(target_os = "macos"))]
-pub fn open_help_url() {
+pub(crate) fn open_help_url() {
     crate::app_mouse::open_url_external(HELP_URL);
 }
 
@@ -2110,11 +2208,6 @@ const HELP_URL: &str = "https://github.com/alabsystems/aterm";
 /// (`Privacy_DocumentsFolder` and its siblings) are NOT anchors — they name
 /// sub-rows of one combined Files-and-Folders section — so they are not
 /// offered here and cannot be reached by mistake.
-///
-/// `allow(dead_code)`: nothing CONSTRUCTS a pane yet — the Security block that
-/// presses [`open_privacy_settings`] is Phase 2's, and the allow comes off with
-/// it, exactly as that function's own note says.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PrivacyPane {
     /// Full Disk Access — the single grant macOS offers for this class.
@@ -2136,19 +2229,23 @@ pub(crate) enum PrivacyPane {
 /// one `crate::is_safe_url`'s rejection test names; keeping the two apart is
 /// why [`open_privacy_settings`] documents its own call site rather than
 /// borrowing the link allowlist.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_FULL_DISK_ACCESS: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles";
 
 /// Full Disk Access, through the legacy pane id the extension still declares
 /// for itself (`legacyBundleIdentifier`). Tried only if the modern id is
 /// refused outright.
+#[cfg(any(target_os = "macos", test))]
 const SETTINGS_FULL_DISK_ACCESS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 
 /// The per-app Files & Folders list, through the modern Settings extension.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_FILES_AND_FOLDERS: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders";
 
 /// Files & Folders, through the legacy pane id.
+#[cfg(any(target_os = "macos", test))]
 const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
 
@@ -2157,6 +2254,7 @@ const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
 /// `the_last_candidate_is_the_unanchored_pane_root` pins: the last entry of
 /// [`privacy_settings_urls`] must always be an anchor-free page that opens
 /// even if every anchor stops resolving.
+#[cfg(any(target_os = "macos", test))]
 const SETTINGS_PRIVACY_ROOT: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension";
 
@@ -2167,6 +2265,7 @@ const SETTINGS_PRIVACY_ROOT: &str =
 /// Apple-documented; if the anchors stop resolving, the Privacy & Security
 /// page still opens and the caller shows [`privacy_settings_path_words`] so
 /// the rest of the route is in words.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3] {
     match pane {
         PrivacyPane::FullDiskAccess => [
@@ -2190,7 +2289,6 @@ pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3
 /// the URL", never "it scrolled to the row"), so the surface that opens the
 /// pane can always say where to look. It names the pane and nothing else — no
 /// folder, and no claim about what a grant there covers.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static str {
     match pane {
         PrivacyPane::FullDiskAccess => {
@@ -2207,7 +2305,6 @@ pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static s
 /// The caller needs the difference because the degraded outcomes change what
 /// it must SAY, not merely what it logs: on anything but [`Self::Anchored`]
 /// the words are the only route the person has.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SettingsOpen {
     /// An anchored URL was accepted. System Settings opened; whether it
@@ -2216,11 +2313,19 @@ pub(crate) enum SettingsOpen {
     Anchored,
     /// Both anchors were refused; the un-anchored Privacy & Security page
     /// opened instead. The caller must show [`privacy_settings_path_words`].
+    #[cfg(target_os = "macos")]
     PaneRoot,
     /// Nothing opened — off the main thread, off macOS, or the shell refused
     /// every candidate. The caller must show the words and must not claim a
     /// pane is up.
     Refused,
+}
+
+impl SettingsOpen {
+    /// Whether System Settings opened at all (anchored or at the pane root).
+    pub(crate) const fn opened(self) -> bool {
+        !matches!(self, Self::Refused)
+    }
 }
 
 /// Open System Settings at `pane` — the owner-gesture entry point the Security
@@ -2236,11 +2341,6 @@ pub(crate) enum SettingsOpen {
 /// no stderr and "the button did nothing visible" is otherwise unexplainable
 /// after the fact. The caller still has to SHOW the words; the log is the
 /// diagnostic copy, not the user-facing one.
-///
-/// `allow(dead_code)`: this is the seam Phase 2's Security block presses, and
-/// `native_settings.rs` is the only caller it will ever have. The allow comes
-/// off with that call site.
-#[allow(dead_code)]
 pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
     #[cfg(target_os = "macos")]
     let outcome = macos::open_privacy_settings(pane);
@@ -2270,8 +2370,9 @@ mod macos {
     use winit::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
-        NS_ALERT_FIRST_BUTTON_RETURN, NS_EVENT_MODIFIER_FLAG_COMMAND,
-        NS_EVENT_MODIFIER_FLAG_CONTROL, NS_EVENT_MODIFIER_FLAG_SHIFT, NS_MODAL_RESPONSE_OK,
+        NS_ALERT_FIRST_BUTTON_RETURN, NS_ALERT_SECOND_BUTTON_RETURN,
+        NS_EVENT_MODIFIER_FLAG_COMMAND, NS_EVENT_MODIFIER_FLAG_CONTROL,
+        NS_EVENT_MODIFIER_FLAG_SHIFT, NS_MODAL_RESPONSE_OK,
     };
     use crate::appkit::{self, MainThread};
 
@@ -2292,7 +2393,7 @@ mod macos {
     /// expires. AppKit references a menu item's target WEAKLY, so the target must
     /// outlive the run loop — `App` holds this handle in a field for the process
     /// lifetime. Named the same on every platform (`()` off macOS).
-    pub struct MenuHandle {
+    pub(crate) struct MenuHandle {
         /// The single `menuAction:` relay target every item is wired to.
         target: Retained<MenuTarget>,
         /// The Version menu's top-level bar item (title `v<version>[ ⬆️]`), whose
@@ -2406,7 +2507,7 @@ mod macos {
     /// is `None`) the menu is simply not installed — never a panic. The winit
     /// event loop always runs `resumed` on the main thread, so in practice the
     /// marker is always present.
-    pub fn install(proxy: &EventLoopProxy<Wake>) -> Option<MenuHandle> {
+    pub(crate) fn install(proxy: &EventLoopProxy<Wake>) -> Option<MenuHandle> {
         let main_thread = MainThread::new()?;
         let _ = TERMINATE_PROXY.set(proxy.clone());
         let target = MenuTarget::alloc_init(main_thread, proxy.clone())?;
@@ -2472,7 +2573,7 @@ mod macos {
     /// still lives INSIDE the menu — its "Updated to aterm v… just now" row — and in its
     /// palette twin, both of which self-dismiss; only the
     /// always-visible bar badge is gated to the action-needed state.
-    pub fn update_version_menu(
+    pub(crate) fn update_version_menu(
         handle: &MenuHandle,
         staged: Option<(u64, &str)>,
         trouble: Option<&super::ApplyTrouble>,
@@ -2723,7 +2824,7 @@ mod macos {
     /// approved. The panel grants no directory or multiple-file authority; the caller
     /// still canonicalizes, bounds, UTF-8-validates, and mints the process-local
     /// document grant before reading the file.
-    pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+    pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
         if super::os_ui_refused(title) {
             return None;
         }
@@ -2811,26 +2912,41 @@ mod macos {
     /// the duration of the `runModal` call: Return (any modifiers) clicks PROCEED,
     /// Escape clicks Cancel, everything else passes through. The watch is a LOCAL whose
     /// scope ends with the blocking call, so it cannot outlive the alert.
-    pub fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
+    pub(crate) fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
         // Headless never shows a confirm: proceed, as `confirm_destructive_close`
         // already does for a headless instance. Every other case where no alert
         // could be shown proceeds too: a quit that cannot ask must not wedge.
-        ask(title, body, proceed_label).unwrap_or(true)
+        ask(title, body, proceed_label, AlertDefault::Proceed).unwrap_or(true)
     }
 
     /// [`confirm`] for an owner gesture that changes this Mac — the Security
     /// panel's reset, warm-up and *Move to Trash*. It fails CLOSED: with no
-    /// window, off the main thread, or with no alert built, the answer is no.
+    /// window, off the main thread, or with no alert built, nobody is asked and
+    /// it returns `None` — never a yes.
     /// Control input arrives as a `Wake`, which is queued while `runModal` spins
     /// and never becomes an event the alert receives, so no control verb can
-    /// answer it.
-    pub fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> bool {
-        ask(title, body, proceed_label) == Some(true)
+    /// answer it. And because a program can choose WHEN the alert appears, its
+    /// default button is Cancel and the destructive button refuses keyboard
+    /// focus: a Return, Escape, Tab or Space the owner was typing elsewhere
+    /// never says yes — only a deliberate click on `proceed_label` does.
+    /// `None` when no alert could be shown — nobody was asked, which the caller
+    /// must not read as a decline.
+    pub(crate) fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
+        ask(title, body, proceed_label, AlertDefault::Cancel)
+    }
+
+    /// Which button of [`ask`]'s alert Return presses.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AlertDefault {
+        /// Return (with any modifiers, via `alert_keys`) proceeds: ⌘Q's alert.
+        Proceed,
+        /// Return and Escape cancel, and no key watch is installed.
+        Cancel,
     }
 
     /// The alert behind [`confirm`] and [`confirm_owner`]: `None` when none
     /// could be shown, else whether the user chose to proceed.
-    fn ask(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
+    fn ask(title: &str, body: &str, proceed_label: &str, default: AlertDefault) -> Option<bool> {
         if super::os_ui_refused(title) || MainThread::new().is_none() {
             return None;
         }
@@ -2864,6 +2980,23 @@ mod macos {
         unsafe {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
+            if default == AlertDefault::Cancel {
+                // The first button added is the default, so Cancel goes first:
+                // Return and Escape both cancel, and the destructive button
+                // takes a click — it refuses keyboard focus, so with keyboard
+                // navigation on neither Tab nor Space reaches it either. No key
+                // watch — its job is to make Return proceed.
+                let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), cancel.id());
+                let proceed_button =
+                    appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), proceed.id());
+                if !proceed_button.is_null() {
+                    // `-setRefusesFirstResponder:` is `-(void)(BOOL)` on NSControl,
+                    // which the NSButton `-addButtonWithTitle:` returns is.
+                    appkit::send_v_bool(proceed_button, sel!(setRefusesFirstResponder:), true);
+                }
+                let response = appkit::send_isize(alert.id(), sel!(runModal));
+                return Some(response == NS_ALERT_SECOND_BUTTON_RETURN);
+            }
             // First button added is the default (Return, with an EMPTY modifier mask —
             // hence the key watch below): the PROCEED action. The second is Cancel
             // (AppKit binds Escape to it).
@@ -2901,7 +3034,7 @@ mod macos {
     /// primary line, `body` the details (version + "what changed"). Best-effort: off the
     /// main thread it does nothing. `runModal` is the same nested-modal pattern `confirm`
     /// uses, safe to call straight from the winit event handler.
-    pub fn notify(title: &str, body: &str) {
+    pub(crate) fn notify(title: &str, body: &str) {
         if super::os_ui_refused(title) || MainThread::new().is_none() {
             return;
         }
@@ -2938,7 +3071,7 @@ mod macos {
     /// the same generation is awaiting confirmation/save proofs. Once `App` marks
     /// the generation complete, a re-entrant terminate is allowed (normal aterm
     /// shutdown uses `ActiveEventLoop::exit` and does not need to re-enter AppKit).
-    pub fn defer_quit_for_terminate() -> bool {
+    pub(crate) fn defer_quit_for_terminate() -> bool {
         let decision = super::with_native_terminate(NativeTerminateArbiter::request);
         match decision {
             NativeTerminateDecision::AllowExit => true,
@@ -2964,7 +3097,7 @@ mod macos {
     /// (`Contents/Resources/Help.html`, bundled by the ship tool — aterm-release
     /// `bundle.rs`) in the default browser. Falls back to the project page when
     /// running outside the `.app` (e.g. `cargo run`), where no bundled resource exists.
-    pub fn open_help_url() {
+    pub(crate) fn open_help_url() {
         if let Some(help) = bundled_resource("Help.html") {
             open_in_workspace(&help, true);
         } else {
@@ -3030,7 +3163,7 @@ mod macos {
     /// `file://` URL: macOS opens it in the app that owns the type (Console for a `.log`).
     /// No shell and no Terminal are spawned, and nothing a program printed can reach this
     /// (the link path's allowlist stays closed). Main thread only; `false` when refused.
-    pub fn open_file_in_workspace(path: &std::path::Path) -> bool {
+    pub(crate) fn open_file_in_workspace(path: &std::path::Path) -> bool {
         path.to_str().is_some_and(|s| open_in_workspace(s, true))
     }
 
@@ -3077,7 +3210,7 @@ mod macos {
     /// [`privacy_settings_path_words`] — the route in words. Off the main thread
     /// nothing is attempted and the answer is [`SettingsOpen::Refused`], which is
     /// the same instruction to the caller.
-    pub fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
+    pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
         if MainThread::new().is_none() {
             return SettingsOpen::Refused;
         }
@@ -3240,361 +3373,6 @@ mod macos {
             assert_eq!(Bool::ENCODING, "B");
         }
 
-        /// THE PROOF for BEHAVIOUR, and FOUNDATION is what reads the `BOOL`.
-        ///
-        /// `NSMethodSignature` + `NSInvocation` is not a detour, it is the
-        /// exact machinery the registered encoding exists for: a method type
-        /// string is what AppKit reaches for on every path that does not send
-        /// the selector directly, and `NSInvocation` decodes the return value
-        /// **by that string**. So this asks Foundation three questions the port
-        /// cannot answer for itself —
-        ///
-        /// * what does `- (BOOL)validateMenuItem:(id)` look like from outside?
-        ///   (`-methodReturnType` must be `Bool::ENCODING`, `-methodReturnLength`
-        ///   must be one byte, `-numberOfArguments` must be three)
-        /// * what does invoking it return for an item AppKit itself tagged?
-        /// * and does the answer differ for the two tags?
-        ///
-        /// — and a wrong encoding fails all three rather than half-passing: a
-        /// `"q"` return would report length 8, an `"@"` return would report a
-        /// pointer, and `NSInvocation` would copy the wrong number of bytes out.
-        ///
-        /// REFUTED, and the refutation is why this shape: the obvious test was
-        /// `-[NSMenu update]`, AppKit's own NSMenuValidation pass. It reaches
-        /// the target through `NSApplication`, and a libtest process has no
-        /// `NSApplication` and cannot make one (`+sharedApplication` is
-        /// main-thread-only; libtest runs every test on a spawned thread). It
-        /// counted **0** `validateMenuItem:` calls, silently — exactly the
-        /// "compiles, does nothing, reports success" shape this campaign has
-        /// already been caught by once.
-        #[test]
-        fn foundation_reads_the_declared_bool_through_the_registered_encoding() {
-            VALIDATED.store(0, Ordering::SeqCst);
-            ACTIONED.store(0, Ordering::SeqCst);
-            let probe = MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
-            autoreleasepool(|_| {
-                // SAFETY: every send below is cast to the exact prototype named
-                // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
-                // `+invocationWithMethodSignature:` is `-(id)(id)`;
-                // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
-                // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
-                // at the pointer, so `&mut arg` need only outlive the call;
-                // `-invokeWithTarget:` is `-(void)(id)`; `-getReturnValue:` is
-                // `-(void)(void *)` and writes `methodReturnLength` bytes, which
-                // is asserted to be `size_of::<Bool>()` before the call.
-                unsafe {
-                    let menu = new_menu().expect("NSMenu");
-                    appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), true);
-                    let mut items = Vec::new();
-                    for tag in 1..=2 {
-                        let item =
-                            new_item(&format!("row {tag}"), sel!(menuAction:), "").expect("item");
-                        appkit::send_v_id(item.id(), sel!(setTarget:), probe.as_id());
-                        appkit::send_v_isize(item.id(), sel!(setTag:), tag);
-                        appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
-                        items.push(item);
-                    }
-                    add_separator(&menu);
-
-                    // What Foundation reads out of the REGISTERED encoding.
-                    let sig_for: unsafe extern "C-unwind" fn(
-                        Id,
-                        aterm_objc::Sel,
-                        aterm_objc::Sel,
-                    ) -> Id = aterm_objc::msg();
-                    let sig = sig_for(
-                        probe.as_id(),
-                        sel!(methodSignatureForSelector:),
-                        sel!(validateMenuItem:),
-                    );
-                    assert!(
-                        !sig.is_null(),
-                        "Foundation could not build a signature for the declared method"
-                    );
-                    // THE PRODUCTION CLASS, not the probe. A judge planted a
-                    // wrong return type on `MenuTarget::validate_menu_item` and
-                    // this test PASSED, because every signature below came from
-                    // `MenuProbe` — a copy that carries the same shape by hand.
-                    // Only the encoding test caught the plant. The probe is
-                    // still what gets INVOKED (constructing a real `MenuTarget`
-                    // needs an `EventLoopProxy` this test has no event loop to
-                    // give), but the signature Foundation is asked to agree with
-                    // now comes from the class that ships, via the class-side
-                    // `+instanceMethodSignatureForSelector:` — which needs no
-                    // instance at all.
-                    let cls_sig_for: unsafe extern "C-unwind" fn(
-                        aterm_objc::ClassPtr,
-                        aterm_objc::Sel,
-                        aterm_objc::Sel,
-                    ) -> Id = aterm_objc::msg();
-                    let target_sig = cls_sig_for(
-                        MenuTarget::class(),
-                        sel!(instanceMethodSignatureForSelector:),
-                        sel!(validateMenuItem:),
-                    );
-                    assert!(
-                        !target_sig.is_null(),
-                        "Foundation could not build a signature for MenuTarget's declared method"
-                    );
-                    let target_ret_type: unsafe extern "C-unwind" fn(
-                        Id,
-                        aterm_objc::Sel,
-                    )
-                        -> *const std::ffi::c_char = aterm_objc::msg();
-                    let target_ret = std::ffi::CStr::from_ptr(target_ret_type(
-                        target_sig,
-                        sel!(methodReturnType),
-                    ));
-                    assert_eq!(
-                        target_ret.to_str().expect("ascii"),
-                        Bool::ENCODING,
-                        "MenuTarget — the class that ships — disagrees with the encoding table"
-                    );
-                    assert_eq!(
-                        appkit::send_usize(target_sig, sel!(methodReturnLength)),
-                        size_of::<Bool>(),
-                        "MenuTarget's registered return length is not a Bool's"
-                    );
-                    assert_eq!(
-                        appkit::send_usize(target_sig, sel!(numberOfArguments)),
-                        3,
-                        "MenuTarget's registered argument count moved"
-                    );
-                    let ret_type: unsafe extern "C-unwind" fn(
-                        Id,
-                        aterm_objc::Sel,
-                    )
-                        -> *const std::ffi::c_char = aterm_objc::msg();
-                    let ret = std::ffi::CStr::from_ptr(ret_type(sig, sel!(methodReturnType)));
-                    assert_eq!(
-                        ret.to_str().expect("ascii"),
-                        Bool::ENCODING,
-                        "NSMethodSignature disagrees with the encoding table"
-                    );
-                    assert_eq!(
-                        appkit::send_usize(sig, sel!(methodReturnLength)),
-                        size_of::<Bool>()
-                    );
-                    assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 3);
-
-                    // …and what it returns, per tag, decoded by that string.
-                    for (i, item) in items.iter().enumerate() {
-                        let tag = i as isize + 1;
-                        let inv = appkit::send_id_id(
-                            class(c"NSInvocation").as_id(),
-                            sel!(invocationWithMethodSignature:),
-                            sig,
-                        );
-                        assert!(!inv.is_null());
-                        let set_sel: unsafe extern "C-unwind" fn(
-                            Id,
-                            aterm_objc::Sel,
-                            aterm_objc::Sel,
-                        ) = aterm_objc::msg();
-                        set_sel(inv, sel!(setSelector:), sel!(validateMenuItem:));
-                        let set_arg: unsafe extern "C-unwind" fn(
-                            Id,
-                            aterm_objc::Sel,
-                            *mut std::ffi::c_void,
-                            isize,
-                        ) = aterm_objc::msg();
-                        let mut arg = item.id();
-                        set_arg(
-                            inv,
-                            sel!(setArgument:atIndex:),
-                            std::ptr::from_mut(&mut arg).cast(),
-                            2,
-                        );
-                        appkit::send_v_id(inv, sel!(invokeWithTarget:), probe.as_id());
-                        let mut out = Bool::NO;
-                        let get_ret: unsafe extern "C-unwind" fn(
-                            Id,
-                            aterm_objc::Sel,
-                            *mut std::ffi::c_void,
-                        ) = aterm_objc::msg();
-                        get_ret(
-                            inv,
-                            sel!(getReturnValue:),
-                            std::ptr::from_mut(&mut out).cast(),
-                        );
-                        assert_eq!(
-                            out.as_bool(),
-                            tag % 2 != 0,
-                            "NSInvocation decoded the wrong BOOL for tag {tag}"
-                        );
-                    }
-                    assert_eq!(VALIDATED.load(Ordering::SeqCst), 2);
-
-                    // The separator AppKit made really is one.
-                    let sep = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 2);
-                    assert!(appkit::send_bool(sep, sel!(isSeparatorItem)));
-
-                    // …and the action leg, through the runtime's own dispatch
-                    // of the target/action pair AppKit stored.
-                    let target_of: unsafe extern "C-unwind" fn(Id, aterm_objc::Sel) -> Id =
-                        aterm_objc::msg();
-                    assert_eq!(target_of(items[1].id(), sel!(target)), probe.as_id());
-                    let perform_sel: unsafe extern "C-unwind" fn(
-                        Id,
-                        aterm_objc::Sel,
-                        aterm_objc::Sel,
-                        Id,
-                    ) -> Id = aterm_objc::msg();
-                    perform_sel(
-                        probe.as_id(),
-                        sel!(performSelector:withObject:),
-                        sel!(menuAction:),
-                        items[1].id(),
-                    );
-                }
-            });
-            assert_eq!(ACTIONED.load(Ordering::SeqCst), 2);
-        }
-
-        /// The menu bar this module builds is the menu bar it built before: the
-        /// same titles, in the same order, with the same submenu item titles,
-        /// tags, key equivalents and modifier masks — read back out of AppKit.
-        ///
-        /// This is the regression check the port owes a USER-VISIBLE surface. It
-        /// does not install the bar (that needs `NSApp` and the main thread); it
-        /// builds the identical structure through the ported constructors and
-        /// interrogates it.
-        #[test]
-        fn the_built_menu_bar_has_the_titles_tags_and_masks_it_had() {
-            let probe = MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
-            autoreleasepool(|_| {
-                // SAFETY: plain AppKit accessors on menus this test built.
-                unsafe {
-                    // The App menu, whole, as `build_app_menu` composes it.
-                    let menu = new_menu().expect("NSMenu");
-                    super::add_item(
-                        &menu,
-                        probe_as_menu_target(&probe),
-                        "Settings…",
-                        super::MenuAction::ToggleSettings,
-                        ",",
-                        true,
-                    );
-                    super::add_item_mods(
-                        &menu,
-                        probe_as_menu_target(&probe),
-                        "Enter Full Screen",
-                        super::MenuAction::ToggleFullScreen,
-                        "f",
-                        super::command_control_mask(),
-                    );
-                    let settings = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 0);
-                    assert_eq!(
-                        appkit::nsstring_to_rust(appkit::send_id(settings, sel!(title))),
-                        "Settings…"
-                    );
-                    assert_eq!(
-                        appkit::send_isize(settings, sel!(tag)),
-                        super::MenuAction::ToggleSettings.tag()
-                    );
-                    assert_eq!(
-                        appkit::nsstring_to_rust(appkit::send_id(settings, sel!(keyEquivalent))),
-                        ","
-                    );
-                    assert_eq!(
-                        appkit::send_usize(settings, sel!(keyEquivalentModifierMask)),
-                        super::command_mask()
-                    );
-                    let full = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 1);
-                    assert_eq!(
-                        appkit::send_usize(full, sel!(keyEquivalentModifierMask)),
-                        super::command_control_mask()
-                    );
-                    assert_ne!(super::command_control_mask(), super::command_mask());
-
-                    // A submenu attaches under a titled, action-less bar item.
-                    let bar = new_menu().expect("NSMenu");
-                    let sub = new_menu().expect("NSMenu");
-                    let item = super::attach_submenu(&bar, "Version", sub).expect("attached");
-                    assert_eq!(
-                        appkit::nsstring_to_rust(appkit::send_id(item.id(), sel!(title))),
-                        "Version"
-                    );
-                    // The item was BUILT with `Sel::NULL`, and AppKit then
-                    // rewrote its action to its own `submenuAction:` when the
-                    // submenu was attached — measured here rather than assumed;
-                    // the first version of this assertion expected nil and was
-                    // wrong. What matters is that nothing of ours is left on it.
-                    let action_of: unsafe extern "C-unwind" fn(
-                        Id,
-                        aterm_objc::Sel,
-                    )
-                        -> aterm_objc::Sel = aterm_objc::msg();
-                    let action = action_of(item.id(), sel!(action));
-                    assert_ne!(action, sel!(menuAction:));
-                    assert_eq!(action, sel!(submenuAction:));
-                    let attached = appkit::send_id(item.id(), sel!(submenu));
-                    assert!(!attached.is_null());
-                    assert_eq!(
-                        appkit::nsstring_to_rust(appkit::send_id(attached, sel!(title))),
-                        "Version"
-                    );
-                    assert_eq!(appkit::send_isize(bar.id(), sel!(numberOfItems)), 1);
-                }
-            });
-        }
-
-        /// SPEC19 §9: under a FLEET hold the native bar's halt pair greys WITH
-        /// the fleet's reason. The palette's rows carried it; the bar's rows
-        /// said only their help (`FrontHold` was a bare `AtomicU8`, and
-        /// `validateMenuItem:` set only the state). The real `FABRIC_MENU` is
-        /// built through the ported constructors with the probe target; the
-        /// tip is what `validateMenuItem:` stamps at the moment the menu opens,
-        /// so the stamp is called here as AppKit would call it.
-        #[test]
-        fn a_fleet_hold_greys_the_native_halt_pair_with_its_reason() {
-            use super::super::{FABRIC_MENU, FrontHold, MENU_STATICS, MenuAction};
-            let _statics = MENU_STATICS.lock().unwrap_or_else(|p| p.into_inner());
-            super::super::set_active_tab_is_terminal(true);
-            let probe = MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
-            autoreleasepool(|_| {
-                let menu = super::build_section(probe_as_menu_target(&probe), FABRIC_MENU)
-                    .expect("the Fabric menu");
-                let halt = [MenuAction::HoldSession, MenuAction::LiftHold];
-                // SAFETY: plain accessors on the menu this test built and the
-                // live items it holds.
-                let items: Vec<(Id, MenuAction)> = unsafe {
-                    let n = appkit::send_isize(menu.id(), sel!(numberOfItems));
-                    (0..n)
-                        .filter_map(|i| {
-                            let item = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), i);
-                            let action = MenuAction::from_tag(appkit::send_isize(item, sel!(tag)))?;
-                            halt.contains(&action).then_some((item, action))
-                        })
-                        .collect()
-                };
-                assert_eq!(items.len(), 2, "both halt rows are on the Fabric menu");
-
-                super::super::set_front_hold(FrontHold::Fleet, "main%20broken");
-                for (item, action) in &items {
-                    assert!(!super::super::native_menu_action_enabled(*action));
-                    super::stamp_native_tip(*item, *action);
-                    // SAFETY: `-toolTip` is `-(NSString *)` on a live NSMenuItem.
-                    let tip =
-                        unsafe { appkit::nsstring_to_rust(appkit::send_id(*item, sel!(toolTip))) };
-                    assert!(
-                        tip.contains("cannot be lifted here") && tip.contains("main broken"),
-                        "{action:?}: the greyed native row says nothing of the fleet hold; its tool tip is {tip:?}"
-                    );
-                }
-
-                // The hold lifts: the pair's tips return to their help.
-                super::super::set_front_hold(FrontHold::None, "");
-                for (item, action) in &items {
-                    super::stamp_native_tip(*item, *action);
-                    // SAFETY: as above.
-                    let tip =
-                        unsafe { appkit::nsstring_to_rust(appkit::send_id(*item, sel!(toolTip))) };
-                    assert_eq!(tip, action.help(), "{action:?}");
-                }
-            });
-        }
-
         /// `add_item` takes a `&MenuTarget`; the probe is a different declared
         /// class of the same shape, so this reinterprets it for the two calls
         /// above. Sound for exactly the reason the trampolines are: both types
@@ -3635,9 +3413,403 @@ mod macos {
         }
 
         /// Keeps `Obj` used even if a future edit drops the only other use.
-        #[allow(dead_code)]
         fn _obj_is_the_owning_type(o: Obj) -> Id {
             o.id()
+        }
+
+        /// THE WINDOW-SERVER ROWS (2026-09-26). Each of these builds its menu
+        /// through the ported constructors, and two of the calls those make open
+        /// a WindowServer connection: `+[NSMenuItem separatorItem]`
+        /// (`add_separator`) and `-[NSMenuItem setToolTip:]` (every
+        /// `add_item_mods` row, and `stamp_native_tip`). Measured with ten-line
+        /// AppKit probes read back from tccd's log, each made WindowServer run a
+        /// synchronous `kTCCServiceListenEvent` preflight of the caller, where
+        /// `-[NSMenu init]`, a plain `NSMenuItem`, a key equivalent and its
+        /// modifier mask, `-setTag:`, `-setSubmenu:` and `-addItem:` drew none.
+        /// Each of the three drew that preflight for the aterm-gui test binary
+        /// when run alone. That is the WindowServer watchdog's trigger (AGENTS.md,
+        /// "Concurrent sessions" rule 5), so they are `#[ignore]`d out of every
+        /// parallel test run and the merge contract's `window-server unit
+        /// tests` stage runs exactly them (`-- --ignored ::window_server::`), in
+        /// the driver lane, beside the objc drivers that already hold real
+        /// windows. `tools/grep_guard.sh` B9e keeps every test in a
+        /// `window_server` module ignored with this reason and no other test so.
+        mod window_server {
+            use super::*;
+
+            /// THE PROOF for BEHAVIOUR, and FOUNDATION is what reads the `BOOL`.
+            ///
+            /// `NSMethodSignature` + `NSInvocation` is not a detour, it is the
+            /// exact machinery the registered encoding exists for: a method type
+            /// string is what AppKit reaches for on every path that does not send
+            /// the selector directly, and `NSInvocation` decodes the return value
+            /// **by that string**. So this asks Foundation three questions the port
+            /// cannot answer for itself —
+            ///
+            /// * what does `- (BOOL)validateMenuItem:(id)` look like from outside?
+            ///   (`-methodReturnType` must be `Bool::ENCODING`, `-methodReturnLength`
+            ///   must be one byte, `-numberOfArguments` must be three)
+            /// * what does invoking it return for an item AppKit itself tagged?
+            /// * and does the answer differ for the two tags?
+            ///
+            /// — and a wrong encoding fails all three rather than half-passing: a
+            /// `"q"` return would report length 8, an `"@"` return would report a
+            /// pointer, and `NSInvocation` would copy the wrong number of bytes out.
+            ///
+            /// REFUTED, and the refutation is why this shape: the obvious test was
+            /// `-[NSMenu update]`, AppKit's own NSMenuValidation pass. It reaches
+            /// the target through `NSApplication`, and a libtest process has no
+            /// `NSApplication` and cannot make one (`+sharedApplication` is
+            /// main-thread-only; libtest runs every test on a spawned thread). It
+            /// counted **0** `validateMenuItem:` calls, silently — exactly the
+            /// "compiles, does nothing, reports success" shape this campaign has
+            /// already been caught by once.
+            #[test]
+            #[ignore = "WINDOW-SERVER LANE: builds AppKit objects that open a WindowServer connection; run by the merge contract's `window-server unit tests` stage (AGENTS.md, Concurrent sessions rule 5)"]
+            fn foundation_reads_the_declared_bool_through_the_registered_encoding() {
+                VALIDATED.store(0, Ordering::SeqCst);
+                ACTIONED.store(0, Ordering::SeqCst);
+                let probe =
+                    MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
+                autoreleasepool(|_| {
+                    // SAFETY: every send below is cast to the exact prototype named
+                    // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
+                    // `+invocationWithMethodSignature:` is `-(id)(id)`;
+                    // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
+                    // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
+                    // at the pointer, so `&mut arg` need only outlive the call;
+                    // `-invokeWithTarget:` is `-(void)(id)`; `-getReturnValue:` is
+                    // `-(void)(void *)` and writes `methodReturnLength` bytes, which
+                    // is asserted to be `size_of::<Bool>()` before the call.
+                    unsafe {
+                        let menu = new_menu().expect("NSMenu");
+                        appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), true);
+                        let mut items = Vec::new();
+                        for tag in 1..=2 {
+                            let item = new_item(&format!("row {tag}"), sel!(menuAction:), "")
+                                .expect("item");
+                            appkit::send_v_id(item.id(), sel!(setTarget:), probe.as_id());
+                            appkit::send_v_isize(item.id(), sel!(setTag:), tag);
+                            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+                            items.push(item);
+                        }
+                        add_separator(&menu);
+
+                        // What Foundation reads out of the REGISTERED encoding.
+                        let sig_for: unsafe extern "C-unwind" fn(
+                            Id,
+                            aterm_objc::Sel,
+                            aterm_objc::Sel,
+                        ) -> Id = aterm_objc::msg();
+                        let sig = sig_for(
+                            probe.as_id(),
+                            sel!(methodSignatureForSelector:),
+                            sel!(validateMenuItem:),
+                        );
+                        assert!(
+                            !sig.is_null(),
+                            "Foundation could not build a signature for the declared method"
+                        );
+                        // THE PRODUCTION CLASS, not the probe. A judge planted a
+                        // wrong return type on `MenuTarget::validate_menu_item` and
+                        // this test PASSED, because every signature below came from
+                        // `MenuProbe` — a copy that carries the same shape by hand.
+                        // Only the encoding test caught the plant. The probe is
+                        // still what gets INVOKED (constructing a real `MenuTarget`
+                        // needs an `EventLoopProxy` this test has no event loop to
+                        // give), but the signature Foundation is asked to agree with
+                        // now comes from the class that ships, via the class-side
+                        // `+instanceMethodSignatureForSelector:` — which needs no
+                        // instance at all.
+                        let cls_sig_for: unsafe extern "C-unwind" fn(
+                            aterm_objc::ClassPtr,
+                            aterm_objc::Sel,
+                            aterm_objc::Sel,
+                        )
+                            -> Id = aterm_objc::msg();
+                        let target_sig = cls_sig_for(
+                            MenuTarget::class(),
+                            sel!(instanceMethodSignatureForSelector:),
+                            sel!(validateMenuItem:),
+                        );
+                        assert!(
+                            !target_sig.is_null(),
+                            "Foundation could not build a signature for MenuTarget's declared method"
+                        );
+                        let target_ret_type: unsafe extern "C-unwind" fn(
+                            Id,
+                            aterm_objc::Sel,
+                        )
+                            -> *const std::ffi::c_char = aterm_objc::msg();
+                        let target_ret = std::ffi::CStr::from_ptr(target_ret_type(
+                            target_sig,
+                            sel!(methodReturnType),
+                        ));
+                        assert_eq!(
+                            target_ret.to_str().expect("ascii"),
+                            Bool::ENCODING,
+                            "MenuTarget — the class that ships — disagrees with the encoding table"
+                        );
+                        assert_eq!(
+                            appkit::send_usize(target_sig, sel!(methodReturnLength)),
+                            size_of::<Bool>(),
+                            "MenuTarget's registered return length is not a Bool's"
+                        );
+                        assert_eq!(
+                            appkit::send_usize(target_sig, sel!(numberOfArguments)),
+                            3,
+                            "MenuTarget's registered argument count moved"
+                        );
+                        let ret_type: unsafe extern "C-unwind" fn(
+                            Id,
+                            aterm_objc::Sel,
+                        )
+                            -> *const std::ffi::c_char = aterm_objc::msg();
+                        let ret = std::ffi::CStr::from_ptr(ret_type(sig, sel!(methodReturnType)));
+                        assert_eq!(
+                            ret.to_str().expect("ascii"),
+                            Bool::ENCODING,
+                            "NSMethodSignature disagrees with the encoding table"
+                        );
+                        assert_eq!(
+                            appkit::send_usize(sig, sel!(methodReturnLength)),
+                            size_of::<Bool>()
+                        );
+                        assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 3);
+
+                        // …and what it returns, per tag, decoded by that string.
+                        for (i, item) in items.iter().enumerate() {
+                            let tag = i as isize + 1;
+                            let inv = appkit::send_id_id(
+                                class(c"NSInvocation").as_id(),
+                                sel!(invocationWithMethodSignature:),
+                                sig,
+                            );
+                            assert!(!inv.is_null());
+                            let set_sel: unsafe extern "C-unwind" fn(
+                                Id,
+                                aterm_objc::Sel,
+                                aterm_objc::Sel,
+                            ) = aterm_objc::msg();
+                            set_sel(inv, sel!(setSelector:), sel!(validateMenuItem:));
+                            let set_arg: unsafe extern "C-unwind" fn(
+                                Id,
+                                aterm_objc::Sel,
+                                *mut std::ffi::c_void,
+                                isize,
+                            ) = aterm_objc::msg();
+                            let mut arg = item.id();
+                            set_arg(
+                                inv,
+                                sel!(setArgument:atIndex:),
+                                std::ptr::from_mut(&mut arg).cast(),
+                                2,
+                            );
+                            appkit::send_v_id(inv, sel!(invokeWithTarget:), probe.as_id());
+                            let mut out = Bool::NO;
+                            let get_ret: unsafe extern "C-unwind" fn(
+                                Id,
+                                aterm_objc::Sel,
+                                *mut std::ffi::c_void,
+                            ) = aterm_objc::msg();
+                            get_ret(
+                                inv,
+                                sel!(getReturnValue:),
+                                std::ptr::from_mut(&mut out).cast(),
+                            );
+                            assert_eq!(
+                                out.as_bool(),
+                                tag % 2 != 0,
+                                "NSInvocation decoded the wrong BOOL for tag {tag}"
+                            );
+                        }
+                        assert_eq!(VALIDATED.load(Ordering::SeqCst), 2);
+
+                        // The separator AppKit made really is one.
+                        let sep = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 2);
+                        assert!(appkit::send_bool(sep, sel!(isSeparatorItem)));
+
+                        // …and the action leg, through the runtime's own dispatch
+                        // of the target/action pair AppKit stored.
+                        let target_of: unsafe extern "C-unwind" fn(Id, aterm_objc::Sel) -> Id =
+                            aterm_objc::msg();
+                        assert_eq!(target_of(items[1].id(), sel!(target)), probe.as_id());
+                        let perform_sel: unsafe extern "C-unwind" fn(
+                            Id,
+                            aterm_objc::Sel,
+                            aterm_objc::Sel,
+                            Id,
+                        )
+                            -> Id = aterm_objc::msg();
+                        perform_sel(
+                            probe.as_id(),
+                            sel!(performSelector:withObject:),
+                            sel!(menuAction:),
+                            items[1].id(),
+                        );
+                    }
+                });
+                assert_eq!(ACTIONED.load(Ordering::SeqCst), 2);
+            }
+
+            /// The menu bar this module builds is the menu bar it built before: the
+            /// same titles, in the same order, with the same submenu item titles,
+            /// tags, key equivalents and modifier masks — read back out of AppKit.
+            ///
+            /// This is the regression check the port owes a USER-VISIBLE surface. It
+            /// does not install the bar (that needs `NSApp` and the main thread); it
+            /// builds the identical structure through the ported constructors and
+            /// interrogates it.
+            #[test]
+            #[ignore = "WINDOW-SERVER LANE: builds AppKit objects that open a WindowServer connection; run by the merge contract's `window-server unit tests` stage (AGENTS.md, Concurrent sessions rule 5)"]
+            fn the_built_menu_bar_has_the_titles_tags_and_masks_it_had() {
+                let probe =
+                    MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
+                autoreleasepool(|_| {
+                    // SAFETY: plain AppKit accessors on menus this test built.
+                    unsafe {
+                        // The App menu, whole, as `build_app_menu` composes it.
+                        let menu = new_menu().expect("NSMenu");
+                        super::super::add_item(
+                            &menu,
+                            probe_as_menu_target(&probe),
+                            "Settings…",
+                            super::super::MenuAction::ToggleSettings,
+                            ",",
+                            true,
+                        );
+                        super::super::add_item_mods(
+                            &menu,
+                            probe_as_menu_target(&probe),
+                            "Enter Full Screen",
+                            super::super::MenuAction::ToggleFullScreen,
+                            "f",
+                            super::super::command_control_mask(),
+                        );
+                        let settings = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 0);
+                        assert_eq!(
+                            appkit::nsstring_to_rust(appkit::send_id(settings, sel!(title))),
+                            "Settings…"
+                        );
+                        assert_eq!(
+                            appkit::send_isize(settings, sel!(tag)),
+                            super::super::MenuAction::ToggleSettings.tag()
+                        );
+                        assert_eq!(
+                            appkit::nsstring_to_rust(appkit::send_id(
+                                settings,
+                                sel!(keyEquivalent)
+                            )),
+                            ","
+                        );
+                        assert_eq!(
+                            appkit::send_usize(settings, sel!(keyEquivalentModifierMask)),
+                            super::super::command_mask()
+                        );
+                        let full = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 1);
+                        assert_eq!(
+                            appkit::send_usize(full, sel!(keyEquivalentModifierMask)),
+                            super::super::command_control_mask()
+                        );
+                        assert_ne!(
+                            super::super::command_control_mask(),
+                            super::super::command_mask()
+                        );
+
+                        // A submenu attaches under a titled, action-less bar item.
+                        let bar = new_menu().expect("NSMenu");
+                        let sub = new_menu().expect("NSMenu");
+                        let item =
+                            super::super::attach_submenu(&bar, "Version", sub).expect("attached");
+                        assert_eq!(
+                            appkit::nsstring_to_rust(appkit::send_id(item.id(), sel!(title))),
+                            "Version"
+                        );
+                        // The item was BUILT with `Sel::NULL`, and AppKit then
+                        // rewrote its action to its own `submenuAction:` when the
+                        // submenu was attached — measured here rather than assumed;
+                        // the first version of this assertion expected nil and was
+                        // wrong. What matters is that nothing of ours is left on it.
+                        let action_of: unsafe extern "C-unwind" fn(
+                            Id,
+                            aterm_objc::Sel,
+                        )
+                            -> aterm_objc::Sel = aterm_objc::msg();
+                        let action = action_of(item.id(), sel!(action));
+                        assert_ne!(action, sel!(menuAction:));
+                        assert_eq!(action, sel!(submenuAction:));
+                        let attached = appkit::send_id(item.id(), sel!(submenu));
+                        assert!(!attached.is_null());
+                        assert_eq!(
+                            appkit::nsstring_to_rust(appkit::send_id(attached, sel!(title))),
+                            "Version"
+                        );
+                        assert_eq!(appkit::send_isize(bar.id(), sel!(numberOfItems)), 1);
+                    }
+                });
+            }
+
+            /// SPEC19 §9: under a FLEET hold the native bar's halt pair greys WITH
+            /// the fleet's reason. The palette's rows carried it; the bar's rows
+            /// said only their help (`FrontHold` was a bare `AtomicU8`, and
+            /// `validateMenuItem:` set only the state). The real `FABRIC_MENU` is
+            /// built through the ported constructors with the probe target; the
+            /// tip is what `validateMenuItem:` stamps at the moment the menu opens,
+            /// so the stamp is called here as AppKit would call it.
+            #[test]
+            #[ignore = "WINDOW-SERVER LANE: builds AppKit objects that open a WindowServer connection; run by the merge contract's `window-server unit tests` stage (AGENTS.md, Concurrent sessions rule 5)"]
+            fn a_fleet_hold_greys_the_native_halt_pair_with_its_reason() {
+                use super::super::super::{FABRIC_MENU, FrontHold, MENU_STATICS, MenuAction};
+                let _statics = MENU_STATICS.lock().unwrap_or_else(|p| p.into_inner());
+                super::super::super::set_active_tab_is_terminal(true);
+                let probe =
+                    MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
+                autoreleasepool(|_| {
+                    let menu =
+                        super::super::build_section(probe_as_menu_target(&probe), FABRIC_MENU)
+                            .expect("the Fabric menu");
+                    let halt = [MenuAction::HoldSession, MenuAction::LiftHold];
+                    // SAFETY: plain accessors on the menu this test built and the
+                    // live items it holds.
+                    let items: Vec<(Id, MenuAction)> = unsafe {
+                        let n = appkit::send_isize(menu.id(), sel!(numberOfItems));
+                        (0..n)
+                            .filter_map(|i| {
+                                let item = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), i);
+                                let action =
+                                    MenuAction::from_tag(appkit::send_isize(item, sel!(tag)))?;
+                                halt.contains(&action).then_some((item, action))
+                            })
+                            .collect()
+                    };
+                    assert_eq!(items.len(), 2, "both halt rows are on the Fabric menu");
+
+                    super::super::super::set_front_hold(FrontHold::Fleet, "main%20broken");
+                    for (item, action) in &items {
+                        assert!(!super::super::super::native_menu_action_enabled(*action));
+                        super::super::stamp_native_tip(*item, *action);
+                        // SAFETY: `-toolTip` is `-(NSString *)` on a live NSMenuItem.
+                        let tip = unsafe {
+                            appkit::nsstring_to_rust(appkit::send_id(*item, sel!(toolTip)))
+                        };
+                        assert!(
+                            tip.contains("cannot be lifted here") && tip.contains("main broken"),
+                            "{action:?}: the greyed native row says nothing of the fleet hold; its tool tip is {tip:?}"
+                        );
+                    }
+
+                    // The hold lifts: the pair's tips return to their help.
+                    super::super::super::set_front_hold(FrontHold::None, "");
+                    for (item, action) in &items {
+                        super::super::stamp_native_tip(*item, *action);
+                        // SAFETY: as above.
+                        let tip = unsafe {
+                            appkit::nsstring_to_rust(appkit::send_id(*item, sel!(toolTip)))
+                        };
+                        assert_eq!(tip, action.help(), "{action:?}");
+                    }
+                });
+            }
         }
     }
 }

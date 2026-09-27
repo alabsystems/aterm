@@ -7,11 +7,6 @@
 //! former modal painter remains unit-tested during compatibility retirement but can no
 //! longer be installed as a shipping window overlay.
 
-#![allow(
-    dead_code,
-    reason = "legacy SettingsState/painter remains the tested compatibility model while shipping Settings is a native tab"
-)]
-
 use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
 
@@ -89,15 +84,18 @@ pub(crate) struct SettingsState {
     /// Shuffled-BAG state for the cameo breeds: every one of the
     /// [`KITTY_BREEDS`] appears within any window of that many summons (no
     /// unlucky streak can hide the rainbow), refilled + reshuffled when empty.
+    #[cfg(test)]
     pub(crate) kitty_bag: Vec<u8>,
     /// Xorshift seed for the bag shuffle and per-summon x placement — advanced
     /// only on SUMMON (input time), so the painter stays a clockless pure
     /// function of state.
+    #[cfg(test)]
     pub(crate) kitty_seed: u32,
     /// How many "kitty" occurrences the comment / query held after the last
     /// edit — a COUNT INCREASE summons a cat (deleting and retyping works;
     /// backspacing alone never does).
     pub(crate) comment_kitties: usize,
+    #[cfg(test)]
     pub(crate) query_kitties: usize,
     /// The ids of the loaded Trail Packs (`cursor_trail_packs`), so the
     /// `cursor_trail_style` picker lists a `pack:<id>` option per loaded pack
@@ -131,6 +129,7 @@ pub(crate) enum KittyHost {
 }
 
 /// Cameo breed count: white, orange, gray, black, calico, magic green, rainbow.
+#[cfg(test)]
 pub(crate) const KITTY_BREEDS: u8 = 7;
 /// Cameo lifetime in demo ticks (~30fps ⇒ ≈2.6 s on screen).
 pub(crate) const KITTY_POP_TICKS: u32 = 78;
@@ -243,6 +242,7 @@ pub(crate) struct WheelState {
 
 impl SettingsState {
     /// Build the snapshot from the live config (call with `App.config`).
+    #[cfg(test)]
     pub(crate) fn from_config(cfg: &Config) -> Self {
         Self::from_config_with_trail_pack_ids(cfg, &[])
     }
@@ -270,9 +270,12 @@ impl SettingsState {
             comment: String::new(),
             landing_phase: 0,
             kitty_pop: None,
+            #[cfg(test)]
             kitty_bag: Vec::new(),
+            #[cfg(test)]
             kitty_seed: 0x9E37_79B9, // any odd constant; advanced per summon
             comment_kitties: 0,
+            #[cfg(test)]
             query_kitties: 0,
             trail_pack_ids: trail_pack_ids.to_vec(),
         };
@@ -288,12 +291,14 @@ impl SettingsState {
 
     /// Non-overlapping, case-insensitive count of "kitty" in `s` — the summon
     /// detector's corpus measure (§L.4).
+    #[cfg(test)]
     pub(crate) fn count_kitty(s: &str) -> usize {
         s.to_lowercase().matches("kitty").count()
     }
 
     /// Note a comment edit: `true` when a NEW "kitty" completion appeared (the
     /// occurrence count went UP), updating the high-water counter either way.
+    #[cfg(test)]
     pub(crate) fn note_kitty_in_comment(&mut self) -> bool {
         let n = Self::count_kitty(&self.comment);
         let fresh = n > self.comment_kitties;
@@ -302,6 +307,7 @@ impl SettingsState {
     }
 
     /// [`Self::note_kitty_in_comment`] for the sidebar search query.
+    #[cfg(test)]
     pub(crate) fn note_kitty_in_query(&mut self) -> bool {
         let n = Self::count_kitty(&self.query);
         let fresh = n > self.query_kitties;
@@ -313,6 +319,7 @@ impl SettingsState {
     /// shuffled bag (refill + Fisher–Yates when empty, xorshift-driven so the
     /// painter stays clockless) and place it at a bag-seeded x. A cameo already
     /// on screen is replaced — the newest summon wins the one cameo slot.
+    #[cfg(test)]
     pub(crate) fn summon_kitty(&mut self, host: KittyHost) {
         // xorshift32 — cheap, std-only, and deterministic per state; the
         // absorbing 0 never enters (`max(1)` on write-back).
@@ -426,12 +433,14 @@ impl SettingsState {
     }
 
     /// Append to the query, keeping the selection on a still-visible row.
+    #[cfg(test)]
     pub(crate) fn search_push(&mut self, c: char) {
         self.query.push(c);
         self.snap_selection_visible();
     }
 
     /// Delete the last query char, keeping the selection visible.
+    #[cfg(test)]
     pub(crate) fn search_backspace(&mut self) {
         self.query.pop();
         self.snap_selection_visible();
@@ -444,6 +453,7 @@ impl SettingsState {
     /// `scroll` re-zeroes (its unit flips from flat field index to [`GroupRow`]
     /// index), and the selection snaps into the category — otherwise the stale
     /// flat scroll would blank the band and activation/reset would silently no-op.
+    #[cfg(test)]
     pub(crate) fn search_confirm(&mut self) {
         self.searching = false;
         self.pane = SettingsPane::Content;
@@ -462,6 +472,7 @@ impl SettingsState {
     /// Clear the filter and leave search (the single Esc level from search/filtered
     /// list). The category FOLLOWS the selection — Esc from a cross-category result
     /// lands in that control's own pane, not wherever the sidebar last pointed.
+    #[cfg(test)]
     pub(crate) fn search_clear(&mut self) {
         self.query.clear();
         self.searching = false;
@@ -478,6 +489,7 @@ impl SettingsState {
 
     /// After a query change, pull `selected` onto the first visible row if it fell out of
     /// the filtered set (so navigation + activation always target a shown control).
+    #[cfg(test)]
     fn snap_selection_visible(&mut self) {
         let vis = self.visible_indices();
         if !vis.contains(&self.selected) {
@@ -505,6 +517,7 @@ impl SettingsState {
 
     /// ↑/↓ while the SIDEBAR pane is focused: move the active category by `delta`,
     /// CLAMPED at the ends (design §6: no wrap).
+    #[cfg(test)]
     pub(crate) fn sidebar_move(&mut self, delta: isize) {
         let cur = self.category.order_index() as isize;
         let last = prefs::Section::ORDER.len() as isize - 1;
@@ -536,6 +549,7 @@ impl SettingsState {
     }
 
     /// →/Tab/↵ from the sidebar: focus the content pane (selection already snapped).
+    #[cfg(test)]
     pub(crate) fn focus_content(&mut self) {
         self.pane = SettingsPane::Content;
         self.status = None; // transient status clears on navigation (design §3.3)
@@ -550,6 +564,7 @@ impl SettingsState {
 
     /// Tab/⇧Tab/Esc from the content pane: focus the sidebar (selection stays put, so
     /// Tab-Tab round-trips to the same control).
+    #[cfg(test)]
     pub(crate) fn focus_sidebar(&mut self) {
         self.pane = SettingsPane::Sidebar;
         self.status = None; // transient status clears on navigation (design §3.3)
@@ -558,6 +573,7 @@ impl SettingsState {
     /// ↑/↓ over the ACTIVE CATEGORY's control rows (grouped mode): captions, footnotes,
     /// and gaps are skipped by construction (the walk is over control indices), clamped
     /// at the ends, keeping the selected row's 2-cell box inside the `band`-cell window.
+    #[cfg(test)]
     pub(crate) fn move_selection_grouped(&mut self, delta: isize, band: usize, wrap: usize) {
         self.status = None; // transient status clears on navigation (design §3.3)
         let controls = category_controls(&self.fields, self.category);
@@ -602,6 +618,7 @@ impl SettingsState {
 
     /// Wheel-scroll the grouped content band by `delta` [`GroupRow`]s, clamped so the
     /// tail never over-scrolls past the band (mirrors `scroll_body` for flat mode).
+    #[cfg(test)]
     pub(crate) fn scroll_grouped(&mut self, delta: isize, band: usize, wrap: usize) {
         let rows = category_layout(&self.fields, self.category, wrap);
         let max = max_group_scroll(&rows, band);
@@ -657,6 +674,7 @@ impl SettingsState {
     }
 
     /// Append a typed character to the edit buffer (no-op when not editing).
+    #[cfg(test)]
     pub(crate) fn edit_push(&mut self, c: char) {
         if let Some(buf) = self.editing.as_mut() {
             buf.push(c);
@@ -664,6 +682,7 @@ impl SettingsState {
     }
 
     /// Delete the last character of the edit buffer (no-op when not editing/empty).
+    #[cfg(test)]
     pub(crate) fn edit_backspace(&mut self) {
         if let Some(buf) = self.editing.as_mut() {
             buf.pop();
@@ -679,6 +698,7 @@ impl SettingsState {
     /// trimmed buffer as the value (blank ⇒ `None`, i.e. remove the key → revert to the
     /// built-in default). `None` when not editing. Does NOT mutate — the caller persists
     /// it and decides whether to clear `editing` (a rejected value stays in edit mode).
+    #[cfg(test)]
     pub(crate) fn edit_pending(&self) -> Option<(&'static str, Option<String>)> {
         let buf = self.editing.as_ref()?;
         let f = self.fields.get(self.selected)?;
@@ -744,6 +764,7 @@ impl SettingsState {
 
     /// Jump the highlight to the NEXT option starting with `c` (case-insensitive),
     /// searching forward from the highlight and wrapping — the type-a-letter fast path.
+    #[cfg(test)]
     pub(crate) fn menu_jump(&mut self, c: char, visible: usize) {
         let Some(m) = self.menu.as_mut() else { return };
         let n = m.options.len();
@@ -768,6 +789,7 @@ impl SettingsState {
 
     /// Scroll the open menu by `delta` options (mouse wheel), clamped to the list. Does
     /// NOT move the highlight (mirrors the body-scroll gesture).
+    #[cfg(test)]
     pub(crate) fn menu_scroll_by(&mut self, delta: isize, visible: usize) {
         let Some(m) = self.menu.as_mut() else { return };
         let max = m.options.len().saturating_sub(visible.max(1));
@@ -859,6 +881,7 @@ impl SettingsState {
     }
 
     /// Tab inside the popover: cycle the keyboard focus Wheel → Value → Hex → Wheel.
+    #[cfg(test)]
     pub(crate) fn wheel_focus_next(&mut self) {
         if let Some(w) = self.wheel.as_mut() {
             w.focus = match w.focus {
@@ -874,6 +897,7 @@ impl SettingsState {
     /// (Shift ±0.15, clamped); on the VALUE slider ←/→ step ±0.02 (Shift ±0.1,
     /// clamped); the HEX field ignores arrows (its keys type digits). `dx`/`dy`
     /// are −1/0/+1 (→ = +dx, ↑ = +dy).
+    #[cfg(test)]
     pub(crate) fn wheel_arrow(&mut self, dx: f32, dy: f32, big: bool) {
         let Some(w) = self.wheel.as_mut() else { return };
         match w.focus {
@@ -895,6 +919,7 @@ impl SettingsState {
     /// Type into the hex readout (focus == Hex only): accepts hex digits (stored
     /// uppercase) and one leading `#`, capped at `#RRGGBB` length. A buffer that
     /// parses live-syncs the wheel to the typed colour.
+    #[cfg(test)]
     pub(crate) fn wheel_hex_push(&mut self, c: char) {
         let Some(w) = self.wheel.as_mut() else { return };
         if w.focus != WheelFocus::Hex {
@@ -909,6 +934,7 @@ impl SettingsState {
     }
 
     /// Delete the last hex character (focus == Hex only), live-syncing when it parses.
+    #[cfg(test)]
     pub(crate) fn wheel_hex_backspace(&mut self) {
         let Some(w) = self.wheel.as_mut() else { return };
         if w.focus != WheelFocus::Hex {
@@ -925,6 +951,7 @@ impl SettingsState {
 
     /// Hex → wheel: when the typed buffer parses (`#RGB`/`#RRGGBB`), snap h/s/v to it;
     /// a partial/invalid buffer leaves the wheel on its last good colour.
+    #[cfg(test)]
     fn wheel_sync_from_hex(w: &mut WheelState) {
         if let Some(rgb) = parse_hex(&w.hex) {
             let (h, s, v) = rgb_to_hsv(rgb);
@@ -940,6 +967,7 @@ impl SettingsState {
     /// by construction. An EMPTY hex commits `None` (remove the key → back to the
     /// theme default, the same blank-clears contract as the text editor). `None`
     /// when no wheel is open. Does NOT mutate — the caller closes + persists.
+    #[cfg(test)]
     pub(crate) fn wheel_pending(&self) -> Option<(&'static str, Option<String>)> {
         let w = self.wheel.as_ref()?;
         let f = self.fields.get(w.field)?;
@@ -954,6 +982,7 @@ impl SettingsState {
     /// Scroll the body band by `delta` VISIBLE controls (mouse wheel): moves `scroll`
     /// without touching the selection, clamped to [`max_scroll`] so the band never shows
     /// trailing blank rows.
+    #[cfg(test)]
     pub(crate) fn scroll_body(&mut self, delta: isize, body: usize) {
         let vis = self.visible_indices();
         if vis.is_empty() {
@@ -975,7 +1004,7 @@ impl SettingsState {
     /// that row is being edited, else its configured value / effective placeholder. Used
     /// by the accessibility tree (no caret, unlike the painter's `render_value`); only the
     /// non-default `a11y-accesskit` build consumes it.
-    #[cfg_attr(not(a11y_tree), allow(dead_code))]
+    #[cfg(a11y_tree)]
     pub(crate) fn displayed_value(&self, idx: usize) -> String {
         let Some(f) = self.fields.get(idx) else {
             return String::new();
@@ -1011,6 +1040,7 @@ impl SettingsState {
     /// Move the highlight by `delta` over the VISIBLE (filtered) rows, CLAMPING at the
     /// ends (design §6 mandates no wrap — ↑ at the top / ↓ at the bottom stay put), and
     /// keep `scroll` so the selected row stays inside a `body`-row window.
+    #[cfg(test)]
     pub(crate) fn move_selection(&mut self, delta: isize, body: usize) {
         self.status = None; // transient status clears on navigation (design §3.3)
         let vis = self.visible_indices();
@@ -1125,6 +1155,7 @@ impl SettingsState {
     /// Legacy overlay-model serialization retained for model-level regression tests.
     /// Production `controls prefs` compiles the native Settings semantic tree and never
     /// calls this serializer.
+    #[cfg(test)]
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let vis = self.shown_indices();
         let mut out = Vec::with_capacity(vis.len() + 3);
@@ -1567,6 +1598,7 @@ pub(crate) fn popup_current_label(f: &EditField) -> String {
 /// than clobbering it); a bounded numeric ([`prefs::range_of`]) moves one `step` (`big`
 /// ⇒ ×10, i.e. Shift held), clamped to the range — `None` at a rail so a held key
 /// doesn't spam "unchanged" saves. Free-form rows (Text/Color/unbounded numeric) no-op.
+#[cfg(test)]
 pub(crate) fn step_edit(
     f: &EditField,
     delta: isize,
@@ -1578,6 +1610,7 @@ pub(crate) fn step_edit(
 /// [`step_edit`] with the loaded Trail Pack ids threaded in, so ←/→ on the
 /// `cursor_trail_style` row cycles through the loaded `pack:<id>` options too.
 /// `pack_ids` is empty for every other row (byte-identical stepping).
+#[cfg(test)]
 pub(crate) fn step_edit_with(
     f: &EditField,
     delta: isize,
@@ -1887,7 +1920,6 @@ fn popup_chip(
         h: wh,
         radius: wh * 0.35,
         fill: rgba(r.elevated, 0xFF),
-        blur: false,
     });
     let mut cx = x + cw * 0.5 + dot_r;
     for s in swatches {
@@ -1896,7 +1928,6 @@ fn popup_chip(
             cy: wy + wh * 0.5,
             r: dot_r,
             color: rgba(*s, 0xFF),
-            breathe: false,
         });
         cx += dot_r * 2.1;
     }
@@ -1959,7 +1990,6 @@ fn segmented(
         h: wh,
         radius: wh * 0.3,
         fill: rgba(r.control_track, 0x99),
-        blur: false,
     });
     let mut x = x0;
     for o in options {
@@ -1973,7 +2003,6 @@ fn segmented(
                 h: wh - 3.0,
                 radius: wh * 0.25,
                 fill: rgba(r.elevated, 0xFF),
-                blur: false,
             });
         }
         prims.push(text_prim(
@@ -2085,7 +2114,6 @@ fn build_widget(
                 h: wh,
                 radius: wh * 0.5,
                 fill: rgba(track, 0xFF),
-                blur: false,
             });
             let knob_r = wh * 0.5 - 1.5;
             let kcx = if on {
@@ -2098,7 +2126,6 @@ fn build_widget(
                 cy,
                 r: knob_r,
                 color: rgba(r.on_accent, 0xFF),
-                breathe: false,
             });
             x
         }
@@ -2154,7 +2181,6 @@ fn build_widget(
                     cy,
                     r: tr,
                     color: rgba(r.on_accent, 0xFF),
-                    breathe: false,
                 });
                 prims.push(DrawPrim::Stroke {
                     x: thumb_x - tr,
@@ -2233,7 +2259,6 @@ fn build_widget(
                 h: wh,
                 radius: wh * 0.3,
                 fill: rgba(col, 0xFF),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x: sx,
@@ -2371,6 +2396,7 @@ pub(crate) fn body_layout_masked(
 /// to `body - 1` with no exact-`body` stop in between — a keep-the-band-full clamp
 /// would leave the final control permanently clipped there, so the clamp accepts the
 /// first non-overflowing scroll instead (at worst one trailing blank row).
+#[cfg(test)]
 pub(crate) fn max_scroll(fields: &[EditField], visible: Option<&[bool]>, body: usize) -> usize {
     if body == 0 {
         return 0;
@@ -2653,7 +2679,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         h,
         radius: (ch * 0.6).min(14.0),
         fill: rgba(LANDING_MINT, 0xFF),
-        blur: false,
     });
     // Blotches, clipped to the card. The clip is RECTANGULAR while the card is
     // rounded, so every blob placement below keeps clear of the four corners —
@@ -2688,7 +2713,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
             cy,
             r,
             color: rgba(c, 0xFF),
-            breathe: false,
         });
         // A second, offset lobe makes each blotch read organic, not geometric.
         prims.push(DrawPrim::Dot {
@@ -2696,7 +2720,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
             cy: cy + r * 0.30,
             r: r * 0.74,
             color: rgba(c, 0xFF),
-            breathe: false,
         });
     }
     // Star glints (§L.5): a few tiny twinkling crosses in the mint sky around
@@ -2805,7 +2828,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         h: bh,
         radius: bh * 0.5,
         fill: rgba([0, 0, 0], 0x24),
-        blur: false,
     });
     prims.push(DrawPrim::Panel {
         x: bx,
@@ -2814,7 +2836,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         h: bh,
         radius: bh * 0.5,
         fill: rgba(LANDING_BUBBLE, 0xFF),
-        blur: false,
     });
     let bsize = TypeStep::Title.px(px * 1.12);
     prims.push(text_prim(
@@ -2836,7 +2857,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         h: th,
         radius: th * 0.5,
         fill: rgba(LANDING_CARD_WHITE, 0xFF),
-        blur: false,
     });
     prims.push(DrawPrim::Stroke {
         x: tx,
@@ -2895,7 +2915,6 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         cy: scy,
         r: sr,
         color: rgba(LANDING_BUBBLE, 0xFF),
-        breathe: false,
     });
     let ssize = TypeStep::Caption.px(px);
     prims.push(text_prim(
@@ -2969,7 +2988,6 @@ fn paint_rainbow_arch(prims: &mut Vec<DrawPrim>, phase: u32, w: f32, h: f32, ch:
                 cy: cy + th.sin() * r,
                 r: st * 0.62,
                 color: rgba(*c, 0x3C),
-                breathe: false,
             });
             a += step;
         }
@@ -3017,7 +3035,6 @@ fn paint_landing_glints(prims: &mut Vec<DrawPrim>, phase: u32, w: f32, h: f32, c
             cy: sy,
             r: len * 0.16,
             color: rgba(c, a),
-            breathe: false,
         });
     }
 }
@@ -3060,7 +3077,6 @@ pub(crate) fn paint_settings_aurora(
                 h: ch + 0.75,
                 radius: 0.0,
                 fill: rgba(lerp_rgb(surface, c, 0.30), 0xFF),
-                blur: false,
             });
         }
     }
@@ -3105,7 +3121,6 @@ pub(crate) fn paint_rainbow_banner(
         h,
         radius: 12.0,
         fill: rgba(sky, 0xFF),
-        blur: false,
     });
     prims.push(DrawPrim::Stroke {
         x,
@@ -3140,7 +3155,6 @@ pub(crate) fn paint_rainbow_banner(
                 cy: acy + th.sin() * r,
                 r: st * 0.62,
                 color: rgba(*c, arch_alpha),
-                breathe: false,
             });
             a += step;
         }
@@ -3269,7 +3283,6 @@ fn paint_kitty_cameo(
             cy: cy - r * 0.72,
             r: r * 0.40,
             color: rgba(ec, a),
-            breathe: false,
         });
     }
     prims.push(DrawPrim::Dot {
@@ -3277,7 +3290,6 @@ fn paint_kitty_cameo(
         cy,
         r,
         color: rgba(coat, a),
-        breathe: false,
     });
     if k.breed == 4 {
         prims.push(DrawPrim::Dot {
@@ -3285,14 +3297,12 @@ fn paint_kitty_cameo(
             cy: cy - r * 0.30,
             r: r * 0.34,
             color: rgba([0xFF, 0x9D, 0x5C], a),
-            breathe: false,
         });
         prims.push(DrawPrim::Dot {
             cx: cx + r * 0.34,
             cy: cy - r * 0.26,
             r: r * 0.30,
             color: rgba([0x4A, 0x4A, 0x4A], a),
-            breathe: false,
         });
     }
     for ex in [-1.0_f32, 1.0_f32] {
@@ -3301,7 +3311,6 @@ fn paint_kitty_cameo(
             cy: cy - r * 0.06,
             r: (r * 0.13).max(1.0),
             color: rgba(face, a),
-            breathe: false,
         });
     }
     prims.push(DrawPrim::Stroke {
@@ -3515,6 +3524,7 @@ pub(crate) fn content_v_left(g: &SettingsGeom) -> f32 {
 /// Which preview arm the card paints for a focused key — serialized on the
 /// `preview kind=` introspection line (graft #3) so a driver can assert the card's
 /// subject without pixel-diffing.
+#[cfg(test)]
 pub(crate) fn preview_kind(key: &str) -> &'static str {
     match key {
         prefs::EDIT_THEME => "theme",
@@ -3693,7 +3703,6 @@ fn preview_card(
         h: gh,
         radius: fit(ch * 0.4, 0.0, 12.0),
         fill: rgba(r.elevated, 0xFF),
-        blur: false,
     });
     // "PREVIEW" caption (secondary, uppercase, no faux tracking — §2).
     // Section caption in the native UI face (theirs), sized off the type scale (ours).
@@ -3741,7 +3750,6 @@ fn preview_card(
         h: sh,
         radius: mock_r,
         fill: rgba(bg, 0xFF),
-        blur: false,
     });
 
     // TITLEBAR STRIP, tinted by the resolved `window_theme`. Chrome tones derive from
@@ -3762,7 +3770,6 @@ fn preview_card(
             h: tb_h,
             radius: mock_r,
             fill: rgba(chrome, 0xFF),
-            blur: false,
         });
     };
     let lead_chrome = match wt {
@@ -3816,7 +3823,6 @@ fn preview_card(
             cy: sy + tb_h * 0.5,
             r: dr,
             color: rgba(c, 0xFF),
-            breathe: false,
         });
         dcx += dr * 2.6;
     }
@@ -3885,7 +3891,6 @@ fn preview_card(
         h: ss * 1.2,
         radius: ss * 0.15,
         fill: rgba(sel, 0xCC),
-        blur: false,
     });
     push_line(prims, sel_row_y, &[("   Running ", dim), (sel_word, fg)]);
     // A code line.
@@ -3925,7 +3930,6 @@ fn preview_card(
         h: chr,
         radius: 0.0,
         fill: rgba(cur, 0xFF),
-        blur: false,
     });
 
     // ---- Animated cursor-effect DEMO (the one sanctioned animation) ----
@@ -4020,7 +4024,6 @@ fn preview_card(
                 h: streak_h,
                 radius: streak_h * 0.5,
                 fill: rgba(u32_rgb(color), a),
-                blur: false,
             });
         }
         // Style particles around the head (sparks / embers / droplets / laser
@@ -4096,7 +4099,6 @@ fn preview_card(
                         h: ss * 0.3 * (1.0 + life),
                         radius: ss * 0.06,
                         fill: rgba(u32_rgb(color), (220.0 * fade * pulse) as u8),
-                        blur: false,
                     });
                 } else {
                     // Comet grains TWINKLE on their own phase (glitter catching
@@ -4112,7 +4114,6 @@ fn preview_card(
                         cy: dot_y,
                         r: ss * 0.13,
                         color: rgba(u32_rgb(color), (220.0 * fade * pulse * tw) as u8),
-                        breathe: false,
                     });
                 }
             }
@@ -4135,7 +4136,6 @@ fn preview_card(
                     cy: sw_y + swr,
                     r: swr,
                     color: rgba(*c, 0xFF),
-                    breathe: false,
                 });
                 swx += swr * 2.6;
             }
@@ -4250,7 +4250,6 @@ fn category_pictogram(
                 cy,
                 r: dr,
                 color: rgba(u32_rgb(theme.fg), 0xFF),
-                breathe: false,
             });
             prims.push(DrawPrim::ClipPush {
                 x: cx,
@@ -4263,7 +4262,6 @@ fn category_pictogram(
                 cy,
                 r: dr,
                 color: rgba(u32_rgb(theme.bg), 0xFF),
-                breathe: false,
             });
             prims.push(DrawPrim::ClipPop);
             prims.push(DrawPrim::Stroke {
@@ -4291,7 +4289,6 @@ fn category_pictogram(
                     h: sh,
                     radius: sh * 0.3,
                     fill: rgba(on, 0xFF),
-                    blur: false,
                 });
             }
             prims.push(DrawPrim::Panel {
@@ -4301,7 +4298,6 @@ fn category_pictogram(
                 h: s * 0.60,
                 radius: bar_w * 0.3,
                 fill: rgba(on, 0xFF),
-                blur: false,
             });
         }
         // Cursor Kitty: the Kitty Log's peeking-cat silhouette WALKING on a
@@ -4320,7 +4316,6 @@ fn category_pictogram(
                     h: s * 0.17,
                     radius: ew * 0.35,
                     fill: rgba(on, 0xFF),
-                    blur: false,
                 });
             }
             prims.push(DrawPrim::Dot {
@@ -4328,7 +4323,6 @@ fn category_pictogram(
                 cy: hy,
                 r: hr,
                 color: rgba(on, 0xFF),
-                breathe: false,
             });
             // The rainbow RAIL it walks: one bar in the tile tint under the cat.
             let tint = category_tint(sec, r, theme);
@@ -4339,7 +4333,6 @@ fn category_pictogram(
                 h: (s * 0.08).max(1.5),
                 radius: (s * 0.04).max(0.75),
                 fill: rgba(tint, 0xFF),
-                blur: false,
             });
         }
         prefs::Section::Typography => {
@@ -4369,7 +4362,6 @@ fn category_pictogram(
                 h: bar_h,
                 radius: s * 0.06,
                 fill: rgba(on, 0xFF),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x: fx,
@@ -4402,7 +4394,6 @@ fn category_pictogram(
                 h: (kh * 0.12).max(2.0),
                 radius: 1.5,
                 fill: rgba(on, 0xFF),
-                blur: false,
             });
         }
         // Performance: three ascending bars (the universal "stats" mark) — crisper at
@@ -4420,7 +4411,6 @@ fn category_pictogram(
                     h: bh,
                     radius: bw * 0.3,
                     fill: rgba(on, 0xFF),
-                    blur: false,
                 });
             }
         }
@@ -4447,7 +4437,6 @@ fn category_pictogram(
                 h: (s * 0.07).max(2.0),
                 radius: 1.0,
                 fill: rgba(pcolor, 0xFF),
-                blur: false,
             });
         }
         // Security: a real padlock — filled rounded body, an arc shackle (a circle
@@ -4480,14 +4469,12 @@ fn category_pictogram(
                 h: body_h,
                 radius: s * 0.07,
                 fill: rgba(on, 0xFF),
-                blur: false,
             });
             prims.push(DrawPrim::Dot {
                 cx,
                 cy: body_y + body_h * 0.42,
                 r: s * 0.055,
                 color: rgba(r.danger, 0xFF),
-                breathe: false,
             });
         }
         // Packages: a parcel — the tile outline with a horizontal tape band
@@ -4514,7 +4501,6 @@ fn category_pictogram(
                 h: sw,
                 radius: 0.0,
                 fill: rgba(on, 0xFF),
-                blur: false,
             });
             prims.push(DrawPrim::Panel {
                 x: cx - sw * 0.5,
@@ -4523,7 +4509,6 @@ fn category_pictogram(
                 h: bh * 0.32,
                 radius: 0.0,
                 fill: rgba(on, 0xFF),
-                blur: false,
             });
         }
         // Harness: the MARK — a HOLLOW outline around a small live pip, the
@@ -4549,7 +4534,6 @@ fn category_pictogram(
                 cy,
                 r: (s * 0.09).max(1.5),
                 color: rgba(on, 0xFF),
-                breathe: false,
             });
         }
         // Kitty Log: a peeking cat head — two rounded ear nubs under a head
@@ -4567,7 +4551,6 @@ fn category_pictogram(
                     h: s * 0.22,
                     radius: ew * 0.35,
                     fill: rgba(on, 0xFF),
-                    blur: false,
                 });
             }
             prims.push(DrawPrim::Dot {
@@ -4575,7 +4558,6 @@ fn category_pictogram(
                 cy: hy,
                 r: hr,
                 color: rgba(on, 0xFF),
-                breathe: false,
             });
             // Eyes in the tile tint (the §F4 pink), on the §5 eye-row height.
             let tint = category_tint(sec, r, theme);
@@ -4585,7 +4567,6 @@ fn category_pictogram(
                     cy: hy - hr * 0.12,
                     r: (s * 0.045).max(1.5),
                     color: rgba(tint, 0xFF),
-                    breathe: false,
                 });
             }
         }
@@ -4620,7 +4601,6 @@ fn paint_sidebar(
         h,
         radius: (ch * 0.6).min(14.0),
         fill: rgba(lerp_rgb(r.surface, u32_rgb(theme.bg), 0.35), 0xF4),
-        blur: false,
     });
     prims.push(DrawPrim::Stroke {
         x: sb_w,
@@ -4679,7 +4659,6 @@ fn paint_sidebar(
             h: 1.4,
             radius: 0.7,
             fill: rgba(r.text_tertiary, 0xFF),
-            blur: false,
         });
         if !pg.icon_strip {
             let qstep = TypeStep::Secondary.px(px);
@@ -4738,7 +4717,6 @@ fn paint_sidebar(
                 h: ph,
                 radius: ch * 0.4,
                 fill: rgba(r.accent, 0xFF),
-                blur: false,
             });
             if state.pane == SettingsPane::Sidebar {
                 prims.push(DrawPrim::Stroke {
@@ -4782,7 +4760,6 @@ fn paint_sidebar(
                 category_tint(*sec, r, theme),
                 if dimmed { 0x66 } else { 0xFF },
             ),
-            blur: false,
         });
         category_pictogram(prims, *sec, r, theme, tile_x, tile_y, tile);
 
@@ -4838,7 +4815,6 @@ fn paint_scrollbar(
         h: track_h,
         radius: sw * 0.5,
         fill: rgba(r.separator, 0x55),
-        blur: false,
     });
     let thumb_h = (track_h * visible / total).clamp(ch.min(track_h), track_h);
     // Map the scrolled-past rows onto the thumb's TRAVEL (track minus thumb): at
@@ -4853,7 +4829,6 @@ fn paint_scrollbar(
         h: thumb_h,
         radius: sw * 0.5,
         fill: rgba(r.text_tertiary, 0xCC),
-        blur: false,
     });
 }
 
@@ -4910,7 +4885,6 @@ fn paint_group_band(
             h: n_cells as f32 * ch,
             radius: ch * 0.5,
             fill: rgba(r.elevated, 0xFF),
-            blur: false,
         });
     };
     let mut run: Option<(usize, usize)> = None;
@@ -4945,7 +4919,6 @@ fn paint_group_band(
                     h: bar_h,
                     radius: (cw * 0.14).max(1.5),
                     fill: rgba(tint, 0xE6),
-                    blur: false,
                 });
                 prims.push(text_prim(
                     box_x + cw * 0.6,
@@ -5001,7 +4974,6 @@ fn paint_group_band(
                         h: 2.0 * ch - 4.0,
                         radius: ch * 0.4,
                         fill: rgba(r.accent, SEL_WASH_ALPHA),
-                        blur: false,
                     });
                     // The focus ring marks the CONTENT pane owning the keyboard;
                     // with the sidebar focused only the wash shows.
@@ -5023,7 +4995,6 @@ fn paint_group_band(
                         cy: y0 + ch,
                         r: (px * 0.16).max(2.0),
                         color: rgba(r.accent, 0xFF),
-                        breathe: false,
                     });
                 }
                 let lstep = TypeStep::Body.px(px);
@@ -5193,7 +5164,6 @@ fn paint_kitty_book_band(
                     if row.seen { r.accent } else { r.text_tertiary },
                     if row.seen { 0xFF } else { 0x66 },
                 ),
-                breathe: false,
             });
             // Label — or the `???` silhouette for an undiscovered cell.
             let (label, lcolor) = if row.seen {
@@ -5298,7 +5268,6 @@ fn paint_flat_band(
                         h: ch - 2.0,
                         radius: ch * 0.32,
                         fill: rgba(r.accent, SEL_WASH_ALPHA),
-                        blur: false,
                     });
                     prims.push(DrawPrim::Stroke {
                         x: box_x,
@@ -5316,7 +5285,6 @@ fn paint_flat_band(
                         cy: y0 + ch * 0.5,
                         r: (px * 0.16).max(2.0),
                         color: rgba(r.accent, 0xFF),
-                        breathe: false,
                     });
                 }
                 let lstep = TypeStep::Body.px(px);
@@ -5412,7 +5380,6 @@ pub(crate) fn settings_tray(
         h,
         radius: (ch * 0.6).min(14.0),
         fill: rgba(r.surface, 0xF4),
-        blur: true,
     });
 
     // The LANDING page (§L) replaces the whole two-pane layout while up — the
@@ -5619,7 +5586,6 @@ pub(crate) fn settings_tray(
             h: menu_h,
             radius: ch * 0.3,
             fill: rgba([0, 0, 0], 0x38),
-            blur: false,
         });
         prims.push(DrawPrim::Panel {
             x: mg.x,
@@ -5628,7 +5594,6 @@ pub(crate) fn settings_tray(
             h: menu_h,
             radius: ch * 0.3,
             fill: rgba(r.elevated, 0xFF),
-            blur: false,
         });
         prims.push(DrawPrim::Stroke {
             x: mg.x,
@@ -5654,7 +5619,6 @@ pub(crate) fn settings_tray(
                     h: mg.row_h - 2.0,
                     radius: ch * 0.25,
                     fill: rgba(r.accent, MENU_WASH_ALPHA),
-                    blur: false,
                 });
             }
             // A leading accent dot marks the value in effect (committing it is a no-op).
@@ -5664,7 +5628,6 @@ pub(crate) fn settings_tray(
                     cy: y0 + mg.row_h * 0.5,
                     r: (px * 0.14).max(2.0),
                     color: rgba(r.accent, 0xFF),
-                    breathe: false,
                 });
             }
             let mut tx = mg.x + cw * 1.6;
@@ -5679,7 +5642,6 @@ pub(crate) fn settings_tray(
                         cy: y0 + mg.row_h * 0.5,
                         r: dot_r,
                         color: rgba(*c, 0xFF),
-                        breathe: false,
                     });
                     scx += dot_r * 2.1;
                 }
@@ -5714,7 +5676,6 @@ pub(crate) fn settings_tray(
                 h: th,
                 radius: cw * 0.09,
                 fill: rgba(r.text_tertiary, 0xCC),
-                blur: false,
             });
         }
         prims.push(DrawPrim::ClipPop);
@@ -5743,7 +5704,6 @@ pub(crate) fn settings_tray(
             h: wg.h,
             radius: ch * 0.3,
             fill: rgba([0, 0, 0], 0x38),
-            blur: false,
         });
         prims.push(DrawPrim::Panel {
             x: wg.x,
@@ -5752,7 +5712,6 @@ pub(crate) fn settings_tray(
             h: wg.h,
             radius: ch * 0.3,
             fill: rgba(r.elevated, 0xFF),
-            blur: false,
         });
         prims.push(DrawPrim::Stroke {
             x: wg.x,
@@ -5792,7 +5751,6 @@ pub(crate) fn settings_tray(
             cy: my,
             r: mr,
             color: rgba(cand, 0xFF),
-            breathe: false,
         });
         prims.push(DrawPrim::Stroke {
             x: mx - mr,
@@ -5822,7 +5780,6 @@ pub(crate) fn settings_tray(
             cy: sy + sh * 0.5,
             r: tr,
             color: rgba(r.on_accent, 0xFF),
-            breathe: false,
         });
         prims.push(DrawPrim::Stroke {
             x: thumb_x - tr,
@@ -5863,7 +5820,6 @@ pub(crate) fn settings_tray(
                 h: h0,
                 radius: h0 * 0.3,
                 fill: rgba(c, 0xFF),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x: x0,
@@ -7639,7 +7595,7 @@ mod tests {
         let names = aterm_types::scheme::builtin_names();
         assert_eq!(next, names[1], "Default → the next built-in scheme");
         assert!(
-            aterm_types::scheme::load(&next).is_ok(),
+            aterm_types::scheme::builtin(&next).is_some(),
             "the picker only ever offers loadable scheme names"
         );
     }
@@ -8532,7 +8488,7 @@ mod tests {
         // THE CENSUS IS SPELLED OUT, NOT DERIVED. Deriving it from
         // `SOUND_MENU_KEYS` (filtered through the very `section_of` under test)
         // would let a misrouted key vanish from both sides of the comparison and
-        // pass. These are the ten audible keys by name; the box holds exactly
+        // pass. These are the eleven audible keys by name; the box holds exactly
         // them, in this exact painted order.
         assert_eq!(
             in_sound,
@@ -8548,6 +8504,9 @@ mod tests {
                 "trail_sound_style",
                 "trail_sound_riff",
                 "bell_sound",
+                // The supervisor's choice chime rides beside the bell: both
+                // answer an event, not a keystroke.
+                "choice_sound",
                 // The `[sparkle_words]` leaves land last: nested leaves are
                 // registered after the top-level rows and keep build order.
                 "sparkle_words.profanity.bonk",
@@ -8556,7 +8515,7 @@ mod tests {
                 // ladder, the quietest; it paints last as the newest row.
                 "output_streak.sound",
             ],
-            "the Sound box holds exactly the ten audible keys, in painted order"
+            "the Sound box holds exactly the eleven audible keys, in painted order"
         );
         // A duplicate would survive the set-shaped checks above, so compare
         // lengths against the deduplicated view explicitly.

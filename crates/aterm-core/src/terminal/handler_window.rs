@@ -539,8 +539,7 @@ impl TerminalHandler<'_> {
 
     /// Pop title(s) from the title stack and restore them.
     ///
-    /// Re-caps at [`super::MAX_TITLE_BYTES`] for defense-in-depth, in case
-    /// the stack was loaded via `set_title_stack()` with uncapped entries.
+    /// Re-caps at [`super::MAX_TITLE_BYTES`] for defense-in-depth.
     fn pop_title(&mut self, icon: bool, window: bool) {
         if let Some((icon_title, window_title)) = self.title.stack.pop() {
             if icon && !icon_title.is_empty() {
@@ -558,9 +557,6 @@ impl TerminalHandler<'_> {
                 } else {
                     window_title
                 };
-                if let Some(ref mut callback) = self.title.callback {
-                    callback(&capped);
-                }
                 // Bump the title-change epoch only on a real value change (mirrors
                 // set_title / the OSC 0/2 handler) so a host polling `title_epoch()`
                 // sees the pop restore the tab title rather than showing a stale one.
@@ -570,22 +566,6 @@ impl TerminalHandler<'_> {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.title.window = capped;
-            }
-            // Fire v3 event callback for popped titles, matching set_title behavior.
-            if let Some(ref mut callback) = self.title.event_callback {
-                let title_type = match (icon, window) {
-                    (true, true) => aterm_types::TitleType::WindowAndIcon,
-                    (true, false) => aterm_types::TitleType::IconOnly,
-                    (false, true) => aterm_types::TitleType::WindowOnly,
-                    (false, false) => return,
-                };
-                let text = match title_type {
-                    aterm_types::TitleType::WindowOnly | aterm_types::TitleType::WindowAndIcon => {
-                        &*self.title.window
-                    }
-                    _ => &*self.title.icon,
-                };
-                callback(title_type, text);
             }
         }
     }

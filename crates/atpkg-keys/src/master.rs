@@ -270,12 +270,11 @@ impl Drop for MasterPhrase {
 }
 
 impl MasterPhrase {
-    /// The phrase as text, for the ONE moment it is legitimately printed: generation.
-    /// Always ASCII by construction, so the conversion cannot fail.
-    ///
-    /// This is the single most dangerous method here. It exists because the owner has to
-    /// be able to read the phrase in order to write it down, and for no other reason.
-    pub fn as_str(&self) -> &str {
+    /// The phrase as text. Test-only: no shipped path prints a phrase, and this is the
+    /// single most dangerous method here, so it does not exist outside the tests that
+    /// read a generated phrase back.
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
         std::str::from_utf8(&self.chars).unwrap_or("")
     }
 

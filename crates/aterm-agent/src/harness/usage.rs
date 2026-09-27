@@ -281,12 +281,14 @@ impl RateLimits {
     }
 
     /// The `seven_day` window.
-    pub fn seven_day(&self) -> Option<&RateWindow> {
+    #[cfg(test)]
+    pub(crate) fn seven_day(&self) -> Option<&RateWindow> {
         self.windows.get("seven_day")
     }
 
     /// The `spend_limit` window.
-    pub fn spend_limit(&self) -> Option<&RateWindow> {
+    #[cfg(test)]
+    pub(crate) fn spend_limit(&self) -> Option<&RateWindow> {
         self.windows.get("spend_limit")
     }
 
@@ -439,6 +441,7 @@ impl ModelSpend {
         self.messages = self.messages.saturating_add(1);
     }
 
+    #[cfg(test)]
     fn add_spend(&mut self, other: &Self) {
         self.input = self.input.saturating_add(other.input);
         self.output = self.output.saturating_add(other.output);
@@ -542,7 +545,8 @@ impl TranscriptUsage {
     }
 
     /// The sum over every model.
-    pub fn total(&self) -> ModelSpend {
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> ModelSpend {
         let mut t = ModelSpend::default();
         for s in self.per_model.values() {
             t.add_spend(s);
@@ -763,12 +767,14 @@ impl PriceTable {
     }
 
     /// Set the price of one model id (exact match, no prefix or family rule).
-    pub fn insert(&mut self, model: impl Into<String>, price: ModelPrice) {
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, model: impl Into<String>, price: ModelPrice) {
         self.rows.insert(model.into(), price);
     }
 
     /// Builder form of [`insert`](Self::insert).
-    pub fn with(mut self, model: impl Into<String>, price: ModelPrice) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with(mut self, model: impl Into<String>, price: ModelPrice) -> Self {
         self.insert(model, price);
         self
     }
@@ -884,7 +890,8 @@ impl AccountView {
     }
 
     /// Add one window read from the vendor's on-disk cache.
-    pub fn add_cache_window(
+    #[cfg(test)]
+    pub(crate) fn add_cache_window(
         &mut self,
         name: impl Into<String>,
         used_pct: Option<f64>,
@@ -900,44 +907,6 @@ impl AccountView {
                 age_s,
             },
         );
-    }
-
-    /// Take the windows Claude Code PAINTED on its `/usage` panel, read off
-    /// aterm's own grid ([`usage_panel_windows`]).
-    ///
-    /// `place` turns the painted reset text into epoch seconds; it is
-    /// injected because no clock is read here. `age_s` is the age of the
-    /// grid read, which is the honest age of a painted figure.
-    ///
-    /// **TARGET — no production caller.** The shipped fold of the same
-    /// panel is [`super::limits::Evidence::windows_from_screen`], read by
-    /// `watch::Watcher::fold_sample` straight off the gated grid read; this
-    /// one is the `harness usage` view's half and is reached only by this
-    /// module's tests. Two folds of one fact, and the documented one is not
-    /// the shipped one — said here rather than left to be discovered.
-    ///
-    /// These land at [`Source::Grid`], the FLOOR for authority: a
-    /// statusLine, cache or transcript figure for the same window keeps its
-    /// place ([`AccountView::insert_window`]). What the grid adds is the
-    /// window no other source carries — `seven_day_overage_included`, the
-    /// Fable bucket design §5.8.2 records as header-only.
-    pub fn add_panel_windows(
-        &mut self,
-        panel: &[PanelWindow],
-        place: impl Fn(&str) -> Option<i64>,
-        age_s: Option<u64>,
-    ) {
-        for w in panel {
-            self.insert_window(
-                w.name.clone(),
-                WindowView {
-                    used_pct: Some(f64::from(w.used_pct)),
-                    resets_at: w.reset_text.as_deref().and_then(&place),
-                    source: Source::Grid,
-                    age_s,
-                },
-            );
-        }
     }
 
     /// Take the per-model spend from a transcript fold, priced by `prices`.
@@ -2577,27 +2546,5 @@ mod tests {
             vec!["five_hour", "seven_day"],
             "a keyless title is dropped, not guessed"
         );
-    }
-
-    #[test]
-    fn panel_windows_are_the_floor_for_authority_and_add_what_no_one_else_has() {
-        let mut acct = AccountView::new("work", true);
-        let line = parse_statusline(STATUSLINE).expect("fixture parses");
-        acct.add_statusline(&line, 0);
-        acct.add_panel_windows(
-            &usage_panel_windows(&rows(PANEL_WIDE)),
-            |_| Some(99),
-            Some(0),
-        );
-        // The statusLine's own figure survives a painted one for the same
-        // window: grid is rank 1 for ADMISSIBILITY and the floor for
-        // AUTHORITY, and both orderings hold here at once.
-        assert_eq!(acct.windows["five_hour"].source, Source::StatusLine);
-        assert_eq!(acct.windows["five_hour"].used_pct, Some(62.0));
-        // And the window no other source carries arrives from the grid.
-        let fable = &acct.windows["seven_day_overage_included"];
-        assert_eq!(fable.source, Source::Grid);
-        assert_eq!(fable.used_pct, Some(100.0));
-        assert_eq!(fable.resets_at, Some(99));
     }
 }

@@ -24,6 +24,11 @@
 //!   its own launch; a fleet restarted together stays in lockstep and hits the host
 //!   in a thundering herd. [`Cadence::delay`] spreads each wait by ±[`JITTER_PCT`]%.
 //!
+//! A healthy check can ask for a sooner one too: a channel head published
+//! source-first, above the last release the machine authorized, has its app build
+//! minutes behind it, so the next checks come on [`IN_FLIGHT_RETRY`] instead of a
+//! whole interval.
+//!
 //! And the log itself: dozens of byte-identical `update check failed: …` lines say
 //! nothing the first one didn't. [`FailureLog`] emits the first occurrence, then
 //! stays quiet until the message CHANGES or [`STILL_FAILING_AFTER`] passes, and always
@@ -145,6 +150,36 @@ pub(crate) fn is_network_unreachable(message: &str) -> bool {
     code_after("curl: (") || code_after("exit status: ") || code_after("(exit ")
 }
 
+/// The waits after a healthy check that found the channel head's APP BUILD IN FLIGHT
+/// — a release published source-first, whose `aterm-appcast.toml` the download host
+/// does not carry yet, and whose tag outranks the last one the machine authorized
+/// (`github::app_build_in_flight`) — indexed by how many consecutive completed checks,
+/// machine-wide, have found it so (`head_in_flight_checks` in the check receipt): 2,
+/// 4, then 8 minutes, and after those the ordinary interval.
+///
+/// Measured 2026-09-24 on the owner's machine: v0.92.0 was published source-first,
+/// the 12:38:35 check met its appcast's 404 ("channel head v0.92.0 has no app
+/// manifest"), and the next check came a whole interval later, at 13:13:10 — which
+/// staged it and applied it in 1035 ms. The app assets had landed minutes after the
+/// first check; the interval was the whole delay. Three quick tries cost three HEADs
+/// and three appcast GETs on the unmetered download host; a head that stays
+/// source-only for a night (v0.80.0 did) falls back to the ordinary cadence after
+/// them. Never longer than the ordinary ladder's own wait ([`Cadence::nominal_at`]).
+pub(crate) const IN_FLIGHT_RETRY: [Duration; 3] = [
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(4 * 60),
+    Duration::from_secs(8 * 60),
+];
+
+/// The quick wait for the `checks`-th consecutive check that found the head's app build
+/// in flight ([`IN_FLIGHT_RETRY`]), or `None` once those are spent (or for `0`: no head
+/// in flight). Shared by the one scheduler ([`Cadence`]) and the machine-wide dedup
+/// window that must not outlast it (`checker_skip_for` in the crate root).
+pub(crate) fn in_flight_retry(checks: u32) -> Option<Duration> {
+    let rung = usize::try_from(checks.checked_sub(1)?).ok()?;
+    IN_FLIGHT_RETRY.get(rung).copied()
+}
+
 /// The floor on a HELD wait that is still in force. A hold a few seconds out (a
 /// sibling's window was nearly over when this process skipped) must not become a
 /// near-zero wait: the loop would re-check at once, read the same fresh ledger stamp,
@@ -165,6 +200,11 @@ pub(crate) struct Cadence {
     /// is that rung and `failures` has not moved; past it, each one counts as an
     /// ordinary failure.
     offline: u32,
+    /// How many consecutive completed checks, machine-wide, have found the channel
+    /// head's app build in flight, as of this process's latest healthy check
+    /// ([`Self::succeeded`]). While it names an [`IN_FLIGHT_RETRY`] rung the next wait
+    /// is that rung; `0` is none. Any other outcome clears it.
+    in_flight: u32,
     /// When set and still in the future, the next wait ends HERE (bounded by
     /// [`Self::cap`], floored by [`HOLD_FLOOR`], un-jittered — the epoch already
     /// carries the loop's 0–60 s scatter) instead of on the doubling ladder.
@@ -178,6 +218,7 @@ impl Cadence {
             base,
             failures: 0,
             offline: 0,
+            in_flight: 0,
             hold: None,
         }
     }
@@ -199,6 +240,7 @@ impl Cadence {
     pub(crate) fn failed(&mut self) {
         self.failures = self.failures.saturating_add(1);
         self.offline = 0;
+        self.in_flight = 0;
         self.hold = None;
     }
 
@@ -211,6 +253,7 @@ impl Cadence {
         if self.offline as usize > OFFLINE_RETRY.len() {
             self.failures = self.failures.saturating_add(1);
         }
+        self.in_flight = 0;
         self.hold = None;
     }
 
@@ -221,10 +264,14 @@ impl Cadence {
     }
 
     /// Note a successful check — the next wait returns to the base interval
-    /// immediately. Recovery must not be rate-limited by how long the outage was.
-    pub(crate) fn succeeded(&mut self) {
+    /// immediately, or, when `head_in_flight_checks` names an [`IN_FLIGHT_RETRY`]
+    /// rung, to that rung: the check found the channel head's app build in flight
+    /// that many times running (`github::head_in_flight`), and its assets are
+    /// minutes away. Recovery must not be rate-limited by how long the outage was.
+    pub(crate) fn succeeded(&mut self, head_in_flight_checks: u32) {
         self.failures = 0;
         self.offline = 0;
+        self.in_flight = head_in_flight_checks;
         self.hold = None;
     }
 
@@ -233,6 +280,7 @@ impl Cadence {
     pub(crate) fn woke(&mut self) {
         self.failures = 0;
         self.offline = 0;
+        self.in_flight = 0;
         self.hold = None;
     }
 
@@ -262,8 +310,9 @@ impl Cadence {
 
     /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
     /// clamped to [`Self::cap`] — or, while a run of unreachable-network failures is
-    /// within [`OFFLINE_RETRY`], that rung. Exposed for tests; [`Self::delay`] is what
-    /// the loop uses.
+    /// within [`OFFLINE_RETRY`], that rung; or, after a healthy check that found the
+    /// head's app build in flight, its [`IN_FLIGHT_RETRY`] rung. Exposed for tests;
+    /// [`Self::delay`] is what the loop uses.
     #[cfg(test)]
     pub(crate) fn nominal(&self) -> Duration {
         self.nominal_at(Instant::now())
@@ -281,7 +330,7 @@ impl Cadence {
         let ladder = self.base.saturating_mul(1u32 << doublings).min(self.cap());
         match self.offline.checked_sub(1) {
             Some(rung) if self.retrying_offline() => OFFLINE_RETRY[rung as usize].min(ladder),
-            _ => ladder,
+            _ => in_flight_retry(self.in_flight).map_or(ladder, |rung| rung.min(ladder)),
         }
     }
 
@@ -398,7 +447,7 @@ pub(crate) enum LogAction {
 ///   news: DNS → auth, say) — or said at INFO while the network is expected to be
 ///   down, on the quick [`OFFLINE_RETRY`] rungs ([`Self::failure_expected`]);
 /// * an identical repeat is suppressed until [`STILL_FAILING_AFTER`], then warned
-///   once with the suppressed count, so the log always shows an ongoing outage
+///   once with the consecutive count, so the log always shows an ongoing outage
 ///   without showing it 48 times an hour;
 /// * recovery is always logged, with how long/how many it took — the transition
 ///   nobody records and everybody wants.
@@ -445,8 +494,7 @@ impl FailureLog {
             format!("update check failed: {message}")
         } else {
             format!(
-                "update check still failing ({} consecutive, {suppressed} identical \
-                 messages suppressed): {message}",
+                "update check still failing ({} consecutive): {message}",
                 self.streak
             )
         };
@@ -465,9 +513,11 @@ impl FailureLog {
         self.since_emit = 0;
         self.emitted_at = None;
         (streak > 0).then(|| {
-            LogAction::Log(format!(
-                "update check recovered after {streak} consecutive failure(s)"
-            ))
+            LogAction::Log(if streak == 1 {
+                "update check recovered after 1 failure".to_string()
+            } else {
+                format!("update check recovered after {streak} consecutive failures")
+            })
         })
     }
 }
@@ -534,7 +584,7 @@ mod tests {
             base * 2,
             "and the ordinary doubling from there"
         );
-        c.succeeded();
+        c.succeeded(0);
         assert!(!c.retrying_offline());
         assert_eq!(c.nominal(), base, "a success ends it");
         c.failed_offline();
@@ -577,6 +627,71 @@ mod tests {
         assert_eq!(c.nominal(), base, "the ordinary ladder's first rung");
     }
 
+    /// THE SOURCE-FIRST RELEASE (measured 2026-09-24: v0.92.0's first check met a
+    /// 404 appcast and the next came a whole interval later). A healthy check that
+    /// found the head's app build in flight waits 2, 4, then 8 minutes — keyed on the
+    /// machine-wide count the check receipt carries — and the ordinary interval after
+    /// those; a healthy check that found none (the negative control, `0`) waits the
+    /// base interval exactly as before. Every other outcome — a failure, an
+    /// unreachable network, a wake — ends the quick ladder, and a hold wins over it.
+    #[test]
+    fn a_head_whose_app_build_is_in_flight_is_rechecked_on_the_short_ladder() {
+        let base = Duration::from_secs(INTERVAL_SECS);
+        let mut c = Cadence::new(base);
+        c.succeeded(0);
+        assert_eq!(
+            c.nominal(),
+            base,
+            "no head in flight: the ordinary interval"
+        );
+        let waits: Vec<Duration> = (1..=4)
+            .map(|checks| {
+                c.succeeded(checks);
+                c.nominal()
+            })
+            .collect();
+        assert_eq!(
+            waits,
+            [120, 240, 480, INTERVAL_SECS].map(Duration::from_secs),
+            "2, 4, 8 minutes, then the interval"
+        );
+        c.succeeded(u32::MAX);
+        assert_eq!(
+            c.nominal(),
+            base,
+            "a head that stays source-only for a night"
+        );
+        for end in [Cadence::failed, Cadence::failed_offline, Cadence::woke] {
+            c.succeeded(1);
+            end(&mut c);
+            assert_ne!(c.nominal(), Duration::from_secs(120), "cleared");
+        }
+        c.succeeded(1);
+        let now = Instant::now();
+        c.hold_until(now + Duration::from_secs(9 * 60));
+        assert_eq!(
+            c.nominal_at(now),
+            Duration::from_secs(9 * 60),
+            "a hold wins"
+        );
+    }
+
+    /// The quick ladder never waits LONGER than the ordinary one: under a base
+    /// shorter than its rungs, every rung is the base.
+    #[test]
+    fn the_in_flight_ladder_never_outwaits_the_ordinary_one() {
+        let short = Duration::from_secs(75);
+        let mut c = Cadence::new(short);
+        for checks in 1..=3 {
+            c.succeeded(checks);
+            assert_eq!(c.nominal(), short);
+        }
+        assert_eq!(in_flight_retry(0), None, "0 is no head in flight");
+        assert_eq!(in_flight_retry(1), Some(Duration::from_secs(120)));
+        assert_eq!(in_flight_retry(3), Some(Duration::from_secs(480)));
+        assert_eq!(in_flight_retry(4), None, "the rungs are spent");
+    }
+
     /// Exits 6, 7 and 28 — could not resolve, could not connect, timed out — in both
     /// spellings the transport writes are an unreachable network; every other curl
     /// failure, and another tool's exit 7, is not.
@@ -601,7 +716,7 @@ mod tests {
             "curl GET x failed (exit status: 35): curl: (35) TLS handshake",
             "ditto zip extract failed (exit status: 7)",
             "HTTP 404 for https://github.com/x: the channel has no published release",
-            "no usable release this check — run `aterm-ctl update status` for the reason",
+            "no usable release this check — run `aterm ctl update status` for the reason",
         ] {
             assert!(!is_network_unreachable(reached), "{reached}");
         }
@@ -614,7 +729,7 @@ mod tests {
             c.failed();
         }
         assert!(c.nominal() > BASE);
-        c.succeeded();
+        c.succeeded(0);
         assert_eq!(c.nominal(), BASE, "one success restores the fast cadence");
         for _ in 0..10 {
             c.failed();
@@ -684,7 +799,7 @@ mod tests {
             anon * MAX_BACKOFF_INTERVALS,
             "and it climbs to the RELATIVE ceiling, above the absolute 15-minute one"
         );
-        c.succeeded();
+        c.succeeded(0);
         assert_eq!(c.nominal(), anon, "recovery snaps back to the base");
     }
 
@@ -730,7 +845,7 @@ mod tests {
         let mut c = Cadence::new(anon);
         c.hold_until(now + Duration::from_secs(10 * 3600));
         assert_eq!(c.nominal_at(now), anon * MAX_BACKOFF_INTERVALS, "capped");
-        c.succeeded();
+        c.succeeded(0);
         assert_eq!(c.nominal_at(now), anon, "a success clears the hold");
         c.hold_until(now + Duration::from_secs(600));
         c.woke();
@@ -830,8 +945,8 @@ mod tests {
         };
         assert!(text.contains("401"), "{text}");
         assert!(
-            text.contains("1 identical messages suppressed"),
-            "the suppressed count is carried forward, not lost: {text}"
+            text.contains("3 consecutive") && !text.contains("suppressed"),
+            "the streak is carried forward, not the log's own suppression count: {text}"
         );
     }
 
@@ -851,7 +966,7 @@ mod tests {
             panic!("past the quick rungs the same failure must be warned");
         };
         assert!(
-            escalated.contains("3 consecutive") && escalated.contains("1 identical"),
+            escalated.contains("3 consecutive") && !escalated.contains("identical"),
             "{escalated}"
         );
         assert_eq!(log.failure_expected(msg, false), LogAction::Suppress);
@@ -873,6 +988,14 @@ mod tests {
         };
         assert!(text.contains("after 5 consecutive"), "{text}");
         assert!(log.success().is_none(), "and only once");
+        // One failure is counted, not hedged with "(s)".
+        let _ = log.failure("offline");
+        assert_eq!(
+            log.success(),
+            Some(LogAction::Log(
+                "update check recovered after 1 failure".to_string()
+            ))
+        );
     }
 
     #[test]

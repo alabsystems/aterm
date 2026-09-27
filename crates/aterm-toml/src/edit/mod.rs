@@ -54,9 +54,6 @@ pub use value::{Array, InlineTable, Value};
 
 pub(crate) use parse::{ParseLimits, parse_document};
 
-/// A parse failure. One type across the crate — see [`crate::Error`].
-pub type TomlError = crate::Error;
-
 /// Raw, unparsed source text: a run of whitespace, newlines, and comments, or
 /// the verbatim spelling of a scalar.
 ///
@@ -173,12 +170,6 @@ impl Repr {
     pub fn new_unchecked(raw: impl Into<RawString>) -> Self {
         Self { raw: raw.into() }
     }
-
-    /// The source text.
-    #[must_use]
-    pub fn as_raw(&self) -> &RawString {
-        &self.raw
-    }
 }
 
 impl fmt::Display for Repr {
@@ -219,16 +210,6 @@ impl<T: ValueRepr> Formatted<T> {
     /// The parsed value.
     pub fn value(&self) -> &T {
         &self.value
-    }
-
-    /// Take the parsed value, dropping the formatting.
-    pub fn into_value(self) -> T {
-        self.value
-    }
-
-    /// The authored spelling, if this node came from a parse.
-    pub fn repr(&self) -> Option<&Repr> {
-        self.repr.as_ref()
     }
 
     /// The spelling this node encodes to, authored or canonical.
@@ -376,24 +357,12 @@ impl Key {
         &self.key
     }
 
-    /// The authored spelling, if this key came from a parse.
-    #[must_use]
-    pub fn repr(&self) -> Option<&Repr> {
-        self.repr.as_ref()
-    }
-
     /// The spelling this key encodes to, authored or canonical.
     #[must_use]
     pub fn display_repr(&self) -> String {
         self.repr
             .as_ref()
             .map_or_else(|| encode::encode_key(&self.key), ToString::to_string)
-    }
-
-    /// Formatting around the key.
-    #[must_use]
-    pub fn decor(&self) -> &Decor {
-        &self.decor
     }
 
     /// Mutable formatting around the key.

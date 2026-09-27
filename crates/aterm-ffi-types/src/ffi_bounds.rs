@@ -4,31 +4,13 @@
 
 //! Shared semantic FFI bounds contract.
 //!
-//! Defines domain-specific validation constants for pointer+len FFI APIs.
-//! All production FFI boundary crates MUST import from this module rather
-//! than defining their own constants, preventing cross-crate drift (#3076).
-//!
-//! The raw [`super::MAX_FFI_BUFFER_SIZE`] (256 MiB) at the crate root remains
-//! as the bulk-buffer fallback for file I/O and GPU uploads. Semantic
-//! subsystems (terminal I/O, paths, arrays) use the tighter limits here.
+//! Defines the validation bound for pointer+len FFI APIs (#3076).
 
 /// Hard cap for byte buffers accepted at the terminal FFI boundary (64 MiB).
 ///
 /// Protects pointer+len APIs from unbounded lengths supplied by foreign callers.
 /// Appropriate for PTY I/O, paste operations, and protocol parsing.
-///
-/// For file I/O operations that handle entire file contents, use
-/// [`super::MAX_FFI_BUFFER_SIZE`] (256 MiB) instead.
-pub const MAX_FFI_INPUT_BYTES: usize = 64 * 1024 * 1024;
-
-/// Hard cap for path byte buffers accepted at the FFI boundary (16 KiB).
-pub const MAX_FFI_PATH_BYTES: usize = 16 * 1024;
-
-/// Hard cap for C string parameter reads at the FFI boundary (1 MiB).
-pub const MAX_FFI_PARAM_STRING_BYTES: usize = 1024 * 1024;
-
-/// Hard cap for array lengths accepted at the FFI boundary.
-pub const MAX_FFI_ARRAY_ELEMENTS: usize = 1_000_000;
+pub(crate) const MAX_FFI_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Validate an FFI-provided length before converting pointer+len to slices.
 ///
@@ -36,7 +18,7 @@ pub const MAX_FFI_ARRAY_ELEMENTS: usize = 1_000_000;
 /// - Must fit in `isize` for `from_raw_parts` APIs.
 /// - Must not exceed a subsystem-defined maximum bound.
 #[must_use]
-pub fn is_valid_ffi_len(len: usize, max_len: usize) -> bool {
+pub(crate) fn is_valid_ffi_len(len: usize, max_len: usize) -> bool {
     len <= max_len && isize::try_from(len).is_ok()
 }
 
@@ -58,33 +40,25 @@ mod tests {
     #[test]
     fn is_valid_ffi_len_zero_is_valid() {
         assert!(is_valid_ffi_len(0, MAX_FFI_INPUT_BYTES));
-        assert!(is_valid_ffi_len(0, MAX_FFI_PATH_BYTES));
-        assert!(is_valid_ffi_len(0, MAX_FFI_ARRAY_ELEMENTS));
     }
 
-    /// Every cap is inclusive: its exact value and one below are accepted,
-    /// one above is rejected.
+    /// The cap is inclusive: its exact value and one below are accepted, one
+    /// above is rejected.
     #[test]
-    fn is_valid_ffi_len_boundary_at_every_cap() {
-        for (cap, max) in [
-            ("MAX_FFI_INPUT_BYTES", MAX_FFI_INPUT_BYTES),
-            ("MAX_FFI_PATH_BYTES", MAX_FFI_PATH_BYTES),
-            ("MAX_FFI_ARRAY_ELEMENTS", MAX_FFI_ARRAY_ELEMENTS),
-            ("MAX_FFI_BUFFER_SIZE", crate::MAX_FFI_BUFFER_SIZE),
-        ] {
-            assert!(
-                is_valid_ffi_len(max, max),
-                "{cap}: exact boundary must be accepted"
-            );
-            assert!(
-                is_valid_ffi_len(max - 1, max),
-                "{cap}: one below boundary must be accepted"
-            );
-            assert!(
-                !is_valid_ffi_len(max + 1, max),
-                "{cap}: one above boundary must be rejected"
-            );
-        }
+    fn is_valid_ffi_len_boundary_at_the_cap() {
+        let max = MAX_FFI_INPUT_BYTES;
+        assert!(
+            is_valid_ffi_len(max, max),
+            "exact boundary must be accepted"
+        );
+        assert!(
+            is_valid_ffi_len(max - 1, max),
+            "one below boundary must be accepted"
+        );
+        assert!(
+            !is_valid_ffi_len(max + 1, max),
+            "one above boundary must be rejected"
+        );
     }
 }
 

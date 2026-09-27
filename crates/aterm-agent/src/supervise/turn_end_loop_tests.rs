@@ -7,12 +7,19 @@
 // Each behaviour has its negative control. Included from `run.rs`'s tests
 // (`mod turn_end`), so the `Mock` and the helpers there are in scope.
 
-use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_SUGGESTION};
+use crate::supervise::policy::turn_end::{RULE_CONSENT, RULE_CONTINUE, RULE_SUGGESTION};
 
-/// The host's policy: every switch on (`SupervisorConfig::default()`).
+/// The host's policy, every switch on (`SupervisorConfig::default()`) but
+/// the answers: these scripts end on a request for a decision ([`STOP`]),
+/// which the owner's `answer_questions = false` hands to a person — so each
+/// shows what the loop typed before it, and the escalation after. The
+/// answer itself is [`a_stop_phrase_is_answered_with_the_answer_text`]'s.
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            ..SupervisorConfig::default()
+        },
         ..auto(max_s, None)
     }
 }
@@ -102,7 +109,7 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
         m.attention.as_deref(),
         Some(
             "claude idle: I need your decision on the schema before I go on. (the worker said \
-             \"need your decision\")"
+             \"need your decision\"; answer_questions is off)"
         )
     );
     let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
@@ -128,6 +135,25 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
     off.policy.continue_policy = false;
     let _ = watch_lines(&mut m, &off);
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+}
+
+/// The request after the write that starts `write` waits for the worker's
+/// REACTION with [`turn_end_loop::REACTION_WAIT`] — the screen moving —
+/// before anything about the write is judged; never the approval press's
+/// 2 s settle, which judged a worker merely slow to react (a continuation
+/// escalated as not shown, an accept key's words typed after it: doubled).
+fn assert_reaction_awaited(m: &Mock, write: &str) {
+    let next = m
+        .requests
+        .iter()
+        .skip_while(|r| !r.starts_with(write))
+        .nth(1);
+    let bound = format!(" timeout {}", turn_end_loop::REACTION_WAIT.as_millis());
+    assert!(
+        next.is_some_and(|r| r.starts_with("await seq ") && r.ends_with(&bound)),
+        "after `{write}` the reaction is awaited{bound}: {:#?}",
+        m.requests
+    );
 }
 
 /// THE WORKER'S OWN SUGGESTION, accepted by the vendor's accept key: `right`
@@ -172,6 +198,7 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
         m.requests
     );
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    assert_reaction_awaited(&m, "key if-gen=1.102");
 
     // Negative control: no generation fence — the words, typed.
     let mut m = Mock::new(
@@ -189,6 +216,40 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
     );
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert!(m.requests.contains(&continue_request("keep going")));
+}
+
+/// THE ELEGANCE REVIEW OF 2026-09-25 (minor): a person's draft whose caret
+/// was moved home (←, Home, ctrl-a) sits at column 2 of the caret row, where
+/// the placeholder does too — the loop read it as the placeholder with no
+/// look and typed its continuation in front of it, the failure the upgrade's
+/// gate had measured. The `cell` at column 2 now says which: DIM is the
+/// placeholder (continued, the suggestion accepted), anything else a typed
+/// draft — never typed over. NEGATIVE CONTROL: the dim cell is the
+/// placeholder, as before.
+#[test]
+fn a_draft_homed_to_column_2_is_never_typed_over() {
+    for (attrs, typed) in [("dim", true), ("none", false)] {
+        let mut m = Mock::new(
+            true,
+            vec![busy_screen(), suggesting("Stage 1 is in."), ended(STOP)],
+        );
+        m.cursor_on_caret = true;
+        m.cell_attrs = attrs;
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        let (lines, _) = watch_lines(&mut m, &hosted(3));
+        assert!(
+            m.requests.iter().any(|r| r.starts_with("cell ")),
+            "{attrs}: the cell was read: {:#?}",
+            m.requests
+        );
+        assert_eq!(
+            m.requests.contains(&continue_request("keep going")),
+            typed,
+            "{attrs}: {lines:#?}\n{:#?}",
+            m.requests
+        );
+    }
 }
 
 /// A 529 END OF TURN (`API Error: 529 Overloaded` under the last message:
@@ -232,7 +293,7 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
         .find(|r| r.kind == "waiting")
         .expect("a WAITING row");
     assert!(
-        waiting.summary.ends_with("overloaded retry 1 of 3"),
+        waiting.summary.ends_with("overloaded retry 1"),
         "{}",
         waiting.summary
     );
@@ -260,13 +321,16 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
     );
 }
 
-/// OWNER DECISION 3, in the loop: a Fable limit types `/model opus` under
-/// `model-fallback@v1` (`TYPED`), raises no badge — the wall is handled,
-/// journaled `LIMITED … handled` — and the `/model` output's point is
-/// continued. Negative control: a bucket that asks consent to spend credits
-/// is escalated and nothing is typed.
+/// OWNER DECISION 3, in a loop with no host to relaunch the agent (`drive
+/// watch`, D7): a Fable limit is WAITED OUT to its reset — never Claude's
+/// own `/model`, which also saves the person's default for every new
+/// session — and raises no badge: the wall is handled, journaled `LIMITED …
+/// handled`. (Where a host relaunches it, the fallback is a relaunch with
+/// `--model`: `run_engine_tests`' `a_model_bucket_is_relaunched_…`.) A
+/// bucket that asks CONSENT to go on on usage credits is accepted instead:
+/// continued under `consent-accept@v1`, and no badge.
 #[test]
-fn a_fable_limit_switches_to_the_fallback_then_continues_with_no_badge() {
+fn a_fable_limit_with_no_host_to_relaunch_is_waited_out_never_by_model() {
     let (dir, path) = journal_file("te-fable");
     let mut fable = rows(&[
         "⏺ Running the suite.",
@@ -277,81 +341,42 @@ fn a_fable_limit_switches_to_the_fallback_then_continues_with_no_badge() {
         "",
     ]);
     fable.extend(composer("  ? for shortcuts"));
-    let mut switched = rows(&[
-        "⏺ Running the suite.",
-        "",
-        "❯ /model opus",
-        "  ⎿  Set model to Opus 5 (1M context) (default)",
-        "",
-    ]);
-    switched.extend(composer("  ? for shortcuts"));
-    let mut m = Mock::new(
-        true,
-        vec![
-            busy_screen(),
-            fable.clone(),
-            switched,
-            busy_screen(),
-            ended(STOP),
-        ],
-    );
-    m.turn_gates = vec![1, 2];
+    let mut m = Mock::new(true, vec![busy_screen(), fable.clone()]);
     m.vanish_after = Some(2);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
-        ..hosted(30)
+        ..hosted(3)
     };
-    let (ldir, ledger) = ledger_at("fable-switch");
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_approval_ledger(Some(ledger.clone()));
-    });
+    let (lines, _) = watch_lines(&mut m, &opts);
     let (records, _) = journal_records(&path);
     let _ = std::fs::remove_dir_all(&dir);
-    // The switch's ledger row says how to undo it (here: the bucket's
-    // model, no reset named), and reads back as the open switch.
-    assert_eq!(
-        crate::supervise::approvals::open_model_switch(&ledger, None),
-        Some(crate::supervise::approvals::OpenSwitch {
-            from: Some("fable".to_string()),
-            to: "opus".to_string(),
-            back_at_unix: None,
-        })
-    );
-    let _ = std::fs::remove_dir_all(&ldir);
-    let decided: Vec<&String> = lines
-        .iter()
-        .filter(|l| l.starts_with("TYPED") || l.starts_with("CONTINUED"))
-        .collect();
-    assert_eq!(
-        decided,
-        [
-            "TYPED seq=102 rule=model-fallback@v1 /model opus (from fable; the notice names no \
-             reset: not switched back; now the default for new sessions)",
-            "CONTINUED seq=103 rule=model-fallback@v1 keep going",
-        ],
-        "{lines:#?}\n{:#?}",
+    assert!(
+        !m.requests.iter().any(|r| r.contains("/model")),
+        "never /model: {:#?}",
         m.requests
     );
-    assert!(m.requests.contains(&continue_request("/model opus")));
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("TYPED") || l.starts_with("CONTINUED")),
+        "{lines:#?}"
+    );
     assert!(
         records
             .iter()
             .any(|r| r.kind == "limited" && r.summary.starts_with("handled: You've reached")),
         "{records:#?}"
     );
-    // Two badges: the default model moved for good (no reset named, so no
-    // switch back — lane B2's review), and the stop phrase's; none for the
-    // wall itself, which was handled.
-    assert_eq!(count(&m, "meta set attention"), 2, "{:#?}", m.requests);
     assert!(
-        m.requests.iter().any(|r| r.contains(
-            "/model opus is now the default for new sessions: not switched back (no reset named)"
-        )),
-        "{:#?}",
-        m.requests
+        records
+            .iter()
+            .any(|r| r.kind == "waiting" && r.summary.contains("until=")),
+        "the reset waited out: {records:#?}"
     );
+    assert_eq!(count(&m, "meta set attention"), 0, "{:#?}", m.requests);
 
-    // Negative control: the consent notice.
+    // The consent notice: accepted (owner, 2026-09-24) — continued, no
+    // switch, and no `limited:` badge.
     let mut consent = rows(&[
         "⏺ Running the suite.",
         "  ⎿  Fable limit reached · continuing on Sonnet uses usage credits, and the prompt \
@@ -363,10 +388,19 @@ fn a_fable_limit_switches_to_the_fallback_then_continues_with_no_badge() {
     consent.extend(composer("  ? for shortcuts"));
     let mut m = Mock::new(true, vec![busy_screen(), consent]);
     m.vanish_after = Some(2);
-    let _ = watch_lines(&mut m, &hosted(30));
-    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    let (lines, _) = watch_lines(&mut m, &hosted(30));
     assert!(
-        m.attention
+        m.requests.contains(&continue_request("keep going")),
+        "{:#?}",
+        m.requests
+    );
+    assert!(
+        lines.contains(&format!("CONTINUED seq=102 rule={RULE_CONSENT} keep going")),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert!(
+        !m.attention
             .as_deref()
             .is_some_and(|a| a.starts_with("limited: ")),
         "{:?}",
@@ -473,7 +507,9 @@ fn a_lost_login_types_login_and_its_badge_goes_when_the_worker_works() {
 }
 
 /// NEVER OVER A PERSON: a draft in the composer (the cursor after it) gets
-/// nothing typed and raises nothing; a session whose program is a shell is
+/// nothing typed and raises nothing within the grace — a draft first seen
+/// is a keystroke just made ([`a_draft_left_standing_is_submitted_once_the_
+/// grace_has_passed`] is what comes after it); a session whose program is a
 /// never typed into (the program read fresh before the act, `SKIPPED`
 /// journaled); a guarded submit whose guard missed (`skipped`) is no act —
 /// no `CONTINUED`, no ledger row. The control is the first test.
@@ -510,7 +546,7 @@ fn a_draft_a_shell_and_a_missed_guard_type_nothing() {
     assert!(
         records
             .iter()
-            .any(|r| r.kind == "skipped" && r.summary.contains("runs zsh, not Claude Code")),
+            .any(|r| r.kind == "skipped" && r.summary.contains("runs zsh, no agent")),
         "{records:#?}"
     );
 
@@ -579,18 +615,21 @@ fn an_offer_is_continued_and_a_question_is_escalated() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
     assert_eq!(
         m.attention.as_deref(),
-        Some("claude question: Did the suite pass on your machine? (the worker asked a question)")
+        Some(
+            "claude question: Did the suite pass on your machine? (the worker asked a question; \
+             answer_questions is off)"
+        )
     );
 }
 
 /// Lane B2's review (major 1), in the loop: a continuation whose reply ends
 /// inside the `turn` verb's own settle is never read busy. Its point is
 /// waited for [`TurnEndTiming::take_within`] (the deadline of the loop's own
-/// wait, no sleep), then judged as the short yield it is — continued once
-/// more at the SAME point ([`Session::turn_end_now`]) — and the second such
-/// yield is escalated as done. Before the fix the first unseen point was
-/// awaited forever: one `turn`, and nothing after. The negative control is
-/// the third point: escalated, never typed into.
+/// wait, no sleep), then judged as the short yield it is — backed off
+/// ([`TurnEndTiming::short_backoff`]) and continued once more at the SAME
+/// point ([`Session::turn_end_now`]) — and never escalated as "done" (the
+/// back-off grows instead). Before the fix the first unseen point was
+/// awaited forever: one `turn`, and nothing after.
 #[test]
 fn a_reply_inside_the_settle_is_judged_at_its_deadline_not_latched() {
     let mut m = Mock::new(
@@ -608,6 +647,8 @@ fn a_reply_inside_the_settle_is_judged_at_its_deadline_not_latched() {
     let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
         s.set_turn_end_timing(TurnEndTiming {
             take_within: Duration::from_millis(60),
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
             ..TurnEndTiming::default()
         });
     });
@@ -616,7 +657,7 @@ fn a_reply_inside_the_settle_is_judged_at_its_deadline_not_latched() {
         .filter(|l| l.starts_with("CONTINUED"))
         .collect();
     assert_eq!(
-        continued,
+        continued[..2],
         [
             "CONTINUED seq=102 rule=continue@v1 keep going",
             "CONTINUED seq=103 rule=continue@v1 keep going",
@@ -624,14 +665,8 @@ fn a_reply_inside_the_settle_is_judged_at_its_deadline_not_latched() {
         "{lines:#?}\n{:#?}",
         m.requests
     );
-    assert_eq!(count(&m, "turn"), 2, "{:#?}", m.requests);
-    assert!(
-        m.attention
-            .as_deref()
-            .is_some_and(|a| a.contains("worker reports done")),
-        "{:?}\n{lines:#?}",
-        m.attention
-    );
+    assert!(count(&m, "turn") >= 2, "{:#?}", m.requests);
+    assert_eq!(m.attention, None, "never escalated as done: {lines:#?}");
 }
 
 /// The `help` a host with both fences answers (`key` and `send` each name
@@ -699,6 +734,7 @@ fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
         m.requests
     );
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    assert_reaction_awaited(&m, "send if-gen=1.102");
     assert!(
         std::fs::read_to_string(&ledger)
             .unwrap_or_default()
@@ -834,9 +870,10 @@ fn a_long_continuations_guard_matches_its_last_row_at_every_width() {
     let rules = "stay on the branch, never push to main, run the lane's tests before \
                  every commit, and keep the ledger rows exact";
     let text = format!("keep going (standing rules: {rules})");
-    let guard =
-        aterm_observe::row_matcher(&crate::supervise::run::turn_end_loop::composer_guard(&text))
-            .expect("a pattern");
+    let guard = aterm_observe::row_matcher(&crate::supervise::run::turn_end_loop::composer_guard(
+        '❯', &text,
+    ))
+    .expect("a pattern");
     let old_tail: String = {
         let chars: Vec<char> = text.chars().collect();
         chars[chars.len() - 40..].iter().collect()
@@ -863,6 +900,39 @@ fn a_long_continuations_guard_matches_its_last_row_at_every_width() {
         crate::supervise::run::turn_end_loop::capped_rules("short rules"),
         "short rules"
     );
+}
+
+/// THE HAZARDS REVIEW OF 2026-09-25 (major): a long text's guard was an
+/// unanchored tail of its last word, and it matched a SHELL's cursor row —
+/// the default `answer_text` against `…prefer reversible steps, and keep
+/// going.` on zsh — so an agent that exited between the read and the write
+/// would have had its answer run as a command. The tail now sits on a row
+/// the composer draws: its caret row, or a continuation indented two.
+/// NEGATIVE CONTROL: the composer's own last rows (Claude Code's `❯` and
+/// Codex's `›`, NBSP caret included) still match.
+#[test]
+fn a_long_texts_guard_never_matches_a_shells_row() {
+    let text = crate::supervise::SupervisorConfig::default().answer_text;
+    for caret in ['❯', '›'] {
+        let guard = aterm_observe::row_matcher(
+            &crate::supervise::run::turn_end_loop::composer_guard(caret, &text),
+        )
+        .expect("a pattern");
+        for shell in [
+            "user@host ~ % Nobody is here to answer. Decide for yourself with your best judgment: \
+             take the option you would recommend, prefer reversible steps, and keep going.",
+            "ould recommend, prefer reversible steps, and keep going.",
+            "$ keep going.",
+        ] {
+            assert!(!guard.matches(shell), "{caret}: {shell}");
+        }
+        for width in 30..=160 {
+            let last = word_wrapped_last_row(&format!("{caret} {text}"), width);
+            assert!(guard.matches(&last), "{caret} width {width}: {last:?}");
+        }
+        let nbsp = format!("{caret}\u{a0}{text}");
+        assert!(guard.matches(&nbsp), "{nbsp}");
+    }
 }
 
 /// The row a composer's text ends on, word-wrapped at `width` columns as
@@ -917,16 +987,18 @@ fn seed_ledger(path: &std::path::Path, age_min: i64, sid: Option<&str>) {
 
 /// Lane B2's review (minor): the typing budget lived only in the loop, so a
 /// loop its host re-spawned started with a fresh six an hour. It is seeded
-/// from the ledger's `typed` rows of the session within the window: six
-/// from an earlier loop in the last hour spend it — escalated, nothing
-/// typed. Negative controls: six from two hours ago, and six of another
-/// session's, leave it whole — continued.
+/// from the ledger's `typed` rows of the session within the window: under a
+/// written `continue_per_hour = 6`, six from an earlier loop in the last hour
+/// spend it — escalated, nothing typed. Negative controls: six from two
+/// hours ago, six of another session's, and the default (`0`, no cap) leave
+/// it whole — continued.
 #[test]
 fn the_typing_budget_counts_an_earlier_loops_acts_from_the_ledger() {
-    for (tag, age, sid, spent) in [
-        ("recent", 1, None, true),
-        ("old", 120, None, false),
-        ("other", 1, Some("@s-9"), false),
+    for (tag, age, sid, cap, spent) in [
+        ("recent", 1, None, 6, true),
+        ("old", 120, None, 6, false),
+        ("other", 1, Some("@s-9"), 6, false),
+        ("uncapped", 1, None, 0, false),
     ] {
         let (dir, ledger) = ledger_at(&format!("budget-{tag}"));
         seed_ledger(&ledger, age, sid);
@@ -938,7 +1010,9 @@ fn the_typing_budget_counts_an_earlier_loops_acts_from_the_ledger() {
             ],
         );
         m.vanish_after = Some(2);
-        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
+        let mut opts = hosted(30);
+        opts.policy.continue_per_hour = cap;
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_approval_ledger(Some(ledger.clone()));
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -956,40 +1030,6 @@ fn the_typing_budget_counts_an_earlier_loops_acts_from_the_ledger() {
             assert_eq!(count(&m, "turn"), 1, "{tag}: {lines:#?}");
         }
     }
-}
-
-/// `/model` also saves the switch as the owner's default for new sessions:
-/// a switch with no way back is said (lane B2's review). Negative control: a
-/// switch whose model and reset are known is switched back — and the
-/// default with it — so it says nothing.
-#[test]
-fn a_switch_with_no_way_back_says_the_default_moved() {
-    use crate::supervise::policy::turn_end::ModelSwitch;
-    use crate::supervise::run::turn_end_loop::default_moved;
-    let known = ModelSwitch {
-        from: Some("fable".to_string()),
-        to: "opus".to_string(),
-        back_at: Some(Instant::now()),
-    };
-    assert_eq!(default_moved(&known), None);
-    let no_reset = ModelSwitch {
-        back_at: None,
-        ..known.clone()
-    };
-    assert!(
-        default_moved(&no_reset).is_some_and(|r| r.contains("default for new sessions")),
-        "{:?}",
-        default_moved(&no_reset)
-    );
-    let no_model = ModelSwitch {
-        from: None,
-        ..known
-    };
-    assert!(
-        default_moved(&no_model).is_some_and(|r| r.contains("no model /model knows")),
-        "{:?}",
-        default_moved(&no_model)
-    );
 }
 
 /// `rows` as Claude Code 2.1.281 draws its composer — the caret, then a
@@ -1057,6 +1097,7 @@ fn the_no_break_space_composer_takes_the_fenced_continuation() {
     // The guarded submit's guard, for a host without the send fence, takes
     // the same caret.
     let g = aterm_observe::row_matcher(&crate::supervise::run::turn_end_loop::composer_guard(
+        '❯',
         "keep going",
     ))
     .expect("compiles");
@@ -1087,65 +1128,23 @@ fn the_no_break_space_composer_takes_the_fenced_continuation() {
     );
 }
 
-/// The transport `hosted_until_stopped` runs the loop over: the `Mock`,
-/// with the host's stop raised on EVIDENCE, never on a clock. The loop's
-/// first `await seq` is its wait for the screen to move past the point it
-/// has just handed over (`Session::wait_for_next` → `moved_past`) — no
-/// earlier request of these scripts is one (a busy read with the footer up
-/// waits with `await gone`) — so by then the point was decided and
-/// escalated, or adopted. There the hand-over flag is raised (when
-/// `hand_over`) and THEN the stop, as the host does. A fixed 150 ms timer
-/// raced that whole first look (claim, reconcile, two waits, two reads, the
-/// decision): on a host loaded to ~39 with 662 tests in the process, the
-/// stop landed first and the run ended `EXIT stopped` with nothing raised.
-struct StopAtPoint<'a> {
-    inner: &'a mut Mock,
-    stop: Arc<AtomicBool>,
-    handover: Arc<AtomicBool>,
-    hand_over: bool,
-}
-
-impl Ctl for StopAtPoint<'_> {
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
-        let r = self.inner.call(args);
-        let mut words = args.iter().filter(|a| !a.starts_with('@'));
-        if words.next() == Some(&"await") && words.next() == Some(&"seq") {
-            self.handover.store(self.hand_over, Ordering::SeqCst);
-            self.stop.store(true, Ordering::SeqCst);
-        }
-        r
-    }
-}
-
-/// Run `run_hosted` over `m` until it has handed its first point over
-/// (`StopAtPoint`), then stop it — with the hand-over flag raised first
-/// when `hand_over` — and return its printed lines. The 30 s budget bounds
-/// a loop that never reaches a point (it ends `TIMEOUT`, not `EXIT
-/// stopped`, and the caller's first assertion says so).
-fn hosted_until_stopped(m: &mut Mock, hand_over: bool) -> Vec<String> {
-    m.stall_sleep = Some(Duration::from_millis(5));
-    let stop = Arc::new(AtomicBool::new(false));
-    let handover = Arc::new(AtomicBool::new(false));
-    let mut ctl = StopAtPoint {
-        inner: m,
-        stop: Arc::clone(&stop),
-        handover: Arc::clone(&handover),
+/// Run `run_hosted` over `m` until its host stops it — once the loop has
+/// read the last screen and is watching past it ([`host_stops`]), not 150 ms
+/// in, which a loaded machine outran before the idle point was reached (2
+/// in 40, measured) — with the hand-over flag raised first when
+/// `hand_over`, and return its printed lines. The approval ledger is the
+/// caller's (a temp one, never the real state root's): the loops of one
+/// restart share it, as a restarted worker's do.
+fn hosted_until_stopped(m: &mut Mock, ledger: &Path, hand_over: bool) -> Vec<String> {
+    let (r, lines) = host_stops(
+        m,
+        Some("@s-1"),
+        ledger.to_path_buf(),
+        &hosted(30),
         hand_over,
-    };
-    let mut out: Vec<u8> = Vec::new();
-    let mut s = Session::new(&mut ctl, Some("@s-1".to_string()));
-    s.set_handover(handover);
-    // Never the real state root's ledger.
-    s.set_approval_ledger(Some(
-        std::env::temp_dir().join(format!("aterm-hand-over-{}.jsonl", std::process::id())),
-    ));
-    let r = s.run_hosted(&hosted(30), stop, &mut out);
+    );
     assert_eq!(r, Ok(()));
-    String::from_utf8(out)
-        .expect("utf-8")
-        .lines()
-        .map(str::to_string)
-        .collect()
+    lines
 }
 
 /// The reliability review of 2026-09-24 (major): a worker restarted by its
@@ -1158,8 +1157,9 @@ fn hosted_until_stopped(m: &mut Mock, hand_over: bool) -> Vec<String> {
 /// good): the badge is cleared, and the next loop raises none.
 #[test]
 fn a_handed_over_idle_escalation_survives_the_restart() {
+    let (dir, ledger) = ledger_at("hand-over");
     let mut m = Mock::new(true, vec![busy_screen(), ended(STOP)]);
-    let first = hosted_until_stopped(&mut m, true);
+    let first = hosted_until_stopped(&mut m, &ledger, true);
     assert_eq!(
         first.last().map(String::as_str),
         Some("EXIT stopped"),
@@ -1174,7 +1174,7 @@ fn a_handed_over_idle_escalation_survives_the_restart() {
         "{raised}"
     );
     assert_eq!(count(&m, "@s-1 meta unset attention owner=supervisor"), 0);
-    let _ = hosted_until_stopped(&mut m, true);
+    let _ = hosted_until_stopped(&mut m, &ledger, true);
     assert_eq!(
         m.attention.as_deref(),
         Some(raised.as_str()),
@@ -1184,28 +1184,101 @@ fn a_handed_over_idle_escalation_survives_the_restart() {
     assert_eq!(count(&m, "@s-1 meta set attention owner=supervisor"), 1);
     assert_eq!(count(&m, "@s-1 meta unset attention owner=supervisor"), 0);
     // The last loop stops for good: its adopted badge is released.
-    let _ = hosted_until_stopped(&mut m, false);
+    let _ = hosted_until_stopped(&mut m, &ledger, false);
     assert_eq!(m.attention, None, "{:#?}", m.requests);
+    let _ = std::fs::remove_dir_all(&dir);
 
-    // Negative control: the stop is not a hand-over — cleared, and the
-    // restarted loop raises nothing on the same point.
+    // Negative control: the stop is not a hand-over — cleared; the question
+    // still stands, so a loop started over it later raises it again.
+    let (dir, ledger) = ledger_at("hand-over-ctl");
     let mut m = Mock::new(true, vec![busy_screen(), ended(STOP)]);
-    let _ = hosted_until_stopped(&mut m, false);
+    let _ = hosted_until_stopped(&mut m, &ledger, false);
     assert_eq!(m.attention, None);
-    let _ = hosted_until_stopped(&mut m, false);
+    let _ = hosted_until_stopped(&mut m, &ledger, false);
     assert_eq!(m.attention, None);
-    assert_eq!(count(&m, "@s-1 meta set attention owner=supervisor"), 1);
-    // The ledger `hosted_until_stopped`'s runs share lives in the process temp
-    // dir: leave nothing behind (it used to accumulate one empty file per run).
-    let _ = std::fs::remove_file(
-        std::env::temp_dir().join(format!("aterm-hand-over-{}.jsonl", std::process::id())),
-    );
+    assert_eq!(count(&m, "@s-1 meta set attention owner=supervisor"), 2);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A ledger holding one `/model` switch row (as the loop that switched wrote
-/// it, [`crate::supervise::approvals::model_switch_reason`]), then — when
-/// `restored` — the switch back's row.
-fn seed_switch(path: &std::path::Path, back_at_unix: i64, restored: bool) {
+/// A STOP IN A CONTINUATION'S SETTLE ends the hosted run before its next
+/// wait (the review of 2026-09-24): after the accept key that fills the
+/// worker's suggestion, and after the fenced write of the continuation, the
+/// loop settles with two waits back to back — the key's change, then the
+/// short idle — and the stop set as the first goes out
+/// ([`stop_in_every_wait`], every other wait of the path too) ends the run
+/// before the second, and before the Enter: `Session::call` refuses a wait
+/// once the stop is set, as it refuses a write. NEGATIVE CONTROL, measured:
+/// with that refusal of a wait removed, each path's stop set in `await seq
+/// 102 timeout <REACTION_WAIT>` is followed by `await idle 500 timeout 1500`.
+/// The settle's bound is read from [`REACTION_WAIT`] itself, never spelled
+/// here: it moved from 2 s to 10 s once, and a copy of the number would have
+/// made this test miss the settle it exists to stop in.
+#[test]
+fn a_stop_in_a_continuations_settle_ends_the_run_before_its_next_wait() {
+    let bound = format!(
+        " timeout {}",
+        crate::supervise::run::turn_end_loop::REACTION_WAIT.as_millis()
+    );
+    let settle = |armed: &[String]| {
+        assert!(
+            armed
+                .iter()
+                .any(|w| w.starts_with("@s-1 await seq ") && w.ends_with(&bound)),
+            "the stop was never set in the settle: {armed:#?}"
+        );
+    };
+    let armed = stop_in_every_wait("suggestion", &hosted(30), Some("@s-1"), || {
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                suggesting("Stage 1 is in."),
+                suggesting("Stage 1 is in."),
+                busy_screen(),
+                ended(STOP),
+            ],
+        );
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.help = FENCED_HELP.to_string();
+        m.screen_cols.insert(2, 12);
+        m.vanish_after = Some(2);
+        m
+    });
+    settle(&armed);
+
+    let armed = stop_in_every_wait("fenced", &hosted(30), Some("@s-1"), || {
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                ended("Fixed the parser; the suite is green."),
+                typed_in("Fixed the parser; the suite is green.", "keep going"),
+                busy_screen(),
+                ended(STOP),
+            ],
+        );
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.help = FENCED_HELP.to_string();
+        m.screen_cols.insert(2, 12);
+        m.vanish_after = Some(2);
+        m
+    });
+    settle(&armed);
+}
+
+/// A ledger holding one model switch row (as the loop that switched wrote
+/// it, [`crate::supervise::approvals::model_switch_reason`]: `relaunch
+/// --model opus`, or before D7 `/model opus`), then — when `restored` — the
+/// switch back's row.
+pub(super) fn seed_switch(
+    path: &std::path::Path,
+    sid: Option<&str>,
+    back_at_unix: i64,
+    restored: bool,
+    legacy: bool,
+) {
     use crate::supervise::approvals::{Outcome, Row, model_switch_reason};
     use crate::supervise::policy::turn_end::{RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
     let now = crate::supervise::journal::unix_ms();
@@ -1214,11 +1287,15 @@ fn seed_switch(path: &std::path::Path, back_at_unix: i64, restored: bool) {
         Row {
             rule_id: RULE_MODEL_FALLBACK,
             outcome: Outcome::Typed,
-            command: "/model opus",
+            command: if legacy {
+                "/model opus"
+            } else {
+                "relaunch --model opus"
+            },
             reason: &reason,
             box_seq: 90,
         }
-        .to_json(now - 30 * 60_000, None),
+        .to_json(now - 30 * 60_000, sid),
         Row {
             rule_id: RULE_MODEL_FALLBACK,
             outcome: Outcome::Typed,
@@ -1226,18 +1303,22 @@ fn seed_switch(path: &std::path::Path, back_at_unix: i64, restored: bool) {
             reason: "the turn-end policy",
             box_seq: 91,
         }
-        .to_json(now - 29 * 60_000, None),
+        .to_json(now - 29 * 60_000, sid),
     ];
     if restored {
         rows.push(
             Row {
                 rule_id: RULE_MODEL_RESTORE,
                 outcome: Outcome::Typed,
-                command: "/model fable",
+                command: if legacy {
+                    "/model fable"
+                } else {
+                    "relaunch --model fable"
+                },
                 reason: "the turn-end policy",
                 box_seq: 95,
             }
-            .to_json(now - 10 * 60_000, None),
+            .to_json(now - 10 * 60_000, sid),
         );
     }
     std::fs::write(path, rows.join("\n") + "\n").expect("the ledger");
@@ -1245,58 +1326,52 @@ fn seed_switch(path: &std::path::Path, back_at_unix: i64, restored: bool) {
 
 /// The reliability review of 2026-09-24 (major): owner decision 3's switch
 /// back at the bucket's reset lived in one loop's memory, so a host restart
-/// between `/model opus` and the reset left the session — and, `/model`
-/// saving it, every new session — on opus for good. The switch's ledger row
-/// now says how to undo it, and a loop that starts after it switches back
-/// at the reset: `/model fable` under `model-restore@v1`. The write side:
-/// the switching loop's row names the bucket's model. NEGATIVE CONTROLS: a
+/// between the switch and the reset left the session on the fallback for
+/// good. The switch's ledger row says how to undo it — `relaunch --model
+/// opus` since D7, `/model opus` in a ledger from before — and a loop that
+/// starts after it reads it back as the OPEN switch; the switch back is a
+/// relaunch its host makes (`run_engine_tests`'
+/// `a_model_bucket_is_relaunched_…`). Here, with no host to relaunch, the
+/// point gets its plain continuation — never `/model`. NEGATIVE CONTROLS: a
 /// ledger whose switch was already undone, and one whose reset is still
-/// ahead, get the plain continuation.
+/// ahead, read back no open switch or one not due.
 #[test]
-fn a_model_switch_is_switched_back_by_a_loop_that_starts_after_it() {
+fn a_model_switch_is_read_back_by_a_loop_that_starts_after_it() {
     use crate::supervise::approvals::{OpenSwitch, open_model_switch};
     // 2026-09-17T12:55:00-07:00 is the watch tests' clock (TEST_NOW).
     let test_now: i64 = 1_789_660_500;
-    for (tag, back_at, restored, expect_restore) in [
-        ("due", test_now - 60, false, true),
-        ("undone", test_now - 60, true, false),
-        ("ahead", test_now + 3600, false, false),
-    ] {
-        let (dir, ledger) = ledger_at(&format!("switch-{tag}"));
-        seed_switch(&ledger, back_at, restored);
-        let open = open_model_switch(&ledger, None);
-        assert_eq!(
-            open,
-            (!restored).then(|| OpenSwitch {
-                from: Some("fable".to_string()),
-                to: "opus".to_string(),
-                back_at_unix: Some(back_at),
-            }),
-            "{tag}"
-        );
-        let mut m = Mock::new(
-            true,
-            vec![busy_screen(), ended("Stage 3 done; the suite is green.")],
-        );
-        m.vanish_after = Some(2);
-        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
-            s.set_approval_ledger(Some(ledger.clone()));
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-        let restore = m.requests.contains(&continue_request("/model fable"));
-        assert_eq!(
-            restore, expect_restore,
-            "{tag}: {lines:#?}\n{:#?}",
-            m.requests
-        );
-        if expect_restore {
-            assert!(
-                lines
-                    .iter()
-                    .any(|l| l.starts_with("TYPED seq=102 rule=model-restore@v1 /model fable")),
-                "{tag}: {lines:#?}"
+    for legacy in [false, true] {
+        for (tag, back_at, restored) in [
+            ("due", test_now - 60, false),
+            ("undone", test_now - 60, true),
+            ("ahead", test_now + 3600, false),
+        ] {
+            let (dir, ledger) = ledger_at(&format!("switch-{tag}-{legacy}"));
+            seed_switch(&ledger, None, back_at, restored, legacy);
+            let open = open_model_switch(&ledger, None);
+            assert_eq!(
+                open,
+                (!restored).then(|| OpenSwitch {
+                    from: Some("fable".to_string()),
+                    to: "opus".to_string(),
+                    back_at_unix: Some(back_at),
+                }),
+                "{tag} {legacy}"
             );
-        } else {
+            let mut m = Mock::new(
+                true,
+                vec![busy_screen(), ended("Stage 3 done; the suite is green.")],
+            );
+            m.vanish_after = Some(2);
+            let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
+                s.set_approval_ledger(Some(ledger.clone()));
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                !m.requests.iter().any(|r| r.contains("/model")),
+                "{tag}: {lines:#?}\n{:#?}",
+                m.requests
+            );
             assert!(
                 m.requests.contains(&continue_request("keep going")),
                 "{tag}: {:#?}",
@@ -1304,4 +1379,430 @@ fn a_model_switch_is_switched_back_by_a_loop_that_starts_after_it() {
             );
         }
     }
+}
+
+/// FULL POWER: a request for a decision is ANSWERED — `answer_text` typed
+/// through the same guarded write as a continuation, `CONTINUED …
+/// rule=answer@v1`, a `typed` ledger row — and no badge is raised. NEGATIVE
+/// CONTROL: under the owner's `answer_questions = false` ([`hosted`]) the
+/// same point is escalated and nothing is typed.
+#[test]
+fn a_stop_phrase_is_answered_with_the_answer_text() {
+    let answer = SupervisorConfig::default().answer_text;
+    let mut m = Mock::new(true, vec![busy_screen(), ended(STOP)]);
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(2);
+    let full = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines(&mut m, &full);
+    assert!(
+        lines.contains(&format!("CONTINUED seq=102 rule=answer@v1 {answer}")),
+        "{lines:#?}"
+    );
+    assert!(
+        m.requests.contains(&continue_request(&answer)),
+        "{:#?}",
+        m.requests
+    );
+    assert_eq!(m.attention, None, "{:#?}", m.requests);
+
+    let mut m = Mock::new(true, vec![busy_screen(), ended(STOP)]);
+    m.vanish_after = Some(2);
+    let _ = watch_lines(&mut m, &hosted(30));
+    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    assert!(m.attention.is_some());
+}
+
+/// A PERSON AT THE KEYBOARD wins (the server's `status human_ms=`): a
+/// continuation the policy decided is not typed within `human_grace_s` of
+/// their last keystroke — `WAITING … a person is typing`, the point decided
+/// again when the grace ends — and a box the policy would answer is HELD,
+/// neither pressed nor escalated. NEGATIVE CONTROLS: a keystroke older than
+/// the grace, and a server that says nothing (`human_ms` absent), hold
+/// nothing.
+#[test]
+fn a_persons_keystroke_holds_the_loop_for_the_grace() {
+    // A short budget: a held point waits out the rest of it.
+    let full = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(1, None)
+    };
+    for (human_ms, holds) in [(Some(1_000), true), (Some(200_000), false), (None, false)] {
+        let mut m = Mock::new(true, vec![busy_screen(), ended("Fixed the parser.")]);
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        m.human_ms = human_ms;
+        let (lines, _) = watch_lines(&mut m, &full);
+        assert_eq!(
+            count(&m, "turn"),
+            usize::from(!holds),
+            "{human_ms:?}: {lines:#?}"
+        );
+        assert_eq!(m.attention, None, "{human_ms:?}");
+
+        let mut m = Mock::new(true, vec![bash_box(&["⏺ Cleaning."], "rm -rf build")]);
+        m.vanish_after = Some(0);
+        m.human_ms = human_ms;
+        let (lines, _) = watch_lines(&mut m, &full);
+        assert_eq!(
+            m.presses().len(),
+            usize::from(!holds),
+            "{human_ms:?}: {lines:#?}"
+        );
+        assert_eq!(
+            m.attention, None,
+            "{human_ms:?}: a held box is nobody's to be told of"
+        );
+    }
+}
+
+/// THE HAZARDS REVIEW OF 2026-09-25 (major): the host fought a manager
+/// driving its worker — it read only `human_ms=`, never `hand=`, so it
+/// continued every turn the manager dispatched and answered questions meant
+/// for the manager. Another driver's hand on the session — a drive lease
+/// (`hand=lease:<holder>`), a turn a named driver typed
+/// (`hand=turn:<id>:<holder>`) — now holds the loop as a person's keystroke
+/// does: no box pressed, nothing typed, nothing raised. NEGATIVE CONTROL: an
+/// owner-class turn (`hand=turn:<id>`, as this loop's own continuations
+/// are) holds nothing.
+#[test]
+fn another_drivers_hand_holds_the_loop() {
+    let opts = || SuperviseOpts {
+        policy: SupervisorConfig {
+            human_grace_s: 60,
+            ..SupervisorConfig::default()
+        },
+        ..auto(2, None)
+    };
+    for hand in ["lease:mgr", "turn:7:mgr"] {
+        let mut m = Mock::new(true, vec![bash_box(&["⏺ Cleaning."], "rm -rf build")]);
+        m.hand = hand;
+        m.stall_sleep = Some(Duration::from_millis(100));
+        let (lines, _) = watch_lines(&mut m, &opts());
+        assert!(
+            m.presses().is_empty(),
+            "{hand}: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "meta set attention"),
+            0,
+            "{hand}: {:#?}",
+            m.requests
+        );
+    }
+    let mut m = Mock::new(true, vec![bash_box(&["⏺ Cleaning."], "rm -rf build")]);
+    m.hand = "turn:7";
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let _ = watch_lines(&mut m, &opts());
+    assert!(!m.presses().is_empty(), "{:#?}", m.requests);
+}
+
+/// A BOX HELD FOR A PERSON IS ANSWERED ONCE THEIR GRACE HAS PASSED: the
+/// first status says they typed half a second ago (`HELD`, nothing pressed
+/// or raised); when the grace runs out the box on the screen is judged
+/// again, on a fresh status that says they have stopped, and pressed —
+/// never before the grace, nothing raised while it was held. (The scripted
+/// box never leaves, so full power reads it as a press that did not land
+/// and tries it again after its back-off — not this test's.)
+/// NEGATIVE CONTROL:
+/// a person who keeps typing keeps it held to the end of the budget.
+#[test]
+fn a_held_box_is_answered_once_the_persons_grace_has_passed() {
+    let opts = |budget: u64| SuperviseOpts {
+        policy: SupervisorConfig {
+            human_grace_s: 1,
+            ..SupervisorConfig::default()
+        },
+        ..auto(budget, None)
+    };
+    let mut m = Mock::new(true, vec![bash_box(&["⏺ Cleaning."], "rm -rf build")]);
+    m.human_ms_reads = VecDeque::from([Some(500)]);
+    m.stall_sleep = Some(Duration::from_millis(300));
+    m.vanish_after = Some(4);
+    let started = Instant::now();
+    let (lines, _) = watch_lines(&mut m, &opts(10));
+    assert!(!m.presses().is_empty(), "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        started.elapsed() >= Duration::from_millis(450),
+        "pressed inside the grace: {:?}",
+        started.elapsed()
+    );
+    let held = m
+        .requests
+        .iter()
+        .position(|r| r == "status")
+        .expect("the status the box was held on");
+    let press = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("key "))
+        .unwrap();
+    assert!(
+        m.requests[held + 1..press].iter().any(|r| r == "status"),
+        "judged again on a fresh status: {:#?}",
+        m.requests
+    );
+    // Nothing raised while it was held. (The scripted box never leaves, so
+    // what follows the press is "the box did not change", not this test's.)
+    assert!(
+        !m.requests[..press]
+            .iter()
+            .any(|r| r.starts_with("meta set attention")),
+        "{:#?}",
+        m.requests
+    );
+
+    let mut m = Mock::new(true, vec![bash_box(&["⏺ Cleaning."], "rm -rf build")]);
+    m.human_ms = Some(300);
+    m.stall_sleep = Some(Duration::from_millis(200));
+    let _ = watch_lines(&mut m, &opts(2));
+    assert!(m.presses().is_empty(), "{:#?}", m.requests);
+    assert_eq!(count(&m, "meta set attention"), 0, "{:#?}", m.requests);
+}
+
+/// A DRAFT LEFT STANDING is the next message (lane P's review: a draft
+/// stopped a fully automatic session for ever, with nobody told): once
+/// nothing has changed it for the grace — the loop's own clock, since this
+/// server says nothing of a person — the policy's act goes as the draft's
+/// Enter, fenced on the judged read and guarded on its caret row, and is
+/// said as the act's `CONTINUED` line with the draft's words; nothing is
+/// typed into it and nothing raised. NEGATIVE CONTROL: a draft still
+/// changing is a person typing — every read shows new text — and nothing is
+/// pressed.
+#[test]
+fn a_draft_left_standing_is_submitted_once_the_grace_has_passed() {
+    let drafted = |text: &str| {
+        let mut r = ended("Fixed the parser; the suite is green.");
+        let caret = r.iter().position(|row| row == "❯").expect("caret");
+        r[caret] = format!("❯ {text}");
+        r
+    };
+    let fenced = |screens: Vec<Vec<String>>| {
+        let mut m = Mock::new(true, screens);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+        m.cursor_col = Some(24);
+        m.stall_sleep = Some(Duration::from_millis(400));
+        m
+    };
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            human_grace_s: 1,
+            ..SupervisorConfig::default()
+        },
+        ..auto(4, None)
+    };
+    let mut m = fenced(vec![busy_screen(), drafted("also check the lexer")]);
+    m.vanish_after = Some(12);
+    let started = Instant::now();
+    let (lines, _) = watch_lines(&mut m, &opts);
+    let enters: Vec<&String> = m
+        .presses()
+        .into_iter()
+        .filter(|p| p.ends_with(" enter"))
+        .collect();
+    assert_eq!(enters.len(), 1, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        enters[0].contains("if-gen=") && enters[0].contains("lexer"),
+        "{enters:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        count(&m, "turn"),
+        0,
+        "nothing typed into it: {:#?}",
+        m.requests
+    );
+    assert_eq!(count(&m, "send"), 0, "{:#?}", m.requests);
+    assert!(
+        lines.iter().any(|l| l.starts_with("CONTINUED seq=")
+            && l.ends_with(&format!("rule={RULE_CONTINUE} also check the lexer"))),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "meta set attention"), 0, "{:#?}", m.requests);
+
+    // Still being written, for longer than the grace and to the end of the
+    // budget: every read, 100 ms apart, shows a different draft.
+    let mut screens = vec![busy_screen()];
+    let words = [
+        "also",
+        "also check",
+        "also check the",
+        "also check the lexer",
+    ];
+    for w in words.iter().cycle().take(200) {
+        screens.push(drafted(w));
+    }
+    let mut m = fenced(screens);
+    m.delay = (0..2000).map(|i| (i, Duration::from_millis(100))).collect();
+    m.vanish_after = Some(0);
+    let started = Instant::now();
+    let _ = watch_lines(&mut m, &opts);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        !m.presses().iter().any(|p| p.ends_with(" enter")),
+        "{:#?}",
+        m.requests
+    );
+}
+
+/// CODEX, END TO END over the scripted server (codex 0.156.1's measured
+/// screens, `program=codex`): the loop reads Codex's own grammar — busy
+/// while its status row runs, an ended turn at its end row — and at full
+/// power continues the turn in CODEX's composer: on a host that fences only
+/// `key`, through the guarded `turn` (`submit=guarded:^›\skeep\x20going…`);
+/// on one that fences `send` too, through the fenced write and a fenced
+/// Enter held until the echo is still 600 ms (Codex takes an Enter right
+/// behind typed text as a newline, its paste guard, measured). A box on the
+/// way is answered by its role (`1`, `Yes, proceed`, guarded on its `$`
+/// row).
+/// NEGATIVE CONTROL: the same screens under `program=zsh` type and press
+/// nothing.
+#[test]
+fn a_codex_session_is_supervised_end_to_end() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let screens = || {
+        vec![
+            screen(cx::BUSY),
+            screen(cx::BOX_EXEC),
+            screen(cx::BUSY),
+            screen(cx::END_OF_TURN),
+        ]
+    };
+    let mut m = Mock::new(true, screens());
+    m.program = "codex";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.turn_releases = Some(3);
+    m.vanish_after = Some(2);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let exec_row = screen(cx::BOX_EXEC)
+        .into_iter()
+        .find(|r| r.trim_start().starts_with("$ touch"))
+        .expect("the command row");
+    let press = m
+        .presses()
+        .into_iter()
+        .find(|r| r.ends_with(" 1"))
+        .cloned()
+        .unwrap_or_else(|| panic!("the box answered: {lines:#?} {:#?}", m.requests));
+    assert!(
+        press.contains(&crate::supervise::policy::row_guard(&exec_row)),
+        "guarded on the $ row: {press}"
+    );
+    let turn = m
+        .requests
+        .iter()
+        .find(|r| r.starts_with("turn "))
+        .unwrap_or_else(|| panic!("the continuation: {lines:#?} {:#?}", m.requests));
+    assert!(
+        turn.starts_with("turn submit=guarded:^›\\skeep\\x20going\\s*$ "),
+        "{turn}"
+    );
+    assert!(
+        !m.requests.iter().any(|r| r.starts_with("send ")),
+        "no fenced send on a host whose send takes no fence: {:#?}",
+        m.requests
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("CONTINUED ")),
+        "{lines:#?}"
+    );
+    // The point's line names Codex's last words, never its footer.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("EVENT idle ") && l.ends_with("as it evolves continuously.")),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "meta set attention"), 0, "nothing handed over");
+
+    // A host that fences `send` (the hazards review of 2026-09-25): the
+    // continuation is written only on the judged read, and its Enter goes
+    // fenced once the echo has held still for Codex's paste guard (600 ms),
+    // never a bare `turn` whose paste checks nothing.
+    let mut typed = screen(cx::END_OF_TURN);
+    let caret = typed
+        .iter()
+        .rposition(|r| r.starts_with("› Ask Codex"))
+        .expect("the composer");
+    typed[caret] = "› keep going".to_string();
+    let mut m = Mock::new(
+        true,
+        vec![
+            screen(cx::BUSY),
+            screen(cx::END_OF_TURN),
+            typed,
+            screen(cx::BUSY),
+            screen(cx::END_OF_TURN),
+        ],
+    );
+    m.program = "codex";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.help = FENCED_HELP.to_string();
+    m.screen_cols.insert(2, 14);
+    m.vanish_after = Some(2);
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let writes: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("send ") || r.starts_with("key "))
+        .collect();
+    assert!(
+        writes.len() >= 2,
+        "fenced write and fenced Enter: {lines:#?}\n{:#?}",
+        m.requests
+    );
+    assert!(writes[0].starts_with("send if-gen="), "{writes:?}");
+    assert!(
+        writes[1].starts_with("key if-gen=") && writes[1].ends_with(" enter"),
+        "{writes:?}"
+    );
+    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    assert!(
+        m.requests.iter().any(|r| r.starts_with("await idle 600 ")),
+        "the paste guard's settle: {:#?}",
+        m.requests
+    );
+
+    // NEGATIVE CONTROL: a shell showing the same screens.
+    let mut m = Mock::new(true, screens());
+    m.program = "zsh";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.vanish_after = Some(2);
+    let _ = watch_lines(&mut m, &opts);
+    assert!(m.presses().is_empty(), "{:#?}", m.requests);
+    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }

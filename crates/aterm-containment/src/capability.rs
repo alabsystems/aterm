@@ -123,8 +123,6 @@ pub enum InputCapability {
 /// Command execution capability levels.
 ///
 /// Maps containment modes to a maximum command-execution capability.
-/// [`CommandCapability::max_tier_level`] derives the corresponding
-/// `aterm-security` `CommandTier` ceiling when commands are allowed.
 /// TLA+ encoding: `CmdNone`=0, `CmdTier2`=1, `CmdTier3`=2, `CmdAll`=3.
 /// This mirrors `CommandCaps` and `PolicyCommand` in the INTENDED
 /// `tla/Containment.tla` model (not in-tree; see the crate-root note).
@@ -140,29 +138,6 @@ pub enum CommandCapability {
     UpToTier3 = 2,
     /// All tiers including Critical (tier 4). Master mode.
     AllTiers = 3,
-}
-
-impl CommandCapability {
-    /// Returns the maximum allowed command tier level, or `None` if no commands allowed.
-    ///
-    /// This is a derived Rust helper over the `PolicyCommand` result, not a
-    /// separate policy axis.
-    ///
-    /// Maps to `CommandTier::level()` in aterm-security:
-    /// - `AllTiers` → `Some(4)` (Critical)
-    /// - `UpToTier3` → `Some(3)` (`HighRisk`)
-    /// - `UpToTier2` → `Some(2)` (`MediumRisk`)
-    /// - `NoCommands` → `None`
-    #[inline(always)]
-    #[must_use]
-    pub const fn max_tier_level(self) -> Option<u8> {
-        match self {
-            Self::AllTiers => Some(4),
-            Self::UpToTier3 => Some(3),
-            Self::UpToTier2 => Some(2),
-            Self::NoCommands => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -224,13 +199,5 @@ mod tests {
         assert!(CommandCapability::AllTiers > CommandCapability::UpToTier3);
         assert!(CommandCapability::UpToTier3 > CommandCapability::UpToTier2);
         assert!(CommandCapability::UpToTier2 > CommandCapability::NoCommands);
-    }
-
-    #[test]
-    fn test_command_max_tier_level() {
-        assert_eq!(CommandCapability::AllTiers.max_tier_level(), Some(4));
-        assert_eq!(CommandCapability::UpToTier3.max_tier_level(), Some(3));
-        assert_eq!(CommandCapability::UpToTier2.max_tier_level(), Some(2));
-        assert_eq!(CommandCapability::NoCommands.max_tier_level(), None);
     }
 }

@@ -167,6 +167,7 @@ impl Line {
     ///
     /// [`Scrollback::image_rows_dropped_by_compression`]: crate::Scrollback::image_rows_dropped_by_compression
     #[must_use]
+    #[cfg(test)]
     pub fn serialize(&self) -> Vec<u8> {
         // The estimate is only a capacity hint (never affects the serialized
         // bytes), so it is computed with saturating arithmetic and bounded
@@ -241,7 +242,7 @@ impl Line {
 
     /// Serialize line by appending its bytes to `result`.
     ///
-    /// Identical wire format to [`Line::serialize`], but writes into the
+    /// Identical wire format to `Line::serialize`, but writes into the
     /// caller's buffer so block-level serialization avoids a per-line
     /// allocation and redundant copy (#5860). Reserves this line's size before
     /// writing; block serialization reserves all lines together instead.

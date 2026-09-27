@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! In-process host for the opt-in operator observer (`$ATERM_OPERATOR=1`).
+//! In-process host for the opt-in operator observer (`[operator] enabled = true`).
 //!
 //! The observer is deliberately narrower than the operator policy/runtime: it owns
 //! no control token and has no input-writing capability. It snapshots the local
@@ -48,29 +48,13 @@ const PENDING_CAPACITY: usize = 256;
 const FLUSH_BUDGET: usize = 16;
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const ESCALATION_NOTICE_HISTORY: usize = 512;
-/// The normal, unnamed aterm profile has one durable operator namespace per
-/// user state root. `ATERM_STATE_HOME` already provides install/deployment
-/// isolation; an explicitly named profile splits that namespace further.
-const DEFAULT_OPERATOR_PROFILE: &str = "default";
-const OPERATOR_PROFILE_ENV: &str = "ATERM_OPERATOR_PROFILE";
-/// The opt-in switch. The embedded operator is DEFAULT-OFF.
-///
-/// Default-on would have bought a user exactly nothing: the managed SID
-/// allowlist is empty on a new profile, so an operator nobody has opted into
-/// observes no session, hashes no screen and takes no terminal lock — while
-/// still costing every aterm process a resident thread, a durable WAL under the
-/// user's state root, and a place in the self-update path. The RFC approves an
-/// EXPERIMENTAL implementation whose §9 acceptance is not discharged
-/// (`docs/OPERATOR-EMBEDDED.md`, "Shape and status"). Zero benefit against that
-/// risk is not a defensible default, so enabling it is one deliberate act:
-/// `ATERM_OPERATOR=1`, then `aterm fleet manage <sid>`.
-const OPERATOR_OPT_IN_ENV: &str = "ATERM_OPERATOR";
-
-/// The kill switch, retained and authoritative: it wins over the opt-in, so a
-/// profile or launcher that exports `ATERM_OPERATOR=1` can still be overridden
-/// per-process without editing it. Spelled exactly like its shipped sibling
-/// `$ATERM_NO_CONTROL_SOCK`.
-const OPERATOR_KILL_ENV: &str = "ATERM_NO_OPERATOR";
+/// The durable operator namespace: ONE per user state root. It deliberately
+/// contains no PID, root SID, nonce, or other launch material, so a cold restart
+/// reopens the same WAL and explicit allowlist; the OS lock in [`DurableQueue`]
+/// is the authority boundary when two processes share it (the second is a
+/// standby). The spelling is the one the retired named-profile scheme gave the
+/// default profile, so an existing WAL is reopened, not orphaned.
+const FLEET_ID: &str = "profile-default";
 
 /// Fixed retry cadence for leadership standby: a sibling aterm can hold the
 /// kernel lock indefinitely and this process must be ready to take over.
@@ -247,7 +231,7 @@ struct QueueSlot {
     /// The durable state failed to open `OPEN_FAILURE_BUDGET` times in a row.
     /// The embedded operator is then OFF for the life of this process: no
     /// observer thread, no authority, no further filesystem attempts — the same
-    /// place `$ATERM_NO_OPERATOR` lands, reached automatically.
+    /// place a process without `[operator] enabled` starts, reached automatically.
     dormant: bool,
 }
 
@@ -904,11 +888,11 @@ impl ControlHandle {
     }
 
     fn surface_notice(&self, local_id: u64, body: &str) {
-        let message = crate::notify::NotifyMsg {
-            session: local_id,
-            title: Some("aterm operator".to_string()),
-            body: body.to_string(),
-        };
+        let message = crate::notify::NotifyMsg::new(
+            local_id,
+            Some("aterm operator".to_string()),
+            body.to_string(),
+        );
         match self.shared.notify_tx.try_send(message) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(message)) => {
@@ -1277,7 +1261,8 @@ impl ControlHandle {
             .ok_or_else(|| "operator manage occurrence overflow".to_string())?;
         let epoch = queue.durable_epoch().map_err(|error| error.to_string())?;
         let generation = compose_generation(observed.generation, epoch, occurrence)?;
-        let condition = manage_baseline_condition(observed.state, &observed.evidence);
+        let condition =
+            manage_baseline_condition(sid, observed.state, &observed.evidence, phase_sees_a_box);
         let event_id = queue
             .manage_with_baseline(NewEvent::new(sid, generation, condition, observed.evidence))
             .map_err(|error| error.to_string())?;
@@ -2001,66 +1986,13 @@ pub(crate) fn start(
     })
 }
 
-/// Whether an operator env switch is engaged.
-///
-/// The predicate is deliberately the SAME one `$ATERM_NO_CONTROL_SOCK` uses
-/// (`aterm_types::control_socket::socket_directive`): set-and-not-`0` engages,
-/// unset/empty/`0` does not. One spelling for every resident-subsystem env var
-/// is the whole point — a user who learned one has learned all of them, and
-/// `ATERM_NO_OPERATOR=0` cannot accidentally mean "off".
-fn switch_engaged(value: Option<&str>) -> bool {
-    value.is_some_and(|value| !value.is_empty() && value != "0")
-}
-
-fn environment_switch(name: &str) -> bool {
-    switch_engaged(
-        std::env::var_os(name)
-            .map(|value| value.to_string_lossy().into_owned())
-            .as_deref(),
-    )
-}
-
-/// Whether this process starts the embedded operator at all.
-///
-/// Default-OFF: `$ATERM_OPERATOR` opts in, `$ATERM_NO_OPERATOR` overrides it.
-/// Without the opt-in there is no observer thread, no durable state directory,
-/// and every operator verb answers `ERR operator unavailable` off the
-/// already-shipped `None` path.
-pub(crate) fn enabled_by_environment() -> bool {
-    environment_switch(OPERATOR_OPT_IN_ENV) && !environment_switch(OPERATOR_KILL_ENV)
-}
-
-/// Resolve the durable fleet namespace for this aterm profile.
-///
-/// This identity deliberately contains no PID, root SID, nonce, or other launch
-/// material: a cold restart must reopen the same WAL and explicit allowlist. The
-/// OS lock in [`DurableQueue`] is the authority boundary when two processes use
-/// the same profile. `ATERM_STATE_HOME` separates installations/deployments; the
-/// optional `ATERM_OPERATOR_PROFILE` names independent profiles within that root.
-fn default_fleet_id() -> Result<String, String> {
-    let profile = match std::env::var_os(OPERATOR_PROFILE_ENV) {
-        Some(value) => value
-            .into_string()
-            .map_err(|_| format!("{OPERATOR_PROFILE_ENV} must be valid UTF-8"))?,
-        None => DEFAULT_OPERATOR_PROFILE.to_string(),
-    };
-    fleet_id_for_profile(&profile)
-}
-
-fn fleet_id_for_profile(profile: &str) -> Result<String, String> {
-    if profile.is_empty()
-        || profile.len() > 112
-        || profile == "."
-        || profile == ".."
-        || !profile
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(format!(
-            "{OPERATOR_PROFILE_ENV} must be 1..=112 ASCII letters, digits, '.', '-', or '_'"
-        ));
-    }
-    Ok(format!("profile-{profile}"))
+/// Whether this process starts the embedded operator at all: `[operator]
+/// enabled = true` in aterm.toml, read once at launch (default OFF — see
+/// [`crate::app_config::OperatorConfig`]). Without it there is no observer
+/// thread, no durable state directory, and every operator verb answers `ERR
+/// operator unavailable` off the already-shipped `None` path.
+pub(crate) fn enabled(config: &crate::app_config::Config) -> bool {
+    config.operator_enabled()
 }
 
 /// Start the production default-on observer and its durable per-profile queue.
@@ -2072,8 +2004,7 @@ pub(crate) fn start_default(
     subscribers: Subscribers,
     notify_tx: std::sync::mpsc::SyncSender<crate::notify::NotifyMsg>,
 ) -> Result<(Runtime, ControlHandle), String> {
-    let fleet_id = default_fleet_id()?;
-    let control = ControlHandle::new(fleet_id, notify_tx);
+    let control = ControlHandle::new(FLEET_ID.to_string(), notify_tx);
     let sink: Arc<dyn EventSink> = Arc::new(DurableSink {
         control: control.clone(),
         store: store.clone(),
@@ -2457,9 +2388,20 @@ impl Track {
     }
 }
 
-#[derive(Default)]
 struct Classifier {
     sessions: HashMap<String, Track>,
+    /// The aterm-phase reading the approval check runs ([`phase_sees_a_box`];
+    /// the seam the tests inject a panicking reader through).
+    phase: fn(&[String]) -> bool,
+}
+
+impl Default for Classifier {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            phase: phase_sees_a_box,
+        }
+    }
 }
 
 impl Classifier {
@@ -2482,6 +2424,7 @@ impl Classifier {
     ) -> Vec<Candidate> {
         let mut candidates = Vec::new();
         let mut seen = HashSet::with_capacity(observed.len());
+        let phase = self.phase;
         for observed in observed {
             seen.insert(observed.sid.clone());
             if let Some(track) = self.sessions.get_mut(&observed.sid) {
@@ -2490,14 +2433,20 @@ impl Classifier {
                     &observed,
                     now,
                     baseline_new_sessions,
+                    phase,
                     &mut candidates,
                 );
             } else {
                 let mut track = Track::new(&observed, now);
+                // An unreadable screen (a reader panic) announces no box: it
+                // enters as the neutral baseline, like any other output.
                 if observed.state == SessionState::Exited {
                     track.generation = track.generation.next_lifecycle();
                     candidates.push(track.candidate(&observed.sid, CandidateKind::SessionExited));
-                } else if track.has_surface && looks_like_approval(&track.screen_tail) {
+                } else if track.has_surface
+                    && approval_gate(Some(observed.sid.as_str()), &track.screen_tail, phase)
+                        == ApprovalReading::Box
+                {
                     track.approval_emitted = Some(track.generation);
                     candidates.push(track.candidate(&observed.sid, CandidateKind::ApprovalPrompt));
                 } else if baseline_new_sessions && track.has_surface {
@@ -2528,6 +2477,7 @@ impl Classifier {
         observed: &ObservedSession,
         now: Instant,
         baseline_new_sessions: bool,
+        phase: fn(&[String]) -> bool,
         candidates: &mut Vec<Candidate>,
     ) {
         track.local_id = observed.local_id;
@@ -2560,9 +2510,8 @@ impl Classifier {
             track.last_change = now;
         }
 
-        if looks_like_approval(&track.screen_tail)
-            && track.approval_emitted != Some(track.generation)
-        {
+        let reading = approval_gate(Some(observed.sid.as_str()), &track.screen_tail, phase);
+        if reading == ApprovalReading::Box && track.approval_emitted != Some(track.generation) {
             track.approval_emitted = Some(track.generation);
             track.busy_seen = false;
             candidates.push(track.candidate(&observed.sid, CandidateKind::ApprovalPrompt));
@@ -2571,6 +2520,13 @@ impl Classifier {
 
         if first_surface && baseline_new_sessions {
             candidates.push(track.candidate(&observed.sid, CandidateKind::LeadershipBaseline));
+            return;
+        }
+
+        // A screen the reader could not read is announced as nothing — not a
+        // box, and not a turn that ended (the ready heuristic cannot rule a box
+        // out). The next generation is read afresh.
+        if reading == ApprovalReading::Unreadable {
             return;
         }
 
@@ -2595,24 +2551,81 @@ impl Classifier {
 /// (`aterm_phase::read`: Codex's choice box), or when the generic shape holds
 /// (an approval phrase AND a choice affordance, [`generic_choice_box`]). Any
 /// one suffices; prose merely discussing approval is none of them.
+///
+/// The aterm-phase readers run behind the screen reader's panic fence
+/// ([`crate::reader_guard`]): a screen that panics them is
+/// [`ApprovalReading::Unreadable`], which THIS gate treats as a box (it FAILS
+/// CLOSED — the operator is refused, as over a box, and nothing is pressed).
+/// Only the refusal sites ask this; the Classifier, which ANNOUNCES boxes,
+/// asks [`approval_gate`] and announces nothing off an unreadable screen.
 pub(crate) fn looks_like_approval(screen: &str) -> bool {
-    let rows: Vec<String> = screen.lines().map(str::to_string).collect();
-    if aterm_phase::parse_prompt(&rows).is_some() {
+    approval_gate(None, screen, phase_sees_a_box).refuses()
+}
+
+/// What the approval check read on one screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalReading {
+    /// A box is up (a reader or the generic shape sees one).
+    Box,
+    /// No reader sees a box.
+    NoBox,
+    /// The aterm-phase reader panicked on the screen: nothing is known. A
+    /// refusal treats it as a box; an announcement treats it as nothing.
+    Unreadable,
+}
+
+impl ApprovalReading {
+    /// Whether a refusal gate refuses over this reading (fail closed).
+    fn refuses(self) -> bool {
+        self != Self::NoBox
+    }
+}
+
+/// Whether aterm-phase's parser, or the reader the screen identifies, sees a
+/// box on `rows`.
+fn phase_sees_a_box(rows: &[String]) -> bool {
+    if aterm_phase::parse_prompt(rows).is_some() {
         return true;
     }
-    let reading = aterm_phase::read(None, &rows, None);
-    reading.prompt.is_some()
-        || reading.phase == aterm_phase::Phase::Prompt
-        || generic_choice_box(screen)
+    let reading = aterm_phase::read(None, rows, None);
+    reading.prompt.is_some() || reading.phase == aterm_phase::Phase::Prompt
+}
+
+/// The check over one screen with `phase` as its aterm-phase reading (the
+/// seam the tests inject a panicking reader through). A reader panic is
+/// warned once per session (`sid`, or a generic name) per location.
+fn approval_gate(
+    sid: Option<&str>,
+    screen: &str,
+    phase: impl FnOnce(&[String]) -> bool,
+) -> ApprovalReading {
+    let rows: Vec<String> = screen.lines().map(str::to_string).collect();
+    match crate::reader_guard::guarded(|| phase(&rows)) {
+        Ok(true) => ApprovalReading::Box,
+        Ok(false) if generic_choice_box(screen) => ApprovalReading::Box,
+        Ok(false) => ApprovalReading::NoBox,
+        Err(panic) => {
+            crate::reader_guard::warn_once(
+                sid.unwrap_or("(operator gate)"),
+                "operator approval gate",
+                &panic,
+                &rows,
+            );
+            ApprovalReading::Unreadable
+        }
+    }
 }
 
 /// Conservative, deterministic presentation heuristic. Both an approval/request
 /// phrase and an actionable choice affordance must be present; prose merely discussing
-/// approval is not an event.
+/// approval is not an event. The phrases a known agent draws are its anchors
+/// (`aterm_phase::anchor`, the one home of vendor text), matched without case;
+/// the rest are the generic shapes other agents print.
 fn generic_choice_box(screen: &str) -> bool {
     let lower = screen.to_lowercase();
+    let has = |needle: &str| lower.contains(&needle.to_lowercase());
     let request = [
-        "do you want to proceed",
+        aterm_phase::anchor("prompt.proceed"),
         "would you like to proceed",
         "would you like to run",
         "allow this command",
@@ -2621,28 +2634,36 @@ fn generic_choice_box(screen: &str) -> bool {
         "requires approval",
         "approve this command",
     ]
-    .iter()
-    .any(|needle| lower.contains(needle));
+    .into_iter()
+    .any(has);
     let choice = [
+        aterm_phase::anchor("prompt.cancel"),
+        aterm_phase::anchor("codex.box.once"),
         "[y/n]",
         "(y/n)",
-        "yes, proceed",
         "yes, allow",
         "allow once",
         "always allow",
         "don't ask again",
         "deny",
-        "esc to cancel",
     ]
-    .iter()
-    .any(|needle| lower.contains(needle));
+    .into_iter()
+    .any(has);
     request && choice
 }
 
-fn manage_baseline_condition(state: SessionState, evidence: &str) -> AttentionCondition {
+/// The condition a `manage` baseline enters with. It ANNOUNCES (the human is
+/// told a box is up), so an unreadable screen is `Changed`, never
+/// `ApprovalRequired`.
+fn manage_baseline_condition(
+    sid: &str,
+    state: SessionState,
+    evidence: &str,
+    phase: impl FnOnce(&[String]) -> bool,
+) -> AttentionCondition {
     if state == SessionState::Exited {
         AttentionCondition::SessionExited
-    } else if looks_like_approval(evidence) {
+    } else if approval_gate(Some(sid), evidence, phase) == ApprovalReading::Box {
         AttentionCondition::ApprovalRequired
     } else {
         AttentionCondition::Changed
@@ -2651,14 +2672,14 @@ fn manage_baseline_condition(state: SessionState, evidence: &str) -> AttentionCo
 
 /// Prompt-shape heuristic for a completed coding-agent turn. It intentionally knows
 /// only the distinctive Claude/Codex composer glyphs and rejects screens still carrying
-/// a live interrupt affordance. This raises a candidate; it never drives the session.
+/// a live interrupt affordance (the agents' own `busy.interrupt` anchor, lowercase as
+/// both draw it, or a generic Ctrl-C one). This raises a candidate; it never drives the session.
 fn looks_like_ready_prompt(screen: &str) -> bool {
     let lower = screen.to_lowercase();
     if [
-        "esc to interrupt",
+        aterm_phase::anchor("busy.interrupt"),
         "ctrl-c to interrupt",
         "ctrl+c to interrupt",
-        "press esc to interrupt",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -2780,6 +2801,8 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            rewrap_gauge: std::sync::Arc::default(),
+            human_input: Default::default(),
         });
         SessionHandle {
             sid,
@@ -2795,52 +2818,20 @@ mod tests {
         }
     }
 
+    /// The durable namespace is the retired default profile's spelling, so an
+    /// operator enabled before the profile variable went reopens its own WAL.
     #[test]
-    fn fleet_identity_is_stable_and_profile_scoped() {
-        assert_eq!(
-            fleet_id_for_profile(DEFAULT_OPERATOR_PROFILE).unwrap(),
-            "profile-default"
-        );
-        assert_eq!(fleet_id_for_profile("work").unwrap(), "profile-work");
-        assert_ne!(
-            fleet_id_for_profile("work").unwrap(),
-            fleet_id_for_profile("personal").unwrap()
-        );
-        for invalid in ["", ".", "..", "has/slash", "has space", "line\nbreak"] {
-            assert!(
-                fleet_id_for_profile(invalid).is_err(),
-                "accepted {invalid:?}"
-            );
-        }
+    fn fleet_identity_is_the_default_profiles_and_stable() {
+        assert_eq!(FLEET_ID, "profile-default");
     }
 
+    /// OFF unless `[operator] enabled = true` — the one switch.
     #[test]
-    fn the_operator_switches_read_exactly_like_their_control_socket_sibling() {
-        // Unset / empty / "0" leave a switch disengaged; anything else engages
-        // it. This is `socket_directive`'s `no_control_sock` rule verbatim; the
-        // pin exists so these env vars cannot drift apart and leave a user who
-        // typed `ATERM_NO_OPERATOR=0` silently unobserved.
-        for disengaged in [None, Some(""), Some("0")] {
-            assert!(
-                !switch_engaged(disengaged),
-                "{disengaged:?} must not engage a switch"
-            );
-            assert_eq!(
-                switch_engaged(disengaged),
-                matches!(
-                    aterm_types::control_socket::socket_directive(None, disengaged),
-                    aterm_types::control_socket::SocketDirective::Disabled
-                ),
-                "the switches must agree on {disengaged:?}"
-            );
-        }
-        for engages in ["1", "true", "off", "yes", "anything"] {
-            assert!(switch_engaged(Some(engages)), "{engages} must engage");
-            assert!(matches!(
-                aterm_types::control_socket::socket_directive(None, Some(engages)),
-                aterm_types::control_socket::SocketDirective::Disabled
-            ));
-        }
+    fn the_operator_starts_only_when_the_config_enables_it() {
+        let parse = |text: &str| aterm_toml::from_str::<crate::app_config::Config>(text).unwrap();
+        assert!(!enabled(&parse("")));
+        assert!(!enabled(&parse("[operator]\nenabled = false\n")));
+        assert!(enabled(&parse("[operator]\nenabled = true\n")));
     }
 
     #[test]
@@ -3162,6 +3153,123 @@ mod tests {
         assert!(!looks_like_approval(&text(fixtures::END_OFFER)));
     }
 
+    /// The gate behind the reader's panic fence: a panicking stand-in for
+    /// aterm-phase's reading does not unwind out of the gate (the window's
+    /// thread lives), and the gate FAILS CLOSED — the screen is taken for a
+    /// box, even one the phrase heuristic would pass — and its session is
+    /// warned once. Controls: the same stand-in answering `false` leaves the
+    /// phrase heuristic to decide, and the real reader still answers.
+    #[test]
+    fn a_reader_panic_fails_the_gate_closed_and_the_thread_lives() {
+        let prose = "ordinary output, no box here";
+        let boom = |_: &[String]| -> bool { panic!("stand-in reader panic") };
+        let read = approval_gate(Some("test-gate-s1"), prose, boom);
+        assert_eq!(read, ApprovalReading::Unreadable);
+        assert!(read.refuses(), "the refusal gate fails closed");
+        assert_eq!(
+            approval_gate(Some("test-gate-s1"), prose, boom),
+            ApprovalReading::Unreadable,
+            "again"
+        );
+        assert_eq!(
+            approval_gate(Some("test-gate-s1"), prose, |_| false),
+            ApprovalReading::NoBox
+        );
+        assert_eq!(
+            approval_gate(
+                None,
+                "Do you want to proceed?\n1. Yes, allow once\n2. Deny",
+                |_| false
+            ),
+            ApprovalReading::Box
+        );
+        assert!(!looks_like_approval(prose));
+        assert!(looks_like_approval(
+            &aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::BOX_RM)
+                .join("\n")
+        ));
+    }
+
+    /// The Classifier ANNOUNCES boxes (an `ApprovalPrompt` candidate is the
+    /// human's "waiting for human approval" notice and the operator's
+    /// approval-required event), so a screen that panics the reader announces
+    /// nothing: no `ApprovalPrompt` for a new session, for a known one, for a
+    /// leadership baseline, or for a `manage` baseline, and no ready turn
+    /// either. The negative control: the same screens through a reader that
+    /// answers DO announce the box, so the silence is the panic's, not the
+    /// screens'.
+    #[test]
+    fn a_reader_panic_announces_no_approval_box() {
+        fn boom(_: &[String]) -> bool {
+            panic!("stand-in reader panic")
+        }
+        fn sees(_: &[String]) -> bool {
+            true
+        }
+        let now = Instant::now();
+        let boxy = "ordinary output\n❯ ";
+        let mut panicking = Classifier {
+            phase: boom,
+            ..Classifier::default()
+        };
+        let mut answering = Classifier {
+            phase: sees,
+            ..Classifier::default()
+        };
+        // A new session.
+        let fresh = panicking.observe(vec![observed("test-cls-a", 1, boxy)], now);
+        assert!(
+            fresh
+                .iter()
+                .all(|c| c.kind != CandidateKind::ApprovalPrompt),
+            "{:?}",
+            fresh.iter().map(|c| c.kind).collect::<Vec<_>>()
+        );
+        // A known session, through a generation change and a settle (a ready
+        // turn would otherwise be announced).
+        for (i, at) in [(2, 1), (3, 30), (3, 60)] {
+            let later = panicking.observe(
+                vec![observed("test-cls-a", i, boxy)],
+                now + Duration::from_secs(at),
+            );
+            assert!(
+                later.is_empty(),
+                "{:?}",
+                later.iter().map(|c| c.kind).collect::<Vec<_>>()
+            );
+        }
+        // A leadership baseline: neutral, never an approval.
+        let mut leader = Classifier {
+            phase: boom,
+            ..Classifier::default()
+        };
+        let base = leader.observe_managed(vec![observed("test-cls-b", 1, boxy)], now);
+        assert_eq!(
+            base.iter().map(|c| c.kind).collect::<Vec<_>>(),
+            vec![CandidateKind::LeadershipBaseline]
+        );
+        // A `manage` baseline.
+        assert_eq!(
+            manage_baseline_condition("test-cls-c", SessionState::Alive, boxy, boom),
+            AttentionCondition::Changed
+        );
+        // Controls: a reader that answers announces the same screens.
+        let seen = answering.observe(vec![observed("test-cls-a", 1, boxy)], now);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind, CandidateKind::ApprovalPrompt);
+        let seen = answering.observe(
+            vec![observed("test-cls-a", 2, boxy)],
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(seen[0].kind, CandidateKind::ApprovalPrompt);
+        assert_eq!(
+            manage_baseline_condition("test-cls-c", SessionState::Alive, boxy, sees),
+            AttentionCondition::ApprovalRequired
+        );
+        // The refusal gate over the same unreadable screen still refuses.
+        assert!(approval_gate(Some("test-cls-a"), boxy, boom).refuses());
+    }
+
     #[test]
     fn approval_requires_request_and_choice() {
         assert!(looks_like_approval(
@@ -3178,16 +3286,21 @@ mod tests {
         ));
         let prompt = "Do you want to proceed?\n1. Yes, allow once\n2. Deny";
         assert_eq!(
-            manage_baseline_condition(SessionState::Alive, prompt),
+            manage_baseline_condition("test-mb", SessionState::Alive, prompt, phase_sees_a_box),
             AttentionCondition::ApprovalRequired
         );
         assert_eq!(
-            manage_baseline_condition(SessionState::Exited, prompt),
+            manage_baseline_condition("test-mb", SessionState::Exited, prompt, phase_sees_a_box),
             AttentionCondition::SessionExited,
             "exit must dominate an approval-looking final screen"
         );
         assert_eq!(
-            manage_baseline_condition(SessionState::Alive, "ordinary pre-existing output"),
+            manage_baseline_condition(
+                "test-mb",
+                SessionState::Alive,
+                "ordinary pre-existing output",
+                phase_sees_a_box
+            ),
             AttentionCondition::Changed
         );
     }
@@ -3432,6 +3545,13 @@ mod tests {
         DurableQueue::open(directory, 1, config).unwrap()
     }
 
+    // Every wait in this test and the next is a HANG DISCRIMINATOR, 30 s like
+    // their siblings below: ordering is proven by the barrier handshakes, never
+    // by the clock. They were 2 s, and each covers F_FULLFSYNC barriers — the
+    // fault marker, its directory and the WAL commit here, sixteen WAL commits
+    // in the next — that this file measures at 82-280 ms EACH on a contended
+    // disk; under another gate's disk load that exceeds 2 s with the code
+    // correct (the load-sensitive test audit of 2026-09-27).
     #[test]
     fn classify_to_overflow_fault_stays_inside_update_exclusion() {
         struct OverflowBarrierSink {
@@ -3481,7 +3601,7 @@ mod tests {
                 self.release_rx
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(Duration::from_secs(30))
                     .expect("release classify barrier");
             }
         }
@@ -3524,7 +3644,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            classified_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            classified_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
             2,
             "the barrier must sit behind a non-empty classified batch"
         );
@@ -3534,7 +3654,7 @@ mod tests {
         };
         assert!(refused.contains("transaction is in flight"), "{refused}");
         release_tx.send(()).unwrap();
-        let (reason, activity_was_live) = fault_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (reason, activity_was_live) = fault_rx.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(reason, FleetFaultReason::ObserverOverflow);
         assert!(
             activity_was_live,
@@ -3606,7 +3726,7 @@ mod tests {
                     self.release_rx
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .recv_timeout(Duration::from_secs(2))
+                        .recv_timeout(Duration::from_secs(30))
                         .expect("release shutdown barrier");
                 }
             }
@@ -3660,7 +3780,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            batch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            batch_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
             EVENT_COUNT - FLUSH_BUDGET,
             "the stop race must occur with a real >16 local backlog"
         );
@@ -4297,11 +4417,11 @@ mod tests {
         let (notify_tx, notify_rx) = std::sync::mpsc::sync_channel(1);
         assert!(
             notify_tx
-                .try_send(crate::notify::NotifyMsg {
-                    session: 1,
-                    title: None,
-                    body: "occupied".to_string(),
-                })
+                .try_send(crate::notify::NotifyMsg::new(
+                    1,
+                    None,
+                    "occupied".to_string()
+                ))
                 .is_ok()
         );
         let control = ControlHandle::new("test-notice-retry".to_string(), notify_tx);
@@ -4388,7 +4508,9 @@ mod tests {
 
     #[test]
     fn final_actuation_permit_rechecks_fault_management_and_exact_intent() {
-        let assert_authority_denial_model = || {
+        // `remanage_granted` is what the final permit read after the session was
+        // managed again, which the model projects as `authority_valid`.
+        let assert_authority_denial_model = |remanage_granted: bool| {
             let model = operator_wal_actuator_model();
             let initial = model.init_state();
             let mut intent = initial.clone();
@@ -4449,6 +4571,25 @@ mod tests {
                 !accepted,
                 "invalid authority admitted a forged write\n{diagnostics}"
             );
+
+            // The re-manage, projected: it leaves the permit revoked, so the model
+            // state does not move. A re-grant is a step the model refuses and
+            // `RevocationIsFinal` rejects.
+            let mut remanaged = invalid.clone();
+            remanaged.insert("authority_valid", i64::from(remanage_granted));
+            assert_eq!(remanaged, invalid, "managing the session again re-granted");
+            let mut regranted = invalid.clone();
+            regranted.insert("authority_valid", 1);
+            let (accepted, diagnostics) = verify::validate_transition_tiered(
+                &model,
+                &[("Buggy", 0)],
+                &invalid,
+                &regranted,
+                Some("InvalidateAuthority"),
+                "host re-manage re-grant negative control",
+            );
+            assert!(!accepted, "a revoked permit was re-granted\n{diagnostics}");
+            assert!(!model.check_invariant("RevocationIsFinal", &regranted));
         };
 
         fn prepared(
@@ -4505,7 +4646,16 @@ mod tests {
             });
         assert!(denied.unwrap_err().contains("authority was revoked"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_authority_denial_model();
+        // Unmanage turned the in-flight intent in-doubt, so managing the session
+        // again cannot re-grant this transaction's permit.
+        assert!(queue.manage_sid("s-a").unwrap());
+        let denied =
+            control.with_actuation_permit(&queue, event_id, &token, "s-a", &action_hash, || {
+                calls.fetch_add(1, Ordering::SeqCst)
+            });
+        assert_authority_denial_model(denied.is_ok());
+        assert!(denied.unwrap_err().contains("authority was revoked"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(control);
         drop(queue);
         let _ = std::fs::remove_dir_all(directory);
@@ -4546,17 +4696,37 @@ mod tests {
 
         let (directory, queue, control, event_id, token, action_hash) =
             prepared("permit-contended");
-        let gate = control.shared.fleet_fault.lock().unwrap();
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let started = Instant::now();
-        let denied =
-            control.with_actuation_permit(&queue, event_id, &token, "s-a", &action_hash, || {
-                calls.fetch_add(1, Ordering::SeqCst)
+        // The permit is asked for on ANOTHER thread — the actuator's side of the
+        // real race — and its refusal must come back while this thread still
+        // holds the gate (the load-sensitive test audit of 2026-09-27). The old
+        // `< 100 ms` stopwatch around a same-thread try_lock timed only the
+        // scheduler: a blocking acquisition there deadlocks this thread and
+        // never reaches the clock. Here it parks the helper, and the 10 s
+        // answer deadline turns that park into a failure instead of a hang.
+        let denied = std::thread::scope(|scope| {
+            let gate = control.shared.fleet_fault.lock().unwrap();
+            let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+            let (control, queue, token, action_hash, calls) =
+                (&control, &queue, &token, &action_hash, &calls);
+            scope.spawn(move || {
+                let _ = answer_tx.send(control.with_actuation_permit(
+                    queue,
+                    event_id,
+                    token,
+                    "s-a",
+                    action_hash,
+                    || calls.fetch_add(1, Ordering::SeqCst),
+                ));
             });
+            let answer = answer_rx.recv_timeout(Duration::from_secs(10));
+            // Released before any verdict, so a parked helper can finish and
+            // the scope's join cannot outlive a failure.
+            drop(gate);
+            answer.expect("the final permit parked behind the held gate instead of refusing")
+        });
         assert!(denied.unwrap_err().contains("transition is busy"));
-        assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        drop(gate);
         drop(control);
         drop(queue);
         let _ = std::fs::remove_dir_all(directory);

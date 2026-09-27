@@ -4,7 +4,6 @@
 // Derived from lz4_flex 0.11.5 and modified by the aterm project in 2026.
 // See ../../LICENSE-MIT for the upstream MIT license.
 
-#[allow(unused_imports)]
 use alloc::boxed::Box;
 
 /// The Hashtable trait used by the compression to store hashed bytes to their position.
@@ -42,8 +41,6 @@ fn hash5(sequence: usize) -> u32 {
 pub trait HashTable {
     fn get_at(&self, pos: usize) -> usize;
     fn put_at(&mut self, pos: usize, val: usize);
-    #[allow(dead_code)]
-    fn clear(&mut self);
     #[inline]
     #[cfg(target_pointer_width = "64")]
     fn get_hash_at(input: &[u8], pos: usize) -> usize {
@@ -114,29 +111,6 @@ impl HashTable for HashTable4KU16 {
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] = val as u16;
     }
     #[inline]
-    // Skip: same audited Box-deref assert class as `get_at`/`put_at` above
-    // (the hoist trips the Null+Misaligned runtime asserts the allocator-
-    // anchored discharge cannot reach across the ctor boundary). Same
-    // droppable-when.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn clear(&mut self) {
-        // Hoist the Box deref ONCE (the init_dict idiom): the loop then
-        // indexes a plain local slice whose `len()` correlates with the bound
-        // in the verifier's model, where a per-iteration `self.dict[..]`
-        // re-deref decorrelates. `% HASHTABLE_SIZE_4K` keeps the index provably
-        // in range under the loop-carried havoc; `wrapping_add` cannot wrap
-        // under `i < HASHTABLE_SIZE_4K`. LLVM elides the mask — same memset.
-        // SAFETY: `self.dict` is an owned `Box`, always non-null, aligned,
-        // and exclusively borrowed through `&mut self`; the reborrow is plain
-        // safe Rust (the unsafe this justifies is `Box`'s inlined deref).
-        let dict = &mut *self.dict;
-        let mut i = 0;
-        while i < HASHTABLE_SIZE_4K {
-            dict[i % HASHTABLE_SIZE_4K] = 0;
-            i = i.wrapping_add(1);
-        }
-    }
-    #[inline]
     fn get_hash_at(input: &[u8], pos: usize) -> usize {
         hash(super::get_batch(input, pos)) as usize
     }
@@ -154,14 +128,6 @@ impl HashTable4K {
         let dict = alloc::boxed::Box::new([0; HASHTABLE_SIZE_4K]);
         Self { dict }
     }
-
-    #[cold]
-    #[allow(dead_code)]
-    pub fn reposition(&mut self, offset: u32) {
-        for i in self.dict.iter_mut() {
-            *i = i.saturating_sub(offset);
-        }
-    }
 }
 impl HashTable for HashTable4K {
     #[inline]
@@ -178,81 +144,5 @@ impl HashTable for HashTable4K {
     fn put_at(&mut self, hash: usize, val: usize) {
         // Same `%` mask idiom as `get_at` above (identical on all real calls).
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] = val as u32;
-    }
-    #[inline]
-    // Skip: same audited Box-deref assert class as the U16 twin above.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn clear(&mut self) {
-        // Hoist the Box deref ONCE (the init_dict idiom): the loop then
-        // indexes a plain local slice whose `len()` correlates with the bound
-        // in the verifier's model, where a per-iteration `self.dict[..]`
-        // re-deref decorrelates. `% HASHTABLE_SIZE_4K` keeps the index provably
-        // in range under the loop-carried havoc; `wrapping_add` cannot wrap
-        // under `i < HASHTABLE_SIZE_4K`. LLVM elides the mask — same memset.
-        // SAFETY: `self.dict` is an owned `Box`, always non-null, aligned,
-        // and exclusively borrowed through `&mut self`; the reborrow is plain
-        // safe Rust (the unsafe this justifies is `Box`'s inlined deref).
-        let dict = &mut *self.dict;
-        let mut i = 0;
-        while i < HASHTABLE_SIZE_4K {
-            dict[i % HASHTABLE_SIZE_4K] = 0;
-            i = i.wrapping_add(1);
-        }
-    }
-}
-
-const HASHTABLE_SIZE_8K: usize = 8 * 1024;
-const HASH_TABLE_BIT_SHIFT_8K: usize = 3;
-
-#[derive(Debug)]
-pub struct HashTable8K {
-    dict: Box<[u32; HASHTABLE_SIZE_8K]>,
-}
-#[allow(dead_code)]
-impl HashTable8K {
-    #[inline]
-    pub fn new() -> Self {
-        // Direct boxed-array allocation; see `HashTable4KU16::new` (avoids the
-        // absent-callee slice->array `try_into` and its `unwrap` panic path).
-        let dict = alloc::boxed::Box::new([0; HASHTABLE_SIZE_8K]);
-
-        Self { dict }
-    }
-}
-impl HashTable for HashTable8K {
-    #[inline]
-    // Skip: same audited Box-deref assert class as the 4K twins above.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn get_at(&self, hash: usize) -> usize {
-        // `hash < 2^16` by construction; `% 8192` is a mask and identical on
-        // all real calls (see `HashTable4KU16::get_at`).
-        self.dict[(hash >> HASH_TABLE_BIT_SHIFT_8K) % HASHTABLE_SIZE_8K] as usize
-    }
-    #[inline]
-    // Skip: same audited Box-deref assert class as the 4K twins above.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn put_at(&mut self, hash: usize, val: usize) {
-        // Same `%` mask idiom as `get_at` above (identical on all real calls).
-        self.dict[(hash >> HASH_TABLE_BIT_SHIFT_8K) % HASHTABLE_SIZE_8K] = val as u32;
-    }
-    #[inline]
-    // Skip: same audited Box-deref assert class as the U16 twin above.
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn clear(&mut self) {
-        // Hoist the Box deref ONCE (the init_dict idiom): the loop then
-        // indexes a plain local slice whose `len()` correlates with the bound
-        // in the verifier's model, where a per-iteration `self.dict[..]`
-        // re-deref decorrelates. `% HASHTABLE_SIZE_8K` keeps the index provably
-        // in range under the loop-carried havoc; `wrapping_add` cannot wrap
-        // under `i < HASHTABLE_SIZE_8K`. LLVM elides the mask — same memset.
-        // SAFETY: `self.dict` is an owned `Box`, always non-null, aligned,
-        // and exclusively borrowed through `&mut self`; the reborrow is plain
-        // safe Rust (the unsafe this justifies is `Box`'s inlined deref).
-        let dict = &mut *self.dict;
-        let mut i = 0;
-        while i < HASHTABLE_SIZE_8K {
-            dict[i % HASHTABLE_SIZE_8K] = 0;
-            i = i.wrapping_add(1);
-        }
     }
 }

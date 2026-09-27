@@ -91,11 +91,13 @@ impl Grid {
                 scrollback_detached_for_reflow: false,
                 pending_scrollback_settings: None,
                 pending_fill_target: None,
+                detached_reader_aim: None,
                 compress_offload_active: false,
                 flood_truncated_lines: 0,
                 ring_byte_watermark: None,
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
+                history_reveal_gen: 0,
                 ring_extras: VecDeque::new(),
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows),
@@ -105,8 +107,6 @@ impl Grid {
                 wrap_serial: 0,
                 any_double_width: false,
                 has_horizontal_margins: false,
-                #[cfg(feature = "disk-tier")]
-                budget_enforcer: None,
                 cursor_state: GridCursorState {
                     cursor: crate::Cursor::default(),
                     saved_cursor: crate::SavedCursor::default(),
@@ -150,6 +150,16 @@ impl Grid {
     /// * `cols` - Number of columns
     /// * `ring_buffer_size` - Size of the fast ring buffer (e.g., 1000)
     /// * `scrollback` - Tiered scrollback for long-term storage (memory or disk-backed)
+    ///
+    /// A store that arrives PRE-FILLED — a restored checkpoint's history, a
+    /// reopened disk tier — holds lines this grid's lineage already pushed, so
+    /// the absolute row counter starts past them: the live top is numbered
+    /// `carried` and the oldest carried line `0`. Starting it at `rows` put the
+    /// live top at `0` with the whole carried history below it, where
+    /// [`Grid::oldest_absolute_row`] saturates onto the live top: every
+    /// history-anchored reader then took the carried lines for evicted ones (a
+    /// selection in them was dropped by the first retention re-floor), and each
+    /// history line shared its absolute number with a visible row.
     #[must_use]
     pub fn with_tiered_scrollback(
         rows: u16,
@@ -160,6 +170,8 @@ impl Grid {
         // Ingress clamp (§5.8): bound the allocation a hostile caller can request.
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
+        let scrollback: ScrollbackStorage = scrollback.into();
+        let carried = u64::try_from(scrollback.line_count()).unwrap_or(u64::MAX);
 
         // Pre-heat pages based on initial grid size. Only enough pages for the
         // visible rows are preheated; extra pages allocate lazily on first need.
@@ -189,27 +201,27 @@ impl Grid {
                 total_lines: rows as usize,
                 display_offset: 0,
                 ring_head: 0,
-                scrollback: Some(scrollback.into()),
+                scrollback: Some(scrollback),
                 lazy_buffer: LazyBuffer::new(),
                 scrollback_detached_for_reflow: false,
                 pending_scrollback_settings: None,
                 pending_fill_target: None,
+                detached_reader_aim: None,
                 compress_offload_active: false,
                 flood_truncated_lines: 0,
                 ring_byte_watermark: None,
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
+                history_reveal_gen: 0,
                 ring_extras: VecDeque::new(),
                 generations: GenerationTracker::new(),
-                absolute_row_counter: u64::from(rows),
+                absolute_row_counter: u64::from(rows).saturating_add(carried),
                 // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
                 content_gen: 1,
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,
                 any_double_width: false,
                 has_horizontal_margins: false,
-                #[cfg(feature = "disk-tier")]
-                budget_enforcer: None,
                 cursor_state: GridCursorState {
                     cursor: crate::Cursor::default(),
                     saved_cursor: crate::SavedCursor::default(),

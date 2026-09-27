@@ -173,12 +173,8 @@ impl<C: Ctl> Session<'_, C> {
                 holder: holder.clone(),
                 tried: now,
             };
-            return said.then(|| {
-                format!(
-                    "WATCHING another supervisor holds this session: {holder} — nothing is \
-                     pressed, typed or badged by this one"
-                )
-            });
+            return said
+                .then(|| format!("WATCHING another supervisor holds this session: {holder}"));
         }
         let why = one_line(r.err_text());
         let said = !matches!(self.claim, Claim::Unavailable { .. });

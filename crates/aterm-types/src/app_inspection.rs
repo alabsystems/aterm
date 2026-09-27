@@ -141,17 +141,6 @@ pub struct ActRequest<'a> {
     pub value: Option<&'a str>,
 }
 
-/// First-party app kind accepted by `open app ...`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpenAppKind {
-    /// The singleton Settings app.
-    Settings,
-    /// A Markdown document view.
-    Markdown,
-    /// An editable document view.
-    Editor,
-}
-
 /// A parsed `open app ...` request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenAppRequest<'a> {
@@ -172,17 +161,7 @@ pub enum OpenAppRequest<'a> {
     },
 }
 
-impl OpenAppRequest<'_> {
-    /// Return the request's first-party app kind.
-    #[must_use]
-    pub const fn kind(self) -> OpenAppKind {
-        match self {
-            Self::Settings { .. } => OpenAppKind::Settings,
-            Self::Markdown { .. } => OpenAppKind::Markdown,
-            Self::Editor { .. } => OpenAppKind::Editor,
-        }
-    }
-}
+impl OpenAppRequest<'_> {}
 
 /// Fail-closed parse error for native app protocol requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,0 +1,25 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (80x24, the owner's settings: auto mode by default, the top effort level on) · auto mode, idle, empty composer: the mode row the footer rewrites and the lights read · the effort tag's word is replaced by the stand-in `workspace`, same width
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Opus 5.5 with xhigh effort · Claude Max
+ ▝▝   ▝▝   ~/aterm · /rc
+
+
+⏺ agents-md: no CLAUDE.md found; AGENTS.md loaded:
+  /Users//user00/aterm/AGENTS.md
+
+
+
+
+
+
+
+
+
+
+
+                                     ✦ workspace · xhigh + workflows · /effort
+──────────────────────────────────────────────────────────────────── workspace ─
+❯ Try "create a util logging.py that..."
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

@@ -72,10 +72,10 @@ fn location_of(font: &FontRef, coords: &[(u32, f32)]) -> Location {
         .location(coords.iter().map(|&(tag, v)| (Tag::from_u32(tag), v)))
 }
 
-/// How the native (Linux / Windows) raster path grid-fits outlines. Resolved ONCE per
-/// renderer from `ATERM_FONT_HINTING` (construction-time, like
-/// `ATERM_RASTERIZER`); rasterized coverage is cached per glyph, so a
-/// mid-flight env flip must not split the atlas between two modes.
+/// How the native (Linux / Windows) raster path grid-fits outlines. [`Full`](Self::Full)
+/// at construction ([`HintMode::initial`]); the host's `font_hinting` config key
+/// changes it through `Renderer::set_font_hinting`, which drops the glyph atlas so
+/// no cache is ever split between two modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HintMode {
     /// FreeType-ported autohinter, normal smooth target: snaps stems and
@@ -99,11 +99,10 @@ pub(crate) enum HintMode {
 }
 
 impl HintMode {
-    /// Parse one mode spelling — shared by the env read ([`Self::from_env`])
-    /// and the config key (`font_hinting`, via `Renderer::set_font_hinting`).
-    /// Unrecognized = the default ([`HintMode::Full`]), the same forgiving
-    /// shape the env always had; explicit disable spellings match the
-    /// workspace's usual off/0/none family.
+    /// Parse one mode spelling of the config key (`font_hinting`, via
+    /// `Renderer::set_font_hinting`). Unrecognized = the default
+    /// ([`HintMode::Full`]); explicit disable spellings match the workspace's
+    /// usual off/0/none family.
     pub(crate) fn parse(s: &str) -> Self {
         match s.trim() {
             "light" => Self::Light,
@@ -113,34 +112,22 @@ impl HintMode {
         }
     }
 
-    /// Whether `ATERM_RASTERIZER` is pinning the raster backend to the
-    /// byte-stable PORTABLE path the golden/parity tests export. It forces
-    /// `Off` at construction AND wins over the `font_hinting` config setter,
-    /// so those tests keep the exact bytes they were written against.
-    ///
-    /// TWO SPELLINGS, deliberately. `portable` is the name of the thing —
-    /// `crate::font::Font` over `crate::raster`, the same code on every OS.
-    /// `fontdue` was that path's name while `fontdue` WAS that code, and it is
-    /// still accepted because it is exported by 20 test sites across 9 files,
-    /// by `aterm-gpu`'s parity harnesses, and by whatever shell scripts and
-    /// muscle memory outlive this comment. Breaking it would buy nothing but a
-    /// tidier string.
+    /// Whether the `ATERM_RASTERIZER` development seam is pinning the raster
+    /// backend to the byte-stable PORTABLE path the golden/parity tests export
+    /// ([`crate::portable_raster_forced`]). It forces `Off` at construction AND
+    /// wins over the `font_hinting` config setter, so those tests keep the exact
+    /// bytes they were written against.
     pub(crate) fn portable_forced() -> bool {
-        matches!(
-            std::env::var("ATERM_RASTERIZER").ok().as_deref(),
-            Some("portable" | "fontdue")
-        )
+        crate::portable_raster_forced()
     }
 
-    /// Parse `ATERM_FONT_HINTING`. Unset or unrecognized = the default
-    /// ([`HintMode::Full`]); [`Self::portable_forced`] forces `Off`.
-    pub(crate) fn from_env() -> Self {
+    /// The mode a renderer is built with: [`HintMode::Full`], or `Off` under
+    /// [`Self::portable_forced`].
+    pub(crate) fn initial() -> Self {
         if Self::portable_forced() {
-            return Self::Off;
-        }
-        match std::env::var("ATERM_FONT_HINTING").ok().as_deref() {
-            Some(s) => Self::parse(s),
-            None => Self::Full,
+            Self::Off
+        } else {
+            Self::Full
         }
     }
 
@@ -725,7 +712,6 @@ mod tests {
     fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
         // Both bundled faces: the text default the bug bit, and the Nerd icon
         // face, whose outlines are shaped nothing like Latin text.
-        #[allow(unused_mut)]
         let mut faces: Vec<(&str, &[u8])> = vec![("DejaVuSansMono (embedded)", dejavu())];
         #[cfg(feature = "embedded-symbols")]
         faces.push((

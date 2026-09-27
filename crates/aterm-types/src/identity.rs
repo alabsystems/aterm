@@ -17,9 +17,6 @@ pub const COMPANY: &str = "ALab";
 /// The project site, as printed (no scheme).
 pub const SITE: &str = "alab.systems";
 
-/// The project site as an absolute URL — what About's "Open Project Site" opens.
-pub const SITE_URL: &str = "https://alab.systems";
-
 /// The ONE origin line every text surface prints under its title.
 pub const ORIGIN_LINE: &str = "by Andrew Yates \u{00b7} ALab \u{00b7} alab.systems";
 
@@ -34,10 +31,6 @@ mod tests {
             ORIGIN_LINE,
             format!("by {AUTHOR} \u{00b7} {COMPANY} \u{00b7} {SITE}")
         );
-        assert_eq!(SITE_URL, format!("https://{SITE}"));
-        assert!(
-            !SITE.contains("://"),
-            "SITE is printed bare; SITE_URL carries the scheme"
-        );
+        assert!(!SITE.contains("://"), "SITE is printed bare");
     }
 }

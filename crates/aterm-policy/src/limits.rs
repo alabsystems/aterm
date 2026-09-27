@@ -211,36 +211,17 @@ impl TokenBucket {
         self.last_refill = Some(now);
     }
 
-    /// Reconfigure the bucket in place from a new [`RateLimit`].
-    ///
-    /// The current balance is preserved but clamped down to the new
-    /// capacity so a host that shrinks the ceiling cannot be immediately
-    /// over-budget.
-    pub fn reconfigure(&mut self, cfg: &RateLimit) {
-        self.capacity_bytes = u64::from(cfg.capacity_bytes);
-        self.refill_per_second = u64::from(cfg.refill_per_second);
-        self.per_sequence_max = u64::from(cfg.per_sequence_max);
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "capacity is bytes-scale; f64 precision sufficient"
-        )]
-        let cap = self.capacity_bytes as f64;
-        if self.tokens > cap {
-            self.tokens = cap;
-        }
-    }
-
-    /// Current burst capacity (read-only accessor; intended for tests
-    /// and diagnostics).
+    /// Current burst capacity. Test-only.
+    #[cfg(test)]
     #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
+    pub(crate) fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
 
-    /// Current token balance rounded down to whole tokens (read-only
-    /// accessor; intended for tests and diagnostics).
+    /// Current token balance rounded down to whole tokens. Test-only.
+    #[cfg(test)]
     #[must_use]
-    pub fn tokens(&self) -> u64 {
+    pub(crate) fn tokens(&self) -> u64 {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -248,12 +229,6 @@ impl TokenBucket {
         )]
         let t = self.tokens as u64;
         t
-    }
-
-    /// Per-sequence cap, or `0` when disabled.
-    #[must_use]
-    pub fn per_sequence_max(&self) -> u64 {
-        self.per_sequence_max
     }
 }
 
@@ -299,8 +274,10 @@ impl RateLimitSlot {
     pub const UNDECLARED: Self = Self(None);
 
     /// `true` when the id this slot came from is declared by the policy.
+    /// Test-only.
+    #[cfg(test)]
     #[must_use]
-    pub const fn is_declared(self) -> bool {
+    pub(crate) const fn is_declared(self) -> bool {
         self.0.is_some()
     }
 }
@@ -332,9 +309,10 @@ pub struct RateLimiterSet {
 
 impl RateLimiterSet {
     /// Construct an empty set (no buckets). Equivalent to a policy with
-    /// an empty `rate_limits` table.
+    /// an empty `rate_limits` table. Test-only.
+    #[cfg(test)]
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -421,37 +399,19 @@ impl RateLimiterSet {
         }
     }
 
-    /// Borrow a bucket by id — useful for diagnostics. Returns `None`
-    /// when no bucket with that id has been declared by the policy.
+    /// Borrow a bucket by id. Returns `None` when no bucket with that id has
+    /// been declared by the policy. Test-only.
+    #[cfg(test)]
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<&TokenBucket> {
+    pub(crate) fn get(&self, id: &str) -> Option<&TokenBucket> {
         self.buckets.get(*self.slots.get(id)?)
     }
 
-    /// Borrow a bucket mutably by id. Returns `None` when no bucket
-    /// with that id has been declared. Intended for host-side
-    /// reconfigure paths.
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut TokenBucket> {
-        let idx = *self.slots.get(id)?;
-        self.buckets.get_mut(idx)
-    }
-
-    /// `true` if a bucket with the given id exists.
+    /// Number of buckets. Test-only.
+    #[cfg(test)]
     #[must_use]
-    pub fn contains(&self, id: &str) -> bool {
-        self.slots.contains_key(id)
-    }
-
-    /// Number of buckets.
-    #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.buckets.len()
-    }
-
-    /// `true` when no buckets are declared.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.buckets.is_empty()
     }
 }
 
@@ -575,18 +535,6 @@ mod tests {
         let clock = FakeClock::new();
         assert!(!bucket.try_consume(1, &clock));
         assert!(!bucket.try_consume(0, &clock));
-    }
-
-    #[test]
-    fn reconfigure_preserves_tokens_under_new_cap() {
-        let mut bucket = TokenBucket::from_config(&rl("x", 500, 1_000, 0));
-        let clock = FakeClock::new();
-        assert!(bucket.try_consume(200, &clock));
-        assert_eq!(bucket.tokens(), 300);
-
-        bucket.reconfigure(&rl("x", 100, 1_000, 0));
-        assert_eq!(bucket.capacity_bytes(), 100);
-        assert!(bucket.tokens() <= 100);
     }
 
     // -----------------------------------------------------------------

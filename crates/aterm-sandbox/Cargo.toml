@@ -29,11 +29,9 @@ aterm-spec = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-# The Tier-1 conformance test (`tests/conformance_sandbox.rs`) needs the derived/
-# external spec machinery and `ty`; the anchors it relies on are compiled via the
-# crate's own test build (`cfg(test)`), so no feature is needed for the test itself.
+# The `#[refines]` anchor on `Limits::apply` compiles in the crate's own test
+# build (`cfg(test)`), so the test build names `aterm_spec`.
 aterm-spec = { workspace = true }
-aterm-spec-models = { workspace = true }
 # Test-only: sandbox tests mint a root `Authority`; `launcher-mint` makes the sealed
 # mint nameable for this crate's own test build. The production `apply`/`restore`
 # seam receives a `Cap<Sandbox>` by argument and never mints. See aterm-cap's

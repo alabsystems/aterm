@@ -5,7 +5,7 @@
 //! The local enforcement gate — aterm's replacement for CI (there is NO CI).
 //!
 //! Run via `targo --unverified run -p xtask -- gate <check>`. The verbs named by
-//! [`WRAPPED_BY_VERIFY_SH`] are wrapped by `tools/verify.sh` and so also run
+//! `WRAPPED_BY_VERIFY_SH` are wrapped by `tools/verify.sh` and so also run
 //! under the opt-in `cargo ship cut --gate`, which shells out to
 //! `tools/verify.sh --full`; the rest are manual. That list is DERIVED from the
 //! driver's own stage list by
@@ -355,8 +355,8 @@
 //!   `main` arrived with drift (5 files, 2, 1), one of them in a crate
 //!   `targo-fmt --all` structurally cannot see. `plan.rs` now carries a
 //!   `Formatting` stage that shells `gate lint --fmt-only` — this lane's both
-//!   passes and no other lane — so the command the pre-push advisory calls "the
-//!   merge contract" now checks formatting and blocks on drift.
+//!   passes and no other lane — so the merge contract now checks formatting
+//!   and blocks on drift.
 //!
 //!   AND THE LANE NOW SWEEPS WHAT `--all` CANNOT REACH (2026-08-31). This
 //!   header used to record the second limit as "nor does `--all` reach the four
@@ -525,8 +525,9 @@
 //!   core-crate edit, against a `gate all` that costs 251.0-542.6 s on the same
 //!   box (the spread is `perf`'s release harness, warm or cold) — +3.0% to
 //!   +6.6%. It leaves 5.0 GB of target dirs, outside the repo, in
-//!   `$ATERM_CELL_TARGET_DIR` (default: `$XDG_CACHE_HOME/aterm/cells`, which is
-//!   disk-backed — see [`cell_target_dir`] for why it is not the temp dir).
+//!   `$ATERM_CELL_TARGET_DIR` (default: `$XDG_CACHE_HOME/aterm/cells/<checkout>`,
+//!   which is disk-backed and one per checkout — see [`cell_target_dir`] for why
+//!   it is not the temp dir, and why worktrees may not share it).
 //! - `certified` (opt-in, NOT in `all`): the KERNEL-CERTIFIED standard,
 //!   enforced locally. Compiles `crates/xtask/certified-corpus/*.rs` through
 //!   the Trust driver under `CERTIFY_FLAG` and requires TWO independent
@@ -572,10 +573,10 @@
 //!   pre-push hook runs"; MEASURED 2026-07-31, that was false, and it is now
 //!   false twice over: `.githooks/pre-push` was demoted to ADVISORY on
 //!   2026-08-24 (the paint guard having made a blocking hook cost twelve
-//!   minutes) and still runs no gate — its 2026-09-17 successor BLOCKS a push
-//!   with no passing gate receipt, which is a file read, not a verb. Nothing
-//!   automatic runs this verb; tools/verify.sh invokes only the verbs
-//!   [`WRAPPED_BY_VERIFY_SH`] names. So `fault`, `forge` and `perf` still have
+//!   minutes), its 2026-09-17 successor read a gate receipt rather than a verb,
+//!   and on 2026-09-25 the hook was deleted outright (no hooks, by the owner's
+//!   mandate). Nothing automatic runs this verb; tools/verify.sh invokes only the verbs
+//!   `WRAPPED_BY_VERIFY_SH` names. So `fault`, `forge` and `perf` still have
 //!   NO automated caller: run them by hand, or wire them into verify.sh (`fault`
 //!   is cheap and toolchain-free; `perf` belongs behind `--full`).
 //!
@@ -615,19 +616,20 @@
 //! gate.rs itself, so every `Proof::Needle` literal was its own witness).
 //! Careful reading demonstrably does not catch that class; only a mechanical
 //! obligation does. So every entry of [`ALL_ROSTER`] must be paired here with
-//! EITHER a named red-fixture test that plants a violation and asserts the gate
-//! reports FAILURE, OR an explicit KNOWN GAP carrying its reason — and
-//! `every_all_roster_gate_has_a_red_fixture_or_a_registered_known_gap` fails
+//! a named red-fixture test that plants a violation and asserts the gate
+//! reports FAILURE — and `every_all_roster_gate_has_a_red_fixture` fails
 //! `cargo test -p xtask` (which tools/verify.sh runs at workspace scope, line
-//! 331) when a roster entry has neither. The registry's `drives` field states
-//! exactly what each fixture calls, so a COMPONENT-level demonstration can
-//! never be read as a VERB-level one. The same check runs as the verb
+//! 331) when a roster entry has none. (The registry once also admitted an
+//! explicit "known gap"; no gate has needed one since the perf and lint
+//! fixtures landed, and the variant was deleted on 2026-09-25.) The registry's
+//! `drives` field states exactly what each fixture calls, so a COMPONENT-level
+//! demonstration can never be read as a VERB-level one. The same check runs as the verb
 //! `gate nonvacuity`, and at the END of `gate all` — so the honest score is
 //! printed at the moment a human is about to read the word GREEN, and a
-//! violated obligation fails `gate all` itself. That score is three counts, not
+//! violated obligation fails `gate all` itself. That score is two counts, not
 //! a fraction: "N/M roster gate(s) proven red at the VERB; C at a COMPONENT
-//! only; G never shown to fail", each derived from [`NON_VACUITY_REGISTRY`] by
-//! [`report_non_vacuity`] — read it there rather than from prose. This sentence
+//! only", each derived from [`NON_VACUITY_REGISTRY`] by [`report_non_vacuity`]
+//! — read it there rather than from prose. This sentence
 //! quoted "9/10 … KNOWN GAP: perf" long after the roster reached thirteen and
 //! `perf` got a verb-level fixture, which is exactly the drift the split-count
 //! wording above it was introduced to prevent.
@@ -812,11 +814,9 @@ pub(crate) fn opt_in_names() -> Vec<&'static str> {
 /// stage list by `the_wrapped_list_is_exactly_what_the_verify_driver_calls`.
 /// Hand-typed prose said "drift, dormant, mainloop and counts" from the day
 /// `cells` and `lint --fmt-only` joined the plan until 2026-09-13.
-/// Read by `the_wrapped_list_is_exactly_what_the_verify_driver_calls` and by the two
-/// doc paragraphs above that link it; no RUNTIME path consults it, so outside `cfg(test)`
-/// it is unused by construction rather than by oversight — say so here instead of letting
-/// `tippy` say it on every build.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Read only by `the_wrapped_list_is_exactly_what_the_verify_driver_calls`: no RUNTIME
+/// path consults it, so it exists only in the test build.
+#[cfg(test)]
 const WRAPPED_BY_VERIFY_SH: &[&str] = &[
     "cells",
     "citations",
@@ -827,317 +827,267 @@ const WRAPPED_BY_VERIFY_SH: &[&str] = &[
     "mainloop",
 ];
 
-/// How a roster gate's ABILITY TO GO RED is established.
-enum RedProof {
-    /// `test` — a `#[test] fn` in `file` (workspace-relative) — plants a
-    /// violation and asserts a RED verdict.
-    Fixture {
-        test: &'static str,
-        file: &'static str,
-        /// EXACTLY what the fixture calls. A component-level demonstration
-        /// (`run_repo_guards`) must say so here; only a fixture that calls the
-        /// verb's own reporting function may claim the verb. Prose, for the
-        /// reader — the machine-checked half is `calls`.
-        drives: &'static str,
-        /// The symbol the fixture MUST mention, checked as a substring of its
-        /// body. Without this the obligation is satisfiable by a fixture that
-        /// never touches the gate — `assert!(!false);` in a correctly-named
-        /// `#[test]` scored as proof, which is the very defect this registry
-        /// exists to stop, one level up. It cannot prove the call is REACHED
-        /// (that needs coverage, not a substring), but it does bind the fixture
-        /// to the gate it claims, and the registry already knew this symbol.
-        calls: &'static str,
-        /// Does the fixture drive the VERB, or only a component of it? The
-        /// printed score separates the two rather than counting them together —
-        /// `lint`'s fixture drives `run_repo_guards`, not `gate_lint`, and a
-        /// score that calls both "verb-level" over-claims exactly like the
-        /// verdict line this repo fixed this morning.
-        verb_level: bool,
-    },
-    /// NOBODY HAS EVER SHOWN THIS GATE FAIL. `reason` states why a fixture is
-    /// not feasible today and what would close the gap. An honest gap is the
-    /// point of this obligation — a fabricated fixture is the thing it exists
-    /// to prevent.
-    ///
-    /// Currently constructed only by this module's own tests: as of the perf and
-    /// lint fixtures landing, the live registry has NO known gaps, which is the
-    /// point. The variant STAYS — deleting it would leave a future hard-to-prove
-    /// gate with no honest way to say so, and the pressure would go somewhere
-    /// worse (a fixture that drives a component and calls it the verb). The
-    /// allow is scoped to `not(test)` so it silences exactly the build where the
-    /// variant is genuinely unconstructed, and nothing else.
-    #[cfg_attr(not(test), allow(dead_code))]
-    KnownGap { reason: &'static str },
-}
-
+/// How a roster gate's ABILITY TO GO RED is established: `test` — a `#[test] fn`
+/// in `file` (workspace-relative) — plants a violation and asserts a RED verdict.
+/// There is no "known gap" alternative: every roster gate has been shown to fail,
+/// and a gate nobody can show failing does not join the roster.
 struct RedFixture {
     gate: &'static str,
-    proof: RedProof,
+    test: &'static str,
+    file: &'static str,
+    /// EXACTLY what the fixture calls. A component-level demonstration
+    /// (`run_repo_guards`) must say so here; only a fixture that calls the
+    /// verb's own reporting function may claim the verb. Prose, for the
+    /// reader — the machine-checked half is `calls`.
+    drives: &'static str,
+    /// The symbol the fixture MUST mention, checked as a substring of its
+    /// body. Without this the obligation is satisfiable by a fixture that
+    /// never touches the gate — `assert!(!false);` in a correctly-named
+    /// `#[test]` scored as proof, which is the very defect this registry
+    /// exists to stop, one level up. It cannot prove the call is REACHED
+    /// (that needs coverage, not a substring), but it does bind the fixture
+    /// to the gate it claims, and the registry already knew this symbol.
+    calls: &'static str,
+    /// Does the fixture drive the VERB, or only a component of it? The
+    /// printed score separates the two rather than counting them together —
+    /// `lint`'s fixture drives `run_repo_guards`, not `gate_lint`, and a
+    /// score that calls both "verb-level" over-claims exactly like the
+    /// verdict line this repo fixed this morning.
+    verb_level: bool,
 }
-
-/// A KNOWN GAP reason shorter than this is not a reason. (An arbitrary but
-/// enforced floor: "TODO" and "hard" cannot be registered as engineering
-/// judgement.)
-const MIN_GAP_REASON: usize = 120;
 
 /// One entry per [`ALL_ROSTER`] gate — fail-closed in both directions.
 const NON_VACUITY_REGISTRY: &[RedFixture] = &[
     RedFixture {
         gate: "cells-foreign",
-        proof: RedProof::Fixture {
-            test: "a_foreign_cell_under_its_floor_fails_the_cells_verb",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB's implementation: cells_under_policy() — `gate cells`' whole body \
-                     after it reads the policy: member list, forge's per-cell graph, the cross \
-                     compile for the cell's own triple, and the verdict — for the foreign cell \
-                     `wasm-cpu` over the real workspace: GREEN under the shipped policy, then RED \
-                     with that cell's floor raised past its graph, a count only the compile can \
-                     fall short of (2026-09-24; until then only the compiler-free \
-                     cell_matrix_audit had been shown red, and it still is, by \
-                     a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit). SKIPS loudly \
-                     on a box with no wasm32 std",
-            calls: "cells_under_policy",
-            verb_level: true,
-        },
+        test: "a_foreign_cell_under_its_floor_fails_the_cells_verb",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB's implementation: cells_under_policy() — `gate cells`' whole body \
+                 after it reads the policy: member list, forge's per-cell graph, the cross \
+                 compile for the cell's own triple, and the verdict — for the foreign cell \
+                 `wasm-cpu` over the real workspace: GREEN under the shipped policy, then RED \
+                 with that cell's floor raised past its graph, a count only the compile can \
+                 fall short of (2026-09-24; until then only the compiler-free \
+                 cell_matrix_audit had been shown red, and it still is, by \
+                 a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit). SKIPS loudly \
+                 on a box with no wasm32 std",
+        calls: "cells_under_policy",
+        verb_level: true,
     },
     RedFixture {
         gate: "citations",
-        proof: RedProof::Fixture {
-            test: "a_path_citation_that_resolves_to_nothing_fails_the_citations_verb",
-            file: "crates/xtask/src/citations.rs",
-            drives: "the VERB: citations_report() over a temp tree whose one \
-                     rostered doc cites a script that is there (GREEN), then one \
-                     that is not (RED, naming the PATH rule and quoting the \
-                     citation), then the same dangling citation admitted as \
-                     retired (GREEN again) — the escape proved to be an escape, \
-                     not a hole; its two siblings do the same for an undefined \
-                     test name and for a roster entry that names nothing",
-            calls: "citations_report",
-            verb_level: true,
-        },
+        test: "a_path_citation_that_resolves_to_nothing_fails_the_citations_verb",
+        file: "crates/xtask/src/citations.rs",
+        drives: "the VERB: citations_report() over a temp tree whose one \
+                 rostered doc cites a script that is there (GREEN), then one \
+                 that is not (RED, naming the PATH rule and quoting the \
+                 citation), then the same dangling citation admitted as \
+                 retired (GREEN again) — the escape proved to be an escape, \
+                 not a hole; its two siblings do the same for an undefined \
+                 test name and for a roster entry that names nothing",
+        calls: "citations_report",
+        verb_level: true,
     },
     RedFixture {
         gate: "drift",
-        proof: RedProof::Fixture {
-            test: "an_unwitnessed_capability_advertised_true_fails_the_drift_verb",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB: drift_report() with the REAL WITNESS_REGISTRY over a \
-                     fixture root whose advertise file is mutated to advertise a \
-                     capability with no implementation witness (GREEN before, RED \
-                     after, GREEN again once the witness lands)",
-            calls: "drift_report",
-            verb_level: true,
-        },
+        test: "an_unwitnessed_capability_advertised_true_fails_the_drift_verb",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB: drift_report() with the REAL WITNESS_REGISTRY over a \
+                 fixture root whose advertise file is mutated to advertise a \
+                 capability with no implementation witness (GREEN before, RED \
+                 after, GREEN again once the witness lands)",
+        calls: "drift_report",
+        verb_level: true,
     },
     RedFixture {
         gate: "dormant",
-        proof: RedProof::Fixture {
-            test: "deleting_the_only_consumer_fails_the_dormant_verb",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB: dormant_report() with the REAL registry entry for \
-                     `apply_bidi_reorder` over a copy of the real render_cells.rs \
-                     with its consumer lines deleted (GREEN before, RED after)",
-            calls: "dormant_report",
-            verb_level: true,
-        },
+        test: "deleting_the_only_consumer_fails_the_dormant_verb",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB: dormant_report() with the REAL registry entry for \
+                 `apply_bidi_reorder` over a copy of the real render_cells.rs \
+                 with its consumer lines deleted (GREEN before, RED after)",
+        calls: "dormant_report",
+        verb_level: true,
     },
     RedFixture {
         gate: "mainloop",
-        proof: RedProof::Fixture {
-            test: "synthetic_prefix_resize_shape_is_red_with_path",
-            file: "crates/aterm-census/src/lib.rs",
-            drives: "the VERB's implementation: run_mainloop_census() over a \
-                     synthetic tree that reintroduces the synchronous \
-                     term_lock(..).resize(..) shape (OB-5 RED with the path)",
-            calls: "run_mainloop_census",
-            verb_level: true,
-        },
+        test: "synthetic_prefix_resize_shape_is_red_with_path",
+        file: "crates/aterm-census/src/lib.rs",
+        drives: "the VERB's implementation: run_mainloop_census() over a \
+                 synthetic tree that reintroduces the synchronous \
+                 term_lock(..).resize(..) shape (OB-5 RED with the path)",
+        calls: "run_mainloop_census",
+        verb_level: true,
     },
     RedFixture {
         gate: "lockorder",
-        proof: RedProof::Fixture {
-            test: "synthetic_cross_boundary_abba_is_red_across_the_namespace",
-            file: "crates/aterm-census/src/lock_order.rs",
-            drives: "the VERB's implementation: run_lock_order_census() over a \
-                     synthetic tree carrying an A-B/B-A cycle across the \
-                     vendored-namespace boundary (OB-7 RED naming both sites)",
-            calls: "run_synth_files",
-            verb_level: true,
-        },
+        test: "synthetic_cross_boundary_abba_is_red_across_the_namespace",
+        file: "crates/aterm-census/src/lock_order.rs",
+        drives: "the VERB's implementation: run_lock_order_census() over a \
+                 synthetic tree carrying an A-B/B-A cycle across the \
+                 vendored-namespace boundary (OB-7 RED naming both sites)",
+        calls: "run_synth_files",
+        verb_level: true,
     },
     RedFixture {
         gate: "wasmloop",
-        proof: RedProof::Fixture {
-            test: "synthetic_reintroduced_sync_resize_is_red_ob10",
-            file: "crates/aterm-census/src/wasm_census.rs",
-            drives: "the VERB's implementation: run_wasm_census() over a synthetic \
-                     tree that puts the synchronous self.term.resize(..) back into \
-                     a wasm resize export (OB-10 RED at its site)",
-            calls: "run_wasm_census",
-            verb_level: true,
-        },
+        test: "synthetic_reintroduced_sync_resize_is_red_ob10",
+        file: "crates/aterm-census/src/wasm_census.rs",
+        drives: "the VERB's implementation: run_wasm_census() over a synthetic \
+                 tree that puts the synchronous self.term.resize(..) back into \
+                 a wasm resize export (OB-10 RED at its site)",
+        calls: "run_wasm_census",
+        verb_level: true,
     },
     RedFixture {
         gate: "scope",
-        proof: RedProof::Fixture {
-            test: "a_per_pane_word_decorations_map_fails_the_flash_limiter_chain",
-            file: "crates/aterm-census/src/scope_census.rs",
-            drives: "the VERB's implementation: run_scope_census_over() with the \
-                     REAL flash-limiter claim over a copy of the real \
-                     aterm-gui/src/lib.rs made per-pane (OB-13 RED)",
-            calls: "run_one",
-            verb_level: true,
-        },
+        test: "a_per_pane_word_decorations_map_fails_the_flash_limiter_chain",
+        file: "crates/aterm-census/src/scope_census.rs",
+        drives: "the VERB's implementation: run_scope_census_over() with the \
+                 REAL flash-limiter claim over a copy of the real \
+                 aterm-gui/src/lib.rs made per-pane (OB-13 RED)",
+        calls: "run_one",
+        verb_level: true,
     },
     RedFixture {
         gate: "lazyinit",
-        proof: RedProof::Fixture {
-            test: "the_v065_self_recursive_once_lock_is_red_with_its_path",
-            file: "crates/aterm-census/src/lazy_init.rs",
-            drives: "the VERB's implementation: run_lazy_init_census()'s derivation \
-                     and verdict, over the EXACT v0.65.0 `debug_seamless_reexec_armed` \
-                     source that shipped a permanent main-thread park (OB-19 RED \
-                     naming the cell and the accessor it calls back into); the \
-                     shipped repair of the same site is GREEN in the sibling test",
-            calls: "run_synth_sources",
-            verb_level: true,
-        },
+        test: "the_v065_self_recursive_once_lock_is_red_with_its_path",
+        file: "crates/aterm-census/src/lazy_init.rs",
+        drives: "the VERB's implementation: run_lazy_init_census()'s derivation \
+                 and verdict, over the EXACT v0.65.0 `debug_seamless_reexec_armed` \
+                 source that shipped a permanent main-thread park (OB-19 RED \
+                 naming the cell and the accessor it calls back into); the \
+                 shipped repair of the same site is GREEN in the sibling test",
+        calls: "run_synth_sources",
+        verb_level: true,
     },
     RedFixture {
         gate: "fault",
-        proof: RedProof::Fixture {
-            test: "an_unarmed_injection_site_fails_the_fault_verb",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB: fault_report() over a synthetic tree whose injected \
-                     fault point no test arms (and the mirror direction: an armed \
-                     name with no injection site)",
-            calls: "fault_report",
-            verb_level: true,
-        },
+        test: "an_unarmed_injection_site_fails_the_fault_verb",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB: fault_report() over a synthetic tree whose injected \
+                 fault point no test arms (and the mirror direction: an armed \
+                 name with no injection site)",
+        calls: "fault_report",
+        verb_level: true,
     },
     RedFixture {
         gate: "forge",
-        proof: RedProof::Fixture {
-            test: "a_reinstated_carved_module_reds_the_forge_verb",
-            file: "crates/aterm-forge/tests/red_fixtures.rs",
-            drives: "the VERB: check_report() — the exact symbol `gate_forge` calls — \
-                     over a miniature aterm workspace built in CARGO_TARGET_TMPDIR \
-                     around a REAL copy of vendor/indexmap. GREEN first (a fixture that \
-                     is red for an unrelated reason proves nothing), then RED once the \
-                     module `vendor/forge.toml` records as CARVED is reinstated \
-                     ([OB-13], naming the path and quoting the ledger's reason), then \
-                     GREEN again when it is removed — so the verb is shown to move in \
-                     BOTH directions, not merely to be stuck red. Three sibling \
-                     fixtures in the same file drive the same verb through the other \
-                     obligation families: an_unreviewed_patch_entry_reds_the_forge_verb \
-                     ([OB-11], a flawless-in-every-other-respect fork with no \
-                     REVIEWED_VENDORED_CRATES row), \
-                     a_notice_that_omits_a_registered_fork_reds_the_forge_verb ([OB-6], \
-                     proving the DELEGATED attest half reaches the verdict rather than \
-                     being reported and dropped), and \
-                     an_unpatched_sibling_version_reds_the_forge_verb ([OB-12] — the \
-                     unpatched-sibling shape synthesized, which cargo itself reports \
-                     as nothing at all). NOT COVERED: [OB-14], the ratchet ceiling. Its \
-                     comparison is proven by aterm-forge's own budget unit tests, not \
-                     through this verb, so a wiring slip that computed the ratchet \
-                     verdict and dropped it would survive these four fixtures.",
-            calls: "check_report",
-            verb_level: true,
-        },
+        test: "a_reinstated_carved_module_reds_the_forge_verb",
+        file: "crates/aterm-forge/tests/red_fixtures.rs",
+        drives: "the VERB: check_report() — the exact symbol `gate_forge` calls — \
+                 over a miniature aterm workspace built in CARGO_TARGET_TMPDIR \
+                 around a REAL copy of vendor/indexmap. GREEN first (a fixture that \
+                 is red for an unrelated reason proves nothing), then RED once the \
+                 module `vendor/forge.toml` records as CARVED is reinstated \
+                 ([OB-13], naming the path and quoting the ledger's reason), then \
+                 GREEN again when it is removed — so the verb is shown to move in \
+                 BOTH directions, not merely to be stuck red. Four sibling \
+                 fixtures in the same file drive the same verb through the other \
+                 obligation families: an_unreviewed_patch_entry_reds_the_forge_verb \
+                 ([OB-11], a flawless-in-every-other-respect fork with no \
+                 REVIEWED_VENDORED_CRATES row), \
+                 a_notice_that_omits_a_registered_fork_reds_the_forge_verb ([OB-6], \
+                 proving the DELEGATED attest half reaches the verdict rather than \
+                 being reported and dropped), \
+                 an_unpatched_sibling_version_reds_the_forge_verb ([OB-12] — the \
+                 unpatched-sibling shape synthesized, which cargo itself reports \
+                 as nothing at all), and \
+                 a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb ([OB-17] — \
+                 a `[forge] cells` row forge does not measure, then `[[fork]]` \
+                 blocks at a version the tree does not carry, with a §4(b) flag \
+                 the license does not owe and with a census namespace the review \
+                 registry does not give, each RED, and GREEN again on the \
+                 repair). NOT COVERED: [OB-14], the ratchet ceiling. Its \
+                 comparison is proven by aterm-forge's own budget unit tests, not \
+                 through this verb, so a wiring slip that computed the ratchet \
+                 verdict and dropped it would survive these five fixtures.",
+        calls: "check_report",
+        verb_level: true,
     },
     RedFixture {
         gate: "counts",
-        proof: RedProof::Fixture {
-            test: "an_empty_inventory_and_a_hand_maintained_total_fail_the_counts_verb",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB: counts_report() over synthetic roots — an empty \
-                     proof inventory, a README asserting a numeric harness total, \
-                     and an unreadable README (each RED; the clean root GREEN)",
-            calls: "counts_report",
-            verb_level: true,
-        },
+        test: "an_empty_inventory_and_a_hand_maintained_total_fail_the_counts_verb",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB: counts_report() over synthetic roots — an empty \
+                 proof inventory, a README asserting a numeric harness total, \
+                 an unreadable README, a Clean island AGENTS.md does not name \
+                 and an unreadable AGENTS.md (each RED; the clean root GREEN)",
+        calls: "counts_report",
+        verb_level: true,
     },
     RedFixture {
         gate: "perf",
-        proof: RedProof::Fixture {
-            test: "every_perf_lane_can_turn_the_verb_red",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB: gate_perf_with() over a lane provider that fails ONE \
-                     lane at a time, all ten in turn, each required to turn the \
-                     verdict red on its own — plus a clean sweep proving the verb is \
-                     not stuck red and asks for every lane once in order, and that \
-                     the trend lane receives the real lanes_ok rather than a \
-                     constant. What this catches is the vacuity a component test \
-                     cannot: a lane computed and then DROPPED (`ok &= f()` slipping \
-                     to `f();`), which makes the gate green by not listening. The \
-                     lane VALUES are proven separately by perf.rs's own decision \
-                     tests (compare_boundary_is_inclusive_pass, keyed_compare_fails_only_\
-                     the_collapsed_metric, trend_same_box_regression_trips_and_other_\
-                     boxes_do_not); this pins the wiring between them. NOT COVERED: \
-                     that the live measurement bindings inside LivePerfLanes select \
-                     the right corpora — that still needs a fixture workspace and a \
-                     toolchain compile.",
-            calls: "gate_perf_with",
-            verb_level: true,
-        },
+        test: "every_perf_lane_can_turn_the_verb_red",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB: gate_perf_with() over a lane provider that fails ONE \
+                 lane at a time, all ten in turn, each required to turn the \
+                 verdict red on its own — plus a clean sweep proving the verb is \
+                 not stuck red and asks for every lane once in order, and that \
+                 the trend lane receives the real lanes_ok rather than a \
+                 constant. What this catches is the vacuity a component test \
+                 cannot: a lane computed and then DROPPED (`ok &= f()` slipping \
+                 to `f();`), which makes the gate green by not listening. The \
+                 lane VALUES are proven separately by perf.rs's own decision \
+                 tests (compare_boundary_is_inclusive_pass, keyed_compare_fails_only_\
+                 the_collapsed_metric, trend_same_box_regression_trips_and_other_\
+                 boxes_do_not); this pins the wiring between them. NOT COVERED: \
+                 that the live measurement bindings inside LivePerfLanes select \
+                 the right corpora — that still needs a fixture workspace and a \
+                 toolchain compile.",
+        calls: "gate_perf_with",
+        verb_level: true,
     },
     RedFixture {
         gate: "lint",
-        proof: RedProof::Fixture {
-            test: "every_lint_lane_can_turn_the_verb_red",
-            file: "crates/xtask/src/gate.rs",
-            drives: "the VERB: gate_lint_with() over a lane provider that gives ONE \
-                     lane at a time a FINDING (tippy / trustfmt / guards), each \
-                     required to turn the verdict red on its own, plus a clean sweep \
-                     pinning order and arity. The NO-VERDICT half is \
-                     every_not_run_lane_blocks_the_verdict, which drives the same verb \
-                     with one lane NOT RUN and requires EACH to block on its own — it \
-                     replaced a fixture that required both answers of the old \
-                     LintLane::not_run_blocks, an exemption removed when the fmt lane \
-                     was armed; only_an_explicit_no_fmt_lets_the_fmt_lane_sit_out \
-                     pins that the surviving non-blocking path is the FLAG and \
-                     nothing else. The fail-closed branches are driven for real by \
-                     an_absent_toolchain_fails_each_lint_lane_closed_on_its_own, which \
-                     runs LiveLintLanes against a stage2 dir holding neither \
-                     targo-tippy nor targo-fmt and requires each lane to answer NotRun \
-                     SEPARATELY — an earlier fixture asserted only their conjunction, \
-                     which left any single arm free to stop failing closed unnoticed \
-                     — and by \
-                     the_armed_fmt_lane_separates_drift_from_a_toolchain_that_never_looked, \
-                     which mutates a stub targo-fmt through absent / drift-on-stdout / \
-                     error-on-stderr / clean, so the ARMED lane is proven able to go \
-                     red AND proven not to go red for the wrong reason. SCOPE NOTE: that \
-                     last fixture drives fmt_workspace_pass(), i.e. PASS ONE of the fmt \
-                     lane only. Pass two — the trustfmt sweep over the files \
-                     `targo-fmt --all` cannot reach — has its own pair, \
-                     a_planted_include_only_source_reds_the_fmt_sweep_and_greens_when_fixed \
-                     (a scratch git tree whose sole offender is `include!`d, required RED \
-                     and then GREEN on the repair alone) and \
-                     the_fmt_sweep_is_not_run_without_a_trustfmt (its own fail-closed \
-                     branch, reached directly because pass one returns before it). NOT \
-                     COVERED: that a file `targo-fmt --all` DOES reach agrees with its \
-                     per-file formatting — that is a measurement (zero disagreements over \
-                     1,752 files on 2026-08-31), not a fixture.",
-            calls: "gate_lint_with",
-            verb_level: true,
-        },
+        test: "every_lint_lane_can_turn_the_verb_red",
+        file: "crates/xtask/src/gate.rs",
+        drives: "the VERB: gate_lint_with() over a lane provider that gives ONE \
+                 lane at a time a FINDING (tippy / trustfmt / guards), each \
+                 required to turn the verdict red on its own, plus a clean sweep \
+                 pinning order and arity. The NO-VERDICT half is \
+                 every_not_run_lane_blocks_the_verdict, which drives the same verb \
+                 with one lane NOT RUN and requires EACH to block on its own — it \
+                 replaced a fixture that required both answers of the old \
+                 LintLane::not_run_blocks, an exemption removed when the fmt lane \
+                 was armed; only_an_explicit_no_fmt_lets_the_fmt_lane_sit_out \
+                 pins that the surviving non-blocking path is the FLAG and \
+                 nothing else. The fail-closed branches are driven for real by \
+                 an_absent_toolchain_fails_each_lint_lane_closed_on_its_own, which \
+                 runs LiveLintLanes against a stage2 dir holding neither \
+                 targo-tippy nor targo-fmt and requires each lane to answer NotRun \
+                 SEPARATELY — an earlier fixture asserted only their conjunction, \
+                 which left any single arm free to stop failing closed unnoticed \
+                 — and by \
+                 the_armed_fmt_lane_separates_drift_from_a_toolchain_that_never_looked, \
+                 which mutates a stub targo-fmt through absent / drift-on-stdout / \
+                 error-on-stderr / clean, so the ARMED lane is proven able to go \
+                 red AND proven not to go red for the wrong reason. SCOPE NOTE: that \
+                 last fixture drives fmt_workspace_pass(), i.e. PASS ONE of the fmt \
+                 lane only. Pass two — the trustfmt sweep over the files \
+                 `targo-fmt --all` cannot reach — has its own pair, \
+                 a_planted_include_only_source_reds_the_fmt_sweep_and_greens_when_fixed \
+                 (a scratch git tree whose sole offender is `include!`d, required RED \
+                 and then GREEN on the repair alone) and \
+                 the_fmt_sweep_is_not_run_without_a_trustfmt (its own fail-closed \
+                 branch, reached directly because pass one returns before it). NOT \
+                 COVERED: that a file `targo-fmt --all` DOES reach agrees with its \
+                 per-file formatting — that is a measurement (zero disagreements over \
+                 1,752 files on 2026-08-31), not a fixture.",
+        calls: "gate_lint_with",
+        verb_level: true,
     },
 ];
 
 /// Run the non-vacuity obligation over the live tree and print its verdict —
-/// including, on success, the HONEST SCORE (how many roster gates are actually
-/// proven red-capable, and which are registered gaps), so the word GREEN is
-/// never read without it. Returns `false` if the obligation is violated.
+/// including, on success, the HONEST SCORE (how many roster gates are proven red
+/// at the verb, and which only at a component), so the word GREEN is never read
+/// without it. Returns `false` if the obligation is violated.
 fn report_non_vacuity() -> bool {
     let root = workspace_root();
     let violations = non_vacuity_violations(&roster_names(), NON_VACUITY_REGISTRY, &|rel| {
         std::fs::read_to_string(root.join(rel)).ok()
     });
-    let gaps: Vec<&str> = NON_VACUITY_REGISTRY
-        .iter()
-        .filter(|e| matches!(e.proof, RedProof::KnownGap { .. }))
-        .map(|e| e.gate)
-        .collect();
     if violations.is_empty() {
         // Report VERB-level and COMPONENT-level separately. Counting them together
         // said "N gates have a red fixture that plants a violation and asserts
@@ -1146,36 +1096,20 @@ fn report_non_vacuity() -> bool {
         // corrected this morning. The score sits next to GREEN; it has to be exact.
         let component: Vec<&str> = NON_VACUITY_REGISTRY
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.proof,
-                    RedProof::Fixture {
-                        verb_level: false,
-                        ..
-                    }
-                )
-            })
+            .filter(|e| !e.verb_level)
             .map(|e| e.gate)
             .collect();
-        let verb = ALL_ROSTER.len() - gaps.len() - component.len();
         eprintln!(
             "\n=== non-vacuity: {}/{} roster gate(s) proven red at the VERB; \
-             {} at a COMPONENT only; {} never shown to fail ===",
-            verb,
+             {} at a COMPONENT only ===",
+            ALL_ROSTER.len() - component.len(),
             ALL_ROSTER.len(),
             component.len(),
-            gaps.len()
         );
         for c in &component {
             eprintln!(
                 "  COMPONENT ONLY: `{c}`'s fixture drives part of the verb, not the verb — \
                  the verb itself has not been shown to go red."
-            );
-        }
-        for gap in &gaps {
-            eprintln!(
-                "  KNOWN GAP: `{gap}` has NEVER been shown to fail — read its GREEN as unproven \
-                 (reason in NON_VACUITY_REGISTRY)."
             );
         }
         true
@@ -1191,7 +1125,7 @@ fn report_non_vacuity() -> bool {
 }
 
 /// THE MECHANICAL OBLIGATION: every [`ALL_ROSTER`] gate is paired with a red
-/// fixture or an explicit gap, and every named fixture EXISTS, is a `#[test]`,
+/// fixture, and every named fixture EXISTS, is a `#[test]`,
 /// and asserts a NEGATIVE outcome. Returns one line per violation (empty ⇒
 /// discharged).
 ///
@@ -1227,78 +1161,65 @@ fn non_vacuity_violations(
             out.push(format!(
                 "  '{gate}' is in the `all` roster with NO NON_VACUITY_REGISTRY entry — \
                  nobody has shown it can fail. Add a red-fixture test that plants a \
-                 violation and asserts FAILURE, or register an explicit KnownGap."
+                 violation and asserts FAILURE."
             ));
             continue;
         };
-        match &entry.proof {
-            RedProof::Fixture {
-                test,
-                file,
-                drives,
-                calls,
-                ..
-            } => {
-                if drives.trim().is_empty() {
+        let RedFixture {
+            test,
+            file,
+            drives,
+            calls,
+            ..
+        } = entry;
+        if drives.trim().is_empty() {
+            out.push(format!(
+                "  '{gate}': the fixture `{test}` records no `drives` scope — say \
+                 whether it drives the verb or a component"
+            ));
+        }
+        let Some(text) = read(file) else {
+            out.push(format!(
+                "  '{gate}': the fixture file {file} could not be read — the \
+                 registered proof does not exist"
+            ));
+            continue;
+        };
+        match test_fn_body(&text, test) {
+            Err(why) => out.push(format!("  '{gate}': fixture `{test}` in {file}: {why}")),
+            Ok(body) => {
+                // Comments are NOT source. Densifying the raw body let
+                // `// we used to assert!(!ok) here` satisfy the negative-
+                // assertion check — a fixture proved by its own commentary.
+                let code: String = body
+                    .lines()
+                    .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // Whitespace-insensitive: the formatter, not the author,
+                // decides whether `assert!(` and `!ok` share a line.
+                let dense: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+                if !dense.contains("assert!(!") {
                     out.push(format!(
-                        "  '{gate}': the fixture `{test}` records no `drives` scope — say \
-                         whether it drives the verb or a component"
+                        "  '{gate}': fixture `{test}` in {file} contains no NEGATIVE \
+                         assertion (`assert!(!…)`) — a red fixture must assert the \
+                         gate FAILS, not that it passes"
                     ));
                 }
-                let Some(text) = read(file) else {
+                // BIND THE FIXTURE TO THE GATE. Without this the obligation
+                // is satisfied by any correctly-named `#[test]` containing a
+                // negative assertion — `assert!(!false);` scored as proof.
+                // A substring cannot prove the call is REACHED, but it does
+                // stop a fixture that never mentions the gate from claiming it.
+                if !dense.contains(
+                    &calls
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect::<String>(),
+                ) {
                     out.push(format!(
-                        "  '{gate}': the fixture file {file} could not be read — the \
-                         registered proof does not exist"
-                    ));
-                    continue;
-                };
-                match test_fn_body(&text, test) {
-                    Err(why) => out.push(format!("  '{gate}': fixture `{test}` in {file}: {why}")),
-                    Ok(body) => {
-                        // Comments are NOT source. Densifying the raw body let
-                        // `// we used to assert!(!ok) here` satisfy the negative-
-                        // assertion check — a fixture proved by its own commentary.
-                        let code: String = body
-                            .lines()
-                            .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        // Whitespace-insensitive: the formatter, not the author,
-                        // decides whether `assert!(` and `!ok` share a line.
-                        let dense: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-                        if !dense.contains("assert!(!") {
-                            out.push(format!(
-                                "  '{gate}': fixture `{test}` in {file} contains no NEGATIVE \
-                                 assertion (`assert!(!…)`) — a red fixture must assert the \
-                                 gate FAILS, not that it passes"
-                            ));
-                        }
-                        // BIND THE FIXTURE TO THE GATE. Without this the obligation
-                        // is satisfied by any correctly-named `#[test]` containing a
-                        // negative assertion — `assert!(!false);` scored as proof.
-                        // A substring cannot prove the call is REACHED, but it does
-                        // stop a fixture that never mentions the gate from claiming it.
-                        if !dense.contains(
-                            &calls
-                                .chars()
-                                .filter(|c| !c.is_whitespace())
-                                .collect::<String>(),
-                        ) {
-                            out.push(format!(
-                                "  '{gate}': fixture `{test}` in {file} never mentions `{calls}` \
-                                 — it cannot be a demonstration that THIS gate goes red"
-                            ));
-                        }
-                    }
-                }
-            }
-            RedProof::KnownGap { reason } => {
-                if reason.trim().len() < MIN_GAP_REASON {
-                    out.push(format!(
-                        "  '{gate}': the KnownGap reason is {} chars; a gap must carry a real \
-                         reason (>= {MIN_GAP_REASON}) saying why a fixture is infeasible and \
-                         what would close it",
-                        reason.trim().len()
+                        "  '{gate}': fixture `{test}` in {file} never mentions `{calls}` \
+                         — it cannot be a demonstration that THIS gate goes red"
                     ));
                 }
             }
@@ -1401,20 +1322,15 @@ fn impl_source_files(root: &Path, exclude_suffix: Option<&str>) -> Vec<PathBuf> 
 
 /// Does any non-test source line under `root/crates/` contain `needle`
 /// (excluding the advertise site `terminal_core.rs`)?
+///
+/// "non-test" is BOTH file-level and region-level, exactly as for `gate
+/// dormant`: a mention inside a `#[cfg(test)]` module of an ordinary source
+/// file is not an implementation witness (see [`live_source_lines`]).
 fn needle_present(root: &Path, needle: &str) -> bool {
-    for file in impl_source_files(root, Some("terminal_core.rs")) {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        // Ignore pure-comment lines so a TODO mention isn't a witness.
-        if text
-            .lines()
-            .any(|l| !l.trim_start().starts_with("//") && l.contains(needle))
-        {
-            return true;
-        }
-    }
-    false
+    impl_source_files(root, Some("terminal_core.rs"))
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .any(|text| live_source_lines(&text).any(|l| l.contains(needle)))
 }
 
 /// Count non-test source lines under `root/consumer_path` (a file OR a dir)
@@ -1451,6 +1367,16 @@ fn consumer_count(root: &Path, symbol: &str, consumer_path: &str) -> usize {
 /// The lines of ONE source file that reference `symbol` outside a comment,
 /// outside its `fn <symbol>` definition, and OUTSIDE every `#[cfg(test)]`
 /// region — that last exclusion being the one a file filter cannot make.
+fn live_reference_lines(text: &str, symbol: &str, def_marker: &str) -> usize {
+    live_source_lines(text)
+        .filter(|line| line.contains(symbol) && !line.contains(def_marker))
+        .count()
+}
+
+/// The lines of ONE source file that the shipped build compiles as code: not a
+/// `//` comment line, and outside every `#[cfg(test)]` region. The one window
+/// both `gate drift`'s witness scan and `gate dormant`'s consumer count read
+/// through, so the two cannot disagree about what "implementation" means.
 ///
 /// The window opens on a line whose trimmed form starts `#[cfg(test)]` and
 /// closes at the end of the gated item: brace depth back to zero on a line that
@@ -1459,17 +1385,17 @@ fn consumer_count(root: &Path, symbol: &str, consumer_path: &str) -> usize {
 /// equality is what keeps a wrapped signature's parameter lines out).
 ///
 /// Braces are counted lexically, literals INCLUDED, so an unbalanced `'{'` in
-/// test code over-extends the window. That direction HIDES consumers and turns
-/// `gate dormant` RED, never green, which is the safe way round for a check
-/// whose red means "this symbol has no live consumer". MEASURED on this tree:
-/// identical counts for all five registry entries, and every region except each
-/// file's trailing test module closes exactly.
-fn live_reference_lines(text: &str, symbol: &str, def_marker: &str) -> usize {
-    let mut count = 0;
+/// test code over-extends the window. That direction HIDES lines — a consumer
+/// from `gate dormant`, a witness from `gate drift` — and so turns either gate
+/// RED, never green, which is the safe way round for checks whose red means
+/// "no live code does this". MEASURED on this tree: identical dormant counts
+/// for all five registry entries, and every region except each file's trailing
+/// test module closes exactly.
+fn live_source_lines(text: &str) -> impl Iterator<Item = &str> {
     let mut depth = 0usize;
     let mut gate_indent = 0;
     let mut in_test = false;
-    for line in text.lines() {
+    text.lines().filter(move |line| {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         if !in_test && trimmed.starts_with("#[cfg(test)]") {
@@ -1478,10 +1404,7 @@ fn live_reference_lines(text: &str, symbol: &str, def_marker: &str) -> usize {
             gate_indent = indent;
         }
         if !in_test {
-            if !trimmed.starts_with("//") && line.contains(symbol) && !line.contains(def_marker) {
-                count += 1;
-            }
-            continue;
+            return !trimmed.starts_with("//");
         }
         let opens = line.matches('{').count();
         let closes = line.matches('}').count();
@@ -1492,8 +1415,8 @@ fn live_reference_lines(text: &str, symbol: &str, def_marker: &str) -> usize {
         if depth == 0 && item_ended {
             in_test = false;
         }
-    }
-    count
+        false
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,8 +2230,14 @@ fn gate_certified() -> ExitCode {
 /// `tools/verify.sh`'s driver runs, not a second copy of the same rules.
 ///
 /// It answers in the workspace's ONE order — `$TRUST_STAGE2_BIN`, the rustup
-/// `trust` toolchain, the atpkg store, PATH — always canonicalised because Trust's
-/// drivers reject a symlinked toolchain path.
+/// `trust` toolchain (below the store when it is older than the store's build:
+/// `aterm_verify::toolchain::Demoted`), the atpkg store, PATH — always
+/// canonicalised because Trust's drivers reject a symlinked toolchain path. Under
+/// the merge gate `$TRUST_STAGE2_BIN` is set whenever the gate found a `targo`:
+/// aterm-verify hands every child the directory its header names, so a verb run by
+/// a stage cannot re-discover another build mid-run. A gate that found none adds
+/// nothing (a caller's own export passes through as it came), and this walk then
+/// answers for itself.
 ///
 /// AND IT CHECKS THE PIN. A directory holding a file called `targo` is not
 /// evidence that it is the fork `rust-toolchain.toml` names; the branded rustc
@@ -3449,21 +3378,28 @@ fn parse_member_names(
 /// Split the workspace's members into the ones this cell's graph carries and the
 /// ones it does not.
 ///
-/// `--workspace --exclude …`, NOT a list of `-p` flags, and that is not a
-/// stylistic choice. Cargo re-resolves for a partial `-p` selection, and this
-/// workspace cannot be resolved for one that holds both `aterm-alloc` and
-/// `aterm-gpu`: the differential oracle pins `arrayvec = "=0.7.7"` as a dev-dep
-/// while `[patch.crates-io]` points every other consumer at the first-party
-/// 0.7.8, and the two cannot coexist in one partial resolve — measured, `error:
-/// failed to select a version for arrayvec … all possible versions conflict
-/// with previously selected packages`.
+/// `--workspace --exclude …`, NOT a list of `-p` flags, and that was not a
+/// stylistic choice. Cargo re-resolves for a partial `-p` selection, and until
+/// 2026-09-25 this workspace could not be resolved for one that held both
+/// `aterm-alloc` and `aterm-gpu`: the differential oracle pins `arrayvec =
+/// "=0.7.7"` as a dev-dep while `[patch.crates-io]` points every other consumer
+/// at the first-party 0.7.8, and the two could not coexist in one partial
+/// resolve — measured, `error: failed to select a version for arrayvec … all
+/// possible versions conflict with previously selected packages`. The cause is
+/// cargo's patch alias (a patch first reached through a crates-io edge also
+/// claims crates-io's semver slot, where the oracle already sits), and the fix
+/// is `aterm-alloc`'s dev-dependency on the shim, which activates it through its
+/// own source first — `crates/aterm-alloc/Cargo.toml` has the whole account.
+/// Both forms below now resolve; the `--exclude` form and the patched-member
+/// rule stay, because they are right on their own terms.
 ///
 /// AND `--exclude` DOES TOUCH WHAT WAS RESOLVED, which this comment used to
 /// deny. Excluding a workspace member that a `[patch.crates-io]` entry POINTS AT
-/// takes the patch out of the resolve with it, and every consumer of the patched
-/// name falls back to the registry — which reproduces the identical arrayvec
-/// conflict the `-p` form was avoided for. Measured 2026-09-18 on m17-tower,
-/// with the `mac-x64` cell's own exclude list:
+/// takes it out of the roots, so the first edge to reach it is a crates-io one —
+/// which reproduced the identical arrayvec conflict the `-p` form was avoided
+/// for (the same mechanism; it no longer fires for `arrayvec` since the shim
+/// edge above). Measured 2026-09-18 on m17-tower, with the `mac-x64` cell's own
+/// exclude list:
 ///
 /// ```text
 /// $ cargo +stable check --target x86_64-apple-darwin --all-targets --workspace \
@@ -3474,8 +3410,8 @@ fn parse_member_names(
 ///     ... which satisfies dependency `arrayvec_upstream = "=0.7.7"` … of package `aterm-alloc`
 /// ```
 ///
-/// The same command with `arrayvec` LEFT IN resolves and compiles. It is the
-/// Apple cells that trip it, because `wgpu` is in no Darwin graph while
+/// The same command with `arrayvec` LEFT IN resolved and compiled. It was the
+/// Apple cells that tripped it, because `wgpu` is in no Darwin graph while
 /// `aterm-bench` still drags it into the WORKSPACE resolve — so the patched
 /// crate is outside the cell's graph, gets excluded, and the patch goes with it.
 /// `mac-x64` was the first cell to meet it: `mac-arm` is native on the boxes
@@ -3907,9 +3843,10 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 ///
 /// AND HOW FAR "EVERY `gate all`" REACHES, because the header says it two
 /// hundred lines up and a reader of this function should not have to go and
-/// find it: `all` is MANUAL. Nothing in the tree invokes it — `.githooks/pre-push`
-/// was demoted to advisory on 2026-08-24 and `tools/verify.sh` calls the verbs
-/// [`WRAPPED_BY_VERIFY_SH`] names, not `all`. So this gate closes the hole for
+/// find it: `all` is MANUAL. Nothing in the tree invokes it — there is no git hook
+/// (the `.githooks/pre-push` that once did was deleted on 2026-09-25, by the
+/// owner's no-hooks mandate) and `tools/verify.sh` calls the verbs
+/// `WRAPPED_BY_VERIFY_SH` names, not `all`. So this gate closes the hole for
 /// anyone who types `xtask gate all`, and the automatic half is a stage in
 /// `crates/aterm-verify`'s FAST plan — a `StageId`, a `plan.rs` push and a
 /// `stages.rs` arm — at the cost measured above: +16.6 s after an edit, +1.2 s
@@ -5315,10 +5252,52 @@ fn cell_cache_root_from(
 /// belongs: `$XDG_CACHE_HOME/aterm/cells`, else `$HOME/.cache/aterm/cells`. The
 /// temp dir survives only as the last resort for a host with neither, where
 /// there is no better answer and the run is a one-shot anyway.
+///
+/// THE THIRD HAZARD: one cache shared by every checkout. The default used to be
+/// the same `<cache>/aterm/cells/<cell>` for every worktree of this repo, and
+/// cargo cannot share a target dir between two checkouts of one workspace: it
+/// hashes a member's package id RELATIVE TO THE WORKSPACE ROOT, so both write
+/// the same artifact names, while the dep-info that decides freshness lists the
+/// OTHER checkout's absolute paths — whose mtimes say nothing about this tree's
+/// edits. So a cell could read another worktree's stale metadata as fresh.
+/// MEASURED 2026-09-25, three times in one day: the dead/gui, dead/engine and
+/// dead/services reviews each ran `gate cells` red on source their tree did not
+/// have (an `aterm-sixel` `hook()` E0061, an `aterm-gui` `Metadata` E0107), and
+/// green with a private `$ATERM_CELL_TARGET_DIR`. A stale artifact can as easily
+/// turn a red cell green, which is the direction a gate may never err in. The
+/// default is now keyed by the checkout ([`checkout_cache_key`]); an explicit
+/// `$ATERM_CELL_TARGET_DIR` is the caller's own choice and is used as given.
+///
+/// THE FOURTH HAZARD, which the third's fix created: a per-checkout cache
+/// outlives its checkout. A worktree is removed, its 20-46 GB of cells stay, and
+/// nothing ever names them again — MEASURED 2026-09-25 on m7, nine orphaned
+/// checkout caches (356 GB) plus four hand-made override dirs took the disk to
+/// 100% and 20 GB free. So each checkout's cache carries a marker naming the
+/// checkout it serves, and every default-cache run sweeps the caches whose
+/// checkout is gone ([`sweep_orphaned_cell_caches`]).
 fn cell_target_dir(root: &Path, cell: &str) -> Result<PathBuf, String> {
     let dir = match std::env::var_os("ATERM_CELL_TARGET_DIR") {
         Some(v) => PathBuf::from(v).join(cell),
-        None => default_cell_cache_root().join(cell),
+        None => {
+            let cache = default_cell_cache_root();
+            let key = checkout_cache_key(root);
+            sweep_orphaned_cell_caches(&cache, &key);
+            let checkout = cache.join(&key);
+            std::fs::create_dir_all(&checkout).map_err(|e| {
+                format!(
+                    "could not create the cells cache {}: {e}",
+                    checkout.display()
+                )
+            })?;
+            let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            // Best effort: a marker that cannot be written only means this cache
+            // is never swept, which is the old behaviour, not a wrong verdict.
+            let _ = std::fs::write(
+                checkout.join(CELL_CACHE_MARKER),
+                canon.as_os_str().as_encoded_bytes(),
+            );
+            checkout.join(cell)
+        }
     };
     let inside = match (dir.canonicalize(), root.canonicalize()) {
         (Ok(d), Ok(r)) => d.starts_with(&r),
@@ -5336,6 +5315,91 @@ fn cell_target_dir(root: &Path, cell: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create the target dir {}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+/// The per-checkout directory under the default cells cache: the checkout's
+/// directory name (for a human reading the cache) and an FNV-1a hash of its
+/// canonical path (so two checkouts that share a name still differ). Stable
+/// across toolchains, unlike `DefaultHasher`, so a checkout keeps its cache.
+/// The file in a checkout's cells cache that names the checkout it serves.
+const CELL_CACHE_MARKER: &str = ".checkout";
+
+/// The flat `<cache>/<cell>` dirs of the layout before per-checkout keys
+/// (2026-09-25): the cells that existed then. A migration list, not the cell
+/// table — `tools/cross-cell-gate.tsv` stays the one roster of cells.
+const LEGACY_FLAT_CELL_DIRS: [&str; 8] = [
+    "mac-arm",
+    "mac-x64",
+    "linux",
+    "linux-arm",
+    "win",
+    "win-arm",
+    "wasm-cpu",
+    "wasm-gpu",
+];
+
+/// Remove every per-checkout cells cache under `cache` whose checkout no longer
+/// exists, and the flat `<cache>/<cell>` dirs of the layout before per-checkout
+/// keys. Never the cache named `keep`, and never a dir without a marker (it may
+/// be a cache this rule cannot account for). Best effort: a failure to read or
+/// remove leaves the cache as it was.
+fn sweep_orphaned_cell_caches(cache: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return;
+    };
+    let listed: Vec<(String, Option<PathBuf>)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| {
+            let marker = std::fs::read(e.path().join(CELL_CACHE_MARKER))
+                .ok()
+                .map(|b| PathBuf::from(String::from_utf8_lossy(&b).into_owned()));
+            (e.file_name().to_string_lossy().into_owned(), marker)
+        })
+        .collect();
+    for name in orphaned_cell_caches(&listed, keep, &LEGACY_FLAT_CELL_DIRS, |p| {
+        p.join("Cargo.toml").is_file()
+    }) {
+        let _ = std::fs::remove_dir_all(cache.join(name));
+    }
+}
+
+/// The pure decision behind [`sweep_orphaned_cell_caches`]: of the cache's
+/// entries `(name, marker)`, which to remove. A marked cache goes when its
+/// checkout is no longer a workspace (`is_checkout`); a legacy flat dir named
+/// for a cell goes; everything else, and `keep`, stays.
+fn orphaned_cell_caches<'a>(
+    entries: &'a [(String, Option<PathBuf>)],
+    keep: &str,
+    cells: &[&str],
+    is_checkout: impl Fn(&Path) -> bool,
+) -> Vec<&'a str> {
+    entries
+        .iter()
+        .filter(|(name, marker)| {
+            name != keep
+                && match marker {
+                    Some(checkout) => !is_checkout(checkout),
+                    None => cells.contains(&name.as_str()),
+                }
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
+fn checkout_cache_key(root: &Path) -> String {
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canon.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // A worktree kept in a dot-directory would otherwise hide its cache too.
+    let name = canon.file_name().map_or_else(
+        || "root".to_owned(),
+        |n| n.to_string_lossy().trim_start_matches('.').to_owned(),
+    );
+    format!("{name}-{hash:016x}")
 }
 
 /// The verdict ONE lint lane reached. THREE-valued on purpose.
@@ -5608,12 +5672,11 @@ enum LaneSelection {
     /// sources `--all` cannot reach. It needs no compiler and no build: it is
     /// the cheap half of this verb, and it exists so that running the check
     /// costs seconds rather than a whole tippy pass. That matters because
-    /// NOTHING invokes this verb automatically — `.githooks/pre-push` ran no
-    /// gate from 2026-08-24, and its 2026-09-17 successor reads the merge
-    /// contract's receipt rather than running any lane — so the only formatting
-    /// check the tree gets is `tools/verify.sh`'s Formatting stage and whatever
-    /// a human chooses to run, and a check nobody can afford is a check nobody
-    /// runs.
+    /// NOTHING else invokes this verb automatically — there is no git hook (the
+    /// `.githooks/pre-push` that once ran it was deleted on 2026-09-25) — so the
+    /// only formatting check the tree gets is `tools/verify.sh`'s Formatting
+    /// stage and whatever a human chooses to run, and a check nobody can afford
+    /// is a check nobody runs.
     FmtOnly,
 }
 
@@ -6768,12 +6831,11 @@ fn tippy_failed_members(stderr: &str) -> Vec<String> {
 /// discriminate on — an exit code alone cannot tell a finding from a lane that
 /// never ran, so the words carry what the code cannot.
 ///
-/// `.githooks/pre-push` used to grep them. Since 2026-09-17 it gates by reading
-/// the verify receipt and greps no verdict text, so no reader outside this file
-/// discriminates on these; one that starts to must quote them exactly. (A
-/// test-only checker for stale hook quotes guarded that dormant coupling until
-/// the 2026-09-24 test-audit trim removed it: it examined nothing while the
-/// hook quoted nothing.)
+/// `.githooks/pre-push` used to grep them, until 2026-09-17; the hook is deleted
+/// (2026-09-25), so no reader outside this file discriminates on these; one that
+/// starts to must quote them exactly. (A test-only checker for stale hook quotes
+/// guarded that dormant coupling until the 2026-09-24 test-audit trim removed it:
+/// it examined nothing while the hook quoted nothing.)
 const LINT_VERDICT_FAILED: &str = "gate lint: FAILED";
 const LINT_VERDICT_NO_VERDICT: &str = "gate lint: COULD NOT RUN";
 const LINT_VERDICT_GREEN: &str = "gate lint: GREEN";
@@ -6907,7 +6969,8 @@ fn gate_lint_with(lanes: &mut dyn LintLanes, selection: LaneSelection) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// G-COUNTS (computed-only proof inventory; no hand-maintained prose total)
+// G-COUNTS (computed-only proof inventory; no hand-maintained prose total;
+// every in-build proof island named where AGENTS.md lists what is verified)
 // ---------------------------------------------------------------------------
 
 /// Recompute `(harnesses, files)` over the workspace's shipping/test crates:
@@ -6955,6 +7018,39 @@ fn readme_asserts_proof_inventory(readme: &str) -> bool {
     })
 }
 
+/// The opener of a Clean proof island (`clean { … }`), spelled the only way an
+/// island can be: alone on its line, at the top of a file a `#[cfg(clean_islands)]`
+/// `mod` reads (inline, it would not lex on the upstream-stable lanes).
+fn is_clean_island_opener(line: &str) -> bool {
+    line.trim() == "clean {"
+}
+
+/// Every `crates/` file carrying a Clean proof island, `/`-separated and relative
+/// to `root`, sorted.
+///
+/// An island is the one proof the compiler discharges during an ordinary
+/// `--unverified` build — the Clean CIC kernel checks it even under
+/// `-Ztrust-verify=off` — so AGENTS.md's "What IS actually verified today,
+/// exhaustively" table must name each one. It said `in-compilation verification |
+/// nowhere` while an island was being checked in every build, because nothing
+/// compared that table with the tree.
+fn clean_island_files(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("crates"), &mut files)?;
+    let mut islands = Vec::new();
+    for file in &files {
+        if std::fs::read_to_string(file)?
+            .lines()
+            .any(is_clean_island_opener)
+        {
+            let rel = file.strip_prefix(root).unwrap_or(file);
+            islands.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    islands.sort();
+    Ok(islands)
+}
+
 fn gate_counts() -> bool {
     let (ok, log) = counts_report(&workspace_root());
     eprint!("{log}");
@@ -6963,8 +7059,9 @@ fn gate_counts() -> bool {
 
 /// `gate counts` over an arbitrary root, returning the verdict plus the
 /// transcript the verb prints. Rooted so a red fixture can plant each of the
-/// three failure conditions (empty inventory, hand-maintained README total,
-/// unreadable README) and watch the gate go red on every one.
+/// failure conditions (empty inventory, hand-maintained README total,
+/// unreadable README, a Clean island AGENTS.md does not name, unreadable
+/// AGENTS.md) and watch the gate go red on every one.
 fn counts_report(root: &Path) -> (bool, String) {
     let mut log = String::new();
     let _ = writeln!(
@@ -7008,10 +7105,50 @@ fn counts_report(root: &Path) -> (bool, String) {
         return (false, log);
     }
 
+    let islands = match clean_island_files(root) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "gate counts: FAILED — could not scan crates/ for Clean islands ({e})"
+            );
+            return (false, log);
+        }
+    };
+    let agents_path = root.join("AGENTS.md");
+    let agents = match std::fs::read_to_string(&agents_path) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "gate counts: FAILED — could not read {agents_path:?} ({e})"
+            );
+            return (false, log);
+        }
+    };
+    let unlisted: Vec<&str> = islands
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !agents.contains(path))
+        .collect();
+    if !unlisted.is_empty() {
+        let _ = writeln!(
+            log,
+            "gate counts: FAILED — Clean proof island(s) the compiler checks on every \
+             build are missing from AGENTS.md's \"What IS actually verified today, \
+             exhaustively\" table: {}. Add a row naming the file and what its theorems \
+             are about",
+            unlisted.join(", ")
+        );
+        return (false, log);
+    }
+
     let _ = writeln!(
         log,
         "gate counts: GREEN — live inventory: {harnesses} ordinary `#[kani::proof]` \
-         harnesses across {files} crate files; no hand-maintained README total"
+         harnesses across {files} crate files; no hand-maintained README total; {} \
+         Clean island file(s), each named in AGENTS.md",
+        islands.len()
     );
     (true, log)
 }
@@ -7415,6 +7552,45 @@ mod cell_cache_root_tests {
             cell_cache_root_from(None, Some(OsStr::new("relative/home")), temp),
             Path::new("/tmp/aterm-cells")
         );
+    }
+
+    /// Two checkouts of the repo never share a default cells cache (cargo reads
+    /// one's stale metadata as fresh in the other), and one checkout always
+    /// finds its own again.
+    #[test]
+    fn each_checkout_gets_its_own_default_cells_cache() {
+        let a = checkout_cache_key(Path::new("/nonexistent/one/aterm"));
+        let b = checkout_cache_key(Path::new("/nonexistent/two/aterm"));
+        assert_ne!(a, b, "two worktrees named alike must not share a cache");
+        assert!(
+            a.starts_with("aterm-") && b.starts_with("aterm-"),
+            "{a} {b}"
+        );
+        assert_eq!(a, checkout_cache_key(Path::new("/nonexistent/one/aterm")));
+        let hidden = checkout_cache_key(Path::new("/nonexistent/.aterm-wt"));
+        assert!(hidden.starts_with("aterm-wt-"), "{hidden}");
+    }
+
+    /// A checkout's cache goes with its checkout: a marked cache whose checkout
+    /// is gone is swept, a live one and the running one stay, a pre-key flat
+    /// cell dir is migrated away, and an unmarked dir nobody can account for
+    /// is left alone.
+    #[test]
+    fn a_cells_cache_whose_checkout_is_gone_is_swept() {
+        let live = PathBuf::from("/wt/live");
+        let gone = PathBuf::from("/wt/gone");
+        let entries = vec![
+            ("live-1".to_owned(), Some(live.clone())),
+            ("gone-2".to_owned(), Some(gone.clone())),
+            ("me-3".to_owned(), Some(gone.clone())),
+            ("linux".to_owned(), None),
+            ("someone-elses".to_owned(), None),
+        ];
+        let swept = orphaned_cell_caches(&entries, "me-3", &LEGACY_FLAT_CELL_DIRS, |p| p == live);
+        assert_eq!(swept, vec!["gone-2", "linux"]);
+        // Negative control: with every checkout alive nothing marked is swept.
+        let none = orphaned_cell_caches(&entries, "me-3", &[], |_| true);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// The first hazard still holds: the gate never writes into the tree it judges.
@@ -7896,7 +8072,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         assert_eq!(stub.seen, LINT_LANES, "every lane must run, once, in order");
     }
 
-    /// `--no-fmt` (the retired push gate's setting; today only a human types
+    /// `--no-fmt` (the deleted push hook's setting; today only a human types
     /// it) must SKIP the fmt lane, not run it
     /// — asserted by the lane never being asked — and must not disturb the
     /// others' verdicts.
@@ -8241,11 +8417,12 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     ///
     /// Fail-closed against the two ways this registry rots: a row for a file
     /// that was deleted or renamed (which silently protects nothing) and a row
-    /// whose "reason" is a shrug. The floor is deliberately the same shape as
-    /// [`MIN_GAP_REASON`]'s — a registry entry nobody can justify in a sentence
-    /// is a waiver with better manners.
+    /// whose "reason" is a shrug. The floor is arbitrary but enforced: "TODO" and
+    /// "hard" are not engineering judgement, and a registry entry nobody can
+    /// justify in a sentence is a waiver with better manners.
     #[test]
     fn every_fmt_sweep_exclusion_names_a_real_file_and_a_real_reason() {
+        const MIN_REASON: usize = 120;
         let root = workspace_root();
         for (path, reason) in FMT_SWEEP_EXCLUSIONS {
             assert!(
@@ -8254,9 +8431,9 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
                  fix the path"
             );
             assert!(
-                reason.trim().len() >= MIN_GAP_REASON,
+                reason.trim().len() >= MIN_REASON,
                 "the exclusion reason for {path} is {} chars; say why the file's SHAPE is \
-                 load-bearing (>= {MIN_GAP_REASON})",
+                 load-bearing (>= {MIN_REASON})",
                 reason.trim().len()
             );
         }
@@ -8470,7 +8647,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     // / synthetic RED+GREEN trees) moved WITH the implementation to
     // `crates/aterm-census` — run `cargo test -p aterm-census`.
     use super::{
-        ALL_ROSTER, DORMANCY_REGISTRY, DormantWatch, NON_VACUITY_REGISTRY, RedFixture, RedProof,
+        ALL_ROSTER, DORMANCY_REGISTRY, DormantWatch, NON_VACUITY_REGISTRY, RedFixture,
         WITNESS_REGISTRY, certified_driver, counts_report, dormant_report, drift_report,
         extract_call_string_args, fault_report, flag_was_rejected, impl_source_files,
         is_ordinary_kani_proof_attr, judge_kernel_certification, needle_present,
@@ -8808,6 +8985,69 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// G-DRIFT's witness scan is region-level, not only file-level — the same
+    /// exclusion `gate dormant` gained in [`live_reference_lines`]. Before the
+    /// scan went through [`live_source_lines`], a `#[cfg(test)]` module inside an
+    /// ORDINARY source file witnessed an advertised capability the shipped
+    /// build does not have: this fixture printed GREEN with `soft_fonts: true`
+    /// and DRCS nowhere but a unit test.
+    #[test]
+    fn a_cfg_test_only_mention_does_not_witness_a_capability() {
+        let root = fixture_root("drift-cfg-test");
+        write_file(&root, "crates/aterm-grapheme/src/lib.rs", "// grapheme\n");
+        write_file(
+            &root,
+            "crates/aterm-types/src/terminal_core.rs",
+            "pub fn aterm_capabilities() -> TerminalCapabilities {\n\
+             \x20   TerminalCapabilities {\n\
+             \x20       unicode: true,\n\
+             \x20       soft_fonts: true,\n\
+             \x20   }\n\
+             }\n",
+        );
+        // An ordinary (non-test) file whose ONLY mention of the needle is its
+        // unit-test module.
+        write_file(
+            &root,
+            "crates/aterm-core/src/terminal/handler_dcs.rs",
+            "pub fn handle_dcs() {}\n\
+             \n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   fn handle_decdld(_: &[u8]) {}\n\
+             \n\
+             \x20   #[test]\n\
+             \x20   fn t() {\n\
+             \x20       handle_decdld(b\"\");\n\
+             \x20   }\n\
+             }\n",
+        );
+        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
+        assert!(
+            !ok,
+            "a #[cfg(test)]-only `fn handle_decdld` must not witness soft_fonts:\n{log}"
+        );
+        assert!(
+            log.contains("'soft_fonts' advertised true but witness MISSING"),
+            "the diagnostic must name the capability:\n{log}"
+        );
+
+        // The mirror: the same needle on a line OUTSIDE the test region is a
+        // witness, so the RED above is the region, not the file.
+        mutate(
+            &root,
+            "crates/aterm-core/src/terminal/handler_dcs.rs",
+            "pub fn handle_dcs() {}\n",
+            "pub fn handle_dcs() {}\n\npub fn handle_decdld(_: &[u8]) {}\n",
+        );
+        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
+        assert!(
+            ok,
+            "a live `fn handle_decdld` must satisfy the gate:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// G-DORMANT, verb level, driven by the REAL registry entry over a COPY of
     /// the real consumer file: `render_cells.rs` calls `apply_bidi_reorder`
     /// exactly once (line 886 on 2026-08-01, plus one comment mention the
@@ -8907,9 +9147,10 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// G-COUNTS, verb level, all three failure conditions: an empty inventory
-    /// (the scan broke, or every harness was deleted), a README that reasserts
-    /// a hand-maintained numeric total, and an unreadable README (fail-closed).
+    /// G-COUNTS, verb level, every failure condition: an empty inventory (the
+    /// scan broke, or every harness was deleted), a README that reasserts a
+    /// hand-maintained numeric total, a Clean island AGENTS.md's verified table
+    /// does not name, and an unreadable README or AGENTS.md (fail-closed).
     #[test]
     fn an_empty_inventory_and_a_hand_maintained_total_fail_the_counts_verb() {
         let root = fixture_root("counts-red");
@@ -8923,9 +9164,11 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
             "README.md",
             "Run the computed proof-inventory gate for live totals.\n",
         );
+        write_file(&root, "AGENTS.md", "| in-compilation | nowhere |\n");
         let (ok, log) = counts_report(&root);
         assert!(ok, "the honest fixture must be GREEN first:\n{log}");
         assert!(log.contains("1 ordinary `#[kani::proof]`"), "log:\n{log}");
+        assert!(log.contains("0 Clean island file(s)"), "log:\n{log}");
 
         // (a) EMPTY INVENTORY.
         delete_lines_containing(&root, "crates/demo/src/lib.rs", "#[kani::proof]");
@@ -8954,7 +9197,38 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         );
         assert!(log.contains("hand-maintained numeric"), "log:\n{log}");
 
-        // (c) UNREADABLE README — fail closed, never a silent pass.
+        // (c) A CLEAN ISLAND AGENTS.md DOES NOT NAME — the shape that let the
+        // verified table say "nowhere" while the compiler checked an island.
+        write_file(
+            &root,
+            "README.md",
+            "Run the computed proof-inventory gate for live totals.\n",
+        );
+        let island = "crates/demo/src/island.rs";
+        write_file(
+            &root,
+            island,
+            "// a proof island\nclean {\n    theorem t : True := trivial\n}\n",
+        );
+        let (ok, log) = counts_report(&root);
+        assert!(!ok, "an island AGENTS.md does not name MUST fail:\n{log}");
+        assert!(log.contains(island), "the refusal names the file:\n{log}");
+        write_file(
+            &root,
+            "AGENTS.md",
+            &format!("| Clean proof island | `{island}` | its theorem |\n"),
+        );
+        let (ok, log) = counts_report(&root);
+        assert!(ok, "naming the island turns the gate GREEN again:\n{log}");
+        assert!(log.contains("1 Clean island file(s)"), "log:\n{log}");
+
+        // (d) UNREADABLE AGENTS.md — fail closed, never a silent pass.
+        std::fs::remove_file(root.join("AGENTS.md")).expect("remove AGENTS.md");
+        let (ok, log) = counts_report(&root);
+        assert!(!ok, "a missing AGENTS.md MUST fail the gate closed:\n{log}");
+        assert!(log.contains("could not read"), "log:\n{log}");
+
+        // (e) UNREADABLE README — fail closed, never a silent pass.
         std::fs::remove_file(root.join("README.md")).expect("remove README");
         let (ok, log) = counts_report(&root);
         assert!(!ok, "a missing README MUST fail the gate closed:\n{log}");
@@ -8969,7 +9243,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     // -----------------------------------------------------------------------
 
     #[test]
-    fn every_all_roster_gate_has_a_red_fixture_or_a_registered_known_gap() {
+    fn every_all_roster_gate_has_a_red_fixture() {
         let root = workspace_root();
         let violations = non_vacuity_violations(&roster_names(), NON_VACUITY_REGISTRY, &|rel| {
             std::fs::read_to_string(root.join(rel)).ok()
@@ -8978,26 +9252,8 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
             violations.is_empty(),
             "NON-VACUITY OBLIGATION VIOLATED — a `gate all` entry asserts more than anyone \
              has shown it verifies:\n{}\n  Fix: add a red-fixture test that plants a violation \
-             and asserts the gate FAILS, and register it in NON_VACUITY_REGISTRY — or register \
-             an explicit KnownGap with its reason.",
+             and asserts the gate FAILS, and register it in NON_VACUITY_REGISTRY.",
             violations.join("\n")
-        );
-        // Say the honest score out loud, so a reader of the test output learns
-        // how much of the roster is actually proven rather than assuming all.
-        let gaps: Vec<&str> = NON_VACUITY_REGISTRY
-            .iter()
-            .filter(|e| matches!(e.proof, RedProof::KnownGap { .. }))
-            .map(|e| e.gate)
-            .collect();
-        eprintln!(
-            "non-vacuity: {}/{} roster gates have a red fixture; KNOWN GAPS: {}",
-            ALL_ROSTER.len() - gaps.len(),
-            ALL_ROSTER.len(),
-            if gaps.is_empty() {
-                "none".to_string()
-            } else {
-                gaps.join(", ")
-            }
         );
     }
 
@@ -9012,21 +9268,16 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     #[test]
     fn the_obligation_goes_red_on_every_shape_of_missing_proof() {
         fn fixture(test: &'static str) -> RedFixture {
-            RedFixture {
-                gate: "drift",
-                proof: RedProof::Fixture {
-                    test,
-                    file: "x.rs",
-                    drives: "the verb",
-                    calls: "thing",
-                    verb_level: true,
-                },
-            }
+            fixture_for("drift", test)
         }
-        fn gap(gate: &'static str, reason: &'static str) -> RedFixture {
+        fn fixture_for(gate: &'static str, test: &'static str) -> RedFixture {
             RedFixture {
                 gate,
-                proof: RedProof::KnownGap { reason },
+                test,
+                file: "x.rs",
+                drives: "the verb",
+                calls: "thing",
+                verb_level: true,
             }
         }
         struct Row {
@@ -9088,16 +9339,9 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
                 red: Some("no NEGATIVE assertion"),
             },
             Row {
-                what: "a hand-waved gap",
-                roster: &["perf"],
-                entry: gap("perf", "hard"),
-                file: Some(GOOD_FIXTURE_FILE),
-                red: Some("must carry a real reason"),
-            },
-            Row {
                 what: "a stale entry for a gate that left the roster",
                 roster: &[],
-                entry: gap("removed", "x"),
+                entry: fixture_for("removed", "f"),
                 file: Some(GOOD_FIXTURE_FILE),
                 red: Some("NOT in the `all` roster"),
             },
@@ -9242,7 +9486,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         );
     }
 
-    /// [`WRAPPED_BY_VERIFY_SH`] is exactly the gate verbs the verify driver
+    /// `WRAPPED_BY_VERIFY_SH` is exactly the gate verbs the verify driver
     /// calls, read out of its own stage list. `cells` and `lint --fmt-only`
     /// joined the plan and two hand-typed sentences in this file did not move.
     #[test]

@@ -9,7 +9,6 @@
 //! 2. release() cannot underflow ref counts
 //! 3. add_ref uses saturating arithmetic (no overflow)
 //! 4. intern deduplicates correctly (same style → same ID)
-//! 5. compact preserves all styles with non-zero ref counts
 //!
 //! Part of extreme-performance theme: StyleTable ref-count safety.
 
@@ -248,114 +247,6 @@ fn intern_different_styles_returns_different_ids() {
 
     // Table should have 3 entries (default + a + b)
     kani::assert(table.len() == 3, "table should have 3 symbolic styles");
-}
-
-// =============================================================================
-// Intern + release + compact cycle
-// =============================================================================
-
-/// After intern → release → compact, released styles are removed
-/// but active styles are preserved, for symbolic style colors.
-///
-/// Uses `kani_intern()` + `compact_vec_only()` to avoid FxHashMap
-/// symbolic state that is intractable for CBMC.  The HashMap rebuild
-/// in production `compact()` is a deterministic function of the Vec
-/// contents — verifying the Vec compaction proves the safety properties.
-#[kani::proof]
-#[kani::unwind(5)]
-fn compact_preserves_active_removes_dead() {
-    let mut table = StyleTable::kani_stub();
-
-    // Use symbolic colors for both styles
-    let keep_r: u8 = kani::any();
-    let keep_g: u8 = kani::any();
-    let drop_r: u8 = kani::any();
-    let drop_g: u8 = kani::any();
-
-    let style_keep = Style {
-        fg: Color::new(keep_r, keep_g, 0),
-        bg: Color::DEFAULT_BG,
-        attrs: StyleAttrs::BOLD,
-    };
-    let style_drop = Style {
-        fg: Color::new(drop_r, drop_g, 1),
-        bg: Color::DEFAULT_BG,
-        attrs: StyleAttrs::ITALIC,
-    };
-
-    // Ensure styles are different (blue channel differs: 0 vs 1)
-    kani::assume(style_keep != style_drop);
-
-    let id_keep = table.kani_intern(style_keep);
-    let id_drop = table.kani_intern(style_drop);
-
-    // Release the style we want to drop
-    table.release(id_drop);
-    kani::assert(
-        table.ref_count(id_drop) == 0,
-        "dropped symbolic style should have ref count 0",
-    );
-
-    // Compact (Vec-only, skips intractable HashMap rebuild)
-    let id_map = table.compact_vec_only();
-
-    // Table should now have 2 entries (default + keep)
-    kani::assert(
-        table.len() == 2,
-        "compact should remove dead symbolic styles",
-    );
-
-    // The kept style should still be retrievable via the remapped ID
-    let new_id = id_map[id_keep.raw() as usize];
-    let retrieved = table.get(new_id);
-    kani::assert(
-        retrieved == Some(&style_keep),
-        "compact must preserve active symbolic style content",
-    );
-
-    // Default style should still be at index 0
-    kani::assert(
-        id_map[0] == StyleId::DEFAULT,
-        "compact must preserve default style at index 0",
-    );
-    kani::assert(
-        table.ref_count(StyleId::DEFAULT) >= 1,
-        "default style ref count must survive compact",
-    );
-}
-
-/// Compact with all styles active is a no-op on table size,
-/// verified with a symbolic style.
-///
-/// Uses `kani_intern()` + `compact_vec_only()` — see
-/// `compact_preserves_active_removes_dead` for rationale.
-#[kani::proof]
-#[kani::unwind(4)]
-fn compact_all_active_preserves_size() {
-    let mut table = StyleTable::kani_stub();
-
-    // Intern a style with symbolic color
-    let r: u8 = kani::any();
-    let g: u8 = kani::any();
-    let b: u8 = kani::any();
-    let style = Style {
-        fg: Color::new(r, g, b),
-        bg: Color::DEFAULT_BG,
-        attrs: StyleAttrs::empty(),
-    };
-    let id = table.kani_intern(style);
-
-    let len_before = table.len();
-    let _id_map = table.compact_vec_only();
-
-    kani::assert(
-        table.len() == len_before,
-        "compact with all active symbolic styles must not change length",
-    );
-    kani::assert(
-        table.ref_count(id) == 1,
-        "compact must not change active ref counts for symbolic style",
-    );
 }
 
 // =============================================================================

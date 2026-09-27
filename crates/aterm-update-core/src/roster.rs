@@ -32,7 +32,7 @@
 //! ```toml
 //! schema      = 1
 //! roster_seq  = 3                       # monotonic; the replay counter
-//! valid_until = "2027-02-01T00:00:00Z"  # the freshness bound
+//! valid_until = "9999-12-31T00:00:00Z"  # checked; minted as "forever"
 //!
 //! [[machine]]
 //! id       = "m3"
@@ -66,8 +66,10 @@
 //! 5. `schema > SUPPORTED_SCHEMA` ⇒ refuse rather than misread. Cheap.
 //! 6. `roster_seq` below the durable floor ⇒ [`RosterReject::Rollback`]. Cheap. THE
 //!    replay defence for a client that has already seen a newer roster.
-//! 7. `valid_until` lapsed ⇒ [`RosterReject::Stale`]. Cheap, pure. The ONLY thing that
-//!    protects a brand-new install, which has no floor yet.
+//! 7. `valid_until` lapsed ⇒ [`RosterReject::Stale`]. Cheap, pure. Still enforced, but
+//!    every roster is minted with 9999-12-31 by owner decision
+//!    (`crates/atpkg-keys/src/roster_ops.rs`), so a brand-new install, which has no
+//!    floor yet, has no replay defence at first contact; revocation is the answer.
 //! 8. the revoked and expired machines are removed from the candidate set BEFORE any
 //!    artifact crypto — a revoked machine's perfectly valid signature is never checked.
 //! 9. verify the appcast under the surviving machines. **CRYPTO #2.**
@@ -284,11 +286,12 @@ pub struct Roster {
     pub roster_seq: u64,
     /// RFC3339 freshness deadline. A lapsed roster is refused fail-closed.
     ///
-    /// This is a DIAL, not a solution, and the tradeoff belongs where it is chosen rather
-    /// than discovered: a short window bounds a stolen key's reach against FRESH installs
+    /// It was a DIAL: a short window bounds a stolen key's reach against FRESH installs
     /// (which have no `roster_seq` floor and so get nothing from the ratchet), but sends
-    /// the owner back to the paper master that often. A long one honours "touch the master
-    /// only to mint" and leaves a correspondingly long replay window. See
+    /// the owner back to the paper master that often. The owner turned it off — every
+    /// mint and revocation stamps 9999-12-31 (`crates/atpkg-keys/src/roster_ops.rs`,
+    /// decided, not defaulted) — so the gate still checks the date but never fires on a
+    /// live channel, and revocation is the only defence against a stolen key. See
     /// `docs/SIGNING-KEY-DESIGN.md`.
     pub valid_until: String,
     /// The authorized machines. `[[machine]]` on the wire.
@@ -602,18 +605,6 @@ fn rfc3339_to_unix(s: &str) -> Option<i64> {
 }
 
 impl Roster {
-    /// `valid_until` as unix seconds, or `None` for a date the strict parser refuses.
-    ///
-    /// For TRANSCRIPTS and horizon warnings, not for gating: the freshness GATE is
-    /// [`Roster::admit`], which treats an unparseable date as lapsed. This accessor
-    /// exists so a producer can say "roster valid until X (N days)" on every cut
-    /// without growing a second date parser — the silence between cuts is the only
-    /// way the 180-day lapse ever arrives as an outage instead of a chore.
-    #[must_use]
-    pub fn valid_until_unix(&self) -> Option<i64> {
-        rfc3339_to_unix(&self.valid_until)
-    }
-
     /// Serialize to the published TOML shape — the producer half, used by the minting tool
     /// so the bytes the owner signs are produced by the same type the client parses.
     ///
@@ -851,9 +842,10 @@ mod tests {
         assert_eq!(old.admit(3, NOW), Ok(()));
     }
 
-    /// FRESHNESS is the only thing a brand-new install has, since it has no floor. A lapsed
-    /// roster is refused, and an unparseable deadline is treated as lapsed — never as
-    /// absent, which would turn a typo into an unbounded window.
+    /// The freshness gate still refuses a lapsed roster (minted rosters say 9999-12-31 by
+    /// owner decision, but the format and the check are kept), and an unparseable deadline
+    /// is treated as lapsed — never as absent, which would turn a typo into an unbounded
+    /// window.
     #[test]
     fn a_lapsed_or_unreadable_valid_until_is_refused() {
         let mut r = roster();

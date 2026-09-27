@@ -55,14 +55,16 @@
 //!   `(deny file-*)` base tight enough to be meaningful also breaks a normal
 //!   `$SHELL` (dyld, `path_helper`, the user's rc, `/dev/tty`). Turning the policy
 //!   inside-out into a positive per-[`FsCapability`](crate::FsCapability) allowlist
-//!   (deny-by-default, allow the specific roots a tier needs) is an explicit
-//!   FOLLOW-UP. The audit log and [`os_sandbox_actuated`]/[`network_sandbox_actuated`]
-//!   say exactly this — network: enforced; secret-dir + private-data read/write:
-//!   enforced; general filesystem: not yet scoped.
+//!   (deny-by-default, allow the specific roots a tier needs) is PARKED
+//!   (2026-09-25, `docs/REARCH-PLAN.md` B-1): nobody is building it, and the
+//!   unwired allowlist gates were deleted. The audit log and
+//!   [`os_sandbox_actuated`]/[`network_sandbox_actuated`] say exactly this —
+//!   network: enforced; secret-dir + private-data read/write: enforced; general
+//!   filesystem: not scoped.
 //! - **Non-macOS platforms.** `sandbox-exec` is macOS-only; on other targets
 //!   [`os_sandbox_actuated`] is `false` and `Containment` falls back to the
-//!   rlimit + process-cap posture with an explicit audit line (a Linux
-//!   seccomp/Landlock lane is the follow-up there).
+//!   rlimit + process-cap posture with an explicit audit line. A Linux
+//!   seccomp/Landlock lane is PARKED (2026-09-25, `docs/REARCH-PLAN.md` B-1).
 //!
 //! The policy model's intended formal spec is a `tla/Containment.tla` model
 //! (planned, NOT yet in-tree; the in-tree checks are the Kani harnesses); see

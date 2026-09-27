@@ -98,29 +98,46 @@
 //! themselves before the queue. The herald never runs in a headless instance.
 
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
-// channel-draining stub (`spawn_delivery`), so the real-notification
-// helpers/fields are intentionally unused there.
-#![cfg_attr(
-    not(any(target_os = "macos", windows)),
-    allow(dead_code, unused_imports)
-)]
+// channel-draining stub (`spawn_delivery`), and the real-notification helpers
+// and the fields only they read are compiled out there.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(any(target_os = "macos", windows))]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 
 /// One pending notification handed from a tab's engine callback to the delivery
 /// thread. `session` is the originating tab's id (for focus-aware suppression).
-pub struct NotifyMsg {
+pub(crate) struct NotifyMsg {
     /// Originating session/tab id (matched against the active tab to suppress
-    /// self-notifications the user is already watching).
+    /// self-notifications the user is already watching). Only a host with real
+    /// delivery reads it.
+    #[cfg(any(target_os = "macos", windows, test))]
     pub session: u64,
     /// Notification title (OSC 99 carries one; OSC 9/777 do not — `None`).
+    #[cfg(any(target_os = "macos", windows, test))]
     pub title: Option<String>,
     /// Notification body.
     pub body: String,
+}
+
+impl NotifyMsg {
+    /// One notification. Off a delivery host (`spawn_delivery` there only drains
+    /// the channel) the session and title have no reader, and are dropped here.
+    pub(crate) fn new(session: u64, title: Option<String>, body: String) -> Self {
+        #[cfg(not(any(target_os = "macos", windows, test)))]
+        let _ = (session, title);
+        Self {
+            #[cfg(any(target_os = "macos", windows, test))]
+            session,
+            #[cfg(any(target_os = "macos", windows, test))]
+            title,
+            body,
+        }
+    }
 }
 
 /// Bound on the notification delivery queue, mirroring the OSC 52 clipboard
@@ -150,7 +167,7 @@ pub(crate) const fn delivery_available() -> bool {
 /// (the active-tab focused-pane id of every focused window); the thread reads it
 /// to apply focus-aware suppression.
 #[cfg(any(target_os = "macos", windows))]
-pub fn spawn_delivery(
+pub(crate) fn spawn_delivery(
     suppress: Arc<Mutex<HashSet<u64>>>,
     silent: Arc<AtomicBool>,
 ) -> SyncSender<NotifyMsg> {
@@ -182,7 +199,7 @@ pub fn spawn_delivery(
 /// workspace builds everywhere. There is no portable native notifier wired up
 /// off macOS/Windows.
 #[cfg(not(any(target_os = "macos", windows)))]
-pub fn spawn_delivery(
+pub(crate) fn spawn_delivery(
     _suppress: Arc<Mutex<HashSet<u64>>>,
     _silent: Arc<AtomicBool>,
 ) -> SyncSender<NotifyMsg> {
@@ -203,7 +220,7 @@ pub fn spawn_delivery(
 /// consent attention path and the escalation herald — are not program output
 /// and do not pass that gate; see *aterm's own notices* in the module doc.
 #[cfg(target_os = "macos")]
-pub fn deliver(title: Option<&str>, body: &str, _silent: bool) {
+pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     use std::process::{Command, Stdio};
 
     let title = title.unwrap_or("aterm");
@@ -261,7 +278,7 @@ pub fn deliver(title: Option<&str>, body: &str, _silent: bool) {
 /// delivery thread (the window has thread affinity and blocking is fine there).
 /// Best-effort: any Win32 failure is swallowed.
 #[cfg(windows)]
-pub fn deliver(title: Option<&str>, body: &str, silent: bool) {
+pub(crate) fn deliver(title: Option<&str>, body: &str, silent: bool) {
     let title = title.unwrap_or("aterm");
     // An empty `szInfo` HIDES the balloon entirely, so a title-only OSC 99
     // (body absent) promotes the title into the body slot.
@@ -272,10 +289,6 @@ pub fn deliver(title: Option<&str>, body: &str, silent: bool) {
     };
     win_balloon::deliver(title, body, silent);
 }
-
-/// Non-macOS/-Windows stub.
-#[cfg(not(any(target_os = "macos", windows)))]
-pub fn deliver(_title: Option<&str>, _body: &str, _silent: bool) {}
 
 /// Windows `NOTIFYICONDATAW.dwInfoFlags` for a normal or serious-mode alert.
 /// `0x10` is `NIIF_NOSOUND`; keeping this pure makes the serious-mode sound
@@ -586,7 +599,7 @@ mod win_balloon {
 /// a space (notifications are one-liners — control bytes carry no display value
 /// and only invite terminal/AppleScript quirks). Defined platform-independently
 /// so it is unit-tested on every target.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 fn applescript_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -608,7 +621,7 @@ fn applescript_escape(s: &str) -> String {
 /// WCHAR buffer, never an interpreter); the copy stops at `out.len() - 1` units
 /// WITHOUT splitting a surrogate pair (truncation is per `char`). Defined
 /// platform-independently so it is unit-tested on every target.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn fold_to_utf16(s: &str, out: &mut [u16]) {
     let Some(cap) = out.len().checked_sub(1) else {
         return;

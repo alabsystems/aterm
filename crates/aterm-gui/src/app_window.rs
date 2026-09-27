@@ -332,6 +332,7 @@ impl App {
     /// structural barrier: the caller must not detach documents, windows, or PTYs.
     /// The worker emits completion only after the child process group is reaped;
     /// `finish_update_handoff` then rolls back overlap and replays this exact intent.
+    #[cfg(unix)]
     pub(crate) fn defer_pending_update_handoff_teardown(
         &mut self,
         intent: crate::DeferredHandoffTeardown,
@@ -348,14 +349,7 @@ impl App {
             // cancelled. `stand_down_prelaunched_successor` shuts the gate and
             // falls back to the poke by itself.
             //
-            // UNIX ONLY, like the stand-down and the struct it takes: the only
-            // writer of `update_handoff_prelaunch` is the macOS
-            // `prelaunch_out_of_band_handoff`, so on Windows the field is `None`
-            // for the life of the process and this branch is unreachable —
-            // `HandoffPrelaunch` is `allow(dead_code)` off unix for the same
-            // reason. Left ungated, this call made the shipped Windows binary
-            // unbuildable from df183f2f9 (2026-09-21) until 2026-09-22.
-            #[cfg(unix)]
+            #[cfg(any(target_os = "macos", all(test, unix)))]
             if self.update_handoff_prelaunch.is_some() {
                 self.note_update_handoff_activity();
                 self.stand_down_prelaunched_successor(
@@ -385,6 +379,15 @@ impl App {
         true
     }
 
+    /// No overlap handoff exists off unix, so nothing is ever deferred behind one.
+    #[cfg(not(unix))]
+    pub(crate) fn defer_pending_update_handoff_teardown(
+        &mut self,
+        _intent: crate::DeferredHandoffTeardown,
+    ) -> bool {
+        false
+    }
+
     /// The frontmost logical window's state (immutable). Transitional — every
     /// caller is single-window today; later steps route by an explicit WindowId.
     pub(crate) fn front(&self) -> Option<&WindowState> {
@@ -412,10 +415,22 @@ impl App {
     /// swapped under an unchanged name is invisible here by design; the
     /// post-join mismatch log + re-store in `attach_os_window` is the
     /// self-healing net for that.
+    ///
+    /// An UNCONFIGURED font keys on the build's default primary identity where
+    /// it has one (`bundled:JetBrains Mono` on non-macOS; empty on macOS, where
+    /// the key is unchanged), so the release that changed that default reads
+    /// as a cache miss rather than early-revealing the previous default's
+    /// metrics.
     fn cell_metrics_font_key(&self) -> String {
         format!(
             "{}|lh={}",
-            self.config.font_family_request().unwrap_or_default(),
+            self.config.font_family_request().unwrap_or_else(|| {
+                aterm_render::bundled::default_primary_candidates()
+                    .first()
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string()
+            }),
             self.config.line_height_or_default(),
         )
     }
@@ -602,7 +617,7 @@ impl App {
         // `cwd_override` (RESTORE-1: the persisted first-leaf cwd) wins; otherwise
         // inherit the cwd of the (still-current) frontmost window's focused pane, so a
         // new window opens where the user is — frontmost_window is repointed to `wid`
-        // only later, in install_window_state.
+        // only later, in install_window_state_with_parent.
         let cwd = cwd_override
             .map(str::to_owned)
             .or_else(|| self.frontmost_window.and_then(|w| self.focused_pane_cwd(w)));
@@ -709,8 +724,14 @@ impl App {
         );
         self.windows.insert(wid, ws);
         self.install_window_config_assets(wid);
-        // The new window becomes frontmost (the standard "open and focus" behavior).
+        // The new window becomes frontmost (the standard "open and focus" behavior),
+        // and the GLOBAL control/notify handle follows it HERE, in the same seam that
+        // moves the front. Leaving the re-point to each caller is the swallow shape
+        // `active_handle_model` exists to catch: the control socket keeps driving
+        // the PREVIOUS window's session for the new window's whole life (Tier-1:
+        // `active_handle_conformance`).
         self.frontmost_window = Some(wid);
+        self.sync_active_session();
         // The status-item glance lists windows now, so a create moves it
         // (fingerprint-gated; runs after every structural mutation above).
         self.refresh_operator_status_item();
@@ -831,14 +852,11 @@ impl App {
             self.close_window_logical(wid);
             return None;
         }
-        // The new window is now frontmost: re-point the GLOBAL control/notify handle
-        // at its session. `install_window_state` set `frontmost_window` but does NOT
-        // sync the global handle, and the OS `Focused(true)` that would normally do so
-        // is a no-op here (its `frontmost != Some(wid)` guard is already satisfied) —
-        // so without this the control socket keeps targeting the PREVIOUS window's
-        // session for the new window's whole life. Mirrors every other new-frontmost
-        // path (Cmd-Shift-O, detach-to-new-window, open_tab_in). On the attach-failure
-        // path above, `close_window_logical` already re-synced the surviving front.
+        // `install_window_state_with_parent` already re-pointed the global handle
+        // at the new front; sync once more now that the OS surface exists, so the
+        // title nudge (which needs the window) lands immediately rather than at
+        // the first redraw. On the attach-failure path above, `close_window_logical` already
+        // re-synced the surviving front.
         self.sync_active_session();
         Some(wid)
     }
@@ -1161,7 +1179,7 @@ impl App {
         };
         // Where a window lands is otherwise invisible to everything but the eye:
         // no control verb reports a frame's screen origin, and the OS placement it
-        // replaces leaves no trace. One `$ATERM_LOG=debug` record (coordinates and
+        // replaces leaves no trace. One debug-level record (coordinates and
         // screen metrics only — never window content) makes the decision auditable.
         aterm_log::debug!(
             "window {} placed at ({x:.0},{y:.0}) pt, cascaded from ({:.0},{:.0}) — frame {:.0}x{:.0} in work area {:.0}x{:.0}+{:.0}+{:.0}",
@@ -1519,12 +1537,17 @@ impl App {
         // position is readable right here (`pending_restore` is drained later,
         // in `about_to_wait`), so it is applied pre-reveal and `resumed`'s
         // post-attach re-application degenerates to a same-place no-op.
-        #[cfg_attr(not(windows), allow(unused_mut))]
+        // The early reveal is Windows-only: everywhere else both stay `None`.
+        #[cfg(windows)]
         let mut early_reveal_size: Option<PhysicalSize<u32>> = None;
+        #[cfg(not(windows))]
+        let early_reveal_size: Option<PhysicalSize<u32>> = None;
         // The colour the early reveal erased to, for the post-join colour check
         // (the geometry check's twin). `None` on every non-early path.
-        #[cfg_attr(not(windows), allow(unused_mut))]
+        #[cfg(windows)]
         let mut early_reveal_bg: Option<u32> = None;
+        #[cfg(not(windows))]
+        let early_reveal_bg: Option<u32> = None;
         #[cfg(windows)]
         if pending_join && !defer_reveal && self.seamless_position.is_none() {
             let bootstrap_restore = self
@@ -1710,7 +1733,7 @@ impl App {
         // pixels and works in physical units throughout, so on a 2× Retina display
         // the built-in 12 px default renders at ~6 LOGICAL points — crisp but tiny.
         // The display scale factor is only knowable once the window exists, so apply
-        // it HERE: when the size is the DEFAULT (no `$ATERM_FONT_PX`, no
+        // it HERE: when the size is the DEFAULT (no `--font-px`, no
         // `config.font_px`), scale it to `round(FONT_PX × scale)`. An EXPLICIT size is
         // honored verbatim — never double-scaled.
         //
@@ -1724,7 +1747,7 @@ impl App {
         // redraw. This is the same mechanism `apply_window_scale` uses per frame, so
         // attach and steady-state agree.
         //
-        // An explicit render-scale override ($ATERM_FORCE_SCALE / --scale) wins over
+        // An explicit render-scale override (`--scale`) wins over
         // the window's real scale_factor(), driving BOTH the auto-scaled font and the
         // interior padding so a forced scale renders identically to that real DPI.
         let scale = resolve_force_scale().unwrap_or_else(|| window.scale_factor());
@@ -2077,6 +2100,9 @@ impl App {
                     } else {
                         false
                     };
+                    if present_installed {
+                        self.adopt_attached_window_focus(wid);
+                    }
                     let (attached, startup_milestones) = present_target_install_outcome(
                         present_installed,
                         crate::metrics::StartupAttachMilestones::new([
@@ -2174,6 +2200,9 @@ impl App {
         } else {
             false
         };
+        if present_installed {
+            self.adopt_attached_window_focus(wid);
+        }
         let (attached, startup_milestones) = present_target_install_outcome(
             present_installed,
             crate::metrics::StartupAttachMilestones::new([
@@ -2190,6 +2219,31 @@ impl App {
             crate::metrics::record_initial_attach_milestones(milestones);
         }
         attached
+    }
+
+    /// A newly attached window can remain behind another app without ever
+    /// receiving a focus event. Adopt the OS state before its first frame;
+    /// surfaceless/controller-owned windows keep their declared focus.
+    fn adopt_attached_window_focus(&mut self, wid: WindowId) {
+        let focused = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.os_window.as_ref())
+            .map(|window| window.has_focus());
+        self.adopt_initial_focus(wid, focused);
+    }
+
+    pub(crate) fn adopt_initial_focus(&mut self, wid: WindowId, os_focus: Option<bool>) {
+        if let Some(focused) = os_focus
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.focused != focused)
+        {
+            // Use the existing focus seam: cursor/pet/rain visibility, modifier
+            // state, notification suppression and focus reports must agree.
+            self.on_focus(wid, focused);
+        }
     }
 
     /// LINUX INITIAL-FRAME SETTLE (see [`crate::InitialFrameSettle`]): called on
@@ -2543,9 +2597,6 @@ impl App {
                 return;
             }
         }
-        if self.exits_app_when_closing(wid) && self.apply_deferred_native_update_on_clean_quit() {
-            return;
-        }
         if matches!(self.close_window_logical(wid), CloseOutcome::Exit) {
             el.exit();
         }
@@ -2827,17 +2878,33 @@ impl App {
                 return;
             }
         }
-        if self.apply_deferred_native_update_on_clean_quit() {
-            return;
-        }
         let _ = self.video_abort_app_shutdown();
         el.exit();
+    }
+
+    /// A harness's lifeline was cut (`crate::lifeline`): the process that started
+    /// this headless instance is gone. Quit the way Cmd-Q quits — a headless
+    /// process has no one to confirm with, so [`Self::on_quit_requested`] goes
+    /// straight to its barriers and `el.exit()`, and the post-loop teardown
+    /// unlinks the socket and hangs up every shell. A barrier that holds the quit
+    /// (a pending update overlap, a document still saving) is left to finish; the
+    /// watcher's backstop ends the process if the quit never comes.
+    #[cfg(unix)]
+    pub(crate) fn on_lifeline_cut(&mut self, el: &ActiveEventLoop) {
+        if !self.headless {
+            // `cli::lifeline_request` refuses the flag on a window, so this is not
+            // reached; were it, a window is a person's to close, not a harness's.
+            aterm_log::warn!("lifeline cut in a windowed instance; leaving it open");
+            return;
+        }
+        self.on_quit_requested(el);
     }
 
     /// Stateful counterpart of AppKit's bare `applicationShouldTerminate:`
     /// callback. The callback always defers the first request and posts this typed
     /// generation; only this event-loop lane may confirm, save documents, apply a
     /// deferred update, and exit.
+    #[cfg(unix)]
     pub(crate) fn on_native_terminate_requested(&mut self, el: &ActiveEventLoop, generation: u64) {
         if !crate::menu::native_termination_is_current(generation) {
             return;
@@ -2888,12 +2955,6 @@ impl App {
                 return;
             }
         }
-        // Keep AppKit's generation Pending while the asynchronous update child
-        // owns this quit. A duplicate Dock/Cmd-Q terminate must remain deferred;
-        // completing early would let AppKit kill the parked parent before Commit.
-        if self.apply_deferred_native_update_on_clean_quit() {
-            return;
-        }
         if !crate::menu::complete_native_termination(generation) {
             return;
         }
@@ -2919,9 +2980,6 @@ impl App {
             ) {
                 return;
             }
-            if self.apply_deferred_native_update_on_clean_quit() {
-                return;
-            }
             // Ordinary quit is now irreversible. Async handoff success exits via
             // `_exit` and intentionally never reaches this completion boundary.
             let _ = crate::menu::complete_current_native_termination();
@@ -2930,11 +2988,6 @@ impl App {
             return;
         }
         for window in windows {
-            if self.exits_app_when_closing(window)
-                && self.apply_deferred_native_update_on_clean_quit()
-            {
-                return;
-            }
             if matches!(self.close_window_logical(window), CloseOutcome::Exit) {
                 el.exit();
                 return;
@@ -3183,6 +3236,7 @@ impl App {
     /// Every winit call here is best-effort by contract — the WM/compositor may
     /// clamp, defer, or refuse (Wayland in particular) — and any geometry that
     /// does change flows back through the ordinary `Resized` path.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn on_window_op(
         &mut self,
         window: WindowId,
@@ -3208,9 +3262,7 @@ impl App {
                         cols,
                         echo_to_window: true,
                     },
-                    crate::input::Source::Controller {
-                        op: aterm_session::Op::WriteInput,
-                    },
+                    crate::input::Source::Controller,
                 );
             }
             return;
@@ -3268,6 +3320,7 @@ impl App {
     /// only while it still names a live one. `None` (session gone AND stamp
     /// dead) drops the operation. Split out so the routing is testable
     /// without glass.
+    #[cfg(any(target_os = "linux", test))]
     fn window_op_target(&self, session: u64, stamped: WindowId) -> Option<WindowId> {
         self.windows_with_focused_session(session)
             .first()
@@ -3392,7 +3445,6 @@ pub(crate) mod taskbar {
     /// ever index the pointers we name, so truncating the tail is sound. The unused
     /// leading slots MUST remain for correct offsets of the ones we call.
     #[repr(C)]
-    #[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
     struct ITaskbarList3Vtbl {
         query_interface:
             unsafe extern "system" fn(*mut ITaskbarList3, *const Guid, *mut *mut c_void) -> i32,
@@ -3674,7 +3726,7 @@ pub(crate) mod placement {
 
 /// HiDPI auto-scale target for [`App::attach_os_window`]: the `font_px` the
 /// default font size should render at on a display of `scale`, or `None` when the
-/// auto-scale does not apply (an EXPLICIT `$ATERM_FONT_PX`/`config.font_px` is
+/// auto-scale does not apply (an EXPLICIT `--font-px`/`config.font_px` is
 /// honored verbatim, and a 1× display keeps the built-in default). Pure and
 /// deterministic: the same `scale` always yields a bit-identical `f32`, so a
 /// caller that stored a previous target into `font_px` can compare with `==` to

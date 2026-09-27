@@ -124,7 +124,22 @@ const NOT_SPINNER: &[char] = &['⏺', '●', '⎿', '❯', '⏵', '◯'];
 /// misreading a supervisor must never make, because it types into a worker
 /// mid-turn.
 fn is_spinner_glyph(g: char) -> bool {
-    SPINNERS.contains(&g) || (!g.is_ascii() && !NOT_SPINNER.contains(&g) && !g.is_alphanumeric())
+    SPINNERS.contains(&g)
+        || (!g.is_ascii()
+            && !NOT_SPINNER.contains(&g)
+            && !is_box_drawing(g)
+            && !g.is_alphanumeric())
+}
+
+/// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …) — the
+/// layout's own strokes, never a spinner. Without this a box's `│`-led row
+/// whose words run into an ellipsis read as a spinner row, and the box's top
+/// was taken to be under it: Claude Code 2.1.281+'s rm breaker note `│
+/// Dangerous rm operation on possibly-empty variable path: ${…}/tmp (use a
+/// literal path: …)` (the vendor's own `${…}` placeholder, jF() in the
+/// binary) parsed as a box titled `│ removes /tmp)`, kind `other`.
+fn is_box_drawing(g: char) -> bool {
+    ('\u{2500}'..='\u{257F}').contains(&g)
 }
 
 /// The SHAPE of Claude Code's spinner row, whatever glyph it is cycling:
@@ -175,11 +190,6 @@ pub fn worker_phase(rows: &[String]) -> Phase {
     } else {
         Phase::Idle
     }
-}
-
-/// Any busy signal in the live zone ([`busy_signal`]), a soft one included.
-pub fn is_busy(rows: &[String]) -> bool {
-    busy_signal(rows).is_some()
 }
 
 /// Where a busy signal was read.
@@ -282,6 +292,54 @@ pub fn busy_signal(rows: &[String]) -> Option<Busy> {
                 .any(|r| footer_count(r, "monitor"))
                 .then(|| Busy::soft(Zone::Footer, "a monitor running"))
         })
+}
+
+/// The rules of [`busy_signal`] that are the agent's OWN BACKGROUND WORK
+/// with its turn over — a dynamic workflow, a background agent or other
+/// background task it waits for, a shell or a monitor it left running, a
+/// workflow's progress line — never a live turn's (a spinner, `esc to
+/// interrupt`, `Still working`, a foreground command's `ctrl+b to run in
+/// background`).
+const BACKGROUND_RULES: &[&str] = &[
+    "waiting for a dynamic workflow",
+    "waiting for a background agent",
+    "waiting for background work",
+    "a shell still running",
+    "a shell running",
+    "a workflow running",
+    "a monitor still running",
+    "a monitor running",
+];
+
+/// WHAT KEEPS THIS SCREEN BUSY IS THE AGENT'S OWN BACKGROUND WORK, AND
+/// NOTHING ELSE: the composer frame is drawn, and the busy signal it carries
+/// ([`busy_signal`], read from the live zone) is one of [`BACKGROUND_RULES`]
+/// — the turn ended (`✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still
+/// running`, [`fixtures`]' `wait_bg4.out`) or the agent waits on work it
+/// started (`✻ Waiting for 1 dynamic workflow to finish`, `wait_bg.out`).
+/// `Some(the rule)`, `None` for a live turn (`wait_bg2.out`: a spinner over
+/// the same workflow's progress line), an idle screen, or one with no frame.
+/// A natural break for a host's word that interrupts the orchestration once
+/// (the live upgrade's notice); never one where anything may be ended.
+///
+/// Nor one where a turn has just BEGUN: a message submitted under the status
+/// row is drawn there (`❯ …`) a frame before the spinner of the turn it
+/// began, and until that spinner comes the waiting row is still the status
+/// row. Read as a break, the notice's last look before typing passed it and
+/// the notice landed in the new turn (the gaps3 review, 2026-09-26, measured
+/// from `wait_bg2.out` with its spinner not yet drawn).
+#[must_use]
+pub fn background_wait(rows: &[String]) -> Option<&'static str> {
+    let frame = composer_frame(rows)?;
+    let block = status_block(rows, frame.top);
+    if rows[block.from..frame.top]
+        .iter()
+        .any(|r| r.starts_with('❯'))
+    {
+        return None;
+    }
+    let busy = busy_signal(rows)?;
+    BACKGROUND_RULES.contains(&busy.rule).then_some(busy.rule)
 }
 
 /// Which busy signal `row` carries, if any (named for the CLI's diagnostics).
@@ -469,6 +527,20 @@ pub(crate) fn composer_frame(rows: &[String]) -> Option<Frame> {
 /// box covers the screen, and the whole-screen rules apply.
 pub fn has_composer_frame(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
+}
+
+/// The index of the composer's BOTTOM rule, when the frame is on the screen —
+/// for aterm's footer (`aterm_agent::harness::footer`), which paints over the
+/// mode row that sits below it and must not look for one anywhere else.
+pub fn composer_bottom(rows: &[String]) -> Option<usize> {
+    composer_frame(rows).map(|f| f.bottom)
+}
+
+/// Both composer rules, `(top, bottom)`, when the frame is on the screen —
+/// for aterm's lights (`aterm_agent::harness::lights`), which read the tags
+/// Claude Code draws INTO the top rule (`──── <tag> ↯ ─`).
+pub fn composer_rules(rows: &[String]) -> Option<(usize, usize)> {
+    composer_frame(rows).map(|f| (f.top, f.bottom))
 }
 
 /// The index of the composer's top rule, when the frame is on the screen —
@@ -738,7 +810,7 @@ fn is_status_row(row: &str) -> bool {
 
 /// The first non-space column of a right-aligned hint: transcript rows start
 /// at 0, 2, 4 or 5, and Claude Code parks its hints against the right edge.
-const HINT_COLUMN: usize = 20;
+pub(crate) const HINT_COLUMN: usize = 20;
 
 pub(crate) fn leading_spaces(row: &str) -> usize {
     row.chars().take_while(|c| c.is_whitespace()).count()
@@ -1122,6 +1194,35 @@ mod tests {
         let mut r = rows(body);
         r.extend(composer(footer));
         r
+    }
+
+    /// The incident of 2026-09-25 (F1): three live shapes of Claude Code
+    /// 2.1.282's question dialog — the preview form (S4-01), the Submit
+    /// (review) tab (S6-05) and a tab whose chat row has the focus — read
+    /// AUTHORITATIVE IDLE on 0.93.0 and on main: no box, and the session
+    /// stalled with nothing answered or escalated. Each is a prompt now, and
+    /// so is a dialog withheld behind a draft in the composer.
+    #[test]
+    fn the_incident_screens_no_longer_read_idle() {
+        use crate::prompt::fixtures::{
+            QUESTION_CHAT_FOCUSED, QUESTION_DEFERRED, QUESTION_PREVIEW, QUESTION_REVIEW, screen,
+        };
+        for text in [
+            QUESTION_PREVIEW,
+            QUESTION_REVIEW,
+            QUESTION_CHAT_FOCUSED,
+            QUESTION_DEFERRED,
+        ] {
+            let r = screen(text);
+            assert_eq!(worker_phase(&r), Phase::Prompt, "{r:#?}");
+            let reading = crate::reader::read(Some("claude"), &r, None);
+            assert_eq!(reading.phase, Phase::Prompt);
+            assert!(reading.phase_authoritative);
+            assert_eq!(
+                reading.prompt.map(|p| p.kind),
+                Some(crate::prompt::PromptKind::Question)
+            );
+        }
     }
 
     #[test]
@@ -1614,6 +1715,58 @@ mod tests {
         assert_eq!(signal(&r), None);
         assert_eq!(last_said_row(&r), Some("  Waiting for your call."));
         assert_eq!(worker_phase(&r), Phase::Idle);
+    }
+
+    /// THE AGENT'S OWN BACKGROUND WORK is read apart from a live turn
+    /// ([`background_wait`]): a workflow waited on after the turn and a shell
+    /// left running under a done row are background work; the same
+    /// workflow's progress line under a LIVE spinner is a turn, and an idle
+    /// screen or one with no frame is neither.
+    #[test]
+    fn background_work_after_the_turn_is_told_from_a_live_turn() {
+        let bg = waiter_capture(include_str!("fixtures/wait_bg.out"));
+        assert_eq!(background_wait(&bg), Some("waiting for a dynamic workflow"));
+        let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
+        assert_eq!(background_wait(&shell), Some("a shell still running"));
+        // NEGATIVE CONTROLS: a live spinner over the same workflow's line,
+        // an idle screen, a screen with no composer frame.
+        let live = waiter_capture(include_str!("fixtures/wait_bg2.out"));
+        assert_eq!(worker_phase(&live), Phase::Busy);
+        assert_eq!(background_wait(&live), None);
+        let idle = waiter_capture(include_str!("fixtures/wait_bg3.out"));
+        assert_eq!(background_wait(&idle), None);
+        let bare: Vec<String> = vec!["✻ Waiting for 1 dynamic workflow to finish".to_string()];
+        assert_eq!(background_wait(&bare), None);
+    }
+
+    /// A MESSAGE SUBMITTED AT A BREAK has begun a turn before its spinner is
+    /// drawn: `wait_bg2.out` a frame earlier — the manager's message drawn
+    /// under `✻ Waiting for 1 dynamic workflow to finish`, its spinner and tip
+    /// not yet — still has the waiting row as its status row, and is no break.
+    /// NEGATIVE CONTROL: the same break with nothing submitted is one.
+    #[test]
+    fn a_message_submitted_under_the_waiting_row_is_no_break() {
+        let r = waiter_capture(include_str!("fixtures/wait_bg2.out"));
+        let spinner = r
+            .iter()
+            .position(|row| row == "✶ Deliberating…")
+            .expect("the live spinner");
+        assert!(r[spinner + 1].contains("Tip:"), "{}", r[spinner + 1]);
+        let mut submitted = r.clone();
+        submitted.drain(spinner..=spinner + 1);
+        assert_eq!(
+            signal(&submitted).as_deref(),
+            Some("status row: waiting for a dynamic workflow"),
+            "the waiting row is still the status row"
+        );
+        assert_eq!(background_wait(&submitted), None);
+        let bg = waiter_capture(include_str!("fixtures/wait_bg.out"));
+        assert_eq!(background_wait(&bg), Some("waiting for a dynamic workflow"));
+        let top = composer_frame(&bg).expect("the frame").top;
+        let mut typed = bg.clone();
+        typed.insert(top, "❯ keep going".to_string());
+        typed.remove(0);
+        assert_eq!(background_wait(&typed), None, "{:?}", &typed[top - 3..=top]);
     }
 
     /// `wait_bg4.out`: the turn is done but `1 shell still running` rides on

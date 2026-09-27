@@ -10,7 +10,20 @@ use std::time::{Duration, Instant};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::rainbow_kitty::TypedClass;
 
+/// What one wrap leaves: the lower row's lit typed columns, and on the old
+/// row (carried up a row by the scroll) the flowing band's frozen fold edge
+/// and the columns still leaving in it.
+struct Wrapped {
+    columns: BTreeSet<u16>,
+    old_edge: Option<u16>,
+    old_leaving: Vec<u16>,
+}
+
 fn wrapped_columns(coalesced: bool, glyph_width: u16, boundary_class: TypedClass) -> BTreeSet<u16> {
+    wrap(coalesced, glyph_width, boundary_class).columns
+}
+
+fn wrap(coalesced: bool, glyph_width: u16, boundary_class: TypedClass) -> Wrapped {
     let geom = Geom {
         cw: 8,
         ch: 16,
@@ -78,23 +91,41 @@ fn wrapped_columns(coalesced: bool, glyph_width: u16, boundary_class: TypedClass
     glow.tick(Some((ROW, landing)), now, &cfg, geom, &mut quads);
     now += Duration::from_millis(40);
     glow.tick(Some((ROW, landing)), now, &cfg, geom, &mut quads);
-    let columns = glow
-        .v2_ribbon()
-        .expect("rainbow engine active")
+    let ribbon = glow.v2_ribbon().expect("rainbow engine active");
+    let columns = ribbon
         .cells()
         .iter()
         .filter(|cell| cell.row == ROW && cell.typing && !cell.leaving())
         .map(|cell| cell.col)
         .collect();
+    let old = ribbon
+        .cohorts()
+        .iter()
+        .find(|k| k.row == ROW - 1 && k.flow.is_some())
+        .copied();
+    let old_leaving = old.map_or_else(Vec::new, |k| {
+        ribbon
+            .cells()
+            .iter()
+            .filter(|cell| cell.cohort == k.id && cell.leaving())
+            .map(|cell| cell.col)
+            .collect()
+    });
+    let old_edge = old.and_then(|k| k.retract_col);
     let admission: Vec<_> = glow
         .admission_log()
         .map(|record| record.line(now))
         .collect();
     let tail = &admission[admission.len().saturating_sub(4)..];
     println!(
-        "coalesced={coalesced}, glyph_width={glyph_width}, lower-row columns={columns:?}, admission={tail:?}"
+        "coalesced={coalesced}, glyph_width={glyph_width}, lower-row columns={columns:?}, \
+         old edge={old_edge:?}, old leaving={old_leaving:?}, admission={tail:?}"
     );
-    columns
+    Wrapped {
+        columns,
+        old_edge,
+        old_leaving,
+    }
 }
 
 #[test]
@@ -127,4 +158,31 @@ fn the_space_class_is_required_to_relocate_the_word() {
         "plain Glyph cannot invent a word boundary"
     );
     assert!(plain.contains(&3), "the new key itself still lights");
+}
+
+/// **THE OLD ROW FLOWS INTO THE LAST CELL THE WRAP KEPT** (2026-09-25, the
+/// review of the drift). On the tick after the wrap the old row — carried
+/// up a row by the scroll — freezes its fold edge while the moved Space and
+/// glyph are still leaving in its own cohort, and the edge is the last
+/// prefix cell (`76 − width`), not the vacated columns' end at 77
+/// (`Ribbon::flow_target`): a drift toward 77 would slide light over
+/// columns the text has left. RED with `!c.leaving()` removed from its
+/// filter.
+#[test]
+fn the_old_row_flows_into_the_last_cell_the_wrap_kept() {
+    for (coalesced, width) in [(false, 1u16), (true, 1), (true, 2)] {
+        let w = wrap(coalesced, width, TypedClass::Space);
+        let kept_end = 76 - width;
+        assert!(
+            w.old_leaving.iter().any(|&col| col > kept_end),
+            "coalesced={coalesced} width={width}: the fixture's point — the vacated cells are \
+             still leaving in the flowing band: {:?}",
+            w.old_leaving
+        );
+        assert_eq!(
+            w.old_edge,
+            Some(kept_end),
+            "coalesced={coalesced} width={width}: the old row flows into its kept end"
+        );
+    }
 }

@@ -142,12 +142,12 @@ fn note_pinned_chain_open() {
     PINNED_CHAIN_OPEN_COUNT.set(PINNED_CHAIN_OPEN_COUNT.get() + 1);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn reset_pinned_chain_open_count() {
     PINNED_CHAIN_OPEN_COUNT.set(0);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn pinned_chain_open_count() -> usize {
     PINNED_CHAIN_OPEN_COUNT.get()
 }
@@ -2170,22 +2170,6 @@ mod imp {
             probe_regular_file(&self.path.join(name)).is_ok()
         }
 
-        #[cfg(test)]
-        pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
-            self.validate_path_identity()?;
-            let mut names = Vec::with_capacity(limit.min(256));
-            for entry in std::fs::read_dir(&self.path)? {
-                if names.len() == limit {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "artifact directory exceeded its entry bound",
-                    ));
-                }
-                names.push(entry?.file_name());
-            }
-            Ok(names)
-        }
-
         pub(crate) fn names_up_to(&self, limit: usize) -> io::Result<Vec<OsString>> {
             self.validate_path_identity()?;
             let mut names = Vec::with_capacity(limit.min(256));
@@ -3253,16 +3237,26 @@ mod tests {
         // SAFETY: `path` is NUL-terminated and points to an absent path.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let pinned = PinnedDir::open(&root).unwrap();
-        let started = std::time::Instant::now();
-        assert!(
-            pinned
-                .write_private(std::ffi::OsStr::new("shot.png"), b"replace")
-                .is_err()
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "O_NONBLOCK must make a writerless FIFO fail promptly"
-        );
+        // A LIVENESS CHECK, NOT A STOPWATCH (the load-sensitive test audit of
+        // 2026-09-27). Losing O_NONBLOCK does not make this open slow — it makes
+        // it block until a writer appears, which here is never. So the call runs
+        // on a helper and the answer is awaited for 30 s: any finite bound
+        // catches that regression (and reports it, where the old inline call
+        // would have hung the suite before its 1 s assertion was reached), while
+        // a test thread kept off the CPU for a second no longer fails a correct
+        // tree. The same shape as `app_documents`' `REFUSES_WITHOUT_BLOCKING`.
+        let (answered, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answered.send(
+                pinned
+                    .write_private(std::ffi::OsStr::new("shot.png"), b"replace")
+                    .is_err(),
+            );
+        });
+        let refused = answer
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("O_NONBLOCK must make a writerless FIFO fail rather than block");
+        assert!(refused, "a FIFO is not a regular file to replace");
 
         let _ = std::fs::remove_dir_all(root);
     }

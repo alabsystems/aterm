@@ -10,7 +10,6 @@ repository.workspace = true
 description = "Smart semantic selection and text selection state machines for terminal text"
 
 [dependencies]
-aterm-ffi-types = { workspace = true }
 aterm-grapheme = { workspace = true }
 aterm-types = { workspace = true }
 # The first-party regular-expression engine (bounded Pike VM). Selection rules

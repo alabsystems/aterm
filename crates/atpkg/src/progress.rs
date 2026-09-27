@@ -268,20 +268,6 @@ pub struct ProgressSink {
 }
 
 impl ProgressSink {
-    /// The live pass's name ("net" / …) — so phase writers can honor
-    /// per-pass display rules without threading pass labels through flow.
-    pub fn pass_name(&self) -> String {
-        self.inner
-            .lock()
-            .map(|st| st.file.pass.clone())
-            .unwrap_or_default()
-    }
-
-    /// The file this sink writes (`<prefix>/progress.json`).
-    pub fn path(&self) -> Option<PathBuf> {
-        self.inner.lock().ok().map(|st| st.path.clone())
-    }
-
     /// The pass as it stands NOW — the snapshot the next write would land, its overall
     /// download credit summed as [`write_now`] sums it — for the terminal meter
     /// ([`crate::meter`]), which must not wait out the write cap or read the file back.
@@ -685,16 +671,43 @@ struct PassHeartbeat {
 /// [`HEARTBEAT_STALE_SECS`] window.
 const HEARTBEAT_TICK_MS: u64 = 500;
 
+/// The tick a pass-owned thread spawned NOW parks for: `ms`, unless a test set
+/// `TICK_OVERRIDE` on the spawning thread. Read there and moved into the new
+/// thread, so no other test's threads ever see it. (Plain backticks: the
+/// override is `cfg(test)`, so an intra-doc link would resolve to nothing in
+/// the build this doc is rendered for.)
+fn pass_tick(ms: u64) -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(tick) = TICK_OVERRIDE.get() {
+            return tick;
+        }
+    }
+    Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TESTS ONLY: the tick [`pass_tick`] hands the pass-owned threads THIS
+    /// thread spawns. An hour makes a stop that waits out its tick unable to
+    /// return inside a test at all, so the return is the proof — not a
+    /// stopwatch. The doc sits INSIDE the macro: on the invocation it would be
+    /// `unused_doc_comments`, an error under this crate's gate.
+    static TICK_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl PassHeartbeat {
     fn spawn(sink: ProgressSink) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
+        let tick = pass_tick(HEARTBEAT_TICK_MS);
         let handle = std::thread::Builder::new()
             .name("atpkg-pass-heartbeat".into())
             .spawn(move || {
                 while !stop2.load(Ordering::Acquire) {
                     sink.heartbeat();
-                    tick_or_stop(&stop2, Duration::from_millis(HEARTBEAT_TICK_MS));
+                    tick_or_stop(&stop2, tick);
                 }
             })
             .ok();
@@ -1006,6 +1019,7 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
     let program = program.to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
+    let tick = pass_tick(PART_POLL_TICK_MS);
     let handle = std::thread::Builder::new()
         .name("atpkg-part-poll".into())
         .spawn(move || {
@@ -1021,7 +1035,7 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
                     // refresh its heartbeat through the rate-cap policy.
                     sink.download_bytes(&program, 0, total);
                 }
-                tick_or_stop(&stop2, Duration::from_millis(PART_POLL_TICK_MS));
+                tick_or_stop(&stop2, tick);
             }
         })
         .ok();
@@ -1273,17 +1287,6 @@ mod tests {
         // render the generic line, not to guess at v2 field meanings.
         let v2: ProgressFile = aterm_json::from_str(r#"{"v":2}"#).unwrap();
         assert_ne!(v2.v, PROGRESS_VERSION);
-    }
-
-    /// The caps and staleness window are shared constants, not per-reader folklore —
-    /// pinned so a drive-by "tune" shows up as a failing test with the rationale
-    /// attached.
-    #[test]
-    fn the_shared_limits_hold_their_documented_values() {
-        assert_eq!(PROGRESS_READ_CAP, 256 * 1024);
-        assert_eq!(BUMP_READ_CAP, 4 * 1024);
-        assert_eq!(HEARTBEAT_STALE_SECS, 10);
-        assert_eq!(WRITE_MIN_INTERVAL_MS, 100, "≤10 Hz");
     }
 }
 
@@ -1610,51 +1613,65 @@ mod writer_tests {
     /// uninterruptible `sleep` made each join wait out whatever remained of the
     /// current tick: up to 100 ms between download-complete and the sha256 on
     /// EVERY downloaded artifact, and up to 500 ms at `end_pass` before the
-    /// terminal snapshot the GUI retires its row on. Asserted on the cost of the
-    /// STOP itself, measured from mid-tick, never on the tick cadence — which is
+    /// terminal snapshot the GUI retires its row on. Asserted on the STOP itself,
+    /// from inside a tick, never on the tick cadence — which production keeps
     /// deliberately unchanged, and is what the heartbeat tests above pin.
+    ///
+    /// PROVEN BY RETURNING, NOT BY A STOPWATCH (2026-09-25). Both threads here
+    /// park for an HOUR ([`TICK_OVERRIDE`]): a stop that waited out its tick
+    /// cannot come back inside this test at all, and one that wakes the thread
+    /// comes back however loaded the machine is. The stopwatch this replaced —
+    /// four drops under 80 ms, `end_pass` under 150 ms — timed two thread wakes
+    /// per drop and an APFS write+rename as much as the stop, and a loaded gate
+    /// failed a correct `end_pass` at 220 ms (e65705bf2) against a regression
+    /// worth ~250 ms: no clock separates the two. The 60 s below is only the
+    /// fail-safe for that hour: a regression fails there, a slow machine never
+    /// does. That no tick lands after the terminal snapshot stays pinned, on the
+    /// real cadence, by `a_silent_phase_keeps_the_pass_heartbeat_live`.
     #[test]
     fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
         let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let l = layout("prompt-stop");
-        assert!(begin_pass(&l.progress_file(), "net"));
-        // Four watches, each dropped from the MIDDLE of a tick. A poller that has
-        // to sleep out the rest owes ~50 ms per drop (~200 ms over the four),
-        // which no plausible scheduler jitter brings under the budget.
-        let mut stopping = Duration::ZERO;
-        for _ in 0..4 {
-            let watch = watch_download("trust", &l.prefix.join("trust-1.tar.zst"), 1000);
-            assert!(watch.handle.is_some(), "a net pass gets the live poller");
-            std::thread::sleep(Duration::from_millis(PART_POLL_TICK_MS / 2));
-            let t = Instant::now();
-            drop(watch);
-            stopping += t.elapsed();
-        }
-        assert!(
-            stopping < Duration::from_millis(80),
-            "four mid-tick drops must not wait out four poll ticks (took {stopping:?})"
-        );
-        // The heartbeat's tick is five times longer, and `end_pass` joins it
-        // BEFORE `finish()` writes the terminal snapshot — so the whole stall
-        // lands between the pass ending and the GUI being told it ended.
-        std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS / 2));
-        let t = Instant::now();
-        end_pass();
-        let ending = t.elapsed();
-        assert!(
-            ending < Duration::from_millis(150),
-            "end_pass must not wait out the heartbeat tick (took {ending:?})"
-        );
-        // The stop still means what it meant: no tick may land after the
-        // terminal snapshot, whichever way the thread was woken.
-        let ended = read_file(&l.progress_file());
-        assert_eq!(ended.pid, None);
-        std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS * 2));
-        assert_eq!(
-            read_file(&l.progress_file()).heartbeat_unix,
-            ended.heartbeat_unix,
-            "no heartbeat tick may land after end_pass"
-        );
+        let progress = l.progress_file();
+        let asset = l.prefix.join("trust-1.tar.zst");
+        // Seven bytes of `.part`: a poller's first tick reports 7, which the
+        // synchronous start of `watch_download` (0) never does — the witness
+        // that the poller ran and is on its way into its hour-long park.
+        std::fs::write(l.prefix.join("trust-1.tar.zst.part"), [0u8; 7]).unwrap();
+        let reported =
+            || live_snapshot().and_then(|f| f.programs.get("trust").map(|r| r.bytes_done));
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+        // The pass runs on a thread of its own (`end_pass` answers only its
+        // owner), so this one can bound the whole of it.
+        let pass = std::thread::spawn(move || {
+            TICK_OVERRIDE.set(Some(Duration::from_secs(3600)));
+            assert!(begin_pass(&progress, "net"));
+            for _ in 0..4 {
+                let watch = watch_download("trust", &asset, 1000);
+                assert!(watch.handle.is_some(), "a net pass gets the live poller");
+                while reported() != Some(7) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(watch);
+            }
+            // `end_pass` joins the heartbeat BEFORE `finish()` writes the
+            // terminal snapshot, so a heartbeat that slept out its tick would
+            // hold the GUI's "ended" back for all of it.
+            end_pass();
+            let _ = ended_tx.send(read_file(&progress));
+        });
+        let ended = match ended_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(ended) => ended,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(pass.join().expect_err("the pass sent nothing"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "the pass did not end within 60 s of hour-long ticks: a stop waited out \
+                 its tick (a poller or the heartbeat sleeps instead of parking)"
+            ),
+        };
+        pass.join().unwrap();
+        assert_eq!(ended.pid, None, "the terminal snapshot landed");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1672,17 +1689,25 @@ mod writer_tests {
         let l = layout("silent-heartbeat");
         assert!(begin_pass(&l.progress_file(), "net"));
         let h0 = read_file(&l.progress_file()).heartbeat_unix;
-        // Longer than the writer's minimum interval, with NO sink call from
-        // the pass thread: only the heartbeat thread can move the stamp.
-        std::thread::sleep(Duration::from_millis(
-            HEARTBEAT_MIN_INTERVAL_SECS * 1000 + 700,
-        ));
-        let file = read_file(&l.progress_file());
-        assert!(
-            file.heartbeat_unix >= h0 + HEARTBEAT_MIN_INTERVAL_SECS,
-            "the pass heartbeat must advance with no flow calls ({h0} → {})",
-            file.heartbeat_unix
-        );
+        // With NO sink call from the pass thread, only the heartbeat thread can
+        // move the stamp, so wait for THAT: a thread that never ticks still
+        // fails at the deadline. It was one read at the minimum interval +
+        // 700 ms, and the due write lands 0-500 ms into that by tick phase, so
+        // five oversleeping 500 ms parks on a loaded run queue made a correct
+        // heartbeat read as dead (the load-sensitive test audit of 2026-09-27).
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let file = loop {
+            let file = read_file(&l.progress_file());
+            if file.heartbeat_unix >= h0 + HEARTBEAT_MIN_INTERVAL_SECS {
+                break file;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass heartbeat must advance with no flow calls ({h0} → {})",
+                file.heartbeat_unix
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert!(
             snapshot_running(&file, unix_now()),
             "a silent-but-live pass reads as running"

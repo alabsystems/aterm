@@ -5,22 +5,17 @@
 //! Integration test: verify mode fallback when hotswap manifest is corrupt.
 //!
 //! When the manifest's containment_mode field is corrupted or missing,
-//! `restore_containment_mode()` falls back to `init_mode_from_env(Containment)`.
+//! `restore_containment_mode()` falls back to `init_mode_from_flag(None, Containment)`.
 //! This test verifies the fail-closed fallback contract. (#5520 AC3, #5603)
 
 use aterm_containment::ContainmentMode;
 
-/// Corrupt manifest mode string falls through to env var / default.
+/// Corrupt manifest mode string falls through to the fail-closed default.
 ///
 /// This mirrors the fallback path in restore_containment_mode():
-/// parse fails → init_mode_from_env(Containment).
+/// parse fails → init_mode_from_flag(None, Containment).
 #[test]
-fn corrupt_manifest_mode_falls_back_to_env_default() {
-    // Ensure env var is NOT set (so default is used). Routed through the
-    // workspace's one lock-scoped env helper (`aterm_log::env`), never a raw
-    // `remove_var`.
-    aterm_log::env::unset("ATERM_CONTAINMENT_MODE");
-
+fn corrupt_manifest_mode_falls_back_to_the_default() {
     // Simulate corrupted manifest mode field.
     let manifest_mode: Option<String> = Some("CORRUPTED_BY_ATTACKER".to_string());
 
@@ -30,11 +25,11 @@ fn corrupt_manifest_mode_falls_back_to_env_default() {
         .and_then(|s| s.parse::<ContainmentMode>().ok());
     assert!(parsed.is_none(), "corrupted string must not parse");
 
-    // Fallback: init_mode_from_env with Containment default (fail-closed).
-    let mode = aterm_containment::init_mode_from_env(ContainmentMode::Containment)
+    // Fallback: no flag, Containment default (fail-closed).
+    let mode = aterm_containment::init_mode_from_flag(None, ContainmentMode::Containment)
         .expect("fallback init should succeed");
 
-    // With no env var set, falls back to Containment (most restrictive).
+    // Falls back to Containment (most restrictive).
     assert_eq!(mode, ContainmentMode::Containment);
     assert_eq!(
         aterm_containment::current_mode(),

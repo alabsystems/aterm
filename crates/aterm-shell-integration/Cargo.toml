@@ -15,6 +15,11 @@ local-pty = ["dep:aterm-containment"]
 
 [dependencies]
 aterm-containment = { workspace = true, optional = true }
+# First-party, dependency-free SHA-256: the NAME of the per-build script folder
+# (`prepare`'s content address, 2026-09-24). Not a security boundary — a same-user
+# writer can do anything — but a collision-free one, so two builds whose scripts
+# differ never share a folder.
+aterm-digest = { workspace = true }
 
 # THE workspace's one audited entropy surface for the capability-nonce mint
 # (`aterm_uds::rand::fill`: getentropy(2) with a bounded read_exact fallback,

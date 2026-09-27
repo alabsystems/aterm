@@ -5,7 +5,8 @@
 //! envelope. `read_frame`/`write_frame` are generic over `Read`/`Write`, so the
 //! codec is unit-testable in memory with no socket.
 
-use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
+use astream_wire::frame::{MAGIC as FRAME_MAGIC, VERSION as FRAME_VERSION};
+use astream_wire::{crc32_ieee, Frame, FrameError, HEADER_SIZE, MAX_PAYLOAD_LEN};
 use std::io::{self, Read, Write};
 
 /// Protocol version (the payload's first byte).
@@ -175,15 +176,11 @@ pub enum Response {
     /// verb's `Mark` (`Fetch` pages by offset through `next`; `Attach` and `Will`
     /// carry no cursor at all).
     ///
-    /// `resume` is not an optional trailer. It was documented as one — a `Mark` that
-    /// stopped after `head` was said to be an older broker's, decoded with `resume`
-    /// empty — but a broker built before the field existed stamps payload byte 0 with
-    /// its own `PROTO_VERSION`, and [`decode_response`] refuses the frame at that byte
-    /// long before the trailer matters. The version byte is what an older peer meets,
-    /// so a `Mark` that ends after `head` is not an older peer's: it is a current
-    /// peer's frame cut short, and it decodes as malformed like every other short body
-    /// (accepting it as `resume = ""` would report "this was the last page" for an
-    /// answer that was truncated).
+    /// `resume` is not an optional trailer. A broker that predates the field stamps
+    /// payload byte 0 with its own `PROTO_VERSION`, and [`decode_response`] refuses
+    /// the frame at that byte, so a `Mark` that ends after `head` is a current peer's
+    /// frame cut short: it decodes as malformed like every other short body (read as
+    /// `resume = ""` it would report "this was the last page" for a truncated answer).
     Mark {
         next: u64,
         head: u64,
@@ -515,11 +512,59 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
 /// and body are read by reference (no deep copy on the read path; the only copy is the
 /// one unavoidable assembly into the outgoing frame).
 pub fn encode_delivery(offset: u64, subject: &str, body: &[u8]) -> Vec<u8> {
-    let mut p = vec![PROTO_VERSION, TAG_DELIVERY];
-    p.extend_from_slice(&offset.to_le_bytes());
-    put_str(&mut p, subject);
-    put_bytes(&mut p, body);
+    let mut p = Vec::with_capacity(2 + 8 + 4 + subject.len() + 4 + body.len());
+    put_delivery(&mut p, offset, subject, body);
     p
+}
+
+fn put_delivery(p: &mut Vec<u8>, offset: u64, subject: &str, body: &[u8]) {
+    p.extend_from_slice(&[PROTO_VERSION, TAG_DELIVERY]);
+    p.extend_from_slice(&offset.to_le_bytes());
+    put_str(p, subject);
+    put_bytes(p, body);
+}
+
+/// Append one framed `Delivery` to `out`, assembled in place: the body is copied once,
+/// into `out`, instead of into a payload, then a `Frame`, then the encoded frame. A
+/// streaming verb gathers several into one buffer and writes them with one call.
+pub(crate) fn append_delivery_frame(
+    out: &mut Vec<u8>,
+    offset: u64,
+    subject: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    append_framed(out, |p| put_delivery(p, offset, subject, body))
+}
+
+/// Append `payload`, framed, to `out` (one copy). See [`append_delivery_frame`].
+pub(crate) fn append_frame(out: &mut Vec<u8>, payload: &[u8]) -> io::Result<()> {
+    append_framed(out, |p| p.extend_from_slice(payload))
+}
+
+/// Frame, in place, the payload `fill` appends to `out`: the header is reserved first
+/// and written once the payload's length and CRC are known. Byte-identical to
+/// `Frame::new(payload).encode()`. A payload over the cap leaves `out` as it was and
+/// is `InvalidData`.
+fn append_framed(out: &mut Vec<u8>, fill: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
+    let start = out.len();
+    out.resize(start + HEADER_SIZE, 0);
+    fill(out);
+    let len = out.len() - start - HEADER_SIZE;
+    let Some(len32) = u32::try_from(len).ok().filter(|_| len <= MAX_PAYLOAD_LEN) else {
+        out.truncate(start);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload exceeds cap",
+        ));
+    };
+    let crc = crc32_ieee(&out[start + HEADER_SIZE..]);
+    let hdr = &mut out[start..start + HEADER_SIZE];
+    hdr[..2].copy_from_slice(&FRAME_MAGIC);
+    hdr[2] = FRAME_VERSION;
+    hdr[3] = 0; // flags: none defined
+    hdr[4..8].copy_from_slice(&len32.to_le_bytes());
+    hdr[8..].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 /// Decode a response from a frame payload (bounds-checked; `None` on malformed).
@@ -563,44 +608,59 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
 const READ_CHUNK: usize = 64 * 1024;
 
 /// Read exactly one frame's payload from `r` (blocking). `Ok(None)` on a clean EOF
-/// (peer closed); `Err` on a malformed/oversized frame, or `UnexpectedEof` on a frame
-/// cut short. `read_exact` handles partial reads (it loops until each chunk arrives).
+/// (peer closed at a frame boundary); `Err` on a malformed/oversized frame, or
+/// `UnexpectedEof` on a frame cut short — in its header or its payload. `read_exact`
+/// handles partial reads (it loops until each chunk arrives).
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let mut hdr = [0u8; HEADER_SIZE];
-    match r.read_exact(&mut hdr) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    // The first read decides between a clean close (nothing at all) and a frame;
+    // once any header byte has arrived, a short header is a truncated frame.
+    let first = loop {
+        match r.read(&mut hdr) {
+            Ok(n) => break n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    };
+    if first == 0 {
+        return Ok(None);
+    }
+    r.read_exact(&mut hdr[first..])?;
+    // The header is judged BEFORE the payload it announces is read: a bad magic,
+    // version or flags byte, or a length over the cap, is refused on these 12 bytes.
+    // A header on its own decodes as "need more bytes" — or, announcing an empty
+    // payload, as the whole frame.
+    match Frame::decode(&hdr) {
+        Ok(None) => {}
+        Ok(Some(d)) => return Ok(Some(d.frame.payload)),
+        Err(FrameError::TooLarge) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds cap",
+            ))
+        }
+        Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt frame")),
     }
     let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
-    if len > MAX_PAYLOAD_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame exceeds cap",
-        ));
+    let crc = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    // Read straight into the payload buffer (no header copy, no second copy out).
+    let mut payload = Vec::with_capacity(len.min(READ_CHUNK));
+    while payload.len() < len {
+        let start = payload.len();
+        payload.resize(start + (len - start).min(READ_CHUNK), 0);
+        r.read_exact(&mut payload[start..])?;
     }
-    let mut full = Vec::with_capacity(HEADER_SIZE + len.min(READ_CHUNK));
-    full.extend_from_slice(&hdr);
-    let mut remaining = len;
-    while remaining > 0 {
-        let n = remaining.min(READ_CHUNK);
-        let start = full.len();
-        full.resize(start + n, 0);
-        r.read_exact(&mut full[start..])?;
-        remaining -= n;
+    if crc32_ieee(&payload) != crc {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt frame"));
     }
-    match Frame::decode(&full) {
-        Ok(Some(d)) => Ok(Some(d.frame.payload)),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt frame")),
-    }
+    Ok(Some(payload))
 }
 
-/// Frame `payload` and write it to `w` (blocking).
+/// Frame `payload` and write it to `w` (blocking), in one `write_all`.
 pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    let bytes = Frame::new(payload.to_vec())
-        .encode()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "payload exceeds cap"))?;
-    w.write_all(&bytes)
+    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+    append_frame(&mut out, payload)?;
+    w.write_all(&out)
 }
 
 #[cfg(test)]
@@ -700,6 +760,94 @@ mod tests {
         );
     }
 
+    /// Only a stream that ends exactly at a frame boundary is a clean close. One cut
+    /// short INSIDE the 12-byte header is `UnexpectedEof`, like one cut inside its
+    /// payload — a subscriber must not read a broker that died mid-header as a
+    /// stream that ended.
+    #[test]
+    fn a_frame_cut_inside_its_header_is_unexpected_eof() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, b"payload").unwrap();
+        for cut in 1..HEADER_SIZE {
+            let mut short = Trickle {
+                bytes: &wire[..cut],
+                step: 4096,
+            };
+            assert_eq!(
+                read_frame(&mut short).map_err(|e| e.kind()),
+                Err(io::ErrorKind::UnexpectedEof),
+                "header cut after {cut} bytes"
+            );
+        }
+        let mut empty = Trickle {
+            bytes: &[],
+            step: 4096,
+        };
+        assert_eq!(read_frame(&mut empty).unwrap(), None);
+    }
+
+    /// The in-place framer is byte-identical to the wire crate's `Frame::encode`, a
+    /// framed delivery to `encode_delivery` framed, and an over-cap payload is refused
+    /// leaving the buffer as it was.
+    #[test]
+    fn in_place_framing_matches_frame_encode() {
+        for payload in [&b""[..], b"x", &[7u8; 70_000]] {
+            let mut out = b"prefix".to_vec();
+            append_frame(&mut out, payload).unwrap();
+            assert_eq!(&out[..6], b"prefix");
+            assert_eq!(out[6..], Frame::new(payload.to_vec()).encode().unwrap()[..]);
+        }
+        let mut out = Vec::new();
+        append_delivery_frame(&mut out, 9, "/a/x", b"body").unwrap();
+        assert_eq!(
+            out,
+            Frame::new(encode_delivery(9, "/a/x", b"body"))
+                .encode()
+                .unwrap()
+        );
+        let mut out = b"kept".to_vec();
+        let big = vec![0u8; MAX_PAYLOAD_LEN + 1];
+        assert_eq!(
+            append_frame(&mut out, &big).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(out, b"kept");
+    }
+
+    /// A header that announces a frame the reader must refuse is refused on the header
+    /// alone: the reader never waits for (or buffers) the payload it announces.
+    #[test]
+    fn a_bad_header_is_refused_before_its_payload_is_read() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &[1u8; 32]).unwrap();
+        // Bad magic, over-cap length: only the 12 header bytes are available.
+        let mut bad_magic = wire[..HEADER_SIZE].to_vec();
+        bad_magic[0] ^= 0xFF;
+        let mut over_cap = wire[..HEADER_SIZE].to_vec();
+        over_cap[4..8].copy_from_slice(&(MAX_PAYLOAD_LEN as u32 + 1).to_le_bytes());
+        for hdr in [bad_magic, over_cap] {
+            let mut r = Trickle {
+                bytes: &hdr,
+                step: 4096,
+            };
+            assert_eq!(
+                read_frame(&mut r).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        // A flipped payload byte is still caught by the CRC.
+        let mut corrupt = wire.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut r = Trickle {
+            bytes: &corrupt,
+            step: 4096,
+        };
+        assert_eq!(
+            read_frame(&mut r).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn responses_round_trip() {
         let a = Response::PublishAck {
@@ -736,7 +884,7 @@ mod tests {
         assert_eq!(read_frame(&mut cur).unwrap(), None);
     }
 
-    /// PROTOCOL ECONOMY, PINNED (DESIGN-aterm-fabric.md R11). The whole fabric —
+    /// PROTOCOL ECONOMY, PINNED. The whole fabric —
     /// retained values, bounded reads, a last will, a proof-of-possession attach, an
     /// exactly-once inbox, request/reply, barriers and presence — rides on TWELVE
     /// request tags and FIVE response tags. This test is the budget: it enumerates
@@ -745,19 +893,12 @@ mod tests {
     /// re-interpret an old client's frames breaks the build instead.
     #[test]
     fn the_tag_budget_is_twelve_requests_and_five_responses() {
-        // The wire is versioned, and the fabric work MOVED it: `Attach` kept its tag
-        // (0x07) and its wire SHAPE (a str then a byte string) while its MEANING
-        // changed -- `{cap_filter, cap_tag}`, a bare capability presentation answering
-        // nothing, became `{grant, proof}`, where the proof is
-        // HMAC-SHA256(tag, nonce || grant) over a broker-issued nonce and the verb
-        // answers with a Mark. Same bytes, different meaning, so a v1 client's Attach
-        // would have decoded CLEANLY into the new variant on a v2 broker instead of
-        // being refused, and would then have desynchronised on the Mark it never
-        // expected. That is precisely what the version byte exists to prevent, so it
-        // moved. The byte is checked on every decode (`decode_request`,
-        // `decode_response`), which turns the silent reinterpretation into a clean
-        // refusal -- and the stored format is untouched, so no existing log is
-        // affected.
+        // Version 2: `Attach` kept its tag (0x07) and its wire SHAPE (a str then a
+        // byte string) while its MEANING changed (`{grant, proof}`, answered with a
+        // Mark), so under an unchanged version byte a version-1 Attach would decode
+        // CLEANLY into the new variant. The byte is checked on every decode, which
+        // turns that silent reinterpretation into a refusal. The stored format is
+        // unaffected.
         assert_eq!(
             PROTO_VERSION, 2,
             "PROTO_VERSION moved to 2 with Attach's redefinition"
@@ -978,11 +1119,10 @@ mod tests {
         assert_eq!(decode_request(&[9, TAG_PUBLISH]), None); // bad version
     }
 
-    /// A `Mark` that stops after `head` is MALFORMED, not an older broker's frame. The
-    /// version byte is what an older broker meets — `decode_response` refuses the whole
-    /// payload there — so the trailing-field tolerance the doc used to advertise had no
-    /// legitimate peer, and all it did was read a current peer's truncated page as
-    /// `resume = ""`, which means "the scan reached the end of the filter's range".
+    /// A `Mark` that stops after `head` is MALFORMED, not an older broker's frame: an
+    /// older broker is refused at the version byte, so tolerating the short form would
+    /// only read a current peer's truncated page as `resume = ""` — "the scan reached
+    /// the end of the filter's range".
     #[test]
     fn a_mark_truncated_after_head_is_malformed() {
         let full = encode_response(&Response::Mark {

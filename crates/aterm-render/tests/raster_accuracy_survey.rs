@@ -793,8 +793,8 @@ fn guard_chars(bytes: &'static [u8], name: &str, stride: usize) -> Vec<char> {
 /// (the 0.862 -> 0.075 tightening is ~36x the phase spread); the worst cell does
 /// not.
 ///
-/// **2. The HINTED path is unmeasured.** `hinted.rs:143` returns
-/// `HintMode::Full` when `ATERM_FONT_HINTING` is unset, so ordinary body text on
+/// **2. The HINTED path is unmeasured.** `hinted.rs` builds every renderer at
+/// `HintMode::Full` (`HintMode::initial`), so ordinary body text on
 /// linux and windows is rasterized from GRID-FITTED outlines that this survey
 /// never builds — it drives `variation.rs`'s unhinted path only. The
 /// `RASTER_PAD` grid-escape class lives entirely in that gap (see §6/§8 of the

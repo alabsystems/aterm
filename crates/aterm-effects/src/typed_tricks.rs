@@ -598,6 +598,7 @@ impl TrickListener {
 
     /// The live tentative fire, if any.
     #[must_use]
+    #[cfg(test)]
     pub fn tentative(&self) -> Option<Trick> {
         self.line.tentative
     }

@@ -26,7 +26,9 @@
 //! and `cargo test -p aterm-alloc` (this file). Both at once needs
 //! `cargo test -p arrayvec@0.7.8 -p aterm-alloc`: the oracle keeps a second
 //! `arrayvec` in the graph, and cargo tolerates the bare name only when it is
-//! the sole `-p`.
+//! the sole `-p`. `-p aterm-alloc` beside any other member — one that reaches
+//! wgpu or naga included — resolves, because this package also dev-depends on
+//! the shim (its manifest says why that is what makes it resolve).
 
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
@@ -100,6 +102,28 @@ fn oracle_is_genuinely_upstream() {
     assert_ne!(
         upstream, mine,
         "the two implementations are indistinguishable by name"
+    );
+}
+
+/// THE SHIM IS THIS CRATE'S TYPE, NOT A COPY OF IT (2026-09-25).
+/// `crates/aterm-arrayvec` — what `[patch.crates-io]` hands naga and wgpu —
+/// claims to be a pure re-export of `aterm_alloc::ArrayVec`. This is the
+/// type-level check of that claim: the function below only compiles if the two
+/// paths name ONE type. It is also why this package dev-depends on the shim;
+/// the manifest gives the other reason, the resolver one. CONTROL: the oracle
+/// is still not the shim.
+#[test]
+fn the_patched_shim_is_this_crates_arrayvec() {
+    fn same_type(v: arrayvec_shim::ArrayVec<u8, 4>) -> MyArrayVec<u8, 4> {
+        v
+    }
+    let mut v = arrayvec_shim::ArrayVec::<u8, 4>::new();
+    v.push(7);
+    assert_eq!(same_type(v).as_slice(), &[7]);
+    assert_ne!(
+        std::any::type_name::<arrayvec_shim::ArrayVec<u8, 4>>(),
+        std::any::type_name::<UpArrayVec<u8, 4>>(),
+        "the oracle resolved to the shim"
     );
 }
 

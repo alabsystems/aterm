@@ -14,6 +14,9 @@
 # - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
 #   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
 #   atpkg lays them — no new tab, no `exec zsh` (owner ask 2026-09-16; see "LIVE" below)
+# - A LOADER and a BODY (2026-09-26): the shell that is ALREADY RUNNING takes a newer
+#   build's integration at its next prompt, when the host that owns it points it there
+#   (see "THE LOADER" below)
 #
 # Compatible with: zsh 5.0+
 
@@ -84,6 +87,23 @@ else
     esac
 fi
 
+# THE IN-PLACE UPGRADE (2026-09-26). The guard below is exported, so a NON-empty
+# value normally proves this shell did not come straight from aterm (a pane — see
+# above). There is one other way to arrive here with it set: THIS VERY SHELL
+# sourcing the file again — the live agent upgrade's relaunch line sources a newer
+# build's loader into a shell spawned before loaders existed (`typed_rekey` in
+# aterm-shell-integration), or a user's rc that sources this file is re-read. That
+# shell, and only that shell, already holds `$__aterm_shell_nonce`: a plain global,
+# never exported, so no pane or child shell can have inherited it. For it the guard
+# is its own, and the load goes on as an upgrade in place: everything below is
+# idempotent, and what must run once per shell (the package blocks, the hook and
+# widget wiring) is skipped where it already ran.
+typeset -gi __aterm_fresh_load=1
+if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]] && (( ${+__aterm_shell_nonce} )); then
+    __aterm_fresh_load=0
+    ATERM_SHELL_INTEGRATION_INSTALLED=
+fi
+
 # Skip if already loaded — marking the boundary on the way out when the
 # inherited guard means we crossed one.
 if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
@@ -102,7 +122,7 @@ if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
                 if [[ ! -e "$__aterm_mux_stamp" ]] &&
                    mkdir -p "$__aterm_mux_dir" 2>/dev/null &&
                    : >"$__aterm_mux_stamp" 2>/dev/null; then
-                    printf 'aterm: inside %s — command blocks, exit codes and cwd tracking do not cross the multiplexer,\n       so aterm records none of them for these panes. `aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences this.\n' "$__aterm_mux" >&2
+                    printf 'aterm: inside %s — no command blocks, exit codes or cwd tracking in these panes (`aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences)\n' "$__aterm_mux" >&2
                 fi
                 unset __aterm_mux_id __aterm_mux_dir __aterm_mux_stamp
             fi
@@ -136,8 +156,116 @@ export ATERM_MUX_BASE
 # a tmux pane would inherit a refusal it does not deserve.
 unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID __aterm_mux
 
-# Package bin directory
-if [ -d "$HOME/.aterm/bin" ]; then
+# ─── THE LOADER (2026-09-26) ───
+#
+# Everything from here to the BODY marker, and the wiring after the body's end
+# marker, is the LOADER: what a shell runs once and keeps for its whole life — the
+# nonce and the two host channels captured and scrubbed, the one precmd trampoline,
+# the hook registrations. Everything between the two markers is the BODY: every
+# mark, every prompt behaviour, the managed-PATH machinery — and it is written a
+# second time, alone, as `aterm_shell_integration_body.zsh` in the same
+# content-addressed folder, so a shell that is already running can source a NEWER
+# build's body at its next prompt.
+#
+# WHY (gap 20 of the 2026-09-24 audit): an integration script used to be fixed at
+# spawn. Only the nonce (the re-key channel) and PATH order were live, so every fix
+# to the marks or anything else reached only NEW tabs — and the long-lived agent
+# tabs (2 and 14 days old on the owner's Mac) kept the old code, with no status
+# word saying so.
+#
+# HOW A NEWER BODY ARRIVES: the host names a per-session POINTER file at spawn
+# ($ATERM_INTEGRATION_POINTER, `<control dir>/integration/<sid>` in its 0700
+# control dir), captured and scrubbed below like the re-key path. A successor that
+# adopts this shell across an update writes its own script folder's 16-hex address
+# there (0600, created exclusively, never through a symlink), and the trampoline
+# takes it at the next prompt: one fork-free `[[ -f ]]` while nothing waits; when a
+# pointer waits, the read, the removal and one `source`. The body is taken ONLY
+# from `<root>/<address>/aterm_shell_integration_body.zsh`, where `<root>` is the
+# folder THIS file was loaded from — the host's own content-addressed cache — and
+# only a 16-hex address is accepted, so no pointer can steer a source anywhere
+# else. A pointer naming the body already running, a missing body, or one not owned
+# by this user changes nothing.
+#
+# WHAT THE HOST SEES: the body signs `633;P;AtermIntegration=<address>` before each
+# prompt's 133;A, and `status integration_rev=` compares it with the address the
+# host ships (`current`, `stale:<address>`, or `frozen` for a shell from before
+# loaders, which no pointer can reach).
+
+# Capture the capability nonce into a shell-local so we can immediately
+# drop it from the environment (#8015). Leaving ATERM_SHELL_NONCE in the
+# exported env lets every child process (env, ssh SendEnv, docker, cron,
+# tmux children, ...) read the 64-hex secret that would be used to bypass
+# the #7960 nonce-enforcement defense. Capture first, then unset BEFORE
+# any prompt hook fires so subprocesses never inherit it.
+#
+# If the env var is missing or empty at source-time, __aterm_shell_nonce
+# stays empty and __aterm_id_suffix falls through to the unnonced form
+# (pre-nonce compatibility for hosts that have not yet authorized a
+# nonce). This matches the documented fallback: the host's OSC 133/633
+# handler drops sequences missing/with a wrong id= only when
+# `TerminalModes::require_shell_integration_nonce` is enabled.
+#
+# In an upgrade in place (see above) the environment holds no nonce any more — it
+# was scrubbed at this shell's first load — so the one the shell already signs
+# with is kept.
+typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-${__aterm_shell_nonce:-}}"
+unset ATERM_SHELL_NONCE
+
+# Precomputed capability-nonce suffix for OSC 133/633 emissions.
+# The nonce is captured exactly once (above) and the env var is unset on the
+# very next line, so this string changes only through the re-key channel below,
+# which rewrites it together with the nonce. Computing it here
+# lets the marker emitters below expand a plain parameter instead of running
+# `$(__aterm_id_suffix)`, which forks a subshell. That mattered: the prompt
+# path fires five markers per command cycle (133;D + 133;A from precmd, 133;B
+# from zle-line-init, 633;E + 133;C from preexec), i.e. five forks of pure
+# dead time around every command. Byte-identical output — same ";id=<hex>"
+# spelling, same empty-string fallback when unnonced. `typeset -g` (not
+# `export`), exactly like $__aterm_shell_nonce itself, so #8015 (no nonce
+# inheritance by subprocesses) is preserved.
+typeset -g __aterm_id_suffix_str=""
+if [[ -n "$__aterm_shell_nonce" ]]; then
+    __aterm_id_suffix_str=";id=${__aterm_shell_nonce}"
+fi
+
+# THE RE-KEY CHANNEL (2026-09-24) — the one way the nonce above changes after
+# source time. A seamless update that could not carry a shell's nonce (a parent
+# from before 0.92, a session adopted without its screen) left every mark it
+# emits dropped for the rest of its life (`status integration=degraded`, both
+# live tabs on the owner's Mac that day), and only closing the tab cured it.
+# The host names a per-session file at spawn ($ATERM_REKEY_PATH, in its 0700
+# control dir); to re-key an adopted shell it writes a fresh 64-hex nonce there
+# (0600, created exclusively, never through a symlink) and authorizes it, and
+# THIS shell takes it at its next prompt. While nothing is pending the cost is
+# one fork-free `[[ -f ]]` per prompt; the read and the removal happen only
+# when a key waits. Captured and scrubbed from the environment like the nonce,
+# so no child process learns the path; the key itself never appears in typed
+# text, scrollback or history.
+typeset -g __aterm_rekey_path="${ATERM_REKEY_PATH:-${__aterm_rekey_path:-}}"
+unset ATERM_REKEY_PATH
+
+# THE BODY POINTER (see "THE LOADER" above), captured and scrubbed exactly like the
+# re-key path: no child process learns it. An upgrade in place keeps the one the
+# shell already has, or takes the one its relaunch line hands it.
+typeset -g __aterm_body_pointer="${ATERM_INTEGRATION_POINTER:-${__aterm_body_pointer:-}}"
+unset ATERM_INTEGRATION_POINTER
+
+# Where this file was loaded from — `<root>/<address>/`, the content-addressed
+# folder the host prepared — and so which body is running: `<address>` when the
+# folder is named by one (16 lowercase hex digits), empty for a hand-installed
+# copy, which signs no revision. `%x` is the file being sourced, never the
+# caller's. The pointer's bodies are taken from `<root>` only.
+typeset -g __aterm_si_dir="${${(%):-%x}:h}"
+typeset -g __aterm_si_root="${__aterm_si_dir:h}"
+typeset -g __aterm_body_rev="${__aterm_si_dir:t}"
+if [[ ${#__aterm_body_rev} -ne 16 || "$__aterm_body_rev" == *[^0-9a-f]* ]]; then
+    __aterm_body_rev=""
+fi
+
+# Package bin directory — once per shell: an upgrade in place already has it (and
+# the shell.d hooks below already ran; the LIVE block re-sources the atpkg hook
+# whenever it changes).
+if (( __aterm_fresh_load )) && [ -d "$HOME/.aterm/bin" ]; then
     export PATH="$HOME/.aterm/bin:$PATH"
 fi
 
@@ -148,11 +276,50 @@ fi
 # printing an error as the first line of every session. Per-glob `(N)` expands an
 # empty match to nothing instead. (bash's unmatched-glob-stays-literal + the `[ -f ]`
 # guard makes the bash script safe without this.)
-if [ -d "$HOME/.aterm/shell.d" ]; then
+if (( __aterm_fresh_load )) && [ -d "$HOME/.aterm/shell.d" ]; then
     for f in "$HOME/.aterm/shell.d"/*.zsh(N) "$HOME/.aterm/shell.d"/*.sh(N); do
         [ -f "$f" ] && . "$f"
     done
 fi
+
+# THE BODY CHECK, first in every precmd (the trampoline below): a newer body waits
+# when the host has written the pointer. Fork-free while nothing waits — one
+# `[[ -f ]]` — and the read, the removal (the one fork) and the source happen only
+# when a pointer waits. The body is sourced under `emulate -L zsh`, so a user's
+# ksh_arrays / sh_word_split / warn_create_global cannot bend its top level, and
+# the revision moves only when the source succeeded: a body that failed to load is
+# still reported as the one before it.
+__aterm_body_check() {
+    [[ -n "$__aterm_body_pointer" && -f "$__aterm_body_pointer" ]] || return 0
+    emulate -L zsh
+    local __aterm_addr="" __aterm_file=""
+    { IFS= read -r __aterm_addr < "$__aterm_body_pointer" } 2>/dev/null
+    command rm -f -- "$__aterm_body_pointer"
+    # Exactly 16 lowercase hex digits — a folder address — or nothing changes.
+    [[ ${#__aterm_addr} -eq 16 && "$__aterm_addr" != *[^0-9a-f]* ]] || return 0
+    [[ "$__aterm_addr" != "$__aterm_body_rev" ]] || return 0
+    __aterm_file="$__aterm_si_root/$__aterm_addr/aterm_shell_integration_body.zsh"
+    [[ -f "$__aterm_file" && -O "$__aterm_file" ]] || return 0
+    . "$__aterm_file" && __aterm_body_rev="$__aterm_addr"
+    return 0
+}
+
+# THE TRAMPOLINE: the one precmd hook, and the one piece of the prompt path that
+# never changes. A body sourced by the check is the body whose precmd runs in the
+# SAME prompt, so the prompt that takes a new body already emits its marks.
+__aterm_precmd() {
+    local __aterm_status=$?
+    __aterm_body_check
+    __aterm_body_precmd "$__aterm_status"
+    return $__aterm_status
+}
+
+# Install hooks using zsh hook arrays (the registrations are at the end of the
+# file, after the body has defined what they name). Autoloaded here, before any
+# `add-zsh-hook` a function below spells.
+autoload -Uz add-zsh-hook
+
+# @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
@@ -313,7 +480,6 @@ __aterm_reroute_path_front
 # for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
 # precisely what the adopted shell lacks. Inert everywhere else.
 typeset -g __aterm_atpkg_hook="$HOME/.aterm/shell.d/00-atpkg.zsh"
-typeset -g __aterm_atpkg_hook_seen=""
 typeset -gi __aterm_managed_live=0
 typeset -gi __aterm_have_zstat=0
 if [[ -n "${ATERM_CHILD:-}" || -n "${ATERM_SESSION_ID:-}" ]]; then
@@ -336,10 +502,15 @@ __aterm_atpkg_hook_stamp() {
 }
 # The copy the shell.d loop above sourced at load is the copy last sourced —
 # whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
-# sourced again until atpkg rewrites it).
-if (( __aterm_managed_live )); then
-    __aterm_atpkg_hook_stamp
-    __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+# sourced again until atpkg rewrites it). Recorded ONCE per shell: a body
+# re-sourced live keeps the record, so a hook rewritten just before is still
+# sourced at the next prompt.
+if (( ! ${+__aterm_atpkg_hook_seen} )); then
+    typeset -g __aterm_atpkg_hook_seen=""
+    if (( __aterm_managed_live )); then
+        __aterm_atpkg_hook_stamp
+        __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+    fi
 fi
 
 # Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
@@ -413,8 +584,9 @@ __aterm_managed_path_live() {
     return 0
 }
 
-# State tracking
-typeset -g __aterm_in_command=0
+# State tracking. KEPT across a live re-source: the body is re-sourced from the
+# precmd trampoline, and a command that was running must still get its 133;D.
+typeset -g __aterm_in_command="${__aterm_in_command:-0}"
 typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
 
 # OSC escape sequences.
@@ -444,38 +616,18 @@ __aterm_osc() {
     printf '\033]%s\a' "$1"
 }
 
-# Capture the capability nonce into a shell-local so we can immediately
-# drop it from the environment (#8015). Leaving ATERM_SHELL_NONCE in the
-# exported env lets every child process (env, ssh SendEnv, docker, cron,
-# tmux children, ...) read the 64-hex secret that would be used to bypass
-# the #7960 nonce-enforcement defense. Capture first, then unset BEFORE
-# any prompt hook fires so subprocesses never inherit it.
-#
-# If the env var is missing or empty at source-time, __aterm_shell_nonce
-# stays empty and __aterm_id_suffix falls through to the unnonced form
-# (pre-nonce compatibility for hosts that have not yet authorized a
-# nonce). This matches the documented fallback: the host's OSC 133/633
-# handler drops sequences missing/with a wrong id= only when
-# `TerminalModes::require_shell_integration_nonce` is enabled.
-typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-}"
-unset ATERM_SHELL_NONCE
-
-# Precomputed capability-nonce suffix for OSC 133/633 emissions.
-# The nonce is captured exactly once (above) and the env var is unset on the
-# very next line, so this string is CONSTANT for the life of the shell — there
-# is no in-shell rotation path that could make it stale. Computing it here
-# lets the marker emitters below expand a plain parameter instead of running
-# `$(__aterm_id_suffix)`, which forks a subshell. That mattered: the prompt
-# path fires five markers per command cycle (133;D + 133;A from precmd, 133;B
-# from zle-line-init, 633;E + 133;C from preexec), i.e. five forks of pure
-# dead time around every command. Byte-identical output — same ";id=<hex>"
-# spelling, same empty-string fallback when unnonced. `typeset -g` (not
-# `export`), exactly like $__aterm_shell_nonce itself, so #8015 (no nonce
-# inheritance by subprocesses) is preserved.
-typeset -g __aterm_id_suffix_str=""
-if [[ -n "$__aterm_shell_nonce" ]]; then
-    __aterm_id_suffix_str=";id=${__aterm_shell_nonce}"
-fi
+# The re-key channel's check (the path is captured by the loader above).
+__aterm_rekey_check() {
+    emulate -L zsh
+    [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
+    local key=""
+    { IFS= read -r key < "$__aterm_rekey_path" } 2>/dev/null
+    command rm -f -- "$__aterm_rekey_path"
+    # Exactly 64 lowercase hex digits, or nothing changes.
+    [[ ${#key} -eq 64 && "$key" != *[^0-9a-f]* ]] || return 0
+    __aterm_shell_nonce="$key"
+    __aterm_id_suffix_str=";id=${key}"
+}
 
 # Capability-nonce suffix for OSC 133/633 emissions (#7960, #7987, #8015).
 # Expands to ";id=<64-hex>" when the captured nonce is non-empty, or to
@@ -547,9 +699,24 @@ __aterm_mark_exec_finish() {
     __aterm_osc "133;D;$1${__aterm_id_suffix_str}"
 }
 
-# precmd - runs before each prompt
-__aterm_precmd() {
-    local last_status=$?
+# The body's revision, SIGNED (633;P, the VS Code property mark): the folder
+# address this body was taken from, so the host can tell a shell running its own
+# body from one running an older build's (`status integration_rev=`). Emitted
+# before every 133;A — a builtin printf, nothing when the revision is unknown (a
+# hand-installed copy) — so a successor that adopted this shell learns it at the
+# first prompt after the update, whatever it carried.
+__aterm_mark_integration_rev() {
+    [[ -n "$__aterm_body_rev" ]] || return 0
+    __aterm_osc "633;P;AtermIntegration=${__aterm_body_rev}${__aterm_id_suffix_str}"
+}
+
+# precmd - runs before each prompt, from the loader's trampoline, which hands it
+# the status the command before it left.
+__aterm_body_precmd() {
+    local last_status=$1
+
+    # A waiting re-key first, so every mark this prompt emits carries it.
+    __aterm_rekey_check
 
     # The managed dirs, live (see "LIVE" above): one stat, one readdir, an assign
     # (or a rehash) only on a change.
@@ -581,7 +748,8 @@ __aterm_precmd() {
         __aterm_osc "0;${__aterm_tab_title//[[:cntrl:]]/}"
     fi
 
-    # Mark prompt start
+    # The revision this prompt runs, then the prompt start.
+    __aterm_mark_integration_rev
     __aterm_mark_prompt_start
 
     return $last_status
@@ -692,24 +860,17 @@ __aterm_setup_keybindings() {
     bindkey '\e[1;2A' up-line-or-history    # Shift+Up
     bindkey '\e[1;2B' down-line-or-history  # Shift+Down
 }
-__aterm_setup_keybindings
+# Called ONCE per shell, by the loader (the end of this file): a body re-sourced
+# live leaves the user's bindings alone.
 
 # ─── OSC 133;B (end of prompt / start of user input) ───
 # Emitted via zle-line-init so it fires after the prompt is fully drawn.
 # Placing it in preexec is too late (user has already typed their command).
-if (( ${+widgets[zle-line-init]} )); then
-    zle -A zle-line-init __aterm_orig_zle_line_init
-fi
+# The widget is wired once, by the loader (end of file).
 __aterm_zle_line_init() {
     __aterm_mark_command_start
     (( ${+widgets[__aterm_orig_zle_line_init]} )) && zle __aterm_orig_zle_line_init
 }
-zle -N zle-line-init __aterm_zle_line_init
-
-# Install hooks using zsh hook arrays.
-# __aterm_first_precmd is registered first so the prompt override lands before
-# __aterm_precmd emits OSC 133;A (prompt start marker).
-autoload -Uz add-zsh-hook
 
 # ─── Deferred First-Precmd Setup ───
 # Runs once on the very first precmd after the shell has fully initialized
@@ -736,6 +897,58 @@ __aterm_first_precmd() {
     add-zsh-hook -d precmd __aterm_first_precmd
     return $last_status
 }
-add-zsh-hook precmd __aterm_first_precmd
+
+# The body ends in success: the loader moves its revision only when the source
+# returned 0.
+true
+
+# @@ATERM-INTEGRATION-BODY-END@@
+
+# ─── THE LOADER, continued: the wiring, once per shell ───
+#
+# OSC 133;B rides zle-line-init. A user's own zle-line-init is kept and chained —
+# on a FRESH load only (review finding 2026-09-26). By an upgrade in place the
+# user's rc has run, and a plugin may have wrapped our widget (`add-zle-hook-widget`
+# keeps it as the first of its hooks; powerlevel10k and older
+# zsh-syntax-highlighting wrap it too): re-wiring then aliased the plugin's widget
+# — which calls ours — as `__aterm_orig_zle_line_init` and installed ours in
+# front of it, which calls that alias. A loop: measured on zsh 5.9, ~250 133;B
+# marks and "recursion limit exceeded" at every prompt of the upgraded shell.
+# Nothing needs re-wiring: a widget names its FUNCTION, so whatever chain the
+# shell has reaches the new body's `__aterm_zle_line_init` as it stands.
+if (( __aterm_fresh_load )); then
+    if (( ${+widgets[zle-line-init]} )) && [[ "${widgets[zle-line-init]}" != "user:__aterm_zle_line_init" ]]; then
+        zle -A zle-line-init __aterm_orig_zle_line_init
+    fi
+    zle -N zle-line-init __aterm_zle_line_init
+fi
+
+# Install hooks using zsh hook arrays (`add-zsh-hook` never adds a name twice).
+# __aterm_first_precmd is registered first so the prompt override lands before
+# __aterm_precmd emits OSC 133;A (prompt start marker) — on a fresh load only: in
+# an upgrade in place it has run and removed itself long ago.
+if (( __aterm_fresh_load )); then
+    add-zsh-hook precmd __aterm_first_precmd
+fi
 add-zsh-hook precmd __aterm_precmd
 add-zsh-hook preexec __aterm_preexec
+
+# The key bindings, ONCE per shell: a fresh load only (review finding
+# 2026-09-26). This file runs before the user's own rc (zsh reads it from the
+# ZDOTDIR .zshenv), so a binding of theirs for one of these keys wins; a body
+# re-sourced live — a newer build's through the pointer, or an upgrade in place
+# — binding them again at a prompt took those keys back from the user in every
+# live tab at every update.
+if (( __aterm_fresh_load )); then
+    __aterm_setup_keybindings
+fi
+
+# An upgrade in place SIGNS its revision now, not at the next prompt: the typed
+# line that upgrades a shell from before loaders goes on to relaunch its agent,
+# which holds the terminal for hours, and until the shell's next prompt the host
+# would name it `integration_rev=frozen` — and an update in between would carry
+# no revision to point it by. (Signed with the key the shell holds; a fresh load
+# signs at its first prompt.)
+if (( ! __aterm_fresh_load )); then
+    __aterm_mark_integration_rev
+fi

@@ -32,12 +32,14 @@ use aterm_core::render::{EffectStreamDamage, FreeSampler, FreeSprite, FreeZ, Lin
 // is a PER-COLUMN question. Re-exported because the callers that must agree on
 // the answer live in other crates (the GPU backend, the parity tests).
 pub use aterm_core::render::DefaultBgSpan;
+pub use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, InkSplit};
 // A-3: the CPU renderer no longer borrows `&Terminal` — it consumes only the
 // engine-built `RenderInput`. `Terminal` is imported solely in the test module
 // (which builds terminals + calls `Terminal::cell_frame` to feed the renderer).
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
 pub mod apron;
+pub mod bundled;
 pub mod chrome_metrics;
 mod colr;
 pub mod deco;
@@ -709,6 +711,16 @@ pub enum FaceId {
     RuntimeFallback,
 }
 
+/// A [`FaceId::Procedural`] key drawn by the chain's LAST-RESORT symbol tier
+/// ([`procedural::covers_symbol`]) rather than the pre-emptive box-drawing
+/// families. Its raster is `cell_span` cells wide, so — like a harmonized
+/// fallback — it carries the materialized span in its key.
+fn is_synthetic_symbol_key(key: GlyphKey) -> bool {
+    key.source == FaceId::Procedural
+        && key.glyph_class == GlyphClass::Mono
+        && key.chr().is_some_and(procedural::covers_symbol)
+}
+
 /// Mono faces whose proportional rasters are normalized into the logical cell
 /// span carried by [`GlyphKey::cell_span`]. Kept as one predicate so key
 /// construction, span overrides, and the final raster pass cannot drift.
@@ -934,6 +946,40 @@ pub const SHADE_PHASE_X_BIT: u32 = 1 << 24;
 /// The row twin of [`SHADE_PHASE_X_BIT`]: set when
 /// `(grid_top + row * cell_h) & 1` (`grid_top = pad + head`).
 pub const SHADE_PHASE_Y_BIT: u32 = 1 << 25;
+
+/// `GlyphKey::ch_or_id` bit of a DRAWN BAND ICON ([`band_icon_key`], design
+/// ruling 251): a [`FaceId::Procedural`] Mono key whose low bits are a
+/// [`BandIcon::index`], not a code point. Bit 26 sits above the scalar range
+/// and the shade-phase bits, so no character's key can carry it.
+pub const CHROME_ICON_BIT: u32 = 1 << 26;
+
+/// `GlyphKey::ch_or_id` bit of a band icon that SPILLS into the blank cell on
+/// each side of its own (design ruling 258): its raster is three cells wide,
+/// anchored one cell left of the icon's cell. Set only beside
+/// [`CHROME_ICON_BIT`], so no character's key can carry it.
+pub const CHROME_ICON_SPILL_BIT: u32 = 1 << 8;
+
+/// The glyph key of `icon` drawn at the renderer's size `px_q`, in a cell of
+/// weight `style` (only [`StyleBits::BOLD`] is read: the icon's stroke is the
+/// face's stem at that weight), spilling into its blank neighbours when
+/// `spill` (ruling 258) or confined to its cell. Both backends key the icon
+/// cell of a chrome row through this ([`Renderer::chrome_icon_key`]), so the
+/// CPU cache and the GPU atlas hold the one raster.
+#[must_use]
+pub fn band_icon_key(icon: BandIcon, style: StyleBits, spill: bool, px_q: u32) -> GlyphKey {
+    GlyphKey {
+        source: FaceId::Procedural,
+        glyph_class: GlyphClass::Mono,
+        ch_or_id: CHROME_ICON_BIT | if spill { CHROME_ICON_SPILL_BIT } else { 0 } | icon.index(),
+        style: if style.contains(StyleBits::BOLD) {
+            StyleBits::BOLD
+        } else {
+            StyleBits::REGULAR
+        },
+        cell_span: 0,
+        px_q,
+    }
+}
 
 /// Fold a cell's ABSOLUTE pixel-position parity into a procedural SHADE
 /// glyph key (U+2591–2593); every other key passes through untouched.
@@ -1287,9 +1333,10 @@ impl AdmittedFontBlob {
         }
     }
 
-    /// Whether this blob is a file mapping rather than anonymous heap.
-    fn is_mapped(&self) -> bool {
-        matches!(self, Self::Face(bytes) if bytes.is_mapped())
+    /// Whether this blob is file-backed — a font-file mapping, or a face
+    /// compiled into the executable — rather than anonymous heap.
+    fn is_file_backed(&self) -> bool {
+        matches!(self, Self::Face(bytes) if !bytes.is_heap())
     }
 }
 
@@ -1302,8 +1349,6 @@ impl PartialEq for AdmittedFontBlob {
         }
     }
 }
-
-impl Eq for AdmittedFontBlob {}
 
 impl std::fmt::Debug for AdmittedFontBlob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1345,8 +1390,10 @@ pub struct AdmittedFontSources {
 impl AdmittedFontSources {
     /// How the DISCOVERED faces of this generation — the broad/CJK fallback
     /// chain, the symbol slot and the colour-emoji face, the ones the seal
-    /// admits by path — are resident: `(mapped_bytes, copied_bytes)`, file
-    /// mapping against anonymous heap. The primary and styled faces are not
+    /// admits by path — are resident: `(mapped_bytes, copied_bytes)`,
+    /// file-backed pages against anonymous heap. A bundled face compiled into
+    /// the binary ([`crate::font::FaceBytes::Static`]) counts as MAPPED: its
+    /// pages are the executable's own read-only image, not a heap copy. The primary and styled faces are not
     /// counted; they are small and were never the residency problem.
     ///
     /// Diagnostics: the seal's residency proof
@@ -1364,7 +1411,7 @@ impl AdmittedFontSources {
             .chain(self.emoji.iter())
         {
             let len = source.bytes.bytes().len() as u64;
-            if source.bytes.is_mapped() {
+            if source.bytes.is_file_backed() {
                 mapped += len;
             } else {
                 copied += len;
@@ -1659,8 +1706,7 @@ pub struct Renderer {
     /// Candidate fallback font paths, tried on first miss; emptied once consumed.
     fallback_paths: Vec<String>,
     /// How many leading [`Self::fallback_paths`] entries are USER-supplied
-    /// (config `fallback_fonts`, then `$ATERM_FALLBACK_FONT`) rather than
-    /// built-in discovery — the boundary [`build_fallback_chain`] needs to know
+    /// (config `fallback_fonts`) rather than built-in discovery — the boundary [`build_fallback_chain`] needs to know
     /// which entries are additive. Always written together with
     /// `fallback_paths` from [`fallback_candidate_paths`]; `0` (the default, and
     /// what a directly-seeded discovery list gets) means "all discovery", which
@@ -1690,7 +1736,7 @@ pub struct Renderer {
     /// Candidate symbol-fallback font paths, tried on first symbol miss; emptied once consumed.
     symbol_fallback_paths: Vec<String>,
     /// How many leading [`Self::symbol_fallback_paths`] entries are USER-supplied
-    /// (config `symbol_font`, then `$ATERM_SYMBOL_FONT`) — the boundary
+    /// (config `symbol_font`) — the boundary
     /// [`build_symbol_chain`] needs. Written together with
     /// `symbol_fallback_paths` from [`symbol_fallback_candidate_paths`].
     symbol_user_prefix: usize,
@@ -1735,8 +1781,8 @@ pub struct Renderer {
     /// face. Real styled faces are unaffected (they are not synthesis).
     synthetic_styles: bool,
     /// NATIVE CRISPNESS (W13 Linux, then Windows): how the native raster path
-    /// grid-fits outlines (`ATERM_FONT_HINTING`, resolved once at construction;
-    /// `Off` under `ATERM_RASTERIZER=fontdue`, so the portable/deterministic
+    /// grid-fits outlines (config `font_hinting` via [`Self::set_font_hinting`];
+    /// `Off` under the `ATERM_RASTERIZER=fontdue` development seam, so the portable/deterministic
     /// path the golden/parity tests export stays bit-stable). See [`hinted`].
     #[cfg(any(all(unix, not(target_os = "macos")), windows))]
     hint_mode: hinted::HintMode,
@@ -1748,8 +1794,8 @@ pub struct Renderer {
     hint_bank: hinted::HintBank,
     /// LINUX SUBPIXEL stage 1 ([`subpixel`], RFC-linux-subpixel-text §4.1):
     /// panel geometry for per-channel coverage in the CPU compositor
-    /// (`ATERM_FONT_SUBPIXEL` / config `font_subpixel`; DEFAULT `Off`; forced
-    /// `Off` under `ATERM_RASTERIZER=fontdue` so the byte-stable exports never
+    /// (config `font_subpixel`; DEFAULT `Off`; forced `Off` under the
+    /// `ATERM_RASTERIZER=fontdue` development seam so the byte-stable exports never
     /// fringe). The GPU backend ignores it entirely until stage 2.
     #[cfg(all(unix, not(target_os = "macos")))]
     subpix_mode: subpixel::SubpixelMode,
@@ -1894,13 +1940,13 @@ pub struct Renderer {
     /// frame on the shaping path. Mirrors `shapeable_scratch`.
     shape_run_scratch: String,
     shape_chars_scratch: Vec<char>,
-    /// Reused per-row line-decoration rect scratch for [`render_row`], taken/returned
+    /// Reused per-row line-decoration rect scratch for [`Renderer::render_row_fg`], taken/returned
     /// via `mem::take` so each decorated row reuses one allocation instead of a fresh
-    /// `Vec<[usize; 4]>` per render_row per frame. The `underline_rects_into` /
+    /// `Vec<[usize; 4]>` per row per frame. The `underline_rects_into` /
     /// `strike_overline_rects_into` helpers clear it first, so reuse is byte-identical.
     /// Mirrors `shapeable_scratch`.
     deco_scratch: Vec<[usize; 4]>,
-    /// Reused per-cell ink-skipped underline rect scratch for [`render_row`]'s
+    /// Reused per-cell ink-skipped underline rect scratch for [`Renderer::render_row_fg`]'s
     /// pass 3 (the rects surviving [`deco::intersect_rect_spans`]). Mirrors
     /// `deco_scratch`.
     deco_skip_rect_scratch: Vec<[usize; 4]>,
@@ -1978,13 +2024,19 @@ pub struct Renderer {
     /// padding gutters as well as its cells — see [`ChromeBleed`]. `None` (default)
     /// is byte-identical to the historical layout.
     chrome_bleed: Option<ChromeBleed>,
+    /// The face's measured ROOM for a chrome row that keeps its words clear of
+    /// its rail ([`Self::chrome_room_for`]): the `(cell_h, baseline)` it was
+    /// measured at, and `(head, foot)`. Dropped with the glyph images.
+    chrome_room_memo: Option<(usize, i32, (usize, usize))>,
+    /// This frame's `(head, foot)` room, taken at the frame's start
+    /// ([`Self::chrome_room_for`]); `(0, 0)` on a frame with no such row.
+    chrome_room: (usize, usize),
     baseline: i32,
     theme: Theme,
     /// Per-renderer stem-weight LUT — the identity (no-op) table by DEFAULT. True
     /// linear-light antialiasing now lives in [`blend`] and the GPU's sRGB-typed
     /// target, NOT here (see [`stem_gamma`]); this LUT is non-identity only when
-    /// `ATERM_STEM_GAMMA` (or the config key `stem_gamma` it aliases, via
-    /// [`Self::set_stem_gamma`]) requests an aesthetic stem thickener/thinner. Rebuilt
+    /// the config key `stem_gamma` (via [`Self::set_stem_gamma`]) requests an aesthetic stem thickener/thinner. Rebuilt
     /// with the renderer (every theme/font/zoom builds a fresh `Renderer`). Applied to
     /// the SHARED coverage bytes, so CPU and GPU stay byte-identical.
     stem_lut: [u8; 256],
@@ -2624,8 +2676,8 @@ pub(crate) struct RenderCache {
     font_epoch: u64,
 }
 
-/// Font paths to try, most-preferred first; override with $ATERM_FONT (or the
-/// `font_family` config, which wins ahead of all of these). SF Mono leads
+/// Font paths to try, most-preferred first; the host's `font_family` config (or
+/// the window's `--font`) wins ahead of all of these. SF Mono leads
 /// (owner decision, 2026-07): the historical Menlo lead came from a visual
 /// judging pass run under the CoreText-free fontdue path, where SF Mono loaded
 /// at its `fvar` DEFAULT instance — the thin "SF NS Mono Light" (SFNSMono.ttf)
@@ -2635,7 +2687,7 @@ pub(crate) struct RenderCache {
 /// judged handicap no longer applies. Leading with the variable SFNSMono also
 /// makes `font_weight`/`font_variation` live at defaults (both are no-ops on
 /// static Menlo). Menlo stays as the next candidate (users who prefer it set
-/// `font_family`/$ATERM_FONT), then Monaco. The historical Andale Mono /
+/// `font_family`), then Monaco. The historical Andale Mono /
 /// Courier New entries stay LAST so a machine missing the nicer faces still
 /// finds a mono font — the no-font fallback (a `None` from `from_system*`) is
 /// unchanged.
@@ -2647,6 +2699,9 @@ const FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
     "/System/Library/Fonts/Supplemental/Courier New.ttf",
     // Linux (Debian/Ubuntu): a real system monospace before the embedded DejaVu.
+    // Reached by default only in a build WITHOUT the bundled font stack: with it,
+    // `primary_candidate_paths` puts the bundled JetBrains Mono ahead of every
+    // entry here (`bundled::default_primary_candidates`).
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansMono-Regular.ttf",
@@ -2664,16 +2719,20 @@ const FONT_CANDIDATES: &[&str] = &[
 ];
 
 /// The primary-font candidate paths shared by [`Renderer::from_system_with_family`]
-/// and the test helpers: `$ATERM_FONT` (if set) followed by the built-in
-/// [`FONT_CANDIDATES`]. Single source of truth so the tests' notion of "the file
-/// `from_system` would load" cannot drift from the loader.
+/// and the test helpers: the built-in [`FONT_CANDIDATES`]. Single source of truth
+/// so the tests' notion of "the file `from_system` would load" cannot drift from
+/// the loader. (A host that wants another face passes it as the family — the
+/// window's `--font` / `font_family`; no environment variable reaches here.)
 fn primary_candidate_paths() -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("ATERM_FONT") {
-        paths.push(p);
-    }
-    paths.extend(FONT_CANDIDATES.iter().map(|s| s.to_string()));
-    paths
+    // The bundled DEFAULT primary (JetBrains Mono, non-macOS) leads the built-in
+    // candidates, so an installed DejaVu Sans Mono — what `fc-match monospace`
+    // answers on a stock Linux — no longer wins by default. Behind a configured
+    // family (in `from_system_with_family`).
+    bundled::default_primary_candidates()
+        .iter()
+        .chain(FONT_CANDIDATES)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Ordered fixed-path candidates used when no configured primary family is
@@ -3065,7 +3124,7 @@ pub fn embedded_symbols_font() -> &'static [u8] {
 /// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] are ADDITIVE (the scan continues past
 /// them); the first NON-additive face that loads ends the scan, so per platform
 /// exactly one broad backstop is reached and it must be listed LAST.
-/// Override with $ATERM_FALLBACK_FONT. Any code point these
+/// The config `fallback_fonts` chain goes first. Any code point these
 /// miss still reaches a real glyph via the recursive runtime fallback scan.
 const FALLBACK_CANDIDATES: &[&str] = &[
     // macOS — a NATIVE CJK design leads (W8): Hiragino Sans GB is a TrueType
@@ -3358,8 +3417,8 @@ const NATIVE_SCRIPT_FALLBACK_CANDIDATES: &[&str] = &[
     "C:\\Windows\\Fonts\\mvboli.ttf",
 ];
 
-/// Monochrome SYMBOL fallback faces, most-preferred first. Override with
-/// `$ATERM_SYMBOL_FONT`. STIX Two Math is the broadest monochrome symbol face
+/// Monochrome SYMBOL fallback faces, most-preferred first, behind the config
+/// `symbol_font`. STIX Two Math is the broadest monochrome symbol face
 /// shipped with macOS — crucially it is (with the colour-only Apple Color Emoji
 /// and the tofu LastResort) one of the only system faces carrying U+23F8..23FA
 /// (⏸⏹⏺). It is consulted only AFTER the primary + broad fallback miss, so it
@@ -3495,14 +3554,70 @@ const SYMBOL_TIER_TEXT_ONLY_BACKSTOPS: &[&str] =
 /// Whether a loaded symbol-tier face is one of the
 /// [`SYMBOL_TIER_TEXT_ONLY_BACKSTOPS`]. A byte-injected face (no path) never is
 /// — a host that injects a symbol face means it as the symbol face.
+///
+/// A BUNDLED face ([`bundled`]) is gated the same way, dedicated symbol face or
+/// not. It LEADS its tier on every non-macOS host, so it must never take what
+/// the host's own faces are better placed to draw: an `Emoji_Presentation=Yes`
+/// point (`⏩` U+23E9 — Noto Sans Symbols 2 maps it) belongs to the colour face,
+/// and a private-use icon to the Symbols Nerd Font. A default-TEXT symbol
+/// (`⏵` `⏺` `✔` `≈`) — the reason the stack ships — is unaffected.
 fn symbol_face_is_text_only_backstop(face: &FallbackFace) -> bool {
-    face.path
-        .as_deref()
-        .is_some_and(|p| SYMBOL_TIER_TEXT_ONLY_BACKSTOPS.contains(&p))
+    [face.path.as_deref(), face.relocated_from.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|p| SYMBOL_TIER_TEXT_ONLY_BACKSTOPS.contains(&p) || bundled::is_bundled_id(p))
 }
 
-/// Colour-emoji faces (bitmap strikes), most-preferred first. Override with
-/// `$ATERM_EMOJI_FONT`. Apple Color Emoji is `sbix`; Noto Color Emoji is `CBDT/CBLC`
+/// Whether the embedded Symbols Nerd Font ([`embedded_symbols_font`]) draws the
+/// NON-private-use `ch` — the owner's font order (2026-09-24) puts that face
+/// AHEAD of the bundled Noto Sans Symbols 2 / Noto Sans Math, so a bundled
+/// symbol face yields such a point to it ([`Renderer::symbol_chain_pick`]).
+///
+/// Measured with fontTools on the embedded faces: the Nerd face maps 14
+/// non-private-use points, and the six of them the bundled Noto faces also
+/// cover (and the embedded DejaVu Sans Mono, which precedes the Nerd face in
+/// that order, does not) are `⏻ ⏼ ⏽ ⏾ ☰ ⭘` (U+23FB–U+23FE, U+2630, U+2B58).
+/// Its private-use icons need no entry here: every bundled face already skips
+/// private use ([`symbol_face_is_text_only_backstop`]). A pure function of
+/// `ch`, so the symbol pick stays recomputable; the set is read from the
+/// face's cmap once, on first use.
+fn embedded_symbols_own_text_point(ch: char) -> bool {
+    #[cfg(feature = "embedded-symbols")]
+    {
+        static OWNED: std::sync::OnceLock<Vec<char>> = std::sync::OnceLock::new();
+        OWNED
+            .get_or_init(|| {
+                let mut owned = Vec::new();
+                if let Ok(face) = ttf_parser::Face::parse(embedded_symbols_font(), 0)
+                    && let Some(cmap) = face.tables().cmap
+                {
+                    for sub in cmap.subtables.into_iter().filter(|t| t.is_unicode()) {
+                        sub.codepoints(|cp| {
+                            if let Some(c) = char::from_u32(cp)
+                                && !font_chain::is_private_use(c)
+                                && face.glyph_index(c).is_some_and(|g| g.0 != 0)
+                            {
+                                owned.push(c);
+                            }
+                        });
+                    }
+                }
+                owned.sort_unstable();
+                owned.dedup();
+                owned
+            })
+            .binary_search(&ch)
+            .is_ok()
+    }
+    #[cfg(not(feature = "embedded-symbols"))]
+    {
+        let _ = ch;
+        false
+    }
+}
+
+/// Colour-emoji faces (bitmap strikes), most-preferred first, behind the config
+/// `emoji_font`. Apple Color Emoji is `sbix`; Noto Color Emoji is `CBDT/CBLC`
 /// — both are PNG bitmap strikes read uniformly through ttf-parser's
 /// `glyph_raster_image` ([`Renderer::color_font_has`]), so the Linux entry renders
 /// colour emoji exactly as the macOS one does. The first path that EXISTS wins.
@@ -3516,71 +3631,97 @@ const COLOR_EMOJI_CANDIDATES: &[&str] = &[
     "C:\\Windows\\Fonts\\seguiemj.ttf",
 ];
 
-/// Env escape hatch for the [`procedural`] glyph source: box-drawing / block /
-/// braille cells are synthesized from the cell geometry by default (cell-exact,
-/// seam-free — see the module docs); set `ATERM_NO_PROCEDURAL_GLYPHS=1` to
-/// restore font glyphs for those ranges. Read once per renderer, at
-/// construction, like $ATERM_FONT / $ATERM_FALLBACK_FONT above.
+/// DEVELOPMENT seam for the [`procedural`] glyph source ([`aterm_types::dev_seam!`]):
+/// box-drawing / block / braille cells are synthesized from the cell geometry
+/// (cell-exact, seam-free — see the module docs) in every shipped binary; a
+/// development build with `ATERM_NO_PROCEDURAL_GLYPHS` set draws the font's own
+/// glyphs for those ranges, to compare the two. Read once per renderer, at
+/// construction.
 const NO_PROCEDURAL_ENV: &str = "ATERM_NO_PROCEDURAL_GLYPHS";
 
 /// The built-in broad-fallback DISCOVERY paths (the lowest-precedence class of
 /// [`fallback_chain_order`]).
+///
+/// The bundled stack's broad entries ([`bundled::broad_fallback_ids`] — the
+/// embedded DejaVu Sans Mono) LEAD the discovery class: behind every
+/// user-configured face, ahead of every system path — including the Linux
+/// per-script faces and Windows' `sylfaen`/`LeelawUI`/`arial` entries.
+///
+/// That precedence is a DECISION, and its reach is wider than "the default
+/// Debian user sees no change": the blocks this face covers and the primary
+/// does not (Greek, the rest of Cyrillic, Armenian, basic Arabic, U+0E3F, Lao,
+/// Georgian — pinned by
+/// `the_bundled_broad_face_shadows_no_cjk_point_and_only_the_scripts_it_always_drew`)
+/// now draw from this MONOSPACE design on every non-macOS host. For an
+/// unconfigured Debian host that is exactly the old routing (the old default
+/// primary was this same DejaVu Sans Mono), and on Fedora/Arch the old
+/// Debian-only candidate paths never found a per-script face anyway. It DOES
+/// change the answer for a user who configured a non-DejaVu primary with the
+/// per-script Noto faces installed, and on Windows: those blocks used to come
+/// from the dedicated proportional face. A cell-width design is the better
+/// terminal glyph, which is why it leads; a user who wants the dedicated face
+/// back names it in `fallback_fonts`, which precedes this whole class.
 fn fallback_discovery_paths() -> Vec<String> {
-    FALLBACK_CANDIDATES
+    bundled::broad_fallback_ids()
         .iter()
+        .chain(FALLBACK_CANDIDATES)
         .map(|s| (*s).to_string())
         .collect()
 }
 
 /// The ordered fallback-font candidate paths for a `config` chain (W6):
-/// config `fallback_fonts` > `$ATERM_FALLBACK_FONT` (compat alias) > the
-/// built-in candidates — the proven [`fallback_chain_order`] law. Loaded
-/// lazily on the first primary-face miss.
+/// config `fallback_fonts` > the built-in candidates — the proven
+/// [`fallback_chain_order`] law. Loaded lazily on the first primary-face miss.
 ///
 /// Returns the paths together with the length of their USER-supplied prefix
-/// (the config entries plus the env alias) — everything past it is built-in
-/// discovery. `build_fallback_chain` needs that boundary: a user entry is
-/// ADDITIVE (an ordered chain of the user's own faces, then the built-ins
-/// behind them), while only a built-in BROAD BACKSTOP ends the scan. Reading
-/// the env var ONCE and returning the count keeps the two in lockstep — a
-/// recount at the point of use could disagree with the list it describes.
+/// (the config entries) — everything past it is built-in discovery.
+/// `build_fallback_chain` needs that boundary: a user entry is ADDITIVE (an
+/// ordered chain of the user's own faces, then the built-ins behind them), while
+/// only a built-in BROAD BACKSTOP ends the scan. Returning the count with the
+/// list keeps the two in lockstep.
 fn fallback_candidate_paths(config: &[String]) -> (Vec<String>, usize) {
-    let env = std::env::var("ATERM_FALLBACK_FONT").ok();
-    let user_prefix = config.len() + usize::from(env.is_some());
     (
-        fallback_chain_order(config, env, &fallback_discovery_paths()),
-        user_prefix,
+        fallback_chain_order(config, &fallback_discovery_paths()),
+        config.len(),
     )
 }
 
 /// The built-in symbol-fallback DISCOVERY paths.
+///
+/// The bundled stack's symbol entries ([`bundled::symbol_fallback_ids`] — Noto
+/// Sans Symbols 2, then Noto Sans Math) LEAD the discovery class, and a system
+/// candidate naming the same file ([`bundled::supersedes_system_face`]) is
+/// dropped: it could only answer what the bundled copy already answered, and
+/// where it is absent its relocation walked the whole font tree for nothing.
 fn symbol_discovery_paths() -> Vec<String> {
-    SYMBOL_FALLBACK_CANDIDATES
+    bundled::symbol_fallback_ids()
         .iter()
+        .chain(
+            SYMBOL_FALLBACK_CANDIDATES
+                .iter()
+                .filter(|p| !bundled::supersedes_system_face(p)),
+        )
         .map(|s| (*s).to_string())
         .collect()
 }
 
 /// The ordered symbol-fallback candidate paths (config `symbol_font` >
-/// `$ATERM_SYMBOL_FONT` > built-ins, the [`fallback_chain_order`] law), loaded
-/// lazily the first time a code point misses the primary + broad fallback.
+/// built-ins, the [`fallback_chain_order`] law), loaded lazily the first time a
+/// code point misses the primary + broad fallback.
 ///
 /// Returns the paths with the length of their USER-supplied prefix, exactly as
 /// [`fallback_candidate_paths`] does and for the same reason:
-/// [`build_symbol_chain`] needs the boundary, and reading the env var ONCE and
-/// returning the count keeps the two from disagreeing.
+/// [`build_symbol_chain`] needs the boundary.
 fn symbol_fallback_candidate_paths(config: &[String]) -> (Vec<String>, usize) {
-    let env = std::env::var("ATERM_SYMBOL_FONT").ok();
-    let user_prefix = config.len() + usize::from(env.is_some());
     (
-        fallback_chain_order(config, env, &symbol_discovery_paths()),
-        user_prefix,
+        fallback_chain_order(config, &symbol_discovery_paths()),
+        config.len(),
     )
 }
 
 /// Which rasterizer turns a glyph id into a coverage mask. `Fontdue` is the
-/// portable, deterministic default (and the forced choice for golden/parity tests
-/// via `ATERM_RASTERIZER=fontdue`); `CoreText` is the macOS-native path (hinted +
+/// portable, deterministic path (and the forced choice for golden/parity tests
+/// via the `ATERM_RASTERIZER=fontdue` development seam); `CoreText` is the macOS-native path (hinted +
 /// system antialiasing, the look every other Mac app has) and is the default there.
 /// Only meaningful on macOS (the only platform with a CoreText backend today).
 #[cfg(target_os = "macos")]
@@ -3590,42 +3731,41 @@ enum RasterKind {
     CoreText,
 }
 
-/// Pick the rasterizer: CoreText by default (batteries-included native quality),
-/// unless `ATERM_RASTERIZER=portable` (or its legacy spelling `=fontdue`) forces
-/// the portable/deterministic path — tests use this for byte-stable,
-/// machine-independent output.
+/// Pick the rasterizer: CoreText (batteries-included native quality), unless a
+/// DEVELOPMENT build's `ATERM_RASTERIZER=portable` seam (or its legacy spelling
+/// `=fontdue`) forces the portable/deterministic path — the golden and parity
+/// suites run in-process in this crate and need byte-stable, machine-independent
+/// output. A shipped binary never reads it ([`aterm_types::dev_seam!`]).
 ///
-/// THE OVERRIDE ANNOUNCES ITSELF, once per process. These reads are in the
-/// SHIPPING render crate, not behind `cfg(test)`, and it is not a small
-/// change: it drops CoreText hinting and system antialiasing, additionally forces
-/// subpixel mode `Off`, and disables the variable-font instancing path. A user
-/// with it exported — or inherited from a test shell — sees glyphs no shipped
-/// build was ever visually judged against, and it is not in the
-/// `app_config` env-override registry that Settings surfaces, so nothing else in
-/// the product would tell them. It cannot simply be deleted: the golden and
-/// parity suites run in-process in this same crate and depend on it for
-/// machine-independent bytes. So it stays, and it is loud.
+/// THE OVERRIDE ANNOUNCES ITSELF, once per process: it drops CoreText hinting
+/// and system antialiasing, additionally forces subpixel mode `Off`, and
+/// disables the variable-font instancing path, so a developer who inherited it
+/// from a test shell must be told the glyphs are not the shipped ones.
 #[cfg(target_os = "macos")]
 fn select_rasterizer() -> RasterKind {
-    match std::env::var("ATERM_RASTERIZER").ok().as_deref() {
-        // `fontdue` is the legacy spelling of `portable`, kept because 20 test
-        // sites export it — see `hinted::HintMode::portable_forced`.
-        Some("portable" | "fontdue") => {
-            static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            ANNOUNCED.get_or_init(|| {
-                eprintln!(
-                    "aterm-render: $ATERM_RASTERIZER is set — glyphs are rasterized \
-                     by the portable first-party path, NOT CoreText. Hinting and \
-                     system antialiasing are off, subpixel rendering is forced Off, \
-                     and variable-font instancing is disabled. This is the \
-                     byte-stable test path; text will not look like any shipped \
-                     build. Unset it to restore CoreText."
-                );
-            });
-            RasterKind::Fontdue
-        }
-        _ => RasterKind::CoreText,
+    if !portable_raster_forced() {
+        return RasterKind::CoreText;
     }
+    static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ANNOUNCED.get_or_init(|| {
+        eprintln!(
+            "aterm-render: $ATERM_RASTERIZER is set — glyphs are rasterized \
+             by the portable first-party path, NOT CoreText. Hinting and \
+             system antialiasing are off, subpixel rendering is forced Off, \
+             and variable-font instancing is disabled. This is the \
+             byte-stable test path; text will not look like any shipped \
+             build. Unset it to restore CoreText."
+        );
+    });
+    RasterKind::Fontdue
+}
+
+/// The `ATERM_RASTERIZER` DEVELOPMENT seam ([`aterm_types::dev_seam!`]): `portable`
+/// (or the legacy `fontdue`, still exported by the golden/parity suites) pins every
+/// native raster path to the byte-stable portable one. `false` in a shipped binary.
+#[cfg(any(unix, windows))]
+fn portable_raster_forced() -> bool {
+    aterm_types::dev_seam!("ATERM_RASTERIZER").is_some_and(|v| v == "portable" || v == "fontdue")
 }
 
 /// Process-unique identity of ONE installed [`StyledFace`], minted at
@@ -3823,15 +3963,11 @@ fn color_emoji_discovery_paths() -> Vec<String> {
     paths
 }
 
-/// The ordered colour-emoji candidate paths (config `emoji_font` >
-/// `$ATERM_EMOJI_FONT` > discovery, the [`fallback_chain_order`] law), loaded
-/// lazily the first time a code point misses both mono faces.
+/// The ordered colour-emoji candidate paths (config `emoji_font` > discovery,
+/// the [`fallback_chain_order`] law), loaded lazily the first time a code point
+/// misses both mono faces.
 fn color_emoji_candidate_paths(config: &[String]) -> Vec<String> {
-    fallback_chain_order(
-        config,
-        std::env::var("ATERM_EMOJI_FONT").ok(),
-        &color_emoji_discovery_paths(),
-    )
+    fallback_chain_order(config, &color_emoji_discovery_paths())
 }
 
 /// W8: the per-face NORMALIZATION FACTS a fallback face's rasterization scale
@@ -4031,6 +4167,13 @@ struct FallbackFace {
     index: u32,
     /// The path this face was loaded from (`None` for host-injected bytes).
     path: Option<String>,
+    /// The BUILT-IN candidate path this face stands in for, when it was found
+    /// at a different path by [`relocate_missing_builtin_fonts`] (the same file
+    /// installed where another distribution puts it). Every by-path membership
+    /// rule that reads a loaded face — today the symbol tier's text-only gate,
+    /// [`symbol_face_is_text_only_backstop`] — must honour this identity too,
+    /// or relocation would silently strip a face of its declared role.
+    relocated_from: Option<String>,
     norm: FaceNorm,
 }
 
@@ -4048,6 +4191,7 @@ impl FallbackFace {
             bytes,
             index: 0,
             path,
+            relocated_from: None,
             norm,
         })
     }
@@ -4107,6 +4251,7 @@ impl FallbackFace {
             bytes,
             index: 0,
             path,
+            relocated_from: None,
             norm,
         })
     }
@@ -4484,8 +4629,10 @@ impl RuntimeFallback {
     /// it is the one runtime-fallback tier a SEALED font generation may still
     /// consult (see [`Renderer::seal_admitted_font_sources`], which closes
     /// pathname discovery but not this).
-    #[cfg_attr(not(feature = "embedded-symbols"), allow(unused_variables))]
     fn try_embedded_symbols(&mut self, ch: char, ctx: FallbackProbeCtx) -> Option<usize> {
+        // A build without the bundled symbol face (the wasm cells) has nothing to probe.
+        #[cfg(not(feature = "embedded-symbols"))]
+        let _ = (ch, ctx);
         #[cfg(feature = "embedded-symbols")]
         {
             let key = Self::EMBEDDED_SYMBOLS_PATH;
@@ -4628,6 +4775,11 @@ impl font_chain::ChainProbe for RendererProbe<'_, '_> {
                     .resolve_embedded_only(self.ch, ctx)
                     .is_some()
             }
+            // The last-resort fontless symbols. NOT gated on
+            // `$ATERM_NO_PROCEDURAL_GLYPHS`: that switch hands box drawing
+            // back to the FONT, and this tier is only ever reached when no
+            // font has the glyph — its alternative is `.notdef`, not a font.
+            font_chain::Tier::Synthetic => procedural::covers_symbol(self.ch),
         }
     }
 
@@ -4846,30 +4998,6 @@ fn font_cmap_ranges(bytes: &[u8], cps: &mut Vec<u32>) -> Option<Vec<(u32, u32)>>
     Some(ranges)
 }
 
-/// Force the one-time [`font_coverage_index`] build NOW (idempotent). Call this from a
-/// background thread at startup so the ~200 ms "read+parse every system font's cmap"
-/// cost is paid OFF the render/engine thread — otherwise it lands synchronously on the
-/// FIRST uncovered glyph (a CJK/emoji/symbol codepoint no configured face carries),
-/// stalling that frame. `OnceLock::get_or_init` means the warm and any concurrent
-/// render-thread lookup coordinate on one build, so warming can never double the work
-/// or race. Cheap no-op after the first call.
-///
-/// ONLY AN UNSEALED RENDERER CAN EVER READ THE INDEX. Its sole consumer is
-/// [`runtime_fallback_scan_candidates`], on the `Tier::RuntimeDecisions` lane,
-/// and [`font_chain::reachable_mask`] removes that tier from every SEALED
-/// policy — which every GUI generation is before its first pixel
-/// ([`Renderer::seal_admitted_font_sources`]). The GUI used to spawn an
-/// `aterm-font-warm` thread calling this after the first present: ~373 whole
-/// system-font reads (~700 MB on a Mac, the 192 MB emoji collection included)
-/// and as many cmap walks, per launch, for a table no sealed renderer could
-/// consult. That spawn is gone; this stays for the unsealed CLI renderers
-/// (`aterm show-face`, tests). `tests/sealed_never_consults_coverage_index.rs`
-/// pins the reachability argument through [`font_coverage_index_built`] and
-/// [`font_coverage_scan_queries`].
-pub fn warm_font_coverage_index() {
-    let _ = font_coverage_index();
-}
-
 /// Whether [`font_coverage_index`] has been built in this process — the
 /// observable that a sealed generation never pays the whole-font-tree read.
 /// Diagnostics only.
@@ -4895,12 +5023,114 @@ static FONT_COVERAGE_INDEX: std::sync::OnceLock<Vec<FontCoverage>> = std::sync::
 static FONT_COVERAGE_SCAN_QUERIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The root every built-in Linux candidate in [`FALLBACK_CANDIDATES`],
+/// [`SYMBOL_FALLBACK_CANDIDATES`] and [`COLOR_EMOJI_CANDIDATES`] is spelled
+/// under — the Debian/Ubuntu layout (`/usr/share/fonts/truetype/<vendor>/`).
+const LINUX_BUILTIN_FONT_ROOT: &str = "/usr/share/fonts/";
+
+/// Where a missing built-in Linux candidate actually lives on THIS host, found
+/// by its FILE NAME in the system font catalogue (pure over `files`).
+///
+/// WHY. A GUI window SEALS its font generation, and the seal closes runtime
+/// system-font discovery for good: after it, the only faces a Linux window can
+/// ever reach are the ones the built-in lists name. Those lists spell the
+/// Debian/Ubuntu paths, so on every other distribution the SAME files — Fedora's
+/// `/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf`, Arch's
+/// `/usr/share/fonts/noto/…`, `/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf`,
+/// a face dropped into `~/.local/share/fonts` — were never admitted, and a
+/// sealed window drew tofu for every code point only they cover. macOS never
+/// had this gap: its lists name paths the OS itself ships. Relocating by file
+/// name, inside the seal (on the worker, where font I/O is admitted), is what
+/// makes the Linux lists mean the FACE rather than one distribution's path to
+/// it — the same resolution fontconfig does for every other app on the box,
+/// without linking it.
+///
+/// Only a path under [`LINUX_BUILTIN_FONT_ROOT`] is relocated, and never onto
+/// itself. The first match in catalogue order wins, so a per-user copy shadows
+/// a system one exactly as it does for [`resolve_font_family`].
+///
+/// WHAT IT DOES NOT REACH: a face no list NAMES. A script with no list entry
+/// stays tofu however many installed faces cover it — measured on a Linux host
+/// on 2026-09-01, 118 installed Noto faces were still unreachable after the
+/// per-script tiers of `9bd31c4f4`. Adding entries scales with the world's
+/// writing systems; what ends it is asking, at seal time, for a face that
+/// COVERS the missing code point (the question fontconfig answers), with these
+/// lists kept as the offline fallback.
+fn relocate_builtin_font_path(declared: &str, files: &[std::path::PathBuf]) -> Option<String> {
+    if !declared.starts_with(LINUX_BUILTIN_FONT_ROOT) {
+        return None;
+    }
+    let name = std::path::Path::new(declared).file_name()?;
+    files
+        .iter()
+        .find(|f| f.file_name() == Some(name) && f.as_os_str() != declared)
+        .and_then(|f| f.to_str())
+        .map(str::to_string)
+}
+
+/// For each built-in entry of `paths` (index `>= user_prefix`) that is NOT a
+/// file at its declared path, the path the same file has on this host
+/// ([`relocate_builtin_font_path`]), else `None`. Index-aligned with `paths`.
+///
+/// One `stat` per built-in candidate; the system font catalogue is consulted
+/// (a memoized walk, revalidated by directory mtimes) only when at least one of
+/// them is missing, and ONCE for the whole list — never per candidate, so the
+/// broad chain's per-face worker threads cannot each start a walk. Only the
+/// Unix-but-not-macOS hosts relocate: the macOS and Windows arms name paths
+/// their OS ships, and a Mac should not pay a font-tree walk to learn that the
+/// Linux spellings in the shared lists are absent.
+fn relocate_missing_builtin_fonts(paths: &[String], user_prefix: usize) -> Vec<Option<String>> {
+    let mut out = vec![None; paths.len()];
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return out;
+    }
+    let missing: Vec<usize> = paths
+        .iter()
+        .enumerate()
+        .skip(user_prefix)
+        .filter(|(_, p)| {
+            p.starts_with(LINUX_BUILTIN_FONT_ROOT) && !std::path::Path::new(p.as_str()).is_file()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if missing.is_empty() {
+        return out;
+    }
+    let files = font_catalog::system_font_files();
+    for i in missing {
+        out[i] = relocate_builtin_font_path(&paths[i], &files);
+    }
+    out
+}
+
+/// Admit `declared` (or, when it is a missing built-in, its `relocated` path)
+/// as a chain face. A relocated face records both paths — see
+/// [`FallbackFace::relocated_from`].
+fn admit_chain_face(declared: &str, relocated: Option<&str>) -> Option<FallbackFace> {
+    // A BUNDLED chain entry (`bundled:…`, [`bundled`]) names compiled-in bytes,
+    // not a file: admitted by borrowing them (no read, no copy), under the same
+    // admission verdict every discovered face gets.
+    if let Some(bytes) = bundled::face_for_id(declared) {
+        return FallbackFace::from_path_bytes(
+            &crate::font::FaceBytes::Static(bytes),
+            Some(declared.to_string()),
+        )
+        .ok();
+    }
+    let load = relocated.unwrap_or(declared);
+    let bytes = font_file::admit_font_file(std::path::Path::new(load)).ok()?;
+    let mut face = FallbackFace::from_path_bytes(&bytes, Some(load.to_string())).ok()?;
+    if relocated.is_some() {
+        face.relocated_from = Some(declared.to_string());
+    }
+    Some(face)
+}
+
 /// Build the LAZY broad-fallback CHAIN for `paths` (W8). A face is ADDITIVE when
 /// the scan keeps going past it; the first NON-additive face that LOADS ends the
 /// scan. Two classes are additive:
 ///
-///  * the first `user_prefix` entries — the config `fallback_fonts` chain and
-///    the `$ATERM_FALLBACK_FONT` alias, in that order (see
+///  * the first `user_prefix` entries — the config `fallback_fonts` chain (see
 ///    [`fallback_candidate_paths`]);
 ///  * built-in [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] entries.
 ///
@@ -4933,8 +5163,11 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     // The additive predicate, by INDEX (the user prefix is positional — a user
     // may legitimately configure a path that is also a built-in backstop, and in
     // that position it must not truncate the chain behind it).
-    let additive =
-        |i: usize, p: &str| i < user_prefix || NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p);
+    let additive = |i: usize, p: &str| {
+        i < user_prefix
+            || NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p)
+            || bundled::is_bundled_id(p)
+    };
     // WHAT THIS COSTS NOW, and why the threads remain.
     //
     // The chain is normally TWO faces on macOS — Hiragino Sans GB (23.5 MB) then
@@ -4977,18 +5210,22 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
         .position(|(i, p)| !additive(i, p.as_str()))
         .map_or(paths.len(), |first_broad| first_broad + 1);
 
+    // Resolved ONCE, before the workers: a missing Debian-spelled built-in is
+    // looked up where this distribution installed the same file.
+    let relocated = relocate_missing_builtin_fonts(paths, user_prefix);
+
     let parsed: Vec<Option<FallbackFace>> = std::thread::scope(|scope| {
         let workers: Vec<_> = paths[..speculative]
             .iter()
-            .map(|p| {
+            .zip(&relocated)
+            .map(|(p, moved)| {
                 scope.spawn(move || {
                     // Straight into the store — this is the loop that had NINE
                     // files in flight at once on Windows, each one resident twice.
                     // On unix a candidate on the system font volume is a
                     // MAPPING here, not a read: the two 23 MB macOS chain faces
                     // are file-backed and faulted in per glyph.
-                    let bytes = font_file::admit_font_file(std::path::Path::new(p)).ok()?;
-                    FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
+                    admit_chain_face(p, moved.as_deref())
                 })
             })
             .collect();
@@ -5012,13 +5249,10 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     // Every speculatively-parsed candidate was additive or failed, so no broad
     // face has ended the scan yet. Continue serially through the remainder.
     for (i, p) in paths.iter().enumerate().skip(speculative) {
-        let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(p)) else {
+        let Some(face) = admit_chain_face(p, relocated[i].as_deref()) else {
             continue;
         };
         let keep_scanning = additive(i, p.as_str());
-        let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
-            continue;
-        };
         chain.push(face);
         if !keep_scanning {
             break;
@@ -5036,8 +5270,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
 /// keeps the scan going, the first other entry that LOADS ends it, and a path
 /// that fails to read or parse is skipped WITHOUT ending the scan.
 ///
-/// `user_prefix` leading entries — the config `symbol_font` then
-/// `$ATERM_SYMBOL_FONT` — are NOT additive, and that is the deliberate
+/// `user_prefix` leading entry — the config `symbol_font` — is NOT additive, and that is the deliberate
 /// difference from the broad tier. `fallback_fonts` is PLURAL and documented as
 /// an ordered chain of the user's own faces; `symbol_font` is SINGULAR and
 /// documented as the symbol face, so a host or a user who names one gets exactly
@@ -5049,16 +5282,18 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
 /// of which are the same macOS file at two spellings, so the scope + join would
 /// cost more than the reads it overlaps.
 fn build_symbol_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFace> {
+    let relocated = relocate_missing_builtin_fonts(paths, user_prefix);
     let mut chain = Vec::new();
     for (i, p) in paths.iter().enumerate() {
-        let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(p)) else {
+        let Some(face) = admit_chain_face(p, relocated[i].as_deref()) else {
             continue;
         };
-        let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
-            continue;
-        };
-        let keep_scanning =
-            i >= user_prefix && SYMBOL_TIER_ADDITIVE_CANDIDATES.contains(&p.as_str());
+        // Membership stays BY THE DECLARED PATH `p`, so a relocated dedicated
+        // symbol face keeps the scan going exactly as it does at its Debian path.
+        // A BUNDLED symbol face is additive too: the stack's Noto faces lead
+        // the tier, and the system's own symbol faces still load behind them.
+        let keep_scanning = i >= user_prefix
+            && (SYMBOL_TIER_ADDITIVE_CANDIDATES.contains(&p.as_str()) || bundled::is_bundled_id(p));
         chain.push(face);
         if !keep_scanning {
             break;
@@ -5073,8 +5308,7 @@ fn build_symbol_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFace>
 /// render-thread freeze on each new uncovered codepoint) — the build is paid once,
 /// then [`runtime_fallback_scan_candidates`] is an in-memory range probe. The
 /// LastResort tofu font is excluded (it "covers" everything). Only the small range
-/// tables are retained; the font bytes are dropped after extraction. Prefer
-/// [`warm_font_coverage_index`] at startup so this never stalls a live frame.
+/// tables are retained; the font bytes are dropped after extraction.
 ///
 /// "The font bytes are dropped after extraction" was true and still cost 27.5 MB
 /// of resident memory, permanently, in every aterm process. The scan reads EVERY
@@ -5427,6 +5661,76 @@ pub fn fallback_fit_scale(
     xmin: i32,
     advance: f32,
 ) -> f32 {
+    fit_scale_about_advance_centre(box_w, box_h, width, height, xmin, advance, true)
+}
+
+/// How a fitted fallback raster is SIZED and ANCHORED, chosen from the
+/// code point's Unicode class by [`fallback_fit_class`].
+///
+/// The two classes differ because their ink means different things:
+///
+/// * a LETTER or DIGIT (`Text`) is set on the baseline, and its advance is
+///   part of its design — a shrink fits the advance box
+///   ([`fallback_fit_scale`]) and scales `ymin` about the BASELINE, so a
+///   Noto Sans Math `𝐖` still stands on the line its neighbours stand on;
+/// * a SYMBOL (`Symbol`: everything that is not alphanumeric — pictographs,
+///   media controls, geometric shapes, dingbats, operators) is a picture
+///   whose side bearings are only spacing, which the terminal cell replaces.
+///   A shrink fits the INK ([`fallback_ink_fit_scale`]) and keeps the ink's
+///   vertical CENTRE ([`shrink_ymin_about_ink_centre`]), so Noto Sans Symbols
+///   2's `⏺` (0.9 em advance, ~0.7 em disc) reads as big as, and level with,
+///   the primary's `●`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackFit {
+    /// Letters and digits: advance fit, baseline anchor.
+    Text,
+    /// Everything else: ink fit, ink-centre anchor.
+    Symbol,
+}
+
+/// The [`FallbackFit`] class of `ch`: [`FallbackFit::Text`] for Unicode
+/// `Alphabetic` or `Numeric` scalars (every script's letters, ideographs,
+/// digits, the Mathematical Alphanumeric Symbols block), else
+/// [`FallbackFit::Symbol`].
+#[doc(hidden)]
+#[must_use]
+pub fn fallback_fit_class(ch: char) -> FallbackFit {
+    if ch.is_alphanumeric() {
+        FallbackFit::Text
+    } else {
+        FallbackFit::Symbol
+    }
+}
+
+/// [`fallback_fit_scale`] for a [`FallbackFit::Symbol`]: the smallest scale
+/// that puts the INK — centred, as the fit always is, on the advance centre —
+/// inside the cell box. The advance itself is not required to fit: its side
+/// bearings are empty space, and fitting them is what drew a wide-advance
+/// symbol at two thirds of its primary twin's size. Never enlarges; the same
+/// degenerate-input contract as [`fallback_fit_scale`].
+#[doc(hidden)]
+#[must_use]
+pub fn fallback_ink_fit_scale(
+    box_w: usize,
+    box_h: usize,
+    width: usize,
+    height: usize,
+    xmin: i32,
+    advance: f32,
+) -> f32 {
+    fit_scale_about_advance_centre(box_w, box_h, width, height, xmin, advance, false)
+}
+
+fn fit_scale_about_advance_centre(
+    box_w: usize,
+    box_h: usize,
+    width: usize,
+    height: usize,
+    xmin: i32,
+    advance: f32,
+    fit_advance: bool,
+) -> f32 {
     if box_w == 0 || box_h == 0 || width == 0 || height == 0 {
         return 1.0;
     }
@@ -5439,8 +5743,14 @@ pub fn fallback_fit_scale(
     let ink_left = xmin as f32 - centre;
     let ink_right = xmin as f32 + width as f32 - centre;
     // Twice the farthest extent from the advance centre is the smallest
-    // symmetric box that contains both advance and ink.
-    let centred_w = 2.0 * ink_left.abs().max(ink_right.abs()).max(centre.abs());
+    // symmetric box that contains the ink (and, for a text fit, the advance).
+    let ink_extent = ink_left.abs().max(ink_right.abs());
+    let extent = if fit_advance {
+        ink_extent.max(centre.abs())
+    } else {
+        ink_extent
+    };
+    let centred_w = 2.0 * extent;
     if !centred_w.is_finite() || centred_w <= 0.0 {
         return 1.0;
     }
@@ -5451,6 +5761,80 @@ pub fn fallback_fit_scale(
         scale
     } else {
         1.0
+    }
+}
+
+/// Synthetic styles [`Renderer::harmonize_fallback_raster`] applies AFTER
+/// its fit, to the fitted mask, instead of letting the fit measure them.
+#[derive(Clone, Copy, Debug)]
+struct DeferredStyle {
+    /// The synthetic-BOLD dilation in px (`0` = none deferred).
+    bold_px: usize,
+    /// Whether the synthetic ITALIC shear is deferred.
+    italic: bool,
+}
+
+impl DeferredStyle {
+    const NONE: DeferredStyle = DeferredStyle {
+        bold_px: 0,
+        italic: false,
+    };
+}
+
+/// Synthetic ITALIC's shear: the horizontal shift per row, in px per px of
+/// height above the bitmap's bottom row.
+const SYNTHETIC_ITALIC_SHEAR: f32 = 0.2;
+
+/// The baseline-relative `ymin` of a fallback raster shrunk from `h` to
+/// `dst_h` rows by [`fallback_fit_scale`]: the ink keeps its own vertical
+/// CENTRE (`ymin + h/2`), and is then moved — never cropped — into the row
+/// band when the smaller ink fits in it (`dst_h <= cell_h`; the band's top
+/// row is `baseline` rows above the baseline). Anchoring at the baseline
+/// instead (`ymin * scale`) pulls every shrunk glyph towards it: a symbol
+/// whose ink starts ON the baseline keeps its floor and loses its top, so its
+/// centre drops by `(1 - scale)` of its half-height.
+///
+/// For a [`FallbackFit::Symbol`] only: a letter's ink rests on the baseline
+/// BY DESIGN, and centring it floats it off the line
+/// ([`shrink_ymin_about_baseline`] is the [`FallbackFit::Text`] anchor).
+#[doc(hidden)]
+#[must_use]
+pub fn shrink_ymin_about_ink_centre(
+    ymin: i32,
+    h: usize,
+    dst_h: usize,
+    baseline: i32,
+    cell_h: usize,
+) -> i32 {
+    let h = i64::try_from(h).unwrap_or(i64::MAX / 4);
+    let dst_h = i64::try_from(dst_h).unwrap_or(i64::MAX / 4);
+    // Twice the new floor, so the halving happens once, rounded half up.
+    let twice = 2 * i64::from(ymin) + h - dst_h;
+    let mut y = twice.div_euclid(2) + twice.rem_euclid(2);
+    let cell_h = i64::try_from(cell_h).unwrap_or(i64::MAX / 4);
+    if dst_h <= cell_h {
+        // The ink's top row is `baseline - dst_h - y` rows into the cell and
+        // must lie in `[0, cell_h - dst_h]`.
+        let hi = i64::from(baseline) - dst_h;
+        let lo = i64::from(baseline) - cell_h;
+        y = y.clamp(lo, hi);
+    }
+    y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// The [`FallbackFit::Text`] anchor: the baseline-relative `ymin` of a raster
+/// shrunk by `scale`, scaled about the BASELINE — a letter or digit whose ink
+/// stands on the line keeps standing on it, and a descender keeps descending
+/// by its scaled depth. (Out-of-band rounding fringes are left to
+/// [`clamp_to_row_band`], as for every fitted raster.)
+#[doc(hidden)]
+#[must_use]
+pub fn shrink_ymin_about_baseline(ymin: i32, scale: f32) -> i32 {
+    let y = (ymin as f32 * scale).round();
+    if y.is_finite() {
+        y.clamp(i32::MIN as f32, i32::MAX as f32) as i32
+    } else {
+        ymin
     }
 }
 
@@ -5586,7 +5970,7 @@ fn ink_row_extent(height: usize, row_has_ink: impl Fn(usize) -> bool) -> Option<
 /// THE ARITHMETIC LIVES HERE, ONCE, because Linux rasterizes the same glyph
 /// through a second cache: the subpixel path keeps its own images, and a seat
 /// applied to only one of them leaves the underscore visible in grayscale and
-/// invisible under `ATERM_FONT_SUBPIXEL` — the same character, the same size,
+/// invisible under `font_subpixel` — the same character, the same size,
 /// two answers. Both callers ask this — and both hand it INK, which is what
 /// makes the two answers equal: the subpixel raster carries a filter pad its
 /// grayscale twin crops off, so a box-measured seat gives the two caches
@@ -5785,6 +6169,54 @@ fn resample_mask_area(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) ->
         }
     }
     Some(out)
+}
+
+/// Crop a mono coverage raster to its INK — the smallest box holding every
+/// non-zero byte — with `xmin`/`ymin` moved so that ink draws exactly where it
+/// did. Lossless: only blank rows and columns go. A raster with no ink (or
+/// malformed dimensions) comes back unchanged.
+///
+/// Why it exists: the macOS CoreText raster pads its box by a pixel or two per
+/// side plus a phase pixel ([`ct_padded_extent`]), fontdue's is the ink's own
+/// box. A fit that sizes the reported BOX therefore shrinks a CoreText glyph
+/// by its pad — Noto Sans Symbols 2's `⏺` drew 5 rows against the primary's
+/// 9-row `●` at 12 px (measured on macOS, 2026-09-25) — and a style that asks
+/// how much room the box leaves finds none beside a pad that fills it.
+/// [`Renderer::harmonize_fallback_raster`] crops first, so both platforms fit
+/// the same thing.
+fn crop_to_ink(
+    w: usize,
+    h: usize,
+    xmin: i32,
+    ymin: i32,
+    bytes: Vec<u8>,
+) -> (usize, usize, i32, i32, Vec<u8>) {
+    if w.checked_mul(h) != Some(bytes.len()) {
+        return (w, h, xmin, ymin, bytes);
+    }
+    let rows = ink_row_extent(h, |y| bytes[y * w..(y + 1) * w].iter().any(|&a| a > 0));
+    let cols = ink_row_extent(w, |x| (0..h).any(|y| bytes[y * w + x] > 0));
+    let (Some((y0, y1)), Some((x0, x1))) = (rows, cols) else {
+        return (w, h, xmin, ymin, bytes);
+    };
+    if (x0, y0, x1, y1) == (0, 0, w, h) {
+        return (w, h, xmin, ymin, bytes);
+    }
+    let (nw, nh) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity(nw * nh);
+    for row in bytes.chunks_exact(w).skip(y0).take(nh) {
+        out.extend_from_slice(&row[x0..x1]);
+    }
+    // Row 0 is the TOP and `ymin` the bottom edge (y up): dropping bottom rows
+    // raises the floor, dropping top rows moves nothing.
+    let lift = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+    (
+        nw,
+        nh,
+        xmin.saturating_add(lift(x0)),
+        ymin.saturating_add(lift(h - y1)),
+        out,
+    )
 }
 
 /// Keep `width` columns of a row-major mask after skipping `skip` source
@@ -6230,7 +6662,9 @@ mod macos_coretext {
     // SAFETY: `data`/`descs` are IMMUTABLE Core Foundation objects (atomic
     // retain/release, thread-safe reads) and `FaceBytes` is `Send + Sync`, so
     // the parse may be moved or shared across threads exactly like `CtFont`.
+
     unsafe impl Send for CtFaceDescriptors {}
+
     unsafe impl Sync for CtFaceDescriptors {}
 
     impl Drop for CtFaceDescriptors {
@@ -6329,7 +6763,9 @@ mod macos_coretext {
     // (Sync) across threads. This lets `new_with_family` build the CPU
     // `Renderer` on a worker thread (moved back via `join`, then only ever
     // rendered single-threaded).
+
     unsafe impl Send for CtFont {}
+
     unsafe impl Sync for CtFont {}
 
     impl Drop for CtFont {
@@ -6749,31 +7185,25 @@ fn resolve_styled_face_lazy(
     }
 }
 
-/// The TOML-vs-env fallback-chain PRECEDENCE LAW (W6), extracted pure so it is
-/// checkable: the ordered candidate list is exactly `config ++ env ++
-/// discovery` — explicit config entries (`fallback_fonts` / `symbol_font` /
-/// `emoji_font`) strictly outrank the legacy `$ATERM_*_FONT` env alias, which
-/// strictly outranks built-in discovery. Loaders consume the result in order
-/// (first EXISTING path wins), so list position IS precedence.
+/// The fallback-chain PRECEDENCE LAW (W6), extracted pure so it is checkable:
+/// the ordered candidate list is exactly `config ++ discovery` — explicit config
+/// entries (`fallback_fonts` / `symbol_font` / `emoji_font`) strictly outrank
+/// built-in discovery. Loaders consume the result in order (first EXISTING path
+/// wins), so list position IS precedence. (The `$ATERM_*_FONT` env tier that sat
+/// between the two was deleted on 2026-09-24.)
 ///
 /// # Invariant (proven)
 ///
-/// TOTAL over any inputs (including empties); every config entry precedes
-/// every env entry precedes every discovery entry; relative order within each
-/// class is preserved; nothing is dropped or invented
-/// (`len == config.len() + env.len() + discovery.len()`). See
+/// TOTAL over any inputs (including empties); every config entry precedes every
+/// discovery entry; relative order within each class is preserved; nothing is
+/// dropped or invented (`len == config.len() + discovery.len()`). See
 /// `crates/aterm-render/tests/styled_faces.rs` (presence-lattice order law)
 /// and the ty-checked abstract twin
 /// `aterm_spec::derive::fallback_precedence_model`.
 #[must_use]
-pub fn fallback_chain_order(
-    config: &[String],
-    env: Option<String>,
-    discovery: &[String],
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(config.len() + 1 + discovery.len());
+pub fn fallback_chain_order(config: &[String], discovery: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(config.len() + discovery.len());
     out.extend(config.iter().cloned());
-    out.extend(env);
     out.extend(discovery.iter().cloned());
     out
 }
@@ -7132,16 +7562,16 @@ const FONT_EXTS: &[&str] = &["ttf", "otf", "ttc", "otc"];
 /// family. All matches are case- and separator-insensitive (`"JetBrains Mono"`,
 /// `"JetBrainsMono"`, `"jetbrains-mono"` all hit `JetBrainsMono.ttf`). An empty /
 /// whitespace family, or no match, returns `None` so the caller falls back to
-/// `$ATERM_FONT` then the built-in candidates.
+/// the built-in candidates.
 ///
 /// This is a dependency-free resolver (no CoreText link); it deliberately does
 /// NOT consult the system font registry, so it is deterministic and testable.
-/// A user who needs an arbitrary registered face can still point `$ATERM_FONT`
-/// (or the family value) at an explicit path.
+/// A user who needs an arbitrary registered face can still point the family
+/// value at an explicit path.
 #[must_use]
 pub fn resolve_font_family(family: &str) -> Option<String> {
     // An explicit path in the family value short-circuits the scan (lets the
-    // user name a file directly, like `$ATERM_FONT`).
+    // user name a file directly).
     let trimmed = family.trim();
     if trimmed.is_empty() {
         return None;
@@ -7187,6 +7617,48 @@ pub fn resolve_font_family(family: &str) -> Option<String> {
     prefix_hit
 }
 
+/// Resolve a family request that may name a BUNDLED face ([`bundled`]) to a
+/// path or a bundled virtual identity.
+///
+/// The precedence is deliberate: the `bundled:` identity always means the
+/// compiled-in face, but a family NAME (`JetBrains Mono`) means an INSTALLED
+/// face whenever one resolves — exactly what it meant before the stack existed,
+/// so a user with the variable `JetBrainsMono[wght].ttf` keeps `font_weight` /
+/// `wght` variations — and the bundled face only when nothing installed
+/// answers. The unconfigured default never comes through here: it is the
+/// identity, placed by [`primary_candidate_paths`], and costs no directory walk.
+#[must_use]
+pub fn resolve_family_or_bundled(family: &str) -> Option<String> {
+    let trimmed = family.trim();
+    let bundled = bundled::face_for_family(trimmed);
+    if let Some((id, _)) = bundled
+        && bundled::is_identity(trimmed)
+    {
+        return Some(id.to_string());
+    }
+    resolve_font_family(trimmed).or_else(|| bundled.map(|(id, _)| id.to_string()))
+}
+
+/// The bytes behind a RESOLVED font identity — what [`resolve_config_font`] or
+/// a font-catalogue entry answered: compiled-in bytes for a `bundled:` or
+/// `display:` identity (borrowed, no copy), a bounded file read
+/// ([`font_file::read_font_file`]) for everything else. Every consumer of a
+/// resolved identity reads through here, so a virtual identity is never handed
+/// to the filesystem as a path.
+///
+/// # Errors
+///
+/// The file read's error, for a path that is not (or no longer) admissible.
+pub fn read_resolved_font(resolved: &str) -> std::io::Result<std::borrow::Cow<'static, [u8]>> {
+    if let Some(bytes) = bundled::face_for_id(resolved) {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    if let Some(bytes) = display_face_for_family(resolved) {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    font_file::read_font_file(std::path::Path::new(resolved)).map(std::borrow::Cow::Owned)
+}
+
 /// Resolve one config-authored family-or-path and validate the resulting file
 /// under the explicit-font admission policy.
 ///
@@ -7207,12 +7679,21 @@ pub fn resolve_config_font(family: &str) -> Result<String, String> {
     if display_face_for_family(trimmed).is_some() {
         return Ok(trimmed.to_string());
     }
+    // The bundled stack's faces (`JetBrains Mono` on non-macOS): the virtual
+    // identity always, a family NAME only when no installed face answers it
+    // ([`resolve_family_or_bundled`]). Either way the answer is compiled-in
+    // bytes, admissible by construction — read them with
+    // [`read_resolved_font`], never as a file.
     let explicit_path = trimmed.contains(['/', '\\']);
     let path = if explicit_path {
         trimmed.to_string()
     } else {
-        resolve_font_family(trimmed)
-            .ok_or_else(|| format!("{trimmed:?} does not resolve to a font file"))?
+        let resolved = resolve_family_or_bundled(trimmed)
+            .ok_or_else(|| format!("{trimmed:?} does not resolve to a font file"))?;
+        if bundled::is_bundled_id(&resolved) {
+            return Ok(resolved);
+        }
+        resolved
     };
     font_file::validate_font_file(std::path::Path::new(&path)).map_err(|error| {
         if explicit_path {
@@ -7368,6 +7849,19 @@ pub fn list_fonts() -> Vec<String> {
             families.insert(stem.to_string());
         }
     }
+    // The bundled stack's primary family is selectable by name on every host
+    // that compiles it in. Listed only when no installed file already answers
+    // that name: an installed copy wins the name ([`resolve_family_or_bundled`])
+    // and is listed by its own stems, so listing both would name one face twice.
+    for family in bundled::selectable_families() {
+        let want = normalize_family(family);
+        if !families
+            .iter()
+            .any(|stem| normalize_family(stem).starts_with(&want))
+        {
+            families.insert((*family).to_string());
+        }
+    }
     families.into_iter().collect()
 }
 
@@ -7472,16 +7966,17 @@ fn deco_tables(bytes: &[u8]) -> Option<deco::DecoTables> {
 /// This is the data behind `aterm show-face <family>`.
 #[must_use]
 pub fn face_info(family: &str) -> Option<FaceInfo> {
-    let path = resolve_font_family(family)?;
-    let bytes = font_file::read_font_file(std::path::Path::new(&path)).ok()?;
+    // A bundled family (`JetBrains Mono` on non-macOS) reports its compiled-in
+    // face under its virtual identity — the face the renderer really loads.
+    let path = resolve_family_or_bundled(family)?;
+    let bytes = read_resolved_font(&path).ok()?;
     let font =
-        crate::font::Font::from_bytes(bytes.as_slice(), crate::font::FontSettings::default())
-            .ok()?;
+        crate::font::Font::from_bytes(&bytes[..], crate::font::FontSettings::default()).ok()?;
     let lm = font.horizontal_line_metrics(FaceInfo::PROBE_PX)?;
     let adv = font.metrics('M', FaceInfo::PROBE_PX).advance_width;
     // Glyph count from the font's glyph table (ttf-parser is already a dependency,
     // used for the colour-emoji sbix path).
-    let glyph_count = ttf_parser::Face::parse(bytes.as_slice(), 0)
+    let glyph_count = ttf_parser::Face::parse(&bytes, 0)
         .map(|f| f.number_of_glyphs() as usize)
         .unwrap_or(0);
     Some(FaceInfo {
@@ -7610,11 +8105,11 @@ impl Renderer {
             styled_faces: [None, None, None],
             synthetic_styles: true,
             #[cfg(any(all(unix, not(target_os = "macos")), windows))]
-            hint_mode: hinted::HintMode::from_env(),
+            hint_mode: hinted::HintMode::initial(),
             #[cfg(any(all(unix, not(target_os = "macos")), windows))]
             hint_bank: hinted::HintBank::default(),
             #[cfg(all(unix, not(target_os = "macos")))]
-            subpix_mode: subpixel::SubpixelMode::from_env(),
+            subpix_mode: subpixel::SubpixelMode::initial(),
             #[cfg(all(unix, not(target_os = "macos")))]
             subpx_bank: hinted::HintBank::default(),
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -7668,10 +8163,12 @@ impl Renderer {
             head: 0,
             pad_top: None,
             chrome_bleed: None,
+            chrome_room_memo: None,
+            chrome_room: (0, 0),
             baseline,
             theme,
-            stem_lut: build_stem_lut(env_stem_gamma()),
-            stem_gamma: env_stem_gamma(),
+            stem_lut: build_stem_lut(DEFAULT_STEM_GAMMA),
+            stem_gamma: DEFAULT_STEM_GAMMA,
             text_blending: TextBlending::default(),
             font_thicken: false,
             selection_fg: None,
@@ -7691,7 +8188,7 @@ impl Renderer {
             land_parses_on_poll: false,
             cursor_blink_phase: true,
             cursor_style_override: None,
-            procedural: std::env::var_os(NO_PROCEDURAL_ENV).is_none(),
+            procedural: aterm_types::dev_seam!(NO_PROCEDURAL_ENV).is_none(),
             deco_masks: std::cell::RefCell::new(Vec::new()),
             deco_tables: deco_tables(bytes),
             underline_adjust_pos: 0,
@@ -8004,8 +8501,7 @@ impl Renderer {
     }
 
     /// Install the CONFIG fallback-font chain (TOML `fallback_fonts`, W6):
-    /// resolved paths that OUTRANK the `$ATERM_FALLBACK_FONT` compat alias,
-    /// which outranks the built-in discovery candidates — the proven
+    /// resolved paths that OUTRANK the built-in discovery candidates — the proven
     /// [`fallback_chain_order`] precedence law. Every entry is loaded, in order,
     /// AHEAD of the built-in chain rather than instead of it — see
     /// [`build_fallback_chain`] on why the user prefix is additive.
@@ -8032,8 +8528,7 @@ impl Renderer {
     }
 
     /// Install the CONFIG symbol-fallback font (TOML `symbol_font`, W6):
-    /// outranks `$ATERM_SYMBOL_FONT`, which outranks the built-ins
-    /// ([`fallback_chain_order`]). Same no-op/hot-reload contract as
+    /// outranks the built-ins ([`fallback_chain_order`]). Same no-op/hot-reload contract as
     /// [`Self::set_config_fallback_fonts`].
     pub fn set_config_symbol_font(&mut self, path: Option<&str>) -> bool {
         if self.cfg_symbol_font.as_deref() == path {
@@ -8051,7 +8546,7 @@ impl Renderer {
     }
 
     /// Install the CONFIG colour-emoji font (TOML `emoji_font`, W6): outranks
-    /// `$ATERM_EMOJI_FONT`, which outranks discovery ([`fallback_chain_order`]).
+    /// discovery ([`fallback_chain_order`]).
     /// Same no-op/hot-reload contract as [`Self::set_config_fallback_fonts`].
     pub fn set_config_emoji_font(&mut self, path: Option<&str>) -> bool {
         if self.cfg_emoji_font.as_deref() == path {
@@ -8272,9 +8767,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// Build from the first available system monospace font ($ATERM_FONT first).
-    /// The Unicode fallback ($ATERM_FALLBACK_FONT first) is recorded but loaded
-    /// LAZILY on the first code point that misses the primary face.
+    /// Build from the first available system monospace font ([`FONT_CANDIDATES`]).
+    /// The Unicode fallback chain is recorded but loaded LAZILY on the first code
+    /// point that misses the primary face.
     pub fn from_system(px: f32, theme: Theme) -> Option<Self> {
         Self::from_system_with_family(None, px, theme)
     }
@@ -8317,14 +8812,14 @@ impl Renderer {
             return Ok(renderer);
         }
         let path = resolve_config_font(family)?;
-        let bytes = font_file::read_font_file(std::path::Path::new(&path))
+        let bytes = read_resolved_font(&path)
             .map_err(|error| format!("font {path:?} failed bounded admission ({error})"))?;
         Self::from_resolved_font_file(path, &bytes, px, theme)
     }
 
     /// Like [`Renderer::from_system`], but tries a configured font FAMILY name
     /// FIRST. The candidate order is: the resolved family file (if `family` names
-    /// one that exists), then `$ATERM_FONT`, then the built-in [`FONT_CANDIDATES`].
+    /// one that exists), then the built-in [`FONT_CANDIDATES`].
     /// A `None` family — or a family that resolves to nothing — reduces EXACTLY to
     /// `from_system`, so the default (and a typo'd family) is byte-identical.
     pub fn from_system_with_family(family: Option<&str>, px: f32, theme: Theme) -> Option<Self> {
@@ -8342,11 +8837,22 @@ impl Renderer {
             return Some(renderer);
         }
         let mut paths: Vec<String> = Vec::new();
-        if let Some(p) = family.and_then(resolve_font_family) {
+        // A bundled virtual identity (what `resolve_config_font` admits a
+        // bundled face as) is compiled-in bytes, never the filesystem; a bundled
+        // family NAME yields to an installed face of that name
+        // ([`resolve_family_or_bundled`]).
+        if let Some(requested) = family
+            && let Some(p) = resolve_family_or_bundled(requested)
+        {
             paths.push(p);
         }
         paths.extend(primary_candidate_paths());
         for p in paths {
+            if let Some((id, bytes)) = bundled::face_for_family(&p)
+                && let Ok(r) = Self::from_resolved_font_file(id, bytes, px, theme)
+            {
+                return Some(r);
+            }
             if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p))
                 && let Ok(r) = Self::from_resolved_font_file(p.clone(), &bytes, px, theme)
             {
@@ -8490,6 +8996,7 @@ impl Renderer {
     /// alone put it there in 18 of the band's 69 glyph cells on the machine
     /// that measured it, and a faster parse or a slower frame moves it.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn debug_land_lazy_parses_on_poll(&mut self, on: bool) {
         self.land_parses_on_poll = on;
     }
@@ -8831,7 +9338,19 @@ impl Renderer {
         if self.fallback_pick.contains_key(&ch) {
             return true;
         }
+        // A BUNDLED broad face (the embedded DejaVu Sans Mono, which LEADS the
+        // tier on non-macOS) is a text face placed ahead of the host's own
+        // faces, so its coverage of an emoji-default or private-use point is
+        // incidental: the colour face / the Symbols Nerd Font own those (the
+        // rule `symbol_face_is_text_only_backstop` states for the symbol tier).
+        // A pure function of `ch`, so the memoized pick below stays the one the
+        // rasterizer reads back.
+        let incidental =
+            aterm_grapheme::is_emoji_presentation(ch) || font_chain::is_private_use(ch);
         for (i, face) in self.fallback_chain.iter().enumerate() {
+            if incidental && face.path.as_deref().is_some_and(bundled::is_bundled_id) {
+                continue;
+            }
             // COVERAGE FROM THE UNICODE CMAP (ttf-parser), NOT fontdue's char
             // lookup — the SAME authority the primary tier already uses, and for
             // the same reason (`primary_unicode_gid`): fontdue mis-selects a Mac
@@ -8933,8 +9452,14 @@ impl Renderer {
         // this pick RECOMPUTABLE in the rasterizer (see the doc above).
         let incidental =
             aterm_grapheme::is_emoji_presentation(ch) || font_chain::is_private_use(ch);
+        // The owner's order puts the embedded Symbols Nerd Font ahead of the
+        // bundled Noto faces: a point it draws is left to it.
+        let nerd_owned = bundled::ACTIVE && !incidental && embedded_symbols_own_text_point(ch);
         self.symbol_chain.iter().position(|face| {
             if incidental && symbol_face_is_text_only_backstop(face) {
+                return false;
+            }
+            if nerd_owned && face.path.as_deref().is_some_and(bundled::is_bundled_id) {
                 return false;
             }
             ttf_parser::Face::parse(&face.bytes, face.index)
@@ -8962,6 +9487,27 @@ impl Renderer {
         let Some(primary) = self.primary_path.clone() else {
             return; // byte-loaded / embedded primary: no sibling to derive
         };
+        // 0) A BUNDLED primary's real styled faces are compiled in beside it
+        // (JetBrains Mono Bold / Italic / BoldItalic): no sibling FILE exists to
+        // derive, and none may be read. Through the shared store like a sibling
+        // file, so the chrome's bold face is the same bytes.
+        if bundled::is_bundled_id(&primary) {
+            for (slot, bytes) in bundled::styled_siblings(&primary).into_iter().enumerate() {
+                if let Some(bytes) = bytes
+                    && self.styled_faces[slot].is_none()
+                    && face_admissible(bytes, 0)
+                {
+                    self.styled_faces[slot] = Some(StyledFace {
+                        font: LazyFontdue::deferred(),
+                        bytes: shared_face_bytes(bytes, 0),
+                        index: 0,
+                        gid_cache: FxHashMap::default(),
+                        id: next_styled_face_id(),
+                    });
+                }
+            }
+            return;
+        }
         // 1) Real sibling FILES (`…-Bold.ttf`), each a single face (index 0).
         let candidates = styled_sibling_paths(&primary);
         for (slot, cands) in candidates.into_iter().enumerate() {
@@ -9415,6 +9961,7 @@ impl Renderer {
     /// (the batteries-included default; `false` under `ATERM_RASTERIZER=fontdue`).
     #[doc(hidden)]
     #[cfg(target_os = "macos")]
+    #[cfg(test)]
     pub fn debug_uses_coretext(&self) -> bool {
         self.rasterizer == RasterKind::CoreText
     }
@@ -9655,7 +10202,6 @@ impl Renderer {
     /// Inert twin (macOS: CoreText owns the native path; wasm: fontdue is the
     /// only backend) so the raster chain reads identically everywhere.
     #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
-    #[allow(clippy::unused_self)]
     fn hinted_primary_char(
         &mut self,
         _key: GlyphKey,
@@ -9887,7 +10433,6 @@ impl Renderer {
                 _ => None,
             };
         // `bytes`/`index` feed the CoreText-native raster below — macOS-only.
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let Some((font, bytes, index, norm)) = parts else {
             let (m, b) = self.font.rasterize(ch, self.px);
             return (m.width, m.height, m.xmin, m.ymin, m.advance_width, b);
@@ -9912,7 +10457,10 @@ impl Renderer {
             })
         };
         #[cfg(not(target_os = "macos"))]
-        let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
+        let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
+            let _ = index; // the face index selects a CoreText face; macOS-only
+            None
+        };
         if let Some(t) = ct {
             t
         } else if let Some(f) = font.as_ref().and_then(|lazy| lazy.get(&bytes)) {
@@ -10181,28 +10729,77 @@ impl Renderer {
     /// `cells` comes from [`GlyphKey::cell_span`]. Frame rendering stamps that
     /// key from [`materialized_cell_span`], preserving old-cell geometry across
     /// an ambiguous-width reload; non-cell callers use [`fallback_cell_count`].
+    ///
+    /// `fit` ([`FallbackFit`], from the code point's Unicode class) picks the
+    /// size and anchor of a shrink. A LETTER or DIGIT fits its advance and is
+    /// scaled about the baseline ([`shrink_ymin_about_baseline`]), so a Noto
+    /// Sans Math `𝐖` stands on the line. A SYMBOL fits its INK
+    /// ([`fallback_ink_fit_scale`]) and keeps its ink CENTRE
+    /// ([`shrink_ymin_about_ink_centre`]): fitting the advance drew Noto Sans
+    /// Symbols 2's `⏺` (0.9 em advance) at two thirds of the primary's `●`,
+    /// and scaling it about the baseline dragged it down towards the line.
+    /// Centring a LETTER instead floated it 3-5 px above its neighbours — the
+    /// reason there are two classes.
+    ///
+    /// The raster is first cropped to its INK ([`crop_to_ink`]): the macOS
+    /// CoreText box carries a pad fontdue's does not, and a fit or a room
+    /// reading taken off that pad differs by platform.
+    ///
+    /// `deferred` carries the synthetic styles applied to the FITTED mask
+    /// rather than measured by the fit — measuring them shrank a box-filling
+    /// symbol by its dilation (bold `✘` 7 rows against the regular 9 at
+    /// 14 px) or its shear (italic `✔` 11 rows against the bold 14). Neither
+    /// costs the glyph its height, and neither is ever dropped:
+    ///
+    /// * `bold_px`, a fitted SYMBOL's synthetic BOLD: the dilation grows into
+    ///   the box's spare columns, and what the box has no room for grows
+    ///   INSIDE the ink — the spill past the box is cut off, so the strokes
+    ///   thicken by the full width while the silhouette keeps its own;
+    /// * `italic`, a fallback face's synthetic ITALIC: the full shear leans
+    ///   the fitted upright mask, the box's spare columns take the widening
+    ///   (the mask moves left into them when the right side has too few), and
+    ///   what the box has no room for comes out of the WIDTH.
+    ///
+    /// A style that instead yielded to the box vanished whenever the fitted
+    /// ink filled it — the common case for a symbol the ink fit sizes by its
+    /// width — and drew a bold or an italic `⚠` exactly as the regular one.
     fn harmonize_fallback_raster(
         &self,
         cells: usize,
         raw: (usize, usize, i32, i32, f32, Vec<u8>),
+        deferred: DeferredStyle,
+        fit: FallbackFit,
     ) -> (usize, usize, i32, i32, f32, Vec<u8>) {
         let (mut w, mut h, mut xmin, mut ymin, mut adv, mut bytes) = raw;
         let cells = cells.min(2);
         if cells > 0 && w > 0 && h > 0 {
+            // Fit the INK, not the raster box: CoreText's box carries a pad
+            // fontdue's does not ([`crop_to_ink`]), and everything below —
+            // the scale, the anchor, the room a deferred style may use —
+            // measures `w`/`h`/`xmin`/`ymin`.
+            (w, h, xmin, ymin, bytes) = crop_to_ink(w, h, xmin, ymin, bytes);
             if !adv.is_finite() || adv <= 0.0 {
                 adv = w as f32;
             }
             let box_w = cells.saturating_mul(self.cell_w).max(1);
-            let scale = fallback_fit_scale(box_w, self.cell_h, w, h, xmin, adv);
+            let scale = match fit {
+                FallbackFit::Text => fallback_fit_scale(box_w, self.cell_h, w, h, xmin, adv),
+                FallbackFit::Symbol => fallback_ink_fit_scale(box_w, self.cell_h, w, h, xmin, adv),
+            };
             if scale < 1.0 {
                 let dst_w = ((w as f32 * scale).round() as usize).clamp(1, box_w);
                 let dst_h = ((h as f32 * scale).round() as usize).clamp(1, self.cell_h.max(1));
                 if let Some(scaled) = resample_mask_area(&bytes, w, h, dst_w, dst_h) {
                     bytes = scaled;
+                    xmin = (xmin as f32 * scale).round() as i32;
+                    ymin = match fit {
+                        FallbackFit::Text => shrink_ymin_about_baseline(ymin, scale),
+                        FallbackFit::Symbol => {
+                            shrink_ymin_about_ink_centre(ymin, h, dst_h, self.baseline, self.cell_h)
+                        }
+                    };
                     w = dst_w;
                     h = dst_h;
-                    xmin = (xmin as f32 * scale).round() as i32;
-                    ymin = (ymin as f32 * scale).round() as i32;
                     adv *= scale;
                 }
             }
@@ -10213,6 +10810,42 @@ impl Renderer {
                 box_w_i32,
                 adv.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32,
             ));
+
+            if deferred.bold_px > 0 {
+                // Dilate the FITTED mask by the full `bold_px`. The widening
+                // keeps as many columns as the box has spare (re-centred so
+                // they split around the ink); the rest of the spill is cut, so
+                // on a box-filling symbol the strokes thicken inward.
+                let (bold, nw) = embolden(&bytes, w, h, deferred.bold_px);
+                let keep = nw.min(box_w.max(w));
+                if let Some(bold) = crop_mask_columns(&bold, nw, h, 0, keep) {
+                    let half = i32::try_from((keep - w) / 2).unwrap_or(0);
+                    bytes = bold;
+                    w = keep;
+                    let max_x = i32::try_from(box_w.saturating_sub(w)).unwrap_or(i32::MAX);
+                    xmin = xmin.saturating_sub(half).min(max_x).max(0);
+                }
+            }
+
+            if deferred.italic {
+                // The slant widens the mask to the RIGHT (its bottom row stays
+                // put). The box takes what it can — moving the mask left into
+                // spare columns — and an area squeeze takes the rest out of the
+                // width; the height is never touched.
+                let (sheared, nw) = slant(&bytes, w, h, SYNTHETIC_ITALIC_SHEAR);
+                let fit_w = nw.min(box_w.max(w));
+                let fitted = if fit_w < nw {
+                    resample_mask_area(&sheared, nw, h, fit_w, h)
+                } else {
+                    Some(sheared)
+                };
+                if let Some(fitted) = fitted {
+                    bytes = fitted;
+                    w = fit_w;
+                    let max_x = i32::try_from(box_w.saturating_sub(w)).unwrap_or(i32::MAX);
+                    xmin = xmin.min(max_x).max(0);
+                }
+            }
 
             // The fit inequality is continuous; raster/bearing rounding can
             // leave a one-pixel fringe. Trim only that fringe so the final mask
@@ -10354,8 +10987,13 @@ impl Renderer {
             return;
         }
         let paths = std::mem::take(&mut self.color_font_paths);
-        for p in paths {
-            if let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(&p)) {
+        // Only the BUILT-IN tail relocates (a configured `emoji_font` names
+        // exactly the file the user meant); that tail is `COLOR_EMOJI_CANDIDATES`.
+        let builtin_from = paths.len().saturating_sub(COLOR_EMOJI_CANDIDATES.len());
+        let relocated = relocate_missing_builtin_fonts(&paths, builtin_from);
+        for (p, moved) in paths.iter().zip(relocated) {
+            let p = moved.as_deref().unwrap_or(p);
+            if let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(p)) {
                 // Validate it parses as a colour (sbix) face before keeping it.
                 if ttf_parser::Face::parse(&bytes, 0).is_ok() {
                     self.color_font = Some(intern_discovered_font_bytes(&bytes));
@@ -10889,13 +11527,6 @@ impl Renderer {
         self.undercurl_masks.borrow_mut().clear();
     }
 
-    /// The current underline adjustment `(position, thickness)` deltas (see
-    /// [`Self::set_adjust_underline`]).
-    #[must_use]
-    pub fn adjust_underline(&self) -> (i32, i32) {
-        (self.underline_adjust_pos, self.underline_adjust_thick)
-    }
-
     /// Enable/disable descender ink-skip (config `underline_skip_descenders`,
     /// W7, DEFAULT ON): underline coverage is zeroed within a 1px dilation of
     /// the cell's own DESCENDER ink (ink strictly below the baseline — letter
@@ -11172,6 +11803,7 @@ impl Renderer {
     }
 
     /// The current line-height multiplier (see [`Self::set_line_height`]).
+    #[cfg(test)]
     pub fn line_height(&self) -> f32 {
         self.line_height_scale
     }
@@ -11200,14 +11832,6 @@ impl Renderer {
     /// the theme, so no glyph-cache invalidation is needed.
     pub fn set_selection_fg(&mut self, fg: Option<u32>) {
         self.selection_fg = fg;
-    }
-
-    /// The current explicit selected-text foreground override (or `None` for the
-    /// contrast-floor default). The GPU renderer reads this off its wrapped CPU
-    /// face so both paths resolve selected-glyph colour identically.
-    #[must_use]
-    pub fn selection_fg(&self) -> Option<u32> {
-        self.selection_fg
     }
 
     /// Set the per-cell minimum contrast ratio (xterm's `minimumContrastRatio`,
@@ -11320,12 +11944,6 @@ impl Renderer {
     /// is `true`. Applied at fill time, so no glyph-cache invalidation is needed.
     pub fn set_selection_inactive_bg(&mut self, bg: Option<u32>) {
         self.selection_inactive_bg = bg;
-    }
-
-    /// The configured inactive selection background override, or `None` (derived).
-    #[must_use]
-    pub fn selection_inactive_bg(&self) -> Option<u32> {
-        self.selection_inactive_bg
     }
 
     /// The selection background to fill selected cells with THIS frame: the active
@@ -11714,6 +12332,19 @@ impl Renderer {
             font_chain::Resolution::Runtime(_) => FaceId::RuntimeFallback,
             font_chain::Resolution::Face(f) => f,
         };
+        // The chain's LAST tier answered: no face covers `ch`, so this is still a
+        // real font miss — report it exactly like `.notdef` does, so a poll-based
+        // host injects a real face (the injection clears the memo, and the real
+        // face then outranks the synthesis). The two procedural families are
+        // disjoint, so `covers_symbol` names the tier unambiguously.
+        let synthetic = face == FaceId::Procedural && procedural::covers_symbol(ch);
+        if synthetic {
+            self.missing_font_classes |= if policy.wants_emoji {
+                MISSING_FONT_CLASS_EMOJI
+            } else {
+                MISSING_FONT_CLASS_TEXT
+            };
+        }
         let mut key = match face {
             // The colour face carries a 32-bit RGBA sbix bitmap (🚀 😀); every
             // other outcome — including the monochromatized colour silhouette
@@ -11729,7 +12360,9 @@ impl Renderer {
             }
             source => GlyphKey::mono_char(source, ch, StyleBits::REGULAR, self.px_q),
         };
-        if key.glyph_class == GlyphClass::Mono && harmonized_fallback_source(key.source) {
+        if synthetic
+            || (key.glyph_class == GlyphClass::Mono && harmonized_fallback_source(key.source))
+        {
             key.cell_span = fallback_cell_count(ch, &self.shaping) as u8;
         }
         // P3 KEY/RASTER AGREEMENT: the record this resolution WROTE must be the
@@ -11750,6 +12383,7 @@ impl Renderer {
     /// [`Self::runtime_fallback`]. Exposed for tests/diagnostics: production code
     /// reaches it only via [`Self::glyph_key`]'s give-up path.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn runtime_fallback_resolves(&mut self, ch: char) -> bool {
         let ctx = self.runtime_probe_ctx();
         self.runtime_fallback.resolve(ch, ctx).is_some()
@@ -12051,9 +12685,8 @@ impl Renderer {
         self.font_thicken
     }
 
-    /// Set the aesthetic stem gamma (config `stem_gamma`, aliased by the
-    /// `ATERM_STEM_GAMMA` env var — the host resolves env > config and passes
-    /// the winner here). Clamped to the same `0.30..=3.0` as the env path;
+    /// Set the aesthetic stem gamma (config `stem_gamma`, which the host passes
+    /// here). Clamped to `0.30..=3.0` ([`clamp_stem_gamma`]);
     /// `1.0` is the identity LUT. A change rebuilds the LUT and drops the
     /// rasterized-glyph cache (stem darkening bakes into the cached coverage
     /// bytes); a same-value call is free.
@@ -12075,10 +12708,9 @@ impl Renderer {
         self.stem_gamma
     }
 
-    /// Set the native grid-fitting mode (config `font_hinting`, aliased by the
-    /// `ATERM_FONT_HINTING` env var — the host resolves env > config and
-    /// passes the winner here, the `stem_gamma` discipline). Spellings:
-    /// `"full"` (the default — and, like the env, what any unrecognized value
+    /// Set the native grid-fitting mode (config `font_hinting`, which the host
+    /// passes here, the `stem_gamma` discipline). Spellings:
+    /// `"full"` (the default — and what any unrecognized value
     /// resolves to) / `"light"` / `"native"` / `"off"|"0"|"none"|"false"`.
     /// Under `ATERM_RASTERIZER=fontdue` the byte-stable fontdue pin stays
     /// forced regardless, so the golden/parity exports cannot be re-hinted by
@@ -12151,9 +12783,8 @@ impl Renderer {
         }
     }
 
-    /// Set the Linux subpixel-RGB text mode (config `font_subpixel`, aliased
-    /// by the `ATERM_FONT_SUBPIXEL` env var — the host resolves env > config
-    /// and passes the winner here, the `font_hinting` discipline). Spellings:
+    /// Set the Linux subpixel-RGB text mode (config `font_subpixel`, which the
+    /// host passes here, the `font_hinting` discipline). Spellings:
     /// `"off"` (the DEFAULT — and what any unrecognized value resolves to) /
     /// `"rgb"|"on"|"1"|"true"` / `"bgr"`. STAGE 1 of
     /// `docs/RFC-linux-subpixel-text.md`: per-channel coverage in the CPU
@@ -12557,6 +13188,135 @@ impl Renderer {
         // can never be described by the old raster's ink.
         self.glyphs.clear();
         self.glyph_bytes = 0;
+        // …and so does the room measured from them.
+        self.chrome_room_memo = None;
+    }
+
+    /// What a drawn band icon is fitted to (rulings 251 and 258): the
+    /// baseline, the capital height (the ink height of `H`), the stem (the
+    /// ink across the middle row of `l`) of this face at `bold` weight and
+    /// the top of its tallest ASCII ink, measured on the rasters the band's
+    /// words are drawn from, so an icon has the weight and the height of the
+    /// letters beside it and never rises above the tallest of them. Read once
+    /// per icon raster (the icon is cached like any glyph, and dropped with
+    /// the images).
+    fn icon_metrics(&mut self, bold: bool) -> procedural::IconMetrics {
+        let style = if bold {
+            StyleBits::BOLD
+        } else {
+            StyleBits::REGULAR
+        };
+        let l = self.glyph_key_styled('l', style);
+        let stem = match &self.cached_glyph(l).img {
+            GlyphImage::Mono {
+                width,
+                height,
+                bytes,
+                ..
+            } if *height > 0 && *width > 0 => {
+                let row = height / 2;
+                bytes[row * width..(row + 1) * width]
+                    .iter()
+                    .map(|&c| f32::from(c))
+                    .sum::<f32>()
+                    / 255.0
+            }
+            _ => (self.cell_w as f32 / 8.0).max(1.0),
+        };
+        let h = self.glyph_key_styled('H', style);
+        let cap = self
+            .glyph_ink_box_cached(h)
+            .map_or(self.cell_h as f32 * 0.55, |(hh, _)| hh as f32);
+        procedural::IconMetrics {
+            baseline: self.baseline as f32,
+            cap,
+            stem,
+            head: self.ascii_ink_room().0 as f32,
+        }
+    }
+
+    /// The rows `[y0, y1)` of the face's single underline in a cell — where
+    /// a band row's closing seam runs, and so the floor an outlined capsule
+    /// stands on ([`chrome_ring_runs`], ruling 254). The one value both
+    /// backends pass the builder.
+    #[must_use]
+    pub fn chrome_ring_floor(&self) -> (usize, usize) {
+        deco::underline_band(UnderlineStyle::Single, self.cell_h, self.deco_metrics())
+            .unwrap_or((self.cell_h.saturating_sub(2), self.cell_h.saturating_sub(1)))
+    }
+
+    /// The glyph key cell `c` of a frame row (`cells`) draws INSTEAD of its
+    /// character's, when the row's chrome raster names a band icon there
+    /// (ruling 251); `None` everywhere else. The one lookup both backends
+    /// make, so the CPU blit and the GPU atlas key the same raster. The icon
+    /// SPILLS into its neighbours (ruling 258) only when both are blank —
+    /// a space drawing no glyph, as the band's ` G TITLE` leaves them — so a
+    /// spilled icon never meets another glyph's ink; beside ink, or at the
+    /// row's edge, it keeps to its cell.
+    #[must_use]
+    pub fn chrome_icon_key(
+        &self,
+        raster: Option<&ChromeRaster>,
+        cells: &[RenderCell],
+        c: usize,
+    ) -> Option<GlyphKey> {
+        let icon = raster?.icon_at(c)?;
+        let cell = cells.get(c)?;
+        let style = if cell.bold {
+            StyleBits::BOLD
+        } else {
+            StyleBits::REGULAR
+        };
+        let blank = |n: Option<&RenderCell>| n.is_some_and(|n| n.ch == ' ' && !n.wide);
+        let spill = c > 0 && blank(cells.get(c - 1)) && blank(cells.get(c + 1));
+        Some(band_icon_key(icon, style, spill, self.px_q))
+    }
+
+    /// The ROOM a chrome row that keeps its words clear of its rail
+    /// ([`ChromeRaster::clear_rail`], design ruling 248) has in one cell:
+    /// `(head, foot)`, the pixel rows above the tallest and below the lowest
+    /// ink of printable ASCII, regular and bold — the band's words — as the
+    /// cell draws it (measured on the rasters, prewarmed, not read off the
+    /// font's metrics, which leave room for accents). `(0, 0)` when `input`
+    /// has no such row. Memoized until the glyph images or the cell geometry
+    /// change; read by both backends ([`chrome_fit`]).
+    pub fn chrome_room_for(&mut self, input: &RenderInput) -> (usize, usize) {
+        if !input.chrome_rasters.iter().any(|m| m.clear_rail) {
+            return (0, 0);
+        }
+        self.ascii_ink_room()
+    }
+
+    /// `(head, foot)`: the pixel rows above the tallest and below the lowest
+    /// ink of printable ASCII, regular and bold, as the cell draws it —
+    /// [`Self::chrome_room_for`]'s measure, and the ceiling of a drawn band
+    /// icon ([`Self::icon_metrics`]). Memoized until the glyph images or the
+    /// cell geometry change.
+    fn ascii_ink_room(&mut self) -> (usize, usize) {
+        if let Some((h, b, room)) = self.chrome_room_memo
+            && h == self.cell_h
+            && b == self.baseline
+        {
+            return room;
+        }
+        let (baseline, cell_h) = (self.baseline, self.cell_h as i32);
+        let (mut top, mut bottom) = (cell_h, 0i32);
+        for ch in '\u{21}'..='\u{7E}' {
+            let regular = self.glyph_key(ch);
+            let bold = self.glyph_key_styled(ch, StyleBits::BOLD);
+            for key in [regular, bold] {
+                if let Some((h, ymin)) = self.glyph_ink_box_cached(key) {
+                    let h = i32::try_from(h).unwrap_or(i32::MAX);
+                    top = top.min(baseline - (ymin + h));
+                    bottom = bottom.max(baseline - ymin);
+                }
+            }
+        }
+        let head = usize::try_from(top.clamp(0, cell_h)).unwrap_or(0);
+        let foot = usize::try_from((cell_h - bottom).clamp(0, cell_h)).unwrap_or(0);
+        let room = (head, foot.min(self.cell_h - head));
+        self.chrome_room_memo = Some((self.cell_h, self.baseline, room));
+        room
     }
 
     /// The rasterized image for `key`, cached. External rasterizers (the GPU
@@ -12695,6 +13455,33 @@ impl Renderer {
                 // hand-built; fail safe to the primary face below rather than
                 // panicking. The key's `px_q` stands in for (cell_w, cell_h):
                 // both are pure functions of this renderer's px and face.
+                if key.source == FaceId::Procedural
+                    && key.ch_or_id & CHROME_ICON_BIT != 0
+                    && let Some(icon) = BandIcon::from_index(
+                        key.ch_or_id & !(CHROME_ICON_BIT | CHROME_ICON_SPILL_BIT),
+                    )
+                {
+                    // A drawn band icon (ruling 251): cell-exact like the
+                    // box-drawing bitmaps below, its stroke the face's stem —
+                    // or, spilling into its blank neighbours (ruling 258),
+                    // three cells wide from the cell to its left.
+                    let spill = key.ch_or_id & CHROME_ICON_SPILL_BIT != 0;
+                    let m = self.icon_metrics(key.style.contains(StyleBits::BOLD));
+                    return GlyphImage::Mono {
+                        width: procedural::band_icon_width(self.cell_w, spill),
+                        height: self.cell_h,
+                        xmin: if spill { -(self.cell_w as i32) } else { 0 },
+                        ymin: self.baseline - self.cell_h as i32,
+                        advance: self.cell_w as f32,
+                        bytes: procedural::band_icon_coverage(
+                            icon,
+                            self.cell_w,
+                            self.cell_h,
+                            m,
+                            spill,
+                        ),
+                    };
+                }
                 if key.source == FaceId::Procedural {
                     let cp = key.ch_or_id & !(SHADE_PHASE_X_BIT | SHADE_PHASE_Y_BIT);
                     let (phase_x, phase_y) = (
@@ -12716,6 +13503,24 @@ impl Renderer {
                             xmin: 0,
                             ymin: self.baseline - self.cell_h as i32,
                             advance: self.cell_w as f32,
+                            bytes,
+                        };
+                    }
+                    // The chain's last-resort symbol tier: a `span`-cell box
+                    // anchored at the lead cell's top-left, exactly like the
+                    // box-drawing bitmap above (one cell when the key carries
+                    // no span, e.g. a hand-built key).
+                    let span = usize::from(key.cell_span).clamp(1, 2);
+                    if let Some(ch) = char::from_u32(cp)
+                        && let Some(bytes) =
+                            procedural::symbol_coverage(ch, self.cell_w, self.cell_h, span)
+                    {
+                        return GlyphImage::Mono {
+                            width: self.cell_w * span,
+                            height: self.cell_h,
+                            xmin: 0,
+                            ymin: self.baseline - self.cell_h as i32,
+                            advance: (self.cell_w * span) as f32,
                             bytes,
                         };
                     }
@@ -12917,7 +13722,29 @@ impl Renderer {
                 } else {
                     synth_style
                 };
-                let (width, bytes) = apply_synthetic_style(synth_style, gw, gh, bytes, self.px);
+                // A fallback face's synthetic ITALIC is deferred into the fit
+                // (`harmonize_fallback_raster`): the shear is applied to the
+                // FITTED mask, so an italic symbol keeps its upright size.
+                let defer_italic = harmonized_fallback_source(key.source)
+                    && key.cell_span > 0
+                    && synth_style.contains(StyleBits::ITALIC);
+                // A fitted SYMBOL's synthetic BOLD is deferred the same way:
+                // measuring the dilated ink shrank a box-filling symbol by the
+                // dilation (a bold `⏺` 7 rows against the regular 9 at 14 px).
+                // A letter keeps its advance fit, which already has the room.
+                let fit = fallback_fit_class(ch);
+                let defer_bold = harmonized_fallback_source(key.source)
+                    && key.cell_span > 0
+                    && fit == FallbackFit::Symbol
+                    && synth_style.contains(StyleBits::BOLD);
+                let mut pre_style = synth_style;
+                if defer_italic {
+                    pre_style = StyleBits(pre_style.0 & !StyleBits::ITALIC.0);
+                }
+                if defer_bold {
+                    pre_style = StyleBits(pre_style.0 & !StyleBits::BOLD.0);
+                }
+                let (width, bytes) = apply_synthetic_style(pre_style, gw, gh, bytes, self.px);
                 let xmin = if key.source == FaceId::Primary {
                     self.display_fit_place(gxmin, width)
                 } else {
@@ -12928,11 +13755,21 @@ impl Renderer {
                         || (key.cell_span > 0
                             && matches!(key.source, FaceId::Primary | FaceId::BoldPrimary))
                     {
-                        // FINAL (post-style) fit: synthetic dilation/shear is part
-                        // of the mask whose terminal-cell containment we promise.
+                        // FINAL (post-style) fit: synthetic dilation is part of
+                        // the mask whose terminal-cell containment we promise,
+                        // and a deferred shear is applied inside the fit.
                         self.harmonize_fallback_raster(
                             usize::from(key.cell_span),
                             (width, gh, xmin, gymin, gadv, bytes),
+                            DeferredStyle {
+                                bold_px: if defer_bold {
+                                    synthetic_bold_px(self.px)
+                                } else {
+                                    0
+                                },
+                                italic: defer_italic,
+                            },
+                            fit,
                         )
                     } else {
                         (width, gh, xmin, gymin, gadv, bytes)
@@ -13279,9 +14116,15 @@ impl Renderer {
                 };
                 let (width, bytes) = apply_synthetic_style(synth, gw, gh, bytes, self.px);
                 let (width, height, xmin, ymin, advance, bytes) = if key.cell_span > 0 {
+                    // A spanned by-ID key is only ever an explicit VS15
+                    // (text-presentation) request for an `Emoji_Presentation`
+                    // scalar (`resolve_cell_key_for_span`) — a pictograph, so
+                    // it takes the symbol fit; its code point is not in the key.
                     self.harmonize_fallback_raster(
                         usize::from(key.cell_span),
                         (width, gh, gxmin, gymin, gadv, bytes),
+                        DeferredStyle::NONE,
+                        FallbackFit::Symbol,
                     )
                 } else {
                     (width, gh, gxmin, gymin, gadv, bytes)
@@ -13704,6 +14547,10 @@ impl Renderer {
         // glyphs (their content is unchanged, so the row diff alone would
         // gate-hit forever).
         self.poll_fallback_parses();
+        // The room a clear-rail chrome row fits its words and rail into
+        // (`chrome_fit`, ruling 248), measured once per face and taken here for
+        // every pass of the frame — the glyph placement and the rail agree.
+        self.chrome_room = self.chrome_room_for(input);
         // The resident row plan belongs to the PREVIOUS frame (whose `input` is
         // gone): unkey it before anything can consult it, so `draw_cursor`'s reuse
         // is frame-scoped by construction. Cleared AFTER the fallback install above,
@@ -14231,7 +15078,7 @@ impl Renderer {
         pixels.clear();
         // `saturating_mul` so a wasm32 (32-bit usize) build cannot WRAP `w * h` for a
         // large-but-legal grid (cols·cell_w × rows·cell_h, dims up to ~MAX_GRID_*):
-        // a wrap would resize the framebuffer SMALL and then render_row's `y*w+x`
+        // a wrap would resize the framebuffer SMALL and then the row passes' `y*w+x`
         // writes would run off the end (OOB). On overflow this saturates to
         // usize::MAX, so the resize fails to allocate and aborts cleanly instead of
         // corrupting memory. On 64-bit the product never overflows, so this is
@@ -14246,7 +15093,7 @@ impl Renderer {
         {
             pixels.copy_from_slice(wp);
         }
-        // Take the per-window image cache out of `wc` so `render_row` can borrow it
+        // Take the per-window image cache out of `wc` so the row passes can borrow it
         // mutably while `self` is borrowed for rasterization (and `wc.cache` is
         // written below). Restored before return.
         let mut ic = std::mem::take(&mut wc.image_cache);
@@ -14428,6 +15275,49 @@ impl Renderer {
         }
     }
 
+    /// Paint row `r`'s [`ChromeRaster`], if the host drew one: its ground
+    /// over the row's band, gutters included, except under the columns it
+    /// leaves to their own cell backgrounds; then its rail in the band's
+    /// lowest `rail_h` pixels ([`chrome_fit`]'s, on a row whose words keep
+    /// clear of it). Runs in Phase A right after the row's cells and
+    /// gutters, so the glyphs draw over it exactly as over a cell background —
+    /// the GPU twin pushes the same pixels as background runs in the same
+    /// slot ([`chrome_raster_runs`]).
+    fn fill_chrome_raster(
+        &self,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        input: &RenderInput,
+        r: usize,
+    ) {
+        let Some(m) = input.chrome_raster(r) else {
+            return;
+        };
+        let (y0, y1) = self.row_band_px(r, h);
+        if y0 >= y1 {
+            return;
+        }
+        let rail_y0 = y1.saturating_sub(chrome_fit(m, self.chrome_room).1).max(y0);
+        for (x0, x1, color, rail) in chrome_raster_runs(m, w, self.pad, self.cell_w, input.cols) {
+            let (ya, yb) = if rail { (rail_y0, y1) } else { (y0, y1) };
+            for y in ya..yb {
+                let row = &mut pixels[y * w..(y + 1) * w];
+                row[x0..x1].fill(color & 0x00ff_ffff);
+            }
+        }
+        // The outlined capsules (ruling 249), over the ground and the rail,
+        // standing on the row's underline (ruling 254).
+        let floor = self.chrome_ring_floor();
+        for (x0, x1, ya, yb, color) in
+            chrome_ring_runs(m, w, self.pad, self.cell_w, self.cell_h, floor)
+        {
+            for y in (y0 + ya).min(y1)..(y0 + yb).min(y1) {
+                pixels[y * w + x0..y * w + x1].fill(color);
+            }
+        }
+    }
+
     /// The `[y0, y1)` device-pixel span of grid row `r`'s band (`grid_top +
     /// r·cell_h` down, one cell tall), clamped to the frame height `h`.
     fn row_band_px(&self, r: usize, h: usize) -> (usize, usize) {
@@ -14531,9 +15421,12 @@ impl Renderer {
         tmp.clear();
         tmp.extend_from_slice(&pixels[sy0 * w..sy1 * w]);
         let mut ctx = self.row_ctx(input, src);
-        // Restrict the draw to band `r`: at/above `by0`, strictly above `sy0`.
-        ctx.scale.clip_y0 = by0 as i32;
-        ctx.scale.clip_y1 = sy0 as i32;
+        // Restrict the draw to band `r`: at/above `by0`, strictly above `sy0`
+        // — NARROWING the row's own clip, so a lifted chrome row, which
+        // clips its ink at its own top (`chrome_lifted`), bleeds nothing here
+        // either.
+        ctx.scale.clip_y0 = ctx.scale.clip_y0.max(by0 as i32);
+        ctx.scale.clip_y1 = ctx.scale.clip_y1.min(sy0 as i32);
         self.render_row_fg(ic, pixels, w, h, input, src, &ctx);
         pixels[sy0 * w..sy1 * w].copy_from_slice(tmp);
     }
@@ -14541,7 +15434,7 @@ impl Renderer {
     /// The SHARED per-frame phase runner (FREE_OVERLAY_LAYER_DESIGN §3.2.2),
     /// called by BOTH `render_core` (the damaged path, passing the dirty rows)
     /// and `full_render` (passing `0..rows`) IN PLACE OF their per-row
-    /// `render_row` loops — so cached(damaged) and fresh(full) are twins by
+    /// fused per-row loops — so cached(damaged) and fresh(full) are twins by
     /// construction. Phases, in painter's order:
     ///
     /// * **A — backgrounds.** Per row: the damaged path's full-width band clear
@@ -14630,6 +15523,9 @@ impl Renderer {
             // reach (and, on row 0, into the strip above the grid). No-op unless the
             // host declared a `ChromeBleed`.
             self.fill_chrome_bleed(pixels, w, h, r);
+            // …and a PIXEL-RESOLUTION chrome row (the message band's meter)
+            // lays its ground and rail over both.
+            self.fill_chrome_raster(pixels, w, h, input, r);
             self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
         }
         // Phase B1 — legacy per-row sprites (single-band, byte-identical slot).
@@ -14851,7 +15747,14 @@ impl Renderer {
         // row-level `line_sizes[row]` is precisely the collapse that corrupted
         // the innocent pane.
         let (line_size, _, _) = input.line_size_run_at(row, col);
-        let (mut scale, anchor_y) = row_scale(line_size, y0, self.cell_h, row + 1 == input.rows);
+        let (mut scale, anchor_y) = chrome_lifted(
+            input,
+            row,
+            y0,
+            self.cell_h,
+            self.chrome_room,
+            row_scale(line_size, y0, self.cell_h, row + 1 == input.rows),
+        );
         // NARROW, never widen. `row_scale` hands back the open x window
         // (`Scale::NORMAL`'s `i32::MIN..i32::MAX`), so this intersection IS the
         // pane box here; a caller that has already carved its own window (the
@@ -14868,8 +15771,8 @@ impl Renderer {
         }
     }
 
-    /// Build row `r`'s [`RowCtx`]. Split out of the fused
-    /// [`Self::render_row`] so the phase runner pays the setup once per row
+    /// Build row `r`'s [`RowCtx`]. Split out of the old fused per-row pass
+    /// so the phase runner pays the setup once per row
     /// per half with no per-row allocation.
     fn row_ctx<'a>(&self, input: &'a RenderInput, r: usize) -> RowCtx<'a> {
         // Per-row vecs are indexed by `r` here; tolerate a producer that left one
@@ -14895,7 +15798,16 @@ impl Renderer {
             .copied()
             .unwrap_or(LineSize::SingleWidth);
         let cw = row_cell_w(line_size, self.cell_w);
-        let (scale, anchor_y) = row_scale(line_size, y0, self.cell_h, r + 1 == input.rows);
+        // A lifted chrome row (the strain row's words over its rail) places
+        // its glyphs higher, clipped clear of the rail (`chrome_lifted`).
+        let (scale, anchor_y) = chrome_lifted(
+            input,
+            r,
+            y0,
+            self.cell_h,
+            self.chrome_room,
+            row_scale(line_size, y0, self.cell_h, r + 1 == input.rows),
+        );
         // …but a COMPOSED row can carry a different DEC line size PER COLUMN RUN
         // (one per split pane — `LineSizeSpan`), and no single row-level value
         // can stand for that. Decided ONCE per row here: uniform rows (every
@@ -15382,42 +16294,6 @@ impl Renderer {
         }
     }
 
-    /// Render one row `r` of `input` into `pixels` — passes 1 (per-cell bg /
-    /// selection fill), 1c (per-row sprites), 2 (glyph + combining-mark blit),
-    /// 3 (underline / strike / overline). The row's band is assumed already
-    /// filled with the theme background. The legacy FUSED entry point,
-    /// reconstituted byte-for-byte from the split halves (§3.2.2) — the
-    /// per-frame loops now run the SAME halves through the phase runner
-    /// [`Self::composite_free`] instead (interleaved across rows), so this is
-    /// kept only for a future single-row caller and as the executable
-    /// definition of the split's equivalence.
-    #[allow(dead_code)]
-    fn render_row(
-        &mut self,
-        ic: &mut ImageCache,
-        pixels: &mut [u32],
-        w: usize,
-        h: usize,
-        input: &RenderInput,
-        r: usize,
-    ) {
-        let ctx = self.row_ctx(input, r);
-        self.render_row_bg(pixels, w, h, input, &ctx);
-        self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
-        // Dead path (kept as the split's executable equivalence pin): build a
-        // one-row rain index slice inline so the fast-path signature is honored.
-        let rain_row: Vec<u32> = input
-            .rain_quads
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| q.row as usize == r)
-            .map(|(i, _)| i as u32)
-            .collect();
-        // Dead path: use the always-correct general stamp (rain_white=false).
-        self.draw_sprites_for_row(pixels, w, h, input, r, &rain_row, false);
-        self.render_row_fg(ic, pixels, w, h, input, r, &ctx);
-    }
-
     /// Passes 1b/2/3 of one row — everything AFTER pass 1c: behind-text
     /// inline-image tiles, glyph + combining-mark blits, over-text inline-image
     /// tiles, line decorations and undercurls. The row's bg (and every
@@ -15518,6 +16394,10 @@ impl Renderer {
         // the ink itself never recolours (the no-recolor law).
         let fire_present = !input.fire_patch.is_empty();
         let mut halo_walk = FireHaloWalk::new(fire_halo_row);
+        // A pixel-resolution chrome row's ink split, hoisted: one lookup per
+        // row, and `None` on every row that is not the band's meter.
+        let row_raster = input.chrome_raster(r);
+        let raster_split = row_raster.and_then(|m| m.split);
         for (c, cell) in cells.iter().take(cols).enumerate() {
             if !image_covers(row_images, c) && !cell.wide && cell.ch != ' ' && !cell.ch.is_control()
             {
@@ -15571,6 +16451,9 @@ impl Renderer {
                 // on a mixed row the phase follows the cell to where its run
                 // actually places it, so the dither still keys on the pixel the
                 // glyph lands on.
+                // A band row's status glyph is DRAWN (ruling 251): its cell keeps
+                // the character, only the raster changes.
+                let key = self.chrome_icon_key(row_raster, cells, c).unwrap_or(key);
                 let key = shade_phase_key(key, x, y0);
                 // Selected cells floor their glyph fg against the selection bg so
                 // colour-on-selection stays legible (GPU mirrors this identically).
@@ -15626,7 +16509,36 @@ impl Renderer {
                         fire_halo_alpha(strength),
                     );
                 }
-                self.blit(pixels, w, x as i32, anchor_y, key, fg, bg_under, scale);
+                match raster_split.filter(|sp| usize::from(sp.col) == c && !selected) {
+                    // A pixel-resolution chrome row's fill ends inside this
+                    // cell (`ChromeRaster::split`): its glyph is drawn twice
+                    // under complementary clips — the fill side's ink left of
+                    // the split, the cell's own right of it — so the edge is
+                    // a crisp line through the letter (the GPU twin splits
+                    // its quad at the same pixel).
+                    Some(sp) => {
+                        let at = i32::try_from(sp.x).unwrap_or(i32::MAX);
+                        let left_fg = effective_glyph_fg(
+                            sel_fg,
+                            self.min_contrast,
+                            sp.ink,
+                            sp.bg,
+                            false,
+                            sel_bg,
+                        );
+                        let left = Scale {
+                            clip_x1: scale.clip_x1.min(at),
+                            ..scale
+                        };
+                        let right = Scale {
+                            clip_x0: scale.clip_x0.max(at),
+                            ..scale
+                        };
+                        self.blit(pixels, w, x as i32, anchor_y, key, left_fg, sp.bg, left);
+                        self.blit(pixels, w, x as i32, anchor_y, key, fg, bg_under, right);
+                    }
+                    None => self.blit(pixels, w, x as i32, anchor_y, key, fg, bg_under, scale),
+                }
                 // Overlay combining diacritics (é, ñ, …) on the base. A
                 // combining mark's own metrics assume the pen sits at the
                 // base's advance (a large negative left bearing backs it up
@@ -16141,7 +17053,25 @@ impl Renderer {
                 materialized_cell_span(&input.cells[r], c),
             ),
         };
-        let baseline = self.baseline;
+        // A band row's status glyph is DRAWN (ruling 251): probe the ink the
+        // cell actually shows — the same substitution the CPU blit and the
+        // GPU atlas prepass make — never the font glyph it replaced.
+        let key = self
+            .chrome_icon_key(input.chrome_raster(r), &input.cells[r], c)
+            .unwrap_or(key);
+        // A LIFTED chrome row (`chrome_lifted`, ruling 248) draws its glyphs
+        // `lift` pixels higher with their ink clipped at `ch − lift`: the
+        // probe below looks where that ink is, so the seam under the strain
+        // row's words never breaks around a descender that no longer
+        // reaches it.
+        let cell_h = self.cell_h as i32;
+        let room = self.chrome_room_for(input);
+        let lift = input.chrome_raster(r).map_or(0, |m| {
+            i32::try_from(chrome_fit(m, room).0)
+                .unwrap_or(0)
+                .min(cell_h)
+        });
+        let baseline = self.baseline - lift;
         let img = self.glyph_image(key);
         let (gw, gh, xmin, ymin) = (img.width(), img.height(), img.xmin(), img.ymin());
         if gw == 0 || gh == 0 {
@@ -16174,7 +17104,10 @@ impl Renderer {
         // around ALL of it would erase the line, so no skip is the honest
         // draw).
         let gy0 = baseline - gh as i32 - ymin;
-        let (ylo, yhi) = ((by0 as i32 - 1).max(baseline + 1), by1 as i32 + 1);
+        let (ylo, mut yhi) = ((by0 as i32 - 1).max(baseline + 1), by1 as i32 + 1);
+        if lift > 0 {
+            yhi = yhi.min(cell_h - lift);
+        }
         ink.clear();
         ink.resize(dw, false);
         // The band filter as LOOP BOUNDS instead of a per-row `continue`:
@@ -16788,7 +17721,7 @@ impl Renderer {
         }
     }
 
-    /// Pass 1c (called from [`Self::render_row`], between the pass-1 bg fill and
+    /// Pass 1c (called from [`Self::composite_free`], between the pass-1 bg fill and
     /// the pass-1b inline images): stamp rain and peeking-CAT sprites whose row
     /// band is `r`, UNDER this row's images / glyphs / line decorations.
     ///
@@ -17109,7 +18042,7 @@ impl Renderer {
             && cursor_shown(style, self.cursor_blink_phase)
         {
             // The cursor row may itself be a DEC double-size line. Inset by
-            // `(pad, grid_top)` exactly like `render_row`, so the cursor lands
+            // `(pad, grid_top)` exactly like the row passes, so the cursor lands
             // on its (padded, head-shifted) cell.
             let (pad_x, pad_y) = (self.pad, self.grid_top());
             let y0 = pad_y + cr * self.cell_h;
@@ -17124,7 +18057,14 @@ impl Renderer {
             let (cw, scale, anchor_y, x0, run_lo, run_hi) = if uniform {
                 let line_size = input.line_sizes[cr];
                 let cw = row_cell_w(line_size, self.cell_w);
-                let (scale, anchor_y) = row_scale(line_size, y0, self.cell_h, cr + 1 == rows);
+                let (scale, anchor_y) = chrome_lifted(
+                    input,
+                    cr,
+                    y0,
+                    self.cell_h,
+                    self.chrome_room,
+                    row_scale(line_size, y0, self.cell_h, cr + 1 == rows),
+                );
                 (cw, scale, anchor_y, pad_x + cc * cw, 0, usize::MAX)
             } else {
                 let p = self.mixed_cell_place(input, cr, cc, y0);
@@ -17304,7 +18244,7 @@ impl Renderer {
                         }
                     };
                     // Same absolute shade phase as the base pass (the column's
-                    // own absolute x, matching `render_row`'s fold), so the block
+                    // own absolute x, matching the row passes' fold), so the block
                     // cursor cuts out the exact dither variant underneath it. On
                     // a composed row that x comes from the column's own run — the
                     // cut-out has to land on the pixels the base pass painted, or
@@ -17552,7 +18492,9 @@ impl Renderer {
             && matches!(key.glyph_class, GlyphClass::Mono | GlyphClass::MonoGid)
         {
             key.cell_span = 1;
-        } else if key.glyph_class == GlyphClass::Mono && harmonized_fallback_source(key.source) {
+        } else if key.glyph_class == GlyphClass::Mono
+            && (harmonized_fallback_source(key.source) || is_synthetic_symbol_key(key))
+        {
             key.cell_span = cell_span.min(2);
         }
         key
@@ -19342,6 +20284,254 @@ fn cursor_shown_in(
         && cursor_shown(style, blink_phase)
 }
 
+/// A [`ChromeRaster`] as horizontal RUNS of one colour, `(x0, x1, color,
+/// rail)` in frame pixels over a `w`-pixel frame whose cells start at `pad`
+/// and are `cell_w` wide: the ground first (skipping the cells the raster
+/// leaves to their own backgrounds), then the rail's runs (`rail == true`,
+/// the row's lowest `rail_h` pixels). The ONE builder both backends paint
+/// from — the CPU fills each run, the GPU pushes each as a background quad —
+/// so the two place identical pixels by construction.
+#[must_use]
+pub fn chrome_raster_runs(
+    m: &ChromeRaster,
+    w: usize,
+    pad: usize,
+    cell_w: usize,
+    cols: usize,
+) -> Vec<(usize, usize, u32, bool)> {
+    let cell_w = cell_w.max(1);
+    let owned = |x: usize| x >= pad && x < pad + cols * cell_w && m.owns((x - pad) / cell_w);
+    let mut runs = Vec::new();
+    let mut push = |px: &[u32], rail: bool| {
+        let n = px.len().min(w);
+        let mut x = 0;
+        while x < n {
+            let c = px[x];
+            if (rail && c == ChromeRaster::KEEP) || owned(x) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < n && px[x] == c && !owned(x) {
+                x += 1;
+            }
+            runs.push((start, x, c, rail));
+        }
+    };
+    push(&m.ground, false);
+    if m.rail_h > 0 {
+        push(&m.rail, true);
+    }
+    runs
+}
+
+/// The OUTLINED capsules of a [`ChromeRaster`] row (design ruling 249) as
+/// rectangles of one colour, `(x0, x1, ya, yb, color)`: frame pixels
+/// `[x0, x1)` across, `[ya, yb)` down from the top of the row's band. The ONE
+/// builder both backends paint from, after the row's ground and rail and
+/// before its glyphs — the CPU fills each rectangle, the GPU pushes each as a
+/// background quad — so the two place identical pixels.
+///
+/// Each ring is a capsule (a pill) inset from its cells by a quarter cell at
+/// each end, and reads as a button on the meter, not a hole cut in it.
+///
+/// THE PILL STANDS ON THE ROW'S UNDERLINE (ruling 254). `floor` is the rows
+/// `[y0, y1)` of the face's single underline in the cell
+/// ([`Renderer::chrome_ring_floor`]) — the rows the band's closing seam runs
+/// on. The capsule's bottom edge is that band's bottom, its stroke that
+/// band's thickness, and its top is inset by the same margin the floor
+/// leaves below it (at most an eighth of the row), so the label sits
+/// centred. On the last band row the seam and the pill's floor are then ONE
+/// line: the seam runs up to the pill's rounded foot and the pill's own
+/// floor carries it on. Between the end cells (`[start + 1, end − 1)`,
+/// [`chrome_ring_floor_cols`]) the floor is NOT painted here: the host gives
+/// those cells a single underline in the ring's colour, so the renderer's
+/// descender ink-skip carves the floor round a `p` or a `g` exactly as it
+/// carves the seam — a descender crosses the pill's edge the way it crosses
+/// every rule on the band. (A face's underline sits above its descenders'
+/// feet by design, so no floor on the seam can hold them inside.) Where the
+/// row carries the seam ([`ChromeRing::seam`]), the builder draws it across
+/// the two end cells itself, so it meets the pill's rounded foot mixed
+/// with it at the same subsamples instead of overwriting it.
+///
+/// Pixels inside the stroke are the ring's colour, inside it the capsule's
+/// ground, outside it the raster's ground under that column. A pixel whose
+/// centre is more than ¾ px from both of the stroke's edges is wholly one
+/// of the three (the distance is exact, so no subsample of it can cross an
+/// edge); only the pixels along the edges mix the three by coverage at 4×4
+/// subsamples in linear light, so the rounded ends are smooth against a
+/// moving comet as much as against a still track while a busy row's motion
+/// frame pays for the edge pixels only.
+#[must_use]
+pub fn chrome_ring_runs(
+    m: &ChromeRaster,
+    w: usize,
+    pad: usize,
+    cell_w: usize,
+    cell_h: usize,
+    floor: (usize, usize),
+) -> Vec<(usize, usize, usize, usize, u32)> {
+    let mut out: Vec<(usize, usize, usize, usize, u32)> = Vec::new();
+    if m.rings.is_empty() || cell_w == 0 || cell_h < 4 {
+        return out;
+    }
+    fn lin(v: u32) -> f32 {
+        let c = v as f32 / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    fn enc(l: f32) -> u32 {
+        let l = l.clamp(0.0, 1.0);
+        let c = if l <= 0.003_130_8 {
+            12.92 * l
+        } else {
+            1.055f32.mul_add(l.powf(1.0 / 2.4), -0.055)
+        };
+        (c * 255.0).round().clamp(0.0, 255.0) as u32
+    }
+    let split = |c: u32| [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(lin);
+    let by1 = floor.1.clamp(1, cell_h);
+    let (fy0, fy1) = (floor.0.min(by1), by1);
+    let t = (fy1 - fy0).clamp(1, (cell_h / 6).max(1)) as f32;
+    let by0 = (cell_h - by1).min(cell_h / 8);
+    let inset_x = cell_w / 4;
+    // A pixel is wholly on one side of an edge when its centre is this far
+    // from it: the subsamples sit within 0.53 px of the centre.
+    const SURE: f32 = 0.75;
+    const SS: usize = 4;
+    let mut prev: Vec<(usize, usize, u32)> = Vec::new();
+    let mut runs: Vec<(usize, usize, u32)> = Vec::new();
+    for ring in &m.rings {
+        let (start, end) = (usize::from(ring.start), usize::from(ring.end));
+        if end <= start {
+            continue;
+        }
+        let bx0 = pad + start * cell_w + inset_x;
+        let bx1 = (pad + end * cell_w).saturating_sub(inset_x).min(w);
+        if bx1 <= bx0 + 2 || by1 <= by0 + 2 {
+            continue;
+        }
+        // The floor the cells' underline draws (see above).
+        let cols = chrome_ring_floor_cols(ring);
+        let (lx0, lx1) = (pad + cols.start * cell_w, (pad + cols.end * cell_w).min(w));
+        // The ring's cells, where the seam (if any) runs.
+        let (sx0, sx1) = (pad + start * cell_w, (pad + end * cell_w).min(w));
+        let (cx, cy) = ((bx0 + bx1) as f32 * 0.5, (by0 + by1) as f32 * 0.5);
+        let (hw, hh) = ((bx1 - bx0) as f32 * 0.5, (by1 - by0) as f32 * 0.5);
+        let rad = hh.min(hw);
+        // The rounded box's signed distance (negative inside); exact, so
+        // 1-Lipschitz.
+        let sd = |px: f32, py: f32| {
+            let qx = (px - cx).abs() - (hw - rad);
+            let qy = (py - cy).abs() - (hh - rad);
+            qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - rad
+        };
+        let (ring_l, inner_l) = (split(ring.ring), split(ring.inner));
+        let (ring_c, inner_c) = (ring.ring & 0x00ff_ffff, ring.inner & 0x00ff_ffff);
+        prev.clear();
+        let mut prev_y = by0;
+        for y in by0..by1 {
+            runs.clear();
+            let on_floor = (fy0..fy1).contains(&y);
+            // On the last row the seam runs across the two end cells, the
+            // whole of them, to meet the pill's foot.
+            let seam = ring.seam.filter(|_| on_floor).map(|c| c & 0x00ff_ffff);
+            let (xa, xb) = if seam.is_some() {
+                (sx0, sx1)
+            } else {
+                (bx0, bx1)
+            };
+            for x in xa..xb {
+                let floored = on_floor && (lx0..lx1).contains(&x);
+                let seamed = seam.filter(|_| !floored);
+                let d = sd(x as f32 + 0.5, y as f32 + 0.5);
+                let color = if d > SURE {
+                    match seamed {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                } else if d < -t - SURE || (floored && d < -SURE) {
+                    inner_c
+                } else if d < -SURE && d > -t + SURE {
+                    ring_c
+                } else {
+                    let (mut n_out, mut n_ring, mut n_in) = (0u32, 0u32, 0u32);
+                    for sy in 0..SS {
+                        for sx in 0..SS {
+                            let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
+                            let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
+                            let d = sd(px, py);
+                            if d > 0.0 {
+                                n_out += 1;
+                            } else if d > -t && !floored {
+                                n_ring += 1;
+                            } else {
+                                n_in += 1;
+                            }
+                        }
+                    }
+                    let total = (SS * SS) as u32;
+                    if n_out == total {
+                        match seamed {
+                            Some(c) => c,
+                            None => continue,
+                        }
+                    } else if n_ring == total {
+                        ring_c
+                    } else if n_in == total {
+                        inner_c
+                    } else {
+                        let under = seamed.unwrap_or_else(|| {
+                            m.ground
+                                .get(x)
+                                .copied()
+                                .filter(|_| !m.owns((x.saturating_sub(pad)) / cell_w))
+                                .unwrap_or(ring.inner)
+                        });
+                        let out_l = split(under);
+                        let total = total as f32;
+                        let ch = |k: usize| {
+                            enc((out_l[k] * n_out as f32
+                                + ring_l[k] * n_ring as f32
+                                + inner_l[k] * n_in as f32)
+                                / total)
+                        };
+                        (ch(0) << 16) | (ch(1) << 8) | ch(2)
+                    }
+                };
+                match runs.last_mut() {
+                    Some(r) if r.1 == x && r.2 == color => r.1 = x + 1,
+                    _ => runs.push((x, x + 1, color)),
+                }
+            }
+            if runs != prev {
+                out.extend(prev.iter().map(|&(a, b, c)| (a, b, prev_y, y, c)));
+                std::mem::swap(&mut prev, &mut runs);
+                prev_y = y;
+            }
+        }
+        out.extend(prev.iter().map(|&(a, b, c)| (a, b, prev_y, by1, c)));
+    }
+    out
+}
+
+/// The cell columns of `ring` whose SINGLE UNDERLINE, in the ring's colour,
+/// is the capsule's floor (ruling 254): every cell but the two its rounded
+/// ends sit in. [`chrome_ring_runs`] leaves the floor there to the
+/// underline, so the renderer's descender ink-skip carves it; the host
+/// stamps the underline on exactly these cells.
+#[must_use]
+pub fn chrome_ring_floor_cols(ring: &ChromeRing) -> std::ops::Range<usize> {
+    let (start, end) = (usize::from(ring.start), usize::from(ring.end));
+    if end < start + 3 {
+        return start..start;
+    }
+    start + 1..end - 1
+}
+
 /// Whether a frame is a PURE-GRID frame the E7 whole-row scroll-blit can shift
 /// rigidly: no position-keyed overlay stream (which the blit does not relocate)
 /// and no active selection (a per-row span the blit would strand). The cursor is
@@ -19364,6 +20554,9 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
         damage.was_empty().unwrap_or(payload.is_empty())
     }
 
+    // A pixel-resolution chrome row ([`ChromeRaster`]) does not refuse the
+    // blit: [`scroll_shift_plan`] marks every such row, and every row the blit
+    // fills from one, dirty — repainted in place over the slid pixels.
     input.cursor_trail.is_empty()
         && absent(&input.cursor_glow_add, &input.cursor_glow_add_damage)
         && absent(&input.glow_halo, &input.glow_halo_damage)
@@ -19615,6 +20808,24 @@ pub fn scroll_shift_plan(
             *row_dirty = true;
         }
     }
+    // Pixel-resolution CHROME rows ([`ChromeRaster`], the message band's
+    // meter): pixels the cells cannot see, so none is ever slid. Every raster
+    // row of this frame is rebuilt, and so is every row the blit fills FROM a
+    // raster row of the last one (its source band carries that raster), and
+    // the last frame's raster rows themselves — the same rebuild a changed
+    // row gets, apron included. Nothing on a frame with none on either side,
+    // so a scroll under a metered band keeps the blit.
+    let raster_rows = input.chrome_rasters.iter().map(|m| i64::from(m.row)).chain(
+        prev.chrome_rasters.iter().flat_map(|m| {
+            let p = i64::from(m.row);
+            [p, p - i64::from(da)]
+        }),
+    );
+    for r in raster_rows {
+        if (0..rows as i64).contains(&r) {
+            dirty[r as usize] = true;
+        }
+    }
     // UPWARD-OVERSHOOT INVARIANT (the general rule; subsumes the ad-hoc bug-2
     // top-strip apron and closes the bug-3 bottom-strip seam for both directions).
     // A single-width row keeps UPWARD glyph overshoot into the row above
@@ -19860,6 +21071,23 @@ pub fn compute_dirty_rows(
         if differs {
             *d = true;
             any_dirty = true;
+        }
+    }
+    // Pixel-resolution CHROME rows (the message band's meter, `ChromeRaster`):
+    // rendered content the cells cannot see — a glide or a glint moves the
+    // ground under unchanged cells — so a row whose raster changed (appeared,
+    // left, or moved) is dirty. Nothing on a frame with none on either side.
+    if prev_input.chrome_rasters != input.chrome_rasters {
+        let raster_rows = prev_input
+            .chrome_rasters
+            .iter()
+            .chain(&input.chrome_rasters)
+            .map(|m| usize::from(m.row));
+        for r in raster_rows {
+            if r < rows && prev_input.chrome_raster(r) != input.chrome_raster(r) {
+                dirty[r] = true;
+                any_dirty = true;
+            }
         }
     }
     // Selection: mark the rows whose SELECTED-COLUMN SPAN moved between the
@@ -20547,6 +21775,58 @@ pub fn row_scale(line_size: LineSize, y0: usize, ch: usize, is_last_row: bool) -
     }
 }
 
+/// How a chrome row that keeps its words CLEAR of its rail
+/// ([`ChromeRaster::clear_rail`], design ruling 248) fits both into one cell,
+/// from the face's measured `room`: `(head, foot)`, the pixel rows above the
+/// tallest and below the lowest printable-ASCII ink
+/// ([`Renderer::chrome_room_for`]). The rail keeps one clear row between it
+/// and the lowest ink, so it is `min(rail_h, head + foot − 1)` tall, never
+/// under one pixel; the words rise by what the rail and its clear row need
+/// beyond the foot room, never by more than the head room — no letter the
+/// band writes is clipped. Returns `(lift, rail_h)` in device pixels; every
+/// other row keeps `(0, rail_h)`. The ONE rule both backends fit by.
+#[must_use]
+pub fn chrome_fit(m: &ChromeRaster, room: (usize, usize)) -> (usize, usize) {
+    let rail_h = usize::from(m.rail_h);
+    if !m.clear_rail || rail_h == 0 {
+        return (0, rail_h);
+    }
+    let (head, foot) = room;
+    let rail = rail_h.min((head + foot).saturating_sub(1)).max(1);
+    let lift = (rail + 1).saturating_sub(foot).min(head);
+    (lift, rail)
+}
+
+/// Row `r`'s glyph placement `placed` (its [`row_scale`]), LIFTED when the
+/// row keeps its words clear of its rail ([`chrome_fit`], design ruling 248):
+/// the glyphs anchor `lift` pixels higher and their ink is clipped to `[y0,
+/// y0 + ch − lift)` — the band clip moves up with them, so a descender keeps
+/// every pixel it had, and nothing overshoots into the row above (a tall
+/// non-ASCII glyph loses at most the `lift` rows the face's head room did not
+/// cover), so a damaged, scrolled or fresh frame paints a lifted row alike.
+/// Every other row gets `placed` back untouched. The ONE rule both backends
+/// place glyphs by.
+#[must_use]
+pub fn chrome_lifted(
+    input: &RenderInput,
+    r: usize,
+    y0: usize,
+    ch: usize,
+    room: (usize, usize),
+    placed: (Scale, i32),
+) -> (Scale, i32) {
+    let lift = input
+        .chrome_raster(r)
+        .map_or(0, |m| chrome_fit(m, room).0.min(ch));
+    if lift == 0 {
+        return placed;
+    }
+    let (mut scale, anchor_y) = placed;
+    scale.clip_y0 = scale.clip_y0.max(y0 as i32);
+    scale.clip_y1 = scale.clip_y1.min((y0 + ch - lift) as i32);
+    (scale, anchor_y - lift as i32)
+}
+
 /// The on-screen cell advance (px) for a row of `line_size` — doubled for any
 /// double-width/height row, single otherwise.
 pub fn row_cell_w(line_size: LineSize, cell_w: usize) -> usize {
@@ -21177,6 +22457,11 @@ fn slant(cov: &[u8], w: usize, h: usize, shear: f32) -> (Vec<u8>, usize) {
     (out, nw)
 }
 
+/// The px synthetic BOLD dilates a glyph by at `px` (never zero).
+fn synthetic_bold_px(px: f32) -> usize {
+    (px / 18.0).round().max(1.0) as usize
+}
+
 /// Apply synthetic BOLD (embolden) then ITALIC (slant) to a freshly rasterized
 /// mono coverage bitmap, returning the possibly-widened `(width, bytes)`. The
 /// advance and left bearing stay the original so cell layout is unchanged.
@@ -21189,13 +22474,13 @@ fn apply_synthetic_style(
 ) -> (usize, Vec<u8>) {
     let (mut w, mut bytes) = (w, bytes);
     if style.contains(StyleBits::BOLD) {
-        let e = (px / 18.0).round().max(1.0) as usize;
+        let e = synthetic_bold_px(px);
         let (b, nw) = embolden(&bytes, w, h, e);
         bytes = b;
         w = nw;
     }
     if style.contains(StyleBits::ITALIC) {
-        let (b, nw) = slant(&bytes, w, h, 0.2);
+        let (b, nw) = slant(&bytes, w, h, SYNTHETIC_ITALIC_SHEAR);
         bytes = b;
         w = nw;
     }
@@ -21597,7 +22882,7 @@ pub fn clamp_stem_gamma(gamma: f32) -> f32 {
     }
 }
 
-/// The coverage gamma for the shared stem-darkening LUT.
+/// The DEFAULT coverage gamma for the shared stem-darkening LUT.
 ///
 /// HISTORY: the renderer used to composite coverage in raw sRGB (gamma) space,
 /// which makes mid-coverage edge texels optically wrong (a 50%-covered white stem
@@ -21608,20 +22893,10 @@ pub fn clamp_stem_gamma(gamma: f32) -> f32 {
 /// Now that [`blend`] (and the GPU's sRGB-typed target) composite in TRUE
 /// linear-light per cell, that approximation is obsolete and would DOUBLE-correct
 /// (thickening text), so the default is the identity `1.0` (a no-op LUT, endpoints
-/// and interior unchanged). `ATERM_STEM_GAMMA` remains as an optional aesthetic
-/// thickener/thinner (<1 thickens, >1 thins) applied in the now-correct pipeline.
-/// The env var takes precedence over the `stem_gamma` config key it aliases
-/// (the GUI resolves env > config and routes the winner via
-/// [`Renderer::set_stem_gamma`]).
-fn env_stem_gamma() -> f32 {
-    if let Ok(v) = std::env::var("ATERM_STEM_GAMMA")
-        && let Ok(g) = v.trim().parse::<f32>()
-        && g.is_finite()
-    {
-        return clamp_stem_gamma(g);
-    }
-    1.0
-}
+/// and interior unchanged). The `stem_gamma` config key remains as an optional
+/// aesthetic thickener/thinner (<1 thickens, >1 thins) applied in the now-correct
+/// pipeline; the GUI routes it via [`Renderer::set_stem_gamma`].
+const DEFAULT_STEM_GAMMA: f32 = 1.0;
 
 /// Build a per-value stem-darkening LUT: `LUT[c] = round(255·(c/255)^gamma)`.
 /// A 256-entry table keeps the hot path a single byte lookup (no per-texel
@@ -21785,6 +23060,7 @@ impl SelectionPalette<'_> {
     /// not describe.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn scalar(&self) -> SelectionColors {
         self.scalar
     }
@@ -23142,6 +24418,8 @@ pub fn comet_beam(
     }
 }
 
+impl Eq for AdmittedFontBlob {}
+
 // ---- THE RIBBON BEAM -------------------------------------------------------
 //
 // `comet_beam` generalized, for migration step 11 of
@@ -23885,26 +25163,6 @@ const COMET_LAYERS: [(f32, f32, u32, f32, f32, usize); 4] = [
     (1.0, 1.00, MIX_WHITE, 0.25, 0.45, 1), // hot white core (hotter toward the head)
 ];
 
-/// The LASER bloom layers (same tuple shape as [`COMET_LAYERS`]). A laser is not
-/// a comet: it reads as a razor-thin white-hot FILAMENT burning inside a wide,
-/// SMOOTH same-hue neon halo. Three differences from the comet stack deliver
-/// that: fine major strides everywhere (≤2 px — the comet's 3 px aura slabs are
-/// what staircase on diagonals); a sub-core filament (0.6×) at full coverage so
-/// the centre line stays needle-crisp while the stacked halos supply a
-/// continuous quadratic-ish falloff; and the stack runs CORE-FIRST — additive
-/// light is order-independent, so when a monster jump saturates the quad budget
-/// the truncation sheds outer haze, never the filament. The white mix tops out
-/// at 0.68 — under the 0.75 monochrome ceiling pinned by the laser hue test —
-/// so the filament glints hot without ever flashing out of its hue.
-const LASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 6] = [
-    (0.6, 1.00, MIX_WHITE, 0.26, 0.42, 1), // white-hot filament (hotter toward the head)
-    (1.5, 0.95, MIX_WHITE, 0.10, 0.0, 1),  // beam body
-    (2.9, 0.60, MIX_WHITE, 0.0, 0.0, 1),   // inner glow
-    (5.4, 0.34, MIX_WHITE, 0.0, 0.0, 1),   // outer halo
-    (9.5, 0.16, MIX_WHITE, 0.0, 0.0, 2),   // far neon haze (style hue)
-    (16.0, 0.07, MIX_WHITE, 0.0, 0.0, 2),  // cinematic bloom — the beam owns its airspace
-];
-
 /// The PHASER bloom layers (same tuple shape as [`COMET_LAYERS`]). The phaser
 /// is a FAT bar of spectrum: `core_px` arrives near the full cell height, so
 /// the stack keeps its halo TIGHT (≤2.0×) — the comet's 5.5× aura at this core
@@ -23962,22 +25220,6 @@ pub fn comet_glow_quads(
     layered_beam_quads(out, clip, run, core_px, straighten, color_at, &COMET_LAYERS);
 }
 
-/// Emit the LASER beam for one contiguous run of swept-cell samples — the
-/// [`LASER_LAYERS`] stack: a needle filament under a wide smooth same-hue halo —
-/// into per-cell-row [`GlowQuad`]s. The laser twin of [`comet_glow_quads`] and,
-/// like it, the SINGLE definition of the style's appearance for the live
-/// animator and any demo/preview.
-pub fn laser_beam_quads(
-    out: &mut Vec<GlowQuad>,
-    clip: BeamClip,
-    run: &[CometSample],
-    core_px: f32,
-    straighten: f32,
-    color_at: &dyn Fn(f32) -> u32,
-) {
-    layered_beam_quads(out, clip, run, core_px, straighten, color_at, &LASER_LAYERS);
-}
-
 /// Emit the PHASER streak — the [`PHASER_LAYERS`] stack: a near-cell-height
 /// band of spectrum under a tight halo — into per-cell-row [`GlowQuad`]s. The
 /// fat twin of [`comet_glow_quads`] and, like it, the SINGLE definition of the
@@ -24017,16 +25259,16 @@ pub fn beam_glow_quads(
     layered_beam_quads(out, clip, run, core_px, straighten, color_at, &BEAM_LAYERS);
 }
 
-/// The maximum bloom layers a Trail Pack beam may stack. Equal to the widest
-/// built-in stack ([`LASER_LAYERS`] = 6), so a pack can express any built-in
-/// beam shape without ever exceeding the proven layer budget.
+/// The maximum bloom layers a Trail Pack beam may stack: the proven layer
+/// budget, above the widest built-in stack ([`BEAM_LAYERS`] = 5), so a pack
+/// can express any built-in beam shape without ever exceeding it.
 pub const MAX_CUSTOM_BEAM_LAYERS: usize = 6;
 
 /// Emit a Trail Pack ("custom") beam for one contiguous run of swept-cell
 /// samples through a CALLER-SUPPLIED bloom-layer stack — the extensibility
-/// twin of [`comet_glow_quads`] / [`laser_beam_quads`] / [`phaser_streak_quads`]
-/// / [`beam_glow_quads`]. It is a THIN, byte-identical forward to the same
-/// private [`layered_beam_quads`] body those four call: the layer loop is not
+/// twin of [`comet_glow_quads`] / [`phaser_streak_quads`] /
+/// [`beam_glow_quads`]. It is a THIN, byte-identical forward to the same
+/// private [`layered_beam_quads`] body those three call: the layer loop is not
 /// reordered and no new compositing is introduced, so a pack whose `layers`
 /// reproduce a built-in stack rasterizes byte-for-byte identically to that
 /// built-in. `layers` carries the `(thickness×core, coverage×, mix target, mix
@@ -24044,8 +25286,8 @@ pub fn custom_beam_quads(
     layered_beam_quads(out, clip, run, core_px, straighten, color_at, layers);
 }
 
-/// Shared body of [`comet_glow_quads`] / [`laser_beam_quads`] /
-/// [`phaser_streak_quads`] / [`beam_glow_quads`]: rasterize one bloom-layer
+/// Shared body of [`comet_glow_quads`] / [`phaser_streak_quads`] /
+/// [`beam_glow_quads`]: rasterize one bloom-layer
 /// stack over a sample run via [`comet_beam`]. The tuple carries the mix
 /// TARGET per layer so the beam's two-tone stack (white core, [`BEAM_SPACE_HAZE`]
 /// sleeve) shares this body — and its hoisted per-sample style eval + the
@@ -24554,7 +25796,7 @@ fn pick_glyph_raster<'a>(
 /// premultiplied linear-light bracket: sRGB → linear (LUT) → premultiply →
 /// filter → unpremultiply → sRGB (LUT). Premultiplication keeps fully
 /// transparent texels from bleeding their (arbitrary) RGB payload into
-/// visible neighbours (CBDT faces via `$ATERM_EMOJI_FONT` carry such payloads;
+/// visible neighbours (CBDT faces via `emoji_font` carry such payloads;
 /// Apple's sbix pre-extends RGB under `a=0`, so it merely didn't hurt there —
 /// the general path is now sound either way), and linear light makes the
 /// average PHYSICAL: a 1px checkerboard minified 4x lands at linear mid-grey
@@ -25334,7 +26576,7 @@ mod tests {
     /// sequences as monochrome silhouettes — so when the active colour font DOES
     /// carry colour for the cluster (saturated texels) we additionally assert that
     /// colour survives to the framebuffer cell (point a COLR font at it via
-    /// `ATERM_EMOJI_FONT` to exercise that branch).
+    /// `set_config_emoji_font` to exercise that branch).
     #[cfg(target_os = "linux")]
     #[test]
     fn zwj_cluster_renders_through_colour_face() {
@@ -27692,12 +28934,21 @@ mod tests {
             .flat_map(move |y| (x0..x0 + cw).map(move |x| frame.pixels[y * frame.width + x]))
     }
 
-    /// The bytes of the first readable primary-font candidate ($ATERM_FONT
-    /// first), i.e. the file `Renderer::from_system` would load.
+    /// The bytes of one primary candidate: a bundled identity's compiled-in
+    /// face, else the file.
+    fn candidate_bytes(p: &str) -> Option<Vec<u8>> {
+        bundled::face_for_id(p)
+            .map(<[u8]>::to_vec)
+            .or_else(|| std::fs::read(p).ok())
+    }
+
+    /// The bytes of the first readable primary-font candidate (the bundled
+    /// default first where compiled in), i.e. the face
+    /// `Renderer::from_system` would load.
     fn system_font_bytes() -> Option<Vec<u8>> {
         primary_candidate_paths()
             .iter()
-            .find_map(|p| std::fs::read(p).ok())
+            .find_map(|p| candidate_bytes(p))
     }
 
     /// The bytes of the first readable STATIC (non-variable) primary candidate.
@@ -27708,7 +28959,7 @@ mod tests {
     fn static_system_font_bytes() -> Option<Vec<u8>> {
         primary_candidate_paths()
             .iter()
-            .filter_map(|p| std::fs::read(p).ok())
+            .filter_map(|p| candidate_bytes(p))
             .find(|b| variation::probe(b, 0).is_none())
     }
 
@@ -28084,6 +29335,10 @@ mod tests {
     /// read from the FILE rather than from any chain.
     #[cfg(target_os = "linux")]
     fn face_coverage(path: &str) -> std::collections::BTreeSet<u32> {
+        // A bundled chain/primary identity measures its compiled-in bytes.
+        if let Some(bytes) = bundled::face_for_id(path) {
+            return collection_coverage(bytes);
+        }
         let Ok(bytes) = std::fs::read(path) else {
             return std::collections::BTreeSet::new();
         };
@@ -28256,7 +29511,7 @@ mod tests {
         }
         let primary = primary_candidate_paths()
             .into_iter()
-            .find(|p| std::path::Path::new(p).is_file());
+            .find(|p| bundled::is_bundled_id(p) || std::path::Path::new(p).is_file());
         let Some(primary) = primary else {
             eprintln!("SKIP: no primary font found");
             return;
@@ -28341,6 +29596,175 @@ mod tests {
         eprintln!(
             "{checked} tier face(s) shadow nothing the CJK backstop owns; \
              {offenders} known offender(s) confirmed still detectable"
+        );
+    }
+
+    /// The seal's residency split counts a face compiled into the binary
+    /// (`FaceBytes::Static`, every `bundled:` chain face) as FILE-BACKED, not
+    /// as an anonymous-heap copy — it is the executable's own read-only pages.
+    #[test]
+    fn a_compiled_in_chain_face_is_not_reported_as_a_heap_copy() {
+        static COMPILED_IN: &[u8] = b"compiled-in face bytes";
+        let face = |bytes: crate::font::FaceBytes| AdmittedFaceSource {
+            bytes: AdmittedFontBlob::Face(bytes),
+            index: 0,
+        };
+        let heap: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(vec![7u8; 5]);
+        let sources = AdmittedFontSources {
+            sealed: true,
+            primary: None,
+            injected_bold: None,
+            styled: [None, None, None],
+            fallback: vec![face(crate::font::FaceBytes::Static(COMPILED_IN))],
+            symbol: vec![face(crate::font::FaceBytes::Vec(heap))],
+            emoji: None,
+        };
+        assert_eq!(
+            sources.discovered_residency(),
+            (COMPILED_IN.len() as u64, 5),
+            "a Static face is file-backed; only the Vec copy is heap"
+        );
+        assert!(!crate::font::FaceBytes::Static(COMPILED_IN).is_heap());
+        assert!(!crate::font::FaceBytes::Static(COMPILED_IN).is_mapped());
+    }
+
+    /// A system symbol candidate that names a file the bundled stack compiles
+    /// in is DROPPED from discovery: it could only answer what the bundled copy
+    /// answered first, and relocating it where it is absent walked the whole
+    /// font tree on every launch.
+    #[test]
+    fn symbol_discovery_drops_system_copies_of_bundled_faces() {
+        let paths = symbol_discovery_paths();
+        let superseded: Vec<&String> = paths
+            .iter()
+            .filter(|p| bundled::supersedes_system_face(p))
+            .collect();
+        assert!(superseded.is_empty(), "{superseded:?}");
+        if bundled::ACTIVE {
+            assert!(
+                !paths
+                    .iter()
+                    .any(|p| p.ends_with("/NotoSansSymbols2-Regular.ttf")),
+                "{paths:?}"
+            );
+            assert_eq!(paths[0], bundled::NOTO_SYMBOLS2_ID);
+        } else {
+            assert!(
+                paths
+                    .iter()
+                    .any(|p| p.ends_with("/NotoSansSymbols2-Regular.ttf")),
+                "without the bundled stack the system Symbols 2 stays a candidate"
+            );
+        }
+    }
+
+    /// FACT 3 for the BUNDLED broad face. The embedded DejaVu Sans Mono LEADS
+    /// the broad tier on a non-macOS build — ahead of every per-script face and
+    /// the CJK backstop — so what it shadows is pinned here, from the
+    /// compiled-in bytes alone (no host fonts needed, so this holds on a host
+    /// that lacks the Debian per-script Noto set the tests above skip or fail
+    /// on).
+    ///
+    /// * It takes NO point in a CJK script block (ideographs, kana, Hangul,
+    ///   CJK symbols and punctuation, fullwidth forms): the shadow law's
+    ///   concern — 、。「」 drawn at proportional width — cannot arise from it.
+    /// * The per-script blocks where it answers ahead of the dedicated faces are
+    ///   exactly Greek, Cyrillic (the parts JetBrains Mono lacks), Armenian,
+    ///   Arabic (DejaVu's basic block — the per-script tier's own comment has
+    ///   always called Noto Sans Arabic "beyond the primary's basic block"),
+    ///   Thai (U+0E3F only), Lao and Georgian. Before the stack shipped the
+    ///   Debian default PRIMARY was the system copy of this same DejaVu Sans
+    ///   Mono design, which answered all of these ahead of the per-script tier,
+    ///   so for an UNCONFIGURED Debian host the lead reproduces the pre-stack
+    ///   routing. It is a deliberate change for a configured non-DejaVu
+    ///   primary with per-script faces installed, and on Windows — see
+    ///   `fallback_discovery_paths`. A DejaVu update that reaches a new script
+    ///   fails here.
+    #[test]
+    fn the_bundled_broad_face_shadows_no_cjk_point_and_only_the_scripts_it_always_drew() {
+        if !bundled::ACTIVE {
+            return;
+        }
+        let coverage = |bytes: &[u8]| -> std::collections::BTreeSet<u32> {
+            let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+            let mut out = std::collections::BTreeSet::new();
+            for sub in face.tables().cmap.unwrap().subtables {
+                if sub.is_unicode() {
+                    sub.codepoints(|cp| {
+                        if char::from_u32(cp)
+                            .and_then(|c| face.glyph_index(c))
+                            .is_some_and(|g| g.0 != 0)
+                        {
+                            out.insert(cp);
+                        }
+                    });
+                }
+            }
+            out
+        };
+        let primary = coverage(bundled::face_for_id(bundled::PRIMARY_ID).unwrap());
+        let dejavu = coverage(bundled::face_for_id(bundled::DEJAVU_ID).unwrap());
+        // What it answers in the chain: its coverage minus the primary's.
+        let leads: Vec<u32> = dejavu.difference(&primary).copied().collect();
+        const CJK_BLOCKS: &[(u32, u32)] = &[
+            (0x1100, 0x11FF),
+            (0x2E80, 0x2FDF),
+            (0x3000, 0x33FF),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xA960, 0xA97F),
+            (0xAC00, 0xD7FF),
+            (0xF900, 0xFAFF),
+            (0xFE30, 0xFE4F),
+            (0xFF00, 0xFFEF),
+            (0x2_0000, 0x3_FFFF),
+        ];
+        let cjk: Vec<String> = leads
+            .iter()
+            .filter(|&&c| CJK_BLOCKS.iter().any(|&(a, b)| (a..=b).contains(&c)))
+            .map(|c| format!("U+{c:04X}"))
+            .collect();
+        assert!(cjk.is_empty(), "bundled DejaVu shadows CJK: {cjk:?}");
+
+        // The scripts the Linux per-script tier carries a dedicated face for.
+        const SCRIPT_BLOCKS: &[(&str, u32, u32)] = &[
+            ("Greek", 0x0370, 0x03FF),
+            ("Cyrillic", 0x0400, 0x04FF),
+            ("Armenian", 0x0530, 0x058F),
+            ("Hebrew", 0x0590, 0x05FF),
+            ("Arabic", 0x0600, 0x06FF),
+            ("Syriac", 0x0700, 0x074F),
+            ("Thaana", 0x0780, 0x07BF),
+            ("NKo", 0x07C0, 0x07FF),
+            ("Devanagari", 0x0900, 0x097F),
+            ("Bengali", 0x0980, 0x09FF),
+            ("Tamil", 0x0B80, 0x0BFF),
+            ("Thai", 0x0E00, 0x0E7F),
+            ("Lao", 0x0E80, 0x0EFF),
+            ("Tibetan", 0x0F00, 0x0FFF),
+            ("Myanmar", 0x1000, 0x109F),
+            ("Georgian", 0x10A0, 0x10FF),
+            ("Ethiopic", 0x1200, 0x137F),
+            ("Cherokee", 0x13A0, 0x13FF),
+            ("Canadian Aboriginal", 0x1400, 0x167F),
+            ("Runic", 0x16A0, 0x16FF),
+            ("Khmer", 0x1780, 0x17FF),
+            ("Coptic", 0x2C80, 0x2CFF),
+            ("Tifinagh", 0x2D30, 0x2D7F),
+            ("Vai", 0xA500, 0xA63F),
+        ];
+        let led: Vec<&str> = SCRIPT_BLOCKS
+            .iter()
+            .filter(|&&(_, a, b)| leads.iter().any(|c| (a..=b).contains(c)))
+            .map(|&(name, _, _)| name)
+            .collect();
+        assert_eq!(
+            led,
+            [
+                "Greek", "Cyrillic", "Armenian", "Arabic", "Thai", "Lao", "Georgian"
+            ],
+            "the per-script blocks the bundled DejaVu Sans Mono answers ahead of \
+             the dedicated faces moved"
         );
     }
 
@@ -28464,6 +29888,113 @@ mod tests {
         }
     }
 
+    // ---- Built-in Linux candidates mean the FACE, not Debian's path to it ----
+    //
+    // A sealed GUI window never asks the system for a font again, so the
+    // built-in lists are all it can reach. They spell the Debian/Ubuntu layout;
+    // `relocate_builtin_font_path` finds the same file where another
+    // distribution (or the user) installed it.
+
+    /// The pure relocation law, over a synthetic catalogue: found by file name
+    /// under another directory, first match in catalogue order, never onto
+    /// itself, never for a path outside the Debian root (the macOS/Windows arms
+    /// name OS-shipped paths), and `None` when the file is nowhere.
+    #[test]
+    fn a_missing_builtin_linux_font_is_found_where_this_distro_put_it() {
+        use std::path::PathBuf;
+        let declared = "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf";
+        let files: Vec<PathBuf> = [
+            "/home/u/.local/share/fonts/Other.ttf",
+            "/home/u/.local/share/fonts/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            relocate_builtin_font_path(declared, &files).as_deref(),
+            Some("/home/u/.local/share/fonts/NotoSansSymbols2-Regular.ttf"),
+            "first catalogue match wins, so a per-user copy shadows a system one"
+        );
+        assert_eq!(
+            relocate_builtin_font_path(declared, &files[2..]).as_deref(),
+            Some("/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf"),
+            "the Fedora layout of the same file"
+        );
+        assert_eq!(
+            relocate_builtin_font_path(declared, &files[3..]),
+            None,
+            "never relocated onto its own declared path"
+        );
+        assert_eq!(relocate_builtin_font_path(declared, &files[..1]), None);
+        assert_eq!(
+            relocate_builtin_font_path("/System/Library/Fonts/Apple Symbols.ttf", &files),
+            None,
+            "only the Debian-rooted Linux spellings relocate"
+        );
+    }
+
+    /// Only BUILT-IN entries relocate: the user prefix names exactly the file
+    /// the user meant, so a missing one stays missing rather than being
+    /// silently swapped for a same-named file elsewhere. A present file is
+    /// never relocated either.
+    #[test]
+    fn relocation_never_touches_the_user_prefix_or_a_present_file() {
+        let absent = format!(
+            "{LINUX_BUILTIN_FONT_ROOT}aterm-no-such-dir-{}/DejaVuSans.ttf",
+            std::process::id()
+        );
+        let paths = vec![absent.clone(), absent];
+        assert_eq!(
+            relocate_missing_builtin_fonts(&paths, 2),
+            vec![None, None],
+            "both entries are user-supplied"
+        );
+        let present = std::env::temp_dir().join(format!(
+            "aterm-relocation-present-probe-{}.ttf",
+            std::process::id()
+        ));
+        std::fs::write(&present, embedded_font()).unwrap();
+        let paths = vec![present.to_str().unwrap().to_string()];
+        assert_eq!(relocate_missing_builtin_fonts(&paths, 0), vec![None]);
+        let _ = std::fs::remove_file(present);
+    }
+
+    /// A RELOCATED text-only backstop keeps its gate. Membership in
+    /// [`SYMBOL_TIER_TEXT_ONLY_BACKSTOPS`] is by path; without
+    /// [`FallbackFace::relocated_from`] a Fedora-installed `DejaVuSans.ttf`
+    /// would enter the symbol tier UNGATED and shadow the colour face for 😀
+    /// and 87 others — the exact regression that const exists to prevent.
+    #[test]
+    fn a_relocated_text_only_backstop_keeps_its_gate() {
+        let backstop = SYMBOL_TIER_TEXT_ONLY_BACKSTOPS[0];
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-relocated-backstop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = dir.join(std::path::Path::new(backstop).file_name().unwrap());
+        std::fs::write(&elsewhere, embedded_font()).unwrap();
+        let elsewhere = elsewhere.to_str().unwrap().to_string();
+
+        let face = admit_chain_face(backstop, Some(&elsewhere)).expect("admissible");
+        assert_eq!(face.path.as_deref(), Some(elsewhere.as_str()));
+        assert_eq!(face.relocated_from.as_deref(), Some(backstop));
+        assert!(
+            symbol_face_is_text_only_backstop(&face),
+            "a relocated backstop must stay gated off emoji/PUA code points"
+        );
+
+        // Control: the same bytes admitted at that path WITHOUT the built-in
+        // identity (a user's own `symbol_font`) are not the declared backstop.
+        let plain = admit_chain_face(&elsewhere, None).expect("admissible");
+        assert_eq!(plain.relocated_from, None);
+        assert!(!symbol_face_is_text_only_backstop(&plain));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// FACT 1b, the LINUX arm's shape: the dedicated symbol face is additive so
     /// the scan continues past it, the backstop is NOT so it ends the scan, and
     /// the backstop is LAST — anything listed after it would be unreachable, the
@@ -28565,16 +30096,23 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no probe was installed here; nothing proven");
-        // And the face the raster actually drew from is the declared backstop,
-        // not some other entry that happened to answer.
+        // And the face the raster actually drew from is the one the tier ORDER
+        // names, not some other entry that happened to answer: the bundled Noto
+        // Sans Math where the bundled stack leads the tier (it carries ⊨), else
+        // the declared backstop itself.
+        let expected = if bundled::ACTIVE {
+            bundled::NOTO_MATH_ID
+        } else {
+            backstop
+        };
         let pick = r
             .symbol_chain_pick('\u{22A8}')
             .and_then(|i| r.symbol_chain.get(i))
             .and_then(|f| f.path.clone());
         assert_eq!(
             pick.as_deref(),
-            Some(backstop),
-            "⊨ must draw from the declared backstop itself"
+            Some(expected),
+            "⊨ must draw from the first symbol-tier face the order names"
         );
         eprintln!("{checked} operator(s) reached the symbol backstop with real ink");
     }
@@ -30152,6 +31690,7 @@ mod tests {
             bytes: crate::font::FaceBytes::Vec(intern_font_bytes_slice(embedded_symbols_font())),
             index: 0,
             path: Some("bad".into()),
+            relocated_from: None,
             norm: FaceNorm::default(),
         };
         r.fallback_chain = vec![bad, good];
@@ -31194,9 +32733,14 @@ mod tests {
     }
 
     /// CAVEAT-2 COVERAGE: when NO mono face on the system covers ⏺ (no STIX / no
-    /// Apple Symbols), it must still render — as the monochromatized colour
-    /// silhouette (`ColorEmojiMono`, a foreground-tinted Mono glyph with real
-    /// coverage), never `.notdef` tofu and never the colour bitmap.
+    /// Apple Symbols), it must still render — never `.notdef` tofu and never the
+    /// colour bitmap. Since 2026-09-24 that stand-in is the chain's fontless
+    /// SYNTHESIS (a filled disc), not the colour face's monochrome silhouette:
+    /// Noto Color Emoji — the Linux colour face — draws ⏺ on a filled key cap, so
+    /// its silhouette was a solid SQUARE and Claude Code's `⏺` tool bullet
+    /// rendered as `■` (measured on a Linux host). The silhouette lane itself
+    /// stays for default-text points the synthesis does not draw; the second half
+    /// of this test pins that it still monochromatizes.
     #[test]
     fn record_symbol_monochromatizes_when_no_mono_symbol_face() {
         let Some(mut r) = renderer() else {
@@ -31216,16 +32760,61 @@ mod tests {
         // NOW: the lazy loads are async, and the test pins the settled routing.
         r.debug_block_on_lazy_fallbacks();
 
-        let key = r.glyph_key('\u{23FA}');
+        if r.primary_unicode_gid('\u{23FA}').is_none() && !r.fallback_has('\u{23FA}') {
+            let key = r.glyph_key('\u{23FA}');
+            assert_eq!(
+                key.source,
+                FaceId::Procedural,
+                "⏺ with no mono glyph anywhere must take the synthesized disc, \
+                 not the colour face's key-cap silhouette"
+            );
+            assert_eq!(key.glyph_class, GlyphClass::Mono);
+            let img = r.glyph_image(key).clone();
+            assert!(
+                img.bytes().iter().any(|&b| b > 0),
+                "the synthesized ⏺ must carry real coverage, not be blank tofu"
+            );
+        } else {
+            // Not silent: this host's primary or broad chain covers ⏺ itself,
+            // so the synthesized-disc half proves nothing here. The
+            // machine-independent pin of that half is
+            // `tests/synthetic_symbols.rs`.
+            eprintln!(
+                "SKIP (synthesized-disc half): this host's primary/broad chain covers U+23FA"
+            );
+        }
+
+        // The silhouette lane: a default-TEXT point only the colour face covers
+        // and the synthesis does not draw. Chosen per host, because which
+        // points the primary/broad faces carry is the host's business.
+        let Some(c) = [
+            '\u{23F2}',
+            '\u{23F1}',
+            '\u{1F56F}',
+            '\u{1F5E8}',
+            '\u{1F6E1}',
+        ]
+        .into_iter()
+        .find(|&c| {
+            !aterm_grapheme::is_emoji_presentation(c)
+                && !procedural::covers_symbol(c)
+                && r.color_font_has(c)
+                && r.primary_unicode_gid(c).is_none()
+                && !r.fallback_has(c)
+        }) else {
+            eprintln!("SKIP silhouette half: every candidate has a mono face here");
+            return;
+        };
+        let key = r.glyph_key(c);
         assert_eq!(
             key.source,
             FaceId::ColorEmojiMono,
-            "⏺ with no mono glyph anywhere must monochromatize the colour glyph"
+            "{c:?} with no mono glyph anywhere must monochromatize the colour glyph"
         );
         assert_eq!(
             key.glyph_class,
             GlyphClass::Mono,
-            "the monochromatized ⏺ must be a Mono (foreground-tinted) glyph, not Rgba"
+            "the monochromatized {c:?} must be a Mono (foreground-tinted) glyph, not Rgba"
         );
         let img = r.glyph_image(key).clone();
         assert!(
@@ -31234,7 +32823,7 @@ mod tests {
         );
         assert!(
             img.bytes().iter().any(|&b| b > 0),
-            "monochromatized ⏺ must carry real coverage, not be blank tofu"
+            "monochromatized {c:?} must carry real coverage, not be blank tofu"
         );
     }
 
@@ -32767,6 +34356,1212 @@ mod tests {
         );
     }
 
+    /// THE BAND'S DRAWN ICONS (design ruling 251): a chrome raster that
+    /// names an icon for a cell draws that icon in place of the cell's font
+    /// glyph — in the cell's ink, inside the cell (at the row's edge it has
+    /// no blank cell to its left to spill into, ruling 258), antialiased —
+    /// and changes no other pixel; the cell keeps its character. Every icon
+    /// of the set draws, at the face's stem: a bold cell's icon carries more
+    /// ink.
+    #[test]
+    fn a_band_icon_draws_in_place_of_the_glyph_and_keeps_the_cell() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const BG: u32 = 0x0030_3135;
+        let (cw, ch) = r.cell_size();
+        r.set_pad(P);
+        for icon in BandIcon::ALL {
+            let mut term = Terminal::new(3, 6);
+            let mut bytes = [0u8; 4];
+            term.process(icon.ch().encode_utf8(&mut bytes).as_bytes());
+            term.process(b" ab");
+            let mut input = term.cell_frame(3, 6);
+            for cell in &mut input.cells[0] {
+                cell.fg = [0xf1, 0xfa, 0x8c];
+                cell.bg = [0x30, 0x31, 0x35];
+            }
+            let plain = r.render_input(&input);
+            let mut drawn_in = input.clone();
+            drawn_in.chrome_rasters.push(ChromeRaster {
+                row: 0,
+                ground: std::sync::Arc::from(Vec::new()),
+                rail: std::sync::Arc::from(Vec::new()),
+                rail_h: 0,
+                clear_rail: false,
+                own: Vec::new(),
+                split: None,
+                rings: Vec::new(),
+                icons: vec![ChromeIcon { col: 0, icon }],
+            });
+            let drawn = r.render_input(&drawn_in);
+            assert_eq!(
+                drawn_in.cells[0][0].ch,
+                icon.ch(),
+                "{icon:?}: the cell keeps its char"
+            );
+            let (w, top) = (drawn.width, r.grid_top());
+            let px = |f: &Frame, x: usize, y: usize| f.pixels[y * w + x] & 0x00ff_ffff;
+            let mut ink = 0usize;
+            let mut partial = false;
+            for y in 0..drawn.height {
+                for x in 0..w {
+                    let in_cell = (P..P + cw).contains(&x) && (top..top + ch).contains(&y);
+                    let (a, b) = (px(&plain, x, y), px(&drawn, x, y));
+                    if in_cell {
+                        if b != BG {
+                            ink += 1;
+                            partial |= b != 0x00f1_fa8c;
+                        }
+                    } else {
+                        // Glyph overshoot of the plain frame's font glyph may
+                        // reach a neighbour; the icon never does.
+                        if !(P..P + cw).contains(&x) {
+                            assert_eq!(a, b, "{icon:?}: pixel ({x},{y}) outside the cell moved");
+                        }
+                    }
+                }
+            }
+            assert!(ink > 2, "{icon:?}: the icon draws ({ink} px)");
+            // The pause bars and the `!` are drawn on whole pixels (ruling
+            // 258); every other icon has antialiased edges.
+            assert!(
+                partial || matches!(icon, BandIcon::Pause | BandIcon::Alert),
+                "{icon:?}: antialiased edges"
+            );
+            // The key both backends use, bold and regular.
+            let regular = r.chrome_icon_key(drawn_in.chrome_raster(0), &drawn_in.cells[0], 0);
+            assert_eq!(
+                regular,
+                Some(band_icon_key(icon, StyleBits::REGULAR, false, r.px_q))
+            );
+            assert_eq!(
+                r.chrome_icon_key(drawn_in.chrome_raster(0), &drawn_in.cells[0], 1),
+                None
+            );
+            let mut bold = drawn_in.clone();
+            bold.cells[0][0].bold = true;
+            let heavy = r.render_input(&bold);
+            let count = |f: &Frame| {
+                (top..top + ch)
+                    .flat_map(|y| (P..P + cw).map(move |x| (x, y)))
+                    .filter(|&(x, y)| px(f, x, y) != BG)
+                    .count()
+            };
+            let cell_px = |f: &Frame| {
+                (top..top + ch)
+                    .flat_map(|y| (P..P + cw).map(move |x| (x, y)))
+                    .map(|(x, y)| px(f, x, y))
+                    .collect::<Vec<u32>>()
+            };
+            assert!(count(&heavy) > 2, "{icon:?}: the bold icon draws");
+            if !matches!(icon, BandIcon::Sparkle) {
+                assert_ne!(
+                    cell_px(&heavy),
+                    cell_px(&drawn),
+                    "{icon:?}: a bold cell's icon is drawn at the bold stem"
+                );
+            }
+        }
+    }
+
+    /// A BAND ICON BETWEEN BLANK CELLS (design ruling 258): laid out as the
+    /// band lays its glyph (` G TITLE`), the icon is drawn at the words'
+    /// capital height and spills into the blank cells on both sides — the
+    /// badges visibly — and changes no pixel anywhere else: not the title's
+    /// cell, not the row below, not a row under the baseline's. A neighbour
+    /// that draws a glyph keeps the icon in its own cell.
+    #[test]
+    fn a_band_icon_spills_into_its_blank_neighbours_and_no_further() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const BG: u32 = 0x0030_3135;
+        let (cw, ch) = r.cell_size();
+        r.set_pad(P);
+        let top = r.grid_top();
+        let baseline = usize::try_from(r.baseline()).unwrap();
+        let cap = r.icon_metrics(true).cap;
+        for icon in BandIcon::ALL {
+            let frame = |r: &mut Renderer, g: char, right: char, drawn: bool| {
+                let mut term = Terminal::new(3, 8);
+                term.process(b"   Ab\r\nxyz");
+                let mut input = term.cell_frame(3, 8);
+                input.cells[0][1].ch = g;
+                input.cells[0][2].ch = right;
+                for cell in &mut input.cells[0] {
+                    cell.fg = [0xf1, 0xfa, 0x8c];
+                    cell.bg = [0x30, 0x31, 0x35];
+                    cell.bold = true;
+                }
+                if drawn {
+                    input.chrome_rasters.push(ChromeRaster {
+                        row: 0,
+                        ground: std::sync::Arc::from(Vec::new()),
+                        rail: std::sync::Arc::from(Vec::new()),
+                        rail_h: 0,
+                        clear_rail: false,
+                        own: Vec::new(),
+                        split: None,
+                        rings: Vec::new(),
+                        icons: vec![ChromeIcon { col: 1, icon }],
+                    });
+                }
+                let key = r.chrome_icon_key(input.chrome_raster(0), &input.cells[0], 1);
+                (r.render_input(&input), key)
+            };
+            let (blank, _) = frame(&mut r, ' ', ' ', false);
+            let (drawn, key) = frame(&mut r, icon.ch(), ' ', true);
+            assert_eq!(
+                key,
+                Some(band_icon_key(icon, StyleBits::BOLD, true, r.px_q)),
+                "{icon:?}: between blanks the key spills"
+            );
+            let w = drawn.width;
+            let px = |f: &Frame, x: usize, y: usize| f.pixels[y * w + x] & 0x00ff_ffff;
+            let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
+            for y in 0..drawn.height {
+                for x in 0..w {
+                    let (a, b) = (px(&blank, x, y), px(&drawn, x, y));
+                    let in_three = (P..P + 3 * cw).contains(&x) && (top..top + ch).contains(&y);
+                    if !in_three {
+                        assert_eq!(
+                            a, b,
+                            "{icon:?}: pixel ({x},{y}) outside the three cells moved"
+                        );
+                    } else if b != BG {
+                        (x0, x1) = (x0.min(x), x1.max(x + 1));
+                        (y0, y1) = (y0.min(y), y1.max(y + 1));
+                    }
+                }
+            }
+            assert!(x1 > x0, "{icon:?}: the icon draws");
+            assert!(
+                y1 <= top + baseline + 1,
+                "{icon:?}: no ink below the baseline's row ({y1})"
+            );
+            if matches!(icon, BandIcon::Info | BandIcon::Warn) {
+                assert!(
+                    x0 < P + cw && x1 > P + 2 * cw,
+                    "{icon:?}: the badge spills into both blank cells ({x0}..{x1})"
+                );
+                assert!(
+                    (y1 - y0) as f32 > cap,
+                    "{icon:?}: the badge is over the capital height ({} vs {cap})",
+                    y1 - y0
+                );
+            }
+            // A glyph beside it keeps the icon in its cell.
+            let (_, key) = frame(&mut r, icon.ch(), 'x', true);
+            assert_eq!(
+                key,
+                Some(band_icon_key(icon, StyleBits::BOLD, false, r.px_q)),
+                "{icon:?}: beside ink the key is the cell's own"
+            );
+        }
+    }
+
+    /// A SPILLED ICON STAYS BETWEEN THE FACE'S OWN EXTREMES (ruling 258), at
+    /// every size and weight: its ink never rises above the face's tallest
+    /// ASCII letter — so a row lifted clear of its rail (ruling 248), which
+    /// clips its glyphs at the row's top, never clips it — and never falls
+    /// below the baseline's row, so the seam's ink-skip never meets it.
+    #[test]
+    fn a_spilled_icon_stays_between_the_faces_tallest_letter_and_its_baseline() {
+        for px in [12.0f32, 14.0, 16.0, 20.0, 24.0, 27.0, 32.0] {
+            let Some(mut r) = Renderer::from_system(px, Theme::default()) else {
+                eprintln!("SKIP: no system mono font found");
+                return;
+            };
+            let (cw, ch) = r.cell_size();
+            let head = r.ascii_ink_room().0;
+            let baseline = usize::try_from(r.baseline()).unwrap();
+            for icon in BandIcon::ALL {
+                for style in [StyleBits::REGULAR, StyleBits::BOLD] {
+                    let key = band_icon_key(icon, style, true, r.px_q);
+                    let GlyphImage::Mono {
+                        width,
+                        height,
+                        bytes,
+                        ..
+                    } = r.glyph_image(key)
+                    else {
+                        panic!("{icon:?}: a Mono raster");
+                    };
+                    assert_eq!((*width, *height), (3 * cw, ch));
+                    let rows: Vec<usize> = (0..*height)
+                        .filter(|&y| bytes[y * width..(y + 1) * width].iter().any(|&c| c > 0))
+                        .collect();
+                    let (y0, y1) = (rows[0], rows[rows.len() - 1]);
+                    let at = format!("{icon:?} {style:?} at {px} px ({cw}x{ch})");
+                    assert!(y0 >= head, "{at}: ink at row {y0} above the head {head}");
+                    assert!(
+                        y1 <= baseline,
+                        "{at}: ink at row {y1} below the baseline {baseline}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A SPILLED ICON REPAINTS WITH ITS ROW (ruling 258): its ink lies in
+    /// the blank cells beside its own, so the damaged path must never repaint
+    /// a neighbour without it, nor keep it where it no longer spills. The
+    /// CPU damages whole rows (the GPU scissors the same row bands), so a
+    /// change to a neighbour, to the icon, to the raster or to another row
+    /// renders what a fresh frame renders.
+    #[test]
+    fn a_spilled_icon_repaints_with_its_neighbours() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.set_pad(8);
+        let base = |left: char, right: char, bg2: [u8; 3], icon: Option<BandIcon>, row1: &str| {
+            let mut term = Terminal::new(3, 10);
+            term.process(format!("   Title\r\n{row1}").as_bytes());
+            let mut input = term.cell_frame(3, 10);
+            input.cells[0][0].ch = left;
+            input.cells[0][1].ch = '\u{26a0}';
+            input.cells[0][2].ch = right;
+            for cell in &mut input.cells[0] {
+                cell.fg = [0xf1, 0xfa, 0x8c];
+                cell.bg = [0x30, 0x31, 0x35];
+            }
+            input.cells[0][2].bg = bg2;
+            if let Some(icon) = icon {
+                input.chrome_rasters.push(ChromeRaster {
+                    row: 0,
+                    ground: std::sync::Arc::from(Vec::new()),
+                    rail: std::sync::Arc::from(Vec::new()),
+                    rail_h: 0,
+                    clear_rail: false,
+                    own: Vec::new(),
+                    split: None,
+                    rings: Vec::new(),
+                    icons: vec![ChromeIcon { col: 1, icon }],
+                });
+            }
+            input
+        };
+        let dark = [0x30, 0x31, 0x35];
+        let frames = [
+            base(' ', ' ', dark, Some(BandIcon::Warn), "abc"),
+            // A neighbour's ground changes under the spill.
+            base(' ', ' ', [0x50, 0x51, 0x55], Some(BandIcon::Warn), "abc"),
+            // Another row changes: the spill stays as it was.
+            base(' ', ' ', [0x50, 0x51, 0x55], Some(BandIcon::Warn), "abd"),
+            // A neighbour takes a glyph: the icon draws in its cell only.
+            base('x', ' ', dark, Some(BandIcon::Warn), "abd"),
+            // …and spills again when it clears.
+            base(' ', ' ', dark, Some(BandIcon::Warn), "abd"),
+            // Another icon, then none: the font glyph, no spill left behind.
+            base(' ', ' ', dark, Some(BandIcon::Info), "abd"),
+            base(' ', ' ', dark, None, "abd"),
+            base(' ', ' ', dark, Some(BandIcon::Warn), "abd"),
+        ];
+        let mut wc = WindowCpu::default();
+        for (i, input) in frames.iter().enumerate() {
+            let fresh = r.render_input(input);
+            assert_eq!(
+                r.render_input_cached(&mut wc, input).pixels(),
+                fresh.pixels,
+                "frame {i}: the damaged path matches a fresh render"
+            );
+        }
+    }
+
+    /// AN OUTLINED CAPSULE (design ruling 249): a ring in its colour over the
+    /// raster's ground, its inside the capsule's ground, the ground running on
+    /// round it, its rounded ends antialiased — the pixels of
+    /// [`chrome_ring_runs`], the one builder both backends paint. It stands
+    /// on the face's underline (ruling 254): its lowest row is the
+    /// underline's, and between its end cells its floor is theirs.
+    #[test]
+    fn an_outlined_capsule_rings_over_the_ground() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const FILL: u32 = 0x0050_FA7B;
+        const RING: u32 = 0x00BD_93F9;
+        const INNER: u32 = 0x0030_3135;
+        let (cw, ch) = r.cell_size();
+        let mut term = Terminal::new(3, 12);
+        term.process(b"            ");
+        let mut input = term.cell_frame(3, 12);
+        for (c, cell) in input.cells[0].iter_mut().enumerate() {
+            cell.bg = if (4..10).contains(&c) {
+                [0x30, 0x31, 0x35]
+            } else {
+                [0x50, 0xfa, 0x7b]
+            };
+        }
+        r.set_pad(P);
+        let w = 12 * cw + 2 * P;
+        let ring = ChromeRing {
+            start: 4,
+            end: 10,
+            ring: RING,
+            inner: INNER,
+            seam: None,
+        };
+        assert_eq!(chrome_ring_floor_cols(&ring), 5..9);
+        input.chrome_rasters.push(ChromeRaster {
+            row: 0,
+            ground: (0..w).map(|_| FILL).collect(),
+            rail: std::sync::Arc::from(Vec::new()),
+            rail_h: 0,
+            clear_rail: false,
+            own: Vec::new(),
+            split: None,
+            rings: vec![ring],
+            icons: Vec::new(),
+        });
+        let (fy0, fy1) = r.chrome_ring_floor();
+        let by0 = (ch - fy1).min(ch / 8);
+        let top = r.grid_top();
+        let mid = P + 7 * cw;
+        // Without the floor's underline the pill is open between its ends.
+        let open = r.render_input(&input);
+        let px = |f: &Frame, x: usize, y: usize| f.pixels[y * f.width + x] & 0x00ff_ffff;
+        assert_eq!(
+            px(&open, mid, top + fy1 - 1),
+            INNER,
+            "the floor is the cells'"
+        );
+        // The host gives the floor cells their underline in the ring's colour.
+        for cell in &mut input.cells[0][5..9] {
+            cell.underline = UnderlineStyle::Single;
+            cell.underline_color = Some([0xBD, 0x93, 0xF9]);
+        }
+        let f = r.render_input(&input);
+        if by0 > 0 {
+            assert_eq!(
+                px(&f, mid, top + by0 - 1),
+                FILL,
+                "the ground runs on above the ring"
+            );
+        }
+        assert_eq!(px(&f, mid, top + by0), RING, "the ring's top line");
+        for y in fy0..fy1 {
+            assert_eq!(
+                px(&f, mid, top + y),
+                RING,
+                "the ring's floor on the underline ({y})"
+            );
+        }
+        assert_eq!(px(&f, mid, top + fy1), FILL, "nothing under the floor");
+        assert_eq!(
+            px(&f, mid, top + ch / 2),
+            INNER,
+            "the capsule's ground inside"
+        );
+        assert_eq!(
+            px(&f, P + 4 * cw, top + ch / 2),
+            FILL,
+            "the ground beside its end"
+        );
+        let blended = (P + 4 * cw..P + 5 * cw)
+            .flat_map(|x| (top..top + ch).map(move |y| (x, y)))
+            .any(|(x, y)| ![FILL, RING, INNER].contains(&px(&f, x, y)));
+        assert!(blended, "the rounded end is antialiased");
+        // Every pixel the builder names is the pixel painted (the floor's
+        // underline aside).
+        let (lx0, lx1) = (P + 5 * cw, P + 9 * cw);
+        for (x0, x1, ya, yb, color) in
+            chrome_ring_runs(&input.chrome_rasters[0], f.width, P, cw, ch, (fy0, fy1))
+        {
+            for y in ya..yb {
+                for x in x0..x1 {
+                    let want = if (fy0..fy1).contains(&y) && (lx0..lx1).contains(&x) {
+                        RING
+                    } else {
+                        color
+                    };
+                    assert_eq!(px(&f, x, top + y), want, "({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// THE PILL STANDS ON THE SEAM (ruling 254). A band's last row carries the
+    /// closing seam at the face's underline; an outlined Primary on it —
+    /// `Stop paste`, the one a paste's progress row carries — has its floor on
+    /// those same rows, so the seam runs up to the pill's foot and the pill's
+    /// floor carries it on: no seam pixel crosses the pill's inside (round
+    /// 13 drew it one row above the floor, through the label). The floor is
+    /// the cells' underline, so the descender ink-skip carves it round the
+    /// `p`s exactly as it carves the seam outside the pill.
+    #[test]
+    fn a_ringed_primary_stands_on_the_seam_and_its_descenders_carve_its_floor() {
+        const P: usize = 8;
+        const TRACK: u32 = 0x004D_4E51;
+        const SEAM: u32 = 0x00A0_A2A8;
+        const RING: u32 = 0x0050_FA7B;
+        const INNER: u32 = 0x0030_3135;
+        const LABEL: u32 = 0x00F1_FA8C;
+        let rgb = |c: u32| {
+            let [_, r, g, b] = c.to_be_bytes();
+            [r, g, b]
+        };
+        for size in [16.0f32, 24.0] {
+            let Some(mut r) = Renderer::from_system(size, Theme::default()) else {
+                eprintln!("SKIP: no system mono font found");
+                return;
+            };
+            r.set_pad(P);
+            let (cw, ch) = r.cell_size();
+            let cols = 19usize;
+            let mut term = Terminal::new(2, cols as u16);
+            term.process(b"Paste   Stop paste ");
+            let mut input = term.cell_frame(2, cols);
+            input.cells[0].resize(cols, RenderCell::default());
+            // The row is chrome: no terminal cursor on it.
+            input.cursor_visible = false;
+            // As the band hands it over: the seam's two end cells to the ring.
+            let ring = ChromeRing {
+                start: 7,
+                end: 19,
+                ring: RING,
+                inner: INNER,
+                seam: Some(SEAM),
+            };
+            let floor_cols = chrome_ring_floor_cols(&ring);
+            assert_eq!(floor_cols, 8..18);
+            for (c, cell) in input.cells[0].iter_mut().enumerate() {
+                let ringed = (7..19).contains(&c);
+                cell.fg = rgb(LABEL);
+                cell.bg = rgb(if ringed { INNER } else { TRACK });
+                // The seam on the row outside the pill; the floor in the
+                // ring's colour; the ring's two end cells bare.
+                if !(c == 7 || c == 18) {
+                    cell.underline = UnderlineStyle::Single;
+                    cell.underline_color =
+                        Some(rgb(if floor_cols.contains(&c) { RING } else { SEAM }));
+                }
+            }
+            let w = cols * cw + 2 * P;
+            input.chrome_rasters.push(ChromeRaster {
+                row: 0,
+                ground: (0..w).map(|_| TRACK).collect(),
+                rail: std::sync::Arc::from(Vec::new()),
+                rail_h: 0,
+                clear_rail: false,
+                own: vec![(7, 19)],
+                split: None,
+                rings: vec![ring],
+                icons: Vec::new(),
+            });
+            let f = r.render_input(&input);
+            let top = r.grid_top();
+            let px = |x: usize, y: usize| f.pixels[(top + y) * f.width + x] & 0x00ff_ffff;
+            let (fy0, fy1) = r.chrome_ring_floor();
+            // The seam outside the pill is on the floor's rows: one edge.
+            for y in 0..ch {
+                assert_eq!(
+                    px(P + cw * 6 + cw / 2, y) == SEAM,
+                    (fy0..fy1).contains(&y),
+                    "{size}: the seam's rows ({y})"
+                );
+            }
+            // One unbroken edge: on the floor's rows the two end cells are
+            // the seam up to the pill's foot, mixed into it — never the
+            // ground (a gap) — and meet it through antialiased pixels.
+            for c in [7usize, 18] {
+                let px_row: Vec<u32> = (fy0..fy1)
+                    .flat_map(|y| (P + c * cw..P + (c + 1) * cw).map(move |x| (x, y)))
+                    .map(|(x, y)| px(x, y))
+                    .collect();
+                assert!(!px_row.contains(&TRACK), "{size}: no gap in end cell {c}");
+                assert!(
+                    px_row.contains(&SEAM),
+                    "{size}: the seam runs into cell {c}"
+                );
+                assert!(
+                    px_row.iter().any(|&p| p != SEAM && p != RING),
+                    "{size}: the seam meets the foot antialiased in cell {c}"
+                );
+            }
+            // No seam pixel inside the pill: above its floor across all its
+            // cells, and on the floor between its ends. (In the two end
+            // cells the seam meets the rounded foot on the floor's rows,
+            // where every pixel is the stroke or the ground outside it.)
+            for y in 0..ch {
+                let (x0, x1) = if (fy0..fy1).contains(&y) {
+                    (P + 8 * cw, P + 18 * cw)
+                } else {
+                    (P + 7 * cw, P + 19 * cw)
+                };
+                for x in x0..x1 {
+                    assert_ne!(px(x, y), SEAM, "{size}: seam inside the pill at ({x},{y})");
+                }
+            }
+            // The floor: the ring's colour under a letter that sits on the
+            // baseline (`o`, cell 10), carved round a `p`'s descender (cells
+            // 11 and 13) when it reaches the floor — the gap the capsule's
+            // ground, the descender the label's ink, as on the seam.
+            let floor_px = |c: usize| {
+                (fy0..fy1)
+                    .flat_map(|y| (P + c * cw..P + (c + 1) * cw).map(move |x| (x, y)))
+                    .map(|(x, y)| px(x, y))
+                    .collect::<Vec<u32>>()
+            };
+            assert!(
+                floor_px(10).iter().all(|&c| c == RING),
+                "{size}: the floor under `o`"
+            );
+            let reaches = |c: usize| {
+                (fy1..ch).any(|y| (P + c * cw..P + (c + 1) * cw).any(|x| px(x, y) != TRACK))
+            };
+            for c in [11usize, 13] {
+                let under = floor_px(c);
+                if !reaches(c) {
+                    eprintln!("{size}: the face's `p` stops above the floor; nothing to carve");
+                    continue;
+                }
+                assert!(
+                    under.contains(&INNER),
+                    "{size}: the floor is carved round the `p` in cell {c}: {under:x?}"
+                );
+                assert!(
+                    under.iter().any(|&c| c != RING && c != INNER),
+                    "{size}: the descender's ink crosses the floor in cell {c}"
+                );
+            }
+        }
+    }
+
+    /// The ring builder's fast path — a pixel whose centre is well clear of
+    /// both of the stroke's edges is taken whole — paints exactly what
+    /// supersampling every pixel painted: the same runs, pixel for pixel, on
+    /// a gradient ground, at several cell sizes and floors, a floored ring
+    /// and short ones without a floor, with and without the seam.
+    #[test]
+    fn the_ring_builders_fast_path_matches_supersampling_every_pixel() {
+        fn reference(
+            m: &ChromeRaster,
+            w: usize,
+            pad: usize,
+            cw: usize,
+            ch: usize,
+            floor: (usize, usize),
+        ) -> Vec<Option<u32>> {
+            let lin = |v: u32| {
+                let c = v as f32 / 255.0;
+                if c <= 0.040_45 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let enc = |l: f32| {
+                let l = l.clamp(0.0, 1.0);
+                let c = if l <= 0.003_130_8 {
+                    12.92 * l
+                } else {
+                    1.055f32.mul_add(l.powf(1.0 / 2.4), -0.055)
+                };
+                (c * 255.0).round().clamp(0.0, 255.0) as u32
+            };
+            let split = |c: u32| [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(lin);
+            let mut out = vec![None; w * ch];
+            let by1 = floor.1.clamp(1, ch);
+            let (fy0, fy1) = (floor.0.min(by1), by1);
+            let t = (fy1 - fy0).clamp(1, (ch / 6).max(1)) as f32;
+            let by0 = (ch - by1).min(ch / 8);
+            for ring in &m.rings {
+                let (start, end) = (usize::from(ring.start), usize::from(ring.end));
+                let bx0 = pad + start * cw + cw / 4;
+                let bx1 = (pad + end * cw).saturating_sub(cw / 4).min(w);
+                // Every pixel of the ring's cells: the seam may reach any.
+                let (sx0, sx1) = (pad + start * cw, (pad + end * cw).min(w));
+                let cols = chrome_ring_floor_cols(ring);
+                let (lx0, lx1) = (pad + cols.start * cw, pad + cols.end * cw);
+                let (cx, cy) = ((bx0 + bx1) as f32 * 0.5, (by0 + by1) as f32 * 0.5);
+                let (hw, hh) = ((bx1 - bx0) as f32 * 0.5, (by1 - by0) as f32 * 0.5);
+                let rad = hh.min(hw);
+                let sd = |px: f32, py: f32| {
+                    let qx = (px - cx).abs() - (hw - rad);
+                    let qy = (py - cy).abs() - (hh - rad);
+                    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - rad
+                };
+                for y in by0..by1 {
+                    for x in sx0..sx1 {
+                        let floored = (fy0..fy1).contains(&y) && (lx0..lx1).contains(&x);
+                        let seamed = ring.seam.filter(|_| (fy0..fy1).contains(&y) && !floored);
+                        let (mut o, mut rg, mut i) = (0u32, 0u32, 0u32);
+                        for sy in 0..4 {
+                            for sx in 0..4 {
+                                let d = sd(
+                                    x as f32 + (sx as f32 + 0.5) / 4.0,
+                                    y as f32 + (sy as f32 + 0.5) / 4.0,
+                                );
+                                if d > 0.0 {
+                                    o += 1;
+                                } else if d > -t && !floored {
+                                    rg += 1;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        out[y * w + x] = match (o, rg, i) {
+                            (16, _, _) => seamed,
+                            (_, 16, _) => Some(ring.ring),
+                            (_, _, 16) => Some(ring.inner),
+                            _ => {
+                                let (a, b, c) = (
+                                    split(seamed.unwrap_or(m.ground[x])),
+                                    split(ring.ring),
+                                    split(ring.inner),
+                                );
+                                let k = |n: usize| {
+                                    enc((a[n] * o as f32 + b[n] * rg as f32 + c[n] * i as f32)
+                                        / 16.0)
+                                };
+                                Some((k(0) << 16) | (k(1) << 8) | k(2))
+                            }
+                        };
+                    }
+                }
+            }
+            out
+        }
+        for (cw, ch, floor) in [
+            (12usize, 24usize, (21usize, 22usize)),
+            (8, 17, (14, 15)),
+            (20, 40, (34, 37)),
+            (10, 20, (17, 19)),
+        ] {
+            let pad = 6;
+            let w = 16 * cw + 2 * pad;
+            let m = ChromeRaster {
+                row: 0,
+                ground: (0..w)
+                    .map(|x| {
+                        let g = u32::try_from(x * 255 / w).unwrap();
+                        (0x50 << 16) | (g << 8) | (255 - g)
+                    })
+                    .collect(),
+                rail: std::sync::Arc::from(Vec::new()),
+                rail_h: 0,
+                clear_rail: false,
+                own: Vec::new(),
+                split: None,
+                rings: vec![
+                    // Long, carrying the seam at all but one size.
+                    ChromeRing {
+                        start: 1,
+                        end: 9,
+                        ring: 0x00BD_93F9,
+                        inner: 0x0030_3135,
+                        seam: (cw != 8).then_some(0x00A0_A2A8),
+                    },
+                    // Short (no floor), without and with the seam.
+                    ChromeRing {
+                        start: 10,
+                        end: 12,
+                        ring: 0x00FF_B86C,
+                        inner: 0x0028_2A36,
+                        seam: None,
+                    },
+                    ChromeRing {
+                        start: 13,
+                        end: 15,
+                        ring: 0x00FF_B86C,
+                        inner: 0x0028_2A36,
+                        seam: Some(0x0066_6666),
+                    },
+                ],
+                icons: Vec::new(),
+            };
+            let mut got = vec![None; w * ch];
+            for (x0, x1, ya, yb, c) in chrome_ring_runs(&m, w, pad, cw, ch, floor) {
+                for y in ya..yb {
+                    for x in x0..x1 {
+                        assert!(
+                            got[y * w + x].is_none(),
+                            "{cw}x{ch}: ({x},{y}) painted twice"
+                        );
+                        got[y * w + x] = Some(c);
+                    }
+                }
+            }
+            let want = reference(&m, w, pad, cw, ch, floor);
+            for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g,
+                    e,
+                    "{cw}x{ch} floor {floor:?}: pixel ({}, {})",
+                    i % w,
+                    i / w
+                );
+            }
+        }
+    }
+
+    /// The seam's descender ink-skip on a DRAWN icon cell (ruling 251) probes
+    /// the icon the cell shows, not the font glyph it replaced: an icon sits
+    /// on the capital height and never reaches the underline, so the seam
+    /// under it runs whole, whatever the fallback face's `⚠` or `⇣` does.
+    /// The cell here holds a `g` — a font glyph that DOES descend through
+    /// the underline, standing in for a fallback symbol that does — so the
+    /// probe carves it until the icon takes the cell over.
+    #[test]
+    fn the_seams_ink_skip_probes_a_drawn_icons_ink() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        let (cw, ch) = r.cell_size();
+        let baseline = r.baseline();
+        // In a cell of its own (a neighbour's edge beside it) and SPILLED
+        // between two blank cells, as the band lays it out (ruling 258).
+        for (line, c) in [("g ", 0usize), (" g ", 1)] {
+            for icon in BandIcon::ALL {
+                let mut term = Terminal::new(1, 3);
+                term.process(line.as_bytes());
+                let mut input = term.cell_frame(1, 3);
+                input.cells[0].resize(3, RenderCell::default());
+                if c == 0 {
+                    input.cells[0][1].ch = 'x';
+                }
+                for cell in &mut input.cells[0] {
+                    cell.underline = UnderlineStyle::Single;
+                }
+                let (mut ink, mut spans) = (Vec::new(), Vec::new());
+                let mut probe = |r: &mut Renderer, input: &RenderInput, c: usize| {
+                    r.underline_keep_spans_into(
+                        input,
+                        0,
+                        c,
+                        ColumnGlyph::PerCell,
+                        c * cw,
+                        cw,
+                        &mut ink,
+                        &mut spans,
+                    )
+                };
+                if !probe(&mut r, &input, c) {
+                    eprintln!("SKIP: this face's `g` does not reach its underline");
+                    return;
+                }
+                input.chrome_rasters.push(ChromeRaster {
+                    row: 0,
+                    ground: std::sync::Arc::from(Vec::new()),
+                    rail: std::sync::Arc::from(Vec::new()),
+                    rail_h: 0,
+                    clear_rail: false,
+                    own: Vec::new(),
+                    split: None,
+                    rings: Vec::new(),
+                    icons: vec![ChromeIcon {
+                        col: c as u16,
+                        icon,
+                    }],
+                });
+                // The premise: the icon's ink ends above the row under the
+                // baseline, wherever it reaches.
+                let key = r
+                    .chrome_icon_key(input.chrome_raster(0), &input.cells[0], c)
+                    .expect("an icon cell");
+                assert_eq!(
+                    key.ch_or_id & CHROME_ICON_SPILL_BIT != 0,
+                    c == 1,
+                    "{icon:?}: spilled only between blanks"
+                );
+                let img = r.glyph_image(key);
+                let (gw, gh, ymin) = (img.width(), img.height(), img.ymin());
+                let gy0 = baseline - gh as i32 - ymin;
+                let lowest = (0..gh)
+                    .rev()
+                    .find(|&gy| {
+                        (0..gw).any(|gx| match img {
+                            GlyphImage::Mono { bytes, .. } => bytes[gy * gw + gx] > 0,
+                            GlyphImage::Rgba { bytes, .. } => bytes[(gy * gw + gx) * 4 + 3] > 0,
+                        })
+                    })
+                    .map(|gy| gy0 + gy as i32);
+                assert!(
+                    lowest.is_some_and(|y| y <= baseline),
+                    "{icon:?} ({cw}x{ch}, col {c}): the icon stays above the underline ({lowest:?})"
+                );
+                assert!(
+                    !probe(&mut r, &input, c),
+                    "{icon:?} ({cw}x{ch}, col {c}): the seam under a drawn icon is not carved"
+                );
+            }
+        }
+    }
+
+    /// A PIXEL-RESOLUTION CHROME ROW ([`ChromeRaster`], the message band's
+    /// meter — design ruling 242): its ground is painted one colour per frame
+    /// pixel over the row's band, gutters included, except under the cells it
+    /// leaves to their own backgrounds; its rail in the band's lowest pixels;
+    /// and the cell it splits draws its glyph in the split's ink left of the
+    /// split pixel and its own right of it. A raster that changes under
+    /// unchanged cells dirties its row (the damaged path matches a fresh
+    /// render), and a frame without one is the historical frame byte for byte.
+    #[test]
+    fn a_chrome_raster_paints_its_ground_rail_and_split_to_the_pixel() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const FILL: u32 = 0x0050_FA7B;
+        const TRACK: u32 = 0x0044_4750;
+        const RAIL: u32 = 0x00F1_FA8C;
+        const OWN: u32 = 0x0012_3456;
+        const LEFT_INK: u32 = 0x0000_0000;
+        let (cw, ch) = r.cell_size();
+        let (rows, cols) = (3usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"MMMMMMMMMMMM");
+        let mut input = term.cell_frame(rows, cols);
+        // The row's own cells: white ink on the track, one cell owning a chip.
+        for (c, cell) in input.cells[0].iter_mut().enumerate() {
+            cell.fg = [255, 255, 255];
+            cell.bg = if c == 9 {
+                [0x12, 0x34, 0x56]
+            } else {
+                [0x44, 0x47, 0x50]
+            };
+        }
+        r.set_pad(P);
+        let base = r.render_input(&input);
+        let w = base.width;
+        let top = r.grid_top();
+        // The fill ends 37 % of the way in, inside cell 4; one AA pixel.
+        let edge = P + 4 * cw + cw / 2;
+        let ground: std::sync::Arc<[u32]> = (0..w)
+            .map(|x| {
+                if x < edge {
+                    FILL
+                } else if x == edge {
+                    0x004A_A066
+                } else {
+                    TRACK
+                }
+            })
+            .collect();
+        let rail: std::sync::Arc<[u32]> = (0..w)
+            .map(|x| if x < edge { RAIL } else { ChromeRaster::KEEP })
+            .collect();
+        input.chrome_rasters.push(ChromeRaster {
+            row: 0,
+            ground,
+            rail,
+            rail_h: 3,
+            clear_rail: false,
+            own: vec![(9, 10)],
+            split: Some(InkSplit {
+                col: 4,
+                x: u32::try_from(edge).unwrap(),
+                ink: LEFT_INK,
+                bg: FILL,
+            }),
+            rings: Vec::new(),
+            icons: Vec::new(),
+        });
+        let lit = r.render_input(&input);
+        let at = |x: usize, y: usize| lit.pixels[y * w + x] & 0x00ff_ffff;
+        // The ground to the pixel, gutters included; the chip's cell its own.
+        for y in top..top + ch - 3 {
+            assert_eq!(at(0, y), FILL, "the left gutter is the fill");
+            assert_eq!(at(w - 1, y), TRACK, "the right gutter is the track");
+        }
+        // (the band's top pixel row: above any glyph's ink)
+        assert_eq!(at(edge - 1, top), FILL);
+        assert_eq!(at(edge, top), 0x004A_A066, "the one antialiased pixel");
+        assert_eq!(at(edge + 1, top), TRACK);
+        // (the band's top pixel row: above any glyph's ink)
+        assert_eq!(at(P + 9 * cw + 1, top), OWN, "a chip keeps its own fill");
+        // The rail in the lowest three pixels, the fill side only.
+        for y in top + ch - 3..top + ch {
+            assert_eq!(at(1, y), RAIL, "the rail from the window's left edge");
+            assert_eq!(at(edge + 2, y), TRACK, "no rail past the level");
+        }
+        // The split: ink pixels left of it in the split's ink (dark), right of
+        // it in the cell's own (light) — somewhere in the split cell's `M`.
+        let (x0, x1) = (P + 4 * cw, P + 5 * cw);
+        let lum = |px: u32| ((px >> 16) & 0xff) + ((px >> 8) & 0xff) + (px & 0xff);
+        let dark_left = (x0..edge).any(|x| (top..top + ch - 3).any(|y| lum(at(x, y)) < 200));
+        let light_right = (edge + 1..x1).any(|x| (top..top + ch - 3).any(|y| lum(at(x, y)) > 600));
+        assert!(dark_left, "the fill side's ink left of the split");
+        assert!(light_right, "the cell's own ink right of it");
+        assert!(
+            (edge + 1..x1).all(|x| (top..top + ch - 3).all(|y| lum(at(x, y)) >= lum(TRACK))),
+            "no dark ink right of the split"
+        );
+        // A raster that moves under unchanged cells dirties its row: the
+        // damaged path matches a fresh render.
+        let mut wc = WindowCpu::default();
+        let mut plain = input.clone();
+        plain.chrome_rasters.clear();
+        let _ = r.render_input_cached(&mut wc, &plain);
+        assert_eq!(r.render_input_cached(&mut wc, &input).pixels(), lit.pixels);
+        let mut moved = input.clone();
+        let shifted: std::sync::Arc<[u32]> = (0..w)
+            .map(|x| if x < edge + 5 { FILL } else { TRACK })
+            .collect();
+        moved.chrome_rasters[0].ground = shifted;
+        let fresh = r.render_input(&moved);
+        assert_eq!(
+            r.render_input_cached(&mut wc, &moved).pixels(),
+            fresh.pixels,
+            "a raster-only change repaints its row"
+        );
+        // No raster: the historical frame.
+        assert_eq!(r.render_input(&plain).pixels, base.pixels);
+    }
+
+    /// A CHROME ROW THAT KEEPS ITS WORDS CLEAR OF ITS RAIL (design ruling
+    /// 248, the strain row's words over its level rail): the rail and one
+    /// clear row fit under the lowest ink the face can draw, the glyphs
+    /// lifted by what that needs and never by more than the face leaves free
+    /// above its tallest letter ([`chrome_fit`] over
+    /// [`Renderer::chrome_room_for`]). Every pixel of ink the unlifted row
+    /// drew is there, moved up; the rail and the clear row carry no ink where
+    /// the unlifted descenders reached into them; an underline under the
+    /// lifted words (the stack's seam) breaks only around ink that is there;
+    /// the damaged path paints the row as a fresh frame does; and a row
+    /// without the flag is the historical placement byte for byte.
+    #[test]
+    fn a_clear_rail_row_keeps_its_descenders_off_the_rail() {
+        if renderer().is_none() {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        }
+        // A 1x cell and larger ones: the room differs, the rules do not.
+        for font_px in [16.0f32, 24.0, 32.0] {
+            clear_rail_at(font_px);
+        }
+    }
+
+    /// [`a_clear_rail_row_keeps_its_descenders_off_the_rail`] at one font
+    /// size.
+    fn clear_rail_at(font_px: f32) {
+        let mut r = Renderer::from_system(font_px, Theme::default()).expect("font checked");
+        const P: usize = 8;
+        const TRACK: u32 = 0x0030_3135;
+        const RAIL: u32 = 0x00F2_FD4A;
+        const SEAM: [u8; 3] = [0x9e, 0x9e, 0xa1];
+        let (cw, ch) = r.cell_size();
+        let (rows, cols) = (3usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"gypq (jgy)'");
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false;
+        for cell in &mut input.cells[0] {
+            cell.fg = [0xd0, 0xd0, 0xd0];
+            cell.bg = [0x30, 0x31, 0x35];
+        }
+        r.set_pad(P);
+        let plain = r.render_input(&input);
+        let w = plain.width;
+        let top = r.grid_top();
+        let rail_px = u16::try_from(ch.div_ceil(8).max(2)).unwrap();
+        let raster = |clear_rail: bool, lit: bool| ChromeRaster {
+            row: 0,
+            ground: std::sync::Arc::from(Vec::new()),
+            rail: (0..w)
+                .map(|_| if lit { RAIL } else { ChromeRaster::KEEP })
+                .collect(),
+            rail_h: rail_px,
+            clear_rail,
+            own: Vec::new(),
+            split: None,
+            rings: Vec::new(),
+            icons: Vec::new(),
+        };
+        // The row's own cells (a snapshot materializes the written ones).
+        let grid = P..P + input.cells[0].len().min(cols) * cw;
+        let px = |f: &Frame, x: usize, y: usize| f.pixels[y * w + x] & 0x00ff_ffff;
+        let inked = |f: &Frame, y: usize| grid.clone().any(|x| px(f, x, y) != TRACK);
+        let mut lifted_in = input.clone();
+        lifted_in.chrome_rasters.push(raster(true, true));
+        let room = r.chrome_room_for(&lifted_in);
+        let (lift, rail) = chrome_fit(&lifted_in.chrome_rasters[0], room);
+        assert!(
+            (1..=usize::from(rail_px)).contains(&rail) && lift <= room.0,
+            "{font_px}: {room:?} → lift {lift}, rail {rail}"
+        );
+        assert_eq!(
+            r.chrome_room_for(&input),
+            (0, 0),
+            "no clear-rail row, no room asked"
+        );
+        // The unlifted words: nothing within the head room, and — with no foot
+        // room — descenders in the row's lowest pixels, where the rail goes.
+        let mut unlifted = input.clone();
+        unlifted.chrome_rasters.push(raster(false, false));
+        let unlifted = r.render_input(&unlifted);
+        assert_eq!(
+            unlifted.pixels, plain.pixels,
+            "an unlit, unlifted raster is no raster"
+        );
+        assert!(
+            (top..top + room.0).all(|y| !inked(&unlifted, y)),
+            "the head room is free of ink"
+        );
+        if room.1 == 0 {
+            assert!(
+                inked(&unlifted, top + ch - 1),
+                "descenders reach the lowest row"
+            );
+        }
+        // Lifted over a lit rail: the same ink `lift` rows higher; the clear
+        // row and the rail untouched by any glyph.
+        let lifted = r.render_input(&lifted_in);
+        for y in top..top + ch - lift {
+            for x in grid.clone() {
+                assert_eq!(
+                    px(&lifted, x, y),
+                    px(&unlifted, x, y + lift),
+                    "({x},{y}): the lifted ink is the row's own, moved up"
+                );
+            }
+        }
+        assert!(
+            !inked(&lifted, top + ch - rail - 1),
+            "one clear row above the rail"
+        );
+        for y in top + ch - rail..top + ch {
+            for x in 0..w {
+                assert_eq!(px(&lifted, x, y), RAIL, "({x},{y}): the rail, no ink on it");
+            }
+        }
+        // An underline (the stack's closing seam) under the lifted words over
+        // an unlit rail breaks only around ink that IS there: the descender
+        // probe looks where the lifted glyphs draw, not where they used to.
+        let deco = r.deco_metrics();
+        let t = deco.underline_t.max(1);
+        let uy = top + deco.underline_y.min(ch - t);
+        let mut bare = input.clone();
+        bare.chrome_rasters.push(raster(true, false));
+        let bare = r.render_input(&bare);
+        let mut seamed = input.clone();
+        for cell in &mut seamed.cells[0] {
+            cell.underline = UnderlineStyle::Single;
+            cell.underline_color = Some(SEAM);
+        }
+        seamed.chrome_rasters.push(raster(true, false));
+        let seamed = r.render_input(&seamed);
+        let seam = (u32::from(SEAM[0]) << 16) | (u32::from(SEAM[1]) << 8) | u32::from(SEAM[2]);
+        let ink_near = |x: usize| {
+            (x - 1..=x + 1)
+                .any(|xx| (uy - 1..(uy + t + 1).min(top + ch)).any(|yy| px(&bare, xx, yy) != TRACK))
+        };
+        let mut breaks = 0;
+        for x in grid.clone() {
+            if px(&seamed, x, uy) != seam {
+                breaks += 1;
+                assert!(
+                    ink_near(x),
+                    "{font_px}: the seam breaks at {x} with no ink near it"
+                );
+            }
+        }
+        assert!(
+            breaks < grid.len(),
+            "{font_px}: the seam is drawn ({breaks} breaks)"
+        );
+        // The damaged path paints the lifted row as a fresh frame does, in
+        // both directions.
+        let mut wc = WindowCpu::default();
+        let _ = r.render_input_cached(&mut wc, &input);
+        assert_eq!(
+            r.render_input_cached(&mut wc, &lifted_in).pixels(),
+            lifted.pixels
+        );
+        assert_eq!(
+            r.render_input_cached(&mut wc, &input).pixels(),
+            plain.pixels
+        );
+    }
+
+    /// A HISTORY SCROLL UNDER A METERED BAND keeps the E7 blit: a raster row
+    /// never refuses the plan — it and every row the blit fills from a raster
+    /// row are repainted over the slid pixels — and each frame is the fresh
+    /// frame byte for byte, in both directions. Row 0 is a chrome row (its
+    /// own cells and raster every frame); row 3 carries a raster over
+    /// TERMINAL content, whose cells slide unchanged, so the only thing that
+    /// says its band is stale after the slide is the raster it came from.
+    #[test]
+    fn a_scroll_under_a_chrome_raster_keeps_the_blit_and_matches_a_fresh_frame() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        r.set_pad(P);
+        let (rows, cols) = (8usize, 20usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        for i in 0..80 {
+            term.process(format!("line {i} gyp tail\r\n").as_bytes());
+        }
+        let probe = r.render_input(&term.cell_frame(rows, cols));
+        let w = probe.width;
+        let raster = |row: u16, level: usize| ChromeRaster {
+            row,
+            ground: (0..w)
+                .map(|x| if x < level { 0x0050_FA7B } else { 0x0044_4750 })
+                .collect(),
+            rail: (0..w)
+                .map(|x| {
+                    if x < level {
+                        0x00F1_FA8C
+                    } else {
+                        ChromeRaster::KEEP
+                    }
+                })
+                .collect(),
+            rail_h: 3,
+            clear_rail: false,
+            own: Vec::new(),
+            split: None,
+            rings: Vec::new(),
+            icons: Vec::new(),
+        };
+        let frame = |term: &mut Terminal| {
+            let mut input = term.cell_frame(rows, cols);
+            for cell in &mut input.cells[0] {
+                cell.ch = 'M';
+                cell.fg = [255, 255, 255];
+                cell.bg = [0x44, 0x47, 0x50];
+            }
+            input.chrome_rasters.push(raster(0, w / 3));
+            input.chrome_rasters.push(raster(3, w / 2));
+            input
+        };
+        let mut wc = WindowCpu::default();
+        let _ = r.render_input_cached(&mut wc, &frame(&mut term));
+        let mut blits = 0;
+        for (step, notch) in [3i32, 3, -2, 1, -3, 2].into_iter().enumerate() {
+            term.scroll_display(notch);
+            let input = frame(&mut term);
+            let warm = r.render_input_cached(&mut wc, &input).pixels().to_vec();
+            let mut fresh = renderer().expect("font checked above");
+            fresh.set_pad(P);
+            assert_eq!(
+                warm,
+                fresh.render_input(&input).pixels,
+                "scroll-blit under a raster != fresh frame @ step {step} ({notch})"
+            );
+            if matches!(wc.last_damage(), DamageOutcome::Scroll { .. }) {
+                blits += 1;
+            }
+        }
+        assert!(blits >= 5, "the blit carries the scroll ({blits}/6)");
+    }
+
     /// A declared [`ChromeBleed`] makes the top rows' SURFACE reach the window edges:
     /// the left/right pad gutters and the whole `[0, grid_top)` strip above the grid
     /// carry the chrome tone instead of the theme background, and the seam hairline
@@ -33565,7 +36360,7 @@ mod tests {
     }
 
     /// An empty / whitespace family resolves to nothing (the caller then falls
-    /// back to `$ATERM_FONT` then the built-in candidates), so the default path is
+    /// back to the built-in candidates), so the default path is
     /// byte-identical to `from_system`.
     #[test]
     fn resolve_family_empty_is_none() {
@@ -33575,7 +36370,7 @@ mod tests {
 
     /// An ABSOLUTE-path family value that names an existing file short-circuits the
     /// directory scan — the user can point the family straight at a font file,
-    /// like `$ATERM_FONT`. (Use the first built-in candidate that exists.)
+    /// (Use the first built-in candidate that exists.)
     #[test]
     fn resolve_family_explicit_path_passthrough() {
         let Some(existing) = FONT_CANDIDATES
@@ -33608,7 +36403,7 @@ mod tests {
     }
 
     /// A family that matches NOTHING resolves to `None`, so the loader transparently
-    /// falls through to `$ATERM_FONT` / the built-in candidates — an unknown family
+    /// falls through to the built-in candidates — an unknown family
     /// never makes the renderer fail to build.
     #[test]
     fn resolve_family_unknown_is_none_but_builds() {
@@ -36437,9 +39232,8 @@ mod subpixel_seat_tests {
     /// visible either way and proves the probe is measuring ink at all.
     #[test]
     fn an_underscore_has_ink_under_subpixel_rendering_too() {
-        // THE SETTER, never the env var: `ATERM_FONT_SUBPIXEL` is process-global,
-        // so writing it here would change what every test sharing this binary
-        // rasterizes — which is the coupling, not a way to test around it.
+        // THE SETTER — the one way to change the mode (no environment variable
+        // reaches the renderer).
         let Some(mut renderer) = crate::Renderer::from_system(15.0, crate::Theme::default()) else {
             return; // no system monospace face (headless CI)
         };

@@ -24,7 +24,14 @@ use super::*;
 /// `RedeliveryCap=2` is the bounded projection of the shipping policy's larger
 /// configurable cap. On the first expiry the event is requeued; on the second it
 /// becomes a claimable escalation. That final human-facing delivery is not
-/// recycled again: expiry moves it to in-doubt.
+/// recycled again: expiry moves it to in-doubt, KEEPING its claimant's token,
+/// because `ReconcileInDoubt` accepts only a token-scoped in-doubt record.
+///
+/// `Buggy=1` adds two more slips `reclaim_locked` and the `Expire` record could
+/// make. An off-by-one cap compare (`new_count + 1 >= redelivery_cap`) escalates
+/// on the first expiry, which `EscalationOccursAtCap` rejects. An in-doubt
+/// transition that writes `InDoubt { token: None }` leaves an event no human can
+/// reconcile, which `ClaimStateOwnsToken` rejects.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn operator_event_delivery_model() -> Model {
@@ -45,7 +52,6 @@ pub fn operator_event_delivery_model() -> Model {
             var escalated = 0;
             var resolution_token = 0;
             var stale_regression = 0;
-            var in_doubt = 0;
 
             action Claim when (
                 phase == 0 && escalated == 0 && next_token <= TokenCap - 2
@@ -73,9 +79,13 @@ pub fn operator_event_delivery_model() -> Model {
                 redeliveries = redeliveries + 1;
             }
 
+            // Buggy=1 also escalates below the cap: the expiry is counted
+            // twice in the cap compare.
             action ReclaimAsEscalation when (
-                phase == 1 && expired == 1 &&
-                redeliveries == RedeliveryCap - 1
+                phase == 1 && expired == 1 && (
+                    redeliveries == RedeliveryCap - 1 ||
+                    (Buggy == 1 && redeliveries <= RedeliveryCap - 2)
+                )
             ) {
                 stale_token = token;
                 token = 0;
@@ -105,12 +115,13 @@ pub fn operator_event_delivery_model() -> Model {
                 resolution_token = token;
             }
 
+            // The in-doubt record keeps the claimant's token. Buggy=1 drops it.
             action ExpiredEscalationInDoubt when (
                 phase == 4 && expired == 1
             ) {
                 phase = 5;
                 expired = 0;
-                in_doubt = 1;
+                token = if Buggy == 1 { 0 } else { token };
             }
 
             // Repeating the same token+resolution is an idempotent success.
@@ -138,8 +149,7 @@ pub fn operator_event_delivery_model() -> Model {
                 phase <= 5 && token <= TokenCap && next_token <= TokenCap &&
                 stale_token <= TokenCap && expired <= 1 &&
                 redeliveries <= RedeliveryCap && escalated <= 1 &&
-                resolution_token <= TokenCap && stale_regression <= 1 &&
-                in_doubt <= 1;
+                resolution_token <= TokenCap && stale_regression <= 1;
             invariant ClaimStateOwnsToken:
                 if phase == 0 || phase == 3 { token == 0 } else { token > 0 };
             invariant ExpiryBelongsToDeliveredClaim:
@@ -156,8 +166,6 @@ pub fn operator_event_delivery_model() -> Model {
                 } else {
                     phase <= 2
                 };
-            invariant InDoubtOnlyAfterEscalation:
-                if phase == 5 { in_doubt == 1 && escalated == 1 } else { in_doubt == 0 };
             invariant StaleTokenCannotRegressState: stale_regression == 0;
         }
     }
@@ -173,11 +181,46 @@ pub fn operator_event_delivery_model() -> Model {
 /// paste. A foreign attempt between paste and submit advances only the former;
 /// healthy `RejectInterjectedSubmit` emits no submit and moves the durable intent
 /// in-doubt. Both unknown-outcome paths after a durable intent recover
-/// conservatively to `InDoubt`; neither may replay the mutation. `Buggy=1`
+/// conservatively to `InDoubt`; neither may replay the mutation.
 /// `authority_valid` projects the host's final actuation permit: fleet fault,
 /// unmanagement, and normal shutdown all revoke it under the same mutex held
-/// through the bounded sink write. `Buggy=1` reproduces input across either an
-/// interjection or revoked authority, plus an in-doubt replay.
+/// through the bounded sink write. `authority_invalidated` records that a
+/// revocation happened and nothing clears it, so `RevocationIsFinal` states that
+/// no step validates a revoked permit again. In the real queue that holds
+/// because `Unmanage` and `BeginFaultClear` turn the in-flight intent in-doubt
+/// and `try_validate_action_permit` grants only an `ActionInFlight` intent: a
+/// re-manage, or a healthy gate after the clear, still reads `Revoked`
+/// (`operator_host`'s final-permit test and the fleet-fault bind drive both).
+///
+/// `Buggy=1` reproduces input across either an interjection or revoked
+/// authority, plus an in-doubt replay, and one slip per WAL law:
+/// - a paste before `begin_action`'s intent frame is durable
+///   (`MutationRequiresDurableIntent`);
+/// - `Acted` persisted without `submitted=1`, the check
+///   `operator_action_transaction` makes before `finish_action`
+///   (`ResultFollowsOneSubmittedMutation`);
+/// - a revoked permit granted again (`RevocationIsFinal`): a re-manage that
+///   re-validates it, as a permit check matching the in-doubt record's retained
+///   claim token instead of the `ActionInFlight` intent would. Once granted,
+///   `GuardedSubmit` would send Enter after the revocation;
+/// - an unknown-outcome record over a finished action
+///   (`DurableOutcomesAreExclusive`);
+/// - an event resolved while its action is in flight, with neither a result nor
+///   an in-doubt record (`ResolutionHasDurableOutcome`).
+///
+/// The last two are not single slips of the real queue: the model folds several
+/// checks into each guard. `ack_at` refuses an in-flight action, and so does
+/// `WalRecord::Resolve`'s apply, which requires `Delivered`.
+/// `mark_action_in_doubt_at` refuses a finished action, and so does
+/// `WalRecord::MarkActionInDoubt`'s apply, which requires `ActionInFlight`;
+/// `commit_record` runs each apply on a clone before any write. Where the
+/// unknown-outcome path really follows a landed `FinishAction` frame (a write
+/// that failed after the frame reached the disk), memory never moved and both
+/// status checks would pass, but that failure poisoned the handle, and the
+/// poison refuses the record. Each mutant is the transition those checks
+/// together would have to admit. The operator's `wal_apply_backstops` unit
+/// tests pin each check behind the API arms: they commit each record past its
+/// arm, and replay a landed frame whose write failed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn operator_wal_actuator_model() -> Model {
@@ -207,7 +250,8 @@ pub fn operator_wal_actuator_model() -> Model {
             }
 
             action MutateOnce when (
-                phase == 1 && intent_durable == 1 && authority_valid == 1
+                ((phase == 1 && intent_durable == 1) || (Buggy == 1 && phase == 0)) &&
+                authority_valid == 1
             ) {
                 phase = 2;
                 mutations = mutations + 1;
@@ -235,12 +279,13 @@ pub fn operator_wal_actuator_model() -> Model {
 
             // Fleet fault, unmanagement, and process shutdown share the same
             // final-write permit in the host. They can win before either the
-            // paste (phase 1) or Enter (phase 2).
+            // paste (phase 1) or Enter (phase 2). Buggy=1 also lets a revoked
+            // permit be granted again: a re-manage that re-validates it.
             action InvalidateAuthority when (
                 (phase == 1 || phase == 2) && submit_writes == 0 &&
-                authority_valid == 1
+                (authority_valid == 1 || Buggy == 1)
             ) {
-                authority_valid = 0;
+                authority_valid = if authority_valid == 1 { 0 } else { 1 };
                 authority_invalidated = 1;
             }
 
@@ -249,8 +294,7 @@ pub fn operator_wal_actuator_model() -> Model {
             // revocation and is rejected by AuthorityLossNeverEgresses.
             action RejectInvalidAuthority when (
                 (phase == 1 || phase == 2) && submit_writes == 0 &&
-                authority_valid == 0 && authority_invalidated == 1 &&
-                writes_after_invalidation == 0
+                authority_valid == 0 && writes_after_invalidation == 0
             ) {
                 phase = if Buggy == 1 { phase } else { 3 };
                 in_doubt = if Buggy == 1 { 0 } else { 1 };
@@ -270,7 +314,7 @@ pub fn operator_wal_actuator_model() -> Model {
             }
 
             action PersistResult when (
-                phase == 2 && mutations == 1 && submit_writes == 1
+                phase == 2 && mutations == 1 && (submit_writes == 1 || Buggy == 1)
             ) {
                 phase = 4;
                 result_durable = 1;
@@ -285,12 +329,18 @@ pub fn operator_wal_actuator_model() -> Model {
                 in_doubt = 1;
             }
 
-            action CrashAfterMutation when (phase == 2) {
+            action CrashAfterMutation when (
+                phase == 2 ||
+                (Buggy == 1 && phase == 4 && result_durable == 1 && in_doubt == 0)
+            ) {
                 phase = 3;
                 in_doubt = 1;
             }
 
-            action ResolveInDoubt when (phase == 3 && in_doubt == 1) {
+            action ResolveInDoubt when (
+                (phase == 3 && in_doubt == 1) ||
+                (Buggy == 1 && (phase == 1 || phase == 2))
+            ) {
                 phase = 4;
                 resolved = 1;
             }
@@ -332,8 +382,12 @@ pub fn operator_wal_actuator_model() -> Model {
                 };
             invariant InterjectionNeverSubmits:
                 if interjected == 1 { submit_writes == 0 } else { interjected == 0 };
-            invariant AuthorityStateIsExclusive:
-                authority_valid + authority_invalidated == 1;
+            invariant RevocationIsFinal:
+                if authority_invalidated == 1 {
+                    authority_valid == 0
+                } else {
+                    authority_valid == 1
+                };
             invariant AuthorityLossNeverEgresses: writes_after_invalidation == 0;
             invariant DurableOutcomesAreExclusive: result_durable + in_doubt <= 1;
             invariant ResolutionHasDurableOutcome:
@@ -528,7 +582,27 @@ pub fn operator_leadership_model() -> Model {
 /// fault record, so a crash in phase 1 recovers to Faulted. Clear commits the
 /// durable healthy transition before marker removal; a crash in phase 4 safely
 /// re-latches from the retained marker. `Buggy=1` models an actuator that emits
-/// while any of those fail-closed phases owns authority.
+/// while any of those fail-closed phases owns authority, and two defects of
+/// `DurableQueue` itself.
+///
+/// One is a single slip: `latch_fault_at` commits the WAL fault record after
+/// swallowing an `ensure_fault_marker` error. The failed write leaves the marker
+/// as it was, so a latch from Healthy commits a fault no marker owns
+/// (`MarkerOwnsEveryBlockedPhase`), which
+/// `operator_fleet_fault_failed_marker_write_commits_no_fault` replays.
+///
+/// The other, a clear committed over an in-doubt action
+/// (`ClearCommitHasNoAmbiguity`), is not: the real clear scans twice, in
+/// `complete_fault_clear_at` before the commit record and again in
+/// `QueueState::complete_fault_clear`, which `commit_record` applies to a clone
+/// before any write. Without the first scan the clear is still refused, the
+/// gate stays `RebaselineRequired` and the marker stays (the operator's
+/// `wal_apply_backstops` unit tests pin that), so the mutant is a clear both
+/// scans pass. It is modeled at `CommitClear`, the commit every clear makes
+/// before its marker removal; `CompleteClear` is that same pair as a successful
+/// caller observes it. The invariant is about phase 4 only: a Healthy queue may
+/// still hold an in-doubt action (an epoch advance recovers an unmatched intent
+/// as `InDoubt` with no gate change), which this model does not represent.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn operator_fleet_fault_model() -> Model {
@@ -554,9 +628,11 @@ pub fn operator_fleet_fault_model() -> Model {
 
             // The public API holds the queue mutex across marker sync and WAL
             // commit, so callers observe this combined successful transition.
+            // Buggy=1 swallows a failed marker write and commits the fault
+            // anyway, leaving whatever marker was already there.
             action LatchFault when (phase == 0 || phase == 3) {
                 phase = 2;
-                marker = 1;
+                marker = if Buggy == 1 { marker } else { 1 };
                 pending = 0;
             }
 
@@ -587,8 +663,10 @@ pub fn operator_fleet_fault_model() -> Model {
                 in_doubt = 0;
             }
 
+            // Buggy=1 commits the clear past both in-doubt scans.
             action CommitClear when (
-                phase == 3 && marker == 1 && pending == 0 && in_doubt == 0
+                phase == 3 && marker == 1 && pending == 0 &&
+                (in_doubt == 0 || Buggy == 1)
             ) {
                 phase = 4;
             }

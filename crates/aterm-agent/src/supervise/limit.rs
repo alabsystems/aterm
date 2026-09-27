@@ -2,16 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! The usage-limit episode's clock: when the notice says the limit resets,
-//! read as a Unix time, so the watcher can wait for it (`Session::probe` in
-//! `run.rs`) and stretch its budget past it.
+//! read as a Unix time, so the turn-end policy can continue the worker a
+//! minute past it (`turn_end_loop.rs`'s `wall_reset_at`) and the loop can
+//! stretch its budget past it (`run.rs`'s `Session::extend`). The band's
+//! countdown reads the same grammar (aterm-gui `presence::countdown_to_reset`).
 //!
 //! Measured 2026-09-15 16:51 → 2026-09-17 08:55: the manager's and the
 //! worker's Claude Code drew on ONE account, its weekly limit hit both at
 //! once, and the watcher printed `EVENT limited … reset=Sep 19 at 11am
 //! (America/Los_Angeles)`, hit its own `--max-s` and exited. Nobody could act
-//! for two days; the worker answered a one-line probe in 23 s once the owner
-//! was back. The reset was on the screen the whole time — this module reads
-//! it.
+//! for two days; the worker answered a one-line message in 23 s once the
+//! owner was back. The reset was on the screen the whole time — this module
+//! reads it.
 //!
 //! Two spellings, as Claude Code prints them after `resets ` / `reset at `
 //! (`aterm_phase::limit_notice` hands over the text after that word):
@@ -20,12 +22,11 @@
 //!   `3am`, `12:05 pm (UTC)` — a clock time, with or without a month and day,
 //!   with or without a zone in parentheses ([`ResetSpec::At`]);
 //! * `in 3h`, `in 2h 30m`, `in 45m`, `in 3 hours` — a span
-//!   ([`ResetSpec::In`]), counted from the notice's print. The watcher can
+//!   ([`ResetSpec::In`]), counted from the notice's print. The loop can
 //!   only count it from its first read — late by however long the notice
-//!   sat before a watcher started onto it; the probe's backoff covers a
-//!   reset placed too late — and counts it ONCE an episode (`run.rs`'s
-//!   `Session::refresh_reset`): the same text read again after a probe is
-//!   the same reset, not one a span later.
+//!   sat before the loop read it — and counts it ONCE an episode (`run.rs`'s
+//!   `Session::refresh_reset`): the same text read again is the same reset,
+//!   not one a span later.
 //!
 //! A third, the auto-continue notice (measured 2026-09-17 13:50: `⚠ Usage
 //! limit reached · continuing automatically at 1:50pm · esc to cancel`,
@@ -34,20 +35,20 @@
 //! after `continuing automatically at ` (`1:50pm`, a bare clock time: today's,
 //! or tomorrow's by the rule above) or the word `shortly`, read as a minute
 //! from now ([`SHORTLY`]) — so the budget stretches past it as for any reset,
-//! and the probe is scheduled [`SHORTLY`] past it (`run.rs`'s
-//! `Session::arm_probe_at_reset`: Claude Code's own continuation goes
-//! first). The phrases themselves parse too. Such a notice is over the
-//! moment the worker is read busy ([`resumes_by_itself`]): the continuation
-//! IS the worker working, and the row stays on the screen while it does.
+//! and Claude Code's own continuation goes first. The phrases themselves
+//! parse too. Such a notice is over the moment the worker is read busy
+//! ([`resumes_by_itself`]): the continuation IS the worker working, and the
+//! row stays on the screen while it does.
 //!
 //! The zone's offset comes from the caller ([`reset_at`]'s `zone_offset`):
 //! in production [`zone_offset_s`], which asks `date` under `TZ=<zone>` for
 //! the zone's offset TODAY — right for a reset within the week unless a DST
-//! change falls between now and it (then an hour off; the probe that follows
-//! finds out) — and only for a zone `/usr/share/zoneinfo` has, since an
-//! unknown `TZ` reads as UTC in silence (measured: `TZ=Nonsense/Zone date +%z`
-//! prints `+0000`). A zone the machine does not know, or none named, is the
-//! local zone: Claude Code prints the notice in the user's own.
+//! change falls between now and it (then an hour off; the continuation that
+//! follows finds the wall again and waits again) — and only for a zone
+//! `/usr/share/zoneinfo` has, since an unknown `TZ` reads as UTC in silence
+//! (measured: `TZ=Nonsense/Zone date +%z` prints `+0000`). A zone the machine
+//! does not know, or none named, is the local zone: Claude Code prints the
+//! notice in the user's own.
 
 use std::path::Path;
 use std::time::Duration;
@@ -78,9 +79,9 @@ pub enum ResetSpec {
 const SAME_DAY: i64 = 19 * 3600;
 
 /// What `continuing shortly` is read as: a minute from the read. Claude Code
-/// says it when its retry is imminent; the probe, this long past the reset
-/// again, finds the worker working (the busy read closed the episode first,
-/// and no probe goes) or the notice still up (the backoff takes over).
+/// says it when its retry is imminent; by then the worker is read working
+/// (the busy read closes the episode) or the notice is still up (the
+/// turn-end policy's back-off takes over).
 pub const SHORTLY: Duration = Duration::from_secs(60);
 
 /// Read the reset out of the notice's text after `resets ` / `reset at ` —
@@ -146,7 +147,7 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
 /// BUSY after it is the continuation, and the episode is over then, the
 /// notice row on the screen or not. A notice naming a reset (`resets Sep 19
 /// at 11am`) says no such thing: a busy spell after it is someone's turn
-/// (the manager's retry, a human's, the probe), which may hit the wall
+/// (the manager's retry, a human's, the continuation), which may hit the wall
 /// again, and the episode ends when the worker answers on a point that is
 /// not the notice.
 pub fn resumes_by_itself(message: &str) -> bool {
@@ -243,7 +244,7 @@ fn month_of(word: &str) -> Option<u32> {
 /// days ahead, `Dec 31` read on Jan 2 two days behind — never a year off
 /// either way), and with no date, today, or tomorrow when today's is more
 /// than [`SAME_DAY`] gone. A time in the past is returned as it is: the
-/// limit reset while the notice sat, and the watcher probes at once.
+/// limit reset while the notice sat, and the continuation goes at once.
 pub fn reset_at(
     spec: &ResetSpec,
     now: i64,
@@ -546,7 +547,7 @@ mod tests {
         assert_eq!(at("1:50pm") - NOW, (4 * 60 + 55) * 60);
         assert_eq!(at("continuing automatically at 1:50pm"), at("1:50pm"));
         // Read at 13:50:18 — as the live notice was, the time it named 18 s
-        // gone — it is today's, passed: the probe goes at once.
+        // gone — it is today's, passed: the continuation goes at once.
         let read_at = NOW + (4 * 60 + 55) * 60 + 18;
         assert_eq!(read_at - reset_at(&one_fifty, read_at, PDT, zones), 18);
         // `3am` read at 23:00 is tomorrow's, four hours ahead; `11:05 am` read
@@ -637,7 +638,7 @@ mod tests {
         assert_eq!(at("12pm") - NOW, (3 * 60 + 5) * 60);
         // A session limit names a time at most five hours ahead: `3am` read
         // at 15:30 (a watcher started onto a stale screen) is twelve and a
-        // half hours passed — the probe goes now — not eleven and a half
+        // half hours passed — the continuation goes now — not eleven and a half
         // ahead; read at 23:00 it is tomorrow's, four hours ahead.
         let half_past_three = NOW + (6 * 60 + 35) * 60; // 15:30 local
         let t = reset_at(&parse_reset("3am").unwrap(), half_past_three, PDT, zones);
@@ -667,12 +668,26 @@ mod tests {
         assert_eq!(one_line("   "), "");
     }
 
+    /// The zone `date +%z` prints, in both spellings, as seconds; anything
+    /// else is no zone (and the times that read it fall back to UTC).
     #[test]
     fn the_local_zone_is_read_from_date() {
-        assert_eq!(parse_zone("+0200"), Some(7200));
-        assert_eq!(parse_zone("-07:00"), Some(-25_200));
-        assert_eq!(parse_zone("0200"), None);
-        assert_eq!(parse_zone(""), None);
+        for (text, want) in [
+            ("+0000", Some(0)),
+            ("+0200", Some(7200)),
+            ("-0700", Some(-25_200)),
+            ("+0530", Some(19_800)),
+            ("-07:00", Some(-25_200)),
+            ("", None),
+            ("UTC", None),
+            ("0200", None),
+            ("0700", None),
+            ("+07", None),
+            ("+070000", None),
+            ("x+0700", None),
+        ] {
+            assert_eq!(parse_zone(text), want, "{text:?}");
+        }
         // Whatever this machine's zone is, it reads as a whole number of
         // minutes within a day.
         assert!(tz_offset_s().abs() < 86_400);

@@ -1,0 +1,63 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `aterm ctl text` of a private headless aterm built from main 42428968c (149x62, a fresh pane whose shell prompt sat at the top) · the folder-trust dialog drawn on rows 5-20 of 62, wholly above the last 40 rows; the cursor, hidden, on row 17 (`❯ No, exit`) · user, host and scratch path redacted at equal length
+export DISABLE_AUTOUPDATER=1
+claude --dangerously-skip-permissions
+user@host-redacted-at-equal-length proj % export DISABLE_AUTOUPDATER=1
+user@host-redacted-at-equal-length proj % claude --dangerously-skip-permissions
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/T/tmp.XXXXXXXXXX/proj
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team).
+ If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

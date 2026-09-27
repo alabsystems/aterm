@@ -25,10 +25,11 @@
 //!
 //! So the host adds none. The macOS arm (the private `macos` module) reads
 //! Mach host statistics, `sysctlbyname`, libproc and `NSProcessInfo`. The
-//! Linux arm is, this round, only its PURE parsers ([`linux`]) over `&str`
-//! with fixture tests — there is no live Linux sampler yet, so a Linux build reads like
-//! every other platform: a [`Reading`] with every field `None` (and a `None`
-//! field is never heavy) and an empty sweep. Windows reads nothing.
+//! Linux arm ([`linux::Sampler`]) reads `/proc` and the thermal zones under
+//! a configurable root, so it is tested here against a fixture tree; a Linux
+//! build samples the live `/proc` and `/sys` (ruling 227). Every other
+//! platform reads a [`Reading`] with every field `None` (and a `None` field
+//! is never heavy) and an empty sweep. Windows reads nothing.
 //!
 //! # Bounded
 //!
@@ -81,7 +82,9 @@ pub const READ_CAP: usize = 4096;
 pub struct Probe {
     #[cfg(target_os = "macos")]
     imp: macos::Mac,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    imp: linux::Sampler,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     cores: u16,
 }
 
@@ -99,13 +102,15 @@ impl Probe {
         Self {
             #[cfg(target_os = "macos")]
             imp: macos::Mac::new(),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            imp: linux::Sampler::new(linux::Roots::live()),
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             cores: logical_cores(),
         }
     }
 
     /// One reading of the machine, stamped when it was taken. On a platform
-    /// with no sampler every field is `None`.
+    /// with no sampler (neither macOS nor Linux) every field is `None`.
     ///
     /// Named `reading`, not `read` (the spec's sketch): a zero-argument
     /// `.read()` is `RwLock::read` to the lock-order census, which scans
@@ -117,7 +122,11 @@ impl Probe {
         {
             self.imp.reading()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.imp.reading(Instant::now())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let mut r = Reading::empty(Instant::now());
             r.cores = self.cores;
@@ -126,14 +135,15 @@ impl Probe {
     }
 
     /// One sweep of the process table (cumulative CPU times; the engine takes
-    /// the deltas). Empty on a platform with no sampler.
+    /// the deltas). Empty on a platform with no sampler (neither macOS nor
+    /// Linux).
     #[must_use]
     pub fn scan(&mut self) -> Vec<ProcRow> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.imp.scan()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             Vec::new()
         }
@@ -150,6 +160,31 @@ pub const SERVICES_NOUN: &str = if cfg!(target_os = "macos") {
     aterm_messages::strain::SYSTEM_SERVICES
 };
 
+/// The working directory of process `pid`, read from the OS: `None` where it
+/// cannot be read (the process is gone, not ours, or the platform has no
+/// reader here). macOS asks `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, Linux
+/// resolves `/proc/<pid>/cwd`. What an agent's session is ABOUT — Claude
+/// Code's folder-trust dialog asks for exactly this directory — where the
+/// shell reported none (no OSC 7).
+#[must_use]
+pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_cwd(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .filter(|p| p.is_absolute())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Logical cores, `0` where unknown.
 #[must_use]
 pub fn logical_cores() -> u16 {
@@ -162,7 +197,21 @@ pub fn logical_cores() -> u16 {
 /// a device that never ends costs 4 KiB, not the machine.
 #[must_use]
 pub fn read_bounded(path: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
+    read_bounded_kind(path).ok()
+}
+
+/// [`read_bounded`], saying why a read failed: a `/proc/<pid>` file the
+/// kernel refuses (`PermissionDenied`: another user's process under
+/// `hidepid`) keeps its row unmeasured, one that is gone (`NotFound`) has
+/// none.
+pub(crate) fn read_bounded_kind(path: &Path) -> Result<String, std::io::ErrorKind> {
+    Ok(String::from_utf8_lossy(&read_bounded_bytes(path)?).into_owned())
+}
+
+/// The bytes of [`read_bounded`], undecoded (`/proc/self/auxv` is binary):
+/// at most [`READ_CAP`], one stack buffer.
+pub(crate) fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>, std::io::ErrorKind> {
+    let mut f = std::fs::File::open(path).map_err(|e| e.kind())?;
     let mut buf = [0u8; READ_CAP];
     let mut n = 0;
     while n < READ_CAP {
@@ -170,10 +219,10 @@ pub fn read_bounded(path: &Path) -> Option<String> {
             Ok(0) => break,
             Ok(k) => n += k,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
+            Err(e) => return Err(e.kind()),
         }
     }
-    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+    Ok(buf[..n].to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +233,7 @@ pub fn read_bounded(path: &Path) -> Option<String> {
 /// bits, saturating. On Apple silicon `rusage_info` times are in these ticks
 /// (timebase 125/3: 12 000 193 ticks were 500 ms of CPU), on Intel 1/1.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn ticks_to_ns(ticks: u64, numer: u32, denom: u32) -> u64 {
     if denom == 0 {
         return 0;
@@ -303,6 +353,7 @@ pub fn fill_cached_paths(rows: &mut [ProcRow], cache: &HashMap<u32, (String, Opt
 /// memory (internal pages less purgeable ones) plus wired plus the pages the
 /// compressor occupies, from `HOST_VM_INFO64`. `None` for a zero page size.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn used_mib_of(
     internal: u64,
     purgeable: u64,
@@ -323,12 +374,14 @@ pub fn used_mib_of(
 /// of uptime; each step adds the WRAPPING difference, so the `(busy, total)`
 /// the engine diffs never runs backwards.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 pub struct CpuTicks {
     last: Option<[u32; 4]>,
     busy: u64,
     total: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl CpuTicks {
     /// Fold one read of `[user, system, idle, nice]`; returns `(busy, total)`.
     pub fn advance(&mut self, now: [u32; 4]) -> (u64, u64) {
@@ -353,6 +406,7 @@ impl CpuTicks {
 /// `kern.memorystatus_vm_pressure_level` as a level: 1 normal, 2 warn,
 /// 4 critical; anything else unknown.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn pressure_of(level: i64) -> Option<MemoryLevel> {
     match level {
         1 => Some(MemoryLevel::Normal),
@@ -367,6 +421,7 @@ pub fn pressure_of(level: i64) -> Option<MemoryLevel> {
 /// left, a pressure gauge; never read as bytes in use (that is
 /// [`used_mib_of`]). Out of range is unknown.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn used_of_level(level: i64) -> Option<u16> {
     let level = u16::try_from(level).ok().filter(|l| *l <= 100)?;
     Some(1000 - 10 * level)
@@ -375,6 +430,7 @@ pub fn used_of_level(level: i64) -> Option<u16> {
 /// `NSProcessInfoThermalState` (0 nominal … 3 critical); anything else is
 /// unknown.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn thermal_of(state: isize) -> Option<Thermal> {
     match state {
         0 => Some(Thermal::Nominal),
@@ -387,6 +443,7 @@ pub fn thermal_of(state: isize) -> Option<Thermal> {
 
 /// A NUL-terminated C `char` array (a `comm`) as text, lossily.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn c_text(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()

@@ -5,9 +5,23 @@
 //! Tier-1 drives the real sink and GUI decisions in `app_input` tests.
 
 use aterm_spec::{
-    derive::{paste_order_sink_isolation_model, queued_key_kernel_delivery_model},
+    derive::{
+        ordered_input_admission_model, paste_order_sink_isolation_model,
+        queued_key_kernel_delivery_model,
+    },
     interp, verify,
 };
+
+#[test]
+fn ordered_input_retention_is_bounded_with_room_for_keys() {
+    let model = ordered_input_admission_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|m| m.name == model.name)
+    );
+    verify::prove_and_catch_scalar(&model, model.name);
+}
 
 #[test]
 fn a_spill_receipt_cannot_grant_queued_key_present_priority() {

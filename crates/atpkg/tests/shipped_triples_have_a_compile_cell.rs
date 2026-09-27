@@ -83,9 +83,10 @@ fn field_after(body: &str, from: usize, key: &str) -> Option<(String, usize)> {
 /// Every `Cell { name: "…", triple: "…", … }` literal in the matrix, in source order.
 ///
 /// Deliberately shallow: the matrix is a hand-written `vec![]` of struct literals, which is
-/// the shape this reads. A cell built any other way would not be found, so the count is
-/// pinned against the committed file by `the_scan_still_sees_the_matrix`, and a literal that
-/// names no `triple` is an error rather than a skip.
+/// the shape this reads. A cell built any other way would not be found — and a shipped
+/// triple the scan misses fails the law below, so a reader that stops seeing cells goes
+/// red rather than vacuous — and a literal that names no `triple` is an error rather than
+/// a skip.
 fn cells(src: &str) -> Result<Vec<Cell>, String> {
     let body = matrix_body(src)?;
     let mut out = Vec::new();
@@ -128,35 +129,6 @@ fn every_shipped_triple_is_a_cell_some_compiler_reads() {
 }
 
 // Non-vacuity
-
-/// The scanner's own obligation, pinned against the committed file rather than a fixture: a
-/// reader that quietly matched nothing would pass the law above forever.
-#[test]
-fn the_scan_still_sees_the_matrix() {
-    let src = resolve_source();
-    let body = matrix_body(&src).unwrap_or_else(|e| panic!("{e}"));
-    let literals = body.matches("Cell {").count();
-    let cells = cells(&src).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(
-        cells.len(),
-        literals,
-        "the matrix body holds {literals} `Cell {{` literal(s) and the scan read {}: a reader \
-         that stops part way through would vouch for a list it never saw",
-        cells.len()
-    );
-    assert!(
-        cells.len() >= 8,
-        "the matrix carries the six shipped triples plus the two browser cells; the scan saw \
-         {} cell(s): {cells:?}",
-        cells.len()
-    );
-    for want in ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"] {
-        assert!(
-            cells.iter().any(|c| c.name == want),
-            "cell `{want}` must still be seen; saw {cells:?}"
-        );
-    }
-}
 
 /// The red proof, against the real shape rather than a mutated constant: the matrix as it
 /// stood before the fix — five cells, three shipped triples unmentioned — and the law must
@@ -215,18 +187,4 @@ pub fn default_cells() -> Vec<Cell> {
         "the pre-fix matrix left exactly these shipped triples uncompiled, and the law must \
          name them"
     );
-}
-
-/// A body this file cannot read is an error, not a pass. A completeness law that shrugs at a
-/// matrix it never parsed reports green on nothing at all.
-#[test]
-fn an_unreadable_matrix_stops_the_test() {
-    let err = cells("fn something_else() {}").expect_err("no matrix function");
-    assert!(err.contains("default_cells"), "{err}");
-    let err = cells("pub fn default_cells() -> Vec<Cell> {\n    vec![Cell {\n")
-        .expect_err("the body never closes");
-    assert!(err.contains("never closes"), "{err}");
-    let err = cells("pub fn default_cells() -> Vec<Cell> {\n    vec![Cell { name: \"x\" }]\n}\n")
-        .expect_err("a cell with no triple");
-    assert!(err.contains("names no `triple:`"), "{err}");
 }

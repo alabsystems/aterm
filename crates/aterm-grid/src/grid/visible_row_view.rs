@@ -22,7 +22,6 @@
 //! At `display_offset == 0` it is byte-identical to the pre-existing live read
 //! (`screen_row == visible_row`, `Live` arm forwards to the same accessors).
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::{Grid, HistoryEpoch, MaterializedRow};
@@ -115,23 +114,21 @@ impl<'a> CellDataView<'a> {
     /// (base = first scalar), so the marks are `complex_char.chars().skip(1)`
     /// (plus any separately-stored combining, normally none) — reconstructing
     /// the same `(base, marks)` pair the live path would produce.
-    #[must_use]
-    pub fn marks(self) -> Cow<'a, [char]> {
-        match self {
-            Self::Live(r) => r
-                .cell_extra()
-                .map_or(Cow::Borrowed(&[][..]), |e| Cow::Borrowed(e.combining())),
-            Self::History(e) => match e.and_then(CellExtra::complex_char) {
-                Some(s) => {
-                    let mut v: Vec<char> = s.chars().skip(1).collect();
-                    if let Some(x) = e {
-                        v.extend_from_slice(x.combining());
-                    }
-                    Cow::Owned(v)
-                }
-                None => e.map_or(Cow::Borrowed(&[][..]), |x| Cow::Borrowed(x.combining())),
-            },
-        }
+    /// Both sources are borrowed: repainting cached history must not allocate
+    /// a temporary character vector for every marked cell. Clone the iterator
+    /// when the renderer needs separate classification and output passes.
+    pub fn marks(self) -> impl Iterator<Item = char> + Clone + 'a {
+        let extra = self.cell_extra();
+        let complex = match self {
+            Self::History(_) => extra
+                .and_then(CellExtra::complex_char)
+                .map_or("", |s| s.as_ref()),
+            Self::Live(_) => "",
+        };
+        let mut tail = complex.chars();
+        let _ = tail.next(); // The complex string starts with the base scalar.
+        let combining = extra.map_or(&[][..], CellExtra::combining);
+        tail.chain(combining.iter().copied())
     }
 }
 

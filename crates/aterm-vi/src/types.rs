@@ -129,6 +129,7 @@ pub enum ViMotion {
 impl ViMotion {
     /// Returns the primary direction of this motion.
     #[must_use]
+    #[cfg(test)]
     pub fn direction(self) -> ViDirection {
         match self {
             Self::Up
@@ -294,11 +295,13 @@ pub struct ViMarks {
 impl ViMarks {
     /// Create an empty mark set.
     #[must_use]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set a mark. Returns `true` if the character is valid (a–z, `` ` ``, `'`).
+    #[cfg(test)]
     pub fn set(&mut self, mark: char, point: ViPoint) -> bool {
         if mark.is_ascii_lowercase() || mark == '\'' || mark == '`' {
             self.marks.insert(mark, point);
@@ -315,17 +318,20 @@ impl ViMarks {
     }
 
     /// Remove a mark, returning the old position.
+    #[cfg(test)]
     pub fn remove(&mut self, mark: char) -> Option<ViPoint> {
         self.marks.remove(&mark)
     }
 
     /// Clear all marks.
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.marks.clear();
     }
 
     /// Check if a mark is set.
     #[must_use]
+    #[cfg(test)]
     pub fn contains(&self, mark: char) -> bool {
         self.marks.contains_key(&mark)
     }

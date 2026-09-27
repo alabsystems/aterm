@@ -21,13 +21,16 @@
 //!
 //! ## The steps, in order
 //!
-//! 1. The binary: `$ATERM_BIN`, else `aterm` on `$PATH`, else this executable.
+//! 1. The binary: `aterm` on `$PATH`, else this executable (a development
+//!    build's `ATERM_BIN` seam first — how the tests point it at the build under
+//!    test).
 //!    It has to carry `link serve` and `link broker`, and every word of the
 //!    bridge command it will be written into is checked for whitespace, `"` and
 //!    `\` FIRST: aterm splits `[fabric] command` on whitespace with no quoting
 //!    grammar (`fabric_launch.rs`, `configured_command`), so a path with a space
 //!    becomes two argv words and the bridge dials the wrong broker.
-//! 2. The root, `$ATERM_FABRIC_HOME` or `~/.local/share/aterm-fabric`, 0700.
+//! 2. The root, `~/.local/share/aterm-fabric`, 0700 (a test redirects it with the
+//!    `$ATERM_FABRIC_HOME` development seam, which a release build does not read).
 //!    The broker's socket lives in it, and its directory IS the security
 //!    boundary: `aterm link broker` checks no capability and no peer uid.
 //!    The socket path has to fit `sun_path` (104 bytes on macOS, one of them the
@@ -108,8 +111,9 @@
 //!     no session is spawned. A failed proof is exit 1 and says what to check;
 //!     no running instance means no proof, and the line says so.
 //! 11. The undo, spelled WITH the environment that scoped this run
-//!     (`ATERM_FABRIC_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `ATERM_BIN`,
-//!     a `HOME` that is not the login home): a sandboxed `on` used to print a
+//!     (the `ATERM_FABRIC_HOME` seam, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, a
+//!     development build's `ATERM_BIN`, a `HOME` that is not the login home): a
+//!     sandboxed `on` used to print a
 //!     bare `--disable` that, run as printed, reached the real install (the
 //!     audit's finding on the script).
 //! 12. `aterm fabric` status, printed last.
@@ -127,7 +131,7 @@
 //!
 //! THE ROOT `off` ACTS ON IS THE ONE THE FABRIC IS ON: the `--broker` the
 //! `[fabric] command` in aterm.toml dials (else the rendezvous file's), and
-//! only then `$ATERM_FABRIC_HOME` or the default. `on` under one root and
+//! only then the `$ATERM_FABRIC_HOME` seam or the default. `on` under one root and
 //! `off` under another (a different `$ATERM_FABRIC_HOME`, or none) used to
 //! answer "not installed" and leave the first root's `KeepAlive` broker
 //! running for ever (the round-13 review).
@@ -179,7 +183,7 @@
 //! command), and a non-loopback bind is refused without `--allow-remote`,
 //! which says why.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -192,8 +196,8 @@ use crate::render::safe;
 /// The rendezvous file's name, beside the instance control sockets.
 pub const RENDEZVOUS_FILE: &str = "fabric.toml";
 
-/// The fleet `on` joins unless `--fleet` (or `$ATERM_FABRIC_FLEET`) says
-/// otherwise — the name `tools/fabric-enable.sh` used.
+/// The fleet `on` joins unless `--fleet` says otherwise — the name
+/// `tools/fabric-enable.sh` used.
 pub const DEFAULT_FLEET: &str = "local";
 
 /// The launchd label (and systemd unit name) of the broker under the DEFAULT
@@ -219,15 +223,30 @@ const ARM_DEADLINE: Duration = Duration::from_secs(5);
 /// The per-request bound on every control socket this command opens.
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// TEST-ONLY: append one effect word per line (`Mint`, `Reject`, `Publish`,
-/// `Supervise`) to this file, so a test can run the real command's effects
-/// through the capability-publication model. Never set by anything shipped.
+/// TEST-ONLY (a development seam, compiled out of a release build): append one
+/// effect word per line (`Mint`, `Reject`, `Publish`, `Supervise`) to this file,
+/// so a test can run the real command's effects through the
+/// capability-publication model.
 const TRACE_ENV: &str = "ATERM_FABRIC_TRACE";
 
-/// TEST-ONLY fault injection: refuse the `<n>`th grant's mint. The same shape
-/// as the bridge's `ATERM_LINK_FAULT` — a refusal that has to be reachable to be
-/// tested, and the mint itself cannot be made to fail from outside.
+/// TEST-ONLY fault injection (a development seam): refuse the `<n>`th grant's
+/// mint. The same shape as the bridge's `ATERM_LINK_FAULT` — a refusal that has
+/// to be reachable to be tested, and the mint itself cannot be made to fail from
+/// outside.
 const FAIL_MINT_ENV: &str = "ATERM_FABRIC_FAIL_MINT_AT";
+
+/// TEST-ONLY (a development seam): the fabric root, in place of the login
+/// user's `~/.local/share/aterm-fabric`. Every test runs under its own, so the
+/// derived label and plist ([`Paths::label`]) keep it off the machine's real
+/// broker; a shipped binary has the one root.
+const ROOT_SEAM: &str = "ATERM_FABRIC_HOME";
+
+/// [`ROOT_SEAM`], when a build that compiles seams has it set (and not empty).
+fn root_seam() -> Option<PathBuf> {
+    aterm_types::dev_seam!(ROOT_SEAM)
+        .filter(|r| !r.is_empty())
+        .map(PathBuf::from)
+}
 
 // ---------------------------------------------------------------------------
 // options
@@ -290,7 +309,7 @@ pub struct OnOpts {
     pub dry_run: bool,
     /// `--service`; `None` is the platform's default.
     pub service: Option<Service>,
-    /// `--fleet`; `None` is `$ATERM_FABRIC_FLEET`, else [`DEFAULT_FLEET`].
+    /// `--fleet`; `None` is [`DEFAULT_FLEET`].
     pub fleet: Option<String>,
     /// `--tcp <bind>`: serve the broker on the SEALED TCP wire at `<host:port>`
     /// as well as the Unix socket (a `sealed` build; module doc).
@@ -376,12 +395,15 @@ impl Paths {
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| "$HOME is not set".to_string())?;
-        let root = std::env::var_os("ATERM_FABRIC_HOME")
-            .filter(|r| !r.is_empty())
-            .map_or_else(|| default_root(&home), PathBuf::from);
-        let aterm = match std::env::var("ATERM_BIN") {
-            Ok(b) if !b.trim().is_empty() => b,
-            _ => match which("aterm") {
+        let root = root_seam().unwrap_or_else(|| default_root(&home));
+        // A development seam (`aterm_types::dev_seam!`): a shipped binary installs
+        // the `aterm` on PATH, else itself — no environment variable repoints it.
+        let seam = aterm_types::dev_seam!("ATERM_BIN")
+            .map(|b| b.to_string_lossy().into_owned())
+            .filter(|b| !b.trim().is_empty());
+        let aterm = match seam {
+            Some(b) => b,
+            None => match which("aterm") {
                 Some(p) => p.to_string_lossy().into_owned(),
                 None => std::env::current_exe()
                     .map_err(|e| format!("no aterm on $PATH and no current exe: {e}"))?
@@ -391,7 +413,6 @@ impl Paths {
         };
         let fleet = fleet
             .map(str::to_string)
-            .or_else(|| std::env::var("ATERM_FABRIC_FLEET").ok())
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_FLEET.to_string());
         if !crate::subject::is_fleet(&fleet) {
@@ -978,8 +999,9 @@ pub fn argv_safe(word: &str) -> Result<(), String> {
     if word.chars().any(char::is_whitespace) || word.contains('"') || word.contains('\\') {
         return Err(format!(
             "`{}` contains whitespace, a quote or a backslash; aterm's [fabric] command is \
-             split on whitespace with no quoting, so the bridge argv would break — set a \
-             different ATERM_FABRIC_HOME / ATERM_BIN / --fleet",
+             split on whitespace with no quoting, so the bridge argv would break — the \
+             fabric root (under $HOME), the aterm binary's path and --fleet must each be one \
+             plain word",
             safe(word, 256)
         ));
     }
@@ -1513,7 +1535,7 @@ fn cap_is_for(path: &Path, node: &str) -> Result<usize, String> {
 /// TEST-ONLY effect trace (module doc). A write that fails is ignored: the
 /// trace is evidence for a test, never a step of the command.
 fn trace(word: &str) {
-    if let Some(path) = std::env::var_os(TRACE_ENV) {
+    if let Some(path) = aterm_types::dev_seam!(TRACE_ENV) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -1543,9 +1565,8 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
             key.len()
         ));
     }
-    let fail_at: Option<usize> = std::env::var(FAIL_MINT_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let fail_at: Option<usize> =
+        aterm_types::dev_seam!(FAIL_MINT_ENV).and_then(|v| v.to_str()?.parse().ok());
     let cap = p.cap();
     let staged = p.root.join(format!(".node.cap.{}", std::process::id()));
     let result = (|| -> Result<usize, String> {
@@ -1651,7 +1672,7 @@ impl Out {
 pub(crate) fn binary_has_link(p: &Paths) -> Result<(), String> {
     if !is_executable(Path::new(&p.aterm)) {
         return Err(format!(
-            "no executable at {} (set ATERM_BIN, or install aterm)",
+            "no executable at {} (install aterm on PATH)",
             safe(&p.aterm, 256)
         ));
     }
@@ -1705,9 +1726,7 @@ pub(crate) fn binary_has_sealed(p: &Paths) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{} carries no sealed TCP transport (a default build, or one that predates round \
-             16) — a bridge it runs could not dial the sealed wire. Point ATERM_BIN at a sealed \
-             build: {}",
+            "{}: {}; put that build first on PATH",
             safe(&p.aterm, 256),
             crate::transport::SEALED_UNAVAILABLE
         ))
@@ -1771,8 +1790,7 @@ fn wire_step(p: &Paths, out: &mut Out) -> bool {
         out.ok(
             "wire",
             &format!(
-                "the sealed TCP wire answers at {dial}: handshake, the node's grants attached \
-                 and a read in {} ms — the one port a joining host dials",
+                "the sealed TCP wire answers at {dial} ({} ms), for joining hosts",
                 view.rtt_ms.unwrap_or(0)
             ),
         );
@@ -1943,13 +1961,10 @@ fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
                 out.fail(
                     "broker",
                     &format!(
-                        "a broker launchd does not manage answers on {sock} (pid {}): launchd \
-                         {label} is not loaded, and bootstrapping it would start a second broker \
-                         on that socket and on {} — stop that broker and run `on` again, or run \
-                         `on --service none` to keep it as it is",
+                        "an unmanaged broker (pid {}) answers on {sock}; stop it and run `on` \
+                         again, or keep it with `on --service none`",
                         view.pid
-                            .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
-                        p.log()
+                            .map_or_else(|| "-".to_string(), |pid| pid.to_string())
                     ),
                 );
                 return false;
@@ -2210,8 +2225,8 @@ fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
                 out.note(
                     "instance",
                     &format!(
-                        "{pid} is armed with a DIFFERENT command ({}): a supervisor arms once \
-                         per process, so only a relaunch of that aterm changes it",
+                        "{pid} is armed with a different command ({}); relaunch that aterm to \
+                         change it",
                         safe(inst.command.as_deref().unwrap_or("-"), 256)
                     ),
                 );
@@ -2287,21 +2302,28 @@ fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
             out.note(
                 "instance",
                 &format!(
-                    "{pid} armed; its bridge attached and has not reported its broker link after \
-                     {ARM_DEADLINE:?} (a bridge older than the link report never does) — the \
-                     proof decides"
+                    "{pid} armed; its bridge has not reported its broker link after \
+                     {ARM_DEADLINE:?} — the proof decides"
                 ),
             );
             inst.supervised = true;
             inst.state = state;
             armed.push(inst);
+        } else if state == "stalled" {
+            out.fail(
+                "instance",
+                &format!(
+                    "{pid} armed, but its broker link is down after {ARM_DEADLINE:?} \
+                     (reason={})",
+                    safe(&reason, 16)
+                ),
+            );
         } else {
             out.fail(
                 "instance",
                 &format!(
-                    "{pid} armed but fabric={} after {ARM_DEADLINE:?}: the bridge did not attach \
-                     (or attached and its broker link is down — `stalled`, with the reason on \
-                     `aterm ctl --pid {pid} fabric status`); the instance's log says which",
+                    "{pid} armed, but its bridge did not connect within {ARM_DEADLINE:?} \
+                     (fabric={})",
                     safe(&state, 16)
                 ),
             );
@@ -2310,11 +2332,12 @@ fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
     armed
 }
 
-/// Every `(instance pid, sid)` whose `status` says `hold=1`, across the
-/// instances the rendezvous walk lists. An instance that cannot be asked is
-/// skipped silently: `off` names what it can see, and the `instances` line at
-/// its end says what is running.
-fn held_sessions() -> Vec<(u32, String)> {
+/// Every `(instance pid, sid, origin)` whose `status` says `hold=1`, across the
+/// instances the rendezvous walk lists — the origin read off the session's
+/// `timeline` ([`fabric::last_hold`]), `None` when it is no longer there. An
+/// instance that cannot be asked is skipped silently: `off` names what it can
+/// see, and the `instances` line at its end says what is running.
+fn held_sessions() -> Vec<(u32, String, Option<String>)> {
     let mut held = Vec::new();
     for (pid, sock) in aterm_ctl::local_instances().unwrap_or_default() {
         let Ok(token) = aterm_ctl::instance_token(&sock) else {
@@ -2348,7 +2371,13 @@ fn held_sessions() -> Vec<(u32, String)> {
                 .filter(crate::ctl::Reply::ok)
                 .is_some_and(|r| kv(r.header(), "hold") == Some("1"));
             if is_held {
-                held.push((pid, sid));
+                let origin = ctl
+                    .request(&format!("@{sid} timeline"))
+                    .ok()
+                    .filter(crate::ctl::Reply::ok)
+                    .and_then(|t| fabric::last_hold(t.rows()))
+                    .map(|(_, origin)| origin);
+                held.push((pid, sid, origin));
             }
         }
     }
@@ -2539,8 +2568,7 @@ pub fn wire_for_on(opts: &OnOpts) -> Result<Wire, String> {
     match crate::transport::endpoint_port(bind) {
         Some(0) | None => {
             return Err(format!(
-                "--tcp {}: a <host>:<port> with a FIXED port — it is written into every joining \
-                 host's bridge command, so an ephemeral one would change under them",
+                "--tcp {}: needs <host>:<port> with a fixed port, not 0",
                 safe(bind, 128)
             ));
         }
@@ -2551,11 +2579,8 @@ pub fn wire_for_on(opts: &OnOpts) -> Result<Wire, String> {
         Ok(false) if opts.allow_remote => {}
         Ok(false) => {
             return Err(format!(
-                "--tcp {}: not a loopback address, and a broker bound there is reachable from the \
-                 network. The sealed wire keeps out a peer WITHOUT the key, but the key is one \
-                 pre-shared secret every host of the fleet holds — a transport boundary, not a \
-                 per-host identity. Add --allow-remote to say that is what you mean (a second \
-                 host needs it; open that one port to it, no wider)",
+                "--tcp {}: not a loopback address, and every host of the fleet holds the one key; \
+                 add --allow-remote to serve it on the network",
                 safe(bind, 128)
             ));
         }
@@ -2683,7 +2708,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             "socket",
             &format!(
                 "{sock} is {} bytes and sun_path holds under {SUN_PATH_MAX} — the broker cannot \
-                 bind it; set a shorter ATERM_FABRIC_HOME",
+                 bind it: the fabric root's path is too long",
                 sock.len()
             ),
         );
@@ -2913,9 +2938,9 @@ pub(crate) fn finish(
         );
         return ExitCode::FAILURE;
     };
-    let text = match std::fs::read_to_string(&config) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+    let (text, existed) = match std::fs::read_to_string(&config) {
+        Ok(t) => (t, true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (String::new(), false),
         Err(e) => {
             out.fail("config", &format!("{}: {e}", config.display()));
             return ExitCode::FAILURE;
@@ -2935,8 +2960,13 @@ pub(crate) fn finish(
             out.done(
                 "config",
                 &format!(
-                    "{word} [fabric] command in {} (previous saved as .bak)",
-                    config.display()
+                    "{word} [fabric] command in {}{}",
+                    config.display(),
+                    if existed {
+                        " (previous saved as .bak)"
+                    } else {
+                        ""
+                    }
                 ),
                 "",
             );
@@ -3035,19 +3065,19 @@ pub(crate) fn finish(
     let armed = arm_instances(argv, out);
 
     // 10. the proof
-    let proof_failed = if armed.is_empty() {
+    let (proof_failed, proof_ran) = if armed.is_empty() {
         out.note(
             "proof",
-            "skipped: no armed instance hosts a session to post through — launch aterm and run \
-             `aterm fabric doctor`",
+            "skipped: no armed instance hosts a session to post through — launch aterm, then run \
+             this again",
         );
-        false
+        (false, false)
     } else {
         match prove(&armed, out) {
-            Ok(_) => false,
+            Ok(_) => (false, true),
             Err(e) => {
                 out.fail("proof", &e);
-                true
+                (true, true)
             }
         }
     };
@@ -3066,28 +3096,21 @@ pub(crate) fn finish(
             .filter(|login| *login != p.home.as_path())
             .map(|_| p.home.to_string_lossy().into_owned());
         let scope = [
-            ("ATERM_FABRIC_HOME", env("ATERM_FABRIC_HOME")),
+            (
+                ROOT_SEAM,
+                root_seam().map(|r| r.to_string_lossy().into_owned()),
+            ),
             ("XDG_CONFIG_HOME", env("XDG_CONFIG_HOME")),
             ("XDG_RUNTIME_DIR", env("XDG_RUNTIME_DIR")),
-            ("ATERM_BIN", env("ATERM_BIN")),
+            (
+                "ATERM_BIN",
+                aterm_types::dev_seam!("ATERM_BIN")
+                    .map(|b| b.to_string_lossy().into_owned())
+                    .filter(|v| !v.is_empty()),
+            ),
             ("HOME", home),
         ];
-        let scoped = scope
-            .iter()
-            .any(|(_, v)| v.as_deref().is_some_and(|v| !v.is_empty()));
-        out.note(
-            "undo",
-            &format!(
-                "{}{}",
-                undo_command(program, &scope),
-                if scoped {
-                    " (with the environment that scoped this run: a bare `off` acts on the \
-                     config and root it finds without it)"
-                } else {
-                    ""
-                }
-            ),
-        );
+        out.note("undo", &undo_command(program, &scope));
     }
 
     if opts.dry_run {
@@ -3108,18 +3131,24 @@ pub(crate) fn finish(
     }
     if out.changed == 0 {
         println!(
-            "\nnothing changed: {}, and the proof ran again.",
+            "\nnothing changed: {}, and the proof {}.",
             match verb {
                 Verb::On => "the fabric was already on",
                 Verb::Join => "this host had already joined",
+            },
+            if proof_ran {
+                "ran again"
+            } else {
+                "was skipped"
             }
         );
     }
 
     // 11. status. THE EXIT CODE IS THIS RUN'S: the proof and the steps. The
-    // status's own warnings are printed with it, and a fabric that turned on
-    // and proved itself is not a failed `on` because a session has unread
-    // mail (the live machine had three such warnings; `on` exited 1 on them).
+    // status's own warnings are printed with it (their header names `aterm
+    // fabric doctor`), and a fabric that turned on and proved itself is not a
+    // failed `on` because a session has unread mail (the live machine had
+    // three such warnings; `on` exited 1 on them) — the last line says so.
     println!();
     match fabric::gather() {
         Ok(report) => {
@@ -3127,12 +3156,8 @@ pub(crate) fn finish(
             if proof_failed || out.failed {
                 ExitCode::FAILURE
             } else {
-                if !report.warnings.is_empty() {
-                    println!(
-                        "\n{} warning(s) above: none is this run's failure — `aterm fabric \
-                         doctor` names the fix for each",
-                        report.warnings.len()
-                    );
+                if let Some(line) = done_despite(verb, report.warnings.len()) {
+                    println!("\n{line}");
                 }
                 ExitCode::SUCCESS
             }
@@ -3141,6 +3166,22 @@ pub(crate) fn finish(
             println!("{}", off.message());
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The verdict a successful run prints under a status that has warnings:
+/// they are the fabric's, not this run's failure. `None` with no warnings.
+fn done_despite(verb: Verb, warnings: usize) -> Option<String> {
+    let name = match verb {
+        Verb::On => "on",
+        Verb::Join => "join",
+    };
+    match warnings {
+        0 => None,
+        1 => Some(format!("{name}: done; the warning above is not this run's")),
+        n => Some(format!(
+            "{name}: done; the {n} warnings above are not this run's"
+        )),
     }
 }
 
@@ -3176,18 +3217,22 @@ pub fn off(opts: &OffOpts) -> ExitCode {
         }
     );
     // THE HELD SESSIONS, BEFORE ANYTHING STOPS (module doc, `off`).
-    for (pid, sid) in held_sessions() {
-        out.warn(
-            "held",
-            &format!(
-                "@{sid} (instance {pid}) is HELD (status hold=1) and off does not lift it: a \
-                 fleet hold lifts only when a bridge reads it withdrawn on the bus, which no \
-                 bridge will once the broker is stopped, and the session answers `ERR halted` \
-                 until its instance is relaunched — withdraw the halt first (the human who \
-                 set it: `aterm link` halt off, or `aterm ctl @{sid} hold off` for a local \
-                 one), or relaunch instance {pid} after this"
-            ),
-        );
+    for (pid, sid, origin) in held_sessions() {
+        let detail = if origin.as_deref() == Some("local") {
+            format!(
+                "@{sid} (instance {pid}) is HELD (hold=1 origin=local); off does not lift it \
+                 — `aterm ctl --pid {pid} hold {sid} off` does"
+            )
+        } else {
+            format!(
+                "@{sid} (instance {pid}) is HELD (hold=1 origin={}); off does not lift it — \
+                 relaunch instance {pid} after this",
+                origin
+                    .as_deref()
+                    .map_or_else(|| "?".to_string(), |o| safe(o, 16))
+            )
+        };
+        out.warn("held", &detail);
     }
     let label = p.label();
     match service {
@@ -3249,14 +3294,11 @@ pub fn off(opts: &OffOpts) -> ExitCode {
             "broker",
             &if Path::new(&p.log()).exists() {
                 format!(
-                    "--service none: whatever runs this root's `link broker` (its log is {}) is \
-                     yours to stop",
+                    "not managed here: stop this root's `link broker` yourself (its log is {})",
                     p.log()
                 )
             } else {
-                "--service none: this root runs no broker of its own (a joined host dials the \
-                 first host's)"
-                    .to_string()
+                "this root runs no broker of its own".to_string()
             },
         ),
     }
@@ -3338,7 +3380,7 @@ pub fn off(opts: &OffOpts) -> ExitCode {
     out.note(
         "kept",
         &format!(
-            "{}: node id{}{}{} — identity is provisioned, never discarded",
+            "{}: node id{}{}{}",
             p.root.display(),
             read_node(&p.state()).map_or_else(String::new, |n| format!(" {n}")),
             if kept.is_empty() { "" } else { ", " },
@@ -3371,8 +3413,7 @@ pub fn off(opts: &OffOpts) -> ExitCode {
             "none running; the next launch starts no bridge".to_string()
         } else {
             format!(
-                "{} running ({}) keep their bridge until relaunched — a supervisor has no stop \
-                 handle — and the next launch starts none",
+                "{} running ({}) keep their bridge until relaunched; the next launch starts none",
                 running.len(),
                 running
                     .iter()
@@ -3408,23 +3449,32 @@ pub fn fix_for(warning: &str) -> String {
     let s = |t: &str| w.contains(t);
     if s("does not answer") && s("no record lands") || s("does not answer this report's own probe")
     {
-        "start the broker: `aterm fabric on` installs and (re)starts it under launchd / systemd \
-         --user and probes it; if the job is installed and flapping, read <root>/broker.err \
-         (a stale socket file, or a socket path over sun_path's 104 bytes)"
-            .to_string()
+        "start the broker: `aterm fabric on`".to_string()
     } else if s("has not reported its broker link") {
-        "nothing, if its mail moves: a bridge older than the link report (0.85 and earlier) \
-         never sends one and reads connected at its first delivery — `aterm ctl @<sid> post \
-         to=@<sid> kind=note --wait=5000 ping` proves it either way; a bridge that is new enough \
-         and still says nothing cannot reach the broker, so check it (`aterm fabric on`)"
+        "nothing, if its mail moves (`aterm ctl @<sid> post to=@<sid> kind=note --wait=5000 \
+         ping` lands); if it does not, check the broker: `aterm fabric on`"
             .to_string()
     } else if s("broker link is down") {
-        "the bridge is alive and cannot reach the broker (reason= says how the dial or the last \
-         exchange failed: no-socket / refused = nothing listens at --broker, `aterm fabric on` \
-         starts it; no-ack = it accepts and never answers, restart the job; attach / denied = the \
-         cap or the socket's permissions): fix the broker and the bridge reconnects on its own \
-         within its 5 s back-off — nothing to restart on the aterm side"
-            .to_string()
+        // The warning carries the bridge's own `reason=`, so the one cause it
+        // names picks the one remedy.
+        let reason = w
+            .split("reason=")
+            .nth(1)
+            .and_then(|r| r.split([',', ' ', ')']).next())
+            .unwrap_or("");
+        let cause = match reason {
+            "no-socket" | "refused" => {
+                "nothing listens at the broker's socket: `aterm fabric on` starts it"
+            }
+            "no-ack" => "the broker accepts and never answers: `aterm fabric on` restarts it",
+            "attach" => {
+                "the broker refuses this node's cap: move <root>/node.cap aside and run `aterm \
+                 fabric on`"
+            }
+            "denied" => "the broker's socket refuses this user: check its owner and mode",
+            _ => "check the broker: `aterm fabric on`",
+        };
+        format!("{cause}; the bridge then reconnects on its own")
     } else if s("bus could not be read") || s("could not be read:") {
         "the cap file's grants do not cover this fleet, or the broker died mid-read: `aterm fabric \
          on` re-mints the cap for the node id in the state dir and probes again; check `--fleet`"
@@ -3438,13 +3488,15 @@ pub fn fix_for(warning: &str) -> String {
     } else if s("cap file") {
         "`aterm fabric on` re-mints the cap file for the node id in the state dir".to_string()
     } else if s("has no bridge") {
-        "`aterm fabric on` arms every running instance (`aterm ctl --pid <pid> fabric attach \
-         <command>` is the verb it uses)"
-            .to_string()
+        "`aterm fabric on` arms every running instance".to_string()
     } else if s("bridge is down") {
         "aterm relaunches its bridge with back-off; if it stays down, the bridge cannot start — \
          run the [fabric] command by hand to see its error, then `aterm fabric on`"
             .to_string()
+    } else if s("has not answered for the work") {
+        "kill that instance's bridge (`kill <bridge pid>` from the BRIDGES row); aterm relaunches \
+         it"
+        .to_string()
     } else if s("armed with a different command") {
         "relaunch that aterm instance: a supervisor arms once per process and reads [fabric] \
          command at launch, so nothing else changes what it runs"
@@ -3453,20 +3505,31 @@ pub fn fix_for(warning: &str) -> String {
         "give each instance its own --state dir (each is then its own node with its own cap), or \
          run one instance"
             .to_string()
-    } else if s("state=gone") {
-        "the node's presence on the bus is stale: kill that instance's bridge (`kill <bridge pid>` \
-         from the BRIDGES row) — aterm relaunches it and the new incarnation publishes state=live. \
-         Know what that costs: every session the bridge governed is held `fabric-lost` from the \
-         kill until the relaunch reads the fleet's halt (about 200 ms), and a driver typing into \
-         one in that window is refused `ERR halted`"
+    } else if s("the bus's own presence") {
+        "kill that instance's bridge (`kill <bridge pid>` from the BRIDGES row); aterm relaunches \
+         it and publishes state=live (its sessions are held for about 200 ms)"
             .to_string()
     } else if s("is HELD") {
-        "a local hold lifts with `aterm ctl hold <sid> off`; a fleet hold lifts when a bridge \
-         reconnects (reason=fabric-lost) or the human who set it withdraws it"
-            .to_string()
+        // The warning names the hold's origin and reason when the timeline
+        // still has them, and that decides which remedy applies.
+        if s("origin=local") {
+            "`aterm ctl hold <sid> off`".to_string()
+        } else if s("reason=fabric-lost origin=fleet") {
+            "it lifts when the bridge reconnects".to_string()
+        } else if s("origin=fleet") {
+            "only the human who set it can withdraw it".to_string()
+        } else {
+            "a local hold lifts with `aterm ctl hold <sid> off`; a fleet hold lifts when a bridge \
+             reconnects (reason=fabric-lost) or the human who set it withdraws it"
+                .to_string()
+        }
     } else if s("lost") && s("evicted") {
         "read mail sooner (`aterm ctl @<sid> await inbox`) and `inbox seen` what is handled; the \
          evicted records are still on the bus"
+            .to_string()
+    } else if s("passed its deadline") {
+        "the session it was sent to has not answered: on that session's host, `aterm ctl @<sid> \
+         inbox` shows it, then `inbox seen <id> handled` (or `refused`)"
             .to_string()
     } else if s("unhandled task/ask") {
         "that session was given work: `aterm ctl @<sid> inbox`, handle it, then `inbox seen <id> \
@@ -3541,8 +3604,8 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
     let silent = fabric::unanswered(&report);
     if !silent.is_empty() {
         println!(
-            "aterm fabric doctor --retire-ghosts: refused — {} local instance(s) did not \
-             answer, so no row on this node can be shown unhosted:",
+            "refused: {} local instance(s) did not answer, so no row on this node can be shown \
+             unhosted:",
             silent.len()
         );
         for why in &silent {
@@ -3560,10 +3623,7 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
         .map(|s| (s.sid.clone(), s.node.clone()))
         .collect();
     if ghosts.is_empty() {
-        println!(
-            "aterm fabric doctor --retire-ghosts: no ghost rows — every presence row this \
-             node advertises live is hosted here"
-        );
+        println!("no ghost rows: every live row on this node is hosted here");
         return ExitCode::SUCCESS;
     }
     println!(
@@ -3578,10 +3638,7 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
     let bridge = running_bridge(&report.instances);
     if !yes && !confirmed() {
         if let Some(pid) = bridge {
-            println!(
-                "  note: the instance at pid {pid} hosts a running bridge; `--yes` (or y) \
-                 asks that bridge to retire them through its own publish sequence"
-            );
+            println!("  note: with --yes, instance {pid}'s bridge is asked to publish them");
         }
         println!("  nothing published (dry). Re-run with --yes, or answer y.");
         return ExitCode::SUCCESS;
@@ -3605,10 +3662,10 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
 /// connection of its own — to retire the rows through its bridge (`fabric
 /// retire <sid>…`), then read the bus back until every row says `exited` or
 /// [`RETIRE_WAIT`] is up. The CLI writes no sequence: the bridge publishes
-/// under its own, which is what makes the two safe together. A row still live
-/// at the deadline is REPORTED, not concluded: the request is queued at the
-/// bridge and may still land, or the bridge refused it (a sibling instance
-/// hosts the session; the node could not be asked) and said so on the bus.
+/// under its own, which is what makes the two safe together. A row the bridge
+/// REFUSED (a sibling instance hosts the session; the node could not be asked)
+/// is named with the reason its `presence-retire-refused` event gives; any other
+/// row still unretired at the deadline is reported as exactly that.
 ///
 /// An instance from 0.91.0 or earlier answers `ERR usage` to the verb; that is
 /// reported with the one remedy that works, and nothing is published.
@@ -3644,8 +3701,10 @@ fn retire_through_bridge(
             safe(&header, 160)
         );
         if header.starts_with("ERR usage") {
-            println!("  its bridge predates `fabric retire` (0.91.0 or earlier): quit that instance, re-run");
-            println!("  this command (it then publishes itself), and relaunch the instance.");
+            println!(
+                "  its bridge is 0.91.0 or earlier, too old for `fabric retire`: quit that \
+                 instance and run this command again"
+            );
         }
         return ExitCode::from(2);
     }
@@ -3653,30 +3712,46 @@ fn retire_through_bridge(
     let mut done = 0;
     let deadline = std::time::Instant::now() + RETIRE_WAIT;
     let mut pending: Vec<&str> = sids.clone();
+    // The report's bus head predates the request, so a refusal at or after it
+    // answers this run and never an earlier one.
+    let since = report.broker.head;
+    let mut refused = BTreeMap::new();
+    // Whether the LAST poll read the bridge's refusals through to the head: only
+    // then does "has not refused it" rest on something read.
+    let mut refusals_read = false;
     while !pending.is_empty() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(rows) = fabric::presence_states(report, &pending) else {
+        let Ok(progress) = fabric::retire_progress(report, &pending, since) else {
+            refusals_read = false;
             continue;
         };
+        refusals_read = progress.refusals_read;
         pending.retain(|sid| {
-            let retired = rows.get(*sid).is_some_and(|s| s == "exited");
+            let retired = progress.states.get(*sid).is_some_and(|s| s == "exited");
             if retired {
                 done += 1;
             }
-            !retired
+            !retired && !progress.refused.contains_key(*sid)
         });
+        refused.extend(progress.refused);
+    }
+    for (sid, why) in &refused {
+        println!("  @{}: the bridge refused it: {why}", safe(sid, 64));
     }
     for sid in &pending {
+        let queued = if refusals_read {
+            " and not refused; the request is still queued at the bridge"
+        } else {
+            "; the request may still be queued at the bridge"
+        };
         println!(
-            "  @{} still reads live after {:?}: the request is queued at the bridge and may \
-             still land, or the bridge refused it — `aterm fabric tail` shows \
-             `presence-retired` or `presence-retire-refused` for it",
-            safe(sid, 64),
-            RETIRE_WAIT
+            "  @{}: not retired within {RETIRE_WAIT:?}{queued} (`aterm fabric tail` shows the \
+             outcome)",
+            safe(sid, 64)
         );
     }
     println!("  published `exited` for {done} row(s) through the bridge");
-    if pending.is_empty() {
+    if pending.is_empty() && refused.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)
@@ -3733,7 +3808,8 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
     }
     match fabric::gather() {
         Err(off) => {
-            println!("{}", off.message());
+            // The state, then the remedy once, in the `fix:` shape every finding uses.
+            println!("{}", off.state());
             println!("  fix: `aterm fabric on` (`--dry-run` first shows every step)");
             ExitCode::from(2)
         }
@@ -4317,6 +4393,12 @@ mod tests {
             "instance 1's bridge was armed with a different command than x",
             "instances 1, 2 run bridges on ONE state dir (/s)",
             "instance 1 says fabric=connected, but the bus's own presence for its node n-a says state=gone",
+            "instance 1 says fabric=connected, but the bus's own presence for its node n-a says \
+             state=live fabric=disconnected",
+            "instance 1's bridge has not answered for the work it was given (fabric=stale, last ack \
+             never)",
+            "ask off=40 from h-andrew to @s-one@n-a passed its deadline 10m ago (dl=600000 ms) with \
+             no answer, report or ack — not yet recorded expired by the asker's bridge",
             "@s-a (instance 1) is HELD (reason=x origin=local)",
             "@s-a (instance 1) lost 2 message(s): its inbox ring evicted rows",
             "@s-a (instance 1) has 1 unhandled task/ask older than 10 min",
@@ -4331,6 +4413,77 @@ mod tests {
             assert_ne!(fix, "see `aterm help fabric`", "no fix for: {w}");
         }
         assert_eq!(fix_for("something new"), "see `aterm help fabric`");
+    }
+
+    /// A SUCCESSFUL RUN UNDER A STATUS WITH WARNINGS says the warnings are not
+    /// its failure; with none it adds nothing.
+    #[test]
+    fn a_run_that_succeeded_says_the_warnings_are_not_its_own() {
+        assert_eq!(done_despite(Verb::On, 0), None);
+        assert_eq!(
+            done_despite(Verb::On, 1).as_deref(),
+            Some("on: done; the warning above is not this run's")
+        );
+        assert_eq!(
+            done_despite(Verb::Join, 3).as_deref(),
+            Some("join: done; the 3 warnings above are not this run's")
+        );
+    }
+
+    /// **ONE REMEDY WHERE THE WARNING ALREADY SAYS WHICH APPLIES.** A hold's
+    /// origin and reason, and a down link's `reason=`, are in the warning's own
+    /// words, so the fix names the one remedy for that cause.
+    #[test]
+    fn a_fix_picks_the_remedy_the_warning_names() {
+        let held = |why: &str| fix_for(&format!("@s-a (instance 1) is HELD ({why})"));
+        assert_eq!(held("reason=x origin=local"), "`aterm ctl hold <sid> off`");
+        assert_eq!(
+            held("reason=fabric-lost origin=fleet"),
+            "it lifts when the bridge reconnects"
+        );
+        assert_eq!(
+            held("reason=stop origin=fleet"),
+            "only the human who set it can withdraw it"
+        );
+        assert!(held("reason and origin no longer in its timeline").contains("a fleet hold"));
+
+        let down = |reason: &str| {
+            fix_for(&format!(
+                "instance 1's bridge is attached but its broker link is down (fabric=stalled \
+                 reason={reason}, last ack 3s ago)"
+            ))
+        };
+        assert!(
+            down("refused").starts_with("nothing listens"),
+            "{}",
+            down("refused")
+        );
+        assert!(
+            down("no-socket").starts_with("nothing listens"),
+            "{}",
+            down("no-socket")
+        );
+        assert!(down("no-ack").contains("restarts it"), "{}", down("no-ack"));
+        assert!(
+            down("attach").contains("move <root>/node.cap aside"),
+            "{}",
+            down("attach")
+        );
+        assert!(
+            down("denied").contains("check its owner and mode") && !down("denied").contains("cap"),
+            "{}",
+            down("denied")
+        );
+        assert!(
+            down("closed").starts_with("check the broker"),
+            "{}",
+            down("closed")
+        );
+        assert!(
+            down("read").ends_with("the bridge then reconnects on its own"),
+            "{}",
+            down("read")
+        );
     }
 
     /// ROUND 16: THE SEALED WIRE this host serves is one argv to launchd and a

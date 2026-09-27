@@ -860,12 +860,16 @@ impl Model {
 // (pure code motion). The `pub use` re-exports keep every existing
 // `crate::derive::*_model` path — and the xref registry — compiling unchanged.
 mod models_atpkg_contention_release;
+mod models_atpkg_flip_quiet;
 mod models_atpkg_full_pass;
+mod models_atpkg_head_watch_hosts;
 mod models_atpkg_index_probe;
 mod models_atpkg_index_publish;
 mod models_atpkg_pass_stamps;
 mod models_atpkg_pending_wait;
 mod models_atpkg_published_spacing;
+mod models_atpkg_session_index;
+mod models_atpkg_session_index_retry;
 mod models_atpkg_vendor_pending;
 mod models_broadcast_checkpoint;
 mod models_broadcast_head;
@@ -873,48 +877,68 @@ mod models_console_life;
 mod models_control_bind_retry;
 mod models_control_preparation;
 mod models_core;
-mod models_cursor_input;
 mod models_effects;
 mod models_fabric_enable;
 mod models_fabric_outbox_wake;
+mod models_foreground_handback;
 mod models_fx;
 mod models_glyphs;
 mod models_gui;
 mod models_harness;
 mod models_harness_host;
+mod models_input;
 mod models_misc;
 mod models_native;
+mod models_notify_follow;
 mod models_operator;
 mod models_paste_order;
 mod models_pet_observation_admission;
+mod models_program_queue;
+mod models_program_resolution;
+mod models_rainbow_composer_newline;
 mod models_rainbow_continuity;
+mod models_rainbow_short_wrap;
 mod models_release;
 mod models_release_head;
 mod models_render;
+mod models_ribbon_follow;
 mod models_ribbon_release_restoration;
 mod models_ribbon_row_hold;
+mod models_run_loop_waker;
 mod models_same_caret_echo;
+mod models_say_replay_budget;
 mod models_screen_generation;
 mod models_session;
+mod models_subscribe_announcement;
 mod models_supervise;
 mod models_title_summary;
+mod models_typed_rekey;
 mod models_update;
 mod models_update_activation_observation;
 mod models_update_check_coordination;
+mod models_update_editor_carry;
 mod models_update_environment_repair;
+mod models_update_history_carry;
+mod models_update_precommit_input;
 mod models_update_retired_intent;
 mod models_update_web_cache;
+mod models_update_window_show;
 
 pub use models_atpkg_contention_release::atpkg_contention_release_park_model;
+pub use models_atpkg_flip_quiet::atpkg_flip_quiet_model;
 pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
+pub use models_atpkg_head_watch_hosts::atpkg_head_watch_hosts_model;
 pub use models_atpkg_index_probe::{
-    atpkg_index_pending_park_model, atpkg_index_probe_cooldown_model,
-    atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
+    atpkg_index_pending_park_model, atpkg_index_probe_completion_cadence_model,
+    atpkg_index_probe_cooldown_model, atpkg_index_successor_selection_model,
+    atpkg_index_wake_highwater_model,
 };
 pub use models_atpkg_index_publish::atpkg_index_publish_walk_model;
 pub use models_atpkg_pass_stamps::atpkg_pass_stamps_model;
 pub use models_atpkg_pending_wait::atpkg_pending_wait_model;
 pub use models_atpkg_published_spacing::atpkg_published_spacing_model;
+pub use models_atpkg_session_index::atpkg_session_index_handoff_model;
+pub use models_atpkg_session_index_retry::atpkg_session_index_retry_model;
 pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
 pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
 pub use models_broadcast_head::broadcast_head_subscription_model;
@@ -922,55 +946,79 @@ pub use models_console_life::*;
 pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
 pub use models_control_preparation::native_update_control_preparation_model;
 pub use models_core::*;
-pub use models_cursor_input::*;
 pub use models_effects::*;
 pub use models_fabric_enable::*;
-pub use models_fabric_outbox_wake::{fabric_outbox_wake_model, fabric_reconnect_backoff_model};
+pub use models_fabric_outbox_wake::{
+    fabric_outbox_wake_model, fabric_reconnect_backoff_model, fabric_refill_retry_model,
+};
+pub use models_foreground_handback::foreground_handback_model;
 pub use models_fx::*;
 pub use models_glyphs::*;
 pub use models_gui::*;
 pub use models_harness::*;
-pub use models_harness_host::harness_worker_lifecycle_model;
+pub use models_harness_host::{
+    harness_exit_record_model, harness_relaunch_on_exit_model, harness_worker_lifecycle_model,
+};
+pub use models_input::input_unread_gate_model;
 pub use models_misc::*;
 pub use models_native::*;
+pub use models_notify_follow::notify_follow_checkpoint_model;
 pub use models_operator::*;
 pub use models_paste_order::*;
 pub use models_pet_observation_admission::*;
+pub use models_program_queue::program_resolver_queue_model;
+pub use models_program_resolution::program_resolution_retry_model;
+pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
 pub use models_rainbow_continuity::*;
+pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
 pub use models_release::*;
 pub use models_release_head::release_channel_head_model;
 pub use models_render::*;
+pub use models_ribbon_follow::*;
 pub use models_ribbon_release_restoration::*;
 pub use models_ribbon_row_hold::*;
+pub use models_run_loop_waker::run_loop_waker_model;
 pub use models_same_caret_echo::*;
+pub use models_say_replay_budget::say_replay_budget_model;
 pub use models_screen_generation::observation_screen_generation_model;
 pub use models_session::*;
+pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_supervise::{
-    supervisor_claim_model, supervisor_focus_choice_model, supervisor_turn_end_model,
+    supervisor_claim_model, supervisor_decline_keys_model, supervisor_focus_choice_model,
+    supervisor_question_answer_model, supervisor_turn_end_model,
 };
 pub use models_title_summary::*;
+pub use models_typed_rekey::typed_rekey_model;
 pub use models_update::*;
 pub use models_update_activation_observation::native_update_activation_observation_model;
 pub use models_update_check_coordination::{
     native_update_boot_health_lock_model, native_update_check_join_model,
     native_update_check_receipt_model, native_update_check_wait_model,
 };
+pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;
+pub use models_update_history_carry::native_update_history_carry_model;
+pub use models_update_precommit_input::native_update_precommit_input_model;
 pub use models_update_retired_intent::{
     native_update_failure_target_model, native_update_retired_intent_model,
 };
 pub use models_update_web_cache::native_update_web_cache_model;
+pub use models_update_window_show::native_update_window_show_model;
 
 /// Property-combinator generators: each returns a fully-formed, `Buggy`-gated
 /// [`Model`] (prove@Buggy=0, counterexample@Buggy=1) for a recurring property
 /// CLASS. A new property is a struct literal + one registry/harness line, not 50
 /// lines of `Expr` constructors. Every name (model / action / var / invariant) is
-/// threaded through, so the emitted TLA+ is whatever the author wants — the 7
-/// introspection models below are byte-identical instances of these generators.
+/// threaded through, so the emitted TLA+ is whatever the author wants — six of the
+/// introspection models (M1 dispatch, M2 relay, S1 registry, the forward-handshake
+/// liveness twin, F1 info-flow, and publish ordering) are byte-identical instances
+/// of these generators. The seventh, reply fidelity, was one until its model gained
+/// `DialFail` (a failure before delivery, which the two-stage shape cannot state)
+/// and is now a hand-written `ty_model!`.
 ///
 /// The classes (the recurring shapes of the hand-built models): lifecycle/no-leak,
-/// gated-completeness, happens-before, teardown-clears, two-stage-leak (info-flow /
-/// reply-fidelity), and liveness/no-wedge.
+/// gated-completeness, happens-before, teardown-clears, two-stage-leak (info-flow),
+/// and liveness/no-wedge.
 pub mod props {
     use super::*;
 
@@ -996,6 +1044,11 @@ pub mod props {
     }
     /// `acquire` bumps both counters (bounded by `max`); `release` decrements `live`
     /// always and `reg` UNLESS Buggy (forgot to deregister). Invariant `reg =< live`.
+    ///
+    /// The mutant forgets only from a sound table (`reg =< live`): one slip is all
+    /// the invariant needs to catch, and a mutant free to repeat it would strand one
+    /// more entry per spawn/close cycle, so the `Buggy = 1` space `live` bounds
+    /// would not be finite and the interpreter could not walk it.
     // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
     // constructor — same class as the zero-arg `*_model()` builders.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -1040,7 +1093,7 @@ pub mod props {
                         Update {
                             var: p.reg,
                             expr: if_(
-                                eq(cst("Buggy"), int(1)),
+                                and_(eq(cst("Buggy"), int(1)), le(var(p.reg), var(p.live))),
                                 var(p.reg),
                                 sub(var(p.reg), int(1)),
                             ),
@@ -1243,7 +1296,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 5: two-stage leak (info-flow / reply-fidelity) ----
+    // ---- CLASS 5: two-stage leak (info-flow) ----
     pub struct TwoStage {
         pub name: &'static str,
         pub stage: &'static str,
@@ -1258,7 +1311,7 @@ pub mod props {
     }
     /// `stage_act` (guard `stage=0`) sets `stage := stage_rhs`; `leak_act` (guard
     /// caller-supplied) sets `leak := leak_rhs`. The RHS exprs let the leak fire on a
-    /// stage VALUE (secrecy) OR on `Buggy` directly (reply-fidelity).
+    /// stage VALUE (secrecy) or on `Buggy` directly.
     // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
     // constructor — same class as the zero-arg `*_model()` builders.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -1545,11 +1598,11 @@ mod tests {
         let tla = ring_model().to_tla();
         // Spot-check the mechanical translation (<= => =<, if => IF/THEN/ELSE).
         assert!(tla.contains("---- MODULE Ring ----"), "{tla}");
-        assert!(tla.contains("CONSTANT MaxSeq, Cap"), "{tla}");
+        assert!(tla.contains("CONSTANT MaxSeq, Cap, Buggy"), "{tla}");
         assert!(tla.contains("VARIABLES seq, lo"), "{tla}");
         assert!(tla.contains("Init == seq = 0 /\\ lo = 1"), "{tla}");
         assert!(
-            tla.contains("Push == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ lo' = (IF seq + 1 - lo + 1 > Cap THEN lo + 1 ELSE lo)"),
+            tla.contains("Push == seq =< MaxSeq - 1 /\\ seq' = seq + 1 /\\ lo' = (IF seq + 1 - lo + 1 > Cap + Buggy THEN lo + 1 ELSE lo)"),
             "{tla}"
         );
         assert!(tla.contains("Next == Push"), "{tla}");
@@ -1577,7 +1630,7 @@ mod tests {
         let m = ring_model();
         let tla = m.transition_spec();
         assert!(
-            tla.contains("CONSTANT MaxSeq, Cap, seq_init, lo_init"),
+            tla.contains("CONSTANT MaxSeq, Cap, Buggy, seq_init, lo_init"),
             "{tla}"
         );
         assert!(
@@ -1609,7 +1662,10 @@ mod tests {
             "{tla}"
         );
         assert!(
-            tla.contains("Deliver == seq > cursor /\\ cursor' = seq /\\ UNCHANGED << seq >>"),
+            tla.contains(
+                "Deliver == seq > cursor /\\ cursor' = (IF Buggy = 1 THEN seq + 1 ELSE seq) \
+                 /\\ UNCHANGED << seq >>"
+            ),
             "{tla}"
         );
         assert!(tla.contains("Next == Grow \\/ Deliver"), "{tla}");

@@ -17,8 +17,9 @@
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
-//!  "kind":"event|approved|dismissed|reconnect|timeout|exit|mail|extend|escalated|cleared|
-//!          continued|typed|waiting|skipped|unverified|limited|probe",
+//!  "kind":"event|approved|declined|dismissed|reconnect|timeout|exit|mail|extend|escalated|
+//!          cleared|continued|typed|restarted|waiting|skipped|unverified|limited|unproven|
+//!          dialog|chose|probe",
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
 //!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
@@ -34,10 +35,24 @@
 //! `EXTEND until=<UTC> reset=<text>` is `extend`; the journal-only `ESCALATED
 //! seq=<n> …` and `CLEARED seq=<n> …` are `escalated` and `cleared`, their
 //! `seq=` read like an EVENT's. The turn-end policy's lines (lane B2 stage 2)
-//! — `CONTINUED` and `TYPED seq=<n> rule=<id> <text>`, the journal-only
+//! — `CONTINUED` and `TYPED seq=<n> rule=<id> <text>`, `RESTARTED seq=<n>
+//! rule=<id> <what>` (the host's restart in place, D3/D7), the journal-only
 //! `WAITING seq=<n> until=<UTC> <why>`, `SKIPPED` and `UNVERIFIED seq=<n>
 //! rule=<id> <why>`, `LIMITED seq=<n> handled: <message>` — are their word
-//! lowercased, `phase` the rule id where the line names one. A journal an
+//! lowercased, `phase` the rule id where the line names one; so is the
+//! journal-only `UNPROVEN seq=<n> rule=<id> unproven: <why>` a full-power
+//! press writes after its `APPROVED` (why the safe rules did not prove the
+//! box, `approval_loop`'s module header), and so is the journal-only `DIALOG
+//! seq=<n> rule=<id|-> <rows>` every question decision writes — the
+//! dialog's rows as drawn, joined by ` ⏎ ` (answered under
+//! `answer-recommended@v1`, or `-` escalated; the critique of 2026-09-25,
+//! O3: the incident's four escalations kept no rows), and so is the
+//! journal-only `DECLINED seq=<n> rule=<id> <subject> => <text>` a decline
+//! writes once its Enter landed (a box refused with a reason the worker
+//! reads, never handed to a person: `approval_loop.rs`), and the question
+//! answer's `CHOSE seq=<n> rule=answer-recommended@v1 policy=<word>
+//! <question → answer | …>` (`chose`, said once a dialog the loop's own keys
+//! answered is done). A journal an
 //! earlier build wrote still reads: its `PROBE <sent|deferred> seq=<n> …`
 //! is `probe`, the probe's outcome an EVENT under `resumed`,
 //! `still-limited`, `rebriefed` or `rebrief-failed`. The file is opened
@@ -170,7 +185,8 @@ impl JournalRecord {
                     tail = after;
                 }
             }
-            "CONTINUED" | "TYPED" | "WAITING" | "SKIPPED" | "UNVERIFIED" | "LIMITED" => {
+            "CONTINUED" | "TYPED" | "RESTARTED" | "WAITING" | "SKIPPED" | "UNVERIFIED"
+            | "LIMITED" | "UNPROVEN" | "DIALOG" | "DECLINED" | "CHOSE" => {
                 rec.kind = word.to_ascii_lowercase();
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
@@ -547,10 +563,55 @@ mod tests {
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
             ("continued", "usage-resume@v1", Some(102), "keep going")
         );
-        let r = rec("TYPED seq=7 rule=model-fallback@v1 /model opus");
+        // A full-power press's journal-only line: the rule is the phase,
+        // the reason the summary.
+        let r = rec("UNPROVEN seq=12 rule=allow-once@v1 unproven: not read-only: touch");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
-            ("typed", "model-fallback@v1", Some(7), "/model opus")
+            (
+                "unproven",
+                "allow-once@v1",
+                Some(12),
+                "unproven: not read-only: touch"
+            )
+        );
+        // The question answer's line, told once a dialog is done.
+        let r =
+            rec("CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Which colour? → Blue");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "chose",
+                "answer-recommended@v1",
+                Some(40),
+                "policy=recommended Which colour? → Blue"
+            )
+        );
+        let r = rec("TYPED seq=7 rule=context-compact@v1 /compact");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("typed", "context-compact@v1", Some(7), "/compact")
+        );
+        let r = rec("RESTARTED seq=8 rule=model-fallback@v1 relaunch --model opus");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "restarted",
+                "model-fallback@v1",
+                Some(8),
+                "relaunch --model opus"
+            )
+        );
+        // The approval policy's decline: journal-only, its rule the phase.
+        let r = rec("DECLINED seq=105 rule=a-rule@v1 a box => aterm harness (not the user): …");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "declined",
+                "a-rule@v1",
+                Some(105),
+                "a box => aterm harness (not the user): …"
+            )
         );
         let r = rec("WAITING seq=9 until=2026-09-19T18:10:00Z overloaded retry 1 of 3");
         assert_eq!(
@@ -560,6 +621,18 @@ mod tests {
                 "-",
                 Some(9),
                 "until=2026-09-19T18:10:00Z overloaded retry 1 of 3"
+            )
+        );
+        // A question decision's rows (O3): the rule is the phase, the rows
+        // the summary.
+        let r = rec("DIALOG seq=31 rule=answer-recommended@v1 ──── ⏎  ☐ Colors ⏎ ❯ 1. Dark");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "dialog",
+                "answer-recommended@v1",
+                Some(31),
+                "──── ⏎  ☐ Colors ⏎ ❯ 1. Dark"
             )
         );
         let r = rec("SKIPPED seq=9 rule=continue@v1 not submitted: skipped");

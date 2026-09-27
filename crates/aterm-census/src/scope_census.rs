@@ -413,7 +413,10 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
         phrase in a file, not the specific doc block — coarse on purpose, so
         the migration is a few decisions rather than a few hundred. OB-17 also
         only sees `///` blocks: `//!` module prose and undocumented enforcers
-        are out of its reach by construction.
+        are out of its reach by construction. And it is POLARITY-BLIND: a
+        reserved phrase fires whether the sentence asserts that scope or
+        names it to DISCLAIM it, so correct disclaiming prose still needs its
+        file listed (output_streak.rs is listed for exactly that).
       - IT PROVES THE ENFORCER DOES NOT MULTIPLY, NOT THAT NOT-MULTIPLYING IS
         SUFFICIENT. Whether the aggregator's scan is CORRECT over every shard
         is a model obligation (the `machine` field), checked elsewhere.

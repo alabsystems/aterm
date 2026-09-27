@@ -23,7 +23,9 @@
 //! * **zero allocation** on every steady-state tick after warm-up, through a
 //!   counting global allocator (the one precedent is
 //!   `tests/word_reflow_identity.rs`), for every scenario and for the idle
-//!   run-out after it;
+//!   run-out after it — through the seam with a row the witness asked for
+//!   withheld on every eighth measured frame and never during warm-up, so
+//!   the first withheld frame comes where a host first meets it;
 //! * **idle → zero**: after the last key, `next_change_deadline == None`,
 //!   `needs_frame_cadence == false`, `fingerprint == 0` and a tick writes
 //!   nothing — and it reports the exact ms after the last key at which each
@@ -46,16 +48,18 @@
 //!     --test rainbow_kitty_v2_frame_cost -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The allocator count is process-wide, so the two tests serialize on one
-//! mutex and only count while a driver call is on the stack; run with
-//! `--test-threads=1` when combining `--include-ignored`.
+//! The allocator counts only the thread that switched it on, and only while a
+//! driver call is on its stack; the tally itself is process-wide, so the two
+//! tests serialize on one mutex. Run with `--test-threads=1` when combining
+//! `--include-ignored`.
 
 mod common;
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -72,19 +76,31 @@ use common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
 // The counting allocator
 // ===========================================================================
 
-/// Counts every allocation, reallocation and zeroed allocation while
-/// [`COUNTING`] is set. The first [`SIZE_SLOTS`] sizes are kept so a red
-/// names the shape of what allocated, not just that something did.
+/// Counts every allocation, reallocation and zeroed allocation made on a
+/// thread whose [`COUNTING`] is set. The first [`SIZE_SLOTS`] sizes are kept
+/// so a red names the shape of what allocated, not just that something did.
 struct CountingAllocator;
 
 const SIZE_SLOTS: usize = 16;
 
-static COUNTING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// PER THREAD, not process-wide (the load-sensitive test audit of
+    /// 2026-09-27). Under a multi-threaded libtest this test runs on a
+    /// spawned thread while the harness's main thread waits in
+    /// `recv_timeout(60 s)`; a run slowed past that mark wakes it to build
+    /// the timed-out list and `format!` "has been running for over 60
+    /// seconds", and with a global flag those allocations landed in a counted
+    /// tick and read as an engine red. The engine starts no thread, so every
+    /// allocation it makes is still made here and still counted; only foreign
+    /// threads drop out. Const-initialised with no destructor, so reading it
+    /// never allocates and is safe inside `GlobalAlloc`.
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_SIZES: [AtomicUsize; SIZE_SLOTS] = [const { AtomicUsize::new(0) }; SIZE_SLOTS];
 
 fn record_allocation(size: usize) {
-    if COUNTING.load(Ordering::Relaxed) {
+    if COUNTING.try_with(Cell::get).unwrap_or(false) {
         let index = ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         if let Some(slot) = ALLOCATION_SIZES.get(index) {
             slot.store(size, Ordering::Relaxed);
@@ -132,20 +148,58 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 /// The two tests share one process-wide counter; they take turns.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Count the allocations `f` makes. Returns the count and the first sizes.
+/// Count the allocations `f` makes on this thread. Returns the count and the
+/// first sizes.
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize, [usize; SIZE_SLOTS]) {
     ALLOCATIONS.store(0, Ordering::Relaxed);
     for slot in &ALLOCATION_SIZES {
         slot.store(0, Ordering::Relaxed);
     }
-    COUNTING.store(true, Ordering::Release);
+    COUNTING.set(true);
     let out = f();
-    COUNTING.store(false, Ordering::Release);
+    COUNTING.set(false);
     (
         out,
         ALLOCATIONS.load(Ordering::Relaxed),
         std::array::from_fn(|index| ALLOCATION_SIZES[index].load(Ordering::Relaxed)),
     )
+}
+
+/// The counter's own two-sided check: one allocation on this thread inside a
+/// counted window is counted exactly once, and one made on another thread in
+/// the same window — the shape of libtest's timeout report — is not. The
+/// first side keeps the zero-alloc laws below from passing on a counter that
+/// counts nothing; the second is the per-thread gate they now rely on. The
+/// hand-off is two atomics and a yield loop, none of which allocates.
+fn assert_counter_is_per_thread() {
+    let go = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let foreign = {
+        let (go, done) = (Arc::clone(&go), Arc::clone(&done));
+        std::thread::spawn(move || {
+            while !go.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::hint::black_box(Box::new([0u8; 48]));
+            done.store(true, Ordering::Release);
+        })
+    };
+    let ((), allocs, sizes) = allocations_during(|| {
+        go.store(true, Ordering::Release);
+        while !done.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::hint::black_box(Box::new([0u8; 24]));
+    });
+    foreign
+        .join()
+        .expect("the foreign allocating thread panicked");
+    assert_eq!(
+        (allocs, sizes[0]),
+        (1, 24),
+        "the counting allocator must count this thread's one 24-byte box and \
+         nothing another thread allocates meanwhile (first sizes {sizes:?})"
+    );
 }
 
 // ===========================================================================
@@ -564,6 +618,13 @@ trait Driver {
     fn witness_feeds(&self) -> u64 {
         0
     }
+    /// The warm-up is over: the passes from here on are the measured ones.
+    fn begin_measured_pass(&mut self) {}
+    /// Frames on which the driver withheld a row the witness asked for,
+    /// over its life — the non-vacuity witness for the withheld path.
+    fn withheld_frames(&self) -> u64 {
+        0
+    }
 }
 
 /// A replica of `rainbow_kitty::fingerprint` (private to the engine): the
@@ -785,7 +846,25 @@ struct Host {
     /// gate paid nothing for while no scenario fed it a single row.
     witness_row: Vec<char>,
     witness_feeds: u64,
+    /// **A WITHHELD ROW, AFTER WARM-UP** (2026-09-25): once the measured
+    /// passes begin, every [`WITHHOLD_EVERY`]th frame delivers every row
+    /// the witness asked for but one — the first that is not the caret's,
+    /// as the composed (split or zoomed) host drops its second,
+    /// generation-checked read — so the walk scans the records beside it
+    /// (`Witness::find_deferred_runs`). The glyphs never change, so no
+    /// verdict does. The warm-up passes withhold nothing: the first
+    /// withheld frame comes long after them, where a host meets it, and
+    /// only scratch reserved up front keeps it from allocating — with
+    /// `Witness::new` reserving none of the deferral's scratch, every
+    /// scenario allocates on its first withheld frames, the scan's list
+    /// growing 48 → 96 → … bytes.
+    withhold: bool,
+    frames: u64,
+    withheld_frames: u64,
 }
+
+/// A measured pass withholds one asked-for row every this many frames.
+const WITHHOLD_EVERY: u64 = 8;
 
 impl Host {
     fn seam() -> Self {
@@ -797,6 +876,9 @@ impl Host {
             last_fp: 0,
             witness_row: vec!['x'; geometry().cols],
             witness_feeds: 0,
+            withhold: false,
+            frames: 0,
+            withheld_frames: 0,
         }
     }
 }
@@ -831,6 +913,8 @@ impl Driver for Host {
         // names are read beside it. The engine consumes them inside the tick
         // below and takes the count to zero.
         {
+            self.frames += 1;
+            let withhold = self.withhold && self.frames.is_multiple_of(WITHHOLD_EVERY);
             let Self {
                 glow, witness_row, ..
             } = self;
@@ -838,13 +922,19 @@ impl Driver for Host {
             let mut rows = [0u16; WITNESS_ROWS];
             let n = glow.ribbon_rows(&mut rows);
             let mut fed = 1u64;
+            let mut withheld = None;
             for &r in &rows[..n] {
                 if r != caret.0 && usize::from(r) < geometry().rows {
+                    if withhold && withheld.is_none() {
+                        withheld = Some(r);
+                        continue;
+                    }
                     glow.observe_ribbon_row(r, witness_row);
                     fed += 1;
                 }
             }
             self.witness_feeds += fed;
+            self.withheld_frames += u64::from(withheld.is_some());
         }
         let fp = self
             .glow
@@ -876,6 +966,14 @@ impl Driver for Host {
 
     fn witness_feeds(&self) -> u64 {
         self.witness_feeds
+    }
+
+    fn begin_measured_pass(&mut self) {
+        self.withhold = true;
+    }
+
+    fn withheld_frames(&self) -> u64 {
+        self.withheld_frames
     }
 }
 
@@ -939,6 +1037,8 @@ struct Report {
     warmup_allocs: Vec<usize>,
     /// Rows the driver handed the content witness over the pass.
     witness_feeds: u64,
+    /// Frames on which the driver withheld an asked-for row.
+    withheld_frames: u64,
 }
 
 impl Report {
@@ -1088,6 +1188,7 @@ fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Repor
     rep.fp_us.sort_unstable();
     rep.out_px.sort_unstable();
     rep.witness_feeds = d.witness_feeds();
+    rep.withheld_frames = d.withheld_frames();
     (rep, now)
 }
 
@@ -1114,6 +1215,7 @@ fn measure(d: &mut dyn Driver, sc: &Scenario) -> Report {
         }
     }
     let mut rep = Report::default();
+    d.begin_measured_pass();
     for _ in 0..repeat() {
         let (r, end) = run(d, sc, t, true);
         rep = r;
@@ -1232,6 +1334,7 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_counter_is_per_thread();
     let mode = if cfg!(debug_assertions) {
         "DEBUG build (timing informational)"
     } else {
@@ -1273,6 +1376,13 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
             reds.push(format!(
                 "[{}] the seam fed the CONTENT WITNESS nothing: this gate prices \
                  none of `observe_ribbon_row` / `Engine::witness_rows`",
+                sc.name
+            ));
+        }
+        if engine_selected("v2s") && rs.withheld_frames == 0 {
+            reds.push(format!(
+                "[{}] the seam withheld no row the witness asked for: this gate \
+                 prices no frame of `Witness::find_deferred_runs`",
                 sc.name
             ));
         }

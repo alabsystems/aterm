@@ -735,6 +735,145 @@ fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
     grid.assert_invariants();
 }
 
+/// A grid holding `n` short history lines, detached for a width change with the
+/// reader at `offset` beforehand: the job, and the grid with nothing attached above
+/// the viewport (short lines rewrap into nothing, and the detach lifts the ring).
+fn detached_with_reader_at(offset: i32, n: usize) -> (Grid, PendingScrollbackReflow) {
+    let rows = 10u16;
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, 80, 8, sb);
+    for i in 0..n {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    grid.scroll_display(offset);
+    let pending = grid
+        .resize_offloading_scrollback(rows, 60)
+        .expect("offload job");
+    assert_eq!(
+        grid.scrollback_lines(),
+        0,
+        "precondition: nothing is attached above the viewport while the job runs"
+    );
+    assert_eq!(grid.display_offset(), 0);
+    (grid, pending)
+}
+
+/// RULING 238: A SCROLL UP WHILE THE HISTORY IS AWAY IS NOT LOST. The wheel moves
+/// nothing (nothing is attached above the viewport), but the reader asked — so the
+/// re-attach lands them where they asked, and they need not scroll again. The view
+/// never moves in the window, and nothing is recorded outside one.
+#[test]
+fn offload_window_scroll_up_over_the_away_history_lands_at_the_reattach() {
+    let (mut grid, pending) = detached_with_reader_at(0, 500);
+    grid.scroll_display(30);
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "nothing to show yet: the view stays"
+    );
+    assert!(grid.reader_aim_held(), "but the ask is kept");
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(
+        grid.display_offset(),
+        30,
+        "the view lands where the reader asked"
+    );
+    assert!(!grid.reader_aim_held(), "spent at the re-attach");
+    grid.assert_invariants();
+
+    // Outside a window the same gesture is only a scroll.
+    grid.scroll_display(5);
+    assert_eq!(grid.display_offset(), 35);
+    assert!(!grid.reader_aim_held());
+}
+
+/// Down spends the aim first; all the way back down is the reader choosing the
+/// live bottom — even over a restore that would have put them 150 rows up.
+#[test]
+fn offload_window_aim_moves_both_ways_and_home_is_a_choice() {
+    let (mut grid, pending) = detached_with_reader_at(0, 500);
+    grid.scroll_display(30);
+    grid.scroll_display(-10);
+    assert_eq!(grid.display_offset(), 0);
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(grid.display_offset(), 20);
+
+    let (mut grid, pending) = detached_with_reader_at(150, 500);
+    grid.scroll_display(30);
+    grid.scroll_display(-30);
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "up and back down to the live bottom is the reader's choice, not a no-op"
+    );
+
+    // End (and a keystroke's snap, which is the same primitive) after an aim.
+    let (mut grid, pending) = detached_with_reader_at(150, 500);
+    grid.scroll_display(30);
+    grid.scroll_to_bottom();
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(grid.display_offset(), 0, "the End after the aim is honored");
+    grid.assert_invariants();
+}
+
+/// Top aims at the top of the WHOLE history; an aim below the restore never pulls
+/// the reader down from the place the restore gives them; with no aim the restore
+/// stands exactly (audit #7's End-that-moved-nothing included).
+#[test]
+fn offload_window_aim_top_and_the_restore() {
+    let (mut grid, pending) = detached_with_reader_at(0, 500);
+    grid.scroll_to_top();
+    grid.scroll_display(-5);
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(grid.display_offset(), grid.scrollback_lines() - 5);
+
+    let (mut grid, pending) = detached_with_reader_at(150, 500);
+    grid.scroll_display(30);
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(
+        grid.display_offset(),
+        150,
+        "they reached UP; the restore already puts them further up than that"
+    );
+
+    let (mut grid, pending) = detached_with_reader_at(150, 500);
+    grid.scroll_to_bottom();
+    assert!(
+        !grid.reader_aim_held(),
+        "an End that moved nothing records nothing"
+    );
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(grid.display_offset(), 150);
+    grid.assert_invariants();
+}
+
+/// Output that scrolls into history after the ask pushes the aim up with it (the
+/// SCR-1 repin's rule), so the reader lands on the content they asked for.
+#[test]
+fn offload_window_aim_rides_up_with_window_output() {
+    let (mut grid, pending) = detached_with_reader_at(0, 500);
+    grid.scroll_display(30);
+    for i in 0..20 {
+        short_line(&mut grid, 10, &format!("W{i}"));
+    }
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert_eq!(grid.display_offset(), 50);
+    grid.assert_invariants();
+}
+
+/// An abort drops the aim with the history it pointed into.
+#[test]
+fn offload_abort_drops_the_reader_aim() {
+    let (mut grid, pending) = detached_with_reader_at(0, 500);
+    grid.scroll_display(30);
+    drop(pending);
+    grid.abort_reflow_offload();
+    assert!(!grid.reader_aim_held());
+    assert!(grid.display_offset() <= grid.scrollback_lines());
+    grid.assert_invariants();
+}
+
 /// The same law reached by the other gesture: scroll up over the streaming output,
 /// then press End. The position the reader descends FROM only exists because window
 /// output staged into the lazy buffer, so it is invisible to any baseline sampled at

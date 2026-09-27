@@ -1,10 +1,11 @@
 //! A blocking client for the broker: connect, publish (awaiting the ack), and
 //! subscribe (blocking on each delivery). The blocking calls are what make tests
 //! deterministic — a publish round-trips before the next step, and a subscriber's
-//! `recv` returns exactly when the next delivery arrives (Condvar-driven), with no
-//! reliance on sleeps or wall-clock.
+//! `recv` returns exactly when the next delivery arrives, with no reliance on sleeps
+//! or wall-clock.
 
 use crate::proto::{decode_response, encode_request, read_frame, write_frame, Request, Response};
+use astream_wire::{Frame, FrameError, HEADER_SIZE};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
@@ -55,7 +56,9 @@ pub enum Walk {
 ///   trusted network only: no confidentiality, no peer authentication.
 /// - `connect_tcp_sealed` (behind the `aead` feature) — TCP inside an
 ///   XChaCha20-Poly1305 sealed record layer under a pre-shared key: confidential
-///   and authenticated across an untrusted network.
+///   and authenticated across an untrusted network. `connect_tcp_handshake`
+///   (`handshake`) and `connect_tcp_identity` (`identity`) put a forward-secret key
+///   agreement in front of the same record layer.
 ///
 /// `S` is the byte stream; any `Read + Write` works (see
 /// [`from_stream`](Client::from_stream)), and the Frame protocol is identical on
@@ -280,25 +283,15 @@ impl<S: Read + Write> Client<S> {
     /// proof is computed over. Answered by a guarded and an unguarded broker alike, so
     /// one client works against either.
     pub fn hello(&mut self) -> io::Result<[u8; 32]> {
-        write_frame(&mut self.stream, &encode_request(&Request::Hello))?;
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::Nonce { nonce }) => nonce.as_slice().try_into().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("broker nonce is {} bytes, expected 32", nonce.len()),
-                    )
-                }),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
+        self.send(&Request::Hello)?;
+        match self.read_response()? {
+            Response::Nonce { nonce } => nonce.as_slice().try_into().map_err(|_| {
+                io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
+                    format!("broker nonce is {} bytes, expected 32", nonce.len()),
+                )
+            }),
+            other => Err(refused(other)),
         }
     }
 
@@ -309,27 +302,11 @@ impl<S: Read + Write> Client<S> {
     /// and returns its `(next, head)`; a refused attach is an error HERE, not a
     /// surprise at the next request.
     pub fn attach_with_proof(&mut self, grant: &str, proof: &[u8]) -> io::Result<(u64, u64)> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Attach {
-                grant: grant.to_string(),
-                proof: proof.to_vec(),
-            }),
-        )?;
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::Mark { next, head, .. }) => Ok((next, head)),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
-        }
+        self.send(&Request::Attach {
+            grant: grant.to_string(),
+            proof: proof.to_vec(),
+        })?;
+        self.read_mark()
     }
 
     /// Add the capability `grant`/`tag` to this connection's keyring: `Hello` for the
@@ -384,29 +361,8 @@ impl<S: Read + Write> Client<S> {
         subject: &str,
         body: &[u8],
     ) -> io::Result<(u64, bool)> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Publish {
-                producer_id,
-                producer_seq,
-                subject: subject.to_string(),
-                body: body.to_vec(),
-            }),
-        )?;
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::PublishAck { offset, deduped }) => Ok((offset, deduped)),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
-        }
+        self.send_publish(producer_id, producer_seq, subject, body)?;
+        self.recv_publish_ack()
     }
 
     /// PIPELINED publish (send side): write a publish WITHOUT waiting for its ack, so a
@@ -422,33 +378,20 @@ impl<S: Read + Write> Client<S> {
         subject: &str,
         body: &[u8],
     ) -> io::Result<()> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Publish {
-                producer_id,
-                producer_seq,
-                subject: subject.to_string(),
-                body: body.to_vec(),
-            }),
-        )
+        self.send(&Request::Publish {
+            producer_id,
+            producer_seq,
+            subject: subject.to_string(),
+            body: body.to_vec(),
+        })
     }
 
     /// PIPELINED publish (receive side): read the next ack in order, returning
     /// `(offset, deduped)`. See [`send_publish`](Self::send_publish).
     pub fn recv_publish_ack(&mut self) -> io::Result<(u64, bool)> {
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::PublishAck { offset, deduped }) => Ok((offset, deduped)),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
+        match self.read_response()? {
+            Response::PublishAck { offset, deduped } => Ok((offset, deduped)),
+            other => Err(refused(other)),
         }
     }
 
@@ -465,6 +408,12 @@ impl<S: Read + Write> Client<S> {
     /// in-flight publishes share group-commit fsyncs — one connection, many in flight.
     /// The effective window is clamped to `[1, MAX_PIPELINE_WINDOW]` so it cannot
     /// out-run the broker's bounded ack queue.
+    ///
+    /// The first publish that fails — refused by the broker, or unframeable here —
+    /// stops the sending, and the error is returned only after the responses of the
+    /// publishes already in flight have been read, so the connection stays in step
+    /// for the next call. Those publishes may have landed; re-sending the same bodies
+    /// under the same `producer_id` dedups them.
     pub fn publish_pipelined(
         &mut self,
         producer_id: u64,
@@ -475,16 +424,37 @@ impl<S: Read + Write> Client<S> {
         let window = window.clamp(1, Self::MAX_PIPELINE_WINDOW);
         let mut acks = Vec::with_capacity(bodies.len());
         let mut sent = 0usize;
-        while acks.len() < bodies.len() {
+        let mut received = 0usize;
+        let mut failure: Option<io::Error> = None;
+        loop {
             // Top the in-flight window back up.
-            while sent < bodies.len() && sent - acks.len() < window {
-                self.send_publish(producer_id, (sent + 1) as u64, subject, bodies[sent])?;
-                sent += 1;
+            while failure.is_none() && sent < bodies.len() && sent - received < window {
+                match self.send_publish(producer_id, (sent + 1) as u64, subject, bodies[sent]) {
+                    Ok(()) => sent += 1,
+                    Err(e) => failure = Some(e),
+                }
             }
-            // Then drain one ack (keeps sends and receives interleaved, no deadlock).
-            acks.push(self.recv_publish_ack()?);
+            if received == sent {
+                break;
+            }
+            // Then drain one response (keeps sends and receives interleaved, no
+            // deadlock). A transport failure ends the connection, so it ends this too.
+            let resp = match self.read_response() {
+                Ok(resp) => resp,
+                Err(e) => return Err(failure.unwrap_or(e)),
+            };
+            received += 1;
+            match resp {
+                Response::PublishAck { offset, deduped } => acks.push((offset, deduped)),
+                other => {
+                    failure.get_or_insert(refused(other));
+                }
+            }
         }
-        Ok(acks)
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(acks),
+        }
     }
 
     /// REGISTER A LAST WILL on this connection: the record the broker appends on your
@@ -510,29 +480,13 @@ impl<S: Read + Write> Client<S> {
         subject: &str,
         body: &[u8],
     ) -> io::Result<(u64, u64)> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Will {
-                producer_id,
-                producer_seq,
-                subject: subject.to_string(),
-                body: body.to_vec(),
-            }),
-        )?;
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::Mark { next, head, .. }) => Ok((next, head)),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
-        }
+        self.send(&Request::Will {
+            producer_id,
+            producer_seq,
+            subject: subject.to_string(),
+            body: body.to_vec(),
+        })?;
+        self.read_mark()
     }
 
     /// LAST-VALUE query: the most recent record of every subject matching `filter`
@@ -576,15 +530,12 @@ impl<S: Read + Write> Client<S> {
         after: &str,
         max: u32,
     ) -> io::Result<(Vec<Record>, (u64, u64), String)> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Last {
-                filter: filter.to_string(),
-                after: after.to_string(),
-                max,
-            }),
-        )?;
-        self.read_page_resumable()
+        self.send(&Request::Last {
+            filter: filter.to_string(),
+            after: after.to_string(),
+            max,
+        })?;
+        self.read_page_resumable(max)
     }
 
     /// WALK A LAST-VALUE FACE: [`last_page`](Self::last_page) repeated on its resume
@@ -671,8 +622,8 @@ impl<S: Read + Write> Client<S> {
             let mut stopped = false;
             for row in page {
                 if remaining == 0 {
-                    // More rows than were asked for: `max` is the CALLER's promise, and
-                    // a peer that over-delivers does not get to break it.
+                    // Unreachable against `last_page`, which refuses a page longer
+                    // than it asked for; kept so `max` holds whatever reads the page.
                     break;
                 }
                 remaining -= 1;
@@ -733,89 +684,63 @@ impl<S: Read + Write> Client<S> {
     /// Non-terminal: unlike `subscribe` it never tails and does not consume the
     /// client — the connection is fully usable afterwards.
     pub fn fetch(&mut self, from: u64, filter: &str, max: u32) -> io::Result<Page> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Fetch {
-                from_offset: from,
-                filter: filter.to_string(),
-                max,
-            }),
-        )?;
-        self.read_page()
+        self.send(&Request::Fetch {
+            from_offset: from,
+            filter: filter.to_string(),
+            max,
+        })?;
+        self.read_page_resumable(max)
+            .map(|(page, mark, _)| (page, mark))
     }
 
     /// Read `Delivery*` then the closing `Mark` of a bounded, non-terminal read,
     /// keeping the `Mark`'s subject cursor.
     ///
+    /// The page is buffered before it is returned, so it is bounded by the `max` the
+    /// request asked for (the broker never sends more): a peer that keeps sending
+    /// deliveries past it is a protocol violation, not a longer page.
+    ///
     /// PRECONDITION: no pipelined publish is un-acked on this connection. The broker
     /// flushes pending acks BEFORE the page (they arrive first, in order), so a caller
     /// that owes itself acks must drain them first; the blocking `publish` never does.
-    fn read_page_resumable(&mut self) -> io::Result<(Vec<Record>, (u64, u64), String)> {
+    fn read_page_resumable(&mut self, max: u32) -> io::Result<(Vec<Record>, (u64, u64), String)> {
         let mut page = Vec::new();
         loop {
-            match read_frame(&mut self.stream)? {
-                None => {
+            match self.read_response()? {
+                Response::Delivery { .. } if page.len() >= max as usize => {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "broker closed",
+                        io::ErrorKind::InvalidData,
+                        format!("broker sent more than the {max} records the page asked for"),
                     ))
                 }
-                Some(p) => match decode_response(&p) {
-                    Some(Response::Delivery {
-                        offset,
-                        subject,
-                        body,
-                    }) => page.push((offset, subject, body)),
-                    Some(Response::Mark { next, head, resume }) => {
-                        return Ok((page, (next, head), resume))
-                    }
-                    Some(Response::Error { msg, .. }) => return Err(io::Error::other(msg)),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unexpected response",
-                        ))
-                    }
-                },
+                Response::Delivery {
+                    offset,
+                    subject,
+                    body,
+                } => page.push((offset, subject, body)),
+                Response::Mark { next, head, resume } => return Ok((page, (next, head), resume)),
+                other => return Err(refused(other)),
             }
         }
-    }
-
-    /// [`read_page_resumable`](Self::read_page_resumable) without the cursor — for the
-    /// verbs whose `Mark` never carries one.
-    fn read_page(&mut self) -> io::Result<Page> {
-        self.read_page_resumable()
-            .map(|(page, mark, _)| (page, mark))
     }
 
     /// Subscribe to every record matching `filter` from `from_offset`, then live.
     /// Consumes the client (the connection becomes a delivery stream).
     pub fn subscribe(self, from_offset: u64, filter: &str) -> io::Result<Subscription<S>> {
-        let mut stream = self.stream;
-        write_frame(
-            &mut stream,
-            &encode_request(&Request::Subscribe {
-                from_offset,
-                filter: filter.to_string(),
-            }),
-        )?;
-        Ok(Subscription {
-            stream,
-            carry: Vec::new(),
+        self.into_subscription(&Request::Subscribe {
+            from_offset,
+            filter: filter.to_string(),
         })
     }
 
     /// Durably advance consumer `group`'s committed offset to `upto` (a pure commit).
     /// Blocks for the ack; returns the commit record's offset.
     pub fn commit(&mut self, group: &str, upto: u64) -> io::Result<u64> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::Commit {
-                group: group.to_string(),
-                upto,
-            }),
-        )?;
-        self.read_ack()
+        self.send(&Request::Commit {
+            group: group.to_string(),
+            upto,
+        })?;
+        self.recv_publish_ack().map(|(offset, _)| offset)
     }
 
     /// The read-process-write TRANSACTION: append `out_body` to `out_subject` AND
@@ -831,64 +756,23 @@ impl<S: Read + Write> Client<S> {
         group: &str,
         upto: u64,
     ) -> io::Result<(u64, bool)> {
-        write_frame(
-            &mut self.stream,
-            &encode_request(&Request::ProcessAndProduce {
-                producer_id,
-                producer_seq,
-                out_subject: out_subject.to_string(),
-                out_body: out_body.to_vec(),
-                group: group.to_string(),
-                upto,
-            }),
-        )?;
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::PublishAck { offset, deduped }) => Ok((offset, deduped)),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
-        }
-    }
-
-    fn read_ack(&mut self) -> io::Result<u64> {
-        match read_frame(&mut self.stream)? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::PublishAck { offset, .. }) => Ok(offset),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker closed",
-            )),
-        }
+        self.send(&Request::ProcessAndProduce {
+            producer_id,
+            producer_seq,
+            out_subject: out_subject.to_string(),
+            out_body: out_body.to_vec(),
+            group: group.to_string(),
+            upto,
+        })?;
+        self.recv_publish_ack()
     }
 
     /// Subscribe as consumer `group`: the broker resumes delivery from the group's
     /// DURABLE committed offset (no client-tracked cursor), then tails live.
     pub fn subscribe_group(self, group: &str, filter: &str) -> io::Result<Subscription<S>> {
-        let mut stream = self.stream;
-        write_frame(
-            &mut stream,
-            &encode_request(&Request::SubscribeGroup {
-                group: group.to_string(),
-                filter: filter.to_string(),
-            }),
-        )?;
-        Ok(Subscription {
-            stream,
-            carry: Vec::new(),
+        self.into_subscription(&Request::SubscribeGroup {
+            group: group.to_string(),
+            filter: filter.to_string(),
         })
     }
 
@@ -903,20 +787,61 @@ impl<S: Read + Write> Client<S> {
         replacement_body: &[u8],
         filter: &str,
     ) -> io::Result<Subscription<S>> {
-        let mut stream = self.stream;
-        write_frame(
-            &mut stream,
-            &encode_request(&Request::ForkSubscribe {
-                fork_at,
-                replacement_subject: replacement_subject.to_string(),
-                replacement_body: replacement_body.to_vec(),
-                filter: filter.to_string(),
-            }),
-        )?;
-        Ok(Subscription {
-            stream,
-            carry: Vec::new(),
+        self.into_subscription(&Request::ForkSubscribe {
+            fork_at,
+            replacement_subject: replacement_subject.to_string(),
+            replacement_body: replacement_body.to_vec(),
+            filter: filter.to_string(),
         })
+    }
+
+    /// Write one request frame.
+    fn send(&mut self, req: &Request) -> io::Result<()> {
+        write_frame(&mut self.stream, &encode_request(req))
+    }
+
+    /// Read the one response a request is owed. A close is `UnexpectedEof` and an
+    /// undecodable payload is `InvalidData`; a broker `Error` is returned AS a
+    /// response, because a refusal leaves the stream in step and a transport failure
+    /// does not.
+    fn read_response(&mut self) -> io::Result<Response> {
+        match read_frame(&mut self.stream)? {
+            Some(p) => decode_response(&p).ok_or_else(unexpected_response),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "broker closed",
+            )),
+        }
+    }
+
+    /// Read the `Mark` that acknowledges an `Attach` or a `Will`: its `(next, head)`.
+    fn read_mark(&mut self) -> io::Result<(u64, u64)> {
+        match self.read_response()? {
+            Response::Mark { next, head, .. } => Ok((next, head)),
+            other => Err(refused(other)),
+        }
+    }
+
+    /// Send a streaming request and hand the connection over to its delivery stream.
+    fn into_subscription(mut self, req: &Request) -> io::Result<Subscription<S>> {
+        self.send(req)?;
+        Ok(Subscription {
+            stream: self.stream,
+            rx: RecvBuf::default(),
+        })
+    }
+}
+
+fn unexpected_response() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "unexpected response")
+}
+
+/// The error a response other than the one a request expects becomes: the broker's
+/// own refusal message, or a protocol violation.
+fn refused(resp: Response) -> io::Error {
+    match resp {
+        Response::Error { msg, .. } => io::Error::other(msg),
+        _ => unexpected_response(),
     }
 }
 
@@ -966,10 +891,17 @@ pub fn take<S: Read + Write>(sub: &mut Subscription<S>, max: usize) -> io::Resul
 /// is the reason this is a library helper rather than something every caller
 /// re-invents.
 ///
-/// The order is deliberate and is what makes redelivery the failure mode: the commit
-/// happens AFTER the records are in the caller's hands, so a crash between the two
-/// redelivers them (at-least-once into an idempotent sink), never loses them. A
-/// caller that must process before committing calls [`take`] and commits itself.
+/// The commit happens AFTER the take, so a failure between the two redelivers the
+/// records rather than skipping them. But the group has moved past them by the time
+/// `drain` returns: a caller that must PROCESS before committing (at-least-once into
+/// an idempotent sink) calls [`take`] and commits itself.
+///
+/// A broker reaps a connection that sends no request within its first-frame timeout
+/// ([`FIRST_FRAME_TIMEOUT`](crate::broker::FIRST_FRAME_TIMEOUT) by default), so a
+/// FRESH `committer` whose first request is this commit fails if the take runs
+/// longer than that. Make one request on it first — an attach, or
+/// [`Client::hello`]; on a guarded broker the deadline runs until a capability is
+/// accepted, so there only a successful attach does.
 ///
 /// Returns the records; an empty result commits nothing.
 pub fn drain<S: Read + Write, C: Read + Write>(
@@ -1003,32 +935,22 @@ pub use crate::store::ACK_SEQ_BASE;
 /// nothing, and re-applies no commit — and it does so whether the retry came through
 /// this helper or through `asb ack`, because both derive the key the same way.
 ///
-/// HONEST BOUNDARY: `offset` must be below [`ACK_SEQ_BASE`] (any real log offset is,
-/// by many orders of magnitude) and ordinary publishes by the same `producer_id` must
-/// stay below it too, which `asb` enforces on `--seq`/`--seq-file` and a library caller
-/// must observe itself. Within those bounds acks and ordinary publishes by one producer
-/// id cannot collide in the dedup map, so a separate acking id is no longer required
-/// for that.
+/// `offset` must be below [`ACK_SEQ_BASE`] (any real log offset is, by many orders of
+/// magnitude), and ordinary publishes by the same `producer_id` must stay below it too
+/// — `asb` enforces that on `--seq`/`--seq-file`; a library caller must observe it
+/// itself. Within those bounds an ack and an ordinary publish by one producer id never
+/// share a dedup key.
 ///
-/// THAT IS A STATEMENT ABOUT DEDUP, AND ABOUT NOTHING ELSE. An ack does not raise the
-/// producer's last-will fence: the reserved half is excluded from
-/// `BrokerLog::producer_high_water`, precisely because an ack's sequence is derived
-/// from an offset rather than from an incarnation and is above every sequence a will
-/// can hold. Acking under the producer id that also holds a will is therefore safe —
-/// it was not, and one ack suppressed that producer's goodbye permanently — and a
-/// will registered at a sequence in the reserved half is refused at registration.
+/// An ack does not raise the producer's last-will fence: the reserved half is excluded
+/// from `BrokerLog::producer_high_water`, because an ack's sequence is derived from an
+/// offset rather than from an incarnation and is above every sequence a will can hold.
+/// Acking under a producer id that also holds a will is therefore safe, and a will
+/// registered at a sequence in the reserved half is refused.
 ///
-/// SECOND HONEST BOUNDARY — THIS DERIVATION CHANGED, AND THE CHANGE IS NOT UPGRADE
-/// COMPATIBLE. This helper previously keyed an ack on the BARE `offset`. An ack already
-/// on the log from a pre-change caller therefore sits under `(producer_id, offset)`,
-/// while a retry of that same logical ack from this version is keyed
-/// `(producer_id, ACK_SEQ_BASE | offset)` — a different key, so the broker sees a new
-/// record and appends a second answer instead of deduping. `PROTO_VERSION` cannot catch
-/// this: the frames are well formed and current, and the incompatibility lives in the
-/// DURABLE dedup map rather than in the codec. Drain a producer's in-flight acks before
-/// upgrading it, or accept at most one duplicated answer per ack whose outcome was in
-/// doubt across the upgrade. The group commit is monotone, so the CURSOR is unaffected
-/// either way; only the answer record can double.
+/// Compatibility: an ack written by a version that keyed it on the BARE `offset` sits
+/// under a different dedup key, so retrying it through this version appends a second
+/// answer record (the monotone group commit is unaffected). Drain a producer's
+/// in-flight acks before upgrading it.
 pub fn ack<S: Read + Write>(
     client: &mut Client<S>,
     producer_id: u64,
@@ -1055,19 +977,16 @@ pub fn ack<S: Read + Write>(
 #[cfg(unix)]
 pub struct Subscription<S = UnixStream> {
     stream: S,
-    /// The bytes of the frame currently being assembled that a TIMED-OUT read
-    /// already took off the stream. Empty at every frame boundary; see
-    /// [`recv_event`](Subscription::recv_event).
-    carry: Vec<u8>,
+    /// What has been read off `stream` and not yet returned; see [`RecvBuf`].
+    rx: RecvBuf,
 }
 
 /// A live delivery stream from the broker (Windows twin: TCP default, as above).
 #[cfg(not(unix))]
 pub struct Subscription<S = TcpStream> {
     stream: S,
-    /// The bytes of the frame currently being assembled that a TIMED-OUT read
-    /// already took off the stream (as above).
-    carry: Vec<u8>,
+    /// What has been read off `stream` and not yet returned; see [`RecvBuf`].
+    rx: RecvBuf,
 }
 
 #[cfg(unix)]
@@ -1077,6 +996,9 @@ impl Subscription<UnixStream> {
     /// thread (and release the broker-side connection) shuts the socket down through
     /// this closer, which makes the blocked `recv` return `Ok(None)`.
     ///
+    /// The closer holds its own handle to the socket, so while it lives, dropping the
+    /// subscription alone does NOT close the connection: call
+    /// [`close`](SubscriptionCloser::close), or drop both.
     /// The TCP and sealed subscriptions have the same method, returning the same
     /// [`Closer`]; an erased [`AnySubscription`] has no socket left to reach, so its
     /// closer is the one [`connect`] handed back.
@@ -1106,46 +1028,104 @@ pub enum Event {
     Mark { next: u64, head: u64 },
 }
 
-/// The partial-frame buffer a subscription keeps between frames: big enough that an
-/// ordinary record never reallocates, small enough that a 16 MiB one is not held for
-/// the life of the subscription. Matches `proto`'s read chunk.
-const CARRY_RESTING: usize = 64 * 1024;
+/// Bytes a subscription asks its stream for per read, and the size its receive
+/// buffer returns to after an oversized frame.
+const READ_CHUNK: usize = 64 * 1024;
 
-/// A subscription's stream as `read_frame` sees it: the socket, plus the bytes of
-/// the frame currently being assembled.
+/// A subscription's receive buffer: the bytes read off the stream that no `recv` has
+/// returned yet, `buf[start..end]`.
 ///
-/// `read_frame` is built out of `read_exact`, which on a timeout returns the error
-/// having ALREADY consumed whatever bytes it managed to read — into a buffer it then
-/// drops. Over `SO_RCVTIMEO` that silently eats a prefix of a record and leaves the
-/// rest queued, so the next read parses a body as a header. This adapter closes that
-/// hole the same way the sealed record layer closes it one level down: every byte
-/// handed to `read_frame` is appended to `carry`, and the next call replays `carry`
-/// from the start (`pos`) before reading the socket again. `read_frame` asks for the
-/// same bytes in the same order every time, so the replay reconstructs exactly the
-/// prefix the timed-out call had, and the frame finishes from where it stopped.
+/// Frames are parsed out of this buffer rather than read off the stream with
+/// `read_exact`, for two reasons. A read can TIME OUT part-way through a frame
+/// (`SO_RCVTIMEO`, under [`take`]'s idle window), and `read_exact` drops the bytes it
+/// had already consumed when it does, so the next read would parse a body as a
+/// header; here those bytes simply stay in the buffer and the next `recv` finishes
+/// the frame. And one read takes every queued frame that fits, so a subscriber
+/// catching up on a backlog pays one syscall per buffer rather than two per frame.
 ///
-/// The cost is that a frame in flight is held twice — once in `carry`, once in the
-/// buffer `read_frame` is filling. Both grow with what the peer has actually SENT,
-/// not with the length it declared, so a peer that announces a huge frame and stalls
-/// still pins only what it sent (see `proto::READ_CHUNK`), now doubled.
-struct Resume<'a, S> {
-    stream: &'a mut S,
-    carry: &'a mut Vec<u8>,
-    pos: usize,
+/// The buffer grows by at most [`READ_CHUNK`] per read — with what the peer has
+/// actually SENT, never with the length a header declares — so a peer that announces
+/// a 16 MiB frame and stalls pins only what it sent.
+#[derive(Default)]
+struct RecvBuf {
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
 }
 
-impl<S: Read> Read for Resume<'_, S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos < self.carry.len() {
-            let n = buf.len().min(self.carry.len() - self.pos);
-            buf[..n].copy_from_slice(&self.carry[self.pos..self.pos + n]);
-            self.pos += n;
-            return Ok(n);
+impl RecvBuf {
+    /// The payload of the next frame; `Ok(None)` when the stream closes at a frame
+    /// boundary. A timeout keeps the unfinished frame for the next call; any other
+    /// error discards it, since the stream cannot be resumed past one.
+    fn next_frame(&mut self, stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            match Frame::decode(&self.buf[self.start..self.end]) {
+                Ok(Some(d)) => {
+                    self.start += d.consumed;
+                    if self.start == self.end {
+                        self.reset();
+                    }
+                    return Ok(Some(d.frame.payload));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.reset();
+                    let msg = match e {
+                        FrameError::TooLarge => "frame exceeds cap",
+                        _ => "corrupt frame",
+                    };
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                }
+            }
+            if self.end == self.buf.len() {
+                // Full: slide the unfinished frame to the front, and grow only when it
+                // already fills the whole buffer.
+                self.buf.copy_within(self.start..self.end, 0);
+                self.end -= self.start;
+                self.start = 0;
+                if self.end == self.buf.len() {
+                    self.buf.resize(self.end + READ_CHUNK, 0);
+                }
+            }
+            match stream.read(&mut self.buf[self.end..]) {
+                Ok(0) => {
+                    let partial = self.end - self.start;
+                    self.reset();
+                    // As `proto::read_frame`: a close inside a header is a close, one
+                    // inside a payload is a frame cut short.
+                    return if partial < HEADER_SIZE {
+                        Ok(None)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "broker closed mid-frame",
+                        ))
+                    };
+                }
+                Ok(n) => self.end += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    if !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) {
+                        self.reset();
+                    }
+                    return Err(e);
+                }
+            }
         }
-        let n = self.stream.read(buf)?;
-        self.carry.extend_from_slice(&buf[..n]);
-        self.pos += n;
-        Ok(n)
+    }
+
+    /// Nothing is owed: empty the buffer, and give back whatever an oversized frame
+    /// grew it by.
+    fn reset(&mut self) {
+        self.start = 0;
+        self.end = 0;
+        if self.buf.len() > READ_CHUNK {
+            self.buf.truncate(READ_CHUNK);
+            self.buf.shrink_to_fit();
+        }
     }
 }
 
@@ -1156,9 +1136,9 @@ impl<S: Read + Write> Subscription<S> {
     /// own: reach the socket through it and bound the read there. (A boxed
     /// [`AnyStream`] cannot be reached this way — erasing it hid the socket — which
     /// is why [`connect`] returns a [`Closer`] alongside it.) Do NOT read or write
-    /// the stream itself — a subscription that has timed out mid-frame holds the
-    /// rest of that frame, and bytes taken from underneath it are gone from the
-    /// stream this resumes.
+    /// the stream itself — a subscription holds the bytes it has already read (the
+    /// rest of a frame a timeout interrupted, and frames queued behind it), and
+    /// bytes taken from underneath it are gone from the stream it resumes.
     pub fn get_ref(&self) -> &S {
         &self.stream
     }
@@ -1185,52 +1165,27 @@ impl<S: Read + Write> Subscription<S> {
     ///
     /// A read that TIMES OUT part-way through a frame (see
     /// [`set_read_timeout`](Subscription::set_read_timeout)) is resumable, not a
-    /// desync: `read_frame` is fed through the `Resume` adapter, which keeps every
-    /// byte it handed out for the unfinished frame and replays them before
-    /// touching the socket again. The frame is then completed from where the
-    /// timeout left it, so the caller sees the whole record once — never a prefix
-    /// dropped on the floor and the tail of a body parsed as the next header. Any
-    /// other error clears the partial frame; the stream is not resumable past it.
+    /// desync: the bytes that arrived stay on the subscription and the next call
+    /// completes the frame from where the timeout left it, so the caller sees the
+    /// whole record once — never a prefix dropped on the floor and the tail of a body
+    /// parsed as the next header. Any other error discards the partial frame; the
+    /// stream is not resumable past it.
     pub fn recv_event(&mut self) -> io::Result<Option<Event>> {
-        let mut r = Resume {
-            stream: &mut self.stream,
-            carry: &mut self.carry,
-            pos: 0,
+        let Some(p) = self.rx.next_frame(&mut self.stream)? else {
+            return Ok(None);
         };
-        let framed = read_frame(&mut r);
-        let timed_out = matches!(
-            &framed,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-        );
-        if !timed_out {
-            // A frame boundary (or an error the stream cannot resume past): nothing is
-            // owed. `clear` keeps the capacity, which is what makes the ordinary case
-            // allocation-free — but one big record should not pin its buffer for the
-            // life of the subscription, so hand back anything past the resting size.
-            self.carry.clear();
-            if self.carry.capacity() > CARRY_RESTING {
-                self.carry.shrink_to(CARRY_RESTING);
-            }
-        }
-        match framed? {
-            Some(p) => match decode_response(&p) {
-                Some(Response::Delivery {
-                    offset,
-                    subject,
-                    body,
-                }) => Ok(Some(Event::Delivery {
-                    offset,
-                    subject,
-                    body,
-                })),
-                Some(Response::Mark { next, head, .. }) => Ok(Some(Event::Mark { next, head })),
-                Some(Response::Error { msg, .. }) => Err(io::Error::other(msg)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected response",
-                )),
-            },
-            None => Ok(None),
+        match decode_response(&p).ok_or_else(unexpected_response)? {
+            Response::Delivery {
+                offset,
+                subject,
+                body,
+            } => Ok(Some(Event::Delivery {
+                offset,
+                subject,
+                body,
+            })),
+            Response::Mark { next, head, .. } => Ok(Some(Event::Mark { next, head })),
+            other => Err(refused(other)),
         }
     }
 }
@@ -1267,9 +1222,8 @@ impl Subscription<TcpStream> {
 impl Subscription<astream_aead::SealedStream<TcpStream>> {
     /// The SEALED twin of [`Subscription::set_read_timeout`] — the same idle window
     /// for a subscription from `connect_tcp_sealed`, `connect_tcp_handshake` or
-    /// `connect_tcp_identity` (all three hand back a `SealedStream<TcpStream>`).
-    /// Without it a direct consumer on the fabric's own transport had no way to bound
-    /// [`drain`] and parked in the read forever.
+    /// `connect_tcp_identity` (all three hand back a `SealedStream<TcpStream>`), so
+    /// a consumer on the sealed transport can bound [`drain`] too.
     ///
     /// The timeout is set on the TCP socket UNDER the record layer, so it can land
     /// part-way through a sealed record as well as part-way through a frame. Both
@@ -1588,4 +1542,110 @@ fn connect_handshake(
         io::ErrorKind::Unsupported,
         "Transport::Handshake needs astream-broker built with the `handshake` feature",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecvBuf, READ_CHUNK};
+    use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
+    use std::io::{self, Read};
+
+    /// A stream that plays `script` one read at a time: `Some(n)` hands out the next
+    /// `n` bytes (fewer at the end), `None` is a read timeout. Past the script it is
+    /// at EOF.
+    struct Scripted {
+        bytes: Vec<u8>,
+        pos: usize,
+        script: Vec<Option<usize>>,
+        step: usize,
+    }
+
+    impl Scripted {
+        fn new(bytes: Vec<u8>, script: Vec<Option<usize>>) -> Scripted {
+            Scripted {
+                bytes,
+                pos: 0,
+                script,
+                step: 0,
+            }
+        }
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(&step) = self.script.get(self.step) else {
+                return Ok(0);
+            };
+            self.step += 1;
+            let Some(n) = step else {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "scripted"));
+            };
+            let n = n.min(buf.len()).min(self.bytes.len() - self.pos);
+            buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn framed(payloads: &[Vec<u8>]) -> Vec<u8> {
+        payloads
+            .iter()
+            .flat_map(|p| Frame::new(p.clone()).encode().unwrap())
+            .collect()
+    }
+
+    /// Every frame comes back whole and in order however the bytes are split — with a
+    /// timeout after every single byte, or with every frame in one read — and a frame
+    /// bigger than the resting buffer gives its growth back.
+    #[test]
+    fn frames_survive_any_split_and_a_timeout_at_every_byte() {
+        let payloads = vec![b"a".to_vec(), vec![], vec![7u8; 70_000], b"z".to_vec()];
+        let bytes = framed(&payloads);
+        let byte_by_byte = (0..bytes.len()).flat_map(|_| [Some(1), None]).collect();
+        let all_at_once = vec![Some(usize::MAX); bytes.len()];
+        for script in [byte_by_byte, all_at_once] {
+            let mut s = Scripted::new(bytes.clone(), script);
+            let mut rx = RecvBuf::default();
+            let mut got = Vec::new();
+            loop {
+                match rx.next_frame(&mut s) {
+                    Ok(Some(p)) => got.push(p),
+                    Ok(None) => break,
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            assert_eq!(got, payloads);
+            assert!(rx.buf.len() <= READ_CHUNK);
+        }
+    }
+
+    /// A close inside a header is a close; inside a payload it is a frame cut short.
+    #[test]
+    fn a_close_mid_frame_is_classified_like_read_frame() {
+        let bytes = framed(&[b"payload".to_vec()]);
+        for (cut, clean) in [(0, true), (HEADER_SIZE - 1, true), (HEADER_SIZE + 3, false)] {
+            let mut s = Scripted::new(bytes[..cut].to_vec(), vec![Some(usize::MAX)]);
+            match RecvBuf::default().next_frame(&mut s) {
+                Ok(None) => assert!(clean, "cut at {cut}"),
+                Err(e) => {
+                    assert!(!clean, "cut at {cut}: {e}");
+                    assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+                }
+                Ok(Some(p)) => panic!("cut at {cut} produced a frame: {p:?}"),
+            }
+        }
+    }
+
+    /// A header declaring more than the cap is refused on the header alone, before a
+    /// byte of its payload is buffered.
+    #[test]
+    fn an_oversized_header_is_refused_before_its_payload_is_read() {
+        let mut hdr = Frame::new(vec![]).encode().unwrap();
+        hdr[4..8].copy_from_slice(&((MAX_PAYLOAD_LEN + 1) as u32).to_le_bytes());
+        let mut s = Scripted::new(hdr, vec![Some(usize::MAX), Some(usize::MAX)]);
+        let e = RecvBuf::default().next_frame(&mut s).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(s.step, 1, "one read: the header's");
+    }
 }

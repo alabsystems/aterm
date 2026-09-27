@@ -98,7 +98,7 @@ impl Verdict {
 }
 
 /// What one UNQUOTED `$(…)` or backtick substitution is in the segments
-/// [`split_segments`] makes and the words [`raw_words`] reads: ONE word (or
+/// [`split_segments`] makes and the words [`program_words`] reads: ONE word (or
 /// part of one) of the command around it, never a command boundary — its
 /// body is split into segments of its own, which run too. It holds nothing
 /// the splitters split on, no `/` ([`program`] takes a basename) and no `=`,
@@ -348,7 +348,7 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
     // (b) Quoted strings are opaque to the danger scan; a substitution the
     // quotes held is flagged ([`QUOTE_SUB_MARK`]) so the splitter reads it as
     // a one-word [`QUOTED_SUBSTITUTION`], not a splitting one.
-    let stripped = strip_quotes_marked(&cmd);
+    let stripped = strip_quotes(&cmd);
     // (c)+(d) Segments of whitespace-split tokens.
     let segments = split_segments(&stripped);
     if segments.is_empty() {
@@ -387,7 +387,7 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
         Err(reason) => return Verdict::no(reason),
     };
     let lexed = strip_alarm_idiom(&lexed);
-    let segments: Vec<Vec<String>> = split_segments(&strip_quotes_marked(&lexed))
+    let segments: Vec<Vec<String>> = split_segments(&strip_quotes(&lexed))
         .into_iter()
         .filter(|seg| {
             let head = seg.iter().find(|t| !is_assignment(t));
@@ -979,42 +979,24 @@ fn is_alarm_body(body: &str) -> bool {
 
 /// Replace every single- and double-quoted string with `""`, keeping a `$(…)`
 /// or backtick substitution found INSIDE double quotes (its command still
-/// runs) glued to that `""` — it is part of the quoted word, so `x="$(…)"`
-/// stays one assignment — turning find's `\(`/`\)` into bare parens so the
-/// splitter sees the group, and keeping any other backslash escape verbatim.
-pub(crate) fn strip_quotes(src: &str) -> String {
-    strip_quotes_impl(src, false)
-}
-
-/// [`strip_quotes`], but a `$(…)` or backtick found INSIDE double quotes is
-/// preceded by [`QUOTE_SUB_MARK`], so [`split_segments`] reads it as a
-/// one-word [`QUOTED_SUBSTITUTION`]. Only [`classify_command_with`] and
-/// [`classify_except_rm`] use it; `rm_policy` keeps the unmarked reading it
-/// resolves operands against (and refuses every `$(`/backtick before it looks).
-fn strip_quotes_marked(src: &str) -> String {
-    strip_quotes_impl(src, true)
-}
-
-fn strip_quotes_impl(src: &str, mark_quoted: bool) -> String {
+/// runs) glued to that `""` and preceded by [`QUOTE_SUB_MARK`] — it is part of
+/// the quoted word, so `x="$(…)"` stays one assignment, and
+/// [`split_segments`] reads it as a one-word [`QUOTED_SUBSTITUTION`] — and a
+/// parameter inside double quotes as [`QUOTED_PARAMETER`], turning find's
+/// `\(`/`\)` into bare parens so the splitter sees the group, and keeping any
+/// other backslash escape verbatim.
+fn strip_quotes(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
-    strip_into(&chars, &mut i, &mut out, None, mark_quoted);
+    strip_into(&chars, &mut i, &mut out, None);
     out
 }
 
 /// `stop` is the character that ends this level: `)` inside a `$(…)`, a
-/// backtick inside a backtick substitution, none at the top. `mark_quoted`
-/// writes a [`QUOTE_SUB_MARK`] before a substitution found inside double
-/// quotes; either way a literal `QUOTE_SUB_MARK` the line carries is dropped,
-/// so it cannot be spoofed in.
-fn strip_into(
-    chars: &[char],
-    i: &mut usize,
-    out: &mut String,
-    stop: Option<char>,
-    mark_quoted: bool,
-) {
+/// backtick inside a backtick substitution, none at the top. A literal
+/// [`QUOTE_SUB_MARK`] the line carries is dropped, so it cannot be spoofed in.
+fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char>) {
     let mut depth = 0usize;
     while *i < chars.len() {
         let c = chars[*i];
@@ -1053,27 +1035,22 @@ fn strip_into(
                         break;
                     }
                     if d == '$' && chars.get(*i + 1) == Some(&'(') {
-                        if mark_quoted {
-                            out.push(QUOTE_SUB_MARK);
-                        }
+                        out.push(QUOTE_SUB_MARK);
                         out.push_str("$(");
                         *i += 2;
-                        strip_into(chars, i, out, Some(')'), mark_quoted);
+                        strip_into(chars, i, out, Some(')'));
                         out.push(')');
                         continue;
                     }
                     if d == '`' {
-                        if mark_quoted {
-                            out.push(QUOTE_SUB_MARK);
-                        }
+                        out.push(QUOTE_SUB_MARK);
                         out.push('`');
                         *i += 1;
-                        strip_into(chars, i, out, Some('`'), mark_quoted);
+                        strip_into(chars, i, out, Some('`'));
                         out.push('`');
                         continue;
                     }
-                    if mark_quoted
-                        && d == '$'
+                    if d == '$'
                         && chars.get(*i + 1).is_some_and(|&n| {
                             n.is_ascii_alphanumeric()
                                 || matches!(n, '_' | '{' | '@' | '*' | '#' | '?' | '$' | '!' | '-')
@@ -1111,7 +1088,7 @@ fn strip_into(
             '$' if chars.get(*i + 1) == Some(&'(') => {
                 out.push_str("$(");
                 *i += 2;
-                strip_into(chars, i, out, Some(')'), mark_quoted);
+                strip_into(chars, i, out, Some(')'));
                 out.push(')');
             }
             '`' if stop == Some('`') => {
@@ -1156,7 +1133,7 @@ fn strip_into(
 /// `<` or `&>` glued to the END of a word that is not a descriptor number
 /// starts a token of its own, as the shell reads it: `rm>/dev/null -rf /`
 /// and `rm&>/dev/null -rf /` are `rm` and a redirect.
-pub(crate) fn split_segments(s: &str) -> Vec<Vec<String>> {
+fn split_segments(s: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = s.chars().collect();
     let mut segments = Vec::new();
     let mut i = 0;
@@ -1278,13 +1255,13 @@ fn glued_to_a_word(cur: &str) -> bool {
 }
 
 /// The program name of a token: its basename, so `/bin/rm` and `rm` agree.
-pub(crate) fn program(tok: &str) -> &str {
+fn program(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
 /// An output redirect token: `Some(target)` when `tok` redirects (`>`, `>>`,
 /// `2>`, `&>`, `>|`, `>file`); `None` when the target is the NEXT token.
-pub(crate) fn redirect_target(tok: &str) -> Option<Option<&str>> {
+fn redirect_target(tok: &str) -> Option<Option<&str>> {
     let pos = tok.find('>')?;
     // `<>` and `<(` are not output redirects; `->`/`=>` inside a word are, in
     // shell, so they are refused (a tie breaks toward not-read-only).
@@ -1299,7 +1276,7 @@ pub(crate) fn redirect_target(tok: &str) -> Option<Option<&str>> {
 /// A redirect target that writes no file: `/dev/null`, a descriptor (`&1`), or
 /// a close (`&-`). `>&word` with any other word is bash for "stdout and stderr
 /// into the file `word`".
-pub(crate) fn redirect_is_safe(target: &str) -> bool {
+fn redirect_is_safe(target: &str) -> bool {
     target == "/dev/null"
         || target.strip_prefix('&').is_some_and(|fd| {
             fd == "-" || (!fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
@@ -1330,7 +1307,7 @@ fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
 /// `printf` do the same, a clock-setting `date`, and an assignment to a
 /// [`HAZARD_VARS`] variable. A program NAME is not judged here: that is the
 /// head check's, so `grep -rn open src` is a read and `open src` is not.
-pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
+fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
     for seg in segments {
         for (i, tok) in seg.iter().enumerate() {
             let prog = program(tok);
@@ -1794,7 +1771,7 @@ const XARGS_VALUE_FLAGS: &[&str] = &[
 
 /// The POSITIVE filter on one segment: `None` when its head is a read-only
 /// program (with the git / tmutil / python refinements), else the reason.
-pub(crate) fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
+fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
     head_from(seg, 0, python_allow)
 }
 
@@ -2242,7 +2219,7 @@ fn aterm_ctl_read(args: &[String]) -> Option<String> {
 /// program a substitution OR a parameter supplies (`awk "$x"`, `sed "$s" f`),
 /// which this scan cannot read. Every word is looked at, not only heads, so
 /// `xargs awk …` and `timeout 5 sed …` are covered.
-pub(crate) fn program_scan(cmd: &str) -> Option<String> {
+fn program_scan(cmd: &str) -> Option<String> {
     for seg in program_words(cmd) {
         for (i, w) in seg.iter().enumerate() {
             let reason = match program(w) {
@@ -2564,23 +2541,14 @@ fn sed_script_writes(script: &str) -> Option<String> {
 /// where [`split_segments`] splits (a `$(…)` or backtick substitution, inside
 /// double quotes too, is a [`SUBSTITUTION`] in the word around it, and its
 /// body's words are segments of their own, first): what a program's argument
-/// really says, which the quote-stripped tokens cannot.
-pub(crate) fn raw_words(src: &str) -> Vec<Vec<String>> {
-    words(src, false)
-}
-
-/// [`raw_words`], but every unquoted or double-quoted PARAMETER expansion
-/// (`$name`, `${…}`, `$1`; not a single-quoted `$1`, which is a literal, nor
-/// an escaped `\$`) is marked a [`SUBSTITUTION`] too — a value the shell
-/// supplies that this check cannot read. Only [`program_scan`] uses it, so
-/// that an awk program or a sed script a parameter supplies (`awk "$x"`, `sed
-/// "$s" f`) is refused like one a substitution supplies; [`raw_words`] keeps
-/// its literal `$` for `rm_policy`, which resolves `"$S/x"` against the cwd.
+/// really says, which the quote-stripped tokens cannot. Every unquoted or
+/// double-quoted PARAMETER expansion (`$name`, `${…}`, `$1`; not a
+/// single-quoted `$1`, which is a literal, nor an escaped `\$`) is marked a
+/// [`SUBSTITUTION`] too — a value the shell supplies that this check cannot
+/// read — so that an awk program or a sed script a parameter supplies (`awk
+/// "$x"`, `sed "$s" f`) is refused by [`program_scan`] like one a
+/// substitution supplies.
 fn program_words(src: &str) -> Vec<Vec<String>> {
-    words(src, true)
-}
-
-fn words(src: &str, mark_params: bool) -> Vec<Vec<String>> {
     let chars: Vec<char> = src.chars().collect();
     let mut scan = WordScan {
         chars: &chars,
@@ -2589,7 +2557,6 @@ fn words(src: &str, mark_params: bool) -> Vec<Vec<String>> {
         seg: Vec::new(),
         cur: String::new(),
         in_word: false,
-        mark_params,
     };
     scan.run(None);
     scan.segments
@@ -2602,9 +2569,6 @@ struct WordScan<'a> {
     seg: Vec<String>,
     cur: String,
     in_word: bool,
-    /// Mark a parameter expansion a [`SUBSTITUTION`]: [`program_words`] does,
-    /// [`raw_words`] does not.
-    mark_params: bool,
 }
 
 impl WordScan<'_> {
@@ -2634,7 +2598,7 @@ impl WordScan<'_> {
     }
     /// A parameter expansion (`$name`, `${…}`, `$1`, `$@`): consumed and
     /// marked a [`SUBSTITUTION`], since the shell's value for it is a word
-    /// this check cannot read. Only reached with [`Self::mark_params`].
+    /// this check cannot read.
     fn mark_parameter(&mut self) {
         self.i += 1; // past `$`
         match self.chars.get(self.i) {
@@ -2717,7 +2681,7 @@ impl WordScan<'_> {
                                 self.i += 2;
                                 self.nested(')');
                             }
-                            '$' if self.mark_params => self.mark_parameter(),
+                            '$' => self.mark_parameter(),
                             '`' => {
                                 self.i += 1;
                                 self.nested('`');
@@ -2733,7 +2697,7 @@ impl WordScan<'_> {
                     self.i += 2;
                     self.nested(')');
                 }
-                '$' if self.mark_params => self.mark_parameter(),
+                '$' => self.mark_parameter(),
                 '`' if stop == Some('`') => {
                     self.i += 1;
                     self.end_seg();
@@ -2825,7 +2789,7 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Lines whose command this check could not name, or whose argument the
 /// split cut off the command it decides, each paired with the rule that
 /// refuses it. Every one was MEASURED `read_only = true` on origin/main
-/// `d8f5fd244` (2026-09-24), so `--auto-reads` and the approval decider's
+/// `d8f5fd244` (2026-09-24), so the approval decider's
 /// read-only rule would have pressed its box. Shared with that decider's
 /// test (`supervise::policy::approval`), which draws each as a box.
 #[cfg(test)]
@@ -3172,7 +3136,10 @@ mod tests {
     fn a_backtick_inside_double_quotes_still_runs() {
         assert_eq!(classify_command("echo \"now: `rm -rf x`\"").reason, "rm");
         assert!(ro("echo \"now: `date`\""));
-        assert_eq!(strip_quotes("echo \"a `date` b\""), "echo \"\"`date`");
+        assert_eq!(
+            strip_quotes("echo \"a `date` b\""),
+            format!("echo \"\"{QUOTE_SUB_MARK}`date`")
+        );
     }
 
     #[test]
@@ -3444,24 +3411,24 @@ mod tests {
     }
 
     /// A substitution is a word of its command here too, its body's words a
-    /// segment of their own, first.
+    /// segment of their own, first; a parameter is a substitution too.
     #[test]
-    fn raw_words_resolve_quotes_and_split_where_the_segments_do() {
+    fn program_words_resolve_quotes_and_split_where_the_segments_do() {
         assert_eq!(
-            raw_words("awk 'a b' \"c $x\" d\\ e | grep x; echo `date`"),
+            program_words("awk 'a b' \"c $x\" d\\ e | grep x; echo `date`"),
             vec![
-                vec!["awk", "a b", "c $x", "d e"],
+                vec!["awk", "a b", "c $…", "d e"],
                 vec!["grep", "x"],
                 vec!["date"],
                 vec!["echo", SUBSTITUTION],
             ]
         );
         assert_eq!(
-            raw_words("echo \"x $(stat -f '%m' \"$f\") y\""),
-            vec![vec!["stat", "-f", "%m", "$f"], vec!["echo", "x $… y"]]
+            program_words("echo \"x $(stat -f '%m' \"$f\") y\""),
+            vec![vec!["stat", "-f", "%m", "$…"], vec!["echo", "x $… y"]]
         );
         assert_eq!(
-            raw_words("awk \"$(cat p.awk)\" f; a$(b)c"),
+            program_words("awk \"$(cat p.awk)\" f; a$(b)c"),
             vec![
                 vec!["cat", "p.awk"],
                 vec!["awk", SUBSTITUTION, "f"],
@@ -3470,15 +3437,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            raw_words("echo \"a \\\" b\" 'c\\d'"),
-            vec![vec!["echo", "a \" b", "c\\d"]]
+            program_words("echo \"a \\\" b\" 'c\\d' '$x' \\$y"),
+            vec![vec!["echo", "a \" b", "c\\d", "$x", "$y"]]
         );
     }
 
     /// Every line the 2026-09-23 audit (APR-4) measured the shipped
     /// classifier calling read-only, each a write or a program of the line's
-    /// choosing. `⏎` in the audit is a newline here. The `rm_policy` corpus
-    /// pins the same shapes for an `rm` verdict.
+    /// choosing. `⏎` in the audit is a newline here.
     #[test]
     fn the_measured_bypasses_are_not_read_only() {
         let bypasses = [
@@ -3691,7 +3657,7 @@ mod tests {
         );
         assert_eq!(
             strip_quotes("echo \"x $(stat -f '%m' \"$f\")\""),
-            "echo \"\"$(stat -f \"\" \"\")"
+            format!("echo \"\"{QUOTE_SUB_MARK}$(stat -f \"\" \"\"{QUOTED_PARAMETER})")
         );
         assert_eq!(strip_quotes("find . \\;"), "find . \\;");
         assert_eq!(strip_quotes("echo 'unterminated"), "echo \"\"");
@@ -4000,9 +3966,6 @@ mod tests {
             let v = classify_command(cmd);
             assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
         }
-        // `raw_words` must still keep the literal `$` `rm_policy` resolves
-        // against; only `program_words` marks it.
-        assert_eq!(raw_words("cat \"$S/x\""), vec![vec!["cat", "$S/x"]]);
         assert_eq!(
             program_words("cat \"$S/x\""),
             vec![vec!["cat".to_string(), format!("{SUBSTITUTION}/x")]]

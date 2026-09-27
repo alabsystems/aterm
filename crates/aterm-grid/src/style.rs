@@ -21,7 +21,9 @@
 
 use std::fmt;
 
-use super::cell::{CellFlags, PackedColor};
+use super::cell::CellFlags;
+#[cfg(test)]
+use super::cell::PackedColor;
 
 #[path = "style_color.rs"]
 mod style_color;
@@ -62,6 +64,7 @@ impl StyleId {
     /// Whether this is the default style (index 0).
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn is_default(self) -> bool {
         self.0 == 0
     }
@@ -217,6 +220,7 @@ impl ExtendedStyle {
     /// Used by Terminal's CurrentStyle which stores fg/bg as separate
     /// PackedColor values rather than the combined PackedColors format.
     #[must_use]
+    #[cfg(test)]
     pub fn from_packed_colors_separate(fg: PackedColor, bg: PackedColor, flags: CellFlags) -> Self {
         let (fg_color, fg_type, fg_index) = Self::unpack_color(fg, Color::DEFAULT_FG);
         let (bg_color, bg_type, bg_index) = Self::unpack_color(bg, Color::DEFAULT_BG);
@@ -237,6 +241,7 @@ impl ExtendedStyle {
     }
 
     /// Unpack a `PackedColor` into its `(Color, ColorType, index)` components.
+    #[cfg(test)]
     fn unpack_color(packed: PackedColor, default: Color) -> (Color, ColorType, u8) {
         if packed.is_default() {
             (default, ColorType::Default, 0)
@@ -279,6 +284,7 @@ impl ExtendedStyle {
 
     /// Convert CellFlags to StyleAttrs.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn cell_flags_to_style_attrs(flags: CellFlags) -> StyleAttrs {
         let mut attrs = StyleAttrs::empty();
         for &(cf, sa) in &Self::FLAG_ATTR_MAP {
@@ -350,7 +356,7 @@ mod style_table;
 pub use style_table::ExtendedStyleInfo;
 pub use style_table::StyleTable;
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, kani))]
 #[path = "style_test_helpers.rs"]
 mod style_test_helpers;
 #[cfg(test)]

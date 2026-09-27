@@ -36,18 +36,6 @@ impl Error {
             line_col: Some(line_col(source, at)),
         }
     }
-
-    /// The 1-based line the failure was raised on, or 0 if it has no position.
-    #[must_use]
-    pub fn line(&self) -> usize {
-        self.line_col.map_or(0, |(line, _)| line)
-    }
-
-    /// The 1-based column the failure was raised at, or 0 if it has no position.
-    #[must_use]
-    pub fn column(&self) -> usize {
-        self.line_col.map_or(0, |(_, col)| col)
-    }
 }
 
 /// Resolve a byte offset to a 1-based line and column, counting a column per

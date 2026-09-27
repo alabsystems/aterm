@@ -47,7 +47,7 @@ const AWAIT_MARGIN: Duration = Duration::from_secs(5);
 /// resolve (re-resolved at every dial).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
-    /// This socket, always (`--socket`, `$ATERM_CONTROL_SOCK`, the host's own).
+    /// This socket, always (`--socket`, the host's own).
     Socket(String),
     /// Whatever `aterm_ctl::resolve_sock_for(self_sid)` names at the dial.
     Resolved { self_sid: Option<String> },
@@ -56,8 +56,8 @@ pub enum Endpoint {
 /// One persistent, authenticated control connection behind the [`Ctl`] seam.
 pub struct RelayCtl {
     endpoint: Endpoint,
-    /// A token given up front (`$ATERM_CONTROL_TOKEN`, the host's own);
-    /// `None` reads the one beside the socket at every dial.
+    /// A token given up front (the host's own); `None` reads the one beside the
+    /// socket at every dial.
     token: Option<String>,
     conn: Option<RelayClient<CtlStream>>,
     /// A second handle on the live connection, for the interrupter.
@@ -283,14 +283,6 @@ impl Transport {
         match relay.connect() {
             Ok(()) => Transport::Relay(relay),
             Err(_) => Transport::Shell(fallback),
-        }
-    }
-
-    /// Which transport this is, for a diagnostic.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Transport::Relay(_) => "relay",
-            Transport::Shell(_) => "aterm-ctl",
         }
     }
 }

@@ -88,8 +88,8 @@ pub(crate) const EDIT_ROBI: &str = "robi";
 /// changes the wording, the timing, or what the notice is for, and reduced motion
 /// holds the colours still.
 pub(crate) const EDIT_NOTICE_SPARKLE: &str = "notice_sparkle";
-/// Ambient-bed toggle (`Config::trail_sound_bed`, default OFF — the owner
-/// dislikes the drone): ON re-enables the continuous per-style background
+/// Ambient-bed toggle (`Config::trail_sound_bed`, default ON since the
+/// owner's 2026-09-09 ruling): ON plays the continuous per-style background
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
 /// (zero bed samples — the notes, brrrring, bonk and melody are untouched).
 pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
@@ -132,6 +132,14 @@ pub(crate) const EDIT_TRAIL_SOUND_RIFF: &str = "trail_sound_riff";
 /// mirrored by [`super::native_settings`]' Advanced gate and by the
 /// [`crate::diagnostics`] capability matrix.
 pub(crate) const EDIT_BELL_SOUND: &str = "bell_sound";
+/// THE SUPERVISOR'S CHOICE CHIME (the question-policy contract, 2026-09-24):
+/// one quiet synth pip when the in-window supervisor answers Claude Code's
+/// question box by policy (`App::chose_chime`). A synth voice like the rest of
+/// the Sound box — subordinate to Music effects and scaled by the volume —
+/// default ON. Muting it silences the chime only; the band's `◆ chose` flash
+/// and the window's rim pulse stay. Parsed and preserved everywhere, inert
+/// where the synth has no output.
+pub(crate) const EDIT_CHOICE_SOUND: &str = "choice_sound";
 /// The curse BONK's two gates, named so the Sound menu, the section router and
 /// the visibility allowlist all spell them once. They are `[sparkle_words]`
 /// leaves in the FILE (that is where the feature's table lives and the spelling
@@ -208,6 +216,7 @@ pub(crate) const SOUND_MENU_KEYS: &[&str] = &[
     EDIT_TRAIL_SOUND_BED,
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
+    EDIT_CHOICE_SOUND,
     EDIT_SPARKLE_BONK,
     EDIT_SPARKLE_BONK_DETONATION,
     EDIT_OUTPUT_STREAK_SOUND,
@@ -406,9 +415,9 @@ pub(crate) const EDIT_SHOW_BUILD_BADGE: &str = "show_build_badge";
 /// key. The Settings ROW comes from its [`NESTED_LEAVES`] registry entry
 /// (Appearance ▸ Matrix rain, Bool, default OFF); this named constant exists for
 /// the code that addresses the key directly — the semantic-snapshot dotted
-/// projection, `raw_bool_value`, and the tests. Runtime per-session overrides
-/// (View ▸ Matrix Rain, `aterm-ctl rain`) win over this durable bit until the
-/// session ends.
+/// projection and the tests (including their `raw_bool_value` fixture
+/// projection). Runtime per-session overrides (View ▸ Matrix Rain, `aterm-ctl
+/// rain`) win over this durable bit until the session ends.
 pub(crate) const EDIT_MATRIX_RAIN_ENABLED: &str = "matrix_rain.enabled";
 
 /// The `[packages]` toolchain-manager switches a person has, addressed as dotted keys
@@ -455,12 +464,48 @@ pub(crate) const EDIT_REROUTE_ANNOUNCE: &str = "reroute.announce";
 /// A Bool, default ON, registered through [`NESTED_LEAVES`] like the other
 /// dotted leaves.
 ///
-/// It is in `aterm.toml` and NOT in the harness's own config on purpose: *"the
-/// kill switch may never depend on the thing it kills"*, so it keeps working
-/// when the harness tree is missing, broken or mid-update. Everything finer —
-/// one switch per capability — lives in the harness's own state and is edited
-/// with `aterm harness enable|disable`; no key exists in both homes.
+/// It is in `aterm.toml` on purpose: *"the kill switch may never depend on the
+/// thing it kills"*, so it keeps working when the harness tree is missing,
+/// broken or mid-update. Every finer key sits beside it in the same table
+/// (`aterm_agent::supervise::config::KEYS`), each at full power by default
+/// and able only to LIMIT it (owner, 2026-09-24); they are written in the
+/// file (Manual) and the row says which are (`HarnessPolicy::words`).
 pub(crate) const EDIT_HARNESS_ENABLED: &str = "harness.enabled";
+/// `[harness] approve` — what the supervisor answers a permission box with
+/// (owner, 2026-09-24: *"all such dialogs must be approved by default unless
+/// there is a setting added later by the user explicitly to NOT do this"*,
+/// and *"configuration limits power"*). An Enum, `all` by default,
+/// registered through [`NESTED_LEAVES`] beside the master switch, so it is a
+/// Settings row, a Search hit and a Manual key at once — "the setting added
+/// later" is this row.
+///
+/// `all`: every box its answer — a permission box its one-shot allow
+/// (`allow-once@v1`; never a standing grant, never a purchase). `safe`: only
+/// what the safe rules prove (owner decision 1: a read-only command, an rm
+/// under a scratch root in bypass, a Read outside the secrets, the trust
+/// dialog under a trust root). `none`: every box is the owner's. The row
+/// seeds from the SUPERVISOR's resolved level ([`Config::harness_policy`]),
+/// so a refused value reads as the limit the reader took it for.
+pub(crate) const EDIT_HARNESS_APPROVE: &str = "harness.approve";
+/// `[harness] answer_questions` — the supervisor's QUESTION ANSWER (owner
+/// directive of 2026-09-25: *"the harness must not stall on escalating to
+/// the user … the harness must choose the recommended option(s) and
+/// continue automatically"*). A Bool, ON by default, registered through
+/// [`NESTED_LEAVES`] beside the approval level, so it is a Settings row, a
+/// Search hit and a Manual key at once.
+///
+/// ON: a Claude Code question dialog (AskUserQuestion) is answered with its
+/// recommended option — option 1 when none is marked; every recommended
+/// option of a multi-select; the review tab submitted — by Enter on the
+/// focused row once a person has been quiet (`answer-recommended@v1`),
+/// never its free-text row, its chat row or Cancel, and a question a person
+/// has begun answering is theirs; and a question or choice the worker asks
+/// in prose gets `[harness] answer_text` (`answer@v1`). OFF — a limit —
+/// every question goes to the menu bar. Independent of
+/// [`EDIT_HARNESS_APPROVE`] both ways: a question is no permission. The row
+/// seeds from the SUPERVISOR's resolved bit ([`Config::harness`]), so a
+/// refused value reads OFF here exactly as the reader limits it.
+pub(crate) const EDIT_HARNESS_ANSWER_QUESTIONS: &str = "harness.answer_questions";
 
 /// `[machine] universal_control` — `"off"` (default) disables macOS Universal Control
 /// for this host whenever the `[machine]` settings are applied (`aterm pkg machine apply`,
@@ -716,12 +761,29 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Toolchain: announce upstream cargo/rustc",
         kind: EditKind::Bool,
     },
-    // [harness] — the aterm wrapper's ONE durable master switch. Everything
-    // finer lives in the harness's own state (`aterm harness enable|disable`),
-    // because two homes for one key drift.
+    // [harness] — the supervisor's master switch, the one key with a row.
+    // The finer keys only limit it and are written in Manual; the row's note
+    // names each one written (`HarnessPolicy::words`).
     NestedLeaf {
         key: EDIT_HARNESS_ENABLED,
         label: "Harness",
+        kind: EditKind::Bool,
+    },
+    // The supervisor's approval level (owner, 2026-09-24): `all` answers
+    // every box; `safe` is decision 1's proven rules; `none` answers none.
+    NestedLeaf {
+        key: EDIT_HARNESS_APPROVE,
+        label: "Approve permission boxes",
+        kind: EditKind::Enum {
+            options: &["all", "safe", "none"],
+        },
+    },
+    // The question answer (owner, 2026-09-25): ON answers a question dialog
+    // with its recommended option, and one asked in prose with
+    // `answer_text`; OFF (a limit) hands every question over.
+    NestedLeaf {
+        key: EDIT_HARNESS_ANSWER_QUESTIONS,
+        label: "Answer questions with the recommended option",
         kind: EditKind::Bool,
     },
     // [sparkle_words] — master + top-level scalars.
@@ -1034,7 +1096,7 @@ pub(crate) fn nested_leaf(key: &str) -> Option<&'static NestedLeaf> {
 /// field that is neither registered (directly or via dotted-leaf rows) nor
 /// listed here — so a future `Config` field cannot silently skip the
 /// introspection surface; deferring it requires writing the reason down.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by the exhaustiveness gate
+#[cfg(test)]
 pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
         "privacy",
@@ -1062,8 +1124,17 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
          Owner-scope client can drive through `settings set`: the whole point of putting \
          `deliver`/`hold` behind a descriptor is that no token unlocks them, and a writable \
          `fabric.command` would hand that authority to whatever a prompt-injected agent named. \
-         Edit `[fabric] command` in aterm.toml (validated by --validate-config), or set \
-         $ATERM_FABRIC_COMMAND",
+         Edit `[fabric] command` in aterm.toml (validated by --validate-config), or run \
+         `aterm fabric on`",
+    ),
+    (
+        "operator",
+        "the EXPERIMENTAL embedded operator's launch switch ([operator] enabled, read once \
+         at launch): an agent-infrastructure opt-in behind `aterm fleet manage`, not a \
+         preference, and off by default because a new profile's allowlist is empty — a \
+         Settings toggle an Owner-scope client can drive would put a resident observer in \
+         every process one click away. Edit `[operator] enabled = true` in aterm.toml \
+         (docs/OPERATOR-EMBEDDED.md)",
     ),
     (
         "keybindings",
@@ -1099,7 +1170,7 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
          Windows, inert on macOS, where CoreText applies its own grid discipline. This \
          registry has no platform-gated-row precedent yet: a knob that visibly does nothing \
          on the platform this Settings surface is authored on would read as broken. It is a \
-         full config key (aterm.toml, $ATERM_FONT_HINTING alias, hot-reload); it joins the \
+         full config key (aterm.toml, hot-reload); it joins the \
          Typography section when per-platform row visibility exists",
     ),
     (
@@ -1108,7 +1179,7 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
          the same platform-gated-row deferral as font_hinting, compounded: this stage is \
          CPU-compositor-only (the default GPU backend renders grayscale regardless), so a \
          Settings row would visibly do nothing for most users on ALL THREE platforms. It \
-         is a full config key (aterm.toml, $ATERM_FONT_SUBPIXEL alias, hot-reload); it \
+         is a full config key (aterm.toml, hot-reload); it \
          joins the Typography section with font_hinting when per-platform (and \
          per-backend) row visibility exists",
     ),
@@ -1134,7 +1205,7 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
          file it under, so seeding it as an orphan enum row on the Window page would promise \
          an in-window effect it cannot have. It joins the registry with a Launch/Startup \
          section. Reachable meanwhile from Manual (it is in native_config_language's \
-         MANUAL_SCHEMA), from aterm.toml, and from $ATERM_WINDOWING_BEHAVIOR",
+         MANUAL_SCHEMA) and from aterm.toml",
     ),
 ];
 
@@ -1235,7 +1306,7 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
 ///   * `font_weight_dark_nudge` / `stream_fade` / `stream_fade_ms` — theme-
 ///     conditional / temporal effects deferred with the preview-matrix
 ///     campaign (KNOWN INCOMPLETE, documented at the migration commit).
-#[cfg_attr(not(test), allow(dead_code))] // consumed by the preview-coverage gate
+#[cfg(test)]
 pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // A process-wide suppression policy, not a single preview-scene property.
     // Its shipping gates are exercised by the app/render conformance tests.
@@ -1264,6 +1335,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // Aural, no pixels — the same rationale as their five siblings above.
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
+    // The supervisor's choice chime: aural, and it answers a question box the
+    // workbench scene never shows.
+    EDIT_CHOICE_SOUND,
     // PRISM WAKE's pip: aural like the six above, and doubly unprojectable —
     // the workbench scene has no PTY, so it produces no program output for a
     // streak to answer in the first place. Listed BY NAME rather than covered
@@ -1602,7 +1676,6 @@ pub(crate) enum EditKind {
 /// The TOML type of each editable key, so [`apply_prefs_edits`] can parse the raw
 /// control text into a correctly-typed `aterm-toml` value. The single source of truth
 /// shared by the window (which builds the controls) and the writer (which types them).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn edit_kind(key: &str) -> EditKind {
     if COLOR_KEYS.contains(&key) {
         return EditKind::Color;
@@ -1711,6 +1784,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TRAIL_SOUND_BED
         | EDIT_TRAIL_SOUND_RIFF
         | EDIT_BELL_SOUND
+        | EDIT_CHOICE_SOUND
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_MOMENTUM_GLOW
         | EDIT_OPTION_AS_META
@@ -1775,7 +1849,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
 /// parse as the key's declared type. Both are surfaced (logged) by the caller, which
 /// then leaves the file untouched rather than risk clobbering it.
 #[derive(Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum PrefsEditError {
     /// The current `aterm.toml` text failed to parse as TOML (`aterm-toml` error). The
     /// edit is refused so a malformed file is never overwritten.
@@ -1836,7 +1909,6 @@ impl std::error::Error for PrefsEditError {}
 ///
 /// Errors ([`PrefsEditError`]): the existing text isn't valid TOML, or a value doesn't
 /// parse as its key's type — in both cases the caller leaves the file untouched.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn apply_prefs_edits(
     existing_toml: &str,
     edits: &[(&str, Option<String>)],
@@ -1903,7 +1975,6 @@ pub(crate) fn apply_prefs_edits(
 /// comments ABOVE the key ride the Key's decor and survive an item replacement on
 /// their own.) A no-op when either side isn't a plain value — a fresh key has no
 /// decor to inherit, and a table squatting on the name is refused upstream.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn adopt_inline_decor(old: Option<&aterm_toml::edit::Item>, new: &mut aterm_toml::edit::Item) {
     let Some(old_value) = old.and_then(aterm_toml::edit::Item::as_value) else {
         return;
@@ -1931,7 +2002,6 @@ fn adopt_inline_decor(old: Option<&aterm_toml::edit::Item>, new: &mut aterm_toml
 /// file untouched) when an intermediate exists as a NON-table value (`net = 5`)
 /// or when the leaf itself is currently a table — overwriting either would
 /// destroy user structure this editor has no business rewriting.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn set_nested_key(
     doc: &mut aterm_toml::edit::DocumentMut,
     parts: &[&str],
@@ -1975,7 +2045,6 @@ fn set_nested_key(
 /// set ⇒ a clean no-op, mirroring the top-level remove. The PARENT tables are
 /// left in place even when emptied — deleting `[net]` outright would also take
 /// its comments, and an empty table parses to the same defaults.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn remove_nested_key(doc: &mut aterm_toml::edit::DocumentMut, parts: &[&str]) {
     let (leaf, tables) = parts.split_last().expect("dotted key has segments");
     let mut cur: &mut aterm_toml::edit::Item = doc.as_item_mut();
@@ -2015,7 +2084,6 @@ fn remove_nested_key(doc: &mut aterm_toml::edit::DocumentMut, parts: &[&str]) {
 /// Signed/narrow fields get explicit arms; that conformance test walks every
 /// registered Integer key and re-parses each boundary through the real serde model,
 /// so an arm can never drift from its field type.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn integer_domain(key: &str) -> std::ops::RangeInclusive<i64> {
     match key {
         // Smart-title request policy: unlike ordinary sliders, these bounds are
@@ -2103,7 +2171,6 @@ fn title_summary_path_has_url_authority(value: &str) -> bool {
 /// compact JWTs, and URL-shaped values). Keeping the check here, immediately before
 /// [`typed_item`] constructs TOML, covers the overlay, native Settings service, and
 /// control-socket writers that all converge on [`apply_prefs_edits`].
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn title_summary_token_file_looks_like_path(value: &str) -> bool {
     if value.is_empty() || value.chars().any(char::is_control) {
         return false;
@@ -2161,7 +2228,6 @@ fn title_summary_token_file_looks_like_path(value: &str) -> bool {
 /// after Settings is saved, so this deliberately performs no filesystem check. It
 /// rejects controls, URLs, and unmistakable inline PEM armor before any certificate
 /// or private-key material can be persisted or copied into a diagnostic.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn title_summary_ca_file_looks_like_path(value: &str) -> bool {
     if value.is_empty()
         || value.chars().any(char::is_control)
@@ -2178,7 +2244,6 @@ fn title_summary_ca_file_looks_like_path(value: &str) -> bool {
 /// serde-representable domain ([`integer_domain`]) — is a
 /// [`PrefsEditError::BadValue`] so a Save never writes a value the reload parser
 /// would reject.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditError> {
     use aterm_toml::edit::{Item, Value};
     let bad = || PrefsEditError::BadValue {
@@ -2408,6 +2473,24 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         // `true` re-typed here — the streak pip's rule, so the switch and the
         // harness can never start in different positions.
         EDIT_HARNESS_ENABLED => boolean(Some(cfg.harness_enabled()), true),
+        // The same law: the supervisor's own resolved switch, so a refused
+        // value shows the limit the reader took it for — and the full-power
+        // default beside it, which Manual's help names (`default true`) as
+        // it does for every key that limits.
+        EDIT_HARNESS_ANSWER_QUESTIONS => (
+            Some(cfg.harness.policy.answer_questions.to_string()),
+            "true".to_string(),
+        ),
+        // The supervisor's own resolved level, so a refused value shows the
+        // limit the reader took it for; the full-power default is the
+        // placeholder, never a seed (a seed is a written override).
+        EDIT_HARNESS_APPROVE => {
+            let level = cfg.harness_approve();
+            (
+                (level != "all").then(|| level.to_string()),
+                "all".to_string(),
+            )
+        }
         "sparkle_words.enabled" => boolean(sw.and_then(|s| s.enabled), true),
         "sparkle_words.reduced_motion" => boolean(sw.and_then(|s| s.reduced_motion), false),
         "sparkle_words.suppress_in_alt_screen" => {
@@ -2523,11 +2606,12 @@ pub(crate) enum Section {
     /// The aterm WRAPPER's own page (design
     /// `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2). Like
     /// [`Section::Packages`] above, it is a SPECIAL page: the durable master
-    /// switch `harness.enabled` is the only key that routes here today, and
-    /// the per-capability switches, the account list and the ledger rows the
-    /// design's page shows live in the harness's own state rather than in
-    /// `aterm.toml`, so no ordinary registry row owns them. Search and the
-    /// Modified review still reach the master switch through the registry.
+    /// switch `harness.enabled` and the approval level `harness.approve`
+    /// (2026-09-24) are its rows, and the finer `[harness]` keys — each able
+    /// only to limit — are written in Manual, where the config language lists
+    /// them with their full-power defaults. Search and the Modified review
+    /// reach both rows through the registry, the master switch's note naming
+    /// every limit the table writes.
     Harness,
     /// The read-only Kitty Log collection book (§F4.6): no editable keys ever
     /// map here ([`section_of`] never returns it), so the content pane paints
@@ -3067,6 +3151,13 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
 pub(crate) const HARNESS_TIMING: &str =
     "Supervision starts or stops when saved; the agent launcher changes for new sessions";
 
+/// [`application_timing`] of the approval-level row: the host restarts every
+/// supervised agent session's worker under the policy the save produced
+/// (`harness_host`, on the config reload), and nothing about the launcher
+/// changes.
+pub(crate) const HARNESS_APPROVE_TIMING: &str =
+    "Applies when saved: every supervised agent session restarts its supervisor under it";
+
 /// When an authored value becomes effective. Most preferences are projected
 /// live. Keep this metadata beside the complete preference schema so Advanced,
 /// Modified, and the Manual language service cannot disagree about a saved
@@ -3091,6 +3182,9 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         // saved (`harness_host`, on the config reload), and the launcher twin,
         // re-rendered without the prelude so the NEXT launch is plain.
         EDIT_HARNESS_ENABLED => Some(HARNESS_TIMING),
+        // Live the same way (2026-09-24), with no launcher half.
+        // So is the question answer (2026-09-25).
+        EDIT_HARNESS_APPROVE | EDIT_HARNESS_ANSWER_QUESTIONS => Some(HARNESS_APPROVE_TIMING),
         EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
         EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
         EDIT_REROUTE_ANNOUNCE => Some("Applies to the next rerouted command"),
@@ -3128,7 +3222,12 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
 pub(crate) fn application_has_live_effect(key: &str) -> bool {
     matches!(
         key,
-        EDIT_AMBIGUOUS_WIDTH | EDIT_MATRIX_RAIN_ENABLED | EDIT_HDR_GLOW | EDIT_HARNESS_ENABLED
+        EDIT_AMBIGUOUS_WIDTH
+            | EDIT_MATRIX_RAIN_ENABLED
+            | EDIT_HDR_GLOW
+            | EDIT_HARNESS_ENABLED
+            | EDIT_HARNESS_APPROVE
+            | EDIT_HARNESS_ANSWER_QUESTIONS
     ) || application_timing(key).is_none()
 }
 
@@ -3138,32 +3237,20 @@ pub(crate) fn application_has_live_effect(key: &str) -> bool {
 pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
     Some(match key {
         EDIT_COLUMNS => {
-            "$ATERM_COLUMNS / --columns overrides on a fresh launch; an authenticated update handoff preserves the live grid"
+            "--columns overrides on a fresh launch; an authenticated update handoff preserves the live grid"
         }
         EDIT_LINES => {
-            "$ATERM_LINES / --lines overrides on a fresh launch; an authenticated update handoff preserves the live grid"
+            "--lines overrides on a fresh launch; an authenticated update handoff preserves the live grid"
         }
-        EDIT_GPU => {
-            "the last --cpu/--gpu flag wins; inherited $ATERM_CPU otherwise wins over $ATERM_GPU; both override this value"
-        }
-        EDIT_FONT_PX => "$ATERM_FONT_PX / --font-px overrides this value",
-        EDIT_FONT_FAMILY => "$ATERM_FONT / --font overrides this value",
-        EDIT_WINDOW_THEME => "on macOS, $ATERM_NO_DARK_CHROME forces Automatic for this launch",
-        EDIT_TAB_STRIP_ROWS => "$ATERM_TAB_STRIP_ROWS overrides this value",
-        EDIT_STEM_GAMMA => "$ATERM_STEM_GAMMA overrides this value",
-        EDIT_SHELL => {
-            "$ATERM_SHELL / --shell overrides this value; -e / --command bypasses the shell"
-        }
+        EDIT_GPU => "a launch --cpu or --gpu overrides this value (the last one given wins)",
+        EDIT_FONT_PX => "a launch --font-px overrides this value",
+        EDIT_FONT_FAMILY => "a launch --font overrides this value",
+        EDIT_SHELL => "a launch --shell overrides this value; -e / --command bypasses the shell",
         EDIT_SHELL_ARGS => "a launch -e / --command bypasses shell_args",
-        "net.listen" => "$ATERM_NET_LISTEN overrides this value",
-        "net.cert" => "$ATERM_NET_CERT overrides this value",
-        "net.key" => "$ATERM_NET_KEY overrides this value",
-        // No `update.*`, `packages.*`, `reroute.*` or `harness.*` key has an
-        // environment override (2026-09-23, owner: "NOT ENV VARS those are for
-        // development"): the setting is the one spelling.
-        EDIT_FALLBACK_FONTS => "when unset, deprecated $ATERM_FALLBACK_FONT supplies the fallback",
-        EDIT_SYMBOL_FONT => "when unset, deprecated $ATERM_SYMBOL_FONT supplies the fallback",
-        EDIT_EMOJI_FONT => "when unset, deprecated $ATERM_EMOJI_FONT supplies the fallback",
+        // No `update.*`, `packages.*`, `reroute.*`, `harness.*` or `net.*` key, and
+        // no window-theme, tab-strip or typography key, has an environment override
+        // (2026-09-23/24, owner: "NOT ENV VARS those are for development"): the
+        // setting is the one spelling.
         _ => return None,
     })
 }
@@ -3437,6 +3524,10 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // effect ("a rainbow streak when in terminal there is output").
         EDIT_OUTPUT_STREAK_SOUND => &[
             "streak", "output", "prism", "comet", "rainbow", "pip", "chime", "sound", "sfx",
+        ],
+        // The supervisor's chime is found by what it answers.
+        EDIT_CHOICE_SOUND => &[
+            "choice", "chime", "harness", "question", "answer", "claude", "sound", "sfx",
         ],
         // Likewise the bell: "beep" and "alert" are what the sound is called
         // outside this codebase.
@@ -3867,6 +3958,38 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // Nested tables share one intent vocabulary per table.
         k if k.starts_with("net.") => &["network", "remote", "drive", "listener", "tls"],
         k if k.starts_with("update.") => &["update", "channel", "github", "release"],
+        // The approval policy answers to what a person reaches for when the
+        // agent keeps stopping on "Do you want to proceed?" — and to the words
+        // for turning the answering off.
+        EDIT_HARNESS_APPROVE => &[
+            "harness",
+            "claude",
+            "approve",
+            "approval",
+            "permission",
+            "prompt",
+            "dialog",
+            "yes",
+            "auto approve",
+            "proceed",
+            "supervisor",
+        ],
+        // The question answer answers to what a person reaches for when the
+        // agent keeps stopping on a question: the tool's name, the words of
+        // the dialog, and the words for answering it automatically.
+        EDIT_HARNESS_ANSWER_QUESTIONS => &[
+            "harness",
+            "claude",
+            "question",
+            "questions",
+            "answer",
+            "askuserquestion",
+            "recommended",
+            "recommendation",
+            "dialog",
+            "choose",
+            "auto answer",
+        ],
         // The one word most people will search for here is the vendor's — so
         // the wrapper's switch answers to "claude" as well as to "harness",
         // and to the two words an operator reaches for when they want it to
@@ -4370,6 +4493,17 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_BELL_SOUND,
             kind: EditKind::Bool,
             seed: Some(cfg.bell_sound_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // THE SUPERVISOR'S CHOICE CHIME (owner: "a little sound … for
+            // choosing"): the in-window supervisor answered a question box by
+            // policy. A synth voice, under Music effects. Seeded through its
+            // resolver.
+            label: "Question choice chime",
+            key: EDIT_CHOICE_SOUND,
+            kind: EditKind::Bool,
+            seed: Some(cfg.choice_sound_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {
@@ -5237,7 +5371,6 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
 /// preserves the expected and observed disk generations for a retry UI;
 /// `PublishedUnverified` requires reconciliation before retry; and `Error`
 /// carries a short human message for a pre-publication failure.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SaveOutcome {
     /// The file's content changed and was written; the caller should post a reload.
@@ -5283,7 +5416,6 @@ pub(crate) struct ConfigSnapshotSaveResult {
 /// returns [`SaveOutcome::Conflict`], and a post-publication proof failure returns
 /// [`SaveOutcome::PublishedUnverified`]. [`SaveOutcome::Saved`] is returned only
 /// when the complete durable proof was produced.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome {
     let Some(path) = crate::app_config::config_path() else {
         let msg = "no config path (HOME/XDG unset)".to_string();
@@ -6659,9 +6791,9 @@ mod edit_tests {
     /// THE OFF SWITCH (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
     /// §4.6.2): the aterm wrapper's master switch is an ordinary Bool row, so
     /// it is reachable from Search, from the Modified review and from
-    /// `settings set harness.enabled false`. It lives in `aterm.toml` and NOT
-    /// in the harness's own config precisely so a kill switch never depends on
-    /// the thing it kills — this test is what pins the key's HOME.
+    /// `settings set harness.enabled false`. It lives in `aterm.toml`
+    /// precisely so a kill switch never depends on the thing it kills — this
+    /// test is what pins the key's HOME.
     #[test]
     fn the_harness_master_switch_round_trips_through_set_and_unset() {
         let key = super::EDIT_HARNESS_ENABLED;
@@ -6695,13 +6827,13 @@ mod edit_tests {
             written.contains("font_px = 14"),
             "an untouched key survives: {written}"
         );
-        let off: Config = aterm_toml::from_str(&written).expect("re-parses as Config");
+        let off = Config::parse(&written).expect("re-parses as Config");
         assert!(!off.harness_enabled());
         // …and the row REALLY switches supervision: the same file's policy is
         // off, and it says so as live (the host follows the reload), not as
         // "Applies to new sessions" (2026-09-23).
-        assert!(!off.harness_policy().0.enabled);
-        assert!(Config::default().harness_policy().0.enabled, "absent is ON");
+        assert!(!off.harness.policy.enabled);
+        assert!(Config::default().harness.policy.enabled, "absent is ON");
         assert_eq!(super::application_timing(key), Some(super::HARNESS_TIMING));
         assert!(super::application_has_live_effect(key));
         assert_eq!(
@@ -6716,31 +6848,201 @@ mod edit_tests {
         // UNSET: clearing the key returns the resolved default, ON. The switch
         // has two positions and no third "unknown" one.
         let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
-        let back: Config = aterm_toml::from_str(&cleared).expect("re-parses as Config");
+        let back = Config::parse(&cleared).expect("re-parses as Config");
         assert!(back.harness_enabled(), "{cleared}");
         assert!(!cleared.contains("enabled = false"), "{cleared}");
 
         // An explicit `true` is indistinguishable from absent, by design.
         let on = apply_prefs_edits("", &[(key, set("true"))]).expect("set true");
-        let on_cfg: Config = aterm_toml::from_str(&on).expect("re-parses as Config");
+        let on_cfg = Config::parse(&on).expect("re-parses as Config");
         assert!(on_cfg.harness_enabled());
 
-        // THE HOME, asserted rather than described: nothing the writer
-        // produces for this key mentions the harness's own state directory,
-        // and no OTHER registered leaf claims the same dotted path.
+        // THE HOME, asserted rather than described: no OTHER registered leaf
+        // claims the same dotted path.
         assert_eq!(
             super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
             1,
             "one registration, one home"
         );
-        // The SHAPE the writer produces, MEASURED by this test on 2026-09-21
-        // and pinned here because `aterm harness` reads this same file with
-        // its own minimal reader and no GUI in the path: a `[harness]` header
-        // and `enabled = false` under it. The harness side transcribes this
-        // fixture in `harness::cli`'s `the_master_switch_is_read_out_of_aterm_toml`.
+        // The SHAPE the writer produces, MEASURED by this test on 2026-09-21:
+        // a `[harness]` header and `enabled = false` under it — what every
+        // reader of the table (`SupervisorConfig::from_aterm_toml`, the one)
+        // reads as the switch off.
         assert!(
             written.ends_with("[harness]\nenabled = false\n"),
             "{written}"
+        );
+    }
+
+    /// THE APPROVAL LEVEL (owner, 2026-09-24: *"all such dialogs must be
+    /// approved by default unless there is a setting added later by the user
+    /// explicitly to NOT do this"*): `harness.approve` is an ordinary Enum row
+    /// beside the master switch in the Harness section — found by Search, the
+    /// Modified review, `settings set harness.approve safe` — seeded from the
+    /// SUPERVISOR's resolved level, and applied live like `enabled` (the host
+    /// restarts every supervised session's worker on the reload). This row is
+    /// "the setting added later": writing `safe` is decision 1's proven rules,
+    /// `none` hands every box to the owner, clearing it is full power again.
+    /// NEGATIVE CONTROL: a value the reader cannot take seeds as the limit it
+    /// was read as (`none`), never `all`.
+    #[test]
+    fn the_approve_row_round_trips_through_set_and_unset() {
+        use aterm_agent::supervise::config::Approve;
+        let key = super::EDIT_HARNESS_APPROVE;
+        assert_eq!(key, "harness.approve", "the FILE spelling is the key");
+        assert_eq!(
+            super::edit_kind(key),
+            EditKind::Enum {
+                options: &["all", "safe", "none"]
+            }
+        );
+        assert_eq!(super::section_of(key), super::Section::Harness);
+        assert_eq!(super::group_of(key), ("Harness", 0));
+        for word in ["harness", "claude", "approve", "permission", "proceed"] {
+            assert!(keywords_of(key).contains(&word), "{word}");
+        }
+        assert_eq!(super::environment_precedence(key), None, "no env override");
+        assert_eq!(
+            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
+            1,
+            "one registration, one home"
+        );
+
+        // Absent is `all`: the default answers every box.
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Approve permission boxes");
+        assert_eq!(row.seed, None, "absent is no override");
+        assert_eq!(row.placeholder, "all", "absent means all");
+
+        // SET safe: the writer adds the key to `[harness]` without touching
+        // the master switch, and the policy is decision 1's rules — still
+        // answering what they prove, not off.
+        let written = apply_prefs_edits("[harness]\nenabled = true\n", &[(key, set("safe"))])
+            .expect("the nested writer edits [harness]");
+        assert!(
+            written.contains("enabled = true") && written.contains("approve = \"safe\""),
+            "{written}"
+        );
+        let safe = Config::parse(&written).expect("re-parses as Config");
+        let policy = &safe.harness.policy;
+        assert!(
+            safe.harness_notices().is_empty(),
+            "{:?}",
+            safe.harness_notices()
+        );
+        assert!(policy.enabled, "the limit is not the kill switch");
+        assert_eq!(policy.approve, Approve::Safe);
+        assert_eq!(safe.harness_approve(), "safe");
+        assert_eq!(
+            super::application_timing(key),
+            Some(super::HARNESS_APPROVE_TIMING)
+        );
+        assert!(super::application_has_live_effect(key));
+        assert_eq!(
+            editable_fields(&safe)
+                .into_iter()
+                .find(|f| f.key == key)
+                .and_then(|f| f.seed),
+            Some("safe".to_string()),
+            "the row reads back exactly what was written"
+        );
+
+        // UNSET: full power again.
+        let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
+        let back = Config::parse(&cleared).expect("re-parses as Config");
+        assert_eq!(back.harness_approve(), "all", "{cleared}");
+        assert!(!cleared.contains("approve"), "{cleared}");
+        assert!(
+            back.harness_enabled(),
+            "the master switch survived: {cleared}"
+        );
+
+        // NEGATIVE CONTROL: a value the reader cannot take is read as its
+        // limit, and the row says so.
+        let refused = Config::parse("[harness]\napprove = \"most\"\n").unwrap();
+        assert_eq!(refused.harness_approve(), "none");
+        assert_eq!(
+            editable_fields(&refused)
+                .into_iter()
+                .find(|f| f.key == key)
+                .and_then(|f| f.seed),
+            Some("none".to_string()),
+            "a refused approve never shows all"
+        );
+    }
+
+    /// THE QUESTION-ANSWER ROW (owner directive of 2026-09-25): the
+    /// `[harness] answer_questions` Bool is a Settings row in the Harness
+    /// section beside the approval level, ON by default, seeded from the
+    /// SUPERVISOR's resolved bit, live like it (the host restarts the
+    /// workers on the reload), and found by "question", "answer" and the
+    /// tool's name. Writing it `false` hands every question over and leaves
+    /// the approval level as it was; clearing it answers again. NEGATIVE
+    /// CONTROL: a refused value seeds OFF — its limit, as the reader takes
+    /// it.
+    #[test]
+    fn the_answer_questions_row_round_trips_through_set_and_unset() {
+        let key = super::EDIT_HARNESS_ANSWER_QUESTIONS;
+        assert_eq!(
+            key, "harness.answer_questions",
+            "the FILE spelling is the key"
+        );
+        assert_eq!(super::edit_kind(key), EditKind::Bool);
+        assert_eq!(super::section_of(key), super::Section::Harness);
+        assert_eq!(super::group_of(key).0, "Harness");
+        for word in ["harness", "claude", "question", "answer", "askuserquestion"] {
+            assert!(keywords_of(key).contains(&word), "{word}");
+        }
+        assert_eq!(super::environment_precedence(key), None, "no env override");
+        assert_eq!(
+            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
+            1,
+            "one registration, one home"
+        );
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Answer questions with the recommended option");
+        assert_eq!(row.seed.as_deref(), Some("true"), "absent means ON");
+        assert_eq!(
+            super::application_timing(key),
+            Some(super::HARNESS_APPROVE_TIMING)
+        );
+        assert!(super::application_has_live_effect(key));
+
+        let written = apply_prefs_edits("[harness]\nenabled = true\n", &[(key, set("false"))])
+            .expect("the nested writer edits [harness]");
+        assert!(written.contains("answer_questions = false"), "{written}");
+        let off = Config::parse(&written).expect("re-parses as Config");
+        assert!(
+            off.harness_notices().is_empty(),
+            "{:?}",
+            off.harness_notices()
+        );
+        assert!(!off.harness.policy.answer_questions);
+        assert_eq!(
+            off.harness_approve(),
+            "all",
+            "the approval level is its own row"
+        );
+
+        let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
+        let back = Config::parse(&cleared).expect("re-parses as Config");
+        assert!(back.harness.policy.answer_questions, "{cleared}");
+
+        let refused = Config::parse("[harness]\nanswer_questions = 0\n").expect("parses");
+        assert!(!refused.harness.policy.answer_questions);
+        assert_eq!(
+            editable_fields(&refused)
+                .into_iter()
+                .find(|f| f.key == key)
+                .and_then(|f| f.seed),
+            Some("false".to_string()),
+            "a refused answer_questions never shows ON"
         );
     }
 

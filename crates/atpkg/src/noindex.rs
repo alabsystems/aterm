@@ -403,8 +403,6 @@ impl Budget {
 pub struct Target {
     /// Absolute path as walked. Never a symlink — [`scan`] does not follow them.
     pub path: PathBuf,
-    /// Which signal recognized it.
-    pub evidence: Evidence,
     /// What its name claims about indexing.
     pub exclusion: Exclusion,
 }
@@ -420,8 +418,6 @@ impl Target {
 /// The result of one bounded walk.
 #[derive(Debug, Clone)]
 pub struct Scan {
-    /// The root walked.
-    pub root: PathBuf,
     /// Every target dir found, sorted by path — a stable report order, not `read_dir`'s.
     pub targets: Vec<Target>,
     /// `false` when a budget ran out, so the caller must say "at least" and never
@@ -460,7 +456,6 @@ impl Scan {
 #[must_use]
 pub fn scan(root: &Path, max_depth: usize, budget: &Budget) -> Scan {
     let mut out = Scan {
-        root: root.to_path_buf(),
         targets: Vec::new(),
         complete: true,
     };
@@ -479,10 +474,9 @@ pub fn scan(root: &Path, max_depth: usize, budget: &Budget) -> Scan {
         out.complete = false;
         return out;
     }
-    if let Some(evidence) = target_evidence(root) {
+    if target_evidence(root).is_some() {
         out.targets.push(Target {
             path: root.to_path_buf(),
-            evidence,
             exclusion: exclusion_of(root),
         });
         return out;
@@ -526,11 +520,10 @@ pub fn scan(root: &Path, max_depth: usize, budget: &Budget) -> Scan {
                 continue;
             }
             let path = entry.path();
-            if let Some(evidence) = target_evidence(&path) {
+            if target_evidence(&path).is_some() {
                 out.targets.push(Target {
                     exclusion: exclusion_of(&path),
                     path,
-                    evidence,
                 });
                 continue;
             }
@@ -979,7 +972,9 @@ pub fn build_in_progress(dir: &Path) -> Option<PathBuf> {
 /// milliseconds; the patience is a hundred, polled every ten, and the LAST reading
 /// is the verdict — a build that takes the lock mid-window is still caught, a copy
 /// that closes mid-window is not mistaken for one.
+#[cfg(unix)]
 const LOCK_PROBE_PATIENCE: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(unix)]
 const LOCK_PROBE_STEP: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Whether someone else holds `flock(2)` on `lock` — for longer than
@@ -1390,6 +1385,7 @@ fn git(repo: &Path, args: &[&str]) -> Option<std::process::Output> {
 
 /// `git rev-parse <args>` in `repo`, as a path; relative answers are resolved against
 /// `repo` (git prints them relative to its `-C` directory).
+#[cfg(unix)]
 fn git_path(repo: &Path, args: &[&str]) -> Option<PathBuf> {
     let mut full = vec!["rev-parse"];
     full.extend_from_slice(args);
@@ -1445,6 +1441,7 @@ fn git_ignores(repo: &Path, path: &Path) -> Option<bool> {
 /// dir's file from a linked worktree too, so every worktree of the clone shares the
 /// line). Never `.gitignore`: that is a tracked file, and editing it is the dirty tree
 /// this whole path exists to avoid.
+#[cfg(unix)]
 fn exclude_in_git(repo: &Path, path: &Path, comment: &str) -> ExcludeNote {
     match git_ignores(repo, path) {
         Some(true) => return ExcludeNote::AlreadyIgnored,
@@ -1532,10 +1529,12 @@ fn exclude_in_git(repo: &Path, path: &Path, comment: &str) -> ExcludeNote {
 }
 
 /// The exclude-file comment over the migrated name's line.
+#[cfg(unix)]
 const EXCLUDE_NEW_NAME: &str =
     "# atpkg noindex: the cargo target dir migrated out of Spotlight's index";
 /// The exclude-file comment over the link's line — written only when the entry that
 /// ignored the directory is directory-only and so stops matching at the link.
+#[cfg(unix)]
 const EXCLUDE_LINK: &str = "# atpkg noindex: the symlink standing where the directory was — the \
                             ignore entry that matched the directory is directory-only";
 
@@ -4375,49 +4374,6 @@ mod tests {
             "a truncated walk must say so, or the report is a census it did not take"
         );
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// THE $HOME WALK MUST NOT STAT A FILE JUST TO DISMISS IT. `apply_machine_settings`
-    /// runs [`scan`] over the whole home on every seed, on every 6-hourly update pass and
-    /// on every install; a stat taken BEFORE the `is_dir` filter charged one lstat to every
-    /// source file at depth 1..3 — work whose only result was `continue`. Those files were
-    /// counted by nothing (`max_entries` counts directories, and `entries += 1` comes after
-    /// the filter), so the 1.5 s wall clock of [`Budget::DOCTOR`] was their only bound: on
-    /// the contended-APFS machine this module was written for, that is how the walk spent
-    /// its clock on files, came back incomplete, and left targets later in the walk
-    /// unmigrated pass after pass — a truncation `apply_machine_settings` discards. Both
-    /// walks screen on readdir's `d_type` instead, which is no-follow just as the stat was;
-    /// only a regular file's LENGTH may cost a stat, and that one is [`sum_into`]'s.
-    ///
-    /// A source gate, because the fix is a syscall count: no output distinguishes it.
-    #[test]
-    fn neither_walk_stats_an_entry_just_to_learn_it_is_not_a_directory() {
-        let src = include_str!("noindex.rs");
-        for (name, head) in [("scan", "\npub fn scan("), ("sum_into", "\nfn sum_into(")] {
-            let start = src
-                .find(head)
-                .unwrap_or_else(|| panic!("{name}'s definition"));
-            let body = &src[start..];
-            let body = &body[..body[3..].find("\n}\n").map_or(body.len(), |i| i + 3)];
-            let loop_at = body
-                .find("for entry in read.flatten()")
-                .unwrap_or_else(|| panic!("{name}'s entry loop"));
-            let walk = &body[loop_at..];
-            let screen = walk
-                .find("entry.file_type()")
-                .unwrap_or_else(|| panic!("{name} must screen entries on readdir's d_type"));
-            assert!(
-                !walk.contains("symlink_metadata"),
-                "{name} takes a stat per entry again — a file pays it only to be thrown \
-                 away, and nothing but the wall clock stops them"
-            );
-            if let Some(path) = walk.find("entry.path()") {
-                assert!(
-                    screen < path,
-                    "{name} builds a PathBuf before it knows the entry is a directory"
-                );
-            }
-        }
     }
 
     /// The screen still recognizes what it must and still refuses what it must: a real

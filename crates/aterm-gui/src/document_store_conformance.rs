@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for the native document mutation/publication and close
-//! protocols. These tests drive the genuine Surface-backed [`DocumentStore`],
+//! protocols. These tests drive the genuine Surface-backed [`DocumentStore`] (and,
+//! for publication, the shipping Editor controller over it),
 //! project independently observed store state into the drift-free models, and
 //! ask the executable model whether each real transition is admitted.
 
@@ -14,44 +15,64 @@ use aterm_spec::interp::{State, admits};
 
 use crate::document_store::{
     DocumentCloseReadiness, DocumentError, DocumentId, DocumentPhase, DocumentStore,
-    DocumentTxnOutcome, DocumentViewId, TextEdit, rebase_position,
+    DocumentTxnOutcome, DocumentViewId, TextEdit,
 };
+use crate::native_editor::{EditorBufferView, EditorError, EditorWorkspace, Selection};
 
 #[derive(Clone, Copy)]
 struct PendingTxn {
     active: bool,
+    /// The Editor transaction's base: the Editor view's anchor sequence when it
+    /// began, read off the shipping view.
     base: Seq,
-    /// Selection-anchor VERSION observed by the controller. The byte position is
-    /// separately transformed through the real returned deltas below.
-    anchor_seq: Seq,
 }
 
 fn relative(seq: Seq, baseline: Seq) -> i64 {
     i64::try_from(seq.0.saturating_sub(baseline.0)).expect("bounded test sequence")
 }
 
+/// Every text the document has published, with the sequence that published it,
+/// from the baseline on — built from the edits THIS TEST made, never read back
+/// from the store. The immutable snapshot's generation is read off its text
+/// against this record. `DocumentSnapshot::seq` is the Surface head by
+/// construction, so projecting `snapshot_seq` from it would make
+/// `SnapshotCurrent` true by construction, and so would recording the store's
+/// own text after each commit: a projection cache left on the old text would be
+/// recorded as the new one. Built independently, a stale cache resolves to the
+/// older sequence it still carries.
+type TextHistory = Vec<(Seq, String)>;
+
 fn publication_projection(
     model: &Model,
     store: &DocumentStore,
     document: DocumentId,
-    editor: DocumentViewId,
+    editor: &EditorBufferView,
     markdown: DocumentViewId,
-    baseline: Seq,
     pending: PendingTxn,
+    history: &TextHistory,
 ) -> State {
+    let baseline = history.first().expect("the baseline text is recorded").0;
     let snapshot = store.snapshot(document).expect("live document");
+    let snapshot_text_seq = history
+        .iter()
+        .rev()
+        .find(|(_, text)| *text == *snapshot.text)
+        .map(|(seq, _)| *seq)
+        .expect("the snapshot carries a text this test published");
     let editor_seen = store
-        .observed_seq(document, editor)
+        .observed_seq(document, editor.document_view)
         .expect("attached Editor view");
     let markdown_seen = store
         .observed_seq(document, markdown)
         .expect("attached Markdown view");
     let mut state = model.init_state();
     state.insert("edit_seq", relative(snapshot.seq, baseline));
-    state.insert("snapshot_seq", relative(snapshot.seq, baseline));
+    state.insert("snapshot_seq", relative(snapshot_text_seq, baseline));
     state.insert("editor_seen", relative(editor_seen, baseline));
     state.insert("markdown_seen", relative(markdown_seen, baseline));
-    state.insert("anchor_seq", relative(pending.anchor_seq, baseline));
+    // The shipping Editor view's own anchor version, which the host moves
+    // through `observe_external` and the Editor's commit through `observe_own`.
+    state.insert("anchor_seq", relative(editor.anchor_seq(), baseline));
     state.insert("txn_active", i64::from(pending.active));
     state.insert("txn_base", relative(pending.base, baseline));
     // These are defect witnesses, not duplicated sources of real state. A real
@@ -108,36 +129,77 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     let mut store = DocumentStore::new();
     let document = store.open("mem://conformance/publication".into(), "alpha".into());
     let markdown = DocumentViewId(101);
-    let editor = DocumentViewId(102);
     store.attach_view(document, markdown).unwrap();
-    store.attach_view(document, editor).unwrap();
+    // The Editor controller is the shipping one: its view, its anchor rebase
+    // and its own commits.
+    let mut workspace = EditorWorkspace::new();
+    let mut editor = workspace
+        .attach(&mut store, document, DocumentViewId(102))
+        .unwrap();
+    let mut caret = 2;
+    editor.selections = vec![Selection::caret(caret)];
     let baseline = store.snapshot(document).unwrap().seq;
+    let mut text = String::from("alpha");
+    let mut history: TextHistory = vec![(baseline, text.clone())];
 
     // Editor begins at the current immutable snapshot. The transaction base is
-    // deliberately retained while two independent writers commit rapidly.
+    // deliberately retained — as the view it was built from — while the other
+    // controller commits twice.
+    let retained = editor.clone();
     let mut pending = PendingTxn {
         active: true,
-        base: baseline,
-        anchor_seq: baseline,
+        base: retained.anchor_seq(),
     };
-    let mut anchor_position = 2usize;
 
-    for suffix in ["-one", "-two"] {
+    for prefix in ["one-", "two-"] {
         let before = publication_projection(
-            &model, &store, document, editor, markdown, baseline, pending,
+            &model, &store, document, &editor, markdown, pending, &history,
         );
-        let (seq, deltas) = committed(append_text(&mut store, document, suffix));
-        let previous_anchor = anchor_position;
-        anchor_position = rebase_position(anchor_position, &deltas);
-        assert!(
-            anchor_position >= previous_anchor,
-            "returned delta transforms the controller anchor"
+        // The other controller inserts ahead of the Editor's caret, and the host
+        // rebases the Editor through the commit's deltas, as it does for a disk
+        // refresh.
+        let snapshot = store.snapshot(document).unwrap();
+        let (seq, deltas) = committed(store.transact(
+            document,
+            snapshot.seq,
+            vec![TextEdit {
+                range: 0..0,
+                insert: prefix.to_string(),
+            }],
+        ));
+        text.insert_str(0, prefix);
+        history.push((seq, text.clone()));
+        let unrebased = editor.clone();
+        editor.observe_external(seq, &deltas);
+        caret += prefix.len();
+        assert_eq!(
+            editor.primary_selection(),
+            &Selection::caret(caret),
+            "the returned deltas carry the caret past the insertion"
         );
-        pending.anchor_seq = seq;
         let after = publication_projection(
-            &model, &store, document, editor, markdown, baseline, pending,
+            &model, &store, document, &editor, markdown, pending, &history,
         );
         assert_transition(&model, &before, &after, "OtherCommit");
+
+        // Negative control: the commit published only to its author. An Editor
+        // the host did not rebase keeps its old anchor version — projected from
+        // that real view — which no healthy step leaves behind; the mutant's
+        // step leaves the snapshot on the old text as well.
+        let missed = publication_projection(
+            &model, &store, document, &unrebased, markdown, pending, &history,
+        );
+        assert_eq!(missed["anchor_seq"], before["anchor_seq"]);
+        assert_eq!(admits(&model, &before, &missed), None);
+        assert!(!model.check_invariant("AnchorsTransformed", &missed));
+        let author_only =
+            aterm_spec::interp::with_buggy(&model, 1).successors("OtherCommit", &before)[0].clone();
+        assert_eq!(author_only["snapshot_seq"], before["snapshot_seq"]);
+        assert_eq!(author_only["anchor_seq"], missed["anchor_seq"]);
+        assert_eq!(admits(&model, &before, &author_only), None);
+        for law in ["SnapshotCurrent", "EditorCurrent", "AnchorsTransformed"] {
+            assert!(!model.check_invariant(law, &author_only), "{law}");
+        }
 
         // Negative control: a router that publishes the commit only to Editor
         // cannot masquerade as the real transition and violates the same derived
@@ -150,14 +212,21 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
         assert!(!model.check_invariant("PublishIsAtomic", &editor_only));
     }
 
-    // The original Editor request is now stale. The genuine mutation lane must
-    // return Conflict and change neither canonical text nor either observer.
+    // The original Editor request is now stale. The shipping Editor refuses its
+    // retained view before any transaction, the store's own lane answers
+    // Conflict to its base, and neither changes canonical text or an observer.
     let before_snapshot = store.snapshot(document).unwrap();
-    let editor_before = store.observed_seq(document, editor);
+    let editor_before = store.observed_seq(document, editor.document_view);
     let markdown_before = store.observed_seq(document, markdown);
     let before_reject = publication_projection(
-        &model, &store, document, editor, markdown, baseline, pending,
+        &model, &store, document, &editor, markdown, pending, &history,
     );
+    let mut stale_view = retained;
+    assert!(matches!(
+        workspace.insert_text(&mut store, &mut stale_view, "X"),
+        Err(EditorError::StaleView { view, current })
+            if view == pending.base && current == before_snapshot.seq
+    ));
     let stale_outcome = store.transact(
         document,
         pending.base,
@@ -173,11 +242,14 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
         }
     );
     assert_eq!(store.snapshot(document).unwrap().text, before_snapshot.text);
-    assert_eq!(store.observed_seq(document, editor), editor_before);
+    assert_eq!(
+        store.observed_seq(document, editor.document_view),
+        editor_before
+    );
     assert_eq!(store.observed_seq(document, markdown), markdown_before);
     pending.active = false;
     let after_reject = publication_projection(
-        &model, &store, document, editor, markdown, baseline, pending,
+        &model, &store, document, &editor, markdown, pending, &history,
     );
     assert_transition(&model, &before_reject, &after_reject, "RejectStale");
 
@@ -199,27 +271,33 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     assert_eq!(admits(&model, &before_reject, &blind_stale), None);
     assert!(!model.check_invariant("StaleTxnIsNoOp", &blind_stale));
 
-    // A fresh Editor transaction commits cleanly and is published to Markdown
-    // before this synchronous call returns.
-    let fresh = store.snapshot(document).unwrap().seq;
+    // A fresh transaction commits through the shipping Editor at its caret and
+    // is published to Markdown before this synchronous call returns.
     pending = PendingTxn {
         active: true,
-        base: fresh,
-        anchor_seq: fresh,
+        base: editor.anchor_seq(),
     };
     let before_clean = publication_projection(
-        &model, &store, document, editor, markdown, baseline, pending,
+        &model, &store, document, &editor, markdown, pending, &history,
     );
-    let (seq, deltas) = committed(append_text(&mut store, document, "-clean"));
-    anchor_position = rebase_position(anchor_position, &deltas);
-    assert!(anchor_position <= store.snapshot(document).unwrap().text.len());
+    workspace
+        .insert_text(&mut store, &mut editor, "-clean")
+        .unwrap();
+    let (seq, _) = workspace
+        .take_last_commit(document)
+        .expect("the Editor's own commit");
+    text.insert_str(caret, "-clean");
+    history.push((seq, text.clone()));
     pending.active = false;
-    pending.anchor_seq = seq;
     let after_clean = publication_projection(
-        &model, &store, document, editor, markdown, baseline, pending,
+        &model, &store, document, &editor, markdown, pending, &history,
     );
     assert_transition(&model, &before_clean, &after_clean, "CommitClean");
-    assert_eq!(store.observed_seq(document, editor), Some(seq));
+    assert_eq!(editor.anchor_seq(), seq);
+    assert_eq!(
+        store.observed_seq(document, editor.document_view),
+        Some(seq)
+    );
     assert_eq!(store.observed_seq(document, markdown), Some(seq));
 }
 
@@ -324,6 +402,22 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
     let after_final = close_projection(&model, &store, document, projection);
     assert_transition(&model, &before_final, &after_final, "BeginFinalClose");
 
+    // Negative control: Closing freezes the head. The genuine mutation lane
+    // refuses an edit here; a lane that admitted it would move the head past
+    // the frozen request, which the healthy model does not admit.
+    assert_eq!(
+        append_text(&mut store, document, "late"),
+        DocumentTxnOutcome::Rejected(DocumentError::Closing)
+    );
+    assert_eq!(
+        close_projection(&model, &store, document, projection),
+        after_final
+    );
+    let late_edit =
+        aterm_spec::interp::with_buggy(&model, 1).successors("Edit", &after_final)[0].clone();
+    assert_eq!(admits(&model, &after_final, &late_edit), None);
+    assert!(!model.check_invariant("FrozenFinalSequence", &late_edit));
+
     let before_refused = close_projection(&model, &store, document, projection);
     assert_eq!(
         store.commit_detach(document, &[markdown]),
@@ -380,6 +474,25 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
     );
 
     let before_ack = close_projection(&model, &store, document, projection);
+
+    // Negative control: the acknowledgement of an OLDER generation (the clean
+    // baseline) leaves the plan Pending in the genuine store. Read as covering
+    // the request, it would close the document below its frozen sequence.
+    assert_eq!(
+        store.checkpoint_ack(document, baseline).unwrap(),
+        DocumentCloseReadiness::Pending { requested }
+    );
+    assert_eq!(
+        close_projection(&model, &store, document, projection),
+        before_ack
+    );
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let stale_ack = buggy.successors("AckCheckpoint", &before_ack)[0].clone();
+    assert_eq!(stale_ack["checkpoint_seq"], before_ack["checkpoint_seq"]);
+    assert_eq!(admits(&model, &before_ack, &stale_ack), None);
+    let closed_short = buggy.successors("CommitClose", &stale_ack)[0].clone();
+    assert!(!model.check_invariant("NoSilentLoss", &closed_short));
+
     assert_eq!(
         store.checkpoint_ack(document, requested).unwrap(),
         DocumentCloseReadiness::Ready { requested }

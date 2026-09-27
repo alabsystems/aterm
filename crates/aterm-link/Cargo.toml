@@ -44,6 +44,13 @@ publish = false
 # and a crate outside the workspace records only what its dependants can reach.)
 # `tests/two_nodes_sealed.rs` is the one thing that turns it on.
 sealed = ["astream-broker/aead"]
+# Development seams (`aterm_types::dev_seam!`) in an optimized build: `ATERM_BIN`
+# (the binary `fabric on` installs), the bridge's and the notifier's fault
+# switches, `aterm fabric on`'s effect trace and mint fault, and the redirected
+# fabric root the tests run under. A debug build (every test) compiles them anyway;
+# the release cutter never enables this — aterm-release's buildplan pins it — so a
+# shipped `aterm fabric`/`aterm link` reads none of them.
+dev-seams = []
 
 [dependencies]
 # The bus. `cap` for the bound grant every fabric principal attaches with; `aead`

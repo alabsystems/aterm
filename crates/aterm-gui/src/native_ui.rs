@@ -8,11 +8,6 @@
 //! serialization from that one description.  Apps therefore cannot independently
 //! author five subtly different versions of a switch or button.
 
-#![allow(
-    dead_code,
-    reason = "native tab-app migration foundation; consumers land with the tab host"
-)]
-
 use std::fmt;
 use std::sync::Arc;
 
@@ -230,8 +225,6 @@ pub(crate) enum Length {
     /// Divide remaining space equally between all `Fill` siblings.
     #[default]
     Fill,
-    /// Use the control's semantic intrinsic size.
-    Intrinsic,
     /// A fixed logical-pixel length.
     Fixed(f32),
     /// A fraction of the parent's content extent, clamped to `0..=1`.
@@ -314,7 +307,7 @@ impl Layout {
 
 fn length_valid(length: Length) -> bool {
     match length {
-        Length::Fill | Length::Intrinsic => true,
+        Length::Fill => true,
         Length::Fixed(v) => v.is_finite() && v >= 0.0,
         Length::Fraction(v) => v.is_finite() && (0.0..=1.0).contains(&v),
     }
@@ -332,9 +325,13 @@ pub(crate) enum SemanticRole {
     TextField,
     RichText,
     TextViewport,
-    Link,
     Navigation,
     Status,
+    /// A SCROLLING LIST of entries (Settings ▸ Messages' log, design ruling
+    /// 264): a list with no pager, which a screen reader scrolls itself —
+    /// accesskit's `List` with its scroll actions, lowered to the same
+    /// `ScrollLines` the wheel and the arrow keys send.
+    List,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -360,6 +357,12 @@ pub(crate) struct ControlState {
     pub(crate) selected: bool,
     pub(crate) invalid: bool,
     pub(crate) busy: bool,
+    /// A DISCLOSURE control's state (design ruling 262): `Some(true)` while
+    /// what it discloses is open, `Some(false)` while it is closed, `None`
+    /// for a control that discloses nothing. A screen reader hears it as
+    /// expanded or collapsed — never as `selected` — and the painter draws the
+    /// button flush, with its trailing chevron (`›` closed, `⌄` open).
+    pub(crate) expanded: Option<bool>,
 }
 
 impl Default for ControlState {
@@ -373,6 +376,7 @@ impl Default for ControlState {
             selected: false,
             invalid: false,
             busy: false,
+            expanded: None,
         }
     }
 }
@@ -510,8 +514,6 @@ pub(crate) enum ButtonIcon {
     Back,
     Forward,
     Copy,
-    External,
-    Anchor,
     ChevronDown,
     Home,
     Modified,
@@ -521,7 +523,6 @@ pub(crate) enum ButtonIcon {
     Window,
     Keyboard,
     Terminal,
-    Performance,
     Security,
     Diagnostics,
     Update,
@@ -588,6 +589,28 @@ pub(crate) const TAB_COLOR_WHEEL_AUDIT: &str = "settings.tab-color.wheel";
 /// decorative, static composition (no action, not focusable) whose semantic
 /// label simply names the scenery for accessibility.
 pub(crate) const RAINBOW_BANNER_AUDIT: &str = "settings.home.rainbow";
+
+/// Settings ▸ Messages' SEVERITY MARK (design ruling 262): a paint-only custom
+/// node whose value is the wire's severity word (`error`, `warn`, `success`,
+/// `info`). It draws the band's own icon for it at the row text's cap height —
+/// ✕ in the danger red, ⚠ in the band's warn amber, ✓ in green, ℹ in the
+/// muted secondary — and, for an Error or a Warning, a 3 pt rail down the
+/// row's leading edge in the same hue. Decorative: the row's control says
+/// the severity in words.
+pub(crate) const MESSAGES_SEVERITY_AUDIT: &str = "settings.messages.severity";
+
+/// Settings ▸ Messages' HAIRLINE between rows in the log's one container
+/// (design ruling 262): a paint-only custom node, a 1 pt rule in the
+/// separator role across its rect.
+pub(crate) const MESSAGES_RULE_AUDIT: &str = "settings.messages.rule";
+
+/// Settings ▸ Messages' SCROLL INDICATOR (design ruling 264): the log is one
+/// scrolling list with no pager, and this paint-only custom node, laid over
+/// the log's card, is the sighted reader's cue that it scrolls and where the
+/// view is — a thin rounded thumb down the card's trailing edge. Its value is
+/// `first,shown,total` in entries. Decorative: the list itself is the
+/// screen reader's scrolling surface ([`SemanticRole::List`]).
+pub(crate) const MESSAGES_SCROLL_AUDIT: &str = "settings.messages.scroll";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 
@@ -808,6 +831,24 @@ pub(crate) fn text_field_x_for_byte(
         + crate::tray_raster::ui_text_width(&text[geometry.visible.start..byte], text_px)
 }
 
+fn text_field_caret_rect(
+    input: &crate::native_text_input::TextInputProjection,
+    geometry: &TextFieldGeometry,
+    rect: LogicalRect,
+    text_px: f32,
+) -> LogicalRect {
+    let caret = input
+        .selection
+        .head
+        .clamp(geometry.visible.start, geometry.visible.end);
+    let x = if input.text.is_empty() {
+        geometry.text_x
+    } else {
+        text_field_x_for_byte(&input.text, geometry, caret, text_px)
+    };
+    LogicalRect::new(x, rect.y + 7.0, 1.0, (rect.height - 14.0).max(1.0))
+}
+
 fn semantic_text(value: &SemanticValue) -> &str {
     match value {
         SemanticValue::Text(value) => value,
@@ -898,6 +939,7 @@ pub(crate) struct TextViewportSpec {
     /// paint path.
     pub(crate) projection: Option<crate::native_editor::EditorViewportProjection>,
     pub(crate) preedit: String,
+    pub(crate) preedit_caret: Option<usize>,
     /// Bounded paint string shown in the footer.
     pub(crate) status: Option<String>,
     /// Complete status value announced by accessibility. This is deliberately
@@ -905,6 +947,8 @@ pub(crate) struct TextViewportSpec {
     /// diagnostic before it reaches the semantic tree.
     pub(crate) semantic_status: Option<String>,
     pub(crate) minibuffer: Option<String>,
+    /// Caret byte in the displayed minibuffer label; absent for prefix HUDs.
+    pub(crate) minibuffer_caret: Option<usize>,
     pub(crate) cursor_label: Option<String>,
     pub(crate) dirty: bool,
     pub(crate) saving: bool,
@@ -929,6 +973,66 @@ pub(crate) struct TextViewportGeometry {
 
 pub(crate) fn text_viewport_geometry(rect: LogicalRect) -> TextViewportGeometry {
     text_viewport_geometry_at_scale(rect, crate::native_appearance::text_scale())
+}
+
+fn editor_caret_rect(
+    geometry: &TextViewportGeometry,
+    row: usize,
+    line: &crate::native_editor::EditorViewportLine,
+    byte: usize,
+) -> LogicalRect {
+    let col = crate::native_editor::editor_display_column(&line.text, byte, line.column_start);
+    LogicalRect::new(
+        geometry.text_x + col as f32 * geometry.cell_w,
+        geometry.body_y + row as f32 * geometry.line_h + 2.0,
+        1.0,
+        geometry.line_h - 4.0,
+    )
+}
+
+/// Primary document composition follows the platform's selected marked-text
+/// position. The committed caret still supplies the painted preedit origin.
+fn editor_composition_caret_rect(mut caret: LogicalRect, spec: &TextViewportSpec) -> LogicalRect {
+    if !spec.preedit.is_empty() {
+        let byte = grapheme_boundary_at_or_before(
+            &spec.preedit,
+            spec.preedit_caret
+                .unwrap_or(spec.preedit.len())
+                .min(spec.preedit.len()),
+        );
+        let prefix = spec.preedit[..byte].replace(['\r', '\n'], "↵");
+        let size = native_type_px(crate::type_scale::TypeStep::Secondary).get();
+        caret.x += 2.0
+            + crate::tray_raster::measure_text(&prefix, size, crate::widget::TextWeight::Regular);
+    }
+    caret
+}
+
+/// The append-only minibuffer caret is already mapped into the painted label;
+/// a shortcut HUD/status has no input caret and therefore cannot claim it.
+fn editor_minibuffer_caret_rect(
+    spec: &TextViewportSpec,
+    rect: LogicalRect,
+    geometry: &TextViewportGeometry,
+) -> Option<LogicalRect> {
+    let label = spec.minibuffer.as_deref()?;
+    let byte = grapheme_boundary_at_or_before(label, spec.minibuffer_caret?.min(label.len()));
+    let caption = native_type_px(crate::type_scale::TypeStep::Caption).get();
+    let footer_y = geometry.body_y + geometry.body_h;
+    let baseline = crate::tray_raster::row_baseline(footer_y, geometry.footer_h, caption);
+    let x = rect.x
+        + 72.0
+        + crate::tray_raster::measure_text(
+            &label[..byte],
+            caption,
+            crate::widget::TextWeight::Regular,
+        );
+    LogicalRect::new(x, baseline - caption, 1.0, caption + 2.0).intersect(LogicalRect::new(
+        rect.x + 72.0,
+        footer_y,
+        (rect.width - 72.0).max(0.0),
+        geometry.footer_h,
+    ))
 }
 
 /// The editor rect's fixed chrome bands and text metre, at 1×. These are the
@@ -1120,10 +1224,6 @@ const MINIMUM_EDITOR_DOCUMENT_ROWS: usize = 6;
 /// Exact editor paint rectangle derived from the same responsive shell metrics
 /// consumed by `EditorApp::view`. The host uses this before reducer input so
 /// caret reveal and the renderer share one row-capacity truth.
-pub(crate) fn editor_text_viewport_rect(viewport: LogicalRect) -> LogicalRect {
-    editor_text_viewport_rect_with_palette(viewport, 0)
-}
-
 pub(crate) fn editor_text_viewport_rect_with_palette(
     viewport: LogicalRect,
     palette_candidates: usize,
@@ -1159,10 +1259,6 @@ fn editor_text_viewport_rect_at_scale(
     )
 }
 
-pub(crate) fn editor_visible_line_capacity(viewport: LogicalRect) -> usize {
-    editor_visible_line_capacity_at_scale(viewport, crate::native_appearance::text_scale())
-}
-
 pub(crate) fn editor_visible_line_capacity_with_palette(
     viewport: LogicalRect,
     palette_candidates: usize,
@@ -1176,6 +1272,7 @@ pub(crate) fn editor_visible_line_capacity_with_palette(
         .clamp(1, 256)
 }
 
+#[cfg(test)]
 pub(crate) fn editor_visible_line_capacity_at_scale(
     viewport: LogicalRect,
     text_scale: f32,
@@ -1257,32 +1354,14 @@ pub(crate) enum UiContent {
 }
 
 impl UiContent {
-    fn intrinsic_size(&self) -> (f32, f32) {
-        let text_scale = crate::native_appearance::text_scale();
+    /// The control's description, where it authored one (ruling 267).
+    fn description(&self) -> Option<String> {
         match self {
-            Self::Group(_) => (0.0, 0.0),
-            Self::Text(TextSpec {
-                role: SemanticRole::Heading,
-                ..
-            }) => (160.0 * text_scale, 32.0 * text_scale),
-            Self::Text(_) => (120.0 * text_scale, 24.0 * text_scale),
-            Self::Button(_) => (96.0 * text_scale, (32.0 * text_scale).max(32.0)),
-            Self::Switch(_) | Self::Slider(_) | Self::TextField(_) => {
-                (240.0 * text_scale, (40.0 * text_scale).max(40.0))
-            }
-            Self::RichText(_) => (320.0 * text_scale, 80.0 * text_scale),
-            Self::MarkdownBlock(spec) => (
-                640.0 * text_scale,
-                if spec.estimated_height.is_finite() {
-                    (spec.estimated_height * text_scale).max(1.0)
-                } else {
-                    1.0
-                },
-            ),
-            Self::TextViewport(_) => (320.0 * text_scale, 200.0 * text_scale),
-            Self::SettingsPreview(_) => (320.0 * text_scale, 176.0 * text_scale),
-            Self::Custom(_) => (120.0 * text_scale, (40.0 * text_scale).max(40.0)),
+            Self::Button(control) => control.spec.description.clone(),
+            Self::Switch(control) => control.spec.description.clone(),
+            _ => None,
         }
+        .filter(|description| !description.trim().is_empty())
     }
 
     fn semantic(&self) -> SemanticProjection {
@@ -1455,6 +1534,7 @@ impl UiTree {
     /// control before any observer is compiled. Paint, hit testing,
     /// accessibility, and control inspection therefore see the same focus
     /// state even for controls authored by different native apps.
+    #[cfg(test)]
     pub(crate) fn apply_focus(mut self, focus: Option<&UiKey>) -> Self {
         self.apply_interaction(focus, None, None, true);
         self
@@ -1591,6 +1671,11 @@ pub(crate) struct SemanticNode {
     pub(crate) state: Option<ControlState>,
     pub(crate) action: Option<ActionId>,
     pub(crate) audit_id: Option<&'static str>,
+    /// A control's DESCRIPTION — what a screen reader says after its name
+    /// (`Error, CI, 3 minutes ago` on a Messages row). It rode the paint node
+    /// only, so no observer saw it (design ruling 267): every observer —
+    /// the accessibility projection and `inspect … tree` — reads it here.
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1617,6 +1702,61 @@ pub(crate) struct CompiledUi {
 }
 
 impl CompiledUi {
+    /// The focused input's visible caret, in this retained leaf's logical
+    /// pixels. Uses the same geometry as paint; a clipped or unfocused caret
+    /// cannot anchor an OS candidate window over unrelated content.
+    pub(crate) fn ime_caret_rect(&self) -> Option<LogicalRect> {
+        self.paint.iter().rev().find_map(|node| {
+            let caret = match &node.content {
+                UiContent::TextField(control) if control.state.focused && control.state.enabled => {
+                    let input = control.spec.input.as_ref()?;
+                    let size = native_type_px(crate::type_scale::TypeStep::Secondary).get();
+                    let geometry = text_field_geometry(control, node.rect, size);
+                    text_field_caret_rect(input, &geometry, node.rect, size).intersect(
+                        LogicalRect::new(
+                            geometry.text_x,
+                            node.rect.y + 2.0,
+                            (geometry.text_right - geometry.text_x).max(0.0),
+                            (node.rect.height - 4.0).max(0.0),
+                        ),
+                    )?
+                }
+                UiContent::TextViewport(spec) if spec.focused => {
+                    let geometry = text_viewport_geometry(node.rect);
+                    if spec.minibuffer_caret.is_some() {
+                        return editor_minibuffer_caret_rect(spec, node.rect, &geometry)?
+                            .intersect(node.clip)?
+                            .intersect(self.bounds);
+                    }
+                    let projection = spec.projection.as_ref()?;
+                    let (row, line, byte) =
+                        projection
+                            .lines
+                            .iter()
+                            .enumerate()
+                            .find_map(|(row, line)| {
+                                line.carets
+                                    .iter()
+                                    .find(|(_, primary)| *primary)
+                                    .map(|(byte, _)| (row, line, *byte))
+                            })?;
+                    editor_composition_caret_rect(
+                        editor_caret_rect(&geometry, row, line, byte),
+                        spec,
+                    )
+                    .intersect(LogicalRect::new(
+                        node.rect.x,
+                        geometry.body_y,
+                        node.rect.width,
+                        geometry.body_h,
+                    ))?
+                }
+                _ => return None,
+            };
+            caret.intersect(node.clip)?.intersect(self.bounds)
+        })
+    }
+
     /// Topmost enabled control at the point, matching paint order.
     pub(crate) fn hit_test(&self, x: f32, y: f32) -> Option<&HitRegion> {
         self.hits.iter().rev().find(|hit| hit.rect.contains(x, y))
@@ -1993,6 +2133,7 @@ impl CompiledUi {
     /// [`crate::App::chrome_palette_theme`]) must call
     /// [`Self::tray_with_chrome`] so the Settings preview keeps showing real
     /// terminal colors on the forced chrome.
+    #[cfg(test)]
     pub(crate) fn tray(
         &self,
         theme: aterm_render::Theme,
@@ -2156,9 +2297,11 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
     spec.document_key.hash(hash);
     spec.selectable.hash(hash);
     spec.preedit.hash(hash);
+    spec.preedit_caret.hash(hash);
     spec.status.hash(hash);
     spec.semantic_status.hash(hash);
     spec.minibuffer.hash(hash);
+    spec.minibuffer_caret.hash(hash);
     spec.cursor_label.hash(hash);
     spec.dirty.hash(hash);
     spec.saving.hash(hash);
@@ -2440,7 +2583,6 @@ fn paint_badge(
         cy,
         r: 3.5,
         color: crate::widget::rgba(roles.danger, 255),
-        breathe: false,
     });
 }
 
@@ -2514,6 +2656,8 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 available,
             ))
         }
+        // A plain switch paints no word (design ruling 262).
+        UiContent::Switch(control) if control.style == StyleRef::Quiet => None,
         UiContent::Switch(control) => {
             let text = if matches!(control.value, SemanticValue::Bool(true)) {
                 "On"
@@ -3006,6 +3150,9 @@ fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate:
         // forcing route names to ellipsize in a 320-point host.
         SemanticRole::Heading if style == StyleRef::Plain => (TypeStep::Body, TextFace::UiBold),
         SemanticRole::Heading => (TypeStep::Title, TextFace::UiBold),
+        // Settings ▸ Messages' technical details (design ruling 262): small
+        // monospace, secondary — a status-sized code line.
+        SemanticRole::Status if style == StyleRef::Code => (TypeStep::Caption, TextFace::Mono),
         _ if style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
         SemanticRole::Status if style == StyleRef::Primary => (TypeStep::Body, TextFace::Ui),
         SemanticRole::Status => (TypeStep::Caption, TextFace::Ui),
@@ -3035,7 +3182,6 @@ fn paint_compiled_node(
                     h: rect.height,
                     radius: 0.0,
                     fill: rgba(roles.surface, 255),
-                    blur: false,
                 });
                 // The Settings surface glows like the terminal it configures:
                 // a dim diagonal spectrum wash over the whole canvas (the
@@ -3063,7 +3209,6 @@ fn paint_compiled_node(
                     h: rect.height,
                     radius: 0.0,
                     fill: rgba(roles.elevated, 245),
-                    blur: false,
                 });
                 prims.push(DrawPrim::Stroke {
                     x: (rect.right() - 1.0).max(rect.x),
@@ -3094,7 +3239,6 @@ fn paint_compiled_node(
                         },
                         255,
                     ),
-                    blur: false,
                 });
                 prims.push(DrawPrim::Stroke {
                     x: rect.x + 0.5,
@@ -3112,7 +3256,6 @@ fn paint_compiled_node(
                     h: 1.0,
                     radius: 0.5,
                     fill: rgba(roles.text_primary, 14),
-                    blur: false,
                 });
             } else if spec.style == StyleRef::Code {
                 // A terminal/editor canvas should read as a working surface
@@ -3126,7 +3269,6 @@ fn paint_compiled_node(
                     h: rect.height,
                     radius: 10.0,
                     fill: rgba(mix_rgb(roles.surface, roles.elevated, 0.12), 255),
-                    blur: false,
                 });
                 prims.push(DrawPrim::Stroke {
                     x: rect.x + 0.5,
@@ -3147,6 +3289,7 @@ fn paint_compiled_node(
                 }
                 SemanticRole::Heading if spec.style == StyleRef::Accent => roles.accent,
                 SemanticRole::Heading => roles.text_primary,
+                SemanticRole::Status if spec.style == StyleRef::Code => readable_secondary(&roles),
                 _ if spec.style == StyleRef::Code => roles.text_primary,
                 SemanticRole::Status if spec.style == StyleRef::Success => roles.success,
                 SemanticRole::Status if spec.style == StyleRef::Primary => roles.text_primary,
@@ -3164,6 +3307,11 @@ fn paint_compiled_node(
                 face,
                 rgba(color, 255),
             ));
+        }
+        UiContent::Button(control)
+            if control.state.expanded.is_some() && control.style == StyleRef::Plain =>
+        {
+            paint_disclosure_button(prims, rect, control, &roles);
         }
         UiContent::Button(control) => {
             let primary = control.style == StyleRef::Primary;
@@ -3248,7 +3396,6 @@ fn paint_compiled_node(
                     h: rect.height,
                     radius: 8.0,
                     fill: rgba(fill, if quiet { 72 } else { 255 }),
-                    blur: false,
                 });
             }
             if primary
@@ -3297,7 +3444,6 @@ fn paint_compiled_node(
                     h: (rect.height - 8.0).max(0.0),
                     radius: 2.0,
                     fill: rgba(roles.accent, 255),
-                    blur: false,
                 });
             }
             let color = if nav_selected {
@@ -3412,7 +3558,25 @@ fn paint_compiled_node(
             }
         }
         UiContent::Switch(control) => {
-            paint_control_surface(prims, rect, control.state, roles);
+            // A PLAIN switch (`StyleRef::Quiet`, design ruling 262): the track and
+            // the thumb alone, flush right in its slot — no boxed surface and no
+            // `On` word beside it, a focus ring only when the keyboard is on it.
+            let plain = control.style == StyleRef::Quiet;
+            if plain {
+                if control.state.focus_visible {
+                    prims.push(DrawPrim::Stroke {
+                        x: rect.x + 0.5,
+                        y: rect.y + 0.5,
+                        w: (rect.width - 1.0).max(0.0),
+                        h: (rect.height - 1.0).max(0.0),
+                        radius: 7.0,
+                        width: 2.0,
+                        color: rgba(roles.accent, 255),
+                    });
+                }
+            } else {
+                paint_control_surface(prims, rect, control.state, roles);
+            }
             let on = matches!(control.value, SemanticValue::Bool(true));
             let enabled = control.state.enabled;
             let track_w = 42.0_f32.min((rect.width - 8.0).max(0.0));
@@ -3460,9 +3624,11 @@ fn paint_compiled_node(
                     },
                     if enabled { 255 } else { 170 },
                 ),
-                breathe: false,
             });
             let size = native_type_px(TypeStep::Secondary);
+            if plain {
+                return;
+            }
             prims.push(text_prim(
                 rect.x + 10.0,
                 row_baseline(rect.y, rect.height, size.get()),
@@ -3547,7 +3713,6 @@ fn paint_compiled_node(
                         h: (rect.height - 12.0).max(1.0),
                         radius: 3.0,
                         fill: rgba(roles.accent, 82),
-                        blur: false,
                     });
                 }
             }
@@ -3593,20 +3758,12 @@ fn paint_compiled_node(
                         });
                     }
                 }
-                let caret = input
-                    .selection
-                    .head
-                    .clamp(geometry.visible.start, geometry.visible.end);
-                let caret_x = if input.text.is_empty() {
-                    geometry.text_x
-                } else {
-                    text_field_x_for_byte(&input.text, &geometry, caret, size.get())
-                };
+                let caret = text_field_caret_rect(input, &geometry, rect, size.get());
                 prims.push(DrawPrim::Stroke {
-                    x: caret_x,
-                    y: rect.y + 7.0,
-                    w: 1.0,
-                    h: (rect.height - 14.0).max(1.0),
+                    x: caret.x,
+                    y: caret.y,
+                    w: caret.width,
+                    h: caret.height,
                     radius: 0.0,
                     width: 1.0,
                     color: rgba(roles.accent, 255),
@@ -3623,7 +3780,6 @@ fn paint_compiled_node(
                     h: TEXT_FIELD_SWATCH_SIZE,
                     radius: 6.0,
                     fill: rgba(color, 255),
-                    blur: false,
                 });
                 prims.push(DrawPrim::Stroke {
                     x: x + 0.5,
@@ -3668,6 +3824,25 @@ fn paint_compiled_node(
             // TWO custom nodes carry a raster lowering; every other custom node
             // keeps the plain label projection below. The rainbow banner is
             // pure static decoration — its semantics live entirely on the node.
+            if spec.audit_id == MESSAGES_SEVERITY_AUDIT {
+                paint_messages_severity(prims, rect, spec.value.as_deref(), &roles);
+                return;
+            }
+            if spec.audit_id == MESSAGES_SCROLL_AUDIT {
+                paint_messages_scroll(prims, rect, spec.value.as_deref(), &roles);
+                return;
+            }
+            if spec.audit_id == MESSAGES_RULE_AUDIT {
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: rect.y + (rect.height - 1.0).max(0.0) / 2.0,
+                    w: rect.width,
+                    h: 1.0,
+                    radius: 0.0,
+                    fill: rgba(roles.separator, 200),
+                });
+                return;
+            }
             if spec.audit_id == RAINBOW_BANNER_AUDIT {
                 let (sky, rim) = rainbow_banner_sky(&roles);
                 crate::settings::paint_rainbow_banner(
@@ -3711,14 +3886,12 @@ fn paint_compiled_node(
                         cy: my,
                         r: 7.0,
                         color: rgba(ring, 255),
-                        breathe: false,
                     });
                     prims.push(crate::widget::DrawPrim::Dot {
                         cx: mx,
                         cy: my,
                         r: 5.0,
                         color: rgba(rgb, 255),
-                        breathe: false,
                     });
                 }
                 return;
@@ -3869,7 +4042,6 @@ fn paint_button_icon(
         h,
         radius,
         fill: rgba(color, 220),
-        blur: false,
     };
     let segment = |x1: f32, y1: f32, x2: f32, y2: f32| DrawPrim::Line {
         x1,
@@ -3894,19 +4066,6 @@ fn paint_button_icon(
             prims.push(outline(cx - 8.0, cy - 8.0, 11.0, 12.0, 2.0));
             prims.push(outline(cx - 3.0, cy - 3.0, 11.0, 12.0, 2.0));
         }
-        ButtonIcon::External => {
-            prims.push(outline(cx - 8.0, cy - 5.0, 13.0, 13.0, 2.0));
-            prims.push(line(cx, cy - 8.0, 8.0, 1.0));
-            prims.push(line(cx + 7.0, cy - 8.0, 1.0, 8.0));
-            prims.push(line(cx - 1.0, cy - 1.0, 8.0, 1.0));
-        }
-        ButtonIcon::Anchor => {
-            prims.push(outline(cx - 3.0, cy - 8.0, 6.0, 6.0, 3.0));
-            prims.push(line(cx, cy - 2.0, 1.0, 10.0));
-            prims.push(line(cx - 7.0, cy + 2.0, 1.0, 5.0));
-            prims.push(line(cx + 7.0, cy + 2.0, 1.0, 5.0));
-            prims.push(line(cx - 7.0, cy + 7.0, 14.0, 1.0));
-        }
         ButtonIcon::ChevronDown => {
             // A compact filled disclosure triangle. The former disconnected
             // one-pixel strokes read as an ellipsis after device scaling; three
@@ -3928,7 +4087,6 @@ fn paint_button_icon(
                 cy,
                 r: 2.0,
                 color: rgba(color, 240),
-                breathe: false,
             });
         }
         ButtonIcon::Appearance => prims.push(DrawPrim::Ring {
@@ -3966,7 +4124,6 @@ fn paint_button_icon(
                     cy: cy - 2.0,
                     r: 1.1,
                     color: rgba(color, 230),
-                    breathe: false,
                 });
             }
             prims.push(line(cx - 5.0, cy + 3.0, 10.0, 1.0));
@@ -3975,11 +4132,6 @@ fn paint_button_icon(
             prims.push(outline(cx - 9.0, cy - 7.0, 18.0, 14.0, 2.0));
             prims.push(line(cx - 5.0, cy - 2.0, 4.0, 1.0));
             prims.push(line(cx + 1.0, cy + 3.0, 5.0, 1.0));
-        }
-        ButtonIcon::Performance => {
-            prims.push(block(cx - 7.0, cy + 1.0, 3.0, 6.0, 1.0));
-            prims.push(block(cx - 1.5, cy - 3.0, 3.0, 10.0, 1.0));
-            prims.push(block(cx + 4.0, cy - 7.0, 3.0, 14.0, 1.0));
         }
         ButtonIcon::Security => {
             prims.push(outline(cx - 7.0, cy - 1.0, 14.0, 9.0, 2.0));
@@ -3993,7 +4145,6 @@ fn paint_button_icon(
                     cy,
                     r: 2.0,
                     color: rgba(color, 230),
-                    breathe: false,
                 });
             }
         }
@@ -4022,7 +4173,6 @@ fn paint_button_icon(
                 cy: cy - 4.0,
                 r: 1.2,
                 color: rgba(color, 240),
-                breathe: false,
             });
             prims.push(line(cx, cy, 1.0, 6.0));
         }
@@ -4048,7 +4198,6 @@ fn paint_markdown_block(
             h: rect.height,
             radius: 7.0,
             fill: rgba(mix_rgb(roles.surface, roles.accent, 0.18), 210),
-            blur: false,
         });
     }
 
@@ -4120,7 +4269,6 @@ fn paint_markdown_block(
                 h: rect.height,
                 radius: 8.0,
                 fill: rgba(mix_rgb(roles.elevated, roles.accent, 0.06), 225),
-                blur: false,
             });
             prims.push(DrawPrim::Panel {
                 x: rect.x,
@@ -4129,7 +4277,6 @@ fn paint_markdown_block(
                 h: (rect.height - 4.0).max(0.0),
                 radius: 1.5,
                 fill: rgba(roles.accent, 220),
-                blur: false,
             });
             text_x += 18.0;
             text_y += 8.0;
@@ -4151,7 +4298,6 @@ fn paint_markdown_block(
                 h: rect.height,
                 radius: 9.0,
                 fill: rgba(mix_rgb(roles.elevated, roles.surface, 0.20), 255),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x: rect.x + 0.5,
@@ -4198,7 +4344,6 @@ fn paint_markdown_block(
                 h: rect.height,
                 radius: 8.0,
                 fill: rgba(roles.elevated, 245),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x: rect.x + 0.5,
@@ -4465,7 +4610,6 @@ fn paint_text_viewport(
         h: rect.height,
         radius: 10.0,
         fill: rgba(roles.surface, 255),
-        blur: false,
     });
     if rect.width <= 1.0 || rect.height <= 1.0 {
         return;
@@ -4489,7 +4633,6 @@ fn paint_text_viewport(
         h: header_h,
         radius: 10.0,
         fill: rgba(roles.elevated, 255),
-        blur: false,
     });
     prims.push(DrawPrim::Panel {
         x: rect.x,
@@ -4498,7 +4641,6 @@ fn paint_text_viewport(
         h: body_h,
         radius: 0.0,
         fill: rgba(mix_rgb(roles.surface, roles.elevated, 0.52), 255),
-        blur: false,
     });
     for y in [body_y, footer_y] {
         prims.push(DrawPrim::Stroke {
@@ -4597,7 +4739,6 @@ fn paint_text_viewport(
                     h: line_h,
                     radius: 0.0,
                     fill: rgba(roles.accent, 18),
-                    blur: false,
                 });
             }
             for selection in &line.selections {
@@ -4631,7 +4772,6 @@ fn paint_text_viewport(
                     h: line_h - 2.0,
                     radius: 2.0,
                     fill: rgba(roles.accent, if selection.primary { 86 } else { 54 }),
-                    blur: false,
                 });
             }
 
@@ -4657,17 +4797,18 @@ fn paint_text_viewport(
             );
 
             for (byte, primary) in &line.carets {
-                let col = crate::native_editor::editor_display_column(
-                    &line.text,
-                    *byte,
-                    line.column_start,
-                );
-                let x = text_x + col as f32 * cell_w;
+                let base_caret = editor_caret_rect(&geometry, row, line, *byte);
+                let caret = if *primary {
+                    editor_composition_caret_rect(base_caret, spec)
+                } else {
+                    base_caret
+                };
+                let x = base_caret.x;
                 prims.push(DrawPrim::Stroke {
-                    x,
-                    y: y + 2.0,
-                    w: 1.0,
-                    h: line_h - 4.0,
+                    x: caret.x,
+                    y: caret.y,
+                    w: caret.width,
+                    h: caret.height,
                     radius: 0.0,
                     width: 1.0,
                     color: rgba(
@@ -4681,9 +4822,13 @@ fn paint_text_viewport(
                 });
                 if *primary && !spec.preedit.is_empty() {
                     let preedit = spec.preedit.replace(['\r', '\n'], "↵");
-                    let preedit_columns =
+                    // The marked range covers complete display cells even
+                    // when the current font cannot paint a cluster. The input
+                    // caret separately follows the text's painted advance.
+                    let preedit_width =
                         crate::native_editor::editor_display_column(&preedit, preedit.len(), 0)
-                            .max(1);
+                            .max(1) as f32
+                            * cell_w;
                     prims.push(text_prim(
                         x + 2.0,
                         row_baseline(y, line_h, secondary.get()),
@@ -4696,7 +4841,7 @@ fn paint_text_viewport(
                     prims.push(DrawPrim::Stroke {
                         x: x + 2.0,
                         y: y + line_h - 2.0,
-                        w: (preedit_columns as f32 * cell_w).max(2.0),
+                        w: preedit_width.max(2.0),
                         h: 1.0,
                         radius: 0.0,
                         width: 1.0,
@@ -4716,7 +4861,6 @@ fn paint_text_viewport(
             h: footer_h,
             radius: 10.0,
             fill: rgba(roles.elevated, 255),
-            blur: false,
         });
         prims.push(DrawPrim::Panel {
             x: rect.x + 10.0,
@@ -4725,7 +4869,6 @@ fn paint_text_viewport(
             h: 17.0,
             radius: 4.0,
             fill: rgba(roles.accent, 38),
-            blur: false,
         });
         prims.push(text_prim(
             rect.x + 17.0,
@@ -4758,6 +4901,17 @@ fn paint_text_viewport(
     }
 
     if spec.focused {
+        if let Some(caret) = editor_minibuffer_caret_rect(spec, rect, &geometry) {
+            prims.push(DrawPrim::Stroke {
+                x: caret.x,
+                y: caret.y,
+                w: caret.width,
+                h: caret.height,
+                radius: 0.0,
+                width: 1.0,
+                color: rgba(roles.accent, 255),
+            });
+        }
         prims.push(DrawPrim::Stroke {
             x: rect.x + 0.5,
             y: rect.y + 0.5,
@@ -4946,6 +5100,196 @@ fn control_rest_fill(roles: &crate::settings::Roles) -> [u8; 3] {
     mix_rgb(roles.elevated, roles.text_primary, 0.05)
 }
 
+/// A DISCLOSURE button ([`ControlState::expanded`], design ruling 262): a row
+/// of a list, not a raised control — flush at rest, a quiet wash under the
+/// pointer, pressed or open, the focus ring when the keyboard is on it, and a
+/// trailing chevron — `›` closed, `⌄` open — in the secondary ink. Its label
+/// (when it paints one) is the Secondary step, left.
+fn paint_disclosure_button(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    control: &Control<ButtonSpec>,
+    roles: &crate::settings::Roles,
+) {
+    use crate::tray_raster::row_baseline;
+    use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
+
+    let state = control.state;
+    let open = state.expanded == Some(true);
+    let wash = if state.pressed {
+        Some(0.14)
+    } else if state.hovered {
+        Some(0.08)
+    } else if open {
+        Some(0.05)
+    } else {
+        None
+    };
+    if let Some(t) = wash {
+        prims.push(DrawPrim::Panel {
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+            radius: 6.0,
+            fill: rgba(mix_rgb(roles.elevated, roles.text_primary, t), 255),
+        });
+    }
+    if state.focus_visible {
+        prims.push(DrawPrim::Stroke {
+            x: rect.x + 1.0,
+            y: rect.y + 1.0,
+            w: (rect.width - 2.0).max(0.0),
+            h: (rect.height - 2.0).max(0.0),
+            radius: 6.0,
+            width: 2.0,
+            color: rgba(roles.accent, 255),
+        });
+    }
+    let label = control
+        .spec
+        .visual_label
+        .as_ref()
+        .unwrap_or(&control.spec.label);
+    if !label.is_empty() {
+        let size = native_type_px(TypeStep::Secondary);
+        prims.push(text_prim(
+            rect.x + 10.0,
+            row_baseline(rect.y, rect.height, size.get()),
+            elide_text_label(
+                label,
+                (rect.width - 44.0).max(0.0),
+                size.get(),
+                TextFace::Ui,
+            ),
+            size,
+            TextWeight::Regular,
+            TextFace::Ui,
+            rgba(control_text_color(state, roles), 255),
+        ));
+    }
+    let ink = rgba(readable_secondary(roles), 235);
+    let (cx, cy) = (rect.right() - 16.0, rect.y + rect.height / 2.0);
+    let segment = |x1: f32, y1: f32, x2: f32, y2: f32| DrawPrim::Line {
+        x1,
+        y1,
+        x2,
+        y2,
+        width: 1.6,
+        color: ink,
+    };
+    if open {
+        prims.push(segment(cx - 4.5, cy - 2.25, cx, cy + 2.25));
+        prims.push(segment(cx, cy + 2.25, cx + 4.5, cy - 2.25));
+    } else {
+        prims.push(segment(cx - 2.25, cy - 4.5, cx + 2.25, cy));
+        prims.push(segment(cx + 2.25, cy, cx - 2.25, cy + 4.5));
+    }
+}
+
+/// Settings ▸ Messages' severity mark ([`MESSAGES_SEVERITY_AUDIT`]): the
+/// band's drawn icon at the Body step's cap height, centred in the rect after
+/// the rail's room, and the rail for an Error or a Warning. The node's value
+/// is `severity:glyph`: the ICON is the one the band draws for the row's
+/// glyph (`aterm v0.92.0 is ready` keeps its ✓, `aterm crashed last time`
+/// its ⚠ — ruling 263), the severity's own where the glyph has none; the
+/// COLOUR and the rail are always the severity's.
+/// Settings ▸ Messages' scroll thumb ([`MESSAGES_SCROLL_AUDIT`]): `value` is
+/// `first,shown,total` — the entries the view starts at and shows, of how
+/// many. A 3 pt rounded thumb down the rect's trailing edge, inset clear of
+/// the card's rounded corners, its length the share shown (never under
+/// 18 pt) and its place the share scrolled past. Nothing where every entry is
+/// shown.
+fn paint_messages_scroll(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    value: Option<&str>,
+    roles: &crate::settings::Roles,
+) {
+    use crate::widget::{DrawPrim, rgba};
+
+    let mut parts = value
+        .unwrap_or("")
+        .split(',')
+        .map(|part| part.trim().parse::<u32>().unwrap_or(0));
+    let (first, shown, total) = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    if total == 0 || shown >= total {
+        return;
+    }
+    let (first, shown, total) = (first as f32, shown as f32, total as f32);
+    let track_y = rect.y + 10.0;
+    let track_h = (rect.height - 20.0).max(0.0);
+    let thumb_h = (track_h * shown / total).max(18.0).min(track_h);
+    let scrolled = (first / (total - shown)).clamp(0.0, 1.0);
+    prims.push(DrawPrim::Panel {
+        x: rect.right() - 7.0,
+        y: (track_h - thumb_h).mul_add(scrolled, track_y),
+        w: 3.0,
+        h: thumb_h,
+        radius: 1.5,
+        fill: rgba(readable_secondary(roles), 120),
+    });
+}
+
+fn paint_messages_severity(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    value: Option<&str>,
+    roles: &crate::settings::Roles,
+) {
+    use crate::widget::{DrawPrim, rgba};
+
+    let value = value.unwrap_or("info");
+    let (severity, glyph) = value
+        .split_once(':')
+        .map_or((value, None), |(sev, rest)| (sev, rest.chars().next()));
+    let (icon, color, rail) = match severity {
+        "error" => (aterm_render::BandIcon::Error, roles.danger, true),
+        "warn" => (
+            aterm_render::BandIcon::Warn,
+            crate::chrome_band::warn_mark(roles.elevated),
+            true,
+        ),
+        "success" => (aterm_render::BandIcon::Success, roles.success, false),
+        _ => (
+            aterm_render::BandIcon::Info,
+            readable_secondary(roles),
+            false,
+        ),
+    };
+    let icon = glyph
+        .and_then(aterm_render::BandIcon::for_char)
+        .unwrap_or(icon);
+    if rail {
+        prims.push(DrawPrim::Panel {
+            x: rect.x,
+            y: rect.y + 3.0,
+            w: 3.0,
+            h: (rect.height - 6.0).max(0.0),
+            radius: 1.5,
+            fill: rgba(color, 255),
+        });
+    }
+    // The icon's square: the Body step's capital height reads at about 0.7
+    // of its pixel size; the icon's own raster fits its cap to 0.68 of the
+    // square, so a square of the step's size stands the mark as tall as the
+    // row's capitals.
+    let size = native_type_px(TypeStep::Body).get().round();
+    let x = rect.x + 3.0 + ((rect.width - 3.0 - size) / 2.0).max(0.0);
+    let y = rect.y + ((rect.height - size) / 2.0).max(0.0);
+    prims.push(DrawPrim::BandIcon {
+        x,
+        y,
+        size,
+        icon,
+        color: rgba(color, 255),
+    });
+}
+
 fn paint_control_surface(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -4974,7 +5318,6 @@ fn paint_control_surface(
             },
             255,
         ),
-        blur: false,
     });
     prims.push(DrawPrim::Stroke {
         x: rect.x + 0.5,
@@ -5208,6 +5551,7 @@ impl Compiler {
         // Runs BEFORE `content` moves into the paint node; `semantic()` clones
         // only the labels it needs.
         let projection = content.semantic();
+        let description = content.description();
         if paint_only && (projection.action.is_some() || projection.focusable) {
             return Err(CompileError::PaintOnlyAction(key));
         }
@@ -5235,6 +5579,7 @@ impl Compiler {
                 state: projection.state,
                 action: projection.action.clone(),
                 audit_id: projection.audit_id,
+                description,
             });
             if projection.focusable {
                 self.output.focus_order.push(key.clone());
@@ -5300,19 +5645,16 @@ fn layout_children(
     let mut fills = 0usize;
     let mut main_lengths = Vec::with_capacity(children.len());
     for child in children {
-        let (intrinsic_w, intrinsic_h) = child.content.intrinsic_size();
         let main = if is_row {
             child.layout.width
         } else {
             child.layout.height
         };
-        let intrinsic = if is_row { intrinsic_w } else { intrinsic_h };
         let value = match main {
             Length::Fill => {
                 fills += 1;
                 None
             }
-            Length::Intrinsic => Some(intrinsic),
             Length::Fixed(v) => Some(v),
             Length::Fraction(v) => Some(available * v),
         };
@@ -5331,14 +5673,12 @@ fn layout_children(
     let mut out = Vec::with_capacity(children.len());
     for (child, main) in children.iter().zip(main_lengths) {
         let main = main.unwrap_or(fill).max(0.0);
-        let (intrinsic_w, intrinsic_h) = child.content.intrinsic_size();
         let cross_length = if is_row {
             child.layout.height
         } else {
             child.layout.width
         };
-        let cross_intrinsic = if is_row { intrinsic_h } else { intrinsic_w };
-        let cross = resolve_length(cross_length, cross_extent, cross_intrinsic);
+        let cross = resolve_length(cross_length, cross_extent);
         let rect = if is_row {
             LogicalRect::new(cursor, content.y, main, cross)
         } else {
@@ -5354,9 +5694,8 @@ fn layout_children(
 }
 
 fn child_rect_overlay(child: &UiNode, content: LogicalRect) -> Result<LogicalRect, CompileError> {
-    let (intrinsic_w, intrinsic_h) = child.content.intrinsic_size();
-    let width = resolve_length(child.layout.width, content.width, intrinsic_w);
-    let height = resolve_length(child.layout.height, content.height, intrinsic_h);
+    let width = resolve_length(child.layout.width, content.width);
+    let height = resolve_length(child.layout.height, content.height);
     let rect = LogicalRect::new(content.x, content.y, width, height);
     if rect.is_valid() {
         Ok(rect)
@@ -5365,10 +5704,9 @@ fn child_rect_overlay(child: &UiNode, content: LogicalRect) -> Result<LogicalRec
     }
 }
 
-fn resolve_length(length: Length, available: f32, intrinsic: f32) -> f32 {
+fn resolve_length(length: Length, available: f32) -> f32 {
     match length {
         Length::Fill => available,
-        Length::Intrinsic => intrinsic.min(available),
         Length::Fixed(value) => value.min(available),
         Length::Fraction(value) => available * value,
     }
@@ -5378,6 +5716,50 @@ fn resolve_length(length: Length, available: f32, intrinsic: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE LOG'S MARK IS THE BAND'S ICON (rulings 262 and 263): the icon is
+    /// the row's own glyph's — `aterm v0.92.0 is ready` (Info, ✓) keeps its
+    /// check, `aterm crashed last time` (Error, ⚠) its triangle — with the
+    /// severity's colour and rail; a glyph with no drawn icon, and a value
+    /// with no glyph, fall back to the severity's own icon.
+    #[test]
+    fn the_log_mark_draws_the_rows_glyph_in_the_severitys_colour() {
+        use crate::widget::{DrawPrim, rgba};
+        use aterm_render::BandIcon;
+
+        let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
+        let mark = |value: &str| {
+            let mut prims = Vec::new();
+            paint_messages_severity(
+                &mut prims,
+                LogicalRect::new(0.0, 0.0, 24.0, 30.0),
+                Some(value),
+                &roles,
+            );
+            let rail = prims
+                .iter()
+                .any(|prim| matches!(prim, DrawPrim::Panel { .. }));
+            let icon = prims
+                .iter()
+                .find_map(|prim| match prim {
+                    DrawPrim::BandIcon { icon, color, .. } => Some((*icon, *color)),
+                    _ => None,
+                })
+                .expect("an icon");
+            (icon.0, icon.1, rail)
+        };
+        let muted = rgba(readable_secondary(&roles), 255);
+        let danger = rgba(roles.danger, 255);
+        assert_eq!(mark("info:\u{2713}"), (BandIcon::Success, muted, false));
+        assert_eq!(mark("error:\u{26a0}"), (BandIcon::Warn, danger, true));
+        assert_eq!(mark("info:\u{21e3}"), (BandIcon::Download, muted, false));
+        assert_eq!(mark("error:x"), (BandIcon::Error, danger, true), "no icon");
+        assert_eq!(mark("error"), (BandIcon::Error, danger, true), "no glyph");
+        assert_eq!(
+            mark("success:\u{2713}"),
+            (BandIcon::Success, rgba(roles.success, 255), false)
+        );
+    }
 
     /// The hero banner's sky survives a MID-TONE terminal theme.
     ///
@@ -6543,9 +6925,11 @@ mod tests {
                     ],
                 }),
                 preedit: "λ".to_string(),
+                preedit_caret: None,
                 status: Some("Saved".to_string()),
                 semantic_status: Some("Saved".to_string()),
                 minibuffer: None,
+                minibuffer_caret: None,
                 cursor_label: Some("Ln 41, Col 11".to_string()),
                 dirty: true,
                 saving: false,
@@ -6670,6 +7054,26 @@ mod tests {
             .unwrap();
         compiled.validate_parity().unwrap();
         let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+        let caret = compiled
+            .ime_caret_rect()
+            .expect("focused primary document caret");
+        assert!(
+            prims.iter().any(|prim| matches!(
+                prim,
+                DrawPrim::Stroke { x, y, w, h, .. }
+                    if (*x, *y, *w, *h) == (caret.x, caret.y, caret.width, caret.height)
+            )),
+            "editor IME anchor must be its painted primary caret"
+        );
+        let mut unfocused = compiled.clone();
+        let UiContent::TextViewport(spec) = &mut unfocused.paint[0].content else {
+            panic!("editor")
+        };
+        spec.focused = false;
+        assert!(unfocused.ime_caret_rect().is_none());
+        let mut clipped = compiled.clone();
+        clipped.paint[0].clip = LogicalRect::new(0.0, 0.0, 760.0, caret.y);
+        assert!(clipped.ime_caret_rect().is_none());
         assert!(prims.iter().any(
             |primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "let answer = 42;")
         ));
@@ -6701,6 +7105,101 @@ mod tests {
                 .hit_test(100.0, 100.0)
                 .map(|hit| hit.action.as_str()),
             Some("editor/focus-buffer")
+        );
+    }
+
+    #[test]
+    fn editor_ime_caret_tracks_document_composition_and_typed_minibuffer() {
+        use crate::widget::DrawPrim;
+        let bounds = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
+        let compile = |preedit_caret, minibuffer, minibuffer_caret| {
+            let mut tree = editor_viewport();
+            let UiContent::TextViewport(spec) = &mut tree.root.content else {
+                panic!("editor")
+            };
+            // The cold direct-view Mono stack has only the embedded face;
+            // uncovered CJK glyphs have no painted advance until coverage lands.
+            // Each tested interval includes a covered Latin glyph so movement
+            // remains a non-vacuous assertion without requiring host fonts.
+            spec.preedit = "e\u{301}日A本B".to_string();
+            spec.preedit_caret = preedit_caret;
+            spec.minibuffer = minibuffer;
+            spec.minibuffer_caret = minibuffer_caret;
+            tree.compile(bounds).unwrap()
+        };
+        let mut previous = None;
+        for byte in [0, 3, 7, 11] {
+            let compiled = compile(Some(byte), None, None);
+            let caret = compiled.ime_caret_rect().unwrap();
+            let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+            assert!(
+                prims.iter().any(|prim| matches!(prim,
+                    DrawPrim::Stroke { x, y, w, h, .. }
+                        if (*x, *y, *w, *h) == (caret.x, caret.y, caret.width, caret.height)
+                )),
+                "candidate caret must be painted at preedit byte {byte}"
+            );
+            if let Some(previous) = previous {
+                assert!(caret.x > previous);
+            }
+            previous = Some(caret.x);
+        }
+        assert_eq!(
+            compile(None, None, None).ime_caret_rect(),
+            compile(Some(11), None, None).ime_caret_rect()
+        );
+        let mut tree = editor_viewport();
+        let UiContent::TextViewport(spec) = &mut tree.root.content else {
+            panic!("editor")
+        };
+        spec.preedit = "e\u{301}日👩‍💻\n本".to_string();
+        spec.preedit_caret = Some("e\u{301}日👩‍💻\n".len());
+        let compiled = tree.compile(bounds).unwrap();
+        let caret = compiled.ime_caret_rect().unwrap();
+        let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+        let preedit_x = prims
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Text { x, s, .. } if s == "e\u{301}日👩‍💻↵本" => Some(*x),
+                _ => None,
+            })
+            .unwrap();
+        let advance = crate::tray_raster::measure_text(
+            "e\u{301}日👩‍💻↵",
+            native_type_px(crate::type_scale::TypeStep::Secondary).get(),
+            crate::widget::TextWeight::Regular,
+        );
+        assert!(
+            (caret.x - preedit_x - advance).abs() < 0.01,
+            "marked caret follows actual fallback-font advances"
+        );
+        let label = "I-search: λ日本Z".to_string();
+        let start = "I-search: λ".len();
+        let typed = compile(Some(3), Some(label.clone()), Some(start));
+        let footer = typed.ime_caret_rect().unwrap();
+        let end = compile(Some(3), Some(label.clone()), Some(label.len()))
+            .ime_caret_rect()
+            .unwrap();
+        assert!(end.x > footer.x);
+        let prims = typed.tray(aterm_render::Theme::default(), 13.0).prims;
+        assert!(prims.iter().any(|prim| matches!(prim,
+            DrawPrim::Stroke { x, y, w, h, .. }
+                if (*x, *y, *w, *h) == (footer.x, footer.y, footer.width, footer.height)
+        )));
+        let hud = compile(Some(3), Some("C-x …".to_string()), None);
+        assert_eq!(
+            hud.ime_caret_rect(),
+            compile(Some(3), None, None).ime_caret_rect()
+        );
+        assert!(
+            hud.ime_caret_rect().unwrap().y < footer.y,
+            "shortcut HUD is not a text input"
+        );
+        let mut clipped = typed;
+        clipped.paint[0].clip.height = footer.y;
+        assert!(
+            clipped.ime_caret_rect().is_none(),
+            "a hidden minibuffer cannot fall back to the document caret"
         );
     }
 
@@ -6792,9 +7291,11 @@ mod tests {
                 }],
             }),
             preedit: String::new(),
+            preedit_caret: None,
             status: None,
             semantic_status: None,
             minibuffer: None,
+            minibuffer_caret: None,
             cursor_label: None,
             dirty: false,
             saving: false,
@@ -6914,9 +7415,11 @@ mod tests {
                     }],
                 }),
                 preedit: preedit.to_string(),
+                preedit_caret: None,
                 status: None,
                 semantic_status: None,
                 minibuffer: None,
+                minibuffer_caret: None,
                 cursor_label: None,
                 dirty: false,
                 saving: false,
@@ -7008,6 +7511,21 @@ mod tests {
             SemanticValue::Text("aにz".to_string())
         );
         let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+        let caret = compiled.ime_caret_rect().expect("focused field caret");
+        assert!(
+            prims.iter().any(|prim| matches!(
+                prim,
+                DrawPrim::Stroke { x, y, w, h, .. }
+                    if (*x, *y, *w, *h) == (caret.x, caret.y, caret.width, caret.height)
+            )),
+            "IME anchor must be the painted composition caret"
+        );
+        let mut clipped = compiled.clone();
+        clipped.paint[0].clip = LogicalRect::new(0.0, 0.0, caret.x, 40.0);
+        assert!(
+            clipped.ime_caret_rect().is_none(),
+            "clipped caret cannot anchor IME"
+        );
         assert!(
             prims
                 .iter()
@@ -7187,8 +7705,6 @@ mod tests {
             ButtonIcon::Back,
             ButtonIcon::Forward,
             ButtonIcon::Copy,
-            ButtonIcon::External,
-            ButtonIcon::Anchor,
             ButtonIcon::ChevronDown,
             ButtonIcon::Home,
             ButtonIcon::Modified,
@@ -7198,7 +7714,6 @@ mod tests {
             ButtonIcon::Window,
             ButtonIcon::Keyboard,
             ButtonIcon::Terminal,
-            ButtonIcon::Performance,
             ButtonIcon::Security,
             ButtonIcon::Diagnostics,
             ButtonIcon::Update,
@@ -7475,9 +7990,11 @@ mod tests {
                 }],
             }),
             preedit: String::new(),
+            preedit_caret: None,
             status: None,
             semantic_status: None,
             minibuffer: None,
+            minibuffer_caret: None,
             cursor_label: None,
             dirty: false,
             saving: false,
@@ -7563,9 +8080,11 @@ mod tests {
                 }],
             }),
             preedit: String::new(),
+            preedit_caret: None,
             status: None,
             semantic_status: None,
             minibuffer: None,
+            minibuffer_caret: None,
             cursor_label: None,
             dirty: false,
             saving: false,
@@ -7629,9 +8148,11 @@ mod tests {
                 }],
             }),
             preedit: String::new(),
+            preedit_caret: None,
             status: None,
             semantic_status: None,
             minibuffer: None,
+            minibuffer_caret: None,
             cursor_label: None,
             dirty: false,
             saving: false,

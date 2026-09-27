@@ -462,7 +462,6 @@ pub(crate) fn bubble_tray(
             h: h + 2.0 * spread,
             radius: radius + spread,
             fill: rgba([0, 0, 0], sa(alpha)),
-            blur: false,
         });
     }
     // Body: an elevated surface, near-opaque so the tip never fights the terminal
@@ -474,7 +473,6 @@ pub(crate) fn bubble_tray(
         h,
         radius,
         fill: rgba(r.elevated, sa(0xFA)),
-        blur: false,
     });
     // A HAIRLINE rim in the separator role — enough to seat the bubble against a
     // same-luminance background without a full-perimeter accent ring.
@@ -495,7 +493,6 @@ pub(crate) fn bubble_tray(
         cy: p.badge_cy,
         r: p.badge_r,
         color: rgba(badge, sa(0xFF)),
-        breathe: false,
     });
     // The pictogram keeps the MONO face: it is glyph art, and the mono stack is the
     // one with the DejaVu coverage fallback behind it. The words take the native UI

@@ -52,7 +52,6 @@ impl AtermGpuTerminal {
     /// one bounded batch of staged lines into the store.
     // Why: both callers are wasm-only (they drive the GPU); native builds keep
     // the drain reachable via `drain_scrollback_backlog`.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) fn drain_compress_backlog_on_render(&mut self) {
         if let Some(bytes) = self.budget_share.pending_effective() {
             let _ = self.term.set_memory_budget(bytes);

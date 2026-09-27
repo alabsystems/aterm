@@ -5,7 +5,7 @@
 //! `claude` and `codex` are fetched from their vendors, authenticated by compiled anchors,
 //! and never wait on the ALab index. This module is the pure core — the table, the
 //! version ↔ build id map, the decision, the small durable records the lane keeps, and the
-//! window's head watch ([`watch`]).
+//! head watch ([`watch`]) the window runs — or, with no window open, one terminal session.
 //!
 //! The index keeps exactly one power over these programs: a signed yank (`policy`),
 //! which can deny the installed version but never supply bytes.
@@ -97,23 +97,24 @@ fn is_hex64(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The wording no line about a vendor-direct program may carry any more (design §1.7):
-/// the index re-pin, the index as its update source, and the index pin itself.
+/// The index-program words no line about a vendor-direct program may carry (design
+/// §1.7): the index pin itself and the index as its update source. This crate still
+/// prints both for index programs — `managed <build> — pinned by index <N>`
+/// (`state::managed`) and doctor's fix-line `… (updates arrive with the ALab index)` — so
+/// a vendor row routed through either renderer would say them. (The index-update era's
+/// "within about an hour" and "pinned by aterm's signed index" have no writer left in
+/// this crate and are not screened.)
 #[cfg(test)]
-pub(crate) const RETIRED_PHRASES: &[&str] = &[
-    "within about an hour",
-    "updates arrive with the ALab index",
-    "pinned by aterm's signed index",
-    "pinned by index",
-];
+pub(crate) const INDEX_PROGRAM_WORDS: &[&str] =
+    &["pinned by index", "updates arrive with the ALab index"];
 
-/// `Some(what)` when `line` carries a [`RETIRED_PHRASES`] entry or a 19-digit number — a
-/// vendor store id used as a label. A run right after `/` is a store directory in a path,
-/// which is where that id belongs.
+/// `Some(what)` when `line` carries an [`INDEX_PROGRAM_WORDS`] entry or a 19-digit number
+/// — a vendor store id used as a label. A run right after `/` is a store directory in a
+/// path, which is where that id belongs.
 #[cfg(test)]
 pub(crate) fn retired_wording(line: &str) -> Option<String> {
-    if let Some(phrase) = RETIRED_PHRASES.iter().find(|p| line.contains(*p)) {
-        return Some((*phrase).to_string());
+    if let Some(words) = INDEX_PROGRAM_WORDS.iter().find(|w| line.contains(*w)) {
+        return Some((*words).to_string());
     }
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -137,7 +138,9 @@ pub(crate) fn retired_wording(line: &str) -> Option<String> {
 mod wording_tests {
     use super::*;
 
-    /// The checker finds each retired phrase and a bare store id, and passes a store path.
+    /// The checker finds each index-program phrase and a bare store id and passes a
+    /// store path — the non-vacuity of every test that screens vendor lines with it —
+    /// and the display words render versions.
     #[test]
     fn the_retired_wording_checker_finds_labels_and_passes_paths() {
         let id = Version::parse("2.1.280").unwrap().build_id();
@@ -153,10 +156,10 @@ mod wording_tests {
             retired_wording(&format!("managed {id} — Anthropic latest")),
             Some(id.to_string())
         );
-        for phrase in RETIRED_PHRASES {
+        for words in INDEX_PROGRAM_WORDS {
             assert_eq!(
-                retired_wording(&format!("x {phrase} y")).as_deref(),
-                Some(*phrase)
+                retired_wording(&format!("managed 2.1.280 — x {words} y")).as_deref(),
+                Some(*words)
             );
         }
         assert_eq!(build_label(id), "2.1.280");

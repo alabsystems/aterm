@@ -242,7 +242,6 @@ pub struct NukeDraw {
     pub tint: u32,
 }
 
-const FLASH_CORE: u32 = 0x00FF_F6E0;
 const CAP_HOT: u32 = 0x00FF_A94A;
 const CAP_DUST: u32 = 0x008F_7668;
 const STEM_HOT: u32 = 0x00FF_C070;
@@ -258,12 +257,6 @@ const CORE_HOT: u32 = 0x00FF_E9B0;
 /// — the hero moment rendered washed-out tan instead of fire-lit).
 fn cool(t_ms: u64) -> f32 {
     aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 / 1600.0).clamp(0.0, 1.0))
-}
-
-/// The tier's flash-core tint, for the host's `0..FLASH_END_MS` crown.
-#[must_use]
-pub fn flash_core() -> u32 {
-    FLASH_CORE
 }
 
 /// Resolve one part at `t_ms`, or `None` when that part is not on screen yet

@@ -55,7 +55,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use aterm_containment::consent::{self, Folder};
+#[cfg(any(target_os = "macos", test))]
+use aterm_containment::consent;
+use aterm_containment::consent::Folder;
 
 /// Bound on the warm-up result queue.
 ///
@@ -81,8 +83,10 @@ const RESULT_QUEUE_CAP: usize = 16;
 pub(crate) enum ReadDirOutcome {
     /// The directory listed. Either it had an entry we could read, or it was
     /// empty — both mean the access was permitted.
+    #[cfg(any(target_os = "macos", test))]
     Listed,
     /// The listing failed with this raw errno.
+    #[cfg(any(target_os = "macos", test))]
     Failed(i32),
     /// The probe was deliberately NOT performed: a headless instance, a unit
     /// test, or an executable that does not resolve inside a `.app`. This is
@@ -104,26 +108,27 @@ pub(crate) enum WarmupRow {
     /// can stay here indefinitely, which is the honest thing for it to do.
     Asking,
     /// The listing succeeded from this process.
+    #[cfg(any(target_os = "macos", test))]
     Allowed,
     /// `EPERM(1)` — the TCC refusal. macOS is not asking again for this folder.
     Denied,
     /// Some other errno. Not a consent verdict; the folder may not exist, or
     /// the volume may be gone.
+    #[cfg(any(target_os = "macos", test))]
     Error,
 }
 
 impl WarmupRow {
-    /// The report spelling, which is also the panel spelling.
-    ///
-    /// PENDING CONSUMER: the Security panel (§3.4) and the `privacy` verb's
-    /// folder rows are the callers, and they land in the change after this one.
-    #[allow(dead_code)]
+    /// The report spelling, which is also the panel spelling: the `privacy`
+    /// verb's folder rows read it.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
             Self::Asking => "asking",
+            #[cfg(any(target_os = "macos", test))]
             Self::Allowed => "allowed",
             Self::Denied => "denied",
+            #[cfg(any(target_os = "macos", test))]
             Self::Error => "error",
         }
     }
@@ -148,12 +153,19 @@ impl WarmupRow {
 /// that distinction, so it stays one rule in one place rather than a variant
 /// match in this module.
 pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> WarmupRow {
+    // Off macOS every answer is `Refused`, whichever folder asked.
+    #[cfg(not(any(target_os = "macos", test)))]
+    let _ = folder;
     match outcome {
+        #[cfg(any(target_os = "macos", test))]
         ReadDirOutcome::Listed => WarmupRow::Allowed,
+        #[cfg(any(target_os = "macos", test))]
         ReadDirOutcome::Failed(consent::ERRNO_EPERM) => WarmupRow::Denied,
+        #[cfg(any(target_os = "macos", test))]
         ReadDirOutcome::Failed(consent::ERRNO_ENOENT) if folder.absent_means_allowed() => {
             WarmupRow::Allowed
         }
+        #[cfg(any(target_os = "macos", test))]
         ReadDirOutcome::Failed(_) => WarmupRow::Error,
         ReadDirOutcome::Refused => WarmupRow::Unknown,
     }
@@ -211,7 +223,7 @@ impl WarmupProbe {
     }
 
     /// Whether this instance's arm can reach the filesystem at all.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn is_live(self) -> bool {
         self.live
     }
@@ -307,6 +319,25 @@ pub(crate) enum StartOutcome {
     SpawnFailed,
 }
 
+impl StartOutcome {
+    /// Why a confirmed press started nothing, in the owner's words — `None`
+    /// when a worker is walking, this press's or one already out.
+    pub(crate) const fn refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Started | Self::AlreadyLive => None,
+            Self::Refused => Some(
+                "the privacy checks or the on-request warm-up are off, or this instance has no \
+                 window to ask in",
+            ),
+            Self::NoFolders => Some(
+                "no folder in [privacy] warmup_folders resolved to a path (an unknown name, or \
+                 no home folder)",
+            ),
+            Self::SpawnFailed => Some("macOS refused the thread it needs"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The instance's warm-up state
 // ---------------------------------------------------------------------------
@@ -365,10 +396,8 @@ impl WarmupState {
         Self::new(true)
     }
 
-    /// Whether this instance's probe can reach the filesystem. The panel reads
-    /// it to say "this instance is not looking" rather than "nothing is
-    /// granted" — PENDING CONSUMER, like [`WarmupRow::as_str`].
-    #[allow(dead_code)]
+    /// Whether this instance's probe can reach the filesystem.
+    #[cfg(test)]
     pub(crate) const fn probe_is_live(&self) -> bool {
         self.probe.is_live()
     }
@@ -530,7 +559,7 @@ impl WarmupState {
     /// gate can be driven from a unit test that must not spawn anything. Test
     /// seam only: production arms the hold through [`Self::start`], and only
     /// alongside a real worker.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn arm_hold_for_test(&mut self, started_at: Instant, hold_cap: Duration) {
         self.generation = self.generation.wrapping_add(1);
         self.live = Some(LivePass {
@@ -1102,7 +1131,6 @@ mod tests {
             !ApplyMode::Immediate.is_automatic(),
             "an explicit `aterm ctl update apply` is the user asking for the freeze"
         );
-        assert!(!ApplyMode::CleanQuit.is_automatic());
         // The hold is consulted through exactly one App method — the ladder's
         // `consent_warmup` fact — and every call site sits under `is_automatic()`,
         // like the keystroke gap beside it.

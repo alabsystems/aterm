@@ -37,11 +37,6 @@ aterm-types = { workspace = true }
 # disagree with the first inside a year. aterm-verify has zero dependencies by
 # charter, so this costs the one binary nothing at link time.
 aterm-verify = { workspace = true }
-# The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
-# `--containment` hands its selection to the init funnel through the env var that
-# funnel reads, and every mutation in the workspace routes through that helper
-# rather than a raw `set_var`. Dependency-free leaf, already linked transitively.
-aterm-log = { workspace = true }
 # `aterm agents`: the coding-agent primer installer. Its own std-only crate so the
 # GUI (auto-prime on every session) and this CLI verb drive ONE installer.
 aterm-primer = { workspace = true }
@@ -58,6 +53,12 @@ aterm-update = { workspace = true }
 # data and a fold: reached only by those two print-and-exit paths, never the shell
 # hot path, and the one binary links the lexicon already (through the window).
 aterm-lexicon = { workspace = true }
+# `aterm doctor`'s `instances:` row: the aterm windows and headless instances no
+# control socket reaches, counted by aterm-ctl's census over the SAME rendezvous walk
+# `aterm ctl instances`/`ls`/`windows` make, so the doctor and the client cannot
+# disagree about what is reachable. Reached only by that print-and-exit path; the
+# one binary links aterm-ctl already, and it brings only aterm-types and aterm-uds.
+aterm-ctl = { path = "../aterm-ctl" }
 
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.

@@ -145,53 +145,6 @@ pub struct TextShapingConfig {
     pub admit_collapsed: bool,
 }
 
-impl TextShapingConfig {
-    /// Get display width for ambiguous characters (1 or 2).
-    #[inline]
-    #[must_use]
-    pub const fn ambiguous_char_width(&self) -> usize {
-        match self.ambiguous_width {
-            AmbiguousWidth::Single => 1,
-            AmbiguousWidth::Double => 2,
-        }
-    }
-
-    /// Check if ligatures should be disabled for a glyph run given cursor position.
-    ///
-    /// Parameters:
-    /// - `cursor`: Optional (row, col) tuple. None if cursor not visible.
-    /// - `shaping_row`: The row being shaped (0-indexed from viewport top).
-    /// - `glyph_start_col`: Start column of the ligature glyph run.
-    /// - `glyph_end_col`: End column (exclusive) of the ligature glyph run.
-    ///
-    /// Returns true if:
-    /// - `ligature_mode == Disabled`, OR
-    /// - `ligature_mode == CursorDisabled` AND cursor is ON this row AND within glyph range
-    #[inline]
-    #[must_use]
-    pub fn should_disable_ligatures(
-        &self,
-        cursor: Option<(usize, usize)>,
-        shaping_row: usize,
-        glyph_start_col: usize,
-        glyph_end_col: usize,
-    ) -> bool {
-        match self.ligature_mode {
-            LigatureMode::Enabled => false,
-            LigatureMode::Disabled => true,
-            LigatureMode::CursorDisabled => {
-                if let Some((cursor_row, cursor_col)) = cursor {
-                    cursor_row == shaping_row
-                        && cursor_col >= glyph_start_col
-                        && cursor_col < glyph_end_col
-                } else {
-                    false
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,54 +155,6 @@ mod tests {
         assert_eq!(cfg.ligature_mode, LigatureMode::Enabled);
         assert_eq!(cfg.ambiguous_width, AmbiguousWidth::Single);
         assert!(cfg.font_features.is_empty());
-    }
-
-    #[test]
-    fn ambiguous_char_width_single() {
-        let cfg = TextShapingConfig::default();
-        assert_eq!(cfg.ambiguous_char_width(), 1);
-    }
-
-    #[test]
-    fn ambiguous_char_width_double() {
-        let cfg = TextShapingConfig {
-            ambiguous_width: AmbiguousWidth::Double,
-            ..Default::default()
-        };
-        assert_eq!(cfg.ambiguous_char_width(), 2);
-    }
-
-    #[test]
-    fn should_disable_ligatures_enabled_mode() {
-        let cfg = TextShapingConfig::default();
-        assert!(!cfg.should_disable_ligatures(Some((0, 5)), 0, 3, 8));
-    }
-
-    #[test]
-    fn should_disable_ligatures_disabled_mode() {
-        let cfg = TextShapingConfig {
-            ligature_mode: LigatureMode::Disabled,
-            ..Default::default()
-        };
-        assert!(cfg.should_disable_ligatures(None, 0, 0, 10));
-    }
-
-    #[test]
-    fn should_disable_ligatures_cursor_disabled_mode() {
-        let cfg = TextShapingConfig {
-            ligature_mode: LigatureMode::CursorDisabled,
-            ..Default::default()
-        };
-        // Cursor on same row, within glyph range
-        assert!(cfg.should_disable_ligatures(Some((0, 5)), 0, 3, 8));
-        // Cursor on different row
-        assert!(!cfg.should_disable_ligatures(Some((1, 5)), 0, 3, 8));
-        // Cursor before glyph range
-        assert!(!cfg.should_disable_ligatures(Some((0, 2)), 0, 3, 8));
-        // Cursor after glyph range
-        assert!(!cfg.should_disable_ligatures(Some((0, 8)), 0, 3, 8));
-        // No cursor
-        assert!(!cfg.should_disable_ligatures(None, 0, 3, 8));
     }
 
     #[test]

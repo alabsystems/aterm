@@ -183,6 +183,7 @@ pub struct MergedDamageIterator<'a> {
 #[cfg(any(test, kani, feature = "testing"))]
 impl<'a> MergedDamageIterator<'a> {
     /// Create a new merged damage iterator.
+    #[cfg(any(test, kani))]
     pub fn new(damage: &'a Damage, rows: u16, cols: u16) -> Self {
         Self {
             inner: damage.iter_bounds(rows, cols),

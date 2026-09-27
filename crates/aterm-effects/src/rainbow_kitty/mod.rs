@@ -110,7 +110,9 @@ use crate::trail_sound::SoundKind;
 use meteor::{Meteors, Spawn};
 use ribbon::Ribbon;
 use spine::Spine;
-use stardust::{GlyphProbe, StarBudget, Stardust};
+#[cfg(test)]
+use stardust::StarBudget;
+use stardust::{GlyphProbe, Stardust};
 use timing::{JUMP_MIN_CELLS, SPRING_SNAP_RESPONSE_S, half_life};
 use witness::{RowSample, Witness};
 
@@ -323,6 +325,15 @@ pub enum Event {
     /// rain**, D8), the pin (it is the caret), and the cadence's
     /// [`SoundKind::Enter`] cue.
     Return,
+    /// A composer line break (Shift+Enter), stamped at the key before its
+    /// repaint. Like `Return`, this starts a fresh ribbon walk without
+    /// minting a flight. Its own typed stamp has the same clock and must not
+    /// spend the fresh-line gate before the first character on that line.
+    ComposerNewline,
+    /// A later non-typing gesture superseded a composer break before its
+    /// caret home was observed. The ribbon drops only that pending gate;
+    /// this key edge mints no light or movement of its own.
+    CancelComposerNewline,
     /// Window focus changed. On loss the ribbon embers out in 300 ms on
     /// `spend` and the stars die; nothing sounds (§8.2).
     Focus(bool),
@@ -493,7 +504,7 @@ pub enum CompanionImpulse {
     /// A meteor was born. The **flying head** takes the frame-0 teleport
     /// (placement snaps, no glide), `disp = max(disp, 0.97)` directly, a
     /// `lead = −0.30` cell whip springing to `+0.22` on
-    /// [`timing::spring_whip`], and `land_at = t0 + t_flight`. The
+    /// `timing::spring_whip`, and `land_at = t0 + t_flight`. The
     /// **resident pet** is only OFFERED this: its owner-ruled pounce
     /// choreography is untouched and it may take `t0 + t_flight` as its perk
     /// edge. Whether the pet should teleport was A/B #14 and is RULED — the
@@ -622,15 +633,20 @@ pub struct Ctx<'a> {
     /// The caret's own field `t` — §6.4's `t_land`, the meteor's phase lock,
     /// and C2's shared colour.
     pub caret_t: f32,
-    /// **THE BAND'S WALK ORIGIN AT THE CARET** (2026-09-14), `(anchor_col,
-    /// t0)` of the cohort that owns the caret's cell
-    /// ([`ribbon::Ribbon::walk_origin_at`]) — set beside [`Ctx::caret_t`]
-    /// on a MOVE's own ctx only, `None` on every other ctx. What
+    /// **THE BAND'S WALK AT THE CARET** (2026-09-14; the odometer,
+    /// 2026-09-23), `(d, t_zero)` of the cohort that owns the caret's cell
+    /// ([`ribbon::Ribbon::walk_origin_at`]): the walk's distance at the
+    /// caret cell, counted from where the walk started, and its `t` at
+    /// distance zero — set beside [`Ctx::caret_t`] on a MOVE's own ctx only,
+    /// `None` on every other ctx and where nothing is laid at the landing. What
     /// [`Ctx::caret_t`] cannot say is the band's PACE past the landing cell
-    /// (`d/16` on a run's first sixteen cells, `d/36` after), and the
-    /// landing's marks must continue the band at the band's pace where it
-    /// lands (`meteor::LandingWalk`).
-    pub caret_walk: Option<(u16, f32)>,
+    /// (`d/16` within the first sixteen cells of its walk, `1/36` a cell
+    /// after — a wrapped row's band can be past the knee from its first
+    /// cell), and the landing's marks must continue the band at the band's
+    /// pace where it lands (`meteor::LandingWalk`). It was `(anchor_col,
+    /// t0)` before the odometer; a continued band's walk does not start on
+    /// its own row.
+    pub caret_walk: Option<(f32, f32)>,
     /// The mend mark, on the one tick that births a typo fix (see [`Mend`]).
     pub mend: Option<Mend>,
     /// [`spine::Spine::surge`] — how much of the crisp edge's stretch the
@@ -680,11 +696,31 @@ pub struct Status {
     /// their own row and standing a row away as a block — Claude Code's
     /// bottom-anchored composer growing a row without a scroll — and the
     /// cells moved there with every clock intact instead of melting
-    /// ([`Engine::follow_rows`], [`ribbon::Ribbon::translate_run`]).
+    /// ([`Engine::follow_rows`], [`ribbon::Ribbon::translate_run`]). Since
+    /// 2026-09-24 it also counts the cells the SHIFT pass carried along
+    /// their own row with the tail a mid-line insert pushed right
+    /// ([`ribbon::Ribbon::shift_run`]).
     /// Cumulative, surviving [`Engine::reset`] like `retired`: a reader of
     /// the control socket can tell "the band went with its text" from "the
     /// band went out because its text moved".
     pub followed: u64,
+    /// `ribbon_follow_missed=` — the follow pass's MISSES over this
+    /// engine's life (2026-09-23, the owner: *"the existing line rainbow
+    /// should beautifully flow and drift and fade away, not simply abruptly
+    /// vanish"*): armed cells whose glyphs left their row while the run's
+    /// text ARRIVED on a neighbouring row that the pass still did not carry
+    /// ([`witness::FollowScore::missed`]) — each one a cell the content
+    /// witness then judges where it stood (it melts, or is released when
+    /// glyphs of its run still stand) instead of the band going with its
+    /// text. Before the twin-neutral follow rule the second growth of
+    /// Claude Code's composer missed its whole row; the healthy number is
+    /// `0`. The arrivals are weighed exactly as the follow weighs them —
+    /// twins and the word a wrap RELAID at the start of the run's row out of
+    /// the count ([`witness::Witness::follow_runs`]); weighed against that
+    /// word, a narrow composer's wrap that moved more letters than it kept
+    /// melted its line while this read `0` (the review of 2026-09-23).
+    /// Cumulative, surviving [`Engine::reset`] like `followed`.
+    pub follow_missed: u64,
     /// The eased spine.
     pub disp: f32,
     /// **THE FLOW ROW** — `flow=` / `combo=` / `combo_best=`. The number a
@@ -1183,14 +1219,25 @@ pub struct Engine {
     retired: u64,
     /// [`Status::followed`]'s tally. Survives [`Engine::reset`].
     followed: u64,
+    /// [`Status::follow_missed`]'s tally. Survives [`Engine::reset`].
+    follow_missed: u64,
     /// The follow pass's verdicts this tick ([`Engine::follow_rows`]) —
     /// resident scratch, cleared by the search.
     follow_scratch: Vec<witness::FollowRun>,
+    /// The shift pass's verdicts this tick ([`Engine::follow_rows`], the
+    /// band following its text ALONG its row) — resident scratch, cleared
+    /// by the search.
+    shift_scratch: Vec<witness::ShiftRun>,
     /// The identities the follow pass moved this tick, for the witness's
     /// re-keying — resident scratch.
     moved_scratch: Vec<(u16, u16, Instant)>,
+    /// The rows the host was asked for this frame and did not deliver —
+    /// the first `withheld_n` ([`Engine::follow_rows`] finds them,
+    /// [`Engine::witness_rows`] hands them to the walk and clears them).
+    withheld: [u16; witness::WITNESS_ROWS + witness::ARMING_ROWS],
+    withheld_n: usize,
     /// The grid's row count as of the last tick, so
-    /// [`Engine::ribbon_rows`] names no neighbour row past the grid.
+    /// [`Engine::ribbon_rows_for`] names no neighbour row past the grid.
     grid_rows: u16,
     /// A held park's clock while its flush is being judged
     /// ([`Engine::set_flush_clock`], [`Engine::on_event`]).
@@ -1253,8 +1300,12 @@ impl Engine {
             restored_scratch: Vec::new(),
             retired: 0,
             followed: 0,
+            follow_missed: 0,
             follow_scratch: Vec::new(),
+            shift_scratch: Vec::new(),
             moved_scratch: Vec::new(),
+            withheld: [0; witness::WITNESS_ROWS + witness::ARMING_ROWS],
+            withheld_n: 0,
             grid_rows: 0,
             flush_clock: None,
             hidden: false,
@@ -1364,7 +1415,11 @@ impl Engine {
                 self.caret_known = true;
                 self.witness.forget_left_of(row, col);
             }
-            Event::Focus(true) | Event::Return | Event::Sweep { .. } => {}
+            Event::Focus(true)
+            | Event::Return
+            | Event::ComposerNewline
+            | Event::CancelComposerNewline
+            | Event::Sweep { .. } => {}
         }
         // **A FLUSHED PARK'S EVENTS BELONG BEFORE THE KEYS PRESSED SINCE**
         // (2026-09-21, measured with Claude Code's own bytes —
@@ -1834,6 +1889,8 @@ impl Engine {
     /// row whose text is intact under a caret that warped away is not
     /// retired at all.
     pub fn witness_rows(&mut self, rows: &[RowSample<'_>], now: Instant) -> u32 {
+        // This frame's withheld rows ([`Engine::follow_rows`]) are read once.
+        let withheld_n = std::mem::take(&mut self.withheld_n);
         if !self.engaged || rows.is_empty() {
             return 0;
         }
@@ -1846,6 +1903,8 @@ impl Engine {
         let recounted = self.witness.walk(
             self.ribbon.cells(),
             rows,
+            &self.withheld[..withheld_n],
+            now,
             &mut self.retire_scratch,
             &mut self.release_scratch,
         );
@@ -1881,45 +1940,98 @@ impl Engine {
 
     /// **THE ROWS THE WITNESS WANTS** — the distinct rows the resident
     /// ribbon occupies and (2026-09-21, the band follows its text) the
-    /// row ABOVE and BELOW each of them. The hand's run and its two possible
-    /// one-row follow destinations go first, then other resident rows and
-    /// their neighbours, up to `out.len()` (deduped, no row past the grid).
-    /// Returns how many. The
-    /// host samples exactly these rows under its terminal lock before the
-    /// tick and hands them to [`Engine::follow_rows`] and
+    /// row ABOVE and BELOW each of them, then — in slots of their own — the
+    /// rows a WAITING KEY arms its record on. Written into `out`; returns
+    /// how many. The host samples exactly these rows under its terminal lock
+    /// before the tick and hands them to [`Engine::follow_rows`] and
     /// [`Engine::witness_rows`]; a grid scan of anything else would be a
-    /// second probe for nothing. The neighbours are what let the follow
-    /// pass SEE where a run's text went when a bottom-anchored box grew a
-    /// row without a scroll; a wrapped paragraph of three rows wants five
-    /// samples, inside [`witness::WITNESS_ROWS`]. `0` while disengaged.
+    /// second probe for nothing. `0` while disengaged. Writes into the
+    /// caller's `out` only; allocates nothing.
     ///
-    /// Read the COHORTS, not the cells, so the count is exactly the walk's:
-    /// a row whose cells are all retired-but-resident is still sampled for up
-    /// to `RETIRE_MELT_S` (harmless — one `row_cols_into` on a row the melt is
-    /// about to empty), and past `out.len()` rows the surplus is dropped, the
-    /// unsampled rows keeping their own clocks. The focused row is a cohort
-    /// on the caret's row when present, otherwise the most recently alive
-    /// cohort: its potential landing row must not lose to older bands when
-    /// the fixed row budget fills.
-    pub fn ribbon_rows(&self, out: &mut [u16]) -> usize {
+    /// **THE BANDS' ROWS** fill at most the first [`witness::WITNESS_ROWS`]
+    /// slots: the hand's run and its two possible one-row follow
+    /// destinations first, then other resident rows and their neighbours
+    /// (deduped, no row past the grid). The neighbours are what let the
+    /// follow pass SEE where a run's text went when a bottom-anchored box
+    /// grew a row without a scroll; a wrapped paragraph of three rows wants
+    /// five samples. Read the COHORTS, not the cells, so the count is exactly
+    /// the walk's: a row whose cells are all retired-but-resident is still
+    /// sampled for up to `RETIRE_MELT_S` (harmless — one `row_cols_into` on a
+    /// row the melt is about to empty), and past the budget the surplus is
+    /// dropped, the unsampled rows keeping their own clocks. The focused row
+    /// is a cohort on the caret's row when present, otherwise the most
+    /// recently alive cohort: its potential landing row must not lose to
+    /// older bands when the budget fills.
+    ///
+    /// **THE ARMING ROWS** follow, up to [`witness::ARMING_ROWS`] more
+    /// (2026-09-25). `arming` is the row a waiting key will lay its cell on
+    /// this frame — the host knows it (`CursorGlow::ribbon_rows`: the key's
+    /// source row), the engine does not, because the cohort that key starts
+    /// does not exist until the tick. The witness ARMS that cell's record on
+    /// this frame's samples, and a copy of its glyph standing one row above
+    /// or below already is a twin at once ([`witness::Witness::walk`]) — if
+    /// that row is seen. So the arming row and the rows one above and below
+    /// it are named after the bands' rows, where they are not among them
+    /// already: a line typed under an identical line whose first keys echo
+    /// together, or are pasted, is not carried onto that line when it is
+    /// erased at once (`tests/erased_under_its_twin.rs`). They have slots of
+    /// their own, so a full band budget never drops them and they never drop
+    /// a band's row: the host gives the list
+    /// [`crate::cursor_glow::CURSOR_WITNESS_ROWS`] slots, the bands' eight,
+    /// these three and the caret's row. A caller with fewer slots gets the
+    /// bands' rows first and no arming row that does not fit.
+    ///
+    /// **NO ROW TWO AWAY IS NAMED.** A row two away is a place where a COPY
+    /// of the line can be taken for where it went: fzf re-sorting its list
+    /// as Ctrl-U clears the query puts an item holding the query's text at
+    /// its columns two rows up in the same batch; a streamed row can quote
+    /// the composer two rows up; something can flicker there
+    /// (`tests/copies_are_not_moves.rs`). Such a row is still sampled when it
+    /// is the caret's (the host always reads the caret's row, and a box
+    /// relocated with its caret carries its band there) or another band's
+    /// neighbour. The bands' rows are the list 0.93.0 named. The host
+    /// records the list it handed out (`CursorGlow::ribbon_rows`), and
+    /// [`Engine::follow_rows`] counts as withheld only rows of THAT list.
+    pub fn ribbon_rows_for(&self, arming: Option<u16>, out: &mut [u16]) -> usize {
         if !self.engaged {
             return 0;
         }
-        let mut n = 0usize;
+        // `0` is a grid not measured yet (no tick): nothing bounds a row.
         let add = |out: &mut [u16], n: &mut usize, row: u16| {
-            if row < self.grid_rows && *n < out.len() && !out[..*n].contains(&row) {
+            if (self.grid_rows == 0 || row < self.grid_rows)
+                && *n < out.len()
+                && !out[..*n].contains(&row)
+            {
                 out[*n] = row;
                 *n += 1;
             }
         };
-        if let Some(focus) = self
+        let budget = out.len().min(witness::WITNESS_ROWS);
+        let mut n = self.band_rows(&mut out[..budget], add);
+        if let Some(row) = arming {
+            for r in [Some(row), row.checked_sub(1), row.checked_add(1)]
+                .into_iter()
+                .flatten()
+            {
+                add(out, &mut n, r);
+            }
+        }
+        n
+    }
+
+    /// The bands' rows of [`Engine::ribbon_rows_for`], into `out` through
+    /// its `add` (deduped, bounded by the grid and by `out.len()`).
+    fn band_rows(&self, out: &mut [u16], add: impl Fn(&mut [u16], &mut usize, u16)) -> usize {
+        let mut n = 0usize;
+        let focus = self
             .ribbon
             .cohorts()
             .iter()
             .max_by_key(|coh| (self.caret_known && coh.row == self.caret.0, coh.alive_at))
-        {
-            add(out, &mut n, focus.row);
-            for row in [focus.row.checked_sub(1), focus.row.checked_add(1)]
+            .map(|coh| coh.row);
+        if let Some(focus) = focus {
+            add(out, &mut n, focus);
+            for row in [focus.checked_sub(1), focus.checked_add(1)]
                 .into_iter()
                 .flatten()
             {
@@ -1950,7 +2062,7 @@ impl Engine {
     /// owner: *"when typing wraps to a new line the previous row's rainbow
     /// vanishes suddenly while the new row populates"*). Run by the host at
     /// the START of the tick, on this frame's samples (the rows
-    /// [`Engine::ribbon_rows`] named, captured under the terminal lock
+    /// [`Engine::ribbon_rows_for`] named, captured under the terminal lock
     /// after the PTY batch was applied), BEFORE the tick replays the
     /// frame's events — so it runs before a composer's re-anchor
     /// ([`ribbon::Ribbon::re_anchor`]) stamps anything on the old row. The
@@ -1963,28 +2075,141 @@ impl Engine {
     /// ([`ribbon::Cohort::flow`]) — the same fold a shell wrap gives a row
     /// in [`ribbon::Ribbon::leave_row`]; a FLOWING run carried back ONTO the
     /// caret's row (the box shrank back under a Backspace through the fold)
-    /// is re-wet, the hand's row again. The tick's erases, addressed in the
+    /// is re-wet, the hand's row again, and a run carried back onto the
+    /// new-line seam's row takes the seam with it — the line it marked as
+    /// continued is gone (2026-09-25). The tick's erases, addressed in the
     /// batch's old layout, leave the cells placed here alone
-    /// ([`ribbon::Ribbon::translate_run`]). Counted on [`Status::followed`].
+    /// ([`ribbon::Ribbon::translate_run`]). Counted on [`Status::followed`];
+    /// a run whose text arrived a row away but that no offset named — the
+    /// arrivals not one block — is counted on [`Status::follow_missed`]
+    /// (2026-09-23), the melt the witness is about to give it made visible.
     /// Returns how many cells moved; `0` while disengaged, with no rows, or
     /// when nothing moved. Deterministic in `(records, samples)`; nothing
     /// is allocated on the steady path.
-    pub fn follow_rows(&mut self, rows: &[RowSample<'_>], now: Instant) -> u32 {
+    ///
+    /// **WHAT THE HOST WITHHELD** (2026-09-25): `asked` is the list the
+    /// host was asked for this frame — what [`Engine::ribbon_rows_for`]
+    /// handed out (`CursorGlow::ribbon_rows` records it). FIRST, before
+    /// either pass moves anything, the rows of it that are NOT among `rows`,
+    /// inside the grid and the focused pane, are kept, and
+    /// [`Engine::witness_rows`] hands them to the walk after the tick: a run
+    /// beside one of them may have moved there unseen, and waits one walk
+    /// for its verdict (`witness::Witness::find_deferred_runs`). The
+    /// composed (split or zoomed) host drops its second, generation-checked
+    /// read of the rows past the caret's `±1` when a PTY chunk lands between
+    /// its locks; the host's slots
+    /// ([`crate::cursor_glow::CURSOR_WITNESS_ROWS`]) hold every row of the
+    /// list and the caret's, so no other row is ever missing. A row outside
+    /// the grid or the pane is one no host can read: it is not withheld, it
+    /// does not exist here, and a run beside it is judged at once. Nor is a
+    /// row the host was never asked for. The accounting comes first because
+    /// it is about what the host DELIVERED, which neither pass changes; the
+    /// walk reads it against the records where both passes left them — a run
+    /// the shift pass carried along its row starts over
+    /// ([`witness::Witness::shift_cells`]) and stands under its glyphs, so
+    /// it is not deferred.
+    ///
+    /// **ALONG THE ROW, THEN ACROSS ROWS** (2026-09-24): the shift pass — a
+    /// mid-line insert pushed the tail of the line right on its own row
+    /// ([`witness::Witness::shift_runs`]) — moves its light with it
+    /// ([`ribbon::Ribbon::shift_run`]) before the vertical search reads the
+    /// records, so a shifted tail is never mistaken for text that left the
+    /// row. Both passes count on [`Status::followed`].
+    /// A content-proved short held park may borrow the move of its source
+    /// row, while `asked` still records rows the host could not sample.
+    pub fn follow_rows(&mut self, rows: &[RowSample<'_>], asked: &[u16], now: Instant) -> u32 {
+        self.follow_rows_with_park(rows, asked, now, None).0
+    }
+
+    /// The same content follow, with the one exact short held park the host
+    /// may be waiting to judge. The bool says this park's source ribbon run
+    /// actually moved, so its delayed judgement can use re-anchor
+    /// morphology without widening the ordinary one-cell park rule.
+    pub(crate) fn follow_rows_with_park(
+        &mut self,
+        rows: &[RowSample<'_>],
+        asked: &[u16],
+        now: Instant,
+        park: Option<((u16, u16), (u16, u16))>,
+    ) -> (u32, bool) {
+        self.withheld_n = 0;
         if !self.engaged || rows.is_empty() {
-            return 0;
+            return (0, false);
         }
+        for &r in asked {
+            let readable = r < self.grid_rows
+                && self
+                    .pane_rows
+                    .is_none_or(|(first, n)| r >= first && r - first < n);
+            if readable
+                && !rows.iter().any(|s| s.row == r)
+                && !self.withheld[..self.withheld_n].contains(&r)
+                && self.withheld_n < self.withheld.len()
+            {
+                self.withheld[self.withheld_n] = r;
+                self.withheld_n += 1;
+            }
+        }
+        self.note_rewrap_starts(rows);
+        // ALONG THE ROW FIRST (see the doc): the caret is the one the last
+        // tick observed — the column the hand edited at, before this frame's
+        // echo moved it.
+        let caret = self.caret_known.then_some(self.caret);
         self.witness
-            .follow_runs(self.ribbon.cells(), rows, &mut self.follow_scratch);
-        if self.follow_scratch.is_empty() {
-            return 0;
-        }
+            .shift_runs(self.ribbon.cells(), rows, caret, &mut self.shift_scratch);
         let mut n = 0u32;
+        let mut park_proved = false;
+        for k in 0..self.shift_scratch.len() {
+            let run = self.shift_scratch[k];
+            self.moved_scratch.clear();
+            let moved = self.ribbon.shift_run(run, &mut self.moved_scratch);
+            if moved == 0 {
+                continue;
+            }
+            self.witness.shift_cells(&mut self.moved_scratch, run.dc);
+            n = n.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
+        }
+        let score = self.witness.follow_runs_with_short_park(
+            self.ribbon.cells(),
+            rows,
+            park,
+            &mut self.follow_scratch,
+        );
+        if score.missed > 0 {
+            self.follow_missed += u64::from(score.missed);
+            self.status.follow_missed = self.follow_missed;
+        }
+        if self.follow_scratch.is_empty() {
+            if n > 0 {
+                self.followed += u64::from(n);
+                self.status.followed = self.followed;
+            }
+            return (n, false);
+        }
+        // Read the park's source run once, before any follow mutates the
+        // ribbon. A composer may carry only its short kept prefix to another
+        // row while its long trailing word stays for the parked echo to
+        // relay. The moved span can therefore be far from the caret, but it
+        // must share the live run of the glyph immediately behind the park.
+        let park_owner = park.and_then(|(from, to)| {
+            if from.0 != to.0 || !(1..=2).contains(&from.1.saturating_sub(to.1)) {
+                return None;
+            }
+            let last_col = from.1.checked_sub(1)?;
+            self.ribbon
+                .cells()
+                .iter()
+                .find(|cell| !cell.leaving() && cell.row == from.0 && cell.col == last_col)
+                .map(|cell| (from.0, cell.cohort))
+        });
         for k in 0..self.follow_scratch.len() {
             let run = self.follow_scratch[k];
             let Some(target) = run.row.checked_add_signed(run.dr) else {
                 continue;
             };
             let away = !self.caret_known || target != self.caret.0;
+            let park_owns_run =
+                park_owner.is_some_and(|(row, cohort)| row == run.row && cohort == run.cohort);
             self.moved_scratch.clear();
             let moved = self
                 .ribbon
@@ -1992,15 +2217,130 @@ impl Engine {
             if moved == 0 {
                 continue;
             }
+            if away && park_owns_run {
+                park_proved = true;
+            }
+            // THE SEAM (2026-09-23, `ribbon::Ribbon::seam`): the text left
+            // the caret's row with the box that grew — the input continues
+            // on the caret's row, which is the new line.
+            if away && self.caret_known && run.row == self.caret.0 {
+                self.ribbon.arm_seam(self.caret.0, now);
+            }
             self.witness
                 .translate_cells(&mut self.moved_scratch, run.dr);
+            // THE ECHO THAT CROSSED WITH ITS TEXT (2026-09-27, the owner's
+            // second gap: a Space typed before `[Image #1]` pushed the
+            // placeholder onto a new row, the composer grew a row in the
+            // SAME frame, and the Space's cell stayed dark between `hthe`
+            // and `cu`). An echo's cells are laid by the sweep of a
+            // same-row advance — the host's, or the bridge
+            // ([`Engine::echo_bridge`]) — and this echo arrived as
+            // `(R, c) → (R+dr, c')`, a cross-row move, before this pass knew
+            // the row had moved, so neither laid it. In the text's own frame
+            // it IS the same-row advance `c → c'` on the row the run now
+            // stands on: that sweep is laid here, on the move's own clock.
+            if self.caret_known && self.caret.0 == target {
+                self.lay_crossed_echo(run, target);
+            }
             n = n.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
         }
         if n > 0 {
             self.followed += u64::from(n);
             self.status.followed = self.followed;
         }
-        n
+        (n, park_proved)
+    }
+
+    /// Bind one content-proved held park to the move its flush just queued.
+    /// The ribbon consumes the exact pair during the next replay and clears
+    /// any unused proof when that frame ends.
+    pub(crate) fn prove_short_reanchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
+        self.ribbon.prove_short_reanchor(from, to, at);
+    }
+
+    /// The frame's buffered ECHO move that crossed rows with the run it
+    /// stood on ([`Engine::follow_rows`]): from `(run.row, c)` — at the run
+    /// or one past its end, where the caret sits after the glyph it typed —
+    /// forward to `(target, c')`, with no sweep already laid on `target`
+    /// over `c..c'`. Its advance is laid as the same-row echo's sweep would
+    /// be, at the front of the frame like the bridge ([`Engine::lay_bridge`]),
+    /// born at the move's own clock; the move is re-seated on the row its
+    /// text now stands on.
+    fn lay_crossed_echo(&mut self, run: witness::FollowRun, target: u16) {
+        let found = self.events.iter().position(|(ev, _)| match *ev {
+            Event::Move {
+                from, to, licence, ..
+            } => {
+                licence.is_echo()
+                    && from.0 == run.row
+                    && to.0 == target
+                    && to.1 > from.1
+                    && (run.lo..=run.hi.saturating_add(1)).contains(&from.1)
+            }
+            _ => false,
+        });
+        let Some(k) = found else {
+            return;
+        };
+        let (Event::Move { from, to, .. }, at) = self.events[k] else {
+            return;
+        };
+        let swept = self.events.iter().any(|(ev, _)| {
+            matches!(*ev, Event::Sweep { row, col0, col1 }
+                if row == target && col0 <= from.1 && col1 >= to.1)
+        });
+        if let (Event::Move { from: f, .. }, _) = &mut self.events[k] {
+            f.0 = target;
+        }
+        if swept {
+            return;
+        }
+        self.bridged = self.bridged.saturating_add(u32::from(to.1 - from.1));
+        self.events.insert(
+            0,
+            (
+                Event::Sweep {
+                    row: target,
+                    col0: from.1,
+                    col1: to.1,
+                },
+                at,
+            ),
+        );
+        if let Some((index, _)) = &mut self.pre_move {
+            *index += 1;
+        }
+    }
+
+    /// For the frame's buffered same-row TYPED re-anchor (a composer's wrap
+    /// landing left of its origin), tell the ribbon where the landing row's
+    /// sample holds its first text: the first column at or past the pane's
+    /// left edge that is neither blank nor a wide glyph's continuation, left
+    /// of the landing ([`ribbon::Ribbon::note_rewrap_start`]). A row the host
+    /// did not sample says nothing.
+    fn note_rewrap_starts(&mut self, rows: &[RowSample<'_>]) {
+        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
+        let found = self.events.iter().rev().find_map(|(ev, _)| match *ev {
+            Event::Move {
+                from, to, licence, ..
+            } if licence == Licence::Typed && from.0 == to.0 && to.1 < from.1 => Some((from, to)),
+            _ => None,
+        });
+        let Some((from, to)) = found else {
+            return;
+        };
+        let Some(sample) = rows.iter().find(|r| r.row == to.0) else {
+            return;
+        };
+        let start = (pane_col0..to.1).find(|&c| {
+            sample
+                .cols
+                .get(usize::from(c))
+                .is_some_and(|&ch| ch != ' ' && ch != '\0')
+        });
+        if let Some(start) = start {
+            self.ribbon.note_rewrap_start(from, to, start);
+        }
     }
 
     /// **THE VERDICT** (sense 3) — a shell command came back GREEN after a
@@ -2165,7 +2505,7 @@ impl Engine {
             reduced_motion: cfg.reduced_motion || self.reduced_motion,
             ..*cfg
         };
-        // The grid's height, for the neighbour rows [`Engine::ribbon_rows`]
+        // The grid's height, for the neighbour rows [`Engine::ribbon_rows_for`]
         // names before the next tick.
         self.grid_rows = u16::try_from(geom.rows).unwrap_or(u16::MAX);
         // The cell a Backspace emptied is the caret as of ITS tick — the same
@@ -2252,9 +2592,10 @@ impl Engine {
             };
             let mut move_ctx = ctx;
             move_ctx.caret_t = self.ribbon.field_at(to.0, to.1).unwrap_or(ctx.caret_t);
-            // …and the band's walk ORIGIN at the landing (2026-09-14), so
-            // the landing's marks continue the band at the band's own pace
-            // where it lands, not at the fast leg's from the landing cell.
+            // …and the band's WALK at the landing (2026-09-14; its distance
+            // and its zero since the odometer, 2026-09-23), so the landing's
+            // marks continue the band at the band's own pace where it lands,
+            // not at the fast leg's from the landing cell.
             move_ctx.caret_walk = self.ribbon.walk_origin_at(to.0, to.1);
             if let Some(spawn) = self.meteor.on_event(&ev, at, &move_ctx) {
                 self.on_spawn(&spawn, licence, &move_ctx);
@@ -2375,6 +2716,7 @@ impl Engine {
             bridged: self.bridged,
             retired: self.retired,
             followed: self.followed,
+            follow_missed: self.follow_missed,
             disp: self.spine.disp(),
             flow: ctx.flow,
             tokens: self.stardust.budget.tokens(),
@@ -2571,6 +2913,7 @@ impl Engine {
     /// engine's fields; it lives on [`Stardust`] because only stardust spends
     /// it, and this is the accessor that name refers to.
     #[must_use]
+    #[cfg(test)]
     pub fn budget(&self) -> &StarBudget {
         &self.stardust.budget
     }
@@ -2587,6 +2930,7 @@ impl Engine {
 
     /// Read-only view of the frame's glyph truth.
     #[must_use]
+    #[cfg(test)]
     pub fn probe(&self) -> &GlyphProbe {
         self.stardust.probe()
     }
@@ -2667,8 +3011,7 @@ impl Engine {
     /// The last frame's LIVENESS — `is_active` follows this when engaged
     /// (§17.2). `0` exactly when nothing is on glass, non-zero otherwise.
     /// It is no longer a content hash: see [`liveness`]. A caller that needs
-    /// to compare the BYTES of two frames folds them with
-    /// [`stream_fingerprint`].
+    /// to compare the BYTES of two frames compares the streams themselves.
     #[must_use]
     pub fn fingerprint(&self) -> u64 {
         self.fp
@@ -2858,6 +3201,7 @@ impl Engine {
         self.status = Status {
             retired: self.retired,
             followed: self.followed,
+            follow_missed: self.follow_missed,
             ..Status::default()
         };
     }
@@ -2932,6 +3276,7 @@ impl Engine {
         self.status = Status {
             retired: self.retired,
             followed: self.followed,
+            follow_missed: self.follow_missed,
             ..Status::default()
         };
         self.brisk = false;
@@ -2955,7 +3300,12 @@ impl Engine {
             return;
         }
         self.ribbon.translate_scroll(rows);
-        self.witness.translate(rows);
+        // The rows the scroll brought in are at the bottom of the region
+        // that scrolled: the focused pane's, in a split, not the window's.
+        let bottom = self
+            .pane_rows
+            .map_or(self.grid_rows, |(first, n)| first.saturating_add(n));
+        self.witness.translate(rows, bottom);
         self.meteor.translate_scroll(rows, cell_h);
         self.stardust.translate_scroll(rows, cell_h);
         // The caret is a POSITION, not a mark: it cannot be dropped, and the
@@ -3258,8 +3608,7 @@ fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
 /// **THE FRAME'S LIVENESS** (§18, T6) — `0` exactly when nothing was appended,
 /// and a fixed non-zero sentinel otherwise.
 ///
-/// This used to be [`stream_fingerprint`], folded over every emitted field on
-/// every tick. NOTHING IN PRODUCTION EVER READ THE VALUE: every consumer in
+/// This used to be an FNV fold over every emitted field on every tick. NOTHING IN PRODUCTION EVER READ THE VALUE: every consumer in
 /// the shipped path asks `== 0` or `!= 0` (`is_active`, the idle early-out,
 /// the status row), and that predicate is byte-identically "did this tick
 /// append anything", which is three `is_empty` calls. The fold was 31.3 µs of
@@ -3267,50 +3616,10 @@ fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
 /// under + 337 out + 68 halos, ~4 dependent multiplies per quad at ~1 ns
 /// each) — measured in the 2026-09-14 performance audit, whole-tick A/B
 /// 186.7/190.3 µs → 134.2/138.1 µs with four controls flat.
-///
-/// The fold itself is kept, as [`stream_fingerprint`], for the callers that
-/// genuinely compare BYTES: the determinism laws and the frame-cost gate.
-/// They fold the streams they are holding, once, where they mean to.
 fn liveness(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
     // The low bit is set for the same reason the fold forced it: a live frame
     // can never collide with the idle sentinel.
     u64::from(!(under.is_empty() && out.is_empty() && halos.is_empty()))
-}
-
-/// The byte-exact frame fingerprint — a 64-bit FNV-1a fold over every emitted
-/// field, with the low bit forced so a legitimate frame can never collide with
-/// the idle `0`. Order-sensitive and a pure function of the bytes the
-/// renderers will composite, which is what lets a determinism law be a byte
-/// comparison rather than a tolerance.
-///
-/// NOT on the frame path (see [`liveness`]): fold the streams where you need
-/// to compare them.
-#[must_use]
-pub fn stream_fingerprint(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
-    if under.is_empty() && out.is_empty() && halos.is_empty() {
-        return 0;
-    }
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(PRIME);
-    };
-    for q in under.iter().chain(out.iter()) {
-        mix(u64::from(q.row));
-        mix(u64::from(q.x) << 16 | u64::from(q.y));
-        mix(u64::from(q.w) << 16 | u64::from(q.h));
-        mix(u64::from(q.color) << 8 | u64::from(q.alpha));
-    }
-    for a in halos {
-        mix(u64::from(a.row));
-        mix(u64::from(a.x) << 16 | u64::from(a.y));
-        mix(u64::from(a.w) << 16 | u64::from(a.h));
-        mix(u64::from(a.cx) << 16 | u64::from(a.cy));
-        mix(u64::from(a.rx) << 16 | u64::from(a.ry));
-        mix(u64::from(a.color));
-    }
-    h | 1
 }
 
 #[cfg(test)]
@@ -5636,15 +5945,31 @@ mod tests {
         }
         let text: Vec<char> = "  ab".chars().collect();
         let blank: Vec<char> = "    ".chars().collect();
-        let original = [3u16, 7, 11].map(|row| RowSample { row, cols: &text });
-        assert_eq!(eng.witness_rows(&original, t), 0, "arm the three runs");
         let mut wanted = [0u16; witness::WITNESS_ROWS];
-        let n = eng.ribbon_rows(&mut wanted);
+        let n = eng.ribbon_rows_for(None, &mut wanted);
         assert!(
             wanted[..n].contains(&12),
             "the hand's run on row 11 needs row 12 to follow its text; requested {:?}",
             &wanted[..n]
         );
+        // Arm the three runs on the rows the engine asked for, as the host
+        // samples them: row 12 is SEEN blank, so the text found there later
+        // arrived. (Armed on the text rows alone, row 12 would be a
+        // neighbour the witness never saw, which is no evidence either way —
+        // `an_unsampled_neighbour_is_no_evidence_either_way` — but the
+        // fixture is the host's.)
+        let original = wanted[..n]
+            .iter()
+            .map(|&row| RowSample {
+                row,
+                cols: if row == 3 || row == 7 || row == 11 {
+                    &text
+                } else {
+                    &blank
+                },
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(eng.witness_rows(&original, t), 0, "arm the three runs");
         let moved = wanted[..n]
             .iter()
             .map(|&row| RowSample {
@@ -5656,11 +5981,326 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
-        assert_eq!(eng.follow_rows(&moved, t + ms(5)), 2);
+        assert_eq!(eng.follow_rows(&moved, &wanted[..n], t + ms(5)), 2);
         tick_at(&mut eng, t + ms(5));
         assert!(
             eng.field_at(12, 2).is_some() && eng.field_at(12, 3).is_some(),
             "the lit run followed its text onto row 12"
+        );
+    }
+
+    /// A held one-cell park may borrow a text follow only when the moved
+    /// run belonged to the caret's short retreat. A separate run far to the
+    /// left can move off the same source row without proving this park.
+    #[test]
+    fn an_unrelated_follow_on_the_parked_row_does_not_prove_the_park() {
+        let model = aterm_spec::derive::rainbow_short_wrap_park_model();
+        let held = model.successors("Hold", &model.init_state())[0].clone();
+        for (origin, landing, local_run, should_prove) in
+            [(4, 3, false, true), (32, 31, true, false)]
+        {
+            let (mut eng, mut t) = typed_runs(&[3]);
+            if local_run {
+                // Another cohort at the parked caret: the far-left run
+                // still follows, but it is not the text this hand just left.
+                eng.observe_caret((3, 31));
+                tick_at(&mut eng, t);
+                let key = t + Duration::from_millis(10);
+                eng.on_event(typed(1), key);
+                tick_at(&mut eng, key);
+                let echo = key + Duration::from_millis(1);
+                eng.on_event(
+                    Event::Sweep {
+                        row: 3,
+                        col0: 31,
+                        col1: 32,
+                    },
+                    key,
+                );
+                eng.on_event(mv((3, 31), (3, 32), Licence::Typed), echo);
+                tick_at(&mut eng, echo);
+                t = echo;
+                let far = eng
+                    .ribbon()
+                    .cells()
+                    .iter()
+                    .find(|cell| cell.row == 3 && cell.col == 2)
+                    .expect("the moving run stands at col 2")
+                    .cohort;
+                let local = eng
+                    .ribbon()
+                    .cells()
+                    .iter()
+                    .find(|cell| cell.row == 3 && cell.col == 31)
+                    .expect("the parked caret has its own typed run")
+                    .cohort;
+                assert_ne!(far, local, "premise: only the distant run moves");
+            } else {
+                eng.observe_caret((3, origin));
+                tick_at(&mut eng, t);
+            }
+            let mut moving_text = vec![' '; 36];
+            moving_text[2] = 'a';
+            moving_text[3] = 'b';
+            let mut text = moving_text.clone();
+            if local_run {
+                text[31] = 'z';
+            }
+            let blank = vec![' '; 36];
+            let mut remaining = blank.clone();
+            if local_run {
+                remaining[31] = 'z';
+            }
+            let before = [
+                RowSample {
+                    row: 3,
+                    cols: &text,
+                },
+                RowSample {
+                    row: 4,
+                    cols: &blank,
+                },
+            ];
+            assert_eq!(eng.witness_rows(&before, t), 0);
+            let after = [
+                RowSample {
+                    row: 3,
+                    cols: &remaining,
+                },
+                RowSample {
+                    row: 4,
+                    cols: &moving_text,
+                },
+            ];
+            let (moved, proved) = eng.follow_rows_with_park(
+                &after,
+                &[3, 4],
+                t + Duration::from_millis(5),
+                Some(((3, origin), (3, landing))),
+            );
+            assert_eq!(moved, 2, "the unrelated run still follows its text");
+            let action = if should_prove {
+                "FollowExact"
+            } else {
+                "FollowOther"
+            };
+            let projected = model.successors(action, &held)[0].clone();
+            assert_eq!(projected.get("content_moved"), Some(&1));
+            assert_eq!(
+                proved,
+                projected.get("exact") == Some(&1),
+                "the parked origin {origin} must borrow only its own run"
+            );
+        }
+    }
+
+    /// An engaged engine with a typed two-cell ribbon run on each of `rows`
+    /// (the caret moved to each row by observation, then two keys echoed at
+    /// columns 2 and 3), and the instant of the last echo.
+    fn typed_runs(rows: &[u16]) -> (Engine, Instant) {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        eng.on_event(mv((rows[0], 0), (rows[0], 2), Licence::Typed), t0);
+        tick_at(&mut eng, t0);
+        let mut t = t0;
+        for &row in rows {
+            if row != rows[0] {
+                eng.observe_caret((row, 2));
+                tick_at(&mut eng, t);
+            }
+            for col in 2..4u16 {
+                t += ms(12);
+                eng.on_event(typed(1), t);
+                tick_at(&mut eng, t);
+                let echo = t + ms(1);
+                eng.on_event(
+                    Event::Sweep {
+                        row,
+                        col0: col,
+                        col1: col + 1,
+                    },
+                    t,
+                );
+                eng.on_event(mv((row, col), (row, col + 1), Licence::Typed), echo);
+                tick_at(&mut eng, echo);
+                t = echo;
+            }
+            assert!(
+                eng.field_at(row, 2).is_some(),
+                "fixture: a typed ribbon run on row {row}"
+            );
+        }
+        (eng, t)
+    }
+
+    /// **A WAITING KEY'S ARMING ROWS HAVE SLOTS OF THEIR OWN**
+    /// ([`Engine::ribbon_rows_for`]). Four typed runs on rows 3, 7, 11 and
+    /// 15 want twelve samples — each run's row and both landing rows —
+    /// against the bands' budget of [`witness::WITNESS_ROWS`]. A key is now
+    /// waiting whose cell will be laid on row 19, a line no cohort lives on
+    /// yet: the witness arms its record on this frame's samples, and a copy
+    /// of its glyph standing beside it already is a twin only if that row is
+    /// seen. The bands' eight rows come first, exactly the list with no key
+    /// waiting — the hand's run and its two landing rows leading it — and
+    /// rows 19, 18 and 20 follow in the [`witness::ARMING_ROWS`] slots after
+    /// them: neither crowds the other out. A caller with only the bands'
+    /// eight slots gets the bands' rows and no arming row: a waiting key
+    /// never evicts a band's row. No row TWO away from the arming row is
+    /// named (each would be a place a copy is taken for the line). And an
+    /// arming row on the grid's last row names nothing past the grid.
+    #[test]
+    fn a_waiting_key_s_arming_rows_have_slots_of_their_own() {
+        let (eng, _) = typed_runs(&[3, 7, 11, 15]);
+        let mut bands = [0u16; witness::WITNESS_ROWS];
+        let b = eng.ribbon_rows_for(None, &mut bands);
+        assert_eq!(
+            b,
+            witness::WITNESS_ROWS,
+            "fixture: the bands fill their budget"
+        );
+        assert_eq!(
+            bands[..3],
+            [15, 14, 16],
+            "the hand's run and its landing rows lead: {bands:?}"
+        );
+        let mut out = [0u16; witness::WITNESS_ROWS + witness::ARMING_ROWS];
+        let n = eng.ribbon_rows_for(Some(19), &mut out);
+        assert_eq!(n, witness::WITNESS_ROWS + witness::ARMING_ROWS);
+        assert_eq!(out[..b], bands, "the bands' rows are untouched: {out:?}");
+        assert_eq!(
+            out[b..n],
+            [19, 18, 20],
+            "the arming row and its neighbours in their own slots: {out:?}"
+        );
+        assert!(
+            !out.contains(&17) && !out.contains(&21),
+            "no row two away from the arming row: {out:?}"
+        );
+        let mut short = [0u16; witness::WITNESS_ROWS];
+        assert_eq!(
+            eng.ribbon_rows_for(Some(19), &mut short),
+            witness::WITNESS_ROWS
+        );
+        assert_eq!(short, bands, "a short caller keeps every band's row");
+        // The grid's last row (`geom()` is 40 rows): nothing past it.
+        let last = u16::try_from(geom().rows - 1).expect("a small grid");
+        let n = eng.ribbon_rows_for(Some(last), &mut out);
+        assert_eq!(
+            out[b..n],
+            [last, last - 1],
+            "the rows past the grid are not neighbours: {:?}",
+            &out[..n]
+        );
+    }
+
+    /// **NO ROW TWO AWAY IS NAMED** ([`Engine::ribbon_rows_for`]). A row two
+    /// away is a new place for a copy of the line to be taken for where it
+    /// went — fzf re-sorting its list as Ctrl-U clears the query, a streamed
+    /// row quoting the composer, a flicker two rows up
+    /// (`tests/copies_are_not_moves.rs`). One band on row 10 names its row
+    /// and its neighbours, as 0.93.0 did; a key waiting on row 10 adds
+    /// nothing two away.
+    #[test]
+    fn no_row_two_away_is_named() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        eng.on_event(mv((10, 0), (10, 2), Licence::Typed), t0);
+        tick_at(&mut eng, t0);
+        let mut t = t0;
+        for col in 2..4u16 {
+            t += ms(12);
+            eng.on_event(typed(1), t);
+            tick_at(&mut eng, t);
+            let echo = t + ms(1);
+            eng.on_event(
+                Event::Sweep {
+                    row: 10,
+                    col0: col,
+                    col1: col + 1,
+                },
+                t,
+            );
+            eng.on_event(mv((10, col), (10, col + 1), Licence::Typed), echo);
+            tick_at(&mut eng, echo);
+            t = echo;
+        }
+        assert!(eng.field_at(10, 2).is_some(), "fixture: a band on row 10");
+        let mut out = [0u16; witness::WITNESS_ROWS + witness::ARMING_ROWS];
+        let n = eng.ribbon_rows_for(None, &mut out);
+        assert_eq!(&out[..n], &[10, 9, 11]);
+        let n = eng.ribbon_rows_for(Some(10), &mut out);
+        assert_eq!(&out[..n], &[10, 9, 11]);
+    }
+
+    /// **WITHHELD IS WHAT THE HOST WAS ASKED FOR AND DID NOT DELIVER**
+    /// ([`Engine::follow_rows`]). Four typed runs on rows 3, 7, 11 and 15
+    /// fill the bands' budget, and a key is waiting on row 19: the host is
+    /// asked for the bands' rows and then rows 19, 18 and 20
+    /// ([`Engine::ribbon_rows_for`]). It delivers every row of that list,
+    /// and nothing is withheld. One row of the list not delivered — the
+    /// composed host's dropped far read — is withheld. A row outside the
+    /// focused pane (a stacked split's other pane) or past the grid is one
+    /// no host reads: not withheld, delivered or not.
+    #[test]
+    fn withheld_is_what_the_host_was_asked_for_and_did_not_deliver() {
+        let (mut eng, t) = typed_runs(&[3, 7, 11, 15]);
+        let blank: Vec<char> = "    ".chars().collect();
+        let deliver = |rows: &[u16]| {
+            rows.iter()
+                .map(|&row| RowSample { row, cols: &blank })
+                .collect::<Vec<_>>()
+        };
+        let withheld = |eng: &Engine| eng.withheld[..eng.withheld_n].to_vec();
+        let mut asked = [0u16; witness::WITNESS_ROWS + witness::ARMING_ROWS];
+        let n = eng.ribbon_rows_for(Some(19), &mut asked);
+        let asked = &asked[..n];
+        assert_eq!(
+            asked[n - 3..],
+            [19, 18, 20],
+            "fixture: the arming rows are asked for"
+        );
+        eng.follow_rows(&deliver(asked), asked, t);
+        assert_eq!(
+            withheld(&eng),
+            Vec::<u16>::new(),
+            "every row asked for came"
+        );
+        let far = asked[n - 1];
+        let without_far: Vec<u16> = asked.iter().copied().filter(|&r| r != far).collect();
+        eng.follow_rows(&deliver(&without_far), asked, t);
+        assert_eq!(withheld(&eng), vec![far], "one row asked for did not come");
+        // The focused pane is rows 0..=16: the arming rows lie outside it.
+        eng.set_pane_rows(Some((0, 17)));
+        let in_pane: Vec<u16> = asked.iter().copied().filter(|&r| r <= 16).collect();
+        eng.follow_rows(&deliver(&in_pane), asked, t);
+        assert_eq!(
+            withheld(&eng),
+            Vec::<u16>::new(),
+            "rows outside the pane are not withheld"
+        );
+        eng.follow_rows(&deliver(&without_far), asked, t);
+        assert_eq!(
+            withheld(&eng),
+            Vec::<u16>::new(),
+            "row 20 is outside the pane"
+        );
+        let inside = asked[0];
+        let without_inside: Vec<u16> = in_pane.iter().copied().filter(|&r| r != inside).collect();
+        eng.follow_rows(&deliver(&without_inside), asked, t);
+        assert_eq!(
+            withheld(&eng),
+            vec![inside],
+            "…and a row inside it still is"
+        );
+        eng.set_pane_rows(None);
+        let past = u16::try_from(geom().rows).expect("a small grid");
+        eng.follow_rows(&deliver(&[15]), &[15, past, past + 1], t);
+        assert_eq!(
+            withheld(&eng),
+            Vec::<u16>::new(),
+            "rows past the grid are not withheld"
         );
     }
 
@@ -6244,6 +6884,146 @@ mod tests {
             cold.fingerprint(),
             "the dark frames differ"
         );
+    }
+
+    /// One frame at `now`, read back as the `RainbowExitSampling` model sees
+    /// it: whether it put ANY light on glass, and whether the engine then asks
+    /// the host for another frame (a cadence or a named deadline).
+    fn exit_sample(eng: &mut Engine, now: Instant) -> (i64, i64) {
+        let mut sc = Scratch::default();
+        let mut fr = sc.frame();
+        eng.tick(now, geom(), &config(), &mut fr);
+        let fp = fr.fp;
+        let visible = fp != 0
+            || !sc.under.is_empty()
+            || !sc.out.is_empty()
+            || !sc.halos.is_empty()
+            || !sc.beams.is_empty();
+        let active = eng.needs_frame_cadence() || eng.next_change_deadline(now).is_some();
+        (i64::from(visible), i64::from(active))
+    }
+
+    /// A fault injected into the engine at the late observation's instant,
+    /// just before that frame runs — or none.
+    type ExitFault = fn(&mut Engine, Instant);
+
+    /// A real typing shape: drive it from a start instant, return its last key's.
+    type TypingShape = fn(&mut Engine, Instant) -> Instant;
+
+    /// The shipped engine, untouched.
+    fn no_exit_fault(_: &mut Engine, _: Instant) {}
+
+    /// The model's `Buggy = 1`, injected into the REAL engine: a lifecycle that
+    /// advances per CALLBACK rather than by time restarts every swoosh that ran
+    /// out unobserved at the first late observation
+    /// (`Ribbon::restart_unobserved_swooshes`), and the real frame then lays
+    /// the reach and arms the retract from there.
+    fn callback_relative_swoosh(eng: &mut Engine, late: Instant) {
+        eng.ribbon.restart_unobserved_swooshes(late);
+    }
+
+    /// Walk `model`'s whole space on the real engine, from three real typing
+    /// shapes (a single key, a slow three-key word, a 44-key flow run) and
+    /// three silences past the whole swoosh (5 s, 30 s, 10 min): the ribbon is
+    /// lit at the last key, logical time passes with NO callback, and ONE
+    /// late tick is observed — with `fault` injected into the engine at it.
+    fn exit_sampling_walk(
+        model: &aterm_spec::derive::Model,
+        fault: ExitFault,
+    ) -> Result<usize, String> {
+        let shapes: [(&str, TypingShape); 3] = [
+            ("one key", |eng, t0| {
+                blank_row(eng, 2);
+                eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+                tick_at(eng, t0);
+                type_key_at(eng, t0 + Duration::from_millis(100), 2)
+            }),
+            ("a slow word", three_typed_cells),
+            ("a flow run", |eng, t0| {
+                flow_run(eng, &mut Scratch::default(), t0, 44, 83);
+                t0 + Duration::from_millis(83) * 44
+            }),
+        ];
+        let mut observed = 0usize;
+        for (shape, type_it) in shapes {
+            for silence in [5u64, 30, 600] {
+                let at =
+                    |state: &aterm_spec::interp::State| format!("{shape}, {silence} s: {state:?}");
+                let mut eng = engaged();
+                let last = type_it(&mut eng, Instant::now());
+                let (visible, active) = exit_sample(&mut eng, last);
+                let lit = std::collections::BTreeMap::from([
+                    ("logical_done", 0),
+                    ("sampled", 0),
+                    ("visible", visible),
+                    ("active", active),
+                ]);
+                if lit != model.init_state() {
+                    return Err(format!(
+                        "the last key does not leave a live ribbon: {}",
+                        at(&lit)
+                    ));
+                }
+                // Logical time passes the whole grace + reach + retract with no
+                // callback at all: nothing on the engine moves.
+                let mut elapsed = lit.clone();
+                elapsed.insert("logical_done", 1);
+                if model.successors("ElapseDone", &lit) != vec![elapsed.clone()] {
+                    return Err(format!(
+                        "the silence is not the model's ElapseDone: {}",
+                        at(&lit)
+                    ));
+                }
+                // The first observation after it.
+                let late = last + Duration::from_secs(silence);
+                fault(&mut eng, late);
+                let (visible, active) = exit_sample(&mut eng, late);
+                let mut sampled = elapsed.clone();
+                sampled.insert("sampled", 1);
+                sampled.insert("visible", visible);
+                sampled.insert("active", active);
+                let expected = model.successors("ObserveDone", &elapsed);
+                if expected != vec![sampled.clone()] {
+                    return Err(format!(
+                        "real ObserveDone took {} to {sampled:?}, the model's ObserveDone to \
+                         {expected:?}",
+                        at(&elapsed)
+                    ));
+                }
+                observed += 1;
+            }
+        }
+        Ok(observed)
+    }
+
+    /// Tier-1 conformance for `RainbowExitSampling`
+    /// (`aterm_spec::derive::rainbow_exit_sampling_model`): the finger-lift
+    /// exit swoosh is a function of TIME, not of callbacks. A live ribbon whose
+    /// whole `grace + reach + retract + fade` passes with no frame at all is,
+    /// at the one late tick that finally comes, settled — nothing on glass and
+    /// nothing armed — on the REAL engine, for every typing shape and silence.
+    ///
+    /// NEGATIVE CONTROL: the model's `Buggy = 1` injected into the same real
+    /// engine — at the late observation, every swoosh that ran out unobserved
+    /// restarts there, as a lifecycle advanced per callback would — is refused
+    /// by the healthy model and is exactly what the buggy one describes, for
+    /// every shape and silence; the shipped, time-sampled engine is refused by
+    /// the buggy one.
+    #[test]
+    fn a_late_tick_samples_the_settled_exit_swoosh() {
+        let model = aterm_spec::derive::rainbow_exit_sampling_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let observed =
+            exit_sampling_walk(&model, no_exit_fault).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(observed, 9, "three typing shapes, three silences each");
+        let refused = exit_sampling_walk(&model, callback_relative_swoosh)
+            .expect_err("the healthy model must refuse a callback-relative swoosh");
+        assert!(refused.contains("real ObserveDone"), "{refused}");
+        exit_sampling_walk(&buggy, callback_relative_swoosh).unwrap_or_else(|why| {
+            panic!("the buggy model must describe the callback-relative swoosh: {why}")
+        });
+        exit_sampling_walk(&buggy, no_exit_fault)
+            .expect_err("the shipped engine must not conform to the callback-relative model");
     }
 
     /// The live (not retracting) ribbon cell at `(row, col)`.
@@ -8875,5 +9655,163 @@ mod tests {
             "the ^A's landing is the hand reaching a column, and the pool has it on \
              the tick the flight is born"
         );
+    }
+
+    /// **THE NEW LINE'S FIRST KEY, PRESSED BEFORE ITS ROW CHANGE WAS SEEN,
+    /// STARTS THE WALK AGAIN THROUGH THE ENGINE'S OWN REPLAY** (2026-09-23,
+    /// `ribbon::Ribbon::fresh_line` — the review's engine-level probe,
+    /// kept as the pin). Thirty keys on row 3 from column 2, then the key
+    /// that starts a new line — a main-screen Return ([`Event::Return`]) or
+    /// a composer's newline (this move-only fallback omits the shipped
+    /// key-time `ComposerNewline` event) —
+    /// the next glyph pressed and HELD, the box's `Licence::Return` move
+    /// `(3, 32) → (4, 2)` observed after it, and the glyph's echo: its sweep
+    /// on its press's clock and its one-cell typed move; then eighteen more
+    /// keys. The review's timings: the Return with the key at +40 ms and
+    /// the move seen at +60 ms, the newline with the key at +120 ms and the
+    /// move seen at +150 ms (Claude Code's repaint). Row 4 starts its walk
+    /// on the colour row 3 reached — `d0 = 0` — and every cell is the
+    /// pre-odometer mint's number bit for bit, `t_next + walk_t(col − 2)`,
+    /// `1/16` a cell on the fast leg.
+    ///
+    /// RED on the gate as first written (dated at the move's observation,
+    /// a later arming overwriting an earlier one): both carried row 3's
+    /// distance (`d0 = 30`) and stepped `1/36` from their first cell, while
+    /// the same keys pressed after the move — the CONTROLS, green then too
+    /// — started again. Whether a line restarted hung on repaint latency.
+    ///
+    /// THE SHAPE, CORRECTED 2026-09-23 (the audit of the gate): the
+    /// newline's move here is a TOP-anchored box's, which changes row.
+    /// Claude Code's box is bottom-anchored — its WRAP was captured
+    /// (`docs/measured/claude-code-composer-wrap-bytes-2026-09-21.md`) — and
+    /// a Shift+Enter is MODELLED as re-laying it the same way, the caret
+    /// homed on the SAME row (its own bytes were not captured); that shape
+    /// is pinned by `ribbon`'s
+    /// `a_new_line_after_a_same_row_composer_newline_continues_the_colour_on_the_fast_leg`
+    /// and, with bytes modelled on the captured wrap chunk, by
+    /// `tests/composer_box_growth_wrap.rs`.
+    #[test]
+    fn a_new_line_s_first_key_pressed_before_the_row_change_was_seen_starts_the_walk_again() {
+        fn key_on(eng: &mut Engine, t: Instant, row: u16, col: u16) -> Instant {
+            eng.on_event(typed(1), t);
+            tick_at(eng, t);
+            let echo = t + Duration::from_millis(8);
+            eng.on_event(
+                Event::Sweep {
+                    row,
+                    col0: col,
+                    col1: col + 1,
+                },
+                t,
+            );
+            eng.on_event(mv((row, col), (row, col + 1), Licence::Typed), echo);
+            tick_at(eng, echo);
+            echo
+        }
+        let ms = Duration::from_millis;
+        for (what, main_screen, key_ms, seen_ms) in [
+            ("a Return, key +40 ms, move seen +60 ms", true, 40, 60),
+            (
+                "a composer's newline, key +120 ms, move seen +150 ms",
+                false,
+                120,
+                150,
+            ),
+            (
+                "control: a Return, move seen +60 ms, key +80 ms",
+                true,
+                80,
+                60,
+            ),
+            (
+                "control: a newline, move seen +150 ms, key +170 ms",
+                false,
+                170,
+                150,
+            ),
+        ] {
+            let t0 = Instant::now();
+            let mut eng = engaged();
+            for row in 2..6 {
+                blank_row(&mut eng, row);
+            }
+            eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+            tick_at(&mut eng, t0);
+            let mut t = t0;
+            for col in 2..32u16 {
+                t = key_on(&mut eng, t + ms(60), 3, col);
+            }
+            let line = *eng
+                .ribbon()
+                .cohorts()
+                .iter()
+                .find(|k| k.row == 3 && !k.wake)
+                .expect("row 3's line");
+            assert_eq!(
+                (line.anchor_col, line.col1, line.d0),
+                (2, 32, 0.0),
+                "{what}: the premise, a cold thirty-cell line"
+            );
+            let t_next = line.t_at(32);
+            let gesture = t + ms(100);
+            eng.on_event(if main_screen { Event::Return } else { typed(1) }, gesture);
+            tick_at(&mut eng, gesture);
+            let key = gesture + ms(key_ms);
+            let seen = gesture + ms(seen_ms);
+            let press = |eng: &mut Engine| {
+                eng.on_event(typed(1), key);
+                tick_at(eng, key);
+            };
+            let observe = |eng: &mut Engine| {
+                eng.on_event(mv((3, 32), (4, 2), Licence::Return), seen);
+                tick_at(eng, seen);
+            };
+            if key < seen {
+                press(&mut eng);
+                observe(&mut eng);
+            } else {
+                observe(&mut eng);
+                press(&mut eng);
+            }
+            let echo = key.max(seen) + ms(50);
+            eng.on_event(
+                Event::Sweep {
+                    row: 4,
+                    col0: 2,
+                    col1: 3,
+                },
+                key,
+            );
+            eng.on_event(mv((4, 2), (4, 3), Licence::Typed), echo);
+            tick_at(&mut eng, echo);
+            let mut t = echo;
+            for col in 3..21u16 {
+                t = key_on(&mut eng, t + ms(60), 4, col);
+            }
+            let new_line = *eng
+                .ribbon()
+                .cohorts()
+                .iter()
+                .filter(|k| k.row == 4 && !k.wake)
+                .min_by_key(|k| k.anchor_col)
+                .expect("row 4's line");
+            assert_eq!(
+                (new_line.anchor_col, new_line.t0.to_bits(), new_line.d0),
+                (2, t_next.to_bits(), 0.0),
+                "{what}: row 4 continues the colour ({} against {t_next}) and starts its walk \
+                 (d0 {})",
+                new_line.t0,
+                new_line.d0
+            );
+            for col in 2..21u16 {
+                let want = t_next + ribbon::walk_t(f32::from(col - 2));
+                let got = eng.field_at(4, col);
+                assert_eq!(
+                    got.map(f32::to_bits),
+                    Some(want.to_bits()),
+                    "{what}: col {col} is {got:?}, the mint before the odometer laid {want}"
+                );
+            }
+        }
     }
 }

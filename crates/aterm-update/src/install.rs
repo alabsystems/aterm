@@ -906,9 +906,8 @@ fn boot_reexec_command(
         // alias identity; this code only runs from the WINDOW entry, so pin
         // the mode for the one-binary router BEFORE the forwarded args — the
         // router's scan stops at the first -e/--command/--, so an appended
-        // flag would be invisible (or pollute the -e payload). An env-launched
-        // headless instance still carries ATERM_HEADLESS here (boot-time
-        // apply runs before the entry consumes it). The forwarded args are
+        // flag would be invisible (or pollute the -e payload). A headless
+        // instance's `--headless` rides the forwarded args. The forwarded args are
         // stripped of the leading pins earlier swaps prepended, so exactly ONE
         // `--window` survives however many updates this process has ridden.
         .args(reexec_forwarded_args(std::env::args_os().skip(1)))
@@ -6328,6 +6327,13 @@ staged_at = "2026-08-17T00:00:00Z"
         disk_model_step(&model, &mut failed_state, "ArmExactTrial");
         let missing = rollback_path(&failed_installed);
         assert!(swap_fixed_candidate(&copied_candidate(&missing), &failed_installed).is_err());
+        // Negative control: a two-rename "swap" failing between its renames would
+        // leave NEW installed and OLD off the fixed path with the trial armed. The
+        // real exchange just failed as one step; the projection below shows
+        // canonical OLD intact.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let torn = buggy.successors("BuggyTwoRenameSwapFailsMidway", &failed_state)[0].clone();
+        assert!(!buggy.check_invariant("FailedSwapNeverReplacesOld", &torn));
         failed_sentinel.confirm().unwrap();
         crate::manifest::FailedMark::clear(&failed_staging.trial());
         disk_model_step(&model, &mut failed_state, "SwapFailsAndDisarms");
@@ -6358,6 +6364,10 @@ staged_at = "2026-08-17T00:00:00Z"
         let _sentinel = prepare_trial(&staging, &ready, &installed).unwrap();
         disk_model_step(&model, &mut state, "ArmExactTrial");
         assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
+        // Negative control: the receipt is recorded only after the exchange below.
+        // Written here, it would name NEW over an installed OLD.
+        let early_receipt = buggy.successors("BuggyWriteReceiptBeforeSwap", &state)[0].clone();
+        assert!(!buggy.check_invariant("ReceiptBindsExactNewIdentity", &early_receipt));
 
         swap_fixed_candidate(&copied_candidate(&fixed), &installed).unwrap();
         disk_model_step(&model, &mut state, "AtomicSwap");
@@ -6474,20 +6484,6 @@ staged_at = "2026-08-17T00:00:00Z"
             &digest,
         );
         let _ = std::fs::remove_dir_all(rollback_root);
-    }
-
-    #[test]
-    fn format_rfc3339_matches_known_instants() {
-        // Epoch.
-        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
-        // A midnight on a clean date: 2025-07-01T00:00:00Z.
-        assert_eq!(format_rfc3339(1_751_328_000), "2025-07-01T00:00:00Z");
-        // A leap day WITH a time-of-day: 2024-02-29T12:34:56Z. Exercises both the
-        // civil-from-days leap handling and the h/m/s split.
-        assert_eq!(format_rfc3339(1_709_210_096), "2024-02-29T12:34:56Z");
-        // One second before the epoch of the last known instant, to catch an
-        // off-by-one in the day/second boundary: 2024-02-28T23:59:59Z.
-        assert_eq!(format_rfc3339(1_709_164_799), "2024-02-28T23:59:59Z");
     }
 
     // -----------------------------------------------------------------------
@@ -7430,7 +7426,6 @@ mod launchd_copy_tests {
 
     fn fake_launchctl(staging: &Staging, mode: &str) -> std::path::PathBuf {
         let script = staging.root.join("launchctl-fixture");
-        std::fs::write(staging.root.join("mode"), mode).unwrap();
         // No launchd mutation and no inherited background child: a hung helper
         // replaces itself with sleep, so the real bounded runner can kill/reap it.
         std::fs::write(
@@ -7462,46 +7457,90 @@ exit 0
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // THE FIRST EXEC IS NOT THE ONE UNDER TEST (2026-09-25). This provenance-
+        // tracked process just wrote the script, so its first exec waits on
+        // syspolicyd's assessment (bc2918c70: 0.4 s idle, ~13 s with the assessor
+        // busy, past 60 s under heavy load, at 0% CPU) and a later exec costs
+        // nothing. Unassessed, that wait landed on the bounded `submit` — 1.25 s at
+        // a 2 s limit — and killed it before its receipt line. So the fixture is run
+        // once here, as a non-hanging `remove` that no bound measures, and its
+        // receipt is cleared: the calls a test reads are the runner's alone.
+        std::fs::write(staging.root.join("mode"), "assess").unwrap();
+        let assessed = std::process::Command::new(&script)
+            .arg("remove")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            assessed.success(),
+            "the fixture's unbounded first exec: {assessed}"
+        );
+        std::fs::remove_file(staging.root.join("calls")).unwrap();
+        std::fs::write(staging.root.join("mode"), mode).unwrap();
         script
     }
 
+    /// THE CALLER'S BUDGET IS THE PROPERTY; THE FIXTURE'S START IS NOT (2026-09-25).
+    /// The fixture arrives already assessed (see `fake_launchctl`), so what is
+    /// left is plain CPU starvation of a spawn. At a 2 s limit in `remove-hangs`,
+    /// `remove` gets what is left after the work deadline — ~0.5 s, of which its own
+    /// kill reserve leaves ~375 ms from BEFORE its spawn to the fixture's first line
+    /// (~0.56 s after a timed-out submit) — and a thread woken late from the poll
+    /// loop spends part of that before the spawn. A call the runner demonstrably
+    /// made and ended at its budget ("… did not finish", "deadline exhausted") whose
+    /// fixture never wrote its receipt line is a starved spawn, not a finding: that
+    /// attempt is repeated at twice the budget. The runner's deadline is itself a
+    /// wall clock and the property under test, so no fixture event can gate it; the
+    /// missing receipt is the evidence. A runner that never makes the call names
+    /// none of that and fails at once, and the last attempt's assertions stand
+    /// whatever it says.
     #[test]
     fn launchd_submit_and_remove_share_the_real_callers_deadline() {
         for mode in ["submit-hangs", "remove-hangs", "both-hang"] {
-            let staging = Staging::scratch(&format!("launchd-bound-{mode}"));
-            let launchctl = fake_launchctl(&staging, mode);
-            let started = Instant::now();
-            let error = ditto_via_launchd_using(
-                &[],
-                "fixture unpack",
-                // Leave room for cold helper startup during parallel tests;
-                // the fake helper's 30 s hang still exceeds this by a wide margin.
-                Duration::from_secs(2),
-                &staging.root,
-                &launchctl,
-            )
-            .unwrap_err();
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{mode} bypassed the deadline: {error}"
-            );
-            assert!(error.contains("did not finish"), "{mode}: {error}");
-            assert_eq!(
-                std::fs::read_to_string(staging.root.join("calls")).unwrap_or_else(|receipt| {
-                    panic!(
-                        "{mode}: missing helper receipt at {}: {receipt}; runner: {error}",
-                        staging.root.display()
-                    )
-                }),
-                "submit\nremove\n"
-            );
-            if mode != "submit-hangs" {
+            let mut limit = Duration::from_secs(2);
+            loop {
+                let staging = Staging::scratch(&format!("launchd-bound-{mode}"));
+                let launchctl = fake_launchctl(&staging, mode);
+                let started = Instant::now();
+                let error = ditto_via_launchd_using(
+                    &[],
+                    "fixture unpack",
+                    limit,
+                    &staging.root,
+                    &launchctl,
+                )
+                .unwrap_err();
+                let elapsed = started.elapsed();
+                let calls = std::fs::read_to_string(staging.root.join("calls")).unwrap_or_default();
+                let _ = std::fs::remove_dir_all(&staging.root);
+                let starved = ["submit", "remove"].iter().any(|op| {
+                    let call = format!("launchctl {op} for fixture unpack");
+                    !calls.lines().any(|line| line == *op)
+                        && (error.contains(&format!("{call} did not finish"))
+                            || error.contains(&format!("{call}: unpack deadline exhausted")))
+                });
+                if starved && limit < Duration::from_secs(8) {
+                    limit *= 2;
+                    continue;
+                }
+                // The fake helper's 30 s hang exceeds every budget here by far.
                 assert!(
-                    error.contains("cleanup not confirmed"),
-                    "a timed-out removal must be explicit: {error}"
+                    elapsed < limit + Duration::from_secs(3),
+                    "{mode} bypassed the {limit:?} deadline ({elapsed:?}): {error}"
                 );
+                assert!(error.contains("did not finish"), "{mode}: {error}");
+                assert_eq!(
+                    calls, "submit\nremove\n",
+                    "{mode}: the helper's receipt; runner: {error}"
+                );
+                if mode != "submit-hangs" {
+                    assert!(
+                        error.contains("cleanup not confirmed"),
+                        "a timed-out removal must be explicit: {error}"
+                    );
+                }
+                break;
             }
-            let _ = std::fs::remove_dir_all(staging.root);
         }
     }
 

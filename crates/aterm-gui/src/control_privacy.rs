@@ -407,6 +407,16 @@ impl ConsentState {
         }
     }
 
+    /// The census slot's generation, for the host's wake test.
+    #[cfg(test)]
+    pub(crate) fn census_generation_for_test(&self) -> u64 {
+        self.shared
+            .census
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
+    }
+
     /// Forget the census answer after the bundles on disk changed under it (a
     /// *Move to Trash*). A worker already out publishes nothing, and the next
     /// read dispatches a fresh one without waiting out the retry floor.
@@ -582,7 +592,7 @@ impl ConsentState {
 
     /// Synthetic cached verdict for host tests. Even a later refresh uses the
     /// inert function pointer, so this helper cannot contact the OS.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_cached_probe_for_test(probe: FdaProbe) -> Self {
         let mut state = Self::inert();
         state.probes.live = true;
@@ -717,6 +727,7 @@ fn identity_cell() -> &'static OnceLock<SigningIdentity> {
 /// Callers that need an identity string must treat `None` as "no identity to
 /// claim" and omit the claim, never substitute the release channel's id — that
 /// is the whole point of reading it (design §3.1 blast radius).
+#[cfg(target_os = "macos")]
 pub(crate) fn running_bundle_id() -> Option<&'static str> {
     signing_identity().bundle_id.as_deref()
 }
@@ -744,7 +755,7 @@ fn read_signing_identity() -> SigningIdentity {
         display_name,
         signing: identity.signing,
         team: identity.team,
-        dr: consent::classify_dr(&identity.dr_text),
+        dr: identity.dr,
         dr_text: identity.dr_text,
         dev_build: text.as_deref().map(plist_marks_dev_build),
     }
@@ -841,6 +852,9 @@ pub(crate) struct PrivacySnapshot {
     claimants: Option<(Claimants, Duration)>,
     /// No census answer exists yet — `census=pending`, as opposed to `off`.
     census_pending: bool,
+    /// Whether `/usr/bin/trash` is on this Mac: without it the Security panel
+    /// offers no move, and the note does not say it does.
+    trash_tool: bool,
 }
 
 /// The `covers=` / `uncovered=` / `unmeasured=` split — THREE buckets, because
@@ -1048,15 +1062,22 @@ impl PrivacySnapshot {
             ));
         }
         if !conflicting.is_empty() {
+            // The same rule the panel's button is drawn from, so the note never
+            // sends a reader to a button that is not there.
+            let remedy = if self.trash_tool && !census.offered_for_trash().is_empty() {
+                "Settings > Security lists it and offers to move the ad-hoc or unsigned \
+                 copies to the Trash"
+            } else {
+                "Settings > Security lists it"
+            };
             out.push(format!(
                 "note {}",
-                pct_encode(
+                pct_encode(&format!(
                     "another copy of this app on this disk has a different code requirement \
                      under the same bundle id; macOS keeps ONE requirement per bundle id and \
                      REPLACES it with whichever copy asks last, which resets the grant for \
-                     every copy; Settings > Security lists it and can move an ad-hoc or \
-                     unsigned copy to the Trash"
-                )
+                     every copy; {remedy}"
+                ))
             ));
         }
         out
@@ -1660,6 +1681,7 @@ impl App {
             folder_source: folder_source_token,
             claimants,
             census_pending,
+            trash_tool: crate::consent_retire::trash_tool_present(),
             observer_fda: observer_fda_value(probe.label),
             observer_responsible: observer_responsible_value(&answers),
             // The reset recipe is built from the RUNNING bundle id, never a
@@ -2447,6 +2469,7 @@ mod tests {
             // No census answer unless a test sets `claimants` itself.
             claimants: None,
             census_pending: false,
+            trash_tool: true,
             platform: "macos",
             os: Some("26.6.2".to_string()),
             identity: SigningIdentity {
@@ -2780,6 +2803,74 @@ mod tests {
             .find(|l| l.starts_with("note another%20copy"))
             .expect("the conflicting census explains itself");
         assert!(note.contains("REPLACES"), "{note}");
+        // The remedy is the panel's own rule, and it is the whole ending of the
+        // note: offered here (the tool is present and an ad-hoc copy sits
+        // beside a Developer-ID running one) …
+        let lists_only = pct_encode("every copy; Settings > Security lists it");
+        let offers = pct_encode(
+            "every copy; Settings > Security lists it and offers to move the ad-hoc or \
+             unsigned copies to the Trash",
+        );
+        assert!(note.ends_with(&offers), "{note}");
+        // … and without the tool the note only says the panel lists it.
+        let mut without_tool = snap.clone();
+        without_tool.trash_tool = false;
+        let listed = without_tool
+            .lines()
+            .into_iter()
+            .find(|l| l.starts_with("note another%20copy"))
+            .expect("the note");
+        assert!(listed.ends_with(&lists_only), "{listed}");
+        // … and with the tool but nothing offerable — the running copy is itself
+        // ad hoc, so a conflicting copy may be the real release — it lists only.
+        let mut unstable = snap.clone();
+        unstable.claimants = Some((
+            census_answer(vec![
+                claimant("/Applications/aterm.app", DrClass::Cdhash, "adhoc", true),
+                claimant("/Users//a/aterm-backup.app", DrClass::Cdhash, "adhoc", false),
+            ]),
+            Duration::from_millis(1),
+        ));
+        let listed = unstable
+            .lines()
+            .into_iter()
+            .find(|l| l.starts_with("note another%20copy"))
+            .expect("the note");
+        assert!(unstable.trash_tool, "the tool is present");
+        assert!(listed.ends_with(&lists_only), "{listed}");
+        // … and with the tool and a retirable copy that sits past the listed
+        // rows: the panel offers only what it lists, so the note lists only.
+        let mut past_the_rows = snap.clone();
+        let mut found = vec![claimant(
+            "/Applications/aterm.app",
+            DrClass::Identity,
+            "developer-id",
+            true,
+        )];
+        for i in 0..consent::MAX_CLAIMANT_ROWS {
+            found.push(claimant(
+                &format!("/Users//a/Old-{i}/aterm.app"),
+                DrClass::Identity,
+                "developer-id",
+                false,
+            ));
+        }
+        found.push(claimant(
+            "/Users//z/zz-adhoc.app",
+            DrClass::Cdhash,
+            "adhoc",
+            false,
+        ));
+        past_the_rows.claimants = Some((census_answer(found), Duration::from_millis(1)));
+        let listed = past_the_rows
+            .lines()
+            .into_iter()
+            .find(|l| l.starts_with("note another%20copy"))
+            .expect("the note");
+        assert!(
+            listed.ends_with(&lists_only),
+            "a copy past the listed rows is not offered: {listed}"
+        );
     }
 
     /// A lone install says `sole=yes` and adds nothing beyond the summary.

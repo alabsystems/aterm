@@ -734,11 +734,18 @@ fn a_wait_that_ends_inside_the_grace_is_never_announced_nor_answered() {
     let child = stream(fx.spawn(&["seed", "--wait-lock", "60"]));
     std::thread::sleep(Duration::from_millis(500));
     drop(guard);
-    let (status, elapsed, stdout, stderr) = child.finish(Duration::from_secs(20));
+    // `elapsed` runs from the spawn, so it also holds the first exec of a
+    // freshly linked `atpkg`, which macOS assesses before it runs: 0.2-3.5 s
+    // with peers building, 26 s once in a gate. The regression is waiting out
+    // the whole 60 s `--wait-lock`, so both bounds sit under THAT, not under
+    // the grace (it was the grace + 5 s — the load-sensitive test audit of
+    // 2026-09-27). The absent `lock-waiting:` line below is the child's own
+    // clock saying its wait ended inside the grace.
+    let (status, elapsed, stdout, stderr) = child.finish(Duration::from_secs(50));
     assert!(status.success(), "{status}; stderr: {stderr}");
     assert!(
-        elapsed < atpkg::lock::WAIT_ANNOUNCE_GRACE + Duration::from_secs(5),
-        "proceeded soon after the release: {elapsed:?}"
+        elapsed < Duration::from_secs(45),
+        "proceeded soon after the release, not at the 60 s bound: {elapsed:?}"
     );
     assert!(
         !stdout.iter().any(|l| l.starts_with(&waiting_line())),
@@ -849,9 +856,7 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
         "stdout: {stdout:?}; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("failed")
-            && stderr.contains("while this one waited")
-            && stderr.contains("(unavailable)"),
+        stderr.contains("the last update failed") && stderr.contains("(unavailable)"),
         "the holder's failure, in its own sentence: {stderr}"
     );
     assert!(

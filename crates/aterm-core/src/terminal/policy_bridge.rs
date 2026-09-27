@@ -18,10 +18,9 @@
 //! * When the policy has no matching rule (the engine falls through to
 //!   `defaults.unmatched`), the legacy `allow_*` boolean is authoritative.
 //!
-//! Eight capability-module `try_mint` paths implement this bridge:
-//! `modal_auth`, `response_capability`, `clipboard_auth` (write + query),
-//! `window_auth`, `multipart_file_auth`, `kitty_file_auth`, and
-//! `shell_integration_auth`. Every one follows the same three-step
+//! The capability modules that implement this bridge are
+//! `response_capability`, `clipboard_auth` (write + query), `window_auth`
+//! and `shell_integration_auth`. Every one follows the same three-step
 //! decision tree, so the logic is factored into [`engine_decision`] here
 //! to keep the sites auditable. Deny-by-default sinks that must not be
 //! reopened by a broad wildcard allow use

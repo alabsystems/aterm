@@ -274,23 +274,18 @@ fn resolve_candidate_face(
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    // The `display:` scheme resolves to embedded bytes, never a file read — the
-    // same interception every other resolution path performs.
-    let resolved = if let Some(bytes) = aterm_render::display_face_for_family(family.trim()) {
-        Ok(ResolvedCandidateFace {
-            path: family.trim().to_string(),
-            bytes: aterm_render::intern_font_bytes(bytes.to_vec()),
-        })
-    } else {
-        aterm_render::resolve_config_font(family).and_then(|path| {
-            aterm_render::font_file::read_font_file(std::path::Path::new(&path))
-                .map(|bytes| ResolvedCandidateFace {
-                    path,
-                    bytes: aterm_render::intern_font_bytes(bytes),
-                })
-                .map_err(|error| format!("font {family:?} could not be read ({error})"))
-        })
-    };
+    // `read_resolved_font`, never a bare file read: a `display:` face or a
+    // bundled one (`JetBrains Mono` on non-macOS, `bundled:…`) resolves to
+    // compiled-in bytes — the same interception every other resolution path
+    // performs.
+    let resolved = aterm_render::resolve_config_font(family).and_then(|path| {
+        aterm_render::read_resolved_font(&path)
+            .map(|bytes| ResolvedCandidateFace {
+                bytes: aterm_render::intern_font_bytes(bytes.into_owned()),
+                path,
+            })
+            .map_err(|error| format!("font {family:?} could not be read ({error})"))
+    });
     cache.insert(key, resolved.clone());
     resolved
 }
@@ -469,6 +464,7 @@ mod synthesized {
     use super::ChromeMetrics;
 
     /// Whether the pen draws `ch` itself when no loaded face covers it.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(super) const fn covers(ch: char) -> bool {
         matches!(ch, '\u{2139}' | '\u{23f8}')
     }
@@ -818,17 +814,7 @@ pub(crate) fn set_chrome_fonts(
             .and_then(|(bytes, index)| ChromeFace::from_bytes(bytes, *index))
     };
     let (p, b) = (parse(&primary), parse(&bold));
-    let mut fonts = lock_fonts();
-    install_chrome_faces_locked(&mut fonts, p, b, semantic);
-    // The service is owned by backend initialization, never demand-spawned by a
-    // semantic compile or paint. Candidate requests remain lazy, but the one
-    // parked worker already exists before a Settings view can ask for one.
-    if fonts.semantic_worker.is_none() {
-        fonts.semantic_worker = SemanticPrewarmWorker::spawn();
-    }
-    if let Some(worker) = fonts.semantic_worker.as_ref() {
-        worker.cancel_queued();
-    }
+    reload_chrome_fonts_locked(&mut lock_fonts(), p, b, semantic);
 }
 
 /// Fully parsed chrome/semantic font generation. Constructed by the font
@@ -856,13 +842,29 @@ pub(crate) fn prepare_chrome_fonts(
 }
 
 pub(crate) fn set_prepared_chrome_fonts(prepared: PreparedChromeFonts) {
-    let mut fonts = lock_fonts();
-    install_chrome_faces_locked(
-        &mut fonts,
+    reload_chrome_fonts_locked(
+        &mut lock_fonts(),
         prepared.primary,
         prepared.bold,
         prepared.semantic,
     );
+}
+
+/// One chrome-font reload on the locked context — the body [`set_chrome_fonts`]
+/// and [`set_prepared_chrome_fonts`] share, and `SemanticPrewarmGeneration`'s
+/// `Reload`. Installing the faces bumps the semantic generation; the job still
+/// queued for the superseded one is dropped in the same critical section, so
+/// the worker never parses a fork of a renderer that is gone.
+fn reload_chrome_fonts_locked(
+    fonts: &mut ChromeFonts,
+    primary: Option<ChromeFace>,
+    bold: Option<ChromeFace>,
+    semantic: Option<Renderer>,
+) {
+    install_chrome_faces_locked(fonts, primary, bold, semantic);
+    // The service is owned by backend initialization, never demand-spawned by a
+    // semantic compile or paint. Candidate requests remain lazy, but the one
+    // parked worker already exists before a Settings view can ask for one.
     if fonts.semantic_worker.is_none() {
         fonts.semantic_worker = SemanticPrewarmWorker::spawn();
     }
@@ -931,13 +933,89 @@ pub(crate) fn install_settled_chrome_fonts_for_test(mut renderer: Renderer) -> u
     fonts.semantic_ready_epoch
 }
 
+/// Drive the real request/result channel without a racing worker. The returned
+/// fixture runs the queued host warmup inline and publishes the result;
+/// production polling, epoch installation and retained rendering stay real.
+#[cfg(test)]
+pub(crate) fn install_pending_chrome_fonts_for_test(
+    renderer: Renderer,
+) -> PendingChromeFontsForTest {
+    let queue = Arc::new(SemanticPrewarmQueue {
+        semantic_job: Mutex::new(None),
+        ready: Condvar::new(),
+    });
+    let (tx, results) = std::sync::mpsc::channel();
+    let mut fonts = lock_fonts();
+    install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
+    fonts.semantic_worker = Some(SemanticPrewarmWorker {
+        queue: queue.clone(),
+        results,
+    });
+    PendingChromeFontsForTest { queue, tx }
+}
+
+#[cfg(test)]
+pub(crate) struct PendingChromeFontsForTest {
+    queue: Arc<SemanticPrewarmQueue>,
+    tx: std::sync::mpsc::Sender<SemanticPrewarmResult>,
+}
+
+#[cfg(test)]
+impl PendingChromeFontsForTest {
+    pub(crate) fn complete(&self) {
+        let job = self
+            .queue
+            .semantic_job
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a real font request");
+        assert!(
+            job.candidate.is_host(),
+            "fixture is for committed host fonts"
+        );
+        let mut base = job.base.expect("first request carries the committed seed");
+        base.prepare_semantic_typography(
+            "Input→present λ π √ ✓ 你好世界 日本語 한글 🚀 😀 🐈‍⬛ e\u{301}",
+        );
+        let (renderer, resolution) =
+            build_semantic_candidate(&base, &job.candidate, &mut CandidateFaceCache::new());
+        self.tx
+            .send(SemanticPrewarmResult {
+                generation: job.generation,
+                request: job.request,
+                candidate: job.candidate,
+                renderer,
+                resolution,
+                elapsed_ms: 0,
+            })
+            .unwrap_or_else(|_| panic!("the font context still owns its result channel"));
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingChromeFontsForTest {
+    fn drop(&mut self) {
+        // Libtest reuses worker threads. A disconnected manual worker must
+        // never prevent a later App from parking its real worker at startup.
+        let mut fonts = lock_fonts();
+        if fonts
+            .semantic_worker
+            .as_ref()
+            .is_some_and(|worker| Arc::ptr_eq(&worker.queue, &self.queue))
+        {
+            fonts.semantic_worker = None;
+            fonts.semantic_pending = None;
+        }
+    }
+}
+
 /// Test-only twin of [`install_settled_chrome_fonts_for_test`] that installs
 /// `renderer` exactly as production's [`set_chrome_fonts`] does — DORMANT, no
 /// warm-up — but parks no worker, so nothing can land through this store
 /// later. The seam for a test whose subject is a chain face landing OUTSIDE
 /// the store: the live terminal parsing a cell the seed shares.
-#[cfg(test)]
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn install_dormant_chrome_fonts_for_test(renderer: Renderer) -> u64 {
     let mut fonts = lock_fonts();
     install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
@@ -1211,6 +1289,14 @@ impl ChromeFonts {
         self.coverage = faces.into_iter().map(ChromeFace::from_font).collect();
     }
 
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativePreviewFontConvergence",
+            action = "Finish",
+            project = "aterm_gui::app_render::native_damage_tests::project_native_preview_font_convergence"
+        )
+    )]
     fn poll_semantic_renderer(&mut self) {
         let mut landed = Vec::new();
         if let Some(worker) = self.semantic_worker.as_ref() {
@@ -1467,6 +1553,14 @@ fn semantic_font_snapshot_locked(
     }
 }
 
+/// Observe a conformance fixture without requesting or polling a font job.
+#[cfg(test)]
+pub(crate) fn semantic_font_snapshot_for_test(
+    candidate: &crate::widget::SemanticFontCandidate,
+) -> SemanticFontSnapshot {
+    semantic_font_snapshot_locked(&lock_fonts(), candidate)
+}
+
 /// One captured semantic fork: `(candidate, ready_epoch, fork)` — the memo key
 /// followed by the renderer it produced (`None` when that key resolved to "no
 /// semantic font"). Named because the inline spelling trips
@@ -1607,8 +1701,9 @@ struct UiFontAssets {
     /// resolved semibold coords, so a pixel-space painter can instance the
     /// real wght-600 cut through `aterm_render::variation::varied_glyph_raster`
     /// instead of the static sibling. `None` for a static regular — and the
-    /// bytes are retained ONLY in the variable case (macOS's Helvetica Neue
-    /// collection is ~9 MB that nobody would read).
+    /// bytes are retained ONLY in the variable case, and never on macOS, whose
+    /// chrome has no strip band to read them.
+    #[cfg(not(target_os = "macos"))]
     variable_semibold: Option<UiVariableSemibold>,
 }
 
@@ -1619,7 +1714,7 @@ struct UiFontAssets {
 /// honest way to the Win11 "Segoe UI Variable Semibold" without pairing the
 /// variable file with itself (two wght-400 faces and no contrast).
 #[derive(Clone)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(not(target_os = "macos"))]
 pub(crate) struct UiVariableSemibold {
     /// The whole font file (ttf-parser borrows it per raster) — the SAME
     /// admission the regular face was parsed from, a file mapping when the
@@ -1640,6 +1735,7 @@ pub(crate) struct UiVariableSemibold {
 /// The CSS/OpenType weight the chrome's `UiBold` stands for (Fluent's
 /// "Semibold" — `seguisb.ttf` is 600 too, so the static and variable paths
 /// name the same weight).
+#[cfg(not(target_os = "macos"))]
 const UI_SEMIBOLD_WGHT: f32 = 600.0;
 
 /// Resolve [`UiVariableSemibold`] for a just-parsed regular, or `None` when the
@@ -1647,6 +1743,7 @@ const UI_SEMIBOLD_WGHT: f32 = 600.0;
 /// is visibly heavier than the regular (a face whose `wght` tops out near 400
 /// would hand `UiBold` a look-alike — the exact contrast loss the "never pair
 /// SegUIVar with itself" rule guards against, in another coat).
+#[cfg(not(target_os = "macos"))]
 fn variable_semibold_of(
     bytes: aterm_render::font::FaceBytes,
     index: u32,
@@ -1932,13 +2029,7 @@ fn resolve_ui_font_assets_with(files: &mut UiFontFiles) -> UiFontAssets {
         let semibold = parse_ui_font(files, &candidate.semibold_path, candidate.semibold_index);
         match (regular, semibold) {
             (Some((regular, bytes)), Some((semibold, _))) => {
-                let variable_semibold =
-                    variable_semibold_of(bytes, candidate.regular_index, &regular);
-                return UiFontAssets {
-                    regular: Some(regular),
-                    semibold: Some(semibold),
-                    variable_semibold,
-                };
+                return ui_font_assets(regular, Some(semibold), bytes, candidate.regular_index);
             }
             (Some(regular), None) if first_regular.is_none() => {
                 first_regular = Some((regular.0, regular.1, candidate.regular_index));
@@ -1951,14 +2042,40 @@ fn resolve_ui_font_assets_with(files: &mut UiFontFiles) -> UiFontAssets {
             // No static semibold anywhere: a variable regular can still
             // instance its own — the band's active label keeps its weight even
             // where `UiBold`'s fontdue slot falls back to the regular.
-            let variable_semibold = variable_semibold_of(bytes, index, &regular);
-            UiFontAssets {
-                regular: Some(regular),
-                semibold: None,
-                variable_semibold,
-            }
+            ui_font_assets(regular, None, bytes, index)
         }
         None => UiFontAssets::default(),
+    }
+}
+
+/// The resolved stack, with the variable semibold instanced from the regular's
+/// own bytes where a strip band will read it.
+#[cfg(not(target_os = "macos"))]
+fn ui_font_assets(
+    regular: Arc<ChromeFont>,
+    semibold: Option<Arc<ChromeFont>>,
+    bytes: aterm_render::font::FaceBytes,
+    index: u32,
+) -> UiFontAssets {
+    UiFontAssets {
+        variable_semibold: variable_semibold_of(bytes, index, &regular),
+        regular: Some(regular),
+        semibold,
+    }
+}
+
+/// macOS: no strip band instances a variable face, so the regular's bytes are
+/// released here rather than retained.
+#[cfg(target_os = "macos")]
+fn ui_font_assets(
+    regular: Arc<ChromeFont>,
+    semibold: Option<Arc<ChromeFont>>,
+    _bytes: aterm_render::font::FaceBytes,
+    _index: u32,
+) -> UiFontAssets {
+    UiFontAssets {
+        regular: Some(regular),
+        semibold,
     }
 }
 
@@ -2010,7 +2127,7 @@ pub(crate) fn warm_chrome_font_assets() {}
 /// seed swap moves the epoch, so the fold is a total key; the band then
 /// re-rasters once and the title moves from the cell lane into the band. The
 /// worker poll and the rung sync are a `try_recv` and a few atomic loads.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_font_epoch() -> u64 {
     let mut fonts = lock_fonts();
     fonts.poll_semantic_renderer();
@@ -2027,7 +2144,7 @@ pub(crate) fn strip_band_font_epoch() -> u64 {
 /// until it is — the first frames before `set_chrome_fonts` lands (and every
 /// unit test that never installs faces) keep the byte-identical cell strip
 /// instead of a half-pixel band whose labels would be mono anyway.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_ui_ready() -> bool {
     lock_fonts().ui_regular.is_some()
 }
@@ -2041,7 +2158,7 @@ pub(crate) fn strip_band_ui_ready() -> bool {
 /// face these bytes were parsed from (`Arc::ptr_eq` against the prepared
 /// asset), so a test seam or a future per-window face swap can never pair
 /// one file's cmap with another file's outlines.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
     let installed = lock_fonts().ui_regular.clone()?;
     prepared_ui_font_assets()
@@ -2064,7 +2181,7 @@ pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
 /// instead of vanishing from a proportional run. A CJK title takes that lane
 /// only until the terminal has parsed its chain face; it is then a band title
 /// like any other, on the cap-centred baseline rather than the cell's.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
     let mut fonts = lock_fonts();
     if fonts.ui_regular.is_none() {
@@ -2927,6 +3044,32 @@ impl Canvas {
         }
     }
 
+    /// A band icon ([`DrawPrim::BandIcon`]) in an `n`-pixel square at `(x, y)`
+    /// device pixels: the band's own coverage raster, fitted to a cap height
+    /// of about two thirds of the square and a stem of a ninth, blended in
+    /// `c` at each pixel's coverage.
+    fn band_icon(&mut self, x: f32, y: f32, size: f32, icon: aterm_render::BandIcon, c: [u8; 4]) {
+        let n = size.round().max(2.0) as usize;
+        let side = n as f32;
+        let metrics = aterm_render::procedural::IconMetrics {
+            baseline: (side * 0.84).round(),
+            cap: (side * 0.68).round(),
+            stem: (side / 9.0).round().max(1.0),
+            head: (side * 0.08).round(),
+        };
+        let coverage = aterm_render::procedural::band_icon_coverage(icon, n, n, metrics, false);
+        let (x0, y0) = (x.round() as i32, y.round() as i32);
+        for (row, line) in coverage.chunks(n).enumerate() {
+            for (col, &cov) in line.iter().enumerate() {
+                if cov == 0 {
+                    continue;
+                }
+                // `blend` clips to the canvas and the clip stack.
+                self.blend(x0 + col as i32, y0 + row as i32, c, f32::from(cov) / 255.0);
+            }
+        }
+    }
+
     fn disc(&mut self, cx: f32, cy: f32, r: f32, c: [u8; 4]) {
         let (x0, y0, x1, y1) = self.clipped_bounds(
             (cx - r - 1.0) as i32,
@@ -3606,33 +3749,9 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                     cv.round_rect(x * s, y * s, fw, h * s, r, *fill);
                 }
             }
-            DrawPrim::Dot {
-                cx, cy, r, color, ..
-            } => cv.disc(cx * s, cy * s, r * s, *color),
+            DrawPrim::Dot { cx, cy, r, color } => cv.disc(cx * s, cy * s, r * s, *color),
             DrawPrim::HsvDisk { cx, cy, r, value } => {
                 cv.hsv_disk(cx * s, cy * s, r * s, *value);
-            }
-            DrawPrim::Sparkline {
-                x,
-                y,
-                w,
-                h,
-                samples,
-                color,
-            } => {
-                let n = samples.len().max(1);
-                let bw = (w * s) / n as f32;
-                for (i, v) in samples.iter().enumerate() {
-                    let bh = (v.clamp(0.0, 1.0)) * h * s;
-                    cv.round_rect(
-                        x * s + i as f32 * bw,
-                        y * s + h * s - bh,
-                        (bw - 1.0).max(1.0),
-                        bh,
-                        1.0,
-                        *color,
-                    );
-                }
             }
             DrawPrim::Text {
                 x,
@@ -3685,6 +3804,13 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 width,
                 color,
             } => cv.line_segment((x1 * s, y1 * s), (x2 * s, y2 * s), width * s, *color),
+            DrawPrim::BandIcon {
+                x,
+                y,
+                size,
+                icon,
+                color,
+            } => cv.band_icon(x * s, y * s, size * s, *icon, *color),
             DrawPrim::ClipPush { .. } | DrawPrim::ClipPop => unreachable!("handled above"),
         }
     }
@@ -3738,6 +3864,35 @@ mod tests {
     use super::*;
     use crate::widget::DrawPrim;
     use aterm_render::Theme;
+
+    /// The Settings preview resolves a BUNDLED family (`JetBrains Mono` on a
+    /// non-macOS build, when none is installed) to its compiled-in bytes. It
+    /// used to hand the resolved `bundled:` identity to the filesystem and
+    /// report the owner's default font as unreadable.
+    #[test]
+    fn the_settings_preview_resolves_the_bundled_default_family() {
+        if !aterm_render::bundled::ACTIVE
+            || aterm_render::resolve_font_family(aterm_render::bundled::PRIMARY_FAMILY).is_some()
+        {
+            return;
+        }
+        let mut cache = CandidateFaceCache::new();
+        for (family, id) in [
+            ("JetBrains Mono", aterm_render::bundled::PRIMARY_ID),
+            (
+                "JetBrains Mono Bold",
+                aterm_render::bundled::PRIMARY_BOLD_ID,
+            ),
+        ] {
+            let face = resolve_candidate_face(family, &mut cache)
+                .unwrap_or_else(|error| panic!("{family}: {error}"));
+            assert_eq!(face.path, id);
+            assert_eq!(
+                &face.bytes[..],
+                aterm_render::bundled::face_for_id(id).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn chrome_font_store_is_cold_until_host_preparation_installs_ui_faces() {
@@ -4029,7 +4184,7 @@ mod tests {
     }
 
     /// A theme-derived spread of prims — three gauge rings, a capacity capsule, a
-    /// status dot, a throughput sparkline, and one funnelled text run — enough to
+    /// status dot, and one funnelled text run — enough to
     /// drive every core arm of the rasterizer without any live metrics source.
     fn demo_prims(cw: f32, ch: f32, theme: Theme) -> Vec<DrawPrim> {
         use crate::type_scale::TypeStep;
@@ -4076,15 +4231,6 @@ mod tests {
             cx: cw - 20.0,
             cy: 20.0,
             r: 4.0,
-            color: good,
-            breathe: false,
-        });
-        prims.push(DrawPrim::Sparkline {
-            x: 16.0,
-            y: ch - 28.0,
-            w: 80.0,
-            h: 12.0,
-            samples: vec![0.1, 0.5, 0.3, 0.9, 0.4],
             color: good,
         });
         prims
@@ -4741,6 +4887,197 @@ mod tests {
         assert!(fonts.semantic_prewarm_ms.is_some());
     }
 
+    /// TIER-1 (`SemanticPrewarmGeneration`, `Reload`): the shipping reload body
+    /// on a local font context whose stub worker queue still holds a job for the
+    /// generation the reload supersedes. The queue is read back off the worker:
+    /// `queued` is the queued job's generation, `current` the context's. The
+    /// same reload without its `cancel_queued` — the model's
+    /// `BuggyReloadKeepsQueued` — leaves the obsolete fork queued and is refused.
+    #[test]
+    fn chrome_font_reload_conforms_to_the_generation_queue_reset() {
+        let model = aterm_spec::derive::semantic_prewarm_generation_model();
+        let mut fonts = default_chrome_fonts();
+        fonts.semantic_generation = 1;
+        let queue = Arc::new(SemanticPrewarmQueue {
+            semantic_job: Mutex::new(Some(SemanticPrewarmJob {
+                generation: 1,
+                request: 1,
+                candidate: crate::widget::SemanticFontCandidate::default(),
+                base: None,
+            })),
+            ready: Condvar::new(),
+        });
+        let (_results_tx, results) = std::sync::mpsc::channel();
+        fonts.semantic_worker = Some(SemanticPrewarmWorker {
+            queue: Arc::clone(&queue),
+            results,
+        });
+        let observe = |fonts: &ChromeFonts| {
+            let mut state = model.init_state();
+            state.insert(
+                "current",
+                i64::try_from(fonts.semantic_generation).expect("small generation"),
+            );
+            let queued = queue
+                .semantic_job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map_or(0, |job| job.generation);
+            state.insert("queued", i64::try_from(queued).expect("small generation"));
+            state
+        };
+        let before = observe(&fonts);
+        let mut requested = model.init_state();
+        assert!(model.fire("Request", &mut requested));
+        assert_eq!(before, requested, "one job queued for the live generation");
+
+        reload_chrome_fonts_locked(&mut fonts, None, None, None);
+        let after = observe(&fonts);
+        assert_eq!(
+            model.successors("Reload", &before),
+            vec![after.clone()],
+            "the shipping reload is the model's Reload"
+        );
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, &after),
+                "{}",
+                invariant.name
+            );
+        }
+
+        // Negative control: the same reload with the cancel lost.
+        let mut kept = after;
+        kept.insert("queued", before["queued"]);
+        assert!(!model.successors("Reload", &before).contains(&kept));
+        assert!(!model.check_invariant("QueueContainsOnlyCurrent", &kept));
+    }
+
+    /// TIER-1 (`SemanticPrewarmHandshake`, the slot half of `DecideResult`).
+    /// The integration bind (`tests/semantic_prewarm_conformance.rs`) holds the
+    /// pure `semantic_prewarm_result_decision`; this one holds what
+    /// `poll_semantic_renderer` DOES with it. Every point of the identity ×
+    /// readiness × active-slot lattice lands one result through the real poll,
+    /// fed from a stub worker channel, and the active slot is read back off
+    /// `ChromeFonts`: `active_after` is whether a renderer paints,
+    /// `active_after_latest` whether it is the requested candidate's. Remove
+    /// `self.semantic = None` from the `FailClosedCurrent` arm — the model's
+    /// `BuggyFailClosedKeepsPrevious` — and the exact-current failure rows with
+    /// an active renderer fail; drop the `semantic_identity` line from the
+    /// `InstallCurrent` arm (`BuggyInstallKeepsStaleIdentity`), or open the
+    /// `CacheSuperseded` arm with `cache_active_semantic()`
+    /// (`BuggyCacheParksActive`), and the install or superseded rows fail.
+    #[test]
+    fn semantic_prewarm_poll_conforms_to_the_handshake_slot_effects() {
+        let model = aterm_spec::derive::semantic_prewarm_handshake_model();
+        let renderer = || {
+            let mut renderer = Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                14.0,
+                aterm_render::Theme::default(),
+            )
+            .expect("embedded renderer");
+            renderer.set_runtime_font_discovery(false);
+            renderer
+        };
+        let requested = crate::widget::SemanticFontCandidate {
+            regular: Some("Requested Candidate 51A7".to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        let older = crate::widget::SemanticFontCandidate {
+            regular: Some("Older Candidate 0B3E".to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        let mut rows = 0;
+        let mut failed_closed_over_active = 0;
+        for generation_matches in [false, true] {
+            for request_matches in [false, true] {
+                for candidate_matches in [false, true] {
+                    for renderer_ready in [false, true] {
+                        for (active_before, active_before_latest) in
+                            [(false, false), (true, false), (true, true)]
+                        {
+                            let mut fonts = default_chrome_fonts();
+                            fonts.semantic_generation = 2;
+                            fonts.semantic_request = 2;
+                            fonts.semantic_requested = requested.clone();
+                            // A landed candidate: an install caches it rather
+                            // than carrying it as the dormant host seed.
+                            fonts.semantic_prewarm_ms = Some(1);
+                            if active_before {
+                                fonts.semantic = Some(renderer());
+                                fonts.semantic_identity = Some(if active_before_latest {
+                                    requested.clone()
+                                } else {
+                                    older.clone()
+                                });
+                            }
+                            let (results_tx, results) = std::sync::mpsc::channel();
+                            fonts.semantic_worker = Some(SemanticPrewarmWorker {
+                                queue: Arc::new(SemanticPrewarmQueue {
+                                    semantic_job: Mutex::new(None),
+                                    ready: Condvar::new(),
+                                }),
+                                results,
+                            });
+                            results_tx
+                                .send(SemanticPrewarmResult {
+                                    generation: if generation_matches { 2 } else { 1 },
+                                    request: if request_matches { 2 } else { 1 },
+                                    candidate: if candidate_matches {
+                                        requested.clone()
+                                    } else {
+                                        older.clone()
+                                    },
+                                    renderer: renderer_ready.then(renderer),
+                                    resolution: SemanticFontResolution::Ready,
+                                    elapsed_ms: 0,
+                                })
+                                .expect("stub worker channel");
+                            fonts.poll_semantic_renderer();
+
+                            let mut before = model.init_state();
+                            for (on, action) in [
+                                (generation_matches, "MarkGenerationCurrent"),
+                                (request_matches, "MarkRequestCurrent"),
+                                (candidate_matches, "MarkCandidateCurrent"),
+                                (renderer_ready, "MarkRendererReady"),
+                                (active_before && !active_before_latest, "MarkActiveBefore"),
+                                (active_before_latest, "MarkActiveBeforeLatest"),
+                            ] {
+                                if on {
+                                    assert!(model.fire(action, &mut before), "{action}");
+                                }
+                            }
+                            let modeled = model.successors("DecideResult", &before)[0].clone();
+                            let active_after = fonts.semantic.is_some();
+                            let latest = active_after
+                                && fonts.semantic_identity.as_ref() == Some(&requested);
+                            assert_eq!(
+                                (modeled["active_after"], modeled["active_after_latest"]),
+                                (i64::from(active_after), i64::from(latest)),
+                                "the poll's active slot diverged from DecideResult at \
+                                 generation={generation_matches} request={request_matches} \
+                                 candidate={candidate_matches} ready={renderer_ready} \
+                                 active={active_before} latest={active_before_latest}"
+                            );
+                            if modeled["decision"] == 3 && active_before {
+                                failed_closed_over_active += 1;
+                            }
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 48);
+        assert_eq!(
+            failed_closed_over_active, 2,
+            "the fail-closed arm is judged over a live renderer, not only an empty slot"
+        );
+    }
+
     #[test]
     fn rapid_candidate_replacement_carries_base_and_cached_views_do_not_cross_contaminate() {
         let mut renderer = Renderer::from_bytes(
@@ -5262,7 +5599,6 @@ mod tests {
                 h: 16.0,
                 radius: 0.0,
                 fill: [0, 255, 0, 255],
-                blur: false,
             },
             DrawPrim::ClipPop,
         ];
@@ -5348,7 +5684,6 @@ mod tests {
             h: h as f32,
             radius: 0.0,
             fill: [21, 24, 31, 255],
-            blur: false,
         }];
         prims.extend(demo_prims(w as f32, h as f32, Theme::default()));
         prims.extend([
@@ -5365,7 +5700,6 @@ mod tests {
                 h: 30.0,
                 radius: 5.0,
                 fill: [230, 90, 75, 255],
-                blur: false,
             },
             DrawPrim::ClipPop,
         ]);
@@ -5443,7 +5777,6 @@ mod tests {
                     h: logical_height as f32,
                     radius: 0.0,
                     fill: [17, 21, 29, 255],
-                    blur: false,
                 },
                 DrawPrim::Panel {
                     x: 30.0,
@@ -5452,7 +5785,6 @@ mod tests {
                     h: 30.0,
                     radius: 6.0,
                     fill,
-                    blur: false,
                 },
             ]
         };
@@ -5600,7 +5932,6 @@ mod tests {
             h: ch,
             radius: 16.0,
             fill: [24, 27, 33, 0xC4],
-            blur: true,
         }];
         prims.extend(demo_prims(cw, ch, Theme::default()));
         let (px, pw, ph) = rasterize_tray(&prims, cw as u32, ch as u32, 2.0, [13, 15, 20, 255]);
@@ -5674,7 +6005,6 @@ mod tests {
                 h: ch,
                 radius: 16.0,
                 fill: [panel[0], panel[1], panel[2], 0xF0],
-                blur: true,
             }];
             prims.extend(demo_prims(cw, ch, theme));
             let (px, pw, ph) = rasterize_tray(&prims, cw as u32, ch as u32, scale, backdrop);

@@ -225,16 +225,13 @@ impl AnimalBaker {
     }
 
     /// Monotonic bake/clear counter — fold it into the frame fingerprint.
+    #[cfg(test)]
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Resident tile count (`≤ MAX_SLOTS`).
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-
     /// Whether the cache holds no tiles.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -242,6 +239,7 @@ impl AnimalBaker {
     /// Resident texel bytes (`≤ MAX_ATLAS_BYTES`) — the residency-bound proof
     /// hook, same as the pet's.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn resident_bytes(&self) -> usize {
         self.bytes
     }

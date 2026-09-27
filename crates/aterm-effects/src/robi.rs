@@ -148,7 +148,7 @@ pub fn body_size_px(geom: &EffectGeom) -> (u16, u16) {
 /// Place a `w × h` body at an evaluated frame's anchor: the dest rect
 /// `(x0, x1, y0, y1)` (right/bottom exclusive, grid px) — top from the
 /// anchor fraction ([`FEET_FRAC`] / [`GRIP_FRAC`]), `frame.x` a CENTER.
-/// Split from [`body_px`] because the emitter must place the RESOLVED tile
+/// Split from `body_px` because the emitter must place the RESOLVED tile
 /// with the same law — on a bake miss that is `robi_last_body` at the
 /// PREVIOUS size, the one accepted transient.
 #[must_use]
@@ -169,6 +169,7 @@ pub fn body_rect_px(frame: &RobiFrame, w: u16, h: u16) -> (i32, i32, i32, i32) {
 /// the same frames the emitter draws nothing for, which is what clears a
 /// host's stashed hit-box.
 #[must_use]
+#[cfg(test)]
 pub fn body_px(frame: &RobiFrame, geom: &EffectGeom) -> Option<(i32, i32, i32, i32)> {
     if frame.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
         return None;

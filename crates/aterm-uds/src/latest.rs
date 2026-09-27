@@ -37,7 +37,7 @@ fn sock_name_pid(sock_name: &str) -> Option<u32> {
 /// The token filename that authenticates the socket named `sock_name`, and the
 /// one name the server writes beside it: a per-instance socket
 /// (`aterm-<pid>.sock`) pairs with its `aterm-<pid>.token`; **everything else**
-/// — an EXPLICIT custom `$ATERM_CONTROL_SOCK` path — pairs with its OWN
+/// — an EXPLICIT custom `--control-sock` path — pairs with its OWN
 /// filename plus `.token` (`a.sock` → `a.sock.token`), prefixed `aterm-sock-`
 /// when the name does not end in `.sock` so it can never land on the reserved
 /// `aterm.token` / `aterm-<pid>.token` names.

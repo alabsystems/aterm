@@ -234,6 +234,137 @@ pub(crate) fn arm(facts: ArmFacts) -> ArmDecision {
     ArmDecision::Set(facts.incoming_build)
 }
 
+/// What the lane knows, at one look, about a STRUCTURAL latch — automatic
+/// apply converged on build N's bytes after two handoffs the bytes answered
+/// for (gap 14, 2026-09-26). The host owns the clock, the disk and the boot
+/// sentinel; this is the decision over what they said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StructuralLatchFacts {
+    /// The latch's ONE re-sample is still owed and its deadline, a day after
+    /// convergence, has passed.
+    pub(crate) resample_due: bool,
+    /// The latch's ONE re-sample is still owed, due or not: the convergence
+    /// notice is promising it ("it tries again by itself in 24 h").
+    pub(crate) resample_owed: bool,
+    /// A verified download strictly newer than the latched build that has not
+    /// yet had an attempt, if one is on disk.
+    pub(crate) unspent_newer_download: Option<u64>,
+    /// Whether one more launch of the latched build keeps its boot trial under
+    /// the revert threshold: `Some(false)` when that launch would be the one
+    /// `check_boot_health` reverts on, `None` when the sentinel's count has not
+    /// been measured yet.
+    pub(crate) trial_room: Option<bool>,
+}
+
+/// The answer [`structural_latch`] gives. `resample` and `newer` name what
+/// earned the attempt; ONE attempt answers both, and either verdict spends
+/// whatever earned it, so a day and a newer release arriving together cost one
+/// park, not two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StructuralLatchDecision {
+    /// Nothing new: the latch stands as it is.
+    Hold,
+    /// Release the latch for ONE automatic attempt.
+    Release { resample: bool, newer: Option<u64> },
+    /// The attempt is earned, but it would be the launch the boot trial
+    /// reverts on: the latch stays, loses its deadline, and the host SAYS so.
+    /// The hold spends the re-sample too, due or not — every launch left is
+    /// the reverting one, so a later look could only say the same again. Also
+    /// the answer with nothing earned (`resample: false, newer: None`) when the
+    /// first count that shows no room finds the re-sample still owed: the
+    /// promise is withdrawn then, not a day later.
+    HoldForTrial { resample: bool, newer: Option<u64> },
+    /// The attempt is earned and the trial has not been measured: decide again
+    /// at the next observation, spending nothing.
+    Unmeasured,
+}
+
+/// THE STRUCTURAL LATCH'S WAY OUT (gap 14, 2026-09-26).
+///
+/// A structural convergence used to be `retry_at: None`, and on the installed
+/// ACTIVATION — where every launched-lane failure lands — nothing automatic
+/// ever moved it: the activation outranks every newer download while the
+/// bundle is newer than this process, so every later release waited for a
+/// person. Two events now earn the latch one more automatic attempt: its one
+/// re-sample coming due a day after convergence, and a verified download
+/// strictly newer than the latched build arriving (the activation's successor
+/// applies that newer stage on its own terms, so this attempt is the one lane
+/// that can carry it here). A day is long enough that the machine, the page
+/// cache and whatever else the proof ran into have all moved; one is all a
+/// verdict confirmed twice is worth.
+///
+/// Never at the boot trial's expense: a structural `ChildDied` keeps its
+/// counted launch, so after two of them the next launch of the build is the
+/// one the sentinel reverts on. An automatic attempt must not be what spends
+/// it — that is the promise `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS <
+/// MAX_BOOT_ATTEMPTS` makes — so an earned attempt the trial cannot afford is
+/// held, and said. Nor is a retry PROMISED past the trial (gap 14 review,
+/// 2026-09-26): convergence promises the day's re-sample before any count has
+/// been read, so the first look whose count rules it out withdraws it and says
+/// so, instead of the notice promising it for a day.
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "NativeUpdateStructuralLatch",
+        action = "Decide",
+        project = "aterm_gui::native_updater_conformance::project_structural_latch"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "TrialHasRoom",
+        reason = "The boot sentinel's measured count, read on the updater facts worker (`InstalledUpdate::trial_launches`); an input to this decision, not a transition of the shipping reducer."
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "TrialIsSpent",
+        reason = "The boot sentinel's measured count at the revert threshold; an input to this decision, not a transition of the shipping reducer."
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "DayPasses",
+        reason = "The monotonic clock passing the re-sample deadline; the host reads it into `resample_due`."
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "NewerArrives",
+        reason = "The checker staging a verified newer download on disk; the host reads it into `unspent_newer_download`."
+    )
+)]
+#[must_use]
+pub(crate) fn structural_latch(facts: StructuralLatchFacts) -> StructuralLatchDecision {
+    let resample = facts.resample_due;
+    let newer = facts.unspent_newer_download;
+    if !resample && newer.is_none() {
+        // Nothing earned — but a re-sample still promised on a trial measured
+        // with no room is a promise nothing will keep.
+        return if facts.resample_owed && facts.trial_room == Some(false) {
+            StructuralLatchDecision::HoldForTrial {
+                resample: false,
+                newer: None,
+            }
+        } else {
+            StructuralLatchDecision::Hold
+        };
+    }
+    match facts.trial_room {
+        None => StructuralLatchDecision::Unmeasured,
+        Some(false) => StructuralLatchDecision::HoldForTrial { resample, newer },
+        Some(true) => StructuralLatchDecision::Release { resample, newer },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PollFacts {
     pub(crate) enabled: bool,
@@ -312,6 +443,7 @@ pub(crate) fn poll(facts: PollFacts) -> PollDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttemptResult {
     Accepted,
+    #[cfg(any(unix, test))]
     InstalledNeedsRelaunch,
     Blocked,
     Failed,
@@ -330,9 +462,9 @@ pub(crate) enum AttemptDisposition {
 #[must_use]
 pub(crate) fn finish(result: AttemptResult) -> AttemptDisposition {
     match result {
-        AttemptResult::Accepted | AttemptResult::InstalledNeedsRelaunch => {
-            AttemptDisposition::Complete
-        }
+        AttemptResult::Accepted => AttemptDisposition::Complete,
+        #[cfg(any(unix, test))]
+        AttemptResult::InstalledNeedsRelaunch => AttemptDisposition::Complete,
         AttemptResult::Blocked => AttemptDisposition::Retry,
         AttemptResult::Failed => AttemptDisposition::ManualOnly,
     }

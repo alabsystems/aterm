@@ -81,9 +81,9 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
         // covering 103 packages / 1,489,245 LOC against a cell holding 101 /
         // 1,487,430. The check was right; the arithmetic was wrong.
         //
-        // This is the same class of error `measured::MAC_ARM_DOMINATORS`
-        // records for `loc::package_dir` (measuring our facade as upstream's
-        // crate): first-party lines counted as third-party surface. Both
+        // This is the same class of error as measuring our facade as
+        // upstream's crate (`loc::package_dir`): first-party lines counted as
+        // third-party surface. Both
         // directions of it flatter the campaign, so both are worth a comment.
         //
         // A package with no `facts` entry is counted IN, unchanged: that is a

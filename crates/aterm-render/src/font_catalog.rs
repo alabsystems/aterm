@@ -243,6 +243,15 @@ impl Catalog {
                 results[index] = Some(Err("empty font name or path".to_string()));
             } else if trimmed.contains(['/', '\\']) {
                 results[index] = Some(Ok(PathBuf::from(trimmed)));
+            } else if crate::bundled::is_identity(trimmed)
+                && let Some((id, _)) = crate::bundled::face_for_family(trimmed)
+            {
+                // A bundled IDENTITY is compiled-in (see
+                // `resolve_and_admit_in_dirs`): never a name for the filename /
+                // name-table passes to hunt for. A bundled family NAME is hunted
+                // like any other and falls back to the bundled face below only
+                // when nothing installed answers (`resolve_family_or_bundled`).
+                results[index] = Some(Ok(PathBuf::from(id)));
             } else {
                 let normalized = normalize_family(trimmed);
                 if normalized.is_empty() {
@@ -341,7 +350,9 @@ impl Catalog {
         for (want, indexes) in wants {
             for index in indexes {
                 if results[index].is_none() {
-                    results[index] = prefix_hits.get(&want).cloned().map(Ok).or_else(|| {
+                    let bundled = crate::bundled::face_for_family(requests[index].trim())
+                        .map(|(id, _)| PathBuf::from(id));
+                    results[index] = prefix_hits.get(&want).cloned().or(bundled).map(Ok).or_else(|| {
                         Some(Err(if truncated {
                             format!(
                                 "{:?} was not found before bounded font discovery exhausted {:?}",
@@ -439,6 +450,7 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
     let need_catalog = requests.iter().take(limits.max_requests).any(|request| {
         !request.trim().contains(['/', '\\'])
             && crate::display_face_for_family(request.trim()).is_none()
+            && !crate::bundled::is_identity(request)
     });
     let mut catalog = if need_catalog {
         Catalog::scan(dirs, limits)
@@ -460,12 +472,25 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
             // The `display:` scheme resolves to embedded bytes ahead of the system
             // catalogue — the exact interception `from_system_with_family`
             // performs at startup, so the two paths cannot disagree.
+            //
+            // A bundled face (`JetBrains Mono` on non-macOS, when nothing
+            // installed answers the name) resolved to its virtual identity, and
+            // is admitted from its compiled-in bytes under that identity so the
+            // renderer built from this entry finds its Bold/Italic siblings.
             let result = match crate::display_face_for_family(requested.trim()) {
                 Some(bytes) => Ok(AdmittedFont {
                     path: requested.trim().to_string(),
                     bytes: Arc::new(bytes.to_vec()),
                 }),
-                None => result.and_then(|path| catalog.admit(&path)),
+                None => result.and_then(|path| {
+                    match path.to_str().and_then(crate::bundled::face_for_id) {
+                        Some(bytes) => Ok(AdmittedFont {
+                            path: path.to_string_lossy().into_owned(),
+                            bytes: Arc::new(bytes.to_vec()),
+                        }),
+                        None => catalog.admit(&path),
+                    }
+                }),
             };
             Entry { requested, result }
         })
@@ -507,6 +532,28 @@ impl FontFilesMemo {
 static FONT_FILES_MEMOS: std::sync::Mutex<Vec<FontFilesMemo>> = std::sync::Mutex::new(Vec::new());
 const MAX_FONT_FILES_MEMOS: usize = 8;
 
+/// One walk gate per root list ([`memoized_font_files_walked`]'s single-flight).
+/// Bounded like the memos; clearing it only forfeits single-flight for a walk
+/// already in progress, never correctness.
+type WalkGate = std::sync::Arc<std::sync::Mutex<()>>;
+static FONT_WALK_GATES: std::sync::Mutex<Vec<(Vec<PathBuf>, WalkGate)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn walk_gate(roots: &[PathBuf]) -> WalkGate {
+    let mut gates = FONT_WALK_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, gate)) = gates.iter().find(|(r, _)| r == roots) {
+        return gate.clone();
+    }
+    if gates.len() >= MAX_FONT_FILES_MEMOS {
+        gates.clear();
+    }
+    let gate = WalkGate::default();
+    gates.push((roots.to_vec(), gate.clone()));
+    gate
+}
+
 /// [`system_font_files`] over an explicit root list, remembered per process.
 ///
 /// A hit costs one `stat` per directory the last walk visited (a few dozen on
@@ -533,20 +580,32 @@ fn memoized_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// take the real tree's first walk inside another test's window, so a global
 /// count is a flake, while this answer is exact for the root list asked about.
 fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
-    {
+    let remembered = || {
         let memos = FONT_FILES_MEMOS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(memo) = memos.iter().find(|m| m.roots == roots)
-            && memo.current()
-        {
-            return (memo.files.clone(), false);
-        }
+        memos
+            .iter()
+            .find(|m| m.roots == roots)
+            .filter(|m| m.current())
+            .map(|m| m.files.clone())
+    };
+    if let Some(files) = remembered() {
+        return (files, false);
     }
-    // Walk OUTSIDE the lock: another thread asking for a different root list
-    // (or the same one — a duplicate walk is only wasted work, never a wrong
-    // answer, and the second publish simply replaces the first) must not wait
-    // behind this one.
+    // SINGLE-FLIGHT per root list: the broad and symbol chain builders run on
+    // two threads at once at every launch, and each used to miss the memo and
+    // walk the whole tree — the same tree, twice. The second caller now waits
+    // on the first walk's gate and is answered from its memo. The walk itself
+    // still runs OUTSIDE the memo lock, so a caller asking for a DIFFERENT
+    // root list (tests walk private fixture roots) never waits behind it.
+    let gate = walk_gate(roots);
+    let _in_flight = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(files) = remembered() {
+        return (files, false);
+    }
     let catalog = Catalog::scan(roots, Limits::default());
     let mut memos = FONT_FILES_MEMOS
         .lock()
@@ -684,6 +743,39 @@ mod tests {
         std::fs::remove_dir_all(absent_root).unwrap();
     }
 
+    /// SINGLE-FLIGHT: the broad and symbol chain builders ask for the same
+    /// tree on two threads at the same instant at every launch. Before the
+    /// walk gate both missed the memo and both walked (measured with `strace`:
+    /// every font directory opened twice). Now exactly one concurrent caller
+    /// walks and the rest are answered from its memo, with the same list.
+    #[test]
+    fn concurrent_asks_for_one_tree_walk_it_once() {
+        let root = fixture("single-flight");
+        for i in 0..64 {
+            let dir = root.join(format!("d{i:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.ttf"), b"f").unwrap();
+        }
+        let roots = vec![root.clone()];
+        let start = std::sync::Barrier::new(8);
+        let answers: Vec<(Vec<PathBuf>, bool)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        start.wait();
+                        memoized_font_files_walked(&roots)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let walks = answers.iter().filter(|(_, walked)| *walked).count();
+        assert_eq!(walks, 1, "{walks} concurrent callers walked the same tree");
+        assert!(answers.iter().all(|(files, _)| files.len() == 64));
+        assert!(answers.windows(2).all(|w| w[0].0 == w[1].0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn one_scan_resolves_duplicates_and_shares_admitted_bytes() {
         let root = fixture("batch");
@@ -697,6 +789,51 @@ mod tests {
         assert_eq!(first.path, path.to_string_lossy());
         assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
         assert_eq!(batch.stats.dirs, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A bundled family NAME yields to an INSTALLED face of that name (so a
+    /// variable `JetBrainsMono[wght].ttf` keeps its weight axis), and falls back
+    /// to the compiled-in face only when nothing installed answers; the
+    /// `bundled:` IDENTITY always means the compiled-in face.
+    #[test]
+    fn an_installed_face_wins_a_bundled_family_name_and_the_identity_never_yields() {
+        if !crate::bundled::ACTIVE {
+            return;
+        }
+        let root = fixture("bundled-name");
+        let installed = root.join("JetBrainsMono-Regular.ttf");
+        std::fs::write(&installed, b"installed jetbrains mono").unwrap();
+        let requests = vec![
+            "JetBrains Mono".to_string(),
+            crate::bundled::PRIMARY_ID.to_string(),
+        ];
+        let batch =
+            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
+        let by_name = batch.get(0).unwrap().as_ref().unwrap();
+        assert_eq!(by_name.path, installed.to_string_lossy(), "installed wins");
+        assert_eq!(&by_name.bytes[..], b"installed jetbrains mono");
+        let by_id = batch.get(1).unwrap().as_ref().unwrap();
+        assert_eq!(by_id.path, crate::bundled::PRIMARY_ID);
+
+        // Nothing installed: the NAME resolves to the compiled-in face, with its
+        // bytes, under its identity (so its Bold/Italic siblings are found).
+        std::fs::remove_file(&installed).unwrap();
+        let batch =
+            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
+        for entry in &batch.entries {
+            let admitted = entry.result.as_ref().unwrap();
+            assert_eq!(
+                admitted.path,
+                crate::bundled::PRIMARY_ID,
+                "{}",
+                entry.requested
+            );
+            assert_eq!(
+                &admitted.bytes[..],
+                crate::bundled::face_for_id(crate::bundled::PRIMARY_ID).unwrap()
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

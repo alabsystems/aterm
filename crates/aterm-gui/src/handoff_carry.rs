@@ -53,21 +53,26 @@
 //! receiver as it reads it and by the sender once the proof checks out, and
 //! swept at the next start when a crash left it behind
 //! (`seamless::sweep_dead_handoff_leftovers`). A receiver with
-//! `ATERM_ALT_ARCHIVE=0` drops the carried rows. The ledger's text is carried
+//! an archive switched off drops the carried rows. The ledger's text is carried
 //! as the ledger holds it, so a redacted operator turn stays redacted.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(unix, test))]
+use std::sync::Mutex;
+#[cfg(any(unix, test))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(unix, test))]
+use aterm_core::terminal::AltArchiveFence;
 use aterm_core::terminal::{
-    AltArchiveCarry, AltArchiveDiffer, AltArchiveFence, AltArchiveGap, AltArchiveGapKind,
-    AltArchiveImport, Terminal,
+    AltArchiveCarry, AltArchiveDiffer, AltArchiveGap, AltArchiveGapKind, AltArchiveImport, Terminal,
 };
 
 use crate::turn_ledger::{ArchMark, TurnLedger, TurnRecord};
 
 /// The most archived rows one session carries, charged as the live archive
 /// charges them (text plus 32 bytes a row). The newest rows win.
+#[cfg(any(unix, test))]
 pub(crate) const CARRY_ARCHIVE_BYTES: usize = 1024 * 1024;
 /// The largest sidecar a receiver reads: the rows above, the ledger (512
 /// records of at most 512 bytes of text) and the differ's state, with JSON's
@@ -81,6 +86,7 @@ pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 /// How many of the newest SUBMITTED turns' marks the carried tail reaches back
 /// to: `aterm drive report` reads `history 8` and starts from the newest
 /// submitted turn among them.
+#[cfg(any(unix, test))]
 pub(crate) const TAIL_TURNS: usize = 8;
 /// The sidecar's layout version. Unknown fields are skipped and missing ones
 /// default, so it moves only when a field changes meaning; a receiver drops a
@@ -97,9 +103,11 @@ pub(crate) const MAX_TURN_ID: u64 = i64::MAX as u64;
 /// are brief (a control read, a `turn` recording its record, the scrollback
 /// compressor) — and the terminal stays frozen until Commit, so the export
 /// never waits long on anyone.
+#[cfg(any(unix, test))]
 const LOCK_PATIENCE: Duration = Duration::from_millis(50);
 
 /// One session's capture, taken in the freeze and exported on the worker.
+#[cfg(any(unix, test))]
 pub(crate) struct CarrySource {
     local_id: u64,
     term: Arc<Mutex<Terminal>>,
@@ -110,11 +118,13 @@ pub(crate) struct CarrySource {
     head: AltArchiveCarry,
 }
 
+#[cfg(any(unix, test))]
 impl CarrySource {
     /// The session this capture belongs to — what the park's capture matches
     /// against its carried screens, so a session whose screen it lowered below
     /// VisibleOnly after the fact goes without its control carry too (the
     /// 2026-09-22/23 update audit, plan P0-1e).
+    #[cfg(unix)]
     pub(crate) fn local_id(&self) -> u64 {
         self.local_id
     }
@@ -124,6 +134,7 @@ impl CarrySource {
 /// — the differ's screen-sized state, under the terminal lock the caller
 /// already holds for this session's checkpoint (so both describe the same
 /// screen). Two `Arc` clones and a screen of row text; it cannot fail.
+#[cfg(any(unix, test))]
 pub(crate) fn capture_head(
     local_id: u64,
     terminal: &Terminal,
@@ -144,6 +155,7 @@ pub(crate) fn capture_head(
 /// THE WORKER'S SHARE, just before the manifest is written: one sidecar per
 /// session, `(local_id, JSON)`. Never fails the handoff — a session whose
 /// sidecar would not fit carries less, and in the end nothing.
+#[cfg(any(unix, test))]
 pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
     let mut out = Vec::with_capacity(sources.len());
     let mut total = 0_u64;
@@ -188,6 +200,7 @@ pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
 
 /// The turn-id counter as the manifest can carry it (a TOML integer is an
 /// `i64`; a count past that is not carried rather than failing the write).
+#[cfg(any(unix, test))]
 pub(crate) fn manifest_turn_id(minted: u64) -> Option<u64> {
     (minted > 0 && minted <= MAX_TURN_ID).then_some(minted)
 }
@@ -213,6 +226,7 @@ pub(crate) fn adopted_ledger(control: Option<&mut ControlCarry>) -> TurnLedger {
 /// that were minted under this archive's origin, and no later than the rows
 /// the screen shows again. With no such turn, from the oldest row (the byte
 /// cap then keeps the newest).
+#[cfg(any(unix, test))]
 fn tail_from(
     turns: &[TurnRecord],
     fence: AltArchiveFence,
@@ -243,6 +257,7 @@ fn tail_from(
 /// A `try_lock` (`attempt`, which names the lock so the lock-order census
 /// sees whose it is) retried until `until`: `None` when another thread keeps
 /// the lock past then. A poisoned lock's data is still the data.
+#[cfg(any(unix, test))]
 fn patiently<G>(
     until: Instant,
     mut attempt: impl FnMut() -> Result<G, std::sync::TryLockError<G>>,
@@ -262,6 +277,7 @@ fn patiently<G>(
 /// Encode, shedding what does not fit `room`: the rows first (counters
 /// only), then the differ's state, then the ledger's older half at a time
 /// (the ids shed are ones the carried ledger no longer vouches for).
+#[cfg(any(unix, test))]
 fn encode_within(
     mut turns: Vec<TurnRecord>,
     mut unheld_below: u64,
@@ -294,6 +310,7 @@ fn encode_within(
 }
 
 /// The carry with its rows left out: counted lost, the indices unchanged.
+#[cfg(any(unix, test))]
 fn counters_only(mut c: AltArchiveCarry) -> AltArchiveCarry {
     let last = c.last();
     c.lost = c.lost.saturating_add(c.rows.len() as u64);
@@ -381,6 +398,7 @@ struct FrameWire {
     rows: Vec<String>,
 }
 
+#[cfg(any(unix, test))]
 fn encode(turns: &[TurnRecord], unheld_below: u64, archive: &AltArchiveCarry) -> Option<Vec<u8>> {
     let wire = Wire {
         version: WIRE_VERSION,
@@ -540,6 +558,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<ControlCarry> {
 }
 
 /// `"<len> <sha256hex>"`: the manifest's name for a sidecar's exact bytes.
+#[cfg(any(unix, test))]
 pub(crate) fn stamp(bytes: &[u8]) -> String {
     format!("{} {}", bytes.len(), hex(&sha256(bytes)))
 }

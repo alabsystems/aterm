@@ -1,0 +1,40 @@
+# claude-code 2.1.281 · MEASURED 2026-09-24, `aterm ctl text --json` of a private headless aterm 140x45 (--model haiku), leading and trailing blank rows dropped, the scratch path shortened to /private/tmp/claude-502/scratch/p/work · the same dialog after `1`: Cheese checked, the tab marked answered, still up (`right` then showed the Submit tab's review)
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    /private/tmp/claude-502/scratch/p/work
+
+
+❯ Use your AskUserQuestion tool right now, with exactly two questions in ONE call: question 1 header 'Color' asks which color to use,
+  options Red, Blue (Recommended), Green; question 2 header 'Size' asks which size, options Small, Large. Do nothing else before asking.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which color would you prefer? → Blue (Recommended)
+     · Which size would you prefer? → Small
+
+⏺ Got it! You've selected:
+  - Color: Blue (Recommended)
+  - Size: Small
+
+  I'm ready to proceed with these selections.
+
+✻ Baked for 7s · done 1:43 PM
+
+❯ Now use AskUserQuestion once more with ONE question, header 'Toppings', multiSelect true, asking which toppings, options Cheese, Olives,
+  Basil. Nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Toppings  ✔ Submit  →
+
+Which toppings would you like?
+
+❯ 1. [✔] Cheese
+         Melted cheese topping
+  2. [ ] Olives
+         Fresh olives
+  3. [ ] Basil
+         Fresh basil
+  4. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

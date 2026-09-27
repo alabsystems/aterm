@@ -7,11 +7,10 @@
 use super::*;
 
 impl DiskBackedScrollback {
-    /// Get the hot+warm memory usage (bytes).
-    ///
-    /// Note: Cold tier is disk-backed (memory-mapped) so not counted in RAM usage.
-    /// Use [`cold_memory_used`](Self::cold_memory_used) for consistency with [`Scrollback`].
+    /// Get the hot+warm memory usage (bytes). Cold tier is disk-backed
+    /// (memory-mapped) so not counted in RAM usage.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn memory_used(&self) -> usize {
         self.bytes_used
     }
@@ -30,6 +29,7 @@ impl DiskBackedScrollback {
     /// Returns the compressed size of data stored on disk in the cold tier.
     /// For [`Scrollback`] (in-memory), use [`cold_memory_used`](Scrollback::cold_memory_used) instead.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn cold_disk_used(&self) -> usize {
         self.cold.compressed_size()
     }

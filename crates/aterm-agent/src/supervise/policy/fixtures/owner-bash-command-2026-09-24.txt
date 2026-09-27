@@ -1,0 +1,528 @@
+cd /Users/_owner/aterm/crates/aterm-agent/tests && cat > /private/tmp/claude-502/-Users-_owner-aterm/288e9fc3-610a-4538-b4df-2f225bcc9f2f/scratchpad/bypass_law.rs <<'EOF'
+// ---------------------------------------------------------------------------
+// The owner's real prompt: bypass mode, a variable `rm` target
+// ---------------------------------------------------------------------------
+
+/// A captured `PermissionRequest` that is the owner's one real `rm` box: the
+/// vendor's `permission_mode` is `bypassPermissions`, the tool is Bash, and
+/// an `rm`/`rmdir` on the line has a `$` expansion in a target — the
+/// possibly-empty-variable check, the only `rm` prompt that mode leaves
+/// (`crates/aterm-phase/src/fixtures/bypass-variable-rm-box.txt`).
+struct BypassRm {
+    /// `<version>/<rel>`, for messages.
+    at: String,
+    text: String,
+    payload: aterm_json::Value,
+    command: String,
+}
+
+/// Every [`BypassRm`] in the corpus, in corpus order.
+fn bypass_rm_payloads() -> Vec<BypassRm> {
+    let mut out = Vec::new();
+    for cap in captures() {
+        for f in cap
+            .fixtures
+            .iter()
+            .filter(|f| f.kind == "PermissionRequest")
+        {
+            let Ok(payload) = aterm_json::from_str::<aterm_json::Value>(&f.text()) else {
+                continue;
+            };
+            let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+            if field("permission_mode").as_deref() != Some(BYPASS)
+                || field("tool_name").as_deref() != Some("Bash")
+            {
+                continue;
+            }
+            let Some(command) = payload
+                .get("tool_input")
+                .and_then(|i| i.get("command"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if !expansions(&command).iter().any(|t| t.in_rm) {
+                continue;
+            }
+            out.push(BypassRm {
+                at: format!("{}/{}", cap.version, f.rel),
+                text: f.text(),
+                payload,
+                command,
+            });
+        }
+    }
+    out
+}
+
+/// One `$NAME`, `${…}` or `$N` in a command line, outside single quotes.
+#[derive(Debug)]
+struct Expansion {
+    start: usize,
+    end: usize,
+    /// The name it expands: `S` for `$S` and `${S:?}`, `1` for `$1`.
+    name: String,
+    /// The simple command it sits in is an `rm` or an `rmdir`.
+    in_rm: bool,
+}
+
+/// The expansions of `cmd`, each with whether it is an `rm` target.
+///
+/// A small, deliberately SEPARATE reader from the harness's own lexer: this
+/// suite checks what the harness sent back, so it must not ask the harness
+/// where the spans are. It tracks quotes, a command's first word after a
+/// separator (`;`, `&`, `|`, newline, `(`, `)`) with the keywords that lead
+/// a command (`do`, `then`, `else`, `!`) and leading `NAME=value` words
+/// skipped, and nothing else — enough for the lines the capture drives, and a
+/// line it cannot read makes the law below fail rather than pass.
+fn expansions(cmd: &str) -> Vec<Expansion> {
+    let b = cmd.as_bytes();
+    let mut out = Vec::new();
+    let (mut single, mut double) = (false, false);
+    let mut head: Option<String> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if single {
+            single = c != b'\'';
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !double => {
+                single = true;
+                i += 1;
+                continue;
+            }
+            b'"' => {
+                double = !double;
+                i += 1;
+                continue;
+            }
+            b';' | b'&' | b'|' | b'\n' | b'(' | b')' if !double => {
+                head = None;
+                i += 1;
+                continue;
+            }
+            b'$' => {
+                let name_at = |from: usize| -> usize {
+                    let mut j = from;
+                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                        j += 1;
+                    }
+                    j
+                };
+                let (end, name) = match b.get(i + 1) {
+                    Some(b'{') => match cmd[i..].find('}') {
+                        Some(close) => (i + close + 1, cmd[i + 2..name_at(i + 2)].to_string()),
+                        None => (b.len(), String::new()),
+                    },
+                    Some(d) if d.is_ascii_digit() => (i + 2, cmd[i + 1..i + 2].to_string()),
+                    Some(a) if a.is_ascii_alphabetic() || *a == b'_' => {
+                        let j = name_at(i + 1);
+                        (j, cmd[i + 1..j].to_string())
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                let in_rm = matches!(head.as_deref(), Some("rm" | "rmdir"));
+                if head.is_none() {
+                    // A command NAMED by an expansion is not an rm this
+                    // reader can vouch for.
+                    head = Some(String::new());
+                }
+                out.push(Expansion {
+                    start: i,
+                    end,
+                    name,
+                    in_rm,
+                });
+                i = end;
+                continue;
+            }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // The start of a word outside quotes: it may be the command's head.
+        let start = i;
+        while i < b.len()
+            && !b[i].is_ascii_whitespace()
+            && !matches!(b[i], b';' | b'&' | b'|' | b'(' | b')' | b'$' | b'\'' | b'"' | b'\\')
+        {
+            i += 1;
+        }
+        let word = &cmd[start..i];
+        let assignment = word.find('=').is_some_and(|eq| {
+            eq > 0
+                && word[..eq]
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        });
+        if head.is_none() && !assignment && !matches!(word, "do" | "then" | "else" | "!") {
+            head = Some(word.to_string());
+        }
+        if i == start {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Is `new` exactly `orig` with only some of its rm-target expansions
+/// replaced — each by a single-quoted literal the line binds that NAME to
+/// (`S=/x … $S` → `'/x'`), or by `${NAME:?}`? Answers the replacements as
+/// `(written, replacement)`, or why not.
+fn only_rm_expansions_changed(orig: &str, new: &str) -> Result<Vec<(String, String)>, String> {
+    fn walk(
+        orig: &str,
+        new: &str,
+        toks: &[Expansion],
+        at: (usize, usize),
+        acc: &mut Vec<(String, String)>,
+    ) -> bool {
+        let (oi, ni) = at;
+        let Some((t, rest)) = toks.split_first() else {
+            return orig[oi..] == new[ni..];
+        };
+        let lit = &orig[oi..t.start];
+        if !new[ni..].starts_with(lit) {
+            return false;
+        }
+        let ni = ni + lit.len();
+        let written = &orig[t.start..t.end];
+        if new[ni..].starts_with(written) && walk(orig, new, rest, (t.end, ni + written.len()), acc)
+        {
+            return true;
+        }
+        if !t.in_rm {
+            return false;
+        }
+        let guard = format!("${{{}:?}}", t.name);
+        let replacement = if new[ni..].starts_with(&guard) {
+            Some(guard)
+        } else if let Some(body) = new[ni..].strip_prefix('\'')
+            && let Some(close) = body.find('\'')
+            && !t.name.bytes().all(|c| c.is_ascii_digit())
+        {
+            let value = &body[..close];
+            let bound = [
+                format!("{}={value}", t.name),
+                format!("{}='{value}'", t.name),
+                format!("{}=\"{value}\"", t.name),
+            ]
+            .iter()
+            .any(|b| orig.contains(b.as_str()));
+            bound.then(|| format!("'{value}'"))
+        } else {
+            None
+        };
+        let Some(replacement) = replacement else {
+            return false;
+        };
+        acc.push((written.to_string(), replacement.clone()));
+        if walk(orig, new, rest, (t.end, ni + replacement.len()), acc) {
+            return true;
+        }
+        acc.pop();
+        false
+    }
+    let toks = expansions(orig);
+    let mut acc = Vec::new();
+    if !walk(orig, new, &toks, (0, 0), &mut acc) {
+        return Err(format!(
+            "the rewrite changed more than the rm-target expansions of {orig:?}: {new:?}"
+        ));
+    }
+    if acc.is_empty() {
+        return Err(format!("the rewrite changed nothing in {orig:?}"));
+    }
+    Ok(acc)
+}
+
+/// THE OWNER'S REAL PROMPT, REPLAYED.
+///
+/// In `claude --dangerously-skip-permissions` an ordinary `rm` never
+/// prompts; the one `rm` box left is the vendor's bypass-immune
+/// possibly-empty-variable check, and `rm_policy`'s bypass branch answers it
+/// ONLY with an `updatedInput` rewrite the vendor re-checks. For every such
+/// payload the vendor was observed to send, this law routes the real bytes
+/// through [`hook_reply`] and requires:
+///
+/// * an `allow` carrying `updatedInput` — never a bare allow;
+/// * `updatedInput.command` differs from `tool_input.command` ONLY inside
+///   rm-target expansion spans, each replaced by the literal the line binds
+///   that name to or by `${NAME:?}` — judged by this file's own reader
+///   ([`expansions`]), never by the harness's;
+/// * every other `tool_input` key comes back unchanged, and no key is added
+///   or dropped;
+/// * the rm ledger row is an allow in bypass mode and records the command
+///   the vendor was sent.
+///
+/// The NEGATIVE CONTROL rides in the same loop: the same payload with its
+/// `permission_mode` turned to `default` must not be answered at all, so a
+/// harness that stopped reading the mode cannot pass.
+///
+/// SKIPPED, LOUDLY, until a bypass capture exists: the corpus was first
+/// captured in manual mode only (2.1.278), which is a prompt the owner never
+/// sees. A skip is printed on the raw stderr every run ([`loud`]); the day
+/// `tools/harness-capture.sh --bypass` records one, this law judges it, and a
+/// payload the harness mishandles FAILS it.
+#[test]
+fn the_owners_bypass_rm_box_is_answered_with_a_rewrite_of_only_its_expansions() {
+    let found = bypass_rm_payloads();
+    if found.is_empty() {
+        let versions: Vec<String> = captures().into_iter().map(|c| c.version).collect();
+        loud(&format!(
+            "vendor corpus: SKIPPED the owner's bypass rm box — no bypassPermissions \
+             PermissionRequest for a variable rm target is in the corpus ({versions:?}), so the \
+             one rm prompt `claude --dangerously-skip-permissions` still shows is NOT replayed. \
+             Record one: tools/harness-capture.sh --bypass"
+        ));
+        return;
+    }
+    let env = replay_env(&corpus_root());
+    for got in &found {
+        let reply = hook_reply("PermissionRequest", &got.text, Some("rm-approve"), &env, 1);
+        let answer: aterm_json::Value = aterm_json::from_str(&reply.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{}: the owner's box got no answer ({e}) — its rm row: {:?}",
+                got.at, reply.rm_row
+            )
+        });
+        let decision = answer
+            .get("hookSpecificOutput")
+            .and_then(|o| o.get("decision"))
+            .unwrap_or_else(|| panic!("{}: no decision in {:?}", got.at, reply.stdout));
+        assert_eq!(
+            decision.get("behavior").and_then(|v| v.as_str()),
+            Some("allow"),
+            "{}: {:?}",
+            got.at,
+            reply.stdout
+        );
+        let updated = decision
+            .get("updatedInput")
+            .and_then(|v| v.as_object())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: a BARE allow in bypass mode — the vendor does not re-check one: {:?}",
+                    got.at, reply.stdout
+                )
+            });
+        let sent = got
+            .payload
+            .get("tool_input")
+            .and_then(|v| v.as_object())
+            .expect("a Bash payload has a tool_input object");
+        let sent_keys: BTreeSet<&String> = sent.keys().collect();
+        let back_keys: BTreeSet<&String> = updated.keys().collect();
+        assert_eq!(
+            sent_keys, back_keys,
+            "{}: updatedInput must carry exactly the keys the vendor sent",
+            got.at
+        );
+        for (key, value) in sent.iter().filter(|(k, _)| k.as_str() != "command") {
+            assert_eq!(
+                updated.get(key),
+                Some(value),
+                "{}: `{key}` changed on the way back",
+                got.at
+            );
+        }
+        let rewritten = updated
+            .get("command")
+            .and_then(|v| v.as_str())
+            .expect("updatedInput.command");
+        let spans = only_rm_expansions_changed(&got.command, rewritten)
+            .unwrap_or_else(|why| panic!("{}: {why}", got.at));
+        let row: aterm_json::Value = aterm_json::from_str(
+            reply
+                .rm_row
+                .as_deref()
+                .unwrap_or_else(|| panic!("{}: no rm row", got.at)),
+        )
+        .expect("the rm row is JSON");
+        for (key, want) in [
+            ("decision", "allow"),
+            ("mode", BYPASS),
+            ("command", got.command.as_str()),
+            ("rewritten", rewritten),
+        ] {
+            assert_eq!(
+                row.get(key).and_then(|v| v.as_str()),
+                Some(want),
+                "{}: rm row `{key}` (spans {spans:?}): {row:?}",
+                got.at
+            );
+        }
+
+        // NEGATIVE CONTROL: the same bytes in `default` mode. The literal
+        // rules refuse a `$` target, so nothing may be printed.
+        let mut manual = got.payload.clone();
+        if let aterm_json::Value::Object(o) = &mut manual {
+            o.insert(
+                "permission_mode".to_string(),
+                aterm_json::Value::from("default".to_string()),
+            );
+        }
+        let manual = aterm_json::to_string(&manual).expect("re-serialise");
+        let reply = hook_reply("PermissionRequest", &manual, Some("rm-approve"), &env, 2);
+        assert!(
+            reply.stdout.is_empty(),
+            "{}: the same line in default mode was answered: {:?}",
+            got.at,
+            reply.stdout
+        );
+    }
+}
+
+/// THE REAL PAYLOAD THAT IS NOT BYPASS GETS NO BYPASS ANSWER — always run,
+/// because the corpus already holds it: 2.1.278's manual-mode `rm first.txt`.
+///
+/// Answered, it is a BARE allow from the literal rules, with no
+/// `updatedInput` and no `rewritten` in its row. Its own bytes with the mode
+/// turned to `bypassPermissions` must then NOT be answered: in bypass mode a
+/// literal target is a line the vendor asks about only because it judged it
+/// bypass-immune, and a bare allow there would not be re-checked. So one real
+/// payload shows both that the mode is read and which branch answers it.
+#[test]
+fn a_captured_non_bypass_rm_gets_no_bypass_answer_and_its_bypass_twin_gets_none() {
+    let env = replay_env(&corpus_root());
+    let mut judged = 0usize;
+    for cap in captures() {
+        for f in cap
+            .fixtures
+            .iter()
+            .filter(|f| f.kind == "PermissionRequest")
+        {
+            let Ok(payload) = aterm_json::from_str::<aterm_json::Value>(&f.text()) else {
+                continue;
+            };
+            let mode = payload.get("permission_mode").and_then(|v| v.as_str());
+            let command = payload
+                .get("tool_input")
+                .and_then(|i| i.get("command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let is_rm = command
+                .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|'))
+                .any(|w| w == "rm" || w == "rmdir");
+            if mode == Some(BYPASS) || mode.is_none() || !is_rm {
+                continue;
+            }
+            let reply = hook_reply("PermissionRequest", &f.text(), Some("rm-approve"), &env, 1);
+            assert!(
+                !reply.stdout.contains("updatedInput"),
+                "{}/{}: a {mode:?} payload got the bypass branch's answer: {:?}",
+                cap.version,
+                f.rel,
+                reply.stdout
+            );
+            assert!(
+                !reply.rm_row.as_deref().unwrap_or_default().contains("\"rewritten\""),
+                "{}/{}: {:?}",
+                cap.version,
+                f.rel,
+                reply.rm_row
+            );
+            let answered = !reply.stdout.is_empty();
+
+            let mut twin = payload.clone();
+            if let aterm_json::Value::Object(o) = &mut twin {
+                o.insert(
+                    "permission_mode".to_string(),
+                    aterm_json::Value::from(BYPASS.to_string()),
+                );
+            }
+            let twin = aterm_json::to_string(&twin).expect("re-serialise");
+            let reply = hook_reply("PermissionRequest", &twin, Some("rm-approve"), &env, 2);
+            if expansions(command).iter().any(|t| t.in_rm) {
+                continue;
+            }
+            assert!(
+                reply.stdout.is_empty(),
+                "{}/{}: the bypass twin of a literal rm was answered: {:?}",
+                cap.version,
+                f.rel,
+                reply.stdout
+            );
+            if answered {
+                judged += 1;
+            }
+        }
+    }
+    assert!(
+        judged > 0,
+        "no captured non-bypass rm was ANSWERED, so nothing here showed a real payload taking the \
+         literal branch while its bypass twin took none"
+    );
+}
+
+/// The reader above is this file's own, so it is checked on its own: the
+/// owner's shape, the two capture stimuli and the lines it must refuse.
+#[test]
+fn the_expansion_reader_finds_rm_targets_and_the_change_check_refuses_everything_else() {
+    let rm_targets = |cmd: &str| -> Vec<String> {
+        expansions(cmd)
+            .into_iter()
+            .filter(|t| t.in_rm)
+            .map(|t| cmd[t.start..t.end].to_string())
+            .collect()
+    };
+    let owner = "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf $S/$1; mkdir -p $S/$1; done";
+    assert_eq!(rm_targets(owner), ["$S", "$1"]);
+    assert_eq!(rm_targets("V=/w/va; rm -rf ${V}/a '$X'"), ["${V}"]);
+    assert!(rm_targets("echo $S; mkdir -p $S/x").is_empty());
+
+    let rewrite =
+        "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf '/tmp/scratch'/${1:?}; mkdir -p $S/$1; done";
+    assert_eq!(
+        only_rm_expansions_changed(owner, rewrite),
+        Ok(vec![
+            ("$S".to_string(), "'/tmp/scratch'".to_string()),
+            ("$1".to_string(), "${1:?}".to_string()),
+        ])
+    );
+    // NEGATIVE CONTROLS: each is a rewrite the harness must never send.
+    for bad in [
+        // nothing changed
+        owner,
+        // a non-rm expansion changed (the mkdir)
+        "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf '/tmp/scratch'/${1:?}; mkdir -p '/tmp/scratch'/$1; done",
+        // a literal the line never bound
+        "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf '/etc'/${1:?}; mkdir -p $S/$1; done",
+        // a byte outside every span changed
+        "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf '/tmp/scratch'/${1:?}; mkdir -p $S/$1; done;",
+        // a positional given a literal value (it has none on the line)
+        "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf '/tmp/scratch'/'a'; mkdir -p $S/$1; done",
+        // a guard with another name
+        "S=/tmp/scratch; for p in a z; do set -- $p; rm -rf '/tmp/scratch'/${2:?}; mkdir -p $S/$1; done",
+    ] {
+        assert!(
+            only_rm_expansions_changed(owner, bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+EOF
+python3 - <<'EOF'
+p='/Users/_owner/aterm/crates/aterm-agent/tests/vendor_corpus.rs'
+s=open(p,encoding='utf-8').read()
+law=open('/private/tmp/claude-502/-Users-_owner-aterm/288e9fc3-610a-4538-b4df-2f225bcc9f2f/scratchpad/bypass_law.rs',encoding='utf-8').read()
+anchor="/// THE HUD, over the vendor's own statusLine payloads."
+assert s.count(anchor)==1
+s=s.replace(anchor, law+anchor)
+open(p,'w',encoding='utf-8').write(s)
+EOF
+cd /Users/_owner/aterm && targo --unverified test -p aterm-agent --test vendor_corpus 2>&1 | grep -vE "^(warning|note|\s+Compiling|\s+Checking)" | tail -40

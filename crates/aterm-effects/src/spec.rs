@@ -630,12 +630,14 @@ impl CompiledToyPack {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn spec_table(&self) -> &SpecTable {
         &self.spec_table
     }
 
     /// Scanner entries to append to the normal user lexicon override.
     #[must_use]
+    #[cfg(test)]
     pub fn lexicon_toml(&self) -> &str {
         &self.lexicon_toml
     }
@@ -673,6 +675,7 @@ impl ToyPackError {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }

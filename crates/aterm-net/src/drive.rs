@@ -12,7 +12,7 @@
 //!   remote driver thereafter speaks the ordinary control protocol; the TLS
 //!   capability is the network-specific gate that replaces the local same-uid
 //!   `SO_PEERCRED` check (which has no network analog).
-//! * **Driver** ([`dial_and_relay`]) — the host doing the driving. Dials a pinned
+//! * **Driver** ([`dial_and_relay_pinned`]) — the host doing the driving. Dials a pinned
 //!   endpoint, presents the channel-bound capability, then relays a local control
 //!   client to the remote. The network analog of `proxy::connect_and_relay`.
 //!
@@ -199,6 +199,10 @@ struct HandshakeWatchdog {
     state: Arc<AtomicU8>,
     /// The parked watchdog thread — its `Thread` handle is the wake channel.
     thread: std::thread::JoinHandle<()>,
+    /// Set by the thread each time it is about to wait — tests only, so a test
+    /// can time `finish` against a thread that is really inside its wait.
+    #[cfg(test)]
+    waiting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HandshakeWatchdog {
@@ -211,6 +215,10 @@ impl HandshakeWatchdog {
         let state = Arc::new(AtomicU8::new(WD_RUNNING));
         let wd_sock = tcp.try_clone()?;
         let wd_state = Arc::clone(&state);
+        #[cfg(test)]
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(test)]
+        let wd_waiting = Arc::clone(&waiting);
         let thread = std::thread::spawn(move || {
             let start = Instant::now();
             loop {
@@ -225,6 +233,8 @@ impl HandshakeWatchdog {
                 if remaining.is_zero() {
                     break;
                 }
+                #[cfg(test)]
+                wd_waiting.store(true, Ordering::Release);
                 std::thread::park_timeout(remaining);
             }
             // Deadline reached: claim FIRED iff still running, then force-close so
@@ -236,7 +246,12 @@ impl HandshakeWatchdog {
                 let _ = wd_sock.shutdown(std::net::Shutdown::Both);
             }
         });
-        Ok(Self { state, thread })
+        Ok(Self {
+            state,
+            thread,
+            #[cfg(test)]
+            waiting,
+        })
     }
 
     /// Claim [`WD_AUTHED`] iff the watchdog has not already fired, wake it, and
@@ -449,52 +464,14 @@ pub fn serve<F, G, E>(
 /// control socket (so the raw token never crosses the wire — only the
 /// channel-bound HMAC does).
 ///
-/// **Identity pinning — what this enforces, and what it does not.** The server
-/// CERTIFICATE fingerprint IS enforced: `config` (from [`tls::client_config`])
-/// rejects the handshake unless the peer presents the pinned cert AND proves key
-/// possession, so a redirected/MITM endpoint fails before any secret crosses the
-/// wire. The session-NONCE half of the rebind guard
-/// ([`RemoteEndpoint::matches`](crate::RemoteEndpoint::matches)) is NOT enforced by
-/// THIS entry point — it presents the capability and relays with no nonce check, so
-/// the un-pinned dial path is byte-identical to before the pin existed. A caller
-/// that wants the rebind guard uses [`dial_and_relay_pinned`], which enforces
-/// `matches` before relaying. (Channel binding still makes a stale capability
-/// useless against a relaunched session: a different session ⇒ a different TLS
-/// exporter ⇒ the tag fails to verify — so this is a defense-in-depth gap, not an
-/// auth bypass.)
-///
-/// # Errors
-/// On a connect/TLS/handshake failure (incl. cert-pin mismatch) or a denied
-/// capability (before any relay). A relay-stage I/O error after a successful
-/// present is returned too, but by then the capability HAS been accepted and bytes
-/// may have flowed.
-pub fn dial_and_relay<A: ToSocketAddrs>(
-    addr: A,
-    config: Arc<ClientConfig>,
-    src: &str,
-    op: &str,
-    token: &EdgeToken,
-    prebuffer: &[u8],
-    local: CtlStream,
-) -> io::Result<()> {
-    dial_and_relay_inner(
-        addr,
-        config,
-        src,
-        op,
-        token,
-        prebuffer,
-        local,
-        HANDSHAKE_TIMEOUT,
-    )
-}
-
-/// [`dial_and_relay`] with the session-NONCE rebind guard ENFORCED when `pin` is
-/// `Some`. The cert-fingerprint half of the pin is already TLS-enforced (`config`
-/// rejects any peer that is not the pinned cert), so the remaining check is the
-/// launch-nonce half of [`RemoteEndpoint::matches`]: after the capability is
-/// presented and BEFORE any control bytes relay, the remote's live launch nonce is
-/// read and `matches` is required to hold.
+/// **Identity pinning.** The server CERTIFICATE fingerprint is enforced by
+/// `config` (from [`tls::client_config`]): the handshake fails unless the peer
+/// presents the pinned cert AND proves key possession, so a redirected/MITM
+/// endpoint fails before any secret crosses the wire. The session-NONCE half of
+/// the rebind guard ([`RemoteEndpoint::matches`](crate::RemoteEndpoint::matches))
+/// is enforced when `pin` is `Some`: after the capability is presented and BEFORE
+/// any control bytes relay, the remote's live launch nonce is read and `matches`
+/// is required to hold. `pin == None` presents and relays with no nonce read.
 ///
 /// **Fail-closed.** The shipping wire protocol does not yet carry a launch-identity
 /// echo, so the live nonce is currently UNOBSERVABLE
@@ -503,12 +480,13 @@ pub fn dial_and_relay<A: ToSocketAddrs>(
 /// silently skipped. When the listener grows a `LaunchNonce` echo, only the
 /// observer is replaced; this enforcement point is unchanged.
 ///
-/// `pin == None` is exactly [`dial_and_relay`] (no nonce read, byte-identical relay).
-///
 /// # Errors
-/// Everything [`dial_and_relay`] returns, plus — when `pin` is `Some` — a
-/// nonce-mismatch or unobservable-nonce error (both BEFORE any relay), so a
-/// relaunched/rebound session is never driven by a stale pin.
+/// On a connect/TLS/handshake failure (incl. cert-pin mismatch) or a denied
+/// capability (before any relay); when `pin` is `Some`, a nonce-mismatch or
+/// unobservable-nonce error (also before any relay), so a relaunched/rebound
+/// session is never driven by a stale pin. A relay-stage I/O error after a
+/// successful present is returned too, but by then the capability HAS been
+/// accepted and bytes may have flowed.
 #[allow(
     clippy::too_many_arguments,
     reason = "the full dial contract (endpoint/TLS/audit-identity/token/prebuffer/stream/pin); bundling into a struct only relocates the argument list"
@@ -548,35 +526,6 @@ fn observe_launch_nonce_unavailable(
     _transport: &mut TlsTransport<rustls::ClientConnection>,
 ) -> io::Result<Option<String>> {
     Ok(None)
-}
-
-/// [`dial_and_relay`] with the unauthenticated-phase deadline injected (tests use a
-/// short value to exercise the dribbling-server timeout without a real wait). The
-/// un-pinned path: delegates to [`dial_and_relay_pinned_inner`] with no pin, so no
-/// launch-nonce read happens and the relay is byte-identical to the original.
-#[allow(clippy::too_many_arguments)]
-fn dial_and_relay_inner<A: ToSocketAddrs>(
-    addr: A,
-    config: Arc<ClientConfig>,
-    src: &str,
-    op: &str,
-    token: &EdgeToken,
-    prebuffer: &[u8],
-    local: CtlStream,
-    handshake_timeout: Duration,
-) -> io::Result<()> {
-    dial_and_relay_pinned_inner(
-        addr,
-        config,
-        src,
-        op,
-        token,
-        prebuffer,
-        local,
-        handshake_timeout,
-        None,
-        observe_launch_nonce_unavailable,
-    )
 }
 
 /// [`dial_and_relay_pinned`] with the unauthenticated-phase deadline AND the
@@ -672,7 +621,7 @@ where
     // remains, read here via `observe_nonce`. A pin that cannot be verified (no wire
     // echo yet ⇒ `None`) FAILS CLOSED — an operator-requested guard is never silently
     // skipped. `pin == None` never touches `observe_nonce`, so the un-pinned path is
-    // byte-identical to `dial_and_relay`.
+    // byte-identical to the un-pinned dial.
     if let Some(pin) = &pin {
         match observe_nonce(&mut transport)? {
             Some(nonce) if pin.matches(&pin.fingerprint, &nonce) => {}
@@ -817,7 +766,9 @@ mod tests {
         // the echo mirrors it back first, proving order.
         let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
         let driver = std::thread::spawn(move || {
-            dial_and_relay(addr, ccfg, "driver-1", "drive", &token, b"PRE\n", drv_local)
+            dial_and_relay_pinned(
+                addr, ccfg, "driver-1", "drive", &token, b"PRE\n", drv_local, None,
+            )
         });
 
         {
@@ -922,7 +873,7 @@ mod tests {
         // Dialer: present the capability, then send ONLY a verb (no token).
         let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
         let driver = std::thread::spawn(move || {
-            dial_and_relay(addr, ccfg, "dial", "drive", &token, b"", drv_local)
+            dial_and_relay_pinned(addr, ccfg, "dial", "drive", &token, b"", drv_local, None)
         });
         drv_client.write_all(b"screen\n").unwrap();
         drv_client.flush().unwrap();
@@ -1089,7 +1040,7 @@ mod tests {
         let (drv_local, _drv_client) = CtlStream::pair().unwrap();
         let started = Instant::now();
         // 300ms deadline (vs the 10s default) so the test is fast.
-        let res = dial_and_relay_inner(
+        let res = dial_and_relay_pinned_inner(
             addr,
             ccfg,
             "dial",
@@ -1098,6 +1049,8 @@ mod tests {
             b"",
             drv_local,
             Duration::from_millis(300),
+            None,
+            observe_launch_nonce_unavailable,
         );
         let elapsed = started.elapsed();
         assert!(
@@ -1158,7 +1111,7 @@ mod tests {
         let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
         let started = Instant::now();
         let driver = std::thread::spawn(move || {
-            dial_and_relay(addr, ccfg, "probe", "drive", &token, b"", drv_local)
+            dial_and_relay_pinned(addr, ccfg, "probe", "drive", &token, b"", drv_local, None)
         });
         drv_client.write_all(b"P\n").unwrap();
         drv_client.flush().unwrap();
@@ -1181,7 +1134,7 @@ mod tests {
 
     /// The CONTROL: the identical TLS 1.3 handshake, channel-bound capability
     /// exchange and relay, assembled inline with NO watchdog. Nothing here calls
-    /// `accept_and_relay`/`dial_and_relay`, so no watchdog is ever armed — this is
+    /// `accept_and_relay`/`dial_and_relay_pinned`, so no watchdog is ever armed — this is
     /// the transport floor the drive path is measured against.
     fn time_bare_handshake(listener: &TcpListener, token: EdgeToken) -> Duration {
         let addr = listener.local_addr().unwrap();
@@ -1247,7 +1200,7 @@ mod tests {
     #[test]
     fn a_fast_handshake_is_not_paced_by_the_watchdogs_wake_interval() {
         // TWO-SIDED, and the two arms differ ONLY by the watchdog:
-        //   ARM     — `accept_and_relay` + `dial_and_relay`: a watchdog on each end.
+        //   ARM     — `accept_and_relay` + `dial_and_relay_pinned`: a watchdog on each end.
         //   CONTROL — the same TLS handshake, capability exchange and relay inline,
         //             with no watchdog at all.
         //
@@ -1259,10 +1212,16 @@ mod tests {
         // was the poll interval. Event-driven, the two arms coincide.
         //
         // The bound is RELATIVE (arm minus control) so a slow or loaded box moves
-        // both arms together and cannot make this flake; 20 ms is under half a
-        // 50 ms poll step, so the old shape fails it by ~35 ms every single time.
-        const MAX_WATCHDOG_COST: Duration = Duration::from_millis(20);
-        const REPS: usize = 3;
+        // both arms together; 30 ms is under two thirds of a 50 ms poll step, so
+        // the old shape fails it by ~25 ms every single time. The ARM pays two
+        // thread spawns and two cross-thread wakes the CONTROL does not, and on
+        // a saturated run queue each can wait milliseconds, so the arms are
+        // sampled INTERLEAVED (a load burst lands on both) and seven times, not
+        // three in two blocks against 20 ms (the load-sensitive test audit of
+        // 2026-09-27). The load-free form of the same property is
+        // `finishing_an_early_handshake_does_not_wait_out_a_wake_interval`.
+        const MAX_WATCHDOG_COST: Duration = Duration::from_millis(30);
+        const REPS: usize = 7;
 
         let token = EdgeToken::generate();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1273,14 +1232,11 @@ mod tests {
         // Minimum over the repetitions: for a latency this is the sample least
         // polluted by an unrelated scheduling stall, and the defect under test is
         // deterministic (it is present in EVERY pre-fix sample, never just the tail).
-        let control = (0..REPS)
-            .map(|_| time_bare_handshake(&listener, token))
-            .min()
-            .unwrap();
-        let arm = (0..REPS)
-            .map(|_| time_drive_setup(&listener, token))
-            .min()
-            .unwrap();
+        let (mut control, mut arm) = (Duration::MAX, Duration::MAX);
+        for _ in 0..REPS {
+            control = control.min(time_bare_handshake(&listener, token));
+            arm = arm.min(time_drive_setup(&listener, token));
+        }
 
         let cost = arm.saturating_sub(control);
         assert!(
@@ -1289,6 +1245,55 @@ mod tests {
              drive setup {arm:?} vs the same transport without a watchdog {control:?} \
              (watchdog cost {cost:?}, budget {MAX_WATCHDOG_COST:?}). A cost near a whole \
              wake interval means the watchdog is being waited out instead of woken."
+        );
+    }
+
+    /// The watchdog's wake, with no TLS and no second end: `finish` on a
+    /// handshake that authenticated early must not wait for the watchdog
+    /// thread to come round on its own. A thread that sleep-polls in steps is
+    /// JOINED only when its current step expires, so `finish` once the thread
+    /// is inside its wait pays the rest of that step (~50 ms for the old
+    /// shape) in every sample; the event-driven thread is woken by the
+    /// `unpark` and pays one scheduling latency. The deadline is armed at 60 s
+    /// so no sample can end by it, and the minimum of ten filters a stalled
+    /// wake without letting a poll step through.
+    ///
+    /// NON-VACUITY: `finish` is timed only once the thread has entered its
+    /// wait. Called before that, it finds the state already claimed and
+    /// returns at once whatever the wait is — measured: the sleep-poll shape
+    /// passed this test until it waited for `waiting`.
+    #[test]
+    fn finishing_an_early_handshake_does_not_wait_out_a_wake_interval() {
+        const MAX_FINISH: Duration = Duration::from_millis(20);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepting = std::thread::spawn(move || listener.accept().unwrap().0);
+        let tcp = TcpStream::connect(addr).unwrap();
+        let _peer = accepting.join().unwrap();
+        let fastest = (0..10)
+            .map(|_| {
+                let watchdog = HandshakeWatchdog::arm(&tcp, Duration::from_secs(60)).unwrap();
+                let entered = Instant::now() + Duration::from_secs(10);
+                while !watchdog.waiting.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < entered,
+                        "the watchdog never began its wait"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let started = Instant::now();
+                assert!(
+                    watchdog.finish(),
+                    "an early handshake beats a 60 s deadline"
+                );
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            fastest < MAX_FINISH,
+            "finish() waited {fastest:?} at best for a watchdog it had just woken — \
+             the watchdog is being waited out on a wake interval, not woken"
         );
     }
 
@@ -1378,6 +1383,131 @@ mod tests {
         );
     }
 
+    /// CONFORMANCE (Tier-1) of the REAL listener to
+    /// `aterm_spec::derive::net_dial_after_grant_model` (`NetDialAfterGrant`):
+    /// `accept_and_relay` dials its local control socket only AFTER the
+    /// channel-bound capability was granted.
+    ///
+    /// Both halves of the latch pair are observed on the real wire, never read
+    /// off the code. `granted` is the verdict the listener sent the dialer
+    /// (`verify_capability` writes `OK` before it returns); `local_dialed` is the
+    /// listener calling `connect_local`. To order them, the `connect_local`
+    /// closure records what the dialer had been TOLD at the moment it is called
+    /// — it waits for the dialer's verdict, which a listener that grants first
+    /// has already sent. A valid and a forged presentation are each driven, and
+    /// every step they took (`Verify`, `DialLocal`, in the order observed) must
+    /// be one the committed model admits, ending in a `DialImpliesGranted` state.
+    ///
+    /// NEGATIVE CONTROL: the premature dial is the step only `Buggy = 1` admits,
+    /// and the real runs are checked to never take it. Call `connect_local()`
+    /// before `verify_capability` in `accept_and_relay_inner` and the dial is
+    /// observed with no verdict yet sent — a `DialLocal` from `granted = 0`,
+    /// which the committed model rejects: this test fails.
+    #[test]
+    fn accept_and_relay_conforms_to_net_dial_after_grant() {
+        use aterm_spec::derive::net_dial_after_grant_model;
+        use aterm_spec::verify::validate_transition_tiered;
+        use std::collections::BTreeMap;
+
+        let model = net_dial_after_grant_model();
+        let at = |granted: bool, dialed: bool| -> BTreeMap<&'static str, i64> {
+            BTreeMap::from([
+                ("granted", i64::from(granted)),
+                ("local_dialed", i64::from(dialed)),
+            ])
+        };
+        // The model's own negative control: from the start, only the mutant dials.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        assert!(!model.action_enabled("DialLocal", &model.init_state()));
+        assert!(buggy.action_enabled("DialLocal", &buggy.init_state()));
+
+        // One real listener run: the dialer's verdict, and — if the listener
+        // dialed its local socket — whether the dialer had been granted by then.
+        let run = |presented: EdgeToken, minted: EdgeToken| -> (bool, Option<bool>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+            let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+            let (told_tx, told_rx) = std::sync::mpsc::channel::<bool>();
+            let dial = Arc::new(Mutex::new(None::<bool>));
+            let host = std::thread::spawn({
+                let dial = Arc::clone(&dial);
+                move || {
+                    let (tcp, _) = listener.accept().unwrap();
+                    accept_and_relay(
+                        tcp,
+                        scfg,
+                        |src, op| (src == "driver-1" && op == "drive").then_some(minted),
+                        move || {
+                            let granted = told_rx.recv_timeout(Duration::from_secs(2)) == Ok(true);
+                            *dial.lock().unwrap() = Some(granted);
+                            // The local peer hangs up at once, so the relay ends.
+                            CtlStream::pair().map(|(local, _peer)| local)
+                        },
+                    )
+                }
+            });
+            let tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut dialer = tls::connect(tcp, tls::fixed_server_name(), ccfg).unwrap();
+            let exporter = dialer.exporter().to_vec();
+            let verdict =
+                present_capability(dialer.stream(), &exporter, "driver-1", "drive", &presented)
+                    .is_ok();
+            let _ = told_tx.send(verdict);
+            drop(dialer);
+            let _ = host.join().unwrap();
+            let dialed = dial.lock().unwrap().take();
+            (verdict, dialed)
+        };
+
+        let token = EdgeToken::generate();
+        for (what, presented) in [("valid", token), ("forged", EdgeToken::generate())] {
+            let (verdict, dialed) = run(presented, token);
+            // The steps in the order the wire showed them.
+            let steps: Vec<&str> = match dialed {
+                Some(true) => vec!["Verify", "DialLocal"],
+                Some(false) if verdict => vec!["DialLocal", "Verify"],
+                Some(false) => vec!["DialLocal"],
+                None if verdict => vec!["Verify"],
+                None => vec![],
+            };
+            let (mut granted, mut local_dialed) = (false, false);
+            for step in &steps {
+                let before = at(granted, local_dialed);
+                match *step {
+                    "Verify" => granted = true,
+                    _ => local_dialed = true,
+                }
+                let after = at(granted, local_dialed);
+                let (ok, why) = validate_transition_tiered(
+                    &model,
+                    &[],
+                    &before,
+                    &after,
+                    Some(step),
+                    "NetDialAfterGrant(accept_and_relay)",
+                );
+                assert!(
+                    ok,
+                    "{what}: the real listener took `{step}` from {before:?}, which the \
+                     model does not admit (observed order {steps:?}) — {why}"
+                );
+            }
+            assert!(
+                model.check_invariant("DialImpliesGranted", &at(granted, local_dialed)),
+                "{what}: the listener dialed its local socket without a grant"
+            );
+            // Pin the outcome too: a listener that never dials satisfies the
+            // invariant vacuously, so the valid run must reach its local socket.
+            assert_eq!(
+                (granted, local_dialed),
+                (what == "valid", what == "valid"),
+                "{what}: observed order {steps:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_denied_capability_never_reaches_the_local_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1408,7 +1538,7 @@ mod tests {
 
         let (drv_local, _drv_client) = CtlStream::pair().unwrap();
         let driver = std::thread::spawn(move || {
-            dial_and_relay(
+            dial_and_relay_pinned(
                 addr,
                 ccfg,
                 "driver-1",
@@ -1416,6 +1546,7 @@ mod tests {
                 &driver_token,
                 b"",
                 drv_local,
+                None,
             )
         });
 

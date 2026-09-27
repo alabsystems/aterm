@@ -9,13 +9,13 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::GLINT_PERIOD;
 use crate::animate::{Anim, Look};
 use crate::center::{EchoKind, MessageCenter, Outcome};
 use crate::glass::Links;
 use crate::log::MessageLog;
 use crate::model::{Restatement, WallStamp};
 use crate::text::{char_width, glass_title_fault, title_words};
-use crate::{FILL_GLIDE, GLINT_PERIOD};
 
 const CORES: u16 = 8;
 const MEM_MIB: u32 = 16_384;
@@ -108,6 +108,7 @@ fn sessions() -> Vec<SessionRef> {
             tab: 1,
             receiving_keys: true,
             elsewhere: false,
+            window: 1,
         },
         SessionRef {
             shell_pid: 200,
@@ -115,6 +116,7 @@ fn sessions() -> Vec<SessionRef> {
             tab: 2,
             receiving_keys: false,
             elsewhere: false,
+            window: 1,
         },
     ]
 }
@@ -417,7 +419,7 @@ fn posts_after_onset_and_two_heavy_readings_not_before() {
     let posts = s.posts();
     assert_eq!(posts.len(), 1, "{:?}", s.outs);
     let (at, msg) = &posts[0];
-    assert_eq!(msg.title, "Typing slowed by yes in tab 2");
+    assert_eq!(msg.title, "Typing slowed by 'yes'");
     // Suspect at the third slow key's window (6 keys, 0.9 s); the row no
     // sooner than STRAIN_ONSET after it.
     assert!(*at >= 900 + 5000, "{at}");
@@ -428,7 +430,7 @@ fn posts_after_onset_and_two_heavy_readings_not_before() {
     let meter = msg.meter.as_ref().unwrap();
     assert!(meter.level && meter.fill_permille == Some(1000));
     assert_eq!(meter.load, Some(Load::Cpu));
-    assert_eq!(meter.stats, "8.0 of 8 cores");
+    assert_eq!(meter.stats, "8 of 8 cores");
     assert_eq!(
         msg.hold,
         Hold::Live {
@@ -439,11 +441,15 @@ fn posts_after_onset_and_two_heavy_readings_not_before() {
     assert_eq!(msg.tag, tags::SYSTEM);
     assert!(!msg.excerpt, "no excerpt: every fact waits behind Details");
     assert!(
-        msg.detail[0].starts_with("top: yes in tab 2 7.9 cores"),
+        msg.detail[0].starts_with("top: 'yes' in tab 2 7.9 cores"),
         "{:?}",
         msg.detail
     );
-    assert!(msg.actions.is_empty(), "no capsule (ruling 101)");
+    assert_eq!(
+        msg.actions,
+        [crate::model::Intent::ShowTab { tab: 2, window: 1 }],
+        "one navigation to the program the title names (ruling 243)"
+    );
 
     // One heavy reading is not HEAVY: a two-second spike under slow typing
     // raises nothing.
@@ -595,7 +601,7 @@ fn own_command_and_own_job_are_records() {
         recs[0]
             .title
             // What burns there, not the idle shell that holds the tab.
-            .starts_with("Typing slowed by yes in tab 1 for "),
+            .starts_with("Typing slowed by 'yes' in tab 1 for "),
         "{}",
         recs[0].title
     );
@@ -686,11 +692,14 @@ fn felt_without_heavy_records_the_turn_owner() {
     assert!(r.title.starts_with("Typing slow for "), "{}", r.title);
     assert!(
         r.detail
-            .contains(&"turn: session_restore 610 ms".to_string()),
+            .contains(&"longest pause in aterm: 610 ms".to_string()),
         "{:?}",
         r.detail
     );
-    assert!(r.detail.contains(&"not shown: no heavy cause".to_string()));
+    assert!(
+        r.detail
+            .contains(&"not shown: nothing heavy was running".to_string())
+    );
     assert!(r.detail.iter().any(|l| l.starts_with("typing: ")));
 }
 
@@ -707,14 +716,14 @@ fn culprit_swap_needs_two_scans() {
     // The first sweep after the change: Chrome leads once.
     let titles: Vec<String> = s.restates().iter().map(|(_, m)| m.title.clone()).collect();
     assert!(
-        titles.iter().all(|t| t == "Typing slowed by yes in tab 2"),
+        titles.iter().all(|t| t == "Typing slowed by 'yes'"),
         "{titles:?}"
     );
     s.run(start + 14_000, &chrome, Some((EVERY, SLOW)));
     let swapped: Vec<(u64, Message)> = s
         .restates()
         .into_iter()
-        .filter(|(_, m)| m.title == "Typing slowed by Google Chrome")
+        .filter(|(_, m)| m.title == "Typing slowed by 'Google Chrome'")
         .collect();
     assert!(!swapped.is_empty(), "{:?}", s.outs);
     assert!(
@@ -749,10 +758,11 @@ fn only_escalation_breaks_quiet() {
     s.run(fold + 80_000, &yes, Some((EVERY, SLOW)));
     s.run(fold + 100_000, &calm, Some((EVERY, FAST)));
     assert_eq!(s.posts().len(), 1, "{:?}", s.outs);
-    assert!(s.records().iter().any(|r| {
-        r.detail
-            .contains(&"not shown: quiet after last episode".to_string())
-    }));
+    assert!(
+        s.records()
+            .iter()
+            .any(|r| { r.detail.contains(&"not shown: shown recently".to_string()) })
+    );
     // Another cause inside three minutes: quiet too.
     let chrome = World::loaded(vec![app(700, "Google Chrome", 7800, 2)], 1000);
     s.run(fold + 120_000, &chrome, Some((EVERY, SLOW)));
@@ -766,7 +776,7 @@ fn only_escalation_breaks_quiet() {
     // Another cause after five minutes: shown.
     s.run(fold + 360_000, &chrome, Some((EVERY, SLOW)));
     assert_eq!(s.posts().len(), 2, "{:?}", s.outs);
-    assert_eq!(s.posts()[1].1.title, "Typing slowed by Google Chrome");
+    assert_eq!(s.posts()[1].1.title, "Typing slowed by 'Google Chrome'");
     s.run(fold + 380_000, &calm, Some((EVERY, FAST)));
     // An escalation breaks the quiet at once: memory pressure Critical.
     let start = s.ms;
@@ -778,15 +788,41 @@ fn only_escalation_breaks_quiet() {
     let posts = s.posts();
     assert_eq!(posts.len(), 3, "{:?}", s.outs);
     let m = &posts[2].1;
-    assert_eq!(m.title, "Typing slowed by Google Chrome");
+    assert_eq!(m.title, "Typing slowed by 'Google Chrome'");
     assert_eq!(m.severity, Severity::Warn, "critical: quit something");
     assert_eq!(m.meter.as_ref().unwrap().load, Some(Load::Memory));
-    assert_eq!(m.meter.as_ref().unwrap().stats, "16 GB \u{b7} swap 59 MB/s");
+    assert_eq!(
+        m.meter.as_ref().unwrap().stats,
+        "memory full \u{b7} swapping"
+    );
     assert!(
-        m.detail[0].starts_with("top: Google Chrome 6.0 GB"),
+        m.detail[0].starts_with("top: 'Google Chrome' 6.0 GB"),
         "{:?}",
         m.detail
     );
+}
+
+/// Review round 12 (ruling 247): a memory row claims only what was read.
+/// An episode entered on Critical pressure alone — no swap, no used figure
+/// (`Reading::mem_used_mib` is `None`) — never says `memory full ·
+/// swapping`; with a used figure it says that; swapping says swapping.
+#[test]
+fn memory_stats_claim_only_what_was_measured() {
+    let stats_of = |used: Option<u16>, swap: u64| {
+        let mut s = Sim::new();
+        let mut full = World::loaded(vec![app(700, "Google Chrome", 500, 6)], 400);
+        full.pressure = Some(MemoryLevel::Critical);
+        full.mem_used_pm = used;
+        full.swap_kib_s = swap;
+        s.run(20_000, &full, Some((EVERY, SLOW)));
+        let posts = s.posts();
+        let m = &posts.first().expect("a memory row").1;
+        assert_eq!(m.meter.as_ref().unwrap().load, Some(Load::Memory), "{m:?}");
+        m.meter.as_ref().unwrap().stats.clone()
+    };
+    assert_eq!(stats_of(None, 0), "", "no reading behind a claim");
+    assert_eq!(stats_of(Some(980), 0), "16 of 16 GB used");
+    assert_eq!(stats_of(None, 60_000), "memory full \u{b7} swapping");
 }
 
 #[test]
@@ -810,7 +846,7 @@ fn glass_cap_two_minutes_min_six_seconds() {
     assert_eq!(s.folds().len(), 1, "{:?}", s.outs);
     let rec = s.folds()[0].1.clone().unwrap();
     assert!(
-        rec.detail.last().unwrap().starts_with("on glass 6 s"),
+        rec.detail.last().unwrap().starts_with("shown for 6 s"),
         "{:?}",
         rec.detail
     );
@@ -823,10 +859,10 @@ fn glass_cap_two_minutes_min_six_seconds() {
     let on = folded - posted;
     assert!((120_000..122_100).contains(&on), "{on}");
     let rec = s.folds()[0].1.clone().unwrap();
-    assert_eq!(rec.detail.last().unwrap(), "on glass 2m 0s");
+    assert_eq!(rec.detail.last().unwrap(), "shown for 2m 0s");
     assert!(
         rec.title
-            .starts_with("Typing slowed by yes in tab 2 for 2m ")
+            .starts_with("Typing slowed by 'yes' in tab 2 for 2m ")
     );
     // …and the quiet keeps it off after (the same cause for 15 min).
     assert_eq!(s.posts().len(), 1, "{:?}", s.outs);
@@ -849,20 +885,16 @@ fn a_level_meter_glides_both_ways_and_never_completes() {
     let ms = Duration::from_millis;
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     let row = |pm: u16| {
-        Message::new(
-            tags::SYSTEM,
-            Severity::Info,
-            "Typing slowed by yes in tab 2",
-        )
-        .key(STRAIN_KEY)
-        .hold(Hold::Live {
-            stale_after: STALE_STRAIN,
-        })
-        .meter(Meter {
-            load: Some(Load::Cpu),
-            ..Meter::level(pm, "7.1 of 8 cores")
-        })
-        .no_excerpt()
+        Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
+            .key(STRAIN_KEY)
+            .hold(Hold::Live {
+                stale_after: STALE_STRAIN,
+            })
+            .meter(Meter {
+                load: Some(Load::Cpu),
+                ..Meter::level(pm, "7.1 of 8 cores")
+            })
+            .no_excerpt()
     };
     let stamp = WallStamp { unix_ms: 1 };
     let id = c.post(row(900), stamp, now).id;
@@ -876,7 +908,15 @@ fn a_level_meter_glides_both_ways_and_never_completes() {
         layout.elapsed.is_some(),
         "the clock: how long it has lasted"
     );
-    assert_eq!(layout.load.map(|(_, w)| w), Some("CPU busy"));
+    assert_eq!(
+        (layout.load, layout.load_slot),
+        (None, None),
+        "no load slot: the title names the load (ruling 243)"
+    );
+    assert!(
+        c.motion(&p, now, Look::MOVING).rows[0].surface.rail,
+        "a level is a rail, never a fill the words ride"
+    );
     // No glint, ever: every frame over two glint periods is the plain bar.
     for f in 0..u64::try_from((2 * GLINT_PERIOD).as_millis() / 33).unwrap() {
         let m = c.motion(&p, now + ms(f * 33), Look::MOVING);
@@ -886,7 +926,8 @@ fn a_level_meter_glides_both_ways_and_never_completes() {
             m.rows[0].anim
         );
     }
-    // Down, then up: each restate glides over FILL_GLIDE from the fill shown.
+    // Down, then up: each restate glides from the fill shown, over a span
+    // that scales with the distance (ruling 245).
     let restate = |c: &mut MessageCenter, pm: u16, at: Instant| {
         c.restate(
             id,
@@ -899,17 +940,19 @@ fn a_level_meter_glides_both_ways_and_never_completes() {
     };
     let t1 = now + ms(2000);
     assert!(restate(&mut c, 400, t1));
-    let mid = c.live(id).unwrap().shown_fill(t1 + FILL_GLIDE / 2).unwrap();
+    let down = crate::animate::glide_span(900, 400);
+    let mid = c.live(id).unwrap().shown_fill(t1 + down / 2).unwrap();
     assert!(400 < mid && mid < 900, "gliding down: {mid}");
-    assert_eq!(c.live(id).unwrap().shown_fill(t1 + FILL_GLIDE), Some(400));
+    assert_eq!(c.live(id).unwrap().shown_fill(t1 + down), Some(400));
     let t2 = t1 + ms(2000);
     assert!(restate(&mut c, 800, t2));
-    let mid = c.live(id).unwrap().shown_fill(t2 + FILL_GLIDE / 2).unwrap();
+    let up = crate::animate::glide_span(400, 800);
+    let mid = c.live(id).unwrap().shown_fill(t2 + up / 2).unwrap();
     assert!(400 < mid && mid < 800, "gliding up: {mid}");
     // The deadline asks frames for the glide only, then nothing but the
     // clock's next word: no glint travel is ever scheduled.
     let p = c.presentation(120, &char_width, None, Links::Painted);
-    let rest = t2 + FILL_GLIDE + ms(100);
+    let rest = t2 + up + ms(100);
     let next = c.motion_deadline(&p, rest, Look::MOVING).unwrap();
     assert!(next >= rest + ms(800), "only the clock ticks at rest");
     // Never carried: the successor measures for itself.
@@ -1028,6 +1071,7 @@ fn every_title_passes_attention_and_the_title_form() {
                 tab,
                 elsewhere,
                 receiving_keys: false,
+                window: 1,
             });
         }
     }
@@ -1054,7 +1098,7 @@ fn every_title_passes_attention_and_the_title_form() {
         "Typing slowed by CPU load"
     );
     // The records' titles say no blather either.
-    for words in ["yes in tab 2", "CPU load", "macOS services"] {
+    for words in ["'yes' in tab 2", "CPU load", "macOS services"] {
         for secs in [0, 40, 192, 3700] {
             let t = format!(
                 "{TITLE_HEAD}{words} for {}",
@@ -1129,8 +1173,7 @@ fn the_accessible_name_ignores_the_numbers() {
         c.presentation(120, &char_width, None, Links::Painted).rows[0].spoken("")
     };
     let before = name(&c);
-    assert_eq!(before, "Typing slowed by yes in tab 2");
-    let mut descriptions = vec![level_description(&posted)];
+    assert_eq!(before, "Typing slowed by 'yes'");
     for m in &restated {
         c.restate(
             id,
@@ -1142,16 +1185,7 @@ fn the_accessible_name_ignores_the_numbers() {
             now + Duration::from_secs(1),
         );
         assert_eq!(name(&c), before, "the numbers never re-announce the row");
-        descriptions.push(level_description(m));
     }
-    assert!(
-        descriptions[0].starts_with("CPU busy \u{b7} 8.0 of 8 cores"),
-        "{descriptions:?}"
-    );
-    assert!(
-        descriptions.iter().any(|d| d.contains("7.0 of 8 cores")),
-        "{descriptions:?}"
-    );
 }
 
 /// The live gate, synthetically: twelve `yes` in tab 2 while a person types
@@ -1171,7 +1205,7 @@ fn a_synthetic_yes_x12_posts_within_nine_seconds_and_folds_within_twelve() {
     let onset = 10_000;
     let lag = posts[0].0 - onset;
     assert!(lag <= 9_000, "posted {lag} ms after the onset");
-    assert_eq!(posts[0].1.title, "Typing slowed by yes in tab 2");
+    assert_eq!(posts[0].1.title, "Typing slowed by 'yes'");
     s.run(100_000, &calm, Some((EVERY, FAST)));
     let folds = s.folds();
     assert_eq!(folds.len(), 1, "{:?}", s.outs);
@@ -1181,12 +1215,12 @@ fn a_synthetic_yes_x12_posts_within_nine_seconds_and_folds_within_twelve() {
     assert_eq!(rec.hold, Hold::LogOnly);
     assert!(
         rec.title
-            .starts_with("Typing slowed by yes in tab 2 for 1m "),
+            .starts_with("Typing slowed by 'yes' in tab 2 for 1m "),
         "{}",
         rec.title
     );
     assert!(rec.detail.len() <= 5);
-    assert!(rec.detail.iter().any(|l| l.starts_with("on glass ")));
+    assert!(rec.detail.iter().any(|l| l.starts_with("shown for ")));
     // Calm again: nothing armed.
     assert_eq!(s.t.state_word(), "calm");
     assert_eq!(s.t.next_sample(s.at(s.ms), OPEN), None);
@@ -1233,7 +1267,7 @@ fn records_only_writes_the_episode_and_posts_nothing() {
     assert!(
         recs[0]
             .detail
-            .contains(&"not shown: records only".to_string())
+            .contains(&"not shown: the band was off".to_string())
     );
 }
 
@@ -1272,7 +1306,8 @@ fn grouping_follows_the_first_match() {
             program: "cc".into(),
             tab: 2,
             elsewhere: false,
-            receiving_keys: false
+            receiving_keys: false,
+            window: 1,
         }),
         Some(12)
     );
@@ -1350,6 +1385,7 @@ fn a_session_is_named_by_what_is_heavy_under_it() {
         tab: 2,
         receiving_keys: false,
         elsewhere: false,
+        window: 1,
     });
     let mut two = rows.clone();
     two.extend([
@@ -1359,7 +1395,7 @@ fn a_session_is_named_by_what_is_heavy_under_it() {
     ]);
     assert_eq!(named(&two, &panes), [("yes".to_string(), 1300)]);
 
-    // End to end: the tracker titles the prompt's load `yes in tab 2`.
+    // End to end: the tracker titles the prompt's load `'yes'` (its tab is the capsule's).
     let mut s = Sim::new();
     s.sessions = at_prompt("zsh");
     let calm = World::calm();
@@ -1368,13 +1404,13 @@ fn a_session_is_named_by_what_is_heavy_under_it() {
     s.run(40_000, &yes, Some((EVERY, SLOW)));
     let posts = s.posts();
     assert_eq!(posts.len(), 1, "{:?}", s.outs);
-    assert_eq!(posts[0].1.title, "Typing slowed by yes in tab 2");
+    assert_eq!(posts[0].1.title, "Typing slowed by 'yes'");
 }
 
 /// Found live (2026-09-24): twelve `yes` killed between two sweeps took
 /// their window's time with them, the services' subtraction took it, and
 /// the live row read `top: macOS services 7.5 cores` under `Typing slowed
-/// by yes in tab 2`; the episode's record then carried the calm machine's
+/// by 'yes' (tab 2)`; the episode's record then carried the calm machine's
 /// last sweep (`macOS services 0.6 cores · aterm 0.2`), which never named
 /// what slowed the typing. A sweep that busy processes exited inside is a
 /// baseline only, and a clearing machine's sweeps never replace a loaded
@@ -1404,14 +1440,14 @@ fn exits_never_hand_the_services_the_culprits_time() {
     };
     for (_, m) in s.restates().iter().chain(s.posts().iter()) {
         assert!(
-            top(m).starts_with("top: yes in tab 2 "),
+            top(m).starts_with("top: 'yes' in tab 2 "),
             "the live row's top line: {:?}",
             m.detail
         );
     }
     let rec = folds[0].1.clone().expect("the episode's record");
     assert!(
-        top(&rec).starts_with("top: yes in tab 2 "),
+        top(&rec).starts_with("top: 'yes' in tab 2 "),
         "the record says what loaded the machine: {:?}",
         rec.detail
     );
@@ -1442,14 +1478,14 @@ fn churning_children_still_name_their_session() {
     }
     let posts = s.posts();
     assert_eq!(posts.len(), 1, "{:?}", s.outs);
-    assert_eq!(posts[0].1.title, "Typing slowed by cargo in tab 2");
+    assert_eq!(posts[0].1.title, "Typing slowed by 'cargo'");
     assert_eq!(posts[0].1.meter.as_ref().unwrap().load, Some(Load::Cpu));
     let mut rows: Vec<Message> = s.posts().into_iter().map(|(_, m)| m).collect();
     rows.extend(s.restates().into_iter().map(|(_, m)| m));
     for m in &rows {
-        assert_eq!(m.title, "Typing slowed by cargo in tab 2", "{:?}", s.outs);
+        assert_eq!(m.title, "Typing slowed by 'cargo'", "{:?}", s.outs);
         assert!(
-            m.detail[0].starts_with("top: cargo in tab 2 "),
+            m.detail[0].starts_with("top: 'cargo' in tab 2 "),
             "the top line is the build, not the services: {:?}",
             m.detail
         );
@@ -1532,9 +1568,9 @@ fn a_heavy_kind_no_longer_rising_never_blocks_a_rising_one() {
     s.run(40_000, &pegged, Some((EVERY, SLOW)));
     let posts = s.posts();
     assert_eq!(posts.len(), 1, "{:?}", s.outs);
-    assert_eq!(posts[0].1.title, "Typing slowed by yes in tab 2");
+    assert_eq!(posts[0].1.title, "Typing slowed by 'yes'");
     for (_, m) in s.restates() {
-        assert_eq!(m.title, "Typing slowed by yes in tab 2", "{:?}", s.outs);
+        assert_eq!(m.title, "Typing slowed by 'yes'", "{:?}", s.outs);
     }
 }
 
@@ -1556,6 +1592,7 @@ fn split_panes_name_the_pane_that_is_heavy() {
             tab: 2,
             receiving_keys: false,
             elsewhere: false,
+            window: 1,
         },
         SessionRef {
             shell_pid: 400,
@@ -1563,6 +1600,7 @@ fn split_panes_name_the_pane_that_is_heavy() {
             tab: 2,
             receiving_keys: false,
             elsewhere: false,
+            window: 1,
         },
     ];
     let rows = vec![
@@ -1578,6 +1616,7 @@ fn split_panes_name_the_pane_that_is_heavy() {
             tab: 2,
             elsewhere: false,
             receiving_keys: false,
+            window: 1,
         },
         "{g:?}"
     );
@@ -1619,7 +1658,7 @@ fn a_gap_folds_where_sampling_stopped() {
         assert_eq!(s.t.state_word(), "calm");
         let glass = rec.detail.last().unwrap();
         let secs: u64 = glass
-            .strip_prefix("on glass ")
+            .strip_prefix("shown for ")
             .and_then(|g| g.strip_suffix(" s"))
             .and_then(|n| n.parse().ok())
             .unwrap_or_else(|| panic!("seconds on glass, not the hour away: {glass}"));

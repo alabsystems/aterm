@@ -147,6 +147,7 @@ pub fn clamp_add(x: f32, headroom: f32) -> f32 {
 /// headroom — the float twin of the WGSL `fs_hdr_glow`. The bound holds
 /// REGARDLESS of what the decode/boost produce (see [`clamp_add`]).
 #[must_use]
+#[cfg(test)]
 pub fn hdr_additive_encode(chan: f32, boost: f32, headroom: f32) -> f32 {
     clamp_add(srgb_channel_to_linear(chan) * boost, headroom)
 }

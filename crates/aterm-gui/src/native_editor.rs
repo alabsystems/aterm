@@ -5,10 +5,8 @@
 //!
 //! This is an editor over [`crate::document_store::DocumentStore`], not a terminal
 //! emulator. Commands, key sequences, prefix state, selections, kill/yank state,
-//! registers, marks, undo frames, and keyboard macros are structured data. Canonical
+//! marks, undo frames, and keyboard macros are structured data. Canonical
 //! bytes and commit ordering remain exclusively in the document store.
-
-#![allow(dead_code, reason = "native editor host integration lands in stages")]
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
@@ -47,6 +45,7 @@ impl Selection {
         self.anchor.min(self.head)..self.anchor.max(self.head)
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_caret(&self) -> bool {
         self.anchor == self.head
     }
@@ -89,7 +88,6 @@ pub(crate) enum Minibuffer {
         query: String,
         origin: usize,
     },
-    Message(String),
 }
 
 /// State that deliberately belongs to one visible editor view.
@@ -141,12 +139,14 @@ impl EditorBufferView {
         }
     }
 
-    pub(crate) fn anchor_seq(&self) -> Seq {
-        self.anchor_seq
-    }
-
     pub(crate) fn primary_selection(&self) -> &Selection {
         &self.selections[self.primary.min(self.selections.len().saturating_sub(1))]
+    }
+
+    /// The document sequence this view's coordinates are expressed at.
+    #[cfg(test)]
+    pub(crate) const fn anchor_seq(&self) -> Seq {
+        self.anchor_seq
     }
 
     pub(crate) fn scroll_lines(&mut self, text: &str, delta: i32) {
@@ -318,12 +318,6 @@ impl EditorBufferView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RegisterValue {
-    Text(String),
-    Position { document: DocumentId, offset: usize },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GlobalMark {
     pub(crate) document: DocumentId,
@@ -459,13 +453,6 @@ impl EditorCommand {
             Self::PlayMacro => "call-last-kbd-macro",
         }
     }
-
-    /// Resolve the exact public command vocabulary shown by M-x. Keeping this
-    /// table next to `name` prevents fuzzy/partial input from invoking a more
-    /// destructive command than the user actually entered.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|command| command.name() == name)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -588,7 +575,6 @@ struct YankRecord {
 pub(crate) struct EditorWorkspace {
     pub(crate) buffers: Vec<DocumentId>,
     pub(crate) kill_ring: VecDeque<String>,
-    pub(crate) registers: BTreeMap<char, RegisterValue>,
     pub(crate) global_mark_ring: VecDeque<GlobalMark>,
     pub(crate) command_history: VecDeque<String>,
     pub(crate) keymap: Keymap,
@@ -605,7 +591,6 @@ impl Default for EditorWorkspace {
         Self {
             buffers: Vec::new(),
             kill_ring: VecDeque::new(),
-            registers: BTreeMap::new(),
             global_mark_ring: VecDeque::new(),
             command_history: VecDeque::new(),
             keymap: Keymap::emacs(),
@@ -711,7 +696,7 @@ impl EditorWorkspace {
             Minibuffer::Buffer { query } | Minibuffer::GotoLine { query, .. } => {
                 (push_bounded(query, text, MINIBUFFER_QUERY_LIMIT), false)
             }
-            Minibuffer::Inactive | Minibuffer::Message(_) => {
+            Minibuffer::Inactive => {
                 return Ok(vec![EditorEffect::Bell]);
             }
         };
@@ -749,7 +734,7 @@ impl EditorWorkspace {
             Minibuffer::Search { query, .. }
             | Minibuffer::Buffer { query }
             | Minibuffer::GotoLine { query, .. } => query,
-            Minibuffer::Inactive | Minibuffer::Message(_) => {
+            Minibuffer::Inactive => {
                 return Ok(vec![EditorEffect::Bell]);
             }
         };
@@ -814,7 +799,7 @@ impl EditorWorkspace {
                 view.mark_active = false;
                 Ok(vec![EditorEffect::Status(format!("Line {line}"))])
             }
-            Minibuffer::Message(_) | Minibuffer::Inactive => Ok(vec![EditorEffect::Bell]),
+            Minibuffer::Inactive => Ok(vec![EditorEffect::Bell]),
         }
     }
 
@@ -1751,6 +1736,7 @@ fn byte_of_line(text: &str, line: usize) -> usize {
 /// walked the whole document four to six times, so frame time — and typing
 /// latency, since the reducer re-renders — grew linearly with file size all the
 /// way to the 32 MiB document limit.
+#[cfg(test)]
 pub(crate) fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = Vec::with_capacity(1 + text.len() / 40);
     starts.push(0);
@@ -1933,6 +1919,7 @@ pub(crate) struct EditorViewportProjection {
 /// produces its real final empty line, and a selection crossing a newline keeps
 /// enough information to paint the selected end-of-line cell. Work is capped so
 /// a corrupt geometry value cannot turn one frame into whole-document layout.
+#[cfg(test)]
 pub(crate) fn project_viewport(
     text: &str,
     view: &EditorBufferView,

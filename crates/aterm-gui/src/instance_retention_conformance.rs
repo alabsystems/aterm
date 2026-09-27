@@ -66,7 +66,6 @@ fn assert_invariants(model: &Model, state: &State, context: &str) {
 // sweeper produces those facts and `Decide` consumes them. Keep that boundary
 // explicit rather than attaching a refinement to a function that does not own
 // the transition.
-#[allow(dead_code)]
 #[aterm_spec::spec_unmodeled(
     machine = "ExactInstanceRetention",
     action = "SelectHeld",
@@ -90,6 +89,10 @@ fn assert_invariants(model: &Model, state: &State, context: &str) {
     action = "ObservePidAlive",
     reason = "environment observation: the OS liveness probe supplies this compatibility fact \
               only for a missing legacy lease; the Tier-1 matrix covers both values"
+)]
+#[expect(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
 )]
 fn explicit_environment_scope_waivers() {}
 
@@ -211,4 +214,30 @@ fn real_instance_sweep_decision_conforms_for_entire_lease_pid_matrix() {
         "held-lease removal mutant unexpectedly conformed: {evidence}"
     );
     assert!(!model.check_invariant("HeldNeverRemoved", &destructive));
+
+    // Negative control: the `Missing if !pid_alive => Remove` arm folded into
+    // the fail-closed Keep arm. The shipping decision removes a lease-less
+    // namespace whose PID is dead; keeping it would leak every pre-lease
+    // namespace forever, and the PID-fallback law refuses that.
+    let legacy_dead = project_before(&model, Missing, false);
+    assert_eq!(decide_instance_namespace_sweep(Missing, false), Remove);
+    let leaked = project_after(&legacy_dead, Keep);
+    assert!(
+        !model
+            .successors(DECIDE_ACTION, &legacy_dead)
+            .contains(&leaked)
+    );
+    let (leak_conforms, evidence) = validate_transition_tiered(
+        &model,
+        &[],
+        &legacy_dead,
+        &leaked,
+        Some(DECIDE_ACTION),
+        "exact-instance retention legacy-leak negative control",
+    );
+    assert!(
+        !leak_conforms,
+        "legacy-namespace leak mutant unexpectedly conformed: {evidence}"
+    );
+    assert!(!model.check_invariant("MissingAloneUsesPidFallback", &leaked));
 }

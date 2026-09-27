@@ -31,7 +31,12 @@ use super::*;
 /// unsafe callback that publishes every completed job. The derived checker thus
 /// proves the send and publication gates and catches a captured snapshot crossing
 /// A -> Off -> A, stale-generation/configuration publication, and disabled-result
-/// publication.
+/// publication. Its teardown paths also forget the observation retry: disable
+/// keeps it armed, so an Off feature still polls the terminal lock
+/// (`DisabledHasNoObservationRetry`), and retirement keeps it for a session that
+/// no longer exists — the class of 7230de0fa, where `Coordinator::retire` dropped
+/// every per-session map but the contended-observation backoff
+/// (`RetiredObservationIsQuiescent`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn title_summary_model() -> Model {
@@ -165,7 +170,7 @@ pub fn title_summary_model() -> Model {
                 applied_generation = 0;
                 applied_semantic = 0;
                 applied_config = 0;
-                retry_pending = 0;
+                retry_pending = if Buggy == 1 { retry_pending } else { 0 };
             }
 
             action Enable when (enabled == 0 && retired == 0) {
@@ -193,7 +198,7 @@ pub fn title_summary_model() -> Model {
             action Retire when (retired == 0) {
                 retired = 1;
                 enabled = 0;
-                retry_pending = 0;
+                retry_pending = if Buggy == 1 { retry_pending } else { 0 };
                 pending = 0;
                 pending_generation = 0;
                 pending_semantic = 0;
@@ -287,16 +292,8 @@ pub fn title_summary_model() -> Model {
                 } else {
                     applied_generation <= current_generation
                 };
-            invariant WorkerLaneHasOneStampedJob:
-                if inflight == 1 {
-                    job_generation > 0 &&
-                    job_generation <= current_generation &&
-                    job_semantic > 0 &&
-                    job_semantic <= semantic_generation &&
-                    job_config <= config_generation
-                } else {
-                    job_generation == 0 && job_semantic == 0 && job_config == 0
-                };
+            // The worker lane is an `Option<Job>`, and `Start` moves the pending
+            // slot's stamps into it only while its guard holds them current.
             invariant GenerationsBounded:
                 current_generation <= MaxGeneration &&
                 semantic_generation <= MaxGeneration &&
@@ -313,6 +310,8 @@ pub fn title_summary_model() -> Model {
 ///
 /// `Buggy=1` models the former bulk drain plus repeated active preference: two
 /// observations occur in one turn and the non-active sessions wait without bound.
+/// Its first turn also serves the sorted head of the due set, the active-first
+/// promotion in `due_observations` skipped (`ActiveSessionStartsBatch`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn title_summary_observation_scheduler_model() -> Model {
@@ -341,30 +340,36 @@ pub fn title_summary_observation_scheduler_model() -> Model {
 
             action ObserveTurn when (turns <= MaxTurns - 1) {
                 chosen = if Buggy == 1 {
-                    2
+                    if turns == 0 { 1 } else { 2 }
                 } else {
                     if queue_turn == 0 { 2 } else {
                         if queue_turn == 1 { 1 } else { 3 }
                     }
                 };
-                first_chosen = if turns == 0 { 2 } else { first_chosen };
+                first_chosen = if turns == 0 {
+                    if Buggy == 1 { 1 } else {
+                        if queue_turn == 0 { 2 } else {
+                            if queue_turn == 1 { 1 } else { 3 }
+                        }
+                    }
+                } else { first_chosen };
                 observations_this_turn = if Buggy == 1 { 2 } else { 1 };
                 wait1 = if (
-                    if Buggy == 1 { 2 } else {
+                    if Buggy == 1 { if turns == 0 { 1 } else { 2 } } else {
                         if queue_turn == 0 { 2 } else {
                             if queue_turn == 1 { 1 } else { 3 }
                         }
                     }
                 ) == 1 { 0 } else { wait1 + 1 };
                 wait2 = if (
-                    if Buggy == 1 { 2 } else {
+                    if Buggy == 1 { if turns == 0 { 1 } else { 2 } } else {
                         if queue_turn == 0 { 2 } else {
                             if queue_turn == 1 { 1 } else { 3 }
                         }
                     }
                 ) == 2 { 0 } else { wait2 + 1 };
                 wait3 = if (
-                    if Buggy == 1 { 2 } else {
+                    if Buggy == 1 { if turns == 0 { 1 } else { 2 } } else {
                         if queue_turn == 0 { 2 } else {
                             if queue_turn == 1 { 1 } else { 3 }
                         }
@@ -659,9 +664,16 @@ pub fn title_summary_runtime_model() -> Model {
 /// completion may never republish an endpoint after revocation.
 ///
 /// Ports are abstracted to the bounded values 1 and 2; value 3 represents the
-/// historical shared default. `Buggy=1` makes process 2 collide with process 1 and
-/// preserves/publishes stale health across revocation, providing non-vacuous
-/// controls for both ownership and telemetry obligations.
+/// historical shared default. `Buggy=1` resolves an automatic endpoint through
+/// configuration — the aliasing `EndpointOrigin` exists to prevent, an absent key
+/// read as the shared default — so both processes launch on it and collide
+/// (`AutomaticEndpointNeverUsesSharedDefault`,
+/// `ConcurrentAutomaticEndpointsAreDistinct`). It preserves/publishes stale
+/// health across revocation (`RevokedHealthIsClear`). And its exit handler — one
+/// code path, `Coordinator`'s `WorkerMessage::ManagedRuntimeExited` arm, so the
+/// same slip in both processes — reports the runtime down but keeps the dead
+/// daemon's record, its endpoint, health and reuse capability, for the next
+/// request (`EndpointBelongsToOwnedProcess`, `ReuseRetainsOwnedEndpoint`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn title_summary_managed_endpoint_model() -> Model {
@@ -683,12 +695,12 @@ pub fn title_summary_managed_endpoint_model() -> Model {
 
             action Launch1 when (process1 == 0) {
                 process1 = 1;
-                endpoint1 = 1;
+                endpoint1 = if Buggy == 1 { 3 } else { 1 };
             }
 
             action Launch2 when (process2 == 0) {
                 process2 = 1;
-                endpoint2 = if Buggy == 1 { 1 } else { 2 };
+                endpoint2 = if Buggy == 1 { 3 } else { 2 };
             }
 
             action Reuse1 when (process1 == 1 && endpoint1 > 0) {
@@ -719,16 +731,16 @@ pub fn title_summary_managed_endpoint_model() -> Model {
 
             action Crash1 when (process1 == 1) {
                 process1 = 0;
-                endpoint1 = 0;
+                endpoint1 = if Buggy == 1 { endpoint1 } else { 0 };
                 health_endpoint1 = if Buggy == 1 { health_endpoint1 } else { 0 };
-                reused1 = 0;
+                reused1 = if Buggy == 1 { reused1 } else { 0 };
             }
 
             action Crash2 when (process2 == 1) {
                 process2 = 0;
-                endpoint2 = 0;
+                endpoint2 = if Buggy == 1 { endpoint2 } else { 0 };
                 health_endpoint2 = if Buggy == 1 { health_endpoint2 } else { 0 };
-                reused2 = 0;
+                reused2 = if Buggy == 1 { reused2 } else { 0 };
             }
 
             action StaleResult1 when (authority1 > 1 && process1 == 0) {
@@ -791,6 +803,16 @@ pub fn title_summary_managed_endpoint_model() -> Model {
 /// 2 ambiguous, 3 unique, 4 structural error, 5 permanent error, and 6 timeout.
 /// `Buggy=1` models the regression where an ambiguous snapshot is treated as a
 /// permanent failure instead of retrying; `TransientObservationsRetry` catches it.
+/// That is the class of fa5658351 too, whose too-tight per-attempt bound read a
+/// slow `lsof` answer as a failure. It carries one slip per remaining law: the
+/// deadline is checked BEFORE the verdict, so an owner found by the attempt that
+/// spends the budget fails as a timeout (`UniqueObservationSucceeds`); and the
+/// retry arm drops its `socket_owner_observation_is_transient` filter, so a
+/// structural error is retried rather than failed closed
+/// (`PermanentErrorsFailClosed`).
+///
+/// No law restates `Timeout`: the shipping loop is deadline-driven and counts no
+/// attempts, so `retries` only bounds this model's retry train.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn title_summary_socket_owner_retry_model() -> Model {
@@ -821,12 +843,13 @@ pub fn title_summary_socket_owner_retry_model() -> Model {
             }
 
             action ObserveUnique when (phase <= 1) {
-                phase = 2;
+                phase = if Buggy == 1 && retries == MaxRetries { 3 } else { 2 };
                 observation = 3;
+                timed_out = if Buggy == 1 && retries == MaxRetries { 1 } else { timed_out };
             }
 
             action ObserveStructuralError when (phase <= 1) {
-                phase = 3;
+                phase = if Buggy == 1 { 1 } else { 3 };
                 observation = 4;
             }
 
@@ -858,12 +881,6 @@ pub fn title_summary_socket_owner_retry_model() -> Model {
                     phase == 3 && timed_out == 0
                 } else {
                     phase <= 3
-                };
-            invariant TimeoutConsumesTheBound:
-                if timed_out == 1 {
-                    phase == 3 && observation == 6 && retries == MaxRetries
-                } else {
-                    observation <= 5
                 };
             invariant RetryBudgetIsBounded: retries <= MaxRetries;
             invariant Bounds:

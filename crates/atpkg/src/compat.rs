@@ -170,7 +170,8 @@ pub fn root_dir(layout: &Layout, build: u64) -> PathBuf {
 pub const ROOT_MARKER: &str = ".atpkg-root";
 
 /// The marker's contents: a version line, so a future construction can tell its own roots
-/// from these.
+/// from these. Written only where roots are laid, which is Unix.
+#[cfg(unix)]
 const ROOT_MARKER_BODY: &str = "atpkg exec root v1 (copy-on-write clones)\n";
 
 /// `<root>/.atpkg-root`.
@@ -190,8 +191,8 @@ fn marker_stands(root: &Path) -> bool {
 /// check ([`crate::seam::first_mismatch`], which at [`Depth::Deep`] also reads the stock
 /// names' bytes) — or `None` when it matches.
 #[must_use]
+#[cfg(unix)]
 pub fn root_first_mismatch(build_dir: &Path, root: &Path, depth: Depth) -> Option<PathBuf> {
-    #[cfg(unix)]
     if crate::seam::is_real_dir(root) && !marker_stands(root) {
         return Some(root_marker(root));
     }
@@ -201,6 +202,7 @@ pub fn root_first_mismatch(build_dir: &Path, root: &Path, depth: Depth) -> Optio
 /// Whether the root at `root` is `build_dir` at `depth` ([`root_first_mismatch`] found
 /// nothing).
 #[must_use]
+#[cfg(unix)]
 pub fn root_matches(build_dir: &Path, root: &Path, depth: Depth) -> bool {
     root_first_mismatch(build_dir, root, depth).is_none()
 }
@@ -284,6 +286,7 @@ impl std::error::Error for Blocked {}
 /// `<prefix>/compat` and then `<prefix>/compat/trust`: `None` when each is a real
 /// directory or absent (absent is laid).
 #[must_use]
+#[cfg(unix)]
 pub fn blocked(layout: &Layout, build: u64) -> Option<Blocked> {
     [compat_dir(layout), roots_dir(layout)]
         .into_iter()
@@ -353,8 +356,9 @@ pub struct Report {
 
 impl Report {
     /// Whether anything was written or refused.
+    #[cfg(all(test, unix))]
     #[must_use]
-    pub fn changed(&self) -> bool {
+    pub(crate) fn changed(&self) -> bool {
         !(self.built.is_empty()
             && self.routed.is_empty()
             && self.swept.is_empty()

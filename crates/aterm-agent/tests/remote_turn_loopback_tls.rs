@@ -4,7 +4,7 @@
 //! E2E: a real `Turn` driven over an L3 loopback-TLS relay.
 //!
 //! Wires the full remote stack exactly the way production does — `RelayClient` -> a
-//! `dial_and_relay` driver -> real rustls 1.3 with a channel-bound capability ->
+//! `dial_and_relay_pinned` driver -> real rustls 1.3 with a channel-bound capability ->
 //! `accept_and_relay` listener -> the remote's authoritative control socket (here a
 //! tiny mock responder). Proves the agent `Turn` drives a REMOTE aterm end-to-end,
 //! byte-identically to a local one, with predicates evaluated on the remote host —
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use aterm_agent::{RelayClient, SelfGovernor, Turn};
-use aterm_net::drive::{accept_and_relay, dial_and_relay};
+use aterm_net::drive::{accept_and_relay, dial_and_relay_pinned};
 use aterm_net::tls::{cert_fingerprint, client_config, server_config};
 use aterm_session::EdgeToken;
 use aterm_uds::CtlStream;
@@ -94,7 +94,9 @@ fn remote_turn_over_loopback_tls() {
     // Driver: relay the local end over TLS; the test wraps the peer in RelayClient.
     let (drv_local, drv_client) = CtlStream::pair().unwrap();
     let driver = thread::spawn(move || {
-        dial_and_relay(addr, ccfg, "driver-1", "drive", &token, b"", drv_local)
+        dial_and_relay_pinned(
+            addr, ccfg, "driver-1", "drive", &token, b"", drv_local, None,
+        )
     });
 
     // Drive a real Turn against the REMOTE — byte-identical to the local path.

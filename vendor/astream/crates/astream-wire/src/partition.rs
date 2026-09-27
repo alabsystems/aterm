@@ -1,9 +1,9 @@
 //! The single, canonical partition-assignment function.
 //!
-//! Producer pre-routing, broker ingest, and NotLeader retries all call this
-//! one pure function, so they independently re-derive the identical partition
-//! with zero coordination. kafka2's idea — kept — but with the divergent
-//! round-robin twin deliberately not ported: there is exactly one of these.
+//! Everything that routes a message calls this one pure function, so producers
+//! and brokers independently re-derive the identical partition with zero
+//! coordination. There is deliberately exactly one of these: a second,
+//! divergent partitioner would route the same message two ways.
 //!
 //! The assignment is a pure function of immutable message attributes:
 //!
@@ -145,9 +145,9 @@ mod tests {
 
     #[test]
     fn domain_separation_holds_when_fields_contain_the_old_separator() {
-        // Under the old single 0x1f separator these two collided
+        // Under a bare 0x1f separator these two would collide
         // ("a\x1fb" + sep + "c" == "a" + sep + "b\x1fc"). Length prefixes make
-        // the encoding injective, so they must now route independently.
+        // the encoding injective, so they route independently.
         let mk = |topic: &str, origin: &str| {
             assign_partition(
                 PartitionKey::UnkeyedDurable {

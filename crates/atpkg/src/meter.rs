@@ -24,7 +24,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -533,7 +533,7 @@ impl Drop for TtyMeter {
 /// was started ignoring (`nohup`) stays ignored.
 #[cfg(unix)]
 mod sigint {
-    use super::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The disposition this process had before [`arm`]; `usize::MAX` = not armed.
     static PREVIOUS: AtomicUsize = AtomicUsize::new(usize::MAX);

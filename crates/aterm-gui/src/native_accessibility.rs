@@ -8,11 +8,6 @@
 //! Consequently pixels, hit testing, introspection, and accessibility share the exact same
 //! stable keys, clipped bounds, values, and state.
 
-#![allow(
-    dead_code,
-    reason = "native AccessKit host wiring lands with the tab-app window adapter"
-)]
-
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -37,12 +32,14 @@ use crate::native_ui::{
 use crate::tab_model::ViewId;
 
 /// A single platform range request is bounded even when its document is enormous.
+#[cfg(test)]
 pub(crate) const MAX_VIRTUAL_TEXT_RANGE: u64 = 1024 * 1024;
 
 /// Deterministically derive an AccessKit identity from a stable semantic key.
 ///
 /// FNV-1a is used only as a stable identifier projection, never as a security primitive.
 /// A collision inside one projected tree is detected and fails the whole projection.
+#[cfg(test)]
 pub(crate) fn stable_node_id(key: &UiKey) -> NodeId {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in b"aterm/native-a11y/v1\0"
@@ -157,6 +154,7 @@ pub(crate) struct VirtualTextSelection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct VirtualTextRequest {
     pub(crate) node: NodeId,
     pub(crate) key: UiKey,
@@ -166,6 +164,7 @@ pub(crate) struct VirtualTextRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum VirtualTextError {
     UnknownNode,
     ReversedRange,
@@ -183,14 +182,17 @@ pub(crate) struct NativeAccessibilityProjection {
 }
 
 impl NativeAccessibilityProjection {
+    #[cfg(test)]
     pub(crate) fn update(&self) -> &TreeUpdate {
         &self.update
     }
 
+    #[cfg(test)]
     pub(crate) fn into_update(self) -> TreeUpdate {
         self.update
     }
 
+    #[cfg(test)]
     pub(crate) fn into_update_and_routes(self) -> (TreeUpdate, Vec<AccessibilityRoute>) {
         (self.update, self.routes)
     }
@@ -201,19 +203,23 @@ impl NativeAccessibilityProjection {
         (self.update, self.routes, self.virtual_text)
     }
 
+    #[cfg(test)]
     pub(crate) fn routes(&self) -> &[AccessibilityRoute] {
         &self.routes
     }
 
+    #[cfg(test)]
     pub(crate) fn virtual_text(&self) -> &[VirtualTextTarget] {
         &self.virtual_text
     }
 
     /// Diagnostic witness that the canonical semantic vector was consumed once.
+    #[cfg(test)]
     pub(crate) fn source_nodes_visited(&self) -> usize {
         self.source_nodes_visited
     }
 
+    #[cfg(test)]
     pub(crate) fn id_for_key(&self, key: &UiKey) -> Option<NodeId> {
         self.routes
             .iter()
@@ -221,11 +227,13 @@ impl NativeAccessibilityProjection {
             .map(|route| route.node)
     }
 
+    #[cfg(test)]
     pub(crate) fn route_for_node(&self, node: NodeId) -> Option<&AccessibilityRoute> {
         self.routes.iter().find(|route| route.node == node)
     }
 
     /// Build a bounded range request for the host's virtual text provider.
+    #[cfg(test)]
     pub(crate) fn request_virtual_text(
         &self,
         node: NodeId,
@@ -329,6 +337,7 @@ pub(crate) struct PublishedNativeAccessibility {
 }
 
 impl PublishedNativeAccessibility {
+    #[cfg(test)]
     pub(crate) fn new(view: ViewId, generation: u64, routes: Vec<AccessibilityRoute>) -> Self {
         let owner = AccessibilityOwner { view, generation };
         Self {
@@ -347,6 +356,7 @@ impl PublishedNativeAccessibility {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_virtual_text(
         view: ViewId,
         generation: u64,
@@ -415,6 +425,7 @@ impl PublishedNativeAccessibility {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn virtual_text(&self) -> &[VirtualTextTarget] {
         &self.virtual_text
     }
@@ -835,6 +846,7 @@ fn text_position_for_source(lines: &[VirtualTextLine], source_byte: u64) -> Opti
 ///
 /// `focused` is the host's authoritative content focus. When omitted, exactly zero or one
 /// `ControlState::focused` flag is accepted; zero falls back to the semantic root.
+#[cfg(test)]
 pub(crate) fn project_native_accessibility(
     compiled: &CompiledUi,
     focused: Option<&UiKey>,
@@ -845,6 +857,7 @@ pub(crate) fn project_native_accessibility(
 /// Project logical native coordinates into the physical-pixel window coordinates AccessKit
 /// requires. The root transform is the only host-owned geometry added to the canonical tree;
 /// every descendant bound still comes verbatim from [`CompiledUi::semantics`].
+#[cfg(test)]
 pub(crate) fn project_native_accessibility_in_container(
     compiled: &CompiledUi,
     focused: Option<&UiKey>,
@@ -971,6 +984,7 @@ pub(crate) fn compose_native_accessibility(
     })
 }
 
+#[cfg(test)]
 fn project_with_ids(
     compiled: &CompiledUi,
     focused: Option<&UiKey>,
@@ -1227,6 +1241,12 @@ fn lower_node(
         node.set_label(semantic.label.clone());
     }
 
+    // A control's description (ruling 267): what a reader says after the
+    // name, never folded into it.
+    if let Some(description) = &semantic.description {
+        node.set_description(description.clone());
+    }
+
     let enabled = semantic.state.is_none_or(|state| state.enabled);
     if let Some(state) = semantic.state {
         lower_state(&mut node, state);
@@ -1290,9 +1310,9 @@ fn lower_role(role: SemanticRole) -> Role {
         SemanticRole::TextField => Role::TextInput,
         SemanticRole::RichText => Role::Document,
         SemanticRole::TextViewport => Role::MultilineTextInput,
-        SemanticRole::Link => Role::Link,
         SemanticRole::Navigation => Role::Navigation,
         SemanticRole::Status => Role::Status,
+        SemanticRole::List => Role::List,
     }
 }
 
@@ -1308,6 +1328,9 @@ fn lower_state(node: &mut Node, state: ControlState) {
     }
     if state.busy {
         node.set_busy();
+    }
+    if let Some(expanded) = state.expanded {
+        node.set_expanded(expanded);
     }
 }
 
@@ -1365,7 +1388,7 @@ fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
         SemanticRole::TextField if has_reducer_action => {
             node.add_action(Action::SetValue);
         }
-        SemanticRole::RichText => {
+        SemanticRole::RichText | SemanticRole::List => {
             node.add_action(Action::ScrollUp);
             node.add_action(Action::ScrollDown);
         }
@@ -1383,7 +1406,6 @@ fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
         | SemanticRole::Text
         | SemanticRole::Button
         | SemanticRole::Switch
-        | SemanticRole::Link
         | SemanticRole::Navigation
         | SemanticRole::Status => {}
     }
@@ -1481,6 +1503,7 @@ mod tests {
             state: None,
             action: None,
             audit_id: None,
+            description: None,
         }
     }
 
@@ -1581,9 +1604,9 @@ mod tests {
             (SemanticRole::TextField, Role::TextInput),
             (SemanticRole::RichText, Role::Document),
             (SemanticRole::TextViewport, Role::MultilineTextInput),
-            (SemanticRole::Link, Role::Link),
             (SemanticRole::Navigation, Role::Navigation),
             (SemanticRole::Status, Role::Status),
+            (SemanticRole::List, Role::List),
         ];
         for (semantic, accesskit) in mappings {
             assert_eq!(lower_role(semantic), accesskit);
@@ -2033,11 +2056,13 @@ mod tests {
                     selectable: true,
                     projection: Some(visible),
                     preedit: String::new(),
+                    preedit_caret: None,
                     status: Some("1 config error · Save blocked".to_string()),
                     semantic_status: Some(
                         "Config error · Ln 7, Col 3 · complete diagnostic message".to_string(),
                     ),
                     minibuffer: None,
+                    minibuffer_caret: None,
                     cursor_label: None,
                     dirty: false,
                     saving: false,
@@ -2227,9 +2252,11 @@ mod tests {
                         lines,
                     }),
                     preedit: String::new(),
+                    preedit_caret: None,
                     status: None,
                     semantic_status: None,
                     minibuffer: None,
+                    minibuffer_caret: None,
                     cursor_label: None,
                     dirty: false,
                     saving: false,

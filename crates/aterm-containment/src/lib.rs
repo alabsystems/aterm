@@ -57,13 +57,10 @@
 //!   explicitly, so it is an audited choice, never a silent claim.
 //! - **OUTPUT / INPUT I/O FILTERING.** `Containment` maps output to
 //!   [`OutputCapability::Filtered`] and input to [`InputCapability::Filtered`], and
-//!   [`OutputSanitizer`] implements a streaming OSC/DCS/APC/SOS/PM stripper for that
-//!   tier. As of this increment that sanitizer is a MODEL / PROOF artifact only: it
-//!   has NO production caller, is NOT wired into any PTY or output path, and so NO
-//!   I/O is filtered at runtime. Input filtering is unimplemented entirely. Treat the
-//!   `Filtered` capability as a policy-data-model value, never a runtime guarantee,
-//!   until a reader-loop hook lands (FOLLOW-UP). (An earlier draft cited an
-//!   `aterm-daemon` reader loop as the integration point; that crate no longer exists.)
+//!   NO I/O is filtered at runtime: treat the `Filtered` capability as a
+//!   policy-data-model value, never a runtime guarantee. (A streaming
+//!   OSC/DCS/APC/SOS/PM stripper for that tier, `OutputSanitizer`, sat here with no
+//!   caller and was deleted, 2026-09-25; a reader-loop hook would bring its own.)
 //!
 //! aterm operates in one of four containment modes, set once by the launcher:
 //!
@@ -71,7 +68,7 @@
 //! |------|------------|-------------|
 //! | **Master** | Full | Developer mode — all capabilities unrestricted |
 //! | **User** | Normal | Standard safeguards — output shadow-scanned |
-//! | **Safety** | Reduced | Allowlisted operations only — POLICY INTENT: the allowlist gates ([`allowlist`]) are a policy/proof artifact today with NO production caller (`init_allowlist` is never invoked and no gate site consults `is_*_allowed`), so no allowlist confinement is enforced at runtime yet (FOLLOW-UP; see the `allowlist` module docs) |
+//! | **Safety** | Reduced | Allowlisted operations only — POLICY INTENT: no allowlist confinement is enforced at runtime (the unwired allowlist gates that modelled it were deleted, 2026-09-25) |
 //! | **Containment** | Hostile | Most restrictive POLICY (no network; I/O *modelled* as filtered) — the NO-NETWORK part AND a conservative SECRET-directory read/write deny (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/aterm`, `~/.netrc`) are OS-enforced on macOS (Seatbelt `deny network*` + `deny file-read*/file-write*` via `sandbox-exec`). The `Filtered` I/O capability is a POLICY/PROOF artifact only — output filtering is NOT wired into any runtime path and input filtering is unimplemented (see the deferred-I/O note below) — and GENERAL OS filesystem scoping is the deferred follow-up |
 //!
 //! ## Core Axiom
@@ -129,13 +126,11 @@
 )]
 
 pub mod actuator;
-pub(crate) mod allowlist;
 pub(crate) mod capability;
 pub mod consent;
 #[cfg(kani)]
 mod kani_proofs;
 pub(crate) mod mode;
-pub(crate) mod output_filter;
 pub(crate) mod policy;
 pub mod sbpl;
 
@@ -152,12 +147,6 @@ pub(crate) mod audit;
 
 pub use actuator::{
     SpawnDecision, decide as decide_spawn, network_sandbox_actuated, os_sandbox_actuated,
-};
-#[cfg(unix)]
-pub use allowlist::verify_executable_fd;
-pub use allowlist::{
-    AllowlistConfig, AllowlistError, init_allowlist, is_mcp_allowed, is_network_allowed,
-    is_plugin_allowed, is_process_allowed,
 };
 pub use audit::{log_denial, log_posture};
 pub use capability::{
@@ -176,15 +165,14 @@ pub use capability::{
 // repair's entry points are found by reading the consent module, not by tab
 // completion on the crate root.
 pub use consent::{
-    Attribution, CachedProbe, ConsentCache, ConsentKey, ConsentPosture, DrClass, FdaProbe,
-    FdaScope, FdaState, Folder, FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel,
-    ProbeOutcome, ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus,
-    Responsible, ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
+    Attribution, ConsentKey, ConsentPosture, DrClass, FdaProbe, FdaScope, FdaState, Folder,
+    FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome, ResetAttempt,
+    ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
+    ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
     classify_image_anchor, image_anchor, probe_fda, protected_roots, responsible_app,
     responsible_pid,
 };
 pub use mode::{ContainmentMode, ParseModeError};
-pub use output_filter::OutputSanitizer;
 pub use policy::{Capabilities, ContainmentPolicy};
 pub use sbpl::{NETWORK_DENY_PROFILE, SANDBOX_EXEC_PATH, profile_for as sbpl_profile_for};
 
@@ -302,40 +290,42 @@ pub fn mode_or_containment() -> ContainmentMode {
     try_current_mode().unwrap_or(ContainmentMode::Containment)
 }
 
-/// Initialize mode from environment variable `ATERM_CONTAINMENT_MODE`.
-///
-/// Falls back to the provided default if the env var is not set.
+/// Initialize the mode from the launcher's `--containment` flag (`None` = no flag
+/// given: `default`). The flag is the one spelling — no environment variable
+/// selects the mode (2026-09-24) — and its value is parsed by the same
+/// [`ContainmentMode::from_str`](std::str::FromStr) every launcher shares.
 /// Returns the resolved mode on success.
 ///
 /// # Errors
 ///
-/// Returns error if the env var contains an invalid value or mode was
-/// already initialized.
-pub fn init_mode_from_env(
+/// Returns error if the flag's value is not a mode (the caller fails CLOSED) or
+/// the mode was already initialized.
+pub fn init_mode_from_flag(
+    flag: Option<&str>,
     default: ContainmentMode,
-) -> Result<ContainmentMode, InitModeFromEnvError> {
-    let mode = match std::env::var("ATERM_CONTAINMENT_MODE") {
-        Ok(val) => val
+) -> Result<ContainmentMode, InitModeFromFlagError> {
+    let mode = match flag {
+        Some(value) => value
             .parse::<ContainmentMode>()
-            .map_err(InitModeFromEnvError::Parse)?,
-        Err(_) => default,
+            .map_err(InitModeFromFlagError::Parse)?,
+        None => default,
     };
-    init_mode(mode).map_err(InitModeFromEnvError::Init)?;
+    init_mode(mode).map_err(InitModeFromFlagError::Init)?;
     Ok(mode)
 }
 
-/// Error from [`init_mode_from_env`].
+/// Error from [`init_mode_from_flag`].
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum InitModeFromEnvError {
-    /// Invalid mode string in environment variable.
+pub enum InitModeFromFlagError {
+    /// The flag's value is not a containment mode.
     Parse(ParseModeError),
     /// Mode already initialized.
     Init(InitError),
 }
 
 // Hand-written `Display`/`Error`/`From` (was `#[derive(aterm_error::Error)]`
-// with `#[error("invalid ATERM_CONTAINMENT_MODE: {0}")]` / `#[error("{0}")]`
+// with `#[error("invalid containment mode: {0}")]` / `#[error("{0}")]`
 // and `#[from]` on both fields): the derive's generated `fmt` expands a
 // runtime-argument `format_args!`, whose unsafe `fmt::Arguments::new`
 // constructor the Trust strict gate's native lowering fails closed on.
@@ -344,11 +334,11 @@ pub enum InitModeFromEnvError {
 // pieces (plus str's options-insensitive `Debug`), so the `{0}` placeholder's
 // default-options rendering and the delegated rendering emit the same bytes.
 // `source()` and the two `From` impls mirror the derive's `#[from]` output.
-impl std::fmt::Display for InitModeFromEnvError {
+impl std::fmt::Display for InitModeFromFlagError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse(e) => {
-                f.write_str("invalid ATERM_CONTAINMENT_MODE: ")?;
+                f.write_str("invalid containment mode: ")?;
                 std::fmt::Display::fmt(e, f)
             }
             Self::Init(e) => std::fmt::Display::fmt(e, f),
@@ -356,7 +346,7 @@ impl std::fmt::Display for InitModeFromEnvError {
     }
 }
 
-impl std::error::Error for InitModeFromEnvError {
+impl std::error::Error for InitModeFromFlagError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Parse(e) => Some(e),
@@ -365,13 +355,13 @@ impl std::error::Error for InitModeFromEnvError {
     }
 }
 
-impl From<ParseModeError> for InitModeFromEnvError {
+impl From<ParseModeError> for InitModeFromFlagError {
     fn from(value: ParseModeError) -> Self {
         Self::Parse(value)
     }
 }
 
-impl From<InitError> for InitModeFromEnvError {
+impl From<InitError> for InitModeFromFlagError {
     fn from(value: InitError) -> Self {
         Self::Init(value)
     }
@@ -403,15 +393,15 @@ mod tests {
         );
     }
 
-    /// Verify InitModeFromEnvError variants have useful messages.
+    /// Verify InitModeFromFlagError variants have useful messages.
     #[test]
-    fn test_init_mode_from_env_error_variants() {
+    fn test_init_mode_from_flag_error_variants() {
         // Parse error wraps ParseModeError
-        let parse_err = InitModeFromEnvError::Parse(ParseModeError("bogus".to_string()));
+        let parse_err = InitModeFromFlagError::Parse(ParseModeError("bogus".to_string()));
         let msg = parse_err.to_string();
         assert!(
-            msg.contains("ATERM_CONTAINMENT_MODE"),
-            "parse error should reference env var: {msg}"
+            msg.contains("invalid containment mode"),
+            "parse error should say what was invalid: {msg}"
         );
         assert!(
             msg.contains("bogus"),
@@ -419,7 +409,7 @@ mod tests {
         );
 
         // Init error wraps InitError
-        let init_err = InitModeFromEnvError::Init(InitError::AlreadyInitialized {
+        let init_err = InitModeFromFlagError::Init(InitError::AlreadyInitialized {
             existing: ContainmentMode::User,
             attempted: ContainmentMode::Safety,
         });

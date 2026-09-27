@@ -899,3 +899,80 @@ fn a_released_band_that_different_text_lands_under_it_a_frame_later_melts_fast()
     );
     assert!(!h.lit(7), "row 7 holds no typed text: dark");
 }
+
+/// Claude Code's same-row submit that paints ONE glyph on the column of the
+/// Space typed between `ab` and `cd` (`> ab cd` on row 5): the row cleared,
+/// the prompt put back, a `*` on 0-based column 4, the caret parked after
+/// the prompt.
+const SUBMIT_GLYPH_ON_THE_SPACE: &[u8] = b"\x1b[?25l\x1b[6;1H\x1b[2K> \x1b[6;5H*\x1b[6;3H\x1b[?25h";
+
+/// The census of HOLES: for each frame over `ms` (16 ms apart, the frame
+/// the census began on first), whether `row`'s bed has an unlit pixel at
+/// the row's centre with a lit one on each side of it — the band punched
+/// through, as the eye reads it. Returns the seconds of each such frame.
+fn hole_frames(h: &mut Host, row: u16, ms: u64) -> Vec<f32> {
+    let holed = |h: &Host| {
+        let mut lit = vec![false; COLS * CW];
+        for q in h.row_quads(row) {
+            let x0 = usize::from(q.x).min(lit.len());
+            let x1 = (usize::from(q.x) + usize::from(q.w)).min(lit.len());
+            for px in &mut lit[x0..x1] {
+                *px = true;
+            }
+        }
+        let first = lit.iter().position(|&l| l);
+        let last = lit.iter().rposition(|&l| l);
+        matches!((first, last), (Some(a), Some(b)) if lit[a..=b].iter().any(|&l| !l))
+    };
+    let start = h.now;
+    let mut out = Vec::new();
+    let end = h.now + Duration::from_millis(ms);
+    loop {
+        if holed(h) {
+            out.push(h.now.saturating_duration_since(start).as_secs_f32());
+        }
+        if h.now >= end {
+            return out;
+        }
+        h.now += Duration::from_millis(16);
+        h.frame();
+    }
+}
+
+/// **A GLYPH THE CLEAR PAINTS ON A TYPED SPACE LEAVES WITH THE SWOOSH**
+/// (2026-09-24, the review of `Witness::landed_goes_with_its_run`). `> ab
+/// cd`, then the same-row submit with a spinner glyph painted on the
+/// Space's column in the batch that clears the row. The letters are
+/// released and swoosh into the hand over the retract's `0.64 s`; the
+/// Space's cell — under a glyph that is not its text — goes WITH them,
+/// on the same swoosh. The band is never punched through while it drains:
+/// no frame has an unlit pixel between two lit ones on the row.
+///
+/// RED before the fix, measured by the review: the landed cell took the
+/// content witness's `0.12 s` melt while its run-mates swooshed, a zero-
+/// alpha gap at x = 31..39 for 17 consecutive frames, t = 0.112..0.368 s.
+/// The plain submit (the control) had none, then and now.
+#[test]
+fn a_glyph_the_clear_paints_on_a_typed_space_leaves_with_the_swoosh_not_ahead_of_it() {
+    for (submit, what) in [
+        (SUBMIT_SAME_ROW, "the plain submit (the control)"),
+        (SUBMIT_GLYPH_ON_THE_SPACE, "a glyph on the Space's column"),
+    ] {
+        let mut h = Host::at_row(5);
+        h.program(b"> ");
+        h.type_str("ab cd");
+        assert_eq!(h.live(5), vec![2, 3, 4, 5, 6], "{what}: the premise");
+        h.ret(submit);
+        let cells = h.cells(5);
+        let holes = hole_frames(&mut h, 5, 800);
+        assert!(
+            holes.is_empty(),
+            "{what}: the draining band is punched through on {} frames: {holes:?}",
+            holes.len()
+        );
+        assert!(
+            cells.iter().all(|&(_, leaving)| !leaving),
+            "{what}: no cell of the released band is stamped for the melt: {cells:?}"
+        );
+    }
+}

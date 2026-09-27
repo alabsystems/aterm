@@ -33,21 +33,21 @@ pub(crate) const SITE: &str = aterm_types::identity::SITE;
 
 /// Application identity shared across the one binary: `[workspace.package]
 /// version`, as written, in every build.
-pub const VERSION: &str = aterm_types::version::APP_VERSION;
+pub(crate) const VERSION: &str = aterm_types::version::APP_VERSION;
 
 /// Short git commit the binary was built from — with a `-dirty` suffix when the
 /// working tree had uncommitted changes. `"unknown"` when git was unavailable at
 /// build time (e.g. a source tarball). Stamped by `build.rs`.
-pub const GIT_COMMIT: &str = env!("ATERM_GIT_COMMIT");
+pub(crate) const GIT_COMMIT: &str = env!("ATERM_GIT_COMMIT");
 
 /// Full source identity for authenticated native-artifact probes. Unlike the
 /// display abbreviation this binds all forty hexadecimal commit characters.
-pub const GIT_COMMIT_FULL: &str = env!("ATERM_GIT_COMMIT_FULL");
-pub const GIT_DIRTY: &str = env!("ATERM_GIT_DIRTY");
-pub const BINARY_TARGET: &str = env!("ATERM_BINARY_TARGET");
+pub(crate) const GIT_COMMIT_FULL: &str = env!("ATERM_GIT_COMMIT_FULL");
+pub(crate) const GIT_DIRTY: &str = env!("ATERM_GIT_DIRTY");
+pub(crate) const BINARY_TARGET: &str = env!("ATERM_BINARY_TARGET");
 
 /// UTC build timestamp (RFC3339), or `"unknown"`. Stamped by `build.rs`.
-pub const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
+pub(crate) const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 
 /// Monotonic build number, stamped by `build.rs`. The updater's ordering lives
 /// here in metadata, independent of the app/source display version above. For a
@@ -57,13 +57,14 @@ pub const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 /// falls back to HEAD's committer Unix epoch — the same seconds scale, so dev
 /// and release builds stay mutually ordered. Used as the macOS
 /// `CFBundleVersion`.
-pub const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
+pub(crate) const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
 
 /// Commits since the newest release tag at build time ("0" when git or the
 /// tag was unavailable) — the menu bar's DEV COUNTER: the third slot of a dev
 /// build's displayed version (owner, 2026-08-16; a release's third slot is
 /// always literal 0, so a nonzero counter can never be mistaken for one).
-pub const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
 
 /// Whether a release lane produced this binary. `cargo ship cut` (both
 /// architecture builds) and the Linux release lane set `ATERM_RELEASE_BUILD`
@@ -71,7 +72,8 @@ pub const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
 /// IS the release/dev discriminator — read by display surfaces only (the menu
 /// bar's DEV signature). It carries no version: every build reports
 /// [`VERSION`].
-pub const IS_RELEASE_BUILD: bool = option_env!("ATERM_RELEASE_BUILD").is_some();
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const IS_RELEASE_BUILD: bool = option_env!("ATERM_RELEASE_BUILD").is_some();
 
 /// Full first line of the producing compiler's `-vV`, e.g.
 /// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)` or
@@ -79,15 +81,15 @@ pub const IS_RELEASE_BUILD: bool = option_env!("ATERM_RELEASE_BUILD").is_some();
 /// canonical `rustc` token by ecosystem contract (version-sniffing build
 /// scripts assert it) and self-identifies in the parenthetical. Stamped by
 /// `build.rs`.
-pub const COMPILER_VERSION_LINE: &str = env!("ATERM_COMPILER_VERSION_LINE");
+pub(crate) const COMPILER_VERSION_LINE: &str = env!("ATERM_COMPILER_VERSION_LINE");
 
 /// The producing compiler's FULL git commit hash (`commit-hash:` from `-vV`), or
 /// `"unknown"`. This is what tells two coexisting 1.96.0 toolchains apart —
 /// per-binary compiler provenance. Stamped by `build.rs`.
-pub const COMPILER_COMMIT: &str = env!("ATERM_COMPILER_COMMIT");
+pub(crate) const COMPILER_COMMIT: &str = env!("ATERM_COMPILER_COMMIT");
 
 /// The producing compiler's host triple (`host:` from `-vV`). Stamped by `build.rs`.
-pub const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
+pub(crate) const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
 
 /// Trust's OWN version — the `trust:` line of the producing compiler's `-vV`
 /// (e.g. `0.1.0`). This is NOT the `1.99.0-dev` in [`COMPILER_VERSION_LINE`]:
@@ -98,20 +100,20 @@ pub const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
 /// where Trust says its own name. It says it here. `""` when the compiler
 /// reported no such line (upstream rustc, or a Trust build predating the
 /// marker). Stamped by `build.rs`.
-pub const COMPILER_TRUST_VERSION: &str = env!("ATERM_COMPILER_TRUST_VERSION");
+pub(crate) const COMPILER_TRUST_VERSION: &str = env!("ATERM_COMPILER_TRUST_VERSION");
 
 /// Compiler flavor: `"r"` = upstream Rust, `"t"` = Trust (trustc). Detection order
 /// (see `build.rs` / `compiler_probe.rs`): the `-vV` self-identification,
 /// `/trust/` in the RUSTC path, `RUSTUP_TOOLCHAIN=trust`, else `"r"`. Evidence
 /// only — no build-environment override can flip it (the `build.rs` name below
 /// is a `cargo:rustc-env` conduit the build script writes, not one it reads).
-pub const COMPILER_FLAVOR: &str = env!("ATERM_COMPILER_FLAVOR");
+pub(crate) const COMPILER_FLAVOR: &str = env!("ATERM_COMPILER_FLAVOR");
 
 /// Cargo profile the binary was compiled under (`"debug"`/`"release"`).
-pub const BUILD_PROFILE: &str = env!("ATERM_BUILD_PROFILE");
+pub(crate) const BUILD_PROFILE: &str = env!("ATERM_BUILD_PROFILE");
 
 /// `"on"` iff `--cfg trust_verify` was active in this compile, else `"off"`.
-pub const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
+pub(crate) const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
 
 /// Exact lowercase SHA-256 fingerprint of the raw paper master key — the one anchor
 /// that authorizes a release — or the all-zero sentinel when none is pinned (a fork).
@@ -119,10 +121,10 @@ pub const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
 /// (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS[0]`), never from a build environment
 /// variable; the release cutter independently cross-checks this record against both
 /// runtime diagnostics and the committed master.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub const EMBEDDED_UPDATE_PIN_SHA256: &str = env!("ATERM_UPDATE_PIN_SHA256");
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const EMBEDDED_UPDATE_PIN_SHA256: &str = env!("ATERM_UPDATE_PIN_SHA256");
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const fn update_pin_record_bytes(value: &str) -> [u8; 64] {
     let bytes = value.as_bytes();
     assert!(bytes.len() == 64);
@@ -143,13 +145,12 @@ const fn update_pin_record_bytes(value: &str) -> [u8; 64] {
 #[cfg(target_vendor = "apple")]
 #[used]
 #[unsafe(link_section = "__DATA,__aterm_upin")]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 static ATERM_UPDATE_PIN_RECORD: [u8; 64] = update_pin_record_bytes(EMBEDDED_UPDATE_PIN_SHA256);
 
 /// Short (8-hex) slug of the producing compiler's commit — the version-suffix slug.
 /// `"unknown"` when the toolchain didn't report a hash (e.g. some distro builds).
 #[must_use]
-pub fn compiler_commit_short() -> &'static str {
+pub(crate) fn compiler_commit_short() -> &'static str {
     if COMPILER_COMMIT.len() >= 8 && COMPILER_COMMIT.bytes().all(|b| b.is_ascii_hexdigit()) {
         &COMPILER_COMMIT[..8]
     } else {
@@ -167,7 +168,7 @@ pub fn compiler_commit_short() -> &'static str {
 /// the release's `vMAJOR.MINOR.PATCH` tag and the apply gate is the monotonic
 /// [`BUILD_NUMBER`], so this string can never affect an update comparison.
 #[must_use]
-pub fn version_display() -> &'static str {
+pub(crate) fn version_display() -> &'static str {
     VERSION
 }
 
@@ -211,7 +212,7 @@ fn toolchain_display() -> String {
 /// Trust's own version, and say what it is compatible with, as three facts.
 /// The release cutter's provenance gate keys on the leading `Trust`.
 #[must_use]
-pub fn compiler_summary() -> String {
+pub(crate) fn compiler_summary() -> String {
     let slug = compiler_commit_short();
     if COMPILER_FLAVOR == "t" {
         format!(
@@ -237,7 +238,7 @@ pub fn compiler_summary() -> String {
 /// one I shipped", which is its purpose in the cross-platform About overlay and
 /// `aterm-ctl version`.
 #[must_use]
-pub fn binary_signature() -> &'static str {
+pub(crate) fn binary_signature() -> &'static str {
     static SIG: OnceLock<String> = OnceLock::new();
     SIG.get_or_init(|| {
         std::env::current_exe()
@@ -258,7 +259,7 @@ pub fn binary_signature() -> &'static str {
 /// value is what "copy this row" puts on the clipboard. Cross-platform (the overlay
 /// replaces the macOS-only native panel).
 #[must_use]
-pub fn about_fields() -> Vec<(&'static str, String)> {
+pub(crate) fn about_fields() -> Vec<(&'static str, String)> {
     let mut fields = vec![
         (
             "tagline",
@@ -292,8 +293,8 @@ pub fn about_fields() -> Vec<(&'static str, String)> {
 /// The S12 About rows (`docs/DESIGN-which-copy-runs-2026-08-27.md`): `running` — the
 /// path of the running bundle (the executable off macOS) — and, when another
 /// `aterm.app` sits in one of the usual places, `another copy` carrying the one
-/// sentence `aterm --version` prints: `<path> (<version>) — not the one running; the
-/// updater updates only this one`. Both values are spelled by
+/// sentence `aterm --version` prints: `<path> (<version>) — the updater leaves it
+/// alone`. Both values are spelled by
 /// `aterm_update::which_copy`, so the two surfaces cannot drift. Several other copies
 /// share the one row, ` · `-separated — the metadata card wraps at exactly that.
 #[must_use]
@@ -332,7 +333,7 @@ pub(crate) fn which_copy_rows(
 /// name that says what it is. `trustc=` keeps carrying that rustc-shaped
 /// release token, unchanged, for every script that already parses it.
 #[must_use]
-pub fn control_line() -> String {
+pub(crate) fn control_line() -> String {
     let trust = if COMPILER_FLAVOR != "t" {
         "none"
     } else if COMPILER_TRUST_VERSION.is_empty() {
@@ -484,10 +485,9 @@ mod tests {
                 ("running", "/Applications/aterm.app".to_string()),
                 (
                     "another copy",
-                    "/Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one running; \
-                     the updater updates only this one \u{00b7} \
-                     /opt/homebrew/Caskroom/aterm/0.59.0/aterm.app (version unknown) \u{2014} \
-                     not the one running; the updater updates only this one"
+                    "/Users//ana/Applications/aterm.app (0.60.0) \u{2014} the updater leaves \
+                     it alone \u{00b7} /opt/homebrew/Caskroom/aterm/0.59.0/aterm.app (version \
+                     unknown) \u{2014} the updater leaves it alone"
                         .to_string()
                 ),
             ]
@@ -507,7 +507,7 @@ mod tests {
                 ),
                 (
                     "another copy",
-                    "/Applications/aterm.app (0.60.0) \u{2014} not the one running".to_string()
+                    "/Applications/aterm.app (0.60.0)".to_string()
                 ),
             ]
         );

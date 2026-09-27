@@ -18,16 +18,16 @@
 //! into every consumer of `aterm-types`, including the dependency-free
 //! `aterm-ctl`.
 
-use aterm_types::keyboard::{self, KeyEventType, KeyboardMode, Modifiers};
+use aterm_types::keyboard::{self, KeyboardMode, Modifiers};
 use winit::event::KeyEvent;
-use winit::keyboard::{Key as WinitKey, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key as WinitKey, ModifiersState};
 
 /// Translate winit's [`ModifiersState`] into the engine's [`Modifiers`].
 ///
 /// Super/Cmd is carried through (the old inline path dropped it); the engine's
 /// encoder uses it for the Kitty/xterm modifier value and for `modifyOtherKeys`.
 #[must_use]
-pub fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
+pub(crate) fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
     let mut out = Modifiers::empty();
     if mods.shift_key() {
         out |= Modifiers::SHIFT;
@@ -68,7 +68,7 @@ pub fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
 /// deliberately: a real, kernel-only round-trip.)
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn lock_modifiers() -> Modifiers {
+pub(crate) fn lock_modifiers() -> Modifiers {
     match hid_lock_state::caps_lock() {
         Some(true) => Modifiers::CAPS_LOCK,
         Some(false) | None => Modifiers::empty(),
@@ -83,7 +83,7 @@ pub fn lock_modifiers() -> Modifiers {
 /// This is also the guarantee that keeps a test binary from ever reaching
 /// WindowServer through the lock-key path (see [`lock_modifiers`]).
 #[must_use]
-pub fn no_lock_modifiers() -> Modifiers {
+pub(crate) fn no_lock_modifiers() -> Modifiers {
     Modifiers::empty()
 }
 
@@ -201,7 +201,7 @@ mod hid_lock_state {
 /// approved list; there is no std alternative).
 #[cfg(windows)]
 #[must_use]
-pub fn lock_modifiers() -> Modifiers {
+pub(crate) fn lock_modifiers() -> Modifiers {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetKeyState(vkey: i32) -> i16;
@@ -226,44 +226,8 @@ pub fn lock_modifiers() -> Modifiers {
 /// wired.
 #[cfg(not(any(target_os = "macos", windows)))]
 #[must_use]
-pub fn lock_modifiers() -> Modifiers {
+pub(crate) fn lock_modifiers() -> Modifiers {
     Modifiers::empty()
-}
-
-/// The PURE key-encoding decision (K-1): given a winit key event, the live
-/// modifiers, and the terminal's current [`KeyboardMode`], return the bytes to
-/// write to the PTY — or `None` when the event maps to no terminal sequence
-/// (an unencodable key, or a bare modifier press).
-///
-/// All encoding is delegated to `aterm_types::keyboard::encode_key_with_layout`,
-/// so Ctrl/Alt/Shift, the legacy vs Kitty vs `modifyOtherKeys` selection, and
-/// the alternate/base-layout key reporting are exactly the engine's protocol —
-/// no `& 0x1f`, no raw-text passthrough. The `base_layout_key` (US-QWERTY
-/// equivalent of the physical key) is supplied for the Kitty
-/// `REPORT_ALTERNATE_KEYS` enhancement.
-///
-/// `logical_key` is the key to encode: pass `key_without_modifiers()` so a
-/// composed character (Option+a → "å") is NOT what gets encoded — Alt must
-/// produce the ESC-prefixed base key, not the composed glyph.
-///
-/// Phase 0.5: the GUI no longer calls this directly (the seam owns encoding via
-/// `build_key_input` + the engine encoder). It is retained as the documented,
-/// unit-tested pure decision (the `keymap::tests` module exercises it).
-#[cfg_attr(not(test), allow(dead_code))]
-#[must_use]
-pub fn encode_key_event(
-    logical_key: &WinitKey,
-    physical_key: PhysicalKey,
-    mods: Modifiers,
-    mode: KeyboardMode,
-) -> Option<Vec<u8>> {
-    let key = aterm_winit_keymap::map_logical_key(logical_key)?;
-    // base_layout_key only matters for Character keys under REPORT_ALTERNATE_KEYS;
-    // the engine ignores it otherwise, so deriving it unconditionally is harmless.
-    let base_layout = aterm_winit_keymap::base_layout_key_for(physical_key);
-    let bytes =
-        keyboard::encode_key_with_layout(&key, mods, mode, KeyEventType::Press, base_layout);
-    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 /// SELECTION CUSTODY (R1): whether this winit press is a bare MODIFIER or LOCK
@@ -282,7 +246,7 @@ pub fn encode_key_event(
 /// modifier-state snapshot (on macOS that snapshot is still stale when the bare
 /// modifier's `KeyboardInput` is delivered).
 #[must_use]
-pub fn press_is_inert(ev: &KeyEvent) -> bool {
+pub(crate) fn press_is_inert(ev: &KeyEvent) -> bool {
     if aterm_winit_keymap::map_logical_key(&ev.logical_key)
         .as_ref()
         .is_some_and(keyboard::is_modifier_or_lock_key)
@@ -322,7 +286,7 @@ pub fn press_is_inert(ev: &KeyEvent) -> bool {
 /// `Ime::Commit` — sending them directly too would double-input. When the
 /// preedit is empty (no composition), ASCII typing proceeds normally.
 #[must_use]
-pub fn suppress_direct_send(preedit: &str) -> bool {
+pub(crate) fn suppress_direct_send(preedit: &str) -> bool {
     !preedit.is_empty()
 }
 
@@ -351,7 +315,7 @@ pub fn suppress_direct_send(preedit: &str) -> bool {
 /// can be exposed as literal bracket-number text by a client that falls back while
 /// decoding input.
 #[must_use]
-pub fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
+pub(crate) fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
     if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC) {
         let mut out = Vec::new();
         for c in text.chars().filter(|c| !c.is_control()) {
@@ -441,7 +405,7 @@ pub fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
 // users got the layout-composed/shifted glyph in the PTY encoding.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[must_use]
-pub fn build_key_input(
+pub(crate) fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
@@ -470,7 +434,7 @@ pub fn build_key_input(
 /// so the strip and the Ctrl+Alt fallback never see one.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[must_use]
-pub fn build_key_input(
+pub(crate) fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
@@ -508,10 +472,10 @@ fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
 /// `VkKeyScanExW`'s shift-state bits for "this character needs Ctrl AND Alt" —
 /// i.e. AltGr. (`winuser.h`: 1 = Shift, 2 = Ctrl, 4 = Alt.)
 ///
-/// COMPILED EVERYWHERE, like the two pure functions below it — see
-/// [`windows_key_input`] for why the platform `cfg` came off. It is a number
-/// out of a Windows header, not a Windows API.
-#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+/// Compiled for Windows and for every test build, like the two pure functions
+/// below it — see [`windows_key_input`]. It is a number out of a Windows header,
+/// not a Windows API.
+#[cfg(any(windows, test))]
 const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 
 /// The Windows half of [`build_key_input`], as a PURE decision so the layout
@@ -550,19 +514,18 @@ const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 ///    sequence. Nothing else can reach this arm: without ALT, winit already
 ///    drops CONTROL from the lookup and hands back the base key itself.
 ///
-/// COMPILED ON EVERY TARGET, and that is deliberate. This function is named for
-/// the platform whose behaviour it encodes, not for a platform API it calls: it
-/// takes `layout_shift_state` as a PARAMETER precisely so the layout cases are
-/// decidable without a window — the only real FFI, [`layout_shift_state`], is
-/// separately `#[cfg(windows)]` and stays that way. While a
-/// `not(any(macos, linux))` gate sat here, the body and its four de-DE/AltGr
-/// regression tests were read by NO compiler in this repository: the host suite
-/// gates them out on both machines this team owns, and `xtask gate cells --cell
-/// win` checks its cell's root package without `--all-targets`, so no compiler
-/// it runs ever reads a test target. The lint attribute below is the whole cost
-/// of the fix on a Unix host, where nothing calls this outside `mod tests`.
-#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+/// COMPILED FOR WINDOWS AND FOR EVERY TEST BUILD, and that is deliberate. This
+/// function is named for the platform whose behaviour it encodes, not for a
+/// platform API it calls: it takes `layout_shift_state` as a PARAMETER precisely
+/// so the layout cases are decidable without a window — the only real FFI,
+/// [`layout_shift_state`], is separately `#[cfg(windows)]` and stays that way.
+/// While a `not(any(macos, linux))` gate sat here, the body and its four
+/// de-DE/AltGr regression tests were read by NO compiler in this repository: the
+/// host suite gated them out on both machines this team owns. `test` in the gate
+/// is what keeps them compiled and run on every host, where nothing calls this
+/// outside `mod tests`.
 #[must_use]
+#[cfg(any(windows, test))]
 fn windows_key_input(
     logical_key: &WinitKey,
     base_key: &WinitKey,
@@ -594,8 +557,8 @@ fn windows_key_input(
 /// only with Ctrl+Alt held on this layout. A control codepoint is exactly what a
 /// real chord would produce, so it can never launder itself through here.
 ///
-/// Pure, and so compiled everywhere — see [`windows_key_input`].
-#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+/// Pure, and so compiled for every test build too — see [`windows_key_input`].
+#[cfg(any(windows, test))]
 fn altgr_composed(
     logical_key: &WinitKey,
     base_layout: Option<char>,
@@ -648,10 +611,26 @@ fn layout_shift_state(_c: char) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winit::keyboard::{KeyCode, NamedKey as WinitNamed, SmolStr};
+    use aterm_types::keyboard::KeyEventType;
+    use winit::keyboard::{KeyCode, NamedKey as WinitNamed, PhysicalKey, SmolStr};
 
     fn ch(c: &str) -> WinitKey {
         WinitKey::Character(SmolStr::new(c))
+    }
+
+    /// The bytes the SHIPPING encode path writes for one standard-location
+    /// press: [`build_key_input`] (the seam's key triple) into the engine's
+    /// encoder. `None` when the press maps to no terminal sequence.
+    fn encode_press(
+        logical: WinitKey,
+        code: KeyCode,
+        mods: Modifiers,
+        mode: KeyboardMode,
+    ) -> Option<Vec<u8>> {
+        let ev = press_at(code, logical, winit::keyboard::KeyLocation::Standard);
+        let (key, mods, base) = build_key_input(&ev, mods)?;
+        let bytes = keyboard::encode_key_with_layout(&key, mods, mode, KeyEventType::Press, base);
+        (!bytes.is_empty()).then_some(bytes)
     }
 
     /// Alt+a must emit the ESC-prefixed base key (ESC a), NOT the macOS
@@ -660,9 +639,9 @@ mod tests {
     /// `ev.text`, which on macOS is the composed glyph.
     #[test]
     fn alt_a_is_esc_prefixed_not_composed() {
-        let bytes = encode_key_event(
-            &ch("a"),
-            PhysicalKey::Code(KeyCode::KeyA),
+        let bytes = encode_press(
+            ch("a"),
+            KeyCode::KeyA,
             Modifiers::ALT,
             KeyboardMode::empty(),
         )
@@ -678,9 +657,9 @@ mod tests {
     /// alphabetics, so Ctrl+Space fell through to a raw " " write — wrong.
     #[test]
     fn ctrl_space_is_nul() {
-        let bytes = encode_key_event(
-            &WinitKey::Named(WinitNamed::Space),
-            PhysicalKey::Code(KeyCode::Space),
+        let bytes = encode_press(
+            WinitKey::Named(WinitNamed::Space),
+            KeyCode::Space,
             Modifiers::CTRL,
             KeyboardMode::empty(),
         )
@@ -692,9 +671,9 @@ mod tests {
     /// Ctrl+\\ produced a raw backslash instead of the control byte.
     #[test]
     fn ctrl_backslash_is_fs() {
-        let bytes = encode_key_event(
-            &ch("\\"),
-            PhysicalKey::Code(KeyCode::Backslash),
+        let bytes = encode_press(
+            ch("\\"),
+            KeyCode::Backslash,
             Modifiers::CTRL,
             KeyboardMode::empty(),
         )
@@ -708,9 +687,9 @@ mod tests {
     /// defect that corrupted ordinary typing.
     #[test]
     fn printable_under_disambiguate_is_plain_text() {
-        let bytes = encode_key_event(
-            &ch("a"),
-            PhysicalKey::Code(KeyCode::KeyA),
+        let bytes = encode_press(
+            ch("a"),
+            KeyCode::KeyA,
             Modifiers::empty(),
             KeyboardMode::DISAMBIGUATE_ESC_CODES,
         )
@@ -725,17 +704,17 @@ mod tests {
     /// classic control bytes 0x03 / 0x04 still reach the PTY.
     #[test]
     fn ctrl_c_and_ctrl_d_unchanged() {
-        let c = encode_key_event(
-            &ch("c"),
-            PhysicalKey::Code(KeyCode::KeyC),
+        let c = encode_press(
+            ch("c"),
+            KeyCode::KeyC,
             Modifiers::CTRL,
             KeyboardMode::empty(),
         )
         .expect("ctrl+c encodes");
         assert_eq!(c, vec![0x03], "Ctrl-C must stay 0x03");
-        let d = encode_key_event(
-            &ch("d"),
-            PhysicalKey::Code(KeyCode::KeyD),
+        let d = encode_press(
+            ch("d"),
+            KeyCode::KeyD,
             Modifiers::CTRL,
             KeyboardMode::empty(),
         )
@@ -747,9 +726,9 @@ mod tests {
     /// literal byte — ordinary ASCII typing still works after the rewrite.
     #[test]
     fn plain_ascii_writes_literal() {
-        let bytes = encode_key_event(
-            &ch("a"),
-            PhysicalKey::Code(KeyCode::KeyA),
+        let bytes = encode_press(
+            ch("a"),
+            KeyCode::KeyA,
             Modifiers::empty(),
             KeyboardMode::empty(),
         )
@@ -766,9 +745,9 @@ mod tests {
     /// is why it slipped past the unit tests twice.
     #[test]
     fn shift_symbol_encodes_shifted_glyph() {
-        let bytes = encode_key_event(
-            &ch("2"),
-            PhysicalKey::Code(KeyCode::Digit2),
+        let bytes = encode_press(
+            ch("2"),
+            KeyCode::Digit2,
             Modifiers::SHIFT,
             KeyboardMode::empty(),
         )
@@ -780,9 +759,9 @@ mod tests {
     #[test]
     fn bare_modifier_press_is_none() {
         assert_eq!(
-            encode_key_event(
-                &WinitKey::Named(WinitNamed::Shift),
-                PhysicalKey::Code(KeyCode::ShiftLeft),
+            encode_press(
+                WinitKey::Named(WinitNamed::Shift),
+                KeyCode::ShiftLeft,
                 Modifiers::SHIFT,
                 KeyboardMode::empty(),
             ),
@@ -843,10 +822,10 @@ mod tests {
     /// ESC NUL: a German user typing a brace got a control code.
     #[test]
     fn de_de_altgr_as_left_ctrl_alt_types_the_character() {
-        for (composed, digit, base, want) in [
-            ("{", KeyCode::Digit7, '7', &b"{"[..]),
-            ("[", KeyCode::Digit8, '8', &b"["[..]),
-            ("@", KeyCode::KeyQ, 'q', &b"@"[..]),
+        for (composed, base, want) in [
+            ("{", '7', &b"{"[..]),
+            ("[", '8', &b"["[..]),
+            ("@", 'q', &b"@"[..]),
         ] {
             let (key, mods, base_layout) = windows_key_input(
                 &ch(composed),
@@ -866,13 +845,13 @@ mod tests {
                 "AltGr's Ctrl+Alt spelling must not survive into the encoding of {composed}"
             );
             assert_eq!(base_layout, Some(base));
-            let bytes = encode_key_event(
-                &ch(composed),
-                PhysicalKey::Code(digit),
+            let bytes = keyboard::encode_key_with_layout(
+                &key,
                 mods,
                 KeyboardMode::empty(),
-            )
-            .expect("the composed character encodes");
+                KeyEventType::Press,
+                base_layout,
+            );
             assert_eq!(bytes, want, "de-DE AltGr must type {composed}");
         }
     }
@@ -905,7 +884,7 @@ mod tests {
     fn genuine_ctrl_alt_letter_still_encodes_a_control_sequence() {
         let unidentified = WinitKey::Unidentified(winit::keyboard::NativeKey::Unidentified);
         for logical in [&unidentified, &ch("a")] {
-            let (key, mods, _) = windows_key_input(
+            let (key, mods, base_layout) = windows_key_input(
                 logical,
                 &ch("a"),
                 Some('a'),
@@ -919,13 +898,13 @@ mod tests {
                 Modifiers::CTRL | Modifiers::ALT,
                 "a real chord must keep its modifiers"
             );
-            let bytes = encode_key_event(
-                &ch("a"),
-                PhysicalKey::Code(KeyCode::KeyA),
+            let bytes = keyboard::encode_key_with_layout(
+                &key,
                 mods,
                 KeyboardMode::empty(),
-            )
-            .expect("Ctrl+Alt+A encodes");
+                KeyEventType::Press,
+                base_layout,
+            );
             assert_eq!(bytes, b"\x1b\x01", "Ctrl+Alt+A must stay ESC ^A");
         }
     }
@@ -951,7 +930,7 @@ mod tests {
             "US-QWERTY has no AltGr; nothing may be stripped"
         );
         // And the ordinary shifted press stays exactly as it was.
-        let (key, mods, _) = windows_key_input(
+        let (key, mods, base_layout) = windows_key_input(
             &ch("{"),
             &ch("["),
             Some('['),
@@ -962,13 +941,13 @@ mod tests {
         assert_eq!(key, keyboard::Key::Character('{'));
         assert_eq!(mods, Modifiers::SHIFT);
         assert_eq!(
-            encode_key_event(
-                &ch("{"),
-                PhysicalKey::Code(KeyCode::BracketLeft),
+            keyboard::encode_key_with_layout(
+                &key,
                 mods,
                 KeyboardMode::empty(),
-            )
-            .expect("Shift+[ encodes"),
+                KeyEventType::Press,
+                base_layout,
+            ),
             b"{"
         );
     }

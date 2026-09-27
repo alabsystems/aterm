@@ -78,7 +78,8 @@
 //!    recorded it, is another root's — two bridges answering as one node
 //!    deliver each other's mail as `not-hosted` and fire each other's wills —
 //!    and is refused, exit 2;
-//! 2. the root, 0700 (`$ATERM_FABRIC_HOME`, else `~/.local/share/aterm-fabric`);
+//! 2. the root, 0700 (`~/.local/share/aterm-fabric`; a test's `$ATERM_FABRIC_HOME`
+//!    seam redirects it in a debug build);
 //! 3. the node id: RECORDED from the cap into `<root>/link-state/node` when
 //!    there is none; the same one is `already`; a DIFFERENT one is refused —
 //!    identity is provisioned, never re-minted — with the `mint-for` that fixes
@@ -661,8 +662,7 @@ fn local_broker_step(p: &Paths, service: Service, remote: &str, out: &mut Out) -
             out.note(
                 "broker",
                 &format!(
-                    "--service none: this host dials {} and supervises nothing; a local broker, \
-                     if one runs, is yours to stop",
+                    "this host dials {}; a local broker, if one runs, is not managed here",
                     safe(remote, 128)
                 ),
             );
@@ -802,7 +802,7 @@ pub fn join(opts: &JoinOpts) -> ExitCode {
             &format!(
                 "it was minted under THIS root's own mint secret ({}): this root is the fleet's \
                  first host, and joining itself would stop the broker it serves. `join` is for a \
-                 SECOND host — or a second root on this one (set ATERM_FABRIC_HOME)",
+                 SECOND host",
                 p.secret().display()
             ),
         );

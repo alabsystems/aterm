@@ -24,6 +24,7 @@
 //! is crash-consistent), and the parked parent's loop picks the remainder up at
 //! its next tick or bump.
 
+#[cfg(unix)]
 use winit::event_loop::ActiveEventLoop;
 
 use crate::App;
@@ -77,6 +78,7 @@ struct HandoffCapture {
     ///
     /// Carried so the worker can report the park->transfer half on the launched
     /// lane at the moment it becomes observable. Data only: nothing branches on it.
+    #[cfg(target_os = "macos")]
     park_at: std::time::Instant,
     manifest: crate::session_store::SessionHandoff,
     fds: crate::session_store::HandoffFds,
@@ -107,11 +109,16 @@ struct HandoffCapture {
     /// pointing `poll` at a device number.
     proof_identities: Vec<(u64, i32, i32)>,
     _owned_masters: Vec<std::os::fd::OwnedFd>,
+    /// THE HISTORY CARRY (`crate::handoff_history`): each handed session's
+    /// history fence as the park saw it, and how the lane exports the history
+    /// the worker joins it to ([`crate::handoff_history::HistoryPlan`]).
+    history_heads: Vec<crate::handoff_history::HistoryHead>,
+    history: crate::handoff_history::HistoryPlan,
 }
 
 /// The park's product, sent from the main thread to a worker that is already
 /// holding a successor's claim (or already knows it must fork instead).
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) struct HandoffTransferJob {
     capture: HandoffCapture,
     /// When the post-park proof wait gives up — computed by the main thread
@@ -122,7 +129,7 @@ pub(crate) struct HandoffTransferJob {
 
 /// The main thread's typed reason for standing a held successor down before the
 /// park delivered anything: which outcome the completion should carry and why.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Debug)]
 pub(crate) struct HandoffStandDown {
     pub(crate) outcome: crate::UpdateHandoffOutcome,
@@ -395,7 +402,9 @@ struct HandoffCommitFacts {
 
 /// The Commit-time layout comparison, reduced to the fields that actually mean
 /// "window/tab/pane topology". Two of them are normalized away, and each was
-/// independently killing healthy in-flight seamless updates:
+/// independently killing healthy in-flight seamless updates (the window's SHOW
+/// state — maximized, and on macOS full screen, minimized, stack and key — is
+/// the position's class and is normalized beside it):
 ///
 /// WINDOW POSITION. `capture_restore_manifest` reads `outer_position()` LIVE
 /// into `outer_x`/`outer_y`, and `WindowLayout` derives `PartialEq` over them,
@@ -489,6 +498,15 @@ fn commit_layout_topology(
         // window during the successor's boot would kill a healthy Commit
         // exactly the way dragging it used to.
         window.maximized = None;
+        // …and the rest of the macOS SHOW STATE (gap #29), which the unix
+        // capture DOES record now: full screen, minimized, the window's place in
+        // the stack and whether it is key. All four are live — entering full
+        // screen, minimizing, or simply clicking another window while the
+        // successor boots changes them — and none is topology. The successor
+        // restores the PENDING capture's show state, exactly as it restores the
+        // pending capture's position, so a change made during the boot is
+        // cosmetic, while rejecting the Commit over it would cost the update.
+        window.show = crate::restore::WindowShow::UNKNOWN;
         // BOTH projections, deliberately: the capture writes the same live
         // session's cwd/title into the legacy `tabs` mirror and the canonical
         // `restored_tabs` tree, so normalizing only one of them would leave the
@@ -694,7 +712,7 @@ enum HandoffRollbackWarrant {
     /// than what the fork lane can say at the same point, where `execve` has
     /// already copied the table. Nothing is killed or waited on here — the
     /// successor discovers the vanished rendezvous, refuses itself, and exits.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     NeverTransferred,
     /// `wait` consumed the candidate: it terminated and THIS process reaped it.
     /// Available only to its parent, and strictly the best answer — reaping is
@@ -1256,22 +1274,6 @@ impl CandidateExitWatch {
     }
 }
 
-/// Off macOS every handoff candidate is a fork child of this process, so `wait`
-/// always answers and there is no lane for a non-parent witness to serve. The
-/// type stays so the decision tail is ONE function on every unix; nothing here
-/// can produce one, because the `watch` constructor is macOS-only and there is no
-/// other.
-#[cfg(all(unix, not(target_os = "macos")))]
-#[allow(dead_code)]
-struct CandidateExitWatch;
-
-#[cfg(all(unix, not(target_os = "macos")))]
-impl CandidateExitWatch {
-    fn exit_status(&self) -> Option<std::process::ExitStatus> {
-        None
-    }
-}
-
 #[cfg(unix)]
 fn signal_handoff_candidate(candidate: HandoffCandidate) {
     let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
@@ -1419,6 +1421,7 @@ fn kill_and_reap_handoff_child(
 ) -> ReapedHandoffCandidate {
     let child = match handle {
         HandoffCandidateHandle::Forked(child) => child,
+        #[cfg(target_os = "macos")]
         HandoffCandidateHandle::Launched(_) => {
             // NOBODY'S `wait` ANSWERS FOR THIS ONE. `waitpid` is not an
             // authority about somebody else's child (it says `ECHILD`, which is
@@ -1480,9 +1483,8 @@ enum HandoffCandidateHandle {
     ///
     /// The [`CandidateExitWatch`] is this lane's ONLY possible statement about how
     /// the candidate died, registered at the rendezvous accept. `None` whenever it
-    /// could not be registered, and always `None` off macOS, where nothing
-    /// launches a candidate at all.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// could not be registered. macOS only: nothing else launches a candidate.
+    #[cfg(target_os = "macos")]
     Launched(Option<CandidateExitWatch>),
 }
 
@@ -1498,6 +1500,7 @@ impl HandoffCandidateHandle {
     fn witnessed_exit_status(&self) -> Option<std::process::ExitStatus> {
         match self {
             Self::Forked(_) => None,
+            #[cfg(target_os = "macos")]
             Self::Launched(watch) => watch.as_ref().and_then(CandidateExitWatch::exit_status),
         }
     }
@@ -1729,17 +1732,47 @@ fn send_warranted_handoff_failure(
     current_build: u64,
     completion: crate::UpdateHandoffCompletion,
 ) {
+    if publish_warranted_handoff_failure(warrant, cleanup, proxy, completion) {
+        send_post_failure_reconcile_facts(cleanup, proxy, current_build);
+    }
+}
+
+/// The first half of [`send_warranted_handoff_failure`]: the completion
+/// itself. `false` when the event loop is gone, and then no disk facts follow.
+///
+/// Split out for the two reject paths that may GIVE BACK the candidate's
+/// counted trial launch: they settle the boot sentinel between the two halves,
+/// so the disk facts that follow read the count the sentinel will keep. Read
+/// before the give-back, those facts said one launch more than the trial
+/// holds, and the automatic lane reads that count to decide whether its next
+/// launch of the build is the one the trial reverts on (gap 14 review,
+/// 2026-09-26).
+#[cfg(unix)]
+fn publish_warranted_handoff_failure(
+    warrant: HandoffRollbackWarrant,
+    cleanup: &HandoffWorkerCleanup,
+    proxy: &winit::event_loop::EventLoopProxy<Wake>,
+    completion: crate::UpdateHandoffCompletion,
+) -> bool {
     warrant.announce(completion.child_pid);
     cleanup.complete(completion.nonce.as_deref());
     // Reader rollback and reducer re-arm are latency-critical. Publish the
     // candidate-terminated fact before waiting behind the updater FIFO for disk
     // facts.
-    if proxy
+    proxy
         .send_event(Wake::UpdateHandoffFinished(completion))
-        .is_err()
-    {
-        return;
-    }
+        .is_ok()
+}
+
+/// The second half of [`send_warranted_handoff_failure`]: the disk as the
+/// failed attempt left it, collected behind the updater FIFO and posted as the
+/// reducer's next observation.
+#[cfg(unix)]
+fn send_post_failure_reconcile_facts(
+    cleanup: &HandoffWorkerCleanup,
+    proxy: &winit::event_loop::EventLoopProxy<Wake>,
+    current_build: u64,
+) {
     if let Some(facts) = cleanup.reconcile.as_ref().and_then(|(worker, ticket)| {
         crate::app_native::collect_native_update_reconcile_facts(worker, *ticket, current_build)
     }) {
@@ -1784,11 +1817,10 @@ fn worker_reject_and_reap_handoff_child(
             candidate.pid
         );
     }
-    send_warranted_handoff_failure(
+    let published = publish_warranted_handoff_failure(
         warrant,
         &job.cleanup,
         proxy,
-        job.current_build,
         crate::UpdateHandoffCompletion::failure(
             job.attempt_id,
             Some(nonce.to_string()),
@@ -1811,8 +1843,17 @@ fn worker_reject_and_reap_handoff_child(
     // is precisely the path a machine under pathological load reaches. The
     // candidate is already dead and the next attempt is minutes away, so nothing
     // depends on this having happened first.
+    //
+    // BUT BEFORE THE DISK FACTS (gap 14 review, 2026-09-26): they carry the
+    // sentinel's count, and a structural latch reads it to decide whether its
+    // next launch of the build is the one the trial reverts on. Collected first,
+    // they said one launch more than the trial keeps — enough to withdraw a
+    // retry the trial could afford.
     if forgives_the_counted_trial_launch(child_death, job.current_build, job.target_build) {
         aterm_update::forgive_trial_launch_if_advanced(job.target_build, job.trial_launches_before);
+    }
+    if published {
+        send_post_failure_reconcile_facts(&job.cleanup, proxy, job.current_build);
     }
     true
 }
@@ -2086,7 +2127,6 @@ fn send_handoff_preparation_failure(
 #[cfg(unix)]
 // The worker's muts serve the macOS handoff arms; on other platforms those arms
 // are configured out and the bindings are read-only.
-#[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
 fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::EventLoopProxy<Wake>) {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -2456,6 +2496,30 @@ fn prepare_outgoing_artifacts(
     let controls = crate::handoff_carry::export(&capture.carries);
     capture.manifest.next_turn_id =
         crate::handoff_carry::manifest_turn_id(crate::control::turn_ids_minted());
+    // THE HISTORY CARRY'S JOIN (`crate::handoff_history`), here where the
+    // capture meets the export that ran with every reader live: each session
+    // whose export still describes its history, and meets the lines its
+    // checkpoint carries, names its sidecar on its record; every other one
+    // keeps the checkpoint's bounded history, and the lines that do not cross
+    // are COUNTED on its record. Nothing here can fail the attempt.
+    // AFTER the control carry's export on purpose: the fork lane's history
+    // export runs here, and the two must not contend for the same locks.
+    if let Some(dir) = crate::control_auth::socket_dir() {
+        let results = std::mem::replace(
+            &mut capture.history,
+            crate::handoff_history::HistoryPlan::Unexported,
+        )
+        .results(&dir);
+        let verdicts = crate::handoff_history::stamp_manifest(
+            &mut capture.manifest,
+            &capture.screens,
+            &capture.history_heads,
+            results,
+            &dir,
+            nonce,
+        );
+        crate::handoff_history::log_verdicts(&verdicts);
+    }
     // The attempt nonce was minted by the CALLER of this writer (2026-09-19): the
     // late park launches the successor with the manifest's path before the
     // manifest exists, so the name must be derivable before the write, and the
@@ -2856,11 +2920,10 @@ fn retire_ungranted_successor(
             "it exited on the closed rendezvous by its own rule"
         }
     );
-    send_warranted_handoff_failure(
+    let published = publish_warranted_handoff_failure(
         stood.warrant,
         &job.cleanup,
         proxy,
-        job.current_build,
         crate::UpdateHandoffCompletion::failure(
             job.attempt_id,
             Some(nonce.to_string()),
@@ -2874,10 +2937,15 @@ fn retire_ungranted_successor(
     // exits on the EOF forgives its own (`main_entry`'s claim-error exit); this
     // process forgives only when it had to kill, and only when the death is not
     // the bytes' fault — `forgives_the_counted_trial_launch` is the decision.
+    // Before the disk facts, so they carry the count the sentinel keeps (see
+    // `publish_warranted_handoff_failure`).
     if stood.signalled
         && forgives_the_counted_trial_launch(stood.death, job.current_build, job.target_build)
     {
         aterm_update::forgive_trial_launch_if_advanced(job.target_build, job.trial_launches_before);
+    }
+    if published {
+        send_post_failure_reconcile_facts(&job.cleanup, proxy, job.current_build);
     }
 }
 
@@ -3826,6 +3894,7 @@ const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// machine; runs 4–6, idle or with the flood finished, committed). The budget
 /// that already bounds the capture — 250 ms explicit, 20 ms first automatic —
 /// is what the wait spends; a poisoned lock is taken as before.
+#[cfg(unix)]
 fn try_lock_by<T>(
     lock: &std::sync::Mutex<T>,
     deadline: std::time::Instant,
@@ -3861,20 +3930,227 @@ fn try_lock_by<T>(
 /// (`PRELAUNCH_MAX_PARK_MISSES`) — as well as across attempts after a physical
 /// failure. An EXPLICIT apply gets the widest window at once: the user asked for
 /// the update, not for a sub-frame swap.
+///
+/// RUNG 0 IS SEEDED, NOT CONSTANT (gap #25, 2026-09-26): `seed` is the attempt's
+/// [`FreezeSeed`] — the larger of a dry run of this very capture, timed while the
+/// successor booted, and what the last park that landed really cost; else what
+/// the ledger holds; else the 20 ms default — and the first automatic rung is
+/// `clamp(1.5 × that, 20 ms, 80 ms)`. The 20 ms rung missed on both updates
+/// before this (0.91 and 0.92 landed on the 80 ms rung in 22 and 20 ms), each
+/// paying a stall, a 500 ms re-park and a second park. The next rung is twice
+/// the seed and never under 80 ms, so the ladder stays strictly wider rung over
+/// rung whatever the seed, and the last is a quarter second as before.
+#[cfg(any(unix, test))]
 pub(crate) fn handoff_freeze_budget(
     mode: crate::native_updater_service::ApplyMode,
     prior_physical_failures: u8,
+    seed: FreezeSeed,
 ) -> std::time::Duration {
     use crate::native_updater_service::ApplyMode;
-    let ms = match mode {
-        ApplyMode::Immediate | ApplyMode::CleanQuit => 250,
+    let rung0 = seed.rung0();
+    match mode {
+        ApplyMode::Immediate => FREEZE_LAST_RUNG,
         ApplyMode::Automatic | ApplyMode::AutomaticPastGrace => match prior_physical_failures {
-            0 => 20,
-            1 => 80,
-            _ => 250,
+            0 => rung0,
+            1 => rung0.saturating_mul(2).max(FREEZE_RUNG0_CEILING),
+            _ => FREEZE_LAST_RUNG,
         },
-    };
-    std::time::Duration::from_millis(ms)
+    }
+}
+
+/// The first automatic rung's FLOOR: the imperceptible default it always was,
+/// and what a desk nobody has measured still gets.
+#[cfg(any(unix, test))]
+pub(crate) const FREEZE_RUNG0_FLOOR: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The first automatic rung's CEILING: the 80 ms the second rung used to be. A
+/// capture that needs more than this on a first attempt is a busy moment, not a
+/// desk to budget for — the ladder's wider rungs answer it, as before.
+#[cfg(any(unix, test))]
+pub(crate) const FREEZE_RUNG0_CEILING: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// The widest rung: an explicit apply's window, and the automatic ladder's top.
+#[cfg(any(unix, test))]
+const FREEZE_LAST_RUNG: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Rung 0 from a measured freeze: `clamp(1.5 × measured, 20 ms, 80 ms)`. The
+/// half again is the margin for a freeze that varies from one park to the next
+/// (the machine's load, a reader's slice ending on the park's own schedule),
+/// and the clamp keeps a desk nobody could time, or one that timed absurdly,
+/// inside the ladder the rung has always been part of.
+#[cfg(any(unix, test))]
+#[must_use]
+pub(crate) fn freeze_rung0_from_capture(capture: std::time::Duration) -> std::time::Duration {
+    (capture.saturating_mul(3) / 2).clamp(FREEZE_RUNG0_FLOOR, FREEZE_RUNG0_CEILING)
+}
+
+/// Where an attempt's first automatic freeze rung came from (gap #25) — said in
+/// the budget's log line and persisted in the health ledger, so a rung that
+/// still misses can be read against the number it was seeded from.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FreezeSeed {
+    /// Nothing measured: the 20 ms default ([`FREEZE_RUNG0_FLOOR`]).
+    Default,
+    /// This attempt's own dry run, timed while its successor booted — and
+    /// never budgeted below the last park that really LANDED (`last_park`, from
+    /// the ledger), because the dry run cannot time the part of the park that
+    /// is the freeze itself: stopping the readers. Measured 2026-09-26 at
+    /// opt-level 3, the capture of a two-session 50x200 desk with 10 000
+    /// scrollback lines each is 1.1 ms; 0.91's and 0.92's parks of a
+    /// two-session desk took 22 and 20 ms.
+    DryRun {
+        capture: std::time::Duration,
+        sessions: usize,
+        last_park: Option<std::time::Duration>,
+    },
+    /// What the health ledger holds — the larger of its last dry run and its
+    /// last landed park, as recorded by `build` — which a lane with no boot to
+    /// time a dry run in (the fork lane), or an attempt whose dry run measured
+    /// nothing, seeds from.
+    Ledger {
+        capture: std::time::Duration,
+        build: u64,
+    },
+}
+
+#[cfg(any(unix, test))]
+impl FreezeSeed {
+    /// The first automatic rung this seed buys.
+    #[must_use]
+    pub(crate) fn rung0(self) -> std::time::Duration {
+        match self {
+            Self::Default => FREEZE_RUNG0_FLOOR,
+            Self::DryRun {
+                capture, last_park, ..
+            } => freeze_rung0_from_capture(capture.max(last_park.unwrap_or_default())),
+            Self::Ledger { capture, .. } => freeze_rung0_from_capture(capture),
+        }
+    }
+
+    /// The ledger's prior — the larger of its dry run and its landed park,
+    /// named by the build that recorded that one — or the default when neither
+    /// was ever measured.
+    #[must_use]
+    pub(crate) fn from_prior(prior: Option<&aterm_update::HandoffCaptureRecord>) -> Self {
+        let Some(record) = prior else {
+            return Self::Default;
+        };
+        let (need_us, build) = if record.park_us >= record.capture_us {
+            (record.park_us, record.park_build)
+        } else {
+            (record.capture_us, record.build)
+        };
+        if need_us == 0 {
+            return Self::Default;
+        }
+        Self::Ledger {
+            capture: std::time::Duration::from_micros(need_us),
+            build,
+        }
+    }
+
+    /// The last landed park the ledger holds, if any.
+    #[must_use]
+    pub(crate) fn last_park_of(
+        prior: Option<&aterm_update::HandoffCaptureRecord>,
+    ) -> Option<std::time::Duration> {
+        prior
+            .filter(|record| record.park_us > 0)
+            .map(|record| std::time::Duration::from_micros(record.park_us))
+    }
+}
+
+#[cfg(any(unix, test))]
+impl std::fmt::Display for FreezeSeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => formatter.write_str("rung 0 at its default: no capture was timed"),
+            Self::DryRun {
+                capture,
+                sessions,
+                last_park,
+            } => {
+                write!(
+                    formatter,
+                    "rung 0 seeded from this attempt's dry-run capture of {:.1} ms over \
+                     {sessions} session(s)",
+                    capture.as_secs_f64() * 1e3
+                )?;
+                match last_park {
+                    Some(park) => write!(
+                        formatter,
+                        " and the last landed park's {:.1} ms",
+                        park.as_secs_f64() * 1e3
+                    ),
+                    None => formatter.write_str(" (no landed park is on record)"),
+                }
+            }
+            Self::Ledger { capture, build } => write!(
+                formatter,
+                "rung 0 seeded from the ledger's last timed freeze, {:.1} ms (build {build})",
+                capture.as_secs_f64() * 1e3
+            ),
+        }
+    }
+}
+
+/// Keep what a LANDED park cost — `parked_in`, from the readers' stop to a
+/// capture ready to hand over, the whole of what the freeze budget is spent on —
+/// for the next update's first rung (gap #25), on a thread of its own: the
+/// ledger lock is a file lock another process may hold, and this runs inside
+/// the freeze. Returns the writer (a test joins it; the park lets it run).
+///
+/// The write is a temp-and-rename taking about a millisecond, and the outgoing
+/// process exits at Commit, hundreds of milliseconds after the park (354 and
+/// 403 ms park->proof on the owner's last two landed updates) — so it lands;
+/// one that did not would cost the next update this one measurement, nothing
+/// more.
+#[cfg(unix)]
+pub(crate) fn keep_landed_park(
+    parked_in: std::time::Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    let build = crate::running_build_number();
+    std::thread::Builder::new()
+        .name("aterm-park-cost".to_string())
+        .spawn(move || {
+            // A small ledger write nobody waits on — but it must land before
+            // Commit, so never the starvable Housekeeping class.
+            crate::qos::set_self(crate::qos::Role::Background);
+            aterm_update::record_handoff_park(build, parked_in);
+        })
+        .ok()
+}
+
+/// The dry run's whole window: two thirds of [`FREEZE_RUNG0_CEILING`], because
+/// 1.5 × anything longer is the ceiling already. It bounds what the main thread
+/// spends timing a capture with every reader live.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) const DRY_RUN_CAPTURE_WINDOW: std::time::Duration =
+    std::time::Duration::from_micros(53_334);
+
+// A window that ran out must saturate the rung: 1.5 × the window ≥ the ceiling.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const _: () =
+    assert!(DRY_RUN_CAPTURE_WINDOW.as_micros() * 3 >= FREEZE_RUNG0_CEILING.as_micros() * 2);
+
+/// What one dry run of the park's capture measured
+/// ([`crate::App::dry_run_handoff_capture`]).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DryRunCapture {
+    /// It captured `sessions` session(s) in `took`.
+    Measured {
+        took: std::time::Duration,
+        sessions: usize,
+    },
+    /// It ran out of its window: at least `took`, which already saturates rung 0.
+    AtLeast {
+        took: std::time::Duration,
+        sessions: usize,
+    },
+    /// It stopped for a reason that says nothing about time; nothing measured.
+    Unmeasured(&'static str),
 }
 
 /// Whether one session may spend `optional` on a budget, on top of the
@@ -3987,6 +4263,13 @@ struct ParkedScreens {
     carries: Vec<crate::handoff_carry::CarrySource>,
     screen_digest: [u8; 32],
     repaint: Vec<u64>,
+    /// Every handed session's foreground holder (`Session::fg_holder`), read
+    /// under the park, whatever rung its screen is carried at. The lanes stamp
+    /// it on the manifest records ([`stamp_fg_holders`]).
+    fg_holders: Vec<(u64, i32)>,
+    /// Every handed session's history fence under the park
+    /// (`handoff_history::capture_head`), what the worker joins its export to.
+    history_heads: Vec<crate::handoff_history::HistoryHead>,
 }
 
 /// Why the in-session overlap handoff cannot run in THIS process. ONE predicate
@@ -4013,7 +4296,7 @@ struct ParkedScreens {
 pub(crate) enum HandoffUnavailable {
     /// A fixed path is configured, but this process never proved it bound it.
     UnownedControlSocket,
-    /// `--headless` / `$ATERM_HEADLESS`: no window to hand across.
+    /// `--headless`: no window to hand across.
     Headless,
     /// No event-loop proxy to drive the handoff's wakes — only
     /// `headless_for_test` builds such an App.
@@ -4045,6 +4328,7 @@ impl HandoffUnavailable {
 
     /// The log line's remedy, for the reasons that have one.
     #[must_use]
+    #[cfg(unix)]
     pub(crate) fn remedy(self) -> &'static str {
         match self {
             Self::UnownedControlSocket => {
@@ -4059,12 +4343,8 @@ impl HandoffUnavailable {
     fn holds_for(self, app: &App) -> bool {
         match self {
             Self::UnownedControlSocket => {
-                use aterm_types::control_socket::{SocketDirective, socket_directive};
-                let socket = std::env::var_os("ATERM_CONTROL_SOCK")
-                    .map(|v| v.to_string_lossy().into_owned());
-                let disabled = std::env::var_os("ATERM_NO_CONTROL_SOCK")
-                    .map(|v| v.to_string_lossy().into_owned());
-                match socket_directive(socket.as_deref(), disabled.as_deref()) {
+                use aterm_types::control_socket::SocketDirective;
+                match crate::cli::launch_flags().socket_directive() {
                     SocketDirective::Explicit(path) => {
                         let plan = crate::control_auth::SocketPlan {
                             sock_path: path.to_string(),
@@ -4097,8 +4377,8 @@ impl App {
     /// NOT folded into `arm_native_auto_apply`'s `enabled` on purpose: the cold
     /// lane is a real automatic path for a headless or opted-out process
     /// whose last terminal has closed (the classifier admits it at zero live
-    /// PTYs, and the cold spawn re-injects `ATERM_HEADLESS`), so a lane that
-    /// never arms would never take it.
+    /// PTYs, and the successor inherits `--headless` with the rest of argv), so
+    /// a lane that never arms would never take it.
     #[must_use]
     pub(crate) fn seamless_handoff_unavailable(&self) -> Option<HandoffUnavailable> {
         HandoffUnavailable::ALL
@@ -4118,15 +4398,19 @@ impl App {
     /// (the round-trip that makes that safe is
     /// proven — `SessionHandoff` + `handoff_roundtrip_model`; the single-use nonce by
     /// `seamless_nonce_model`). Scope: the live process, visible rows, terminal modes/cursors,
-    /// and output queued after reader park survive. Preexisting off-screen scrollback is
-    /// carried only up to `seamless::MAX_HANDOFF_HISTORY_LINES` (256) per session, and
-    /// DROPPED ENTIRELY for a session when the time ladder or the aggregate cell budget
-    /// says so — the standing policy is "the failure mode is less scrollback, never the
-    /// update did not apply". A tab configured for the default 100,000-line ring
-    /// therefore keeps its processes, its visible screen and its queued output across an
-    /// in-session update, but not its history. (This sentence used to say scrollback was
-    /// "deliberately excluded", which stopped being true when the 256-line carry landed
-    /// and understated what survives; 2026-08-19.) A cold relaunch is
+    /// and output queued after reader park survive, and so does the WHOLE off-screen
+    /// scrollback (2026-09-26, `crate::handoff_history`): the screen checkpoint still
+    /// carries at most `seamless::MAX_HANDOFF_HISTORY_LINES` (256) of it, fewer or none
+    /// under the time ladder or the aggregate cell budget, and everything older rides a
+    /// fenced sidecar exported with the readers live and imported by the successor after
+    /// Commit. A history that moved under its export (a rewrap, a clear, a reset), that
+    /// more output outran than the checkpoint carries, or whose sidecar fails its sha,
+    /// crosses with the checkpoint's lines alone — and the lines left behind are COUNTED,
+    /// per tab on `status` (`history_lost=`) and once on the band, never only in the log.
+    /// The standing policy is unchanged: "the failure mode is less scrollback, never the
+    /// update did not apply". (Until this date a tab on the default 100,000-line ring
+    /// kept a screen and a half of its history, which this sentence said since
+    /// 2026-08-19; it said "deliberately excluded" before that.) A cold relaunch is
     /// permitted only when no foreground terminal job would be destroyed. Every path that
     /// leaves this process alive returns an actionable failure so the updater reducer can
     /// re-arm the verified stage instead of remaining stuck in `Applying`.
@@ -4205,6 +4489,8 @@ impl App {
         // above), but kept correct for when a Windows update lane exists.
         #[cfg(windows)]
         {
+            // One cold replacement lane: an automatic and a manual apply replace alike.
+            let _ = mode;
             let live_ptys = self.pool.iter().count();
             let facts = crate::native_update_admission::AdmissionFacts {
                 staged_verified: same_image.is_some() || apply_attempt.is_some(),
@@ -4256,13 +4542,7 @@ impl App {
                 ))
                 .env("ATERM_UPDATED_FROM", build.to_string());
                 bind_expected_update_artifact(&mut cmd, apply_attempt.as_ref());
-                // Same headless re-injection as the unix exec path above (and for
-                // the same reason: argv passes through verbatim, so the env
-                // channel — the flag's exact equivalent — is what survives an
-                // `-e` boundary).
-                if self.headless {
-                    cmd.env("ATERM_HEADLESS", "1");
-                }
+                // `--headless` rides the forwarded argv like every launch flag.
                 match cmd.spawn() {
                     Ok(_) => std::process::exit(0),
                     Err(error) => Err(error),
@@ -4384,7 +4664,7 @@ impl App {
         // status bar repeated it until 2026-08-30.)
         //
         // ONE PREDICATE FOR BOTH READERS. Four conjuncts were AND-ed right here —
-        // the opt-out, `$ATERM_CONTROL_SOCK`, `headless`, `proxy` — while the
+        // the opt-out, `--control-sock`, `headless`, `proxy` — while the
         // status bar's posture folded only the first, so a `--control-sock` or
         // `--headless` process painted "applies in place within ~2 min" over an
         // apply this gate refused (2026-08-30). `seamless_handoff_unavailable`
@@ -4436,6 +4716,19 @@ impl App {
             }
             crate::native_update_admission::AdmissionDecision::Apply(
                 crate::native_update_admission::ApplyLane::Cold,
+            ) if safety_token.carried_drafts() > 0 => {
+                // A CARRIED DRAFT RIDES THE SEAMLESS LANE ONLY. Its successor
+                // reopens every document tab from the handed-over layout and
+                // replays the draft; a cold exec hands no layout over, so the
+                // tab would close with the draft left in its journal until the
+                // file is next opened. Refused — the preflight's person-facing
+                // shape, so the row says what to do.
+                return Err(crate::UpdateHandoffStartError::refused(
+                    cold_lane_carried_drafts_refusal(safety_token.carried_drafts()),
+                ));
+            }
+            crate::native_update_admission::AdmissionDecision::Apply(
+                crate::native_update_admission::ApplyLane::Cold,
             ) => {
                 // Direct exec is authorized only for an exact zero-PTY state.
                 debug_assert!(live.is_empty());
@@ -4459,19 +4752,9 @@ impl App {
                         .as_ref()
                         .filter(|attempt| !attempt.is_installed_activation()),
                 );
-                // Headless survives the re-exec. The ENV channel, not the flag,
-                // is right here even though `--headless` is the canonical
-                // user-facing spelling: the successor inherits our argv (minus
-                // the leading pins), and argv may carry an `-e`/`--command`
-                // boundary that swallows every token after it — an appended flag
-                // would become part of the child's command line, and a prepended
-                // one would reorder a payload we must pass through unchanged.
-                // `$ATERM_HEADLESS=1` is an exact equivalent of the flag and is
-                // consumed once at the successor's boot, so this re-injection is
-                // the whole handoff and it leaks nowhere further.
-                if self.headless {
-                    command.env("ATERM_HEADLESS", "1");
-                }
+                // Headless survives the re-exec with no help: `--headless` is a
+                // launch flag, and the successor inherits our argv (minus the
+                // leading pins), where it sits before any `-e` payload.
                 let operator_quiesce = match self.operator_control.as_ref() {
                     Some(control) => Some(control.try_begin_update_quiesce().map_err(|error| {
                         crate::UpdateHandoffStartError::failed(format!(
@@ -4571,7 +4854,7 @@ impl App {
                 "updater reconciliation identity space is exhausted",
             ));
         };
-        let Some(reconcile_worker) = self.native_update_reconcile_worker() else {
+        let Some(reconcile_worker) = self.native_update_reconcile_worker.clone() else {
             return Err(crate::UpdateHandoffStartError::failed(
                 "updater reconciliation worker is unavailable",
             ));
@@ -4604,11 +4887,7 @@ impl App {
         // the park through `reduce_returned_handoff_completion`.
         self.begin_update_installing(
             build,
-            matches!(
-                mode,
-                crate::native_updater_service::ApplyMode::Immediate
-                    | crate::native_updater_service::ApplyMode::CleanQuit
-            ),
+            matches!(mode, crate::native_updater_service::ApplyMode::Immediate),
         );
         // On record before the park: the park's budget has no room for a file write.
         self.record_update_switch_started(build, same_image.is_some(), mode.is_automatic());
@@ -4794,6 +5073,13 @@ impl App {
             });
         }
 
+        // RUNG 0'S SEED, READ HERE — before the activity re-check and the park,
+        // so the one small ledger read this lane makes can never sit inside the
+        // TOCTOU window below (gap #25). The fork lane has no successor boot to
+        // time a dry run in, so it seeds from what the ledger holds: the larger
+        // of the last dry run and the last park that landed.
+        let freeze_seed = FreezeSeed::from_prior(aterm_update::handoff_capture_prior().as_ref());
+
         // Capture the session registry BEFORE parking, because this projection can
         // FAIL: a `WouldBlock` here must return with the terminal completely
         // untouched, which is only true while no reader has been stopped. It
@@ -4912,13 +5198,13 @@ impl App {
         let prior_physical_failures = self
             .prior_physical_failures_of(apply_attempt.as_ref())
             .saturating_add(fork_park_misses);
-        let freeze_budget = handoff_freeze_budget(mode, prior_physical_failures);
+        let freeze_budget = handoff_freeze_budget(mode, prior_physical_failures, freeze_seed);
         let freeze_ms = freeze_budget.as_millis();
         let handoff_history_comfort = freeze_budget / 2;
         aterm_log::info!(
             "update apply: freeze budget {freeze_ms} ms ({mode:?}, {prior_physical_failures} prior \
              physical failure(s) of the target artifact incl. {fork_park_misses} fork-lane park \
-             miss(es); running build {build})"
+             miss(es); {freeze_seed}; running build {build})"
         );
         // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
         // user experiences, and the zero point of the two numbers reported at
@@ -4960,6 +5246,8 @@ impl App {
             carries,
             screen_digest,
             repaint,
+            fg_holders,
+            history_heads,
         } = match self.capture_parked_screens(
             &live,
             deadline,
@@ -4981,12 +5269,15 @@ impl App {
                     ParkAttempt::Missed(reason) => self.fork_park_missed(target_build, reason),
                     // The classifier answers only the two above; anything else
                     // it ever grows is timing until proven otherwise.
+                    #[cfg(any(target_os = "macos", all(test, unix)))]
                     ParkAttempt::Parked | ParkAttempt::NotYet(_) | ParkAttempt::Failed(_) => {
                         self.fork_park_missed(target_build, failure.to_string())
                     }
                 });
             }
         };
+        // The foreground holders ride the manifest records, whatever rung.
+        let manifest = stamp_fg_holders(manifest, &fg_holders);
 
         // POST-PARK, AND DELIBERATELY SO. Every reader is stopped and joined, and
         // the capture loop above just proved every session's `term` was lockable,
@@ -5034,6 +5325,9 @@ impl App {
                 format!("handoff proof capture exceeded the {freeze_ms} ms deadline"),
             ));
         }
+        // The park landed inside its budget: keep what it cost for the next
+        // update's first rung (gap #25), as the launched lane does.
+        let _ledger_write = keep_landed_park(park_at.elapsed());
         let activity_epoch = self.update_handoff_activity_epoch;
         let arbiter = crate::HandoffAttemptArbiter::new();
         self.pending_update_handoff = Some(crate::PendingUpdateHandoff {
@@ -5061,11 +5355,7 @@ impl App {
             activity_epoch,
             cancel: cancel.clone(),
             arbiter: arbiter.clone(),
-            teardown: if mode == crate::native_updater_service::ApplyMode::CleanQuit {
-                crate::DeferredHandoffTeardown::CleanQuitReady
-            } else {
-                crate::DeferredHandoffTeardown::None
-            },
+            teardown: crate::DeferredHandoffTeardown::None,
             commit_drain_started: None,
             revoked_by_activity: false,
         });
@@ -5083,6 +5373,7 @@ impl App {
             command,
             // The fork lane parks first, so its capture travels with the job.
             capture: Some(HandoffCapture {
+                #[cfg(target_os = "macos")]
                 park_at,
                 manifest,
                 fds,
@@ -5096,6 +5387,13 @@ impl App {
                 live: adoption,
                 proof_identities,
                 _owned_masters: owned_masters,
+                history_heads,
+                // Exported by the worker once this capture is done
+                // (`HistoryPlan::Deferred`): never beside the park.
+                history: self.history_sessions(target_build).map_or(
+                    crate::handoff_history::HistoryPlan::Unexported,
+                    crate::handoff_history::HistoryPlan::Deferred,
+                ),
             }),
             #[cfg(target_os = "macos")]
             prelaunch: None,
@@ -5176,6 +5474,135 @@ impl App {
             .collect()
     }
 
+    /// Start the launched lane's HISTORY CARRY export (`crate::handoff_history`)
+    /// for every handed session, with every reader live, beside the launch,
+    /// FOLLOWING each history until the park stops it —
+    /// `None`, and nothing exported, for [`Self::history_sessions`]'s reasons
+    /// or when the worker cannot start (said in the log; the sessions then
+    /// carry the screen carry's bounded history, and the join counts what that
+    /// leaves behind). The fork lane exports on its worker instead
+    /// (`HistoryPlan::Deferred`).
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    fn start_history_export(
+        &self,
+        target_build: u64,
+    ) -> Option<crate::handoff_history::HistoryExporter> {
+        let sessions = self.history_sessions(target_build)?;
+        let dir = crate::control_auth::socket_dir()?;
+        match crate::handoff_history::HistoryExporter::start(dir, sessions, true) {
+            Ok(export) => Some(export),
+            Err(error) => {
+                aterm_log::warn!(
+                    "update apply: the scrollback export could not start ({error}); each tab \
+                     carries the screen carry's bounded history"
+                );
+                None
+            }
+        }
+    }
+
+    /// Every handed session's engine, for the history carry's export — `None`,
+    /// and nothing exported, when the successor is OLDER than this build (a
+    /// rollback has no importer) or there is no private control dir to write
+    /// into (each said in the log; the sessions then carry the screen carry's
+    /// bounded history, and the join counts what that leaves behind).
+    #[cfg(unix)]
+    fn history_sessions(
+        &self,
+        target_build: u64,
+    ) -> Option<
+        Vec<(
+            u64,
+            std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
+        )>,
+    > {
+        if !crate::handoff_history::exports_for_target(crate::running_build_number(), target_build)
+        {
+            aterm_log::info!(
+                "update apply: the successor (build {target_build}) is older than this build and \
+                 imports no scrollback sidecar; each tab carries the screen carry's bounded \
+                 history"
+            );
+            return None;
+        }
+        if crate::control_auth::socket_dir().is_none() {
+            aterm_log::warn!(
+                "update apply: no private control dir for the scrollback export; each tab \
+                 carries the screen carry's bounded history"
+            );
+            return None;
+        }
+        let live = self.handoff_live_sessions();
+        Some(
+            self.pool
+                .iter()
+                .filter(|session| live.iter().any(|(id, _, _)| *id == session.id))
+                .map(|session| (session.id, std::sync::Arc::clone(&session.term)))
+                .collect(),
+        )
+    }
+
+    /// THE SUCCESSOR'S HALF of the history carry, at Commit: take every
+    /// adopted session's carry (`Session::handoff_history`) and import it on a
+    /// worker — NEVER here: an import is O(the imported history), and this is
+    /// the event loop. The worker counts what failed onto each session's
+    /// `history_lost` itself (so a wake that never arrives cannot lose the
+    /// count) and reports back as `Wake::HandoffHistorySettled`, which says it
+    /// on the band. A worker that cannot start costs every carry its lines,
+    /// counted and said here.
+    #[cfg(unix)]
+    pub(crate) fn start_handoff_history_imports(&mut self) {
+        let jobs = self.pool.take_handoff_histories();
+        if jobs.is_empty() {
+            return;
+        }
+        let not_run: Vec<crate::handoff_history::ImportReport> = jobs
+            .iter()
+            .map(|job| {
+                crate::handoff_history::ImportReport::not_run(
+                    job,
+                    "the import worker could not start",
+                )
+            })
+            .collect();
+        let store = std::sync::Arc::clone(&self.store);
+        let proxy = self.proxy.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aterm-history-import".to_string())
+            .spawn(move || {
+                // The attach takes the terminal lock the UI thread contends:
+                // Responsive is the floor for such a holder (`qos`).
+                crate::qos::set_self(crate::qos::Role::Responsive);
+                let reports = crate::handoff_history::run_imports(jobs);
+                crate::handoff_history::record_reports(&store, &reports);
+                if let Some(proxy) = proxy {
+                    let _ = proxy.send_event(Wake::HandoffHistorySettled(reports));
+                }
+            });
+        if let Err(error) = spawned {
+            aterm_log::warn!("overlap handoff: the scrollback import could not start ({error})");
+            crate::handoff_history::record_reports(&self.store, &not_run);
+            self.settle_handoff_history(&not_run);
+        }
+    }
+
+    /// Say what the history carry's imports left behind, once they settle:
+    /// when this update left ANY line of any tab's history behind (the
+    /// outgoing side's fallbacks and the sidecars that failed here), one row
+    /// on the band says how many, in how many tabs. The per-tab counts are
+    /// already on the registry (`handoff_history::record_reports`).
+    #[cfg(unix)]
+    pub(crate) fn settle_handoff_history(
+        &mut self,
+        reports: &[crate::handoff_history::ImportReport],
+    ) {
+        let (lines, tabs) = crate::handoff_history::loss_summary(reports);
+        if lines > 0 {
+            self.post_message(crate::update_words::scrollback_lost(lines, tabs));
+            self.sync_messages();
+        }
+    }
+
     /// THE CAPTURE LADDER, under the park: every session's screen (and as much
     /// scrollback as the remaining budget allows) plus the control carry's head,
     /// priced against the freeze budget and the aggregate cell and
@@ -5214,7 +5641,17 @@ impl App {
         // nothing (`carry_room` false) — never a failed capture.
         let mut carries = Vec::new();
         let carry_room = carries.try_reserve_exact(live.len()).is_ok();
-        if wire.try_reserve_exact(live.len()).is_err() {
+        // The foreground holders, as best-effort as the control carry, but
+        // never tied to it (see the push below).
+        let mut fg_holders = Vec::new();
+        let holder_room = fg_holders.try_reserve_exact(live.len()).is_ok();
+        // The history heads are not best-effort: a session without one would
+        // lose its history with nothing counting it, so storage for them is
+        // reserved like the screens' own.
+        let mut history_heads = Vec::new();
+        if wire.try_reserve_exact(live.len()).is_err()
+            || history_heads.try_reserve_exact(live.len()).is_err()
+        {
             return Err(CaptureFailure::Storage);
         }
         let mut capture_failed = None;
@@ -5391,6 +5828,23 @@ impl App {
             // was not carried (plan P0-1e).
             let differ = deadline.saturating_duration_since(std::time::Instant::now())
                 >= handoff_history_comfort;
+            // THE FOREGROUND HOLDER, for EVERY session and apart from the
+            // control carry below (the 2026-09-25 review). The readers are
+            // parked, so it is the last group the reader saw. A session at the
+            // Sanitized or Repaint rung, or one whose sidecar the aggregate
+            // budget drops, goes without the control carry but still restores
+            // its modes: its holder is what lets the adopting reader hand back
+            // a job that died during the handoff. Reserved above: no allocation.
+            if holder_room {
+                fg_holders.push((
+                    session.id,
+                    session.fg_holder.load(std::sync::atomic::Ordering::Acquire),
+                ));
+            }
+            // THE HISTORY HEAD, under the same lock as the checkpoint: the
+            // fence the worker joins this session's export to. A pure read.
+            // Reserved for every live session above, so this never allocates.
+            history_heads.push(crate::handoff_history::capture_head(session.id, &terminal));
             // Reserved for every live session above, so this never allocates.
             if carry_room && rung.keeps_control_carry() {
                 carries.push(crate::handoff_carry::capture_head(
@@ -5453,7 +5907,169 @@ impl App {
             carries,
             screen_digest,
             repaint,
+            fg_holders,
+            history_heads,
         })
+    }
+
+    /// THE DRY RUN (gap #25): the park's own capture — [`Self::capture_parked_screens`],
+    /// the one the park runs, over the same handed set — timed with every reader
+    /// LIVE and nothing parked, so the first freeze rung can be budgeted from what
+    /// this desk costs instead of from a constant it had outgrown. What it cannot
+    /// time — the readers' stop, the freeze itself — the last landed park's cost
+    /// supplies (`keep_landed_park`).
+    ///
+    /// NOTHING IS PARKED AND NOTHING LEAVES. The capture is a pure read of each
+    /// engine under its own lock (the checkpoint, the archive and history heads,
+    /// the foreground holder), and its product is dropped here: no descriptor is
+    /// duplicated, no artifact written, no reader stopped. So the handoff stays in
+    /// the island's `launched` phase throughout — this is no protocol step — and a
+    /// reader that wants its engine meanwhile waits one session's capture at most,
+    /// which is what the lock would cost it on any redraw.
+    ///
+    /// It prices the WIDEST capture a rung would attempt: history is carried for
+    /// every session the aggregate budgets admit (`Duration::ZERO` comfort), as
+    /// on a rung with time to spare, and the window is the rung ceiling's two
+    /// thirds — past that, 1.5 × the time already saturates the ceiling, so the
+    /// main thread never spends more than [`DRY_RUN_CAPTURE_WINDOW`] learning it.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    pub(crate) fn dry_run_handoff_capture(
+        &mut self,
+        caps: crate::seamless::WireCaps,
+    ) -> DryRunCapture {
+        let live = self.handoff_live_sessions();
+        if live.is_empty() {
+            return DryRunCapture::Unmeasured("no live session to capture");
+        }
+        let started = std::time::Instant::now();
+        let captured = self.capture_parked_screens(
+            &live,
+            started + DRY_RUN_CAPTURE_WINDOW,
+            DRY_RUN_CAPTURE_WINDOW.as_millis(),
+            std::time::Duration::ZERO,
+            caps,
+        );
+        let took = started.elapsed();
+        match captured {
+            Ok(parked) => DryRunCapture::Measured {
+                took,
+                sessions: parked.screens.len(),
+            },
+            // Out of time — the capture itself, or an engine lock a reader held
+            // the whole window: at least the window, which saturates the rung.
+            Err(CaptureFailure::Deadline { .. } | CaptureFailure::EngineBusy) => {
+                DryRunCapture::AtLeast {
+                    took: took.max(DRY_RUN_CAPTURE_WINDOW),
+                    sessions: live.len(),
+                }
+            }
+            // A reader mid-sequence over live output is ordinary while readers
+            // run; storage and a refusal are the park's to report. None of them
+            // says how long a capture takes.
+            Err(CaptureFailure::MidSequence { .. }) => {
+                DryRunCapture::Unmeasured("a parser was mid-sequence over live output")
+            }
+            Err(CaptureFailure::Storage) => {
+                DryRunCapture::Unmeasured("the capture could not reserve its storage")
+            }
+            Err(CaptureFailure::Refused { .. }) => {
+                DryRunCapture::Unmeasured("the capture refused the desk")
+            }
+        }
+    }
+
+    /// Seed this attempt's first automatic freeze rung (gap #25): time the dry
+    /// run while the successor boots, never budget below the last park that
+    /// landed (which the dry run cannot see: the readers' stop), persist what it
+    /// measured in the health ledger for the next update (off this thread — the
+    /// ledger's lock is a file lock another process may hold), and fall back to
+    /// what the ledger holds, then the 20 ms default, when it measured nothing.
+    /// An explicit apply's window is the widest rung whatever rung 0 is, so it
+    /// spends no dry run. The seed is stored on the prelaunched attempt, whose
+    /// every park reads it ([`Self::prelaunched_park_budget`]), and returned.
+    ///
+    /// Also returns the ledger writer's handle when one was started: production
+    /// lets it run detached; a test joins it before reading the ledger back.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    pub(crate) fn seed_first_freeze_rung(
+        &mut self,
+        mode: crate::native_updater_service::ApplyMode,
+        caps: crate::seamless::WireCaps,
+    ) -> (FreezeSeed, Option<std::thread::JoinHandle<()>>) {
+        if !mode.is_automatic() {
+            return (FreezeSeed::Default, None);
+        }
+        let dry = self.dry_run_handoff_capture(caps);
+        // One small read, while the successor boots: the last landed park, which
+        // the dry run cannot time, and the fallback when it measured nothing.
+        let prior = aterm_update::handoff_capture_prior();
+        let mut kept = None;
+        let seed = match dry {
+            DryRunCapture::Measured { took, sessions }
+            | DryRunCapture::AtLeast { took, sessions } => {
+                let seed = FreezeSeed::DryRun {
+                    capture: took,
+                    sessions,
+                    last_park: FreezeSeed::last_park_of(prior.as_ref()),
+                };
+                let record = aterm_update::HandoffCaptureRecord {
+                    capture_us: u64::try_from(took.as_micros()).unwrap_or(u64::MAX).max(1),
+                    sessions: u32::try_from(sessions).unwrap_or(u32::MAX),
+                    freeze_seed_ms: u64::try_from(seed.rung0().as_millis()).unwrap_or(u64::MAX),
+                    ..aterm_update::HandoffCaptureRecord::default()
+                };
+                let build = crate::running_build_number();
+                match std::thread::Builder::new()
+                    .name("aterm-freeze-seed".to_string())
+                    .spawn(move || {
+                        // A small ledger write nobody waits on.
+                        crate::qos::set_self(crate::qos::Role::Background);
+                        aterm_update::record_handoff_capture(build, &record);
+                    }) {
+                    Ok(handle) => kept = Some(handle),
+                    Err(error) => aterm_log::warn!(
+                        "update apply: the timed capture could not be kept for the next update \
+                         ({error}); this attempt still seeds from it"
+                    ),
+                }
+                seed
+            }
+            DryRunCapture::Unmeasured(why) => {
+                aterm_log::info!("update apply: the dry-run capture measured nothing ({why})");
+                FreezeSeed::from_prior(prior.as_ref())
+            }
+        };
+        let saturated = if matches!(dry, DryRunCapture::AtLeast { .. }) {
+            " — it ran out of its window, so the rung takes its ceiling"
+        } else {
+            ""
+        };
+        aterm_log::info!(
+            "update apply: first freeze rung {} ms — {seed}{saturated}",
+            seed.rung0().as_millis()
+        );
+        if let Some(prelaunch) = self.update_handoff_prelaunch.as_mut() {
+            prelaunch.freeze_seed = seed;
+        }
+        (seed, kept)
+    }
+
+    /// The prelaunched attempt's budget for its NEXT park: the ladder at the
+    /// target's prior physical failures plus this attempt's own misses, with
+    /// rung 0 the seed its dry run bought — `(prior failures incl. misses,
+    /// budget, seed)`, or `None` with no attempt prelaunched. The one place the
+    /// park reads its budget from.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    pub(crate) fn prelaunched_park_budget(&self) -> Option<(u8, std::time::Duration, FreezeSeed)> {
+        let prelaunch = self.update_handoff_prelaunch.as_ref()?;
+        let prior = self
+            .prior_physical_failures_of(prelaunch.apply_attempt.as_ref())
+            .saturating_add(prelaunch.park_misses);
+        Some((
+            prior,
+            handoff_freeze_budget(prelaunch.mode, prior, prelaunch.freeze_seed),
+            prelaunch.freeze_seed,
+        ))
     }
 
     /// The launched lane's first half (2026-09-19, the late park): record the
@@ -5509,11 +6125,16 @@ impl App {
             dialled: None,
             park_retry_at: None,
             park_misses: 0,
+            // Seeded below, once the successor is booting.
+            freeze_seed: FreezeSeed::Default,
             land_waits: 0,
             last_wait: None,
             stood_down: false,
             teardown: crate::DeferredHandoffTeardown::None,
             revoked_by_activity: false,
+            // Started now, beside the launch: the successor's whole boot runs
+            // while the history is exported with every reader live.
+            history_export: self.start_history_export(target_build),
         });
         let cleanup = HandoffWorkerCleanup {
             parent_socket: self.handoff_parent_socket(),
@@ -5556,13 +6177,22 @@ impl App {
             "update apply: launching the successor with every reader live (the late park); \
              the outgoing process parks once it has dialled"
         );
+        // THE SUCCESSOR IS BOOTING (seconds: launch->dial was 1.1–4.6 s on the
+        // owner's last four updates), and nothing waits on this thread until it
+        // dials — so the park's capture is timed NOW, with every reader live, and
+        // the first freeze rung is budgeted from it and from the last park that
+        // landed (gap #25). No phase moves: the attempt is `launched` before
+        // this and after it, which now carries the seed its parks read. The
+        // ledger writer runs detached: nothing here waits on a file lock.
+        let _seeded =
+            self.seed_first_freeze_rung(mode, crate::seamless::WireCaps::for_target(target_build));
         Ok(())
     }
 
     /// `Wake::UpdateHandoffAwaitingPark`: the worker has the successor's dial in
     /// hand (or must fork), so the park may now be taken — at once for an
     /// explicit apply, at the next quiet moment for the automatic lane.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn on_update_handoff_awaiting_park(
         &mut self,
         attempt_id: u64,
@@ -5608,7 +6238,7 @@ impl App {
     /// moment, and bounded by [`PRELAUNCH_HOLD_MAX`]: an attempt held past it
     /// stands down as activity-revoked (no physical budget spent), and the
     /// automatic lane retries at a later quiet window.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn try_park_for_prelaunched_successor(&mut self, now: std::time::Instant) {
         let Some(prelaunch) = self.update_handoff_prelaunch.as_ref() else {
             return;
@@ -5695,7 +6325,7 @@ impl App {
     /// Tell the worker to stand the held successor down with a typed reason.
     /// Idempotent per attempt; the completion the worker then sends is what
     /// clears the attempt record.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn stand_down_prelaunched_successor(&mut self, stand_down: HandoffStandDown) {
         let Some(prelaunch) = self.update_handoff_prelaunch.as_mut() else {
             return;
@@ -5736,7 +6366,7 @@ impl App {
     /// retry launching beside the candidate being stood down. The parked record's
     /// deferred teardown and activity flag move onto it so the completion still
     /// replays them.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn answer_prelaunched_stand_down(&mut self, attempt_id: u64) {
         let mut ack = None;
         if let Some(prelaunch) = self.update_handoff_prelaunch.as_mut()
@@ -5784,7 +6414,7 @@ impl App {
     /// carry. Every `Failed` after `park_all_readers` has already rolled the
     /// readers back: the successor holds nothing, so the readers never wait for
     /// its stand-down.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     fn park_and_transfer_to_prelaunched_successor(
         &mut self,
         now: std::time::Instant,
@@ -5820,6 +6450,23 @@ impl App {
                 outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
                 detail: "every terminal session closed while the successor booted".to_string(),
             });
+        }
+        // THE SCROLLBACK EXPORT'S FIRST PASS FIRST (`crate::handoff_history`):
+        // it runs with every reader live, and a park that does not wait for it
+        // leaves each session it has not reached with the screen carry's
+        // bounded history (counted). Bounded by
+        // `handoff_history::EXPORT_PATIENCE` after the dial, in every mode —
+        // waiting freezes nothing. After its first pass the export FOLLOWS
+        // each history until the park stops it below.
+        let exporting = self
+            .update_handoff_prelaunch
+            .as_mut()
+            .and_then(|prelaunch| prelaunch.history_export.as_mut())
+            .is_some_and(|export| !export.caught_up());
+        if let Some(reason) =
+            crate::handoff_history::park_wait(exporting, now.saturating_duration_since(dialled_at))
+        {
+            return ParkAttempt::NotYet(reason);
         }
         // THE GATE — the only decision that costs the user anything, taken here
         // and nowhere else (`prelaunch_park_admitted` says what each mode owes).
@@ -5868,6 +6515,42 @@ impl App {
                     outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
                     detail: hold_cap_stand_down_detail(reason, gate_facts.held_for, last_wait),
                 });
+            }
+        }
+        // THE EXPORT IS STOPPED BEFORE ANYTHING FREEZES: it follows every
+        // history with the readers live, and a chunk read beside the park
+        // would contend with the capture's locks and with the layout's
+        // `try_lock` (a degraded layout reads as a moved topology at Commit).
+        // The stop takes one bounded last look at what landed since the
+        // export's last tick; what lands after it rides the screen carry. An
+        // export whose FIRST pass outran its patience leaves the tabs it had
+        // not reached with the screen carry's bounded history, counted by the
+        // join.
+        if let Some(export) = self
+            .update_handoff_prelaunch
+            .as_mut()
+            .and_then(|prelaunch| prelaunch.history_export.as_mut())
+        {
+            let caught_up = export.caught_up();
+            let stopped = export.halt(crate::handoff_history::HALT_WAIT);
+            if !caught_up {
+                aterm_log::warn!(
+                    "update apply: the scrollback export ran past {} s after the dial; {} it \
+                     before the park — the tabs it had not reached carry the screen carry's \
+                     bounded history, counted",
+                    crate::handoff_history::EXPORT_PATIENCE.as_secs(),
+                    if stopped {
+                        "stopped"
+                    } else {
+                        "asked to stop (it had not answered)"
+                    }
+                );
+            } else if !stopped {
+                aterm_log::warn!(
+                    "update apply: the scrollback export had not stopped {} ms after the park \
+                     asked; the park goes ahead, and the worker hands over what it finished",
+                    crate::handoff_history::HALT_WAIT.as_millis()
+                );
             }
         }
         // THIS PROCESS'S OWN LIMITS ARE NOT A VERDICT ABOUT THE CANDIDATE
@@ -5972,19 +6655,23 @@ impl App {
             });
         }
         // THE LADDER, PLUS THIS ATTEMPT'S OWN MISSES. A park that missed its
-        // budget re-parks on the next rung (20 -> 80 -> 250 ms) without giving
-        // the booted successor back: the rung a physical failure would have
-        // bought the NEXT attempt, bought here for 500 ms instead of a relaunch.
-        let prior_physical_failures = self
-            .prior_physical_failures_of(apply_attempt.as_ref())
-            .saturating_add(park_misses);
-        let freeze_budget = handoff_freeze_budget(mode, prior_physical_failures);
+        // budget re-parks on the next rung (seed -> 2 × seed, at least 80 ->
+        // 250 ms) without giving the booted successor back: the rung a physical
+        // failure would have bought the NEXT attempt, bought here for 500 ms
+        // instead of a relaunch. Rung 0 is the seed bought beside the launch —
+        // the dry run, floored by the last landed park (gap #25).
+        let Some((prior_physical_failures, freeze_budget, freeze_seed)) =
+            self.prelaunched_park_budget()
+        else {
+            return ParkAttempt::NotYet("no attempt is prelaunched");
+        };
         let freeze_ms = freeze_budget.as_millis();
         let handoff_history_comfort = freeze_budget / 2;
         aterm_log::info!(
             "update apply: freeze budget {freeze_ms} ms ({mode:?}, {prior_physical_failures} prior \
              physical failure(s) of the target artifact incl. {park_misses} park miss(es) of this \
-             attempt; running build {build}) — parking {} ms after the successor's dial",
+             attempt; {freeze_seed}; running build {build}) — parking {} ms after the successor's \
+             dial",
             now.saturating_duration_since(dialled_at).as_millis()
         );
         // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
@@ -5997,6 +6684,9 @@ impl App {
                 "a PTY reader missed the {freeze_ms} ms handoff park deadline"
             ));
         }
+        // The split the freeze's one number used to hide (gap #25): how much of
+        // it stopping the readers took, and how much the capture after it.
+        let readers_parked_at = std::time::Instant::now();
         // Session DEATH is a safety fact, not an idleness preference: every
         // automatic mode refuses to commit an adoption proof whose live set died
         // underneath it.
@@ -6012,6 +6702,8 @@ impl App {
             carries,
             screen_digest,
             repaint,
+            fg_holders,
+            history_heads,
         } = match self.capture_parked_screens(
             &live,
             deadline,
@@ -6021,12 +6713,24 @@ impl App {
         ) {
             Ok(captured) => captured,
             Err(failure) => {
+                // Stamped before the rollback, which resumes readers: the split
+                // is the freeze's, not the resume's.
+                let readers_ms = readers_parked_at
+                    .saturating_duration_since(park_at)
+                    .as_millis();
+                let capture_ms = readers_parked_at.elapsed().as_millis();
                 self.rollback_overlap(None, &live);
+                aterm_log::info!(
+                    "update apply: the park stopped the readers in {readers_ms} ms and its \
+                     capture ran {capture_ms} ms before it stopped ({freeze_ms} ms budget)"
+                );
                 // A MISS OR A REFUSAL, decided by the failure's TYPE (plan
                 // P0-3): only timing and storage re-park on the next rung.
                 return classify_capture_failure(&failure);
             }
         };
+        // The foreground holders ride the manifest records, whatever rung.
+        let manifest = stamp_fg_holders(manifest, &fg_holders);
         // POST-PARK, AND DELIBERATELY SO — see the fork lane for why a pre-park
         // layout capture revoked healthy attempts.
         let layout = self.capture_restore_manifest();
@@ -6044,6 +6748,10 @@ impl App {
                 "handoff proof capture exceeded the {freeze_ms} ms deadline"
             ));
         }
+        // THE PARK LANDED INSIDE ITS BUDGET: what it cost is the number the next
+        // update's first rung should be budgeted from (gap #25) — the dry run
+        // cannot time the readers' stop, and this can.
+        let _ledger_write = keep_landed_park(park_at.elapsed());
         let activity_epoch = self.update_handoff_activity_epoch;
         let proof_deadline = handoff_proof_deadline(mode, prior_physical_failures, park_at);
         self.pending_update_handoff = Some(crate::PendingUpdateHandoff {
@@ -6071,16 +6779,13 @@ impl App {
             activity_epoch,
             cancel,
             arbiter,
-            teardown: if mode == crate::native_updater_service::ApplyMode::CleanQuit {
-                crate::DeferredHandoffTeardown::CleanQuitReady
-            } else {
-                crate::DeferredHandoffTeardown::None
-            },
+            teardown: crate::DeferredHandoffTeardown::None,
             commit_drain_started: None,
             revoked_by_activity: false,
         });
         let transfer = HandoffTransferJob {
             capture: HandoffCapture {
+                #[cfg(target_os = "macos")]
                 park_at,
                 manifest,
                 fds,
@@ -6094,9 +6799,25 @@ impl App {
                 live: adoption,
                 proof_identities,
                 _owned_masters: owned_masters,
+                history_heads,
+                // Taken here, after every point a park can miss at: a re-park
+                // keeps the export it waited for.
+                history: self
+                    .update_handoff_prelaunch
+                    .as_mut()
+                    .and_then(|prelaunch| prelaunch.history_export.take())
+                    .map_or(
+                        crate::handoff_history::HistoryPlan::Unexported,
+                        crate::handoff_history::HistoryPlan::Exported,
+                    ),
             },
             proof_deadline,
         };
+        let carried = transfer.capture.screens.len();
+        let proof_budget_ms = transfer
+            .proof_deadline
+            .saturating_duration_since(park_at)
+            .as_millis();
         let sent = self
             .update_handoff_prelaunch
             .as_ref()
@@ -6110,9 +6831,14 @@ impl App {
             });
         }
         aterm_log::info!(
-            "update apply: parked and captured in {} ms; the capture is on its way to the \
-             held successor",
-            park_at.elapsed().as_millis()
+            "update apply: parked and captured {carried} screen(s) in {} ms (the readers stopped \
+             in {} ms, the capture and its hand-over took {} ms); the capture is on its way to \
+             the held successor (proof due {proof_budget_ms} ms after the park)",
+            park_at.elapsed().as_millis(),
+            readers_parked_at
+                .saturating_duration_since(park_at)
+                .as_millis(),
+            readers_parked_at.elapsed().as_millis()
         );
         ParkAttempt::Parked
     }
@@ -6289,8 +7015,8 @@ impl App {
         if exact_layout && live_layout != pending_layout {
             aterm_log::info!(
                 "update apply: the Commit-time capture differs from the committed snapshot \
-                 only in window position or degradable session metadata — topology is \
-                 unchanged, so Commit stays admitted"
+                 only in window position, window show state or degradable session metadata \
+                 — topology is unchanged, so Commit stays admitted"
             );
         }
         let parent_still_parked = self
@@ -6341,7 +7067,9 @@ impl App {
         let matches_pending = self
             .pending_update_handoff
             .as_ref()
-            .is_some_and(|pending| pending.attempt_id == completion.attempt_id)
+            .is_some_and(|pending| pending.attempt_id == completion.attempt_id);
+        #[cfg(any(target_os = "macos", all(test, unix)))]
+        let matches_pending = matches_pending
             || self
                 .update_handoff_prelaunch
                 .as_ref()
@@ -6731,6 +7459,7 @@ impl App {
     /// against the artifact `attempt` targets — the number the freeze budget
     /// widens on. `0` with no attempt (the QA seam) or no record.
     #[must_use]
+    #[cfg(unix)]
     pub(crate) fn prior_physical_failures_of(
         &self,
         attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
@@ -6747,7 +7476,7 @@ impl App {
     /// `target_build` — the rungs it climbs across attempts, since it cannot
     /// climb them inside one (see `App::fork_park_misses`).
     #[must_use]
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     pub(crate) fn fork_park_misses_of(&self, target_build: u64) -> u8 {
         self.fork_park_misses
             .filter(|(build, _)| *build == target_build)
@@ -6838,7 +7567,7 @@ impl App {
     /// automatic/person-initiated split can be gotten right (see
     /// [`crate::app_native::HandoffFailureLane`]).
     #[cfg(unix)]
-    fn reduce_returned_handoff_completion(
+    pub(crate) fn reduce_returned_handoff_completion(
         &mut self,
         completion: crate::UpdateHandoffCompletion,
     ) -> Option<crate::DeferredHandoffTeardown> {
@@ -6868,15 +7597,21 @@ impl App {
         let parked = self
             .pending_update_handoff
             .take_if(|pending| pending.attempt_id == _attempt_id);
+        #[cfg(any(target_os = "macos", all(test, unix)))]
         let prelaunch = self
             .update_handoff_prelaunch
             .take_if(|prelaunch| prelaunch.attempt_id == _attempt_id);
-        let pending = match (parked, prelaunch) {
-            (Some(mut parked), prelaunch) => {
-                if let Some(prelaunch) = prelaunch {
-                    parked.teardown.merge(prelaunch.teardown);
-                    parked.revoked_by_activity |= prelaunch.revoked_by_activity;
-                }
+        let pending = match parked {
+            Some(parked) => {
+                #[cfg(any(target_os = "macos", all(test, unix)))]
+                let parked = {
+                    let mut parked = parked;
+                    if let Some(prelaunch) = prelaunch {
+                        parked.teardown.merge(prelaunch.teardown);
+                        parked.revoked_by_activity |= prelaunch.revoked_by_activity;
+                    }
+                    parked
+                };
                 crate::ReturnedHandoffRecord {
                     mode: parked.mode,
                     apply_attempt: parked.apply_attempt,
@@ -6886,15 +7621,20 @@ impl App {
                     parked_live: Some(parked.live),
                 }
             }
-            (None, Some(prelaunch)) => crate::ReturnedHandoffRecord {
-                mode: prelaunch.mode,
-                apply_attempt: prelaunch.apply_attempt,
-                same_image: prelaunch.same_image,
-                teardown: prelaunch.teardown,
-                revoked_by_activity: prelaunch.revoked_by_activity,
-                parked_live: None,
-            },
-            (None, None) => return None,
+            #[cfg(any(target_os = "macos", all(test, unix)))]
+            None => {
+                let prelaunch = prelaunch?;
+                crate::ReturnedHandoffRecord {
+                    mode: prelaunch.mode,
+                    apply_attempt: prelaunch.apply_attempt,
+                    same_image: prelaunch.same_image,
+                    teardown: prelaunch.teardown,
+                    revoked_by_activity: prelaunch.revoked_by_activity,
+                    parked_live: None,
+                }
+            }
+            #[cfg(not(any(target_os = "macos", all(test, unix))))]
+            None => return None,
         };
         // Lane classification for the bounded automatic retry budgets, from the two
         // typed facts this reduction still holds: the mode the apply was authorized
@@ -6927,22 +7667,18 @@ impl App {
             child_death,
             pending.revoked_by_activity,
         );
-        let teardown = match (pending.mode, pending.teardown) {
-            // Construction records this eagerly; keep a fail-safe derivation from
-            // the typed mode so a future constructor cannot strand an authorized
-            // clean quit merely by omitting the replay marker.
-            (
-                crate::native_updater_service::ApplyMode::CleanQuit,
-                crate::DeferredHandoffTeardown::None,
-            ) => crate::DeferredHandoffTeardown::CleanQuitReady,
-            (_, teardown) => teardown,
-        };
+        let teardown = pending.teardown;
         // ROLLBACK IFF PARKED: a prelaunched attempt that never parked has
         // nothing to resume, and one whose readers were released ahead of the
         // stand-down (`Wake::UpdateHandoffStandingDown`) already resumed them.
         if let Some(live) = pending.parked_live.as_deref() {
             self.rollback_overlap(nonce.as_deref(), live);
         }
+        // THE ATTEMPT RECORD IS GONE, and with it the fence that held draft
+        // journals still: a re-seat the stand-down's rollback owed while the
+        // prelaunch record stood, and the appends waiting behind it, run now
+        // rather than at the person's next keystroke.
+        self.drive_owed_document_journals();
         // THE ROW SAID "INSTALLING" FOR THIS ATTEMPT, and the attempt is over:
         // put the words (or the absence of a row) back and end the charging
         // surge BEFORE the outcome below decides whether to say anything — a
@@ -7007,15 +7743,6 @@ impl App {
         Some(teardown)
     }
 
-    #[cfg(not(unix))]
-    pub(crate) fn finish_update_handoff(
-        &mut self,
-        _el: &ActiveEventLoop,
-        _completion: crate::UpdateHandoffCompletion,
-    ) {
-        aterm_log::warn!("ignored unix-only handoff completion on this platform");
-    }
-
     /// OVERLAP-HANDOFF failure rollback: restore this (still-running) parent to
     /// a fully-working terminal after a candidate that never became ready.
     ///
@@ -7035,16 +7762,35 @@ impl App {
     /// * re-arm CLOEXEC on every master (the exact pre-apply fd posture);
     /// * resume the parked readers ([`Self::attach_deferred_readers`] — parked
     ///   sessions are self-describing: `reader_join: None`);
+    /// * owe every draft journal a re-seat: a candidate that got as far as its
+    ///   restore republished the journal of each document it reopened, under
+    ///   its own sequence numbers, and this process's next append would fail
+    ///   against that image forever
+    ///   ([`Self::reseat_document_journals_after_rollback`]).
     ///
     /// The event-loop half performs no filesystem I/O, update-status read, or
-    /// child-process probe.
+    /// child-process probe: the re-seats are queued to the document worker.
     #[cfg(unix)]
-    fn rollback_overlap(&mut self, _nonce: Option<&str>, live: &[(u64, i32, i32)]) {
+    pub(crate) fn rollback_overlap(&mut self, _nonce: Option<&str>, live: &[(u64, i32, i32)]) {
         for (_, master, _) in live {
             let _ = aterm_pty::set_cloexec(*master, true);
         }
         self.resume_deferred_readers_nonblocking();
+        self.reseat_document_journals_after_rollback();
     }
+}
+
+/// The cold lane's refusal of a safety token that carries `carried` unsaved
+/// editor drafts: the preflight's person-facing shape
+/// ([`crate::app_native::DIRTY_DOCUMENTS_BLOCK`]), so the row says what to do.
+#[cfg(unix)]
+pub(crate) fn cold_lane_carried_drafts_refusal(carried: usize) -> String {
+    format!(
+        "{} {carried} document(s) have uncheckpointed edits an update cannot carry: no \
+         terminal session is open to carry the editor across, so replacing the app now would \
+         close it",
+        crate::app_native::DIRTY_DOCUMENTS_BLOCK,
+    )
 }
 
 /// The session registry's projection narrowed to the sessions this attempt
@@ -7065,6 +7811,34 @@ fn handed_sessions_only(
         live.iter()
             .any(|(local_id, _, _)| *local_id == record.local_id)
     });
+    manifest
+}
+
+/// Stamp each record with its session's foreground holder
+/// (`SessionRecord::fg_holder`), as the park capture read it
+/// ([`ParkedScreens::fg_holders`]).
+///
+/// THE HOLDER IS A RECORD SCALAR (the 2026-09-25 foreground handback review).
+/// It used to ride the control-carry sidecar, which is dropped for a session
+/// carried at the Sanitized or Repaint rung, for one the receiver repaints, and
+/// for one past the 16 MiB aggregate sidecar budget (about the fifth busy
+/// session on). Every one of those sessions still restores its modes, so a job
+/// that died while the readers were parked left its alt screen, mouse and
+/// kitty modes armed under the prompt: the adopting reader got holder `0`,
+/// probed afresh, saw the reclaimed shell, and never cut. A holder that is no
+/// pgid (`<= 0`, nothing seen yet) is not written.
+#[cfg(unix)]
+fn stamp_fg_holders(
+    mut manifest: crate::session_store::SessionHandoff,
+    holders: &[(u64, i32)],
+) -> crate::session_store::SessionHandoff {
+    for record in &mut manifest.sessions {
+        record.fg_holder = holders
+            .iter()
+            .find(|(local_id, _)| *local_id == record.local_id)
+            .map(|(_, holder)| *holder)
+            .filter(|holder| *holder > 0);
+    }
     manifest
 }
 
@@ -7291,7 +8065,7 @@ struct PrelaunchArgs {
 /// runs; none is remembered from the attempt's entry, because the entry is now
 /// seconds or minutes earlier — the successor was launched there and has been
 /// booting and holding since.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParkGateFacts {
     pub(crate) mode: crate::native_updater_service::ApplyMode,
@@ -7327,7 +8101,7 @@ pub(crate) struct ParkGateFacts {
 }
 
 /// What the park gate decides.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkGate {
     /// Park now.
@@ -7353,7 +8127,7 @@ pub(crate) enum ParkGate {
 /// So the rule is the one the ENTRY gate applied, re-read at the instant it
 /// matters:
 ///
-/// * `Immediate` / `CleanQuit` — the person asked for this. Park at once; they
+/// * `Immediate` — the person asked for this. Park at once; they
 ///   are waiting for it, and a gate here would be aterm deciding it knows better.
 /// * the automatic modes — THE LADDER
 ///   (`native_update_auto_intent::automatic_park_refusal`), read at its live
@@ -7388,14 +8162,14 @@ pub(crate) enum ParkGate {
 /// nothing can make a stood-down gate admit again. That is what bounds the hold
 /// — a booted successor is not left waiting behind a terminal that never goes
 /// quiet; the ladder's next phase admits the next attempt sooner.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn prelaunch_park_admitted(
     facts: ParkGateFacts,
     hold_cap: Option<std::time::Duration>,
 ) -> ParkGate {
     use crate::native_updater_service::ApplyMode;
-    if matches!(facts.mode, ApplyMode::Immediate | ApplyMode::CleanQuit) {
+    if matches!(facts.mode, ApplyMode::Immediate) {
         return ParkGate::Park;
     }
     if hold_cap.is_some_and(|cap| facts.held_for >= cap) {
@@ -7429,7 +8203,7 @@ pub(crate) fn prelaunch_park_admitted(
 /// command exited, or a flooded master, as the user being busy; the real
 /// reason reached only a debug log (the 2026-09-24 review of the 2026-09-22/23
 /// update audit fixes).
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn hold_cap_stand_down_detail(
     reason: &str,
@@ -7466,7 +8240,7 @@ const _: () = assert!(
 
 /// The hold cap for `mode`: the automatic lanes are bounded, the explicit ones
 /// park at once and so can never reach a cap.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn prelaunch_hold_cap(
     mode: crate::native_updater_service::ApplyMode,
@@ -7479,8 +8253,10 @@ pub(crate) fn prelaunch_hold_cap(
 #[derive(Debug)]
 pub(crate) enum ParkAttempt {
     /// Parked, captured, and the capture is on its way to the worker.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     Parked,
     /// Not now — re-run the gate after [`PRELAUNCH_PARK_RETRY`].
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     NotYet(&'static str),
     /// The park itself missed: the readers were parked and rolled back, nothing
     /// was granted, and the successor is still holding. Re-park once, after
@@ -7504,6 +8280,7 @@ pub(crate) enum ParkAttempt {
     Refused(CaptureRefusal),
     /// Stand the held successor down with this outcome; readers (if they were
     /// parked) have already been rolled back.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     Failed(HandoffStandDown),
 }
 
@@ -7594,7 +8371,7 @@ impl App {
 /// typed `CaptureRefused`, with a detail that names the session, so the
 /// completion reaches the refusal lane and the ledger says what held the update
 /// back.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn capture_refusal_stand_down(refusal: &CaptureRefusal) -> HandoffStandDown {
     HandoffStandDown {
@@ -7613,7 +8390,7 @@ const PRELAUNCH_PARK_RETRY: std::time::Duration = std::time::Duration::from_mill
 /// budget. Long enough for whatever took the engine lock (the scrollback
 /// compressor, a render) to finish, short enough that the successor's hold is
 /// not visibly spent on it.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const PRELAUNCH_REPARK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How many times one prelaunched attempt re-parks before it stands its
@@ -7632,11 +8409,11 @@ const PRELAUNCH_REPARK_DELAY: std::time::Duration = std::time::Duration::from_mi
 /// says nothing about the candidate, so the ledger is exactly the wrong place
 /// for it; the attempt climbs the rungs itself and, past the last one, stands
 /// down as a busy-machine fact ([`park_miss_disposition`]).
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) const PRELAUNCH_MAX_PARK_MISSES: u8 = 2;
 
 /// What one park that missed its freeze budget costs the prelaunched attempt.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Debug)]
 pub(crate) enum ParkMissDisposition {
     /// Re-park after [`PRELAUNCH_REPARK_DELAY`] on the ladder's next rung;
@@ -7666,7 +8443,7 @@ pub(crate) enum ParkMissDisposition {
 /// every fifteen minutes about facts no amount of waiting changes. A refusal is
 /// now [`ParkAttempt::Refused`] and never reaches this function, which is what
 /// makes the sentence below true.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 pub(crate) fn park_miss_disposition(misses: u8, reason: String) -> ParkMissDisposition {
     if misses >= PRELAUNCH_MAX_PARK_MISSES {
@@ -7717,7 +8494,7 @@ const _: () = assert!(
 /// an explicit apply (the person asked, and a busy machine may take it).
 /// `ATERM_HANDOFF_PROOF_TIMEOUT_MS` overrides all three — a DEVELOPMENT SEAM
 /// (`aterm_types::dev_seam!`): a shipped binary does not read it.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[must_use]
 fn handoff_proof_deadline(
     mode: crate::native_updater_service::ApplyMode,
@@ -7728,7 +8505,7 @@ fn handoff_proof_deadline(
     let ms = aterm_types::dev_seam!("ATERM_HANDOFF_PROOF_TIMEOUT_MS")
         .and_then(|value| value.to_str()?.parse::<u64>().ok())
         .unwrap_or(match mode {
-            ApplyMode::Immediate | ApplyMode::CleanQuit => 30_000,
+            ApplyMode::Immediate => 30_000,
             ApplyMode::Automatic | ApplyMode::AutomaticPastGrace => match prior_physical_failures {
                 0 => 3_000,
                 _ => 6_000,
@@ -8203,11 +8980,13 @@ mod late_park_record_tests {
                 dialled: None,
                 park_retry_at: None,
                 park_misses: 0,
+                freeze_seed: super::FreezeSeed::Default,
                 land_waits: 0,
                 last_wait: None,
                 stood_down: false,
                 teardown: crate::DeferredHandoffTeardown::None,
                 revoked_by_activity: false,
+                history_export: None,
             },
             cancelled,
             stood_down,
@@ -8260,19 +9039,18 @@ mod late_park_record_tests {
     }
 
     /// A completion for an attempt that only ever PRELAUNCHED clears that
-    /// record (so a retry may launch) and derives the clean-quit replay from
-    /// the mode, exactly as a parked attempt's would.
+    /// record, so a retry may launch.
     #[test]
-    fn a_prelaunched_attempt_is_cleared_by_its_completion_and_keeps_its_clean_quit_replay() {
+    fn a_prelaunched_attempt_is_cleared_by_its_completion() {
         let mut app = App::headless_for_test();
         let (record, _cancelled, _stood_down, _transferred) =
-            prelaunch_record(9, ApplyMode::CleanQuit);
+            prelaunch_record(9, ApplyMode::Immediate);
         app.update_handoff_prelaunch = Some(record);
         assert!(app.update_handoff_in_flight());
         let teardown = app
             .reduce_returned_handoff_completion(completion(9))
             .expect("the prelaunched attempt is reduced");
-        assert_eq!(teardown, crate::DeferredHandoffTeardown::CleanQuitReady);
+        assert_eq!(teardown, crate::DeferredHandoffTeardown::None);
         assert!(app.update_handoff_prelaunch.is_none());
         assert!(app.pending_update_handoff.is_none());
         assert!(!app.update_handoff_in_flight());
@@ -8536,10 +9314,6 @@ mod late_park_record_tests {
             budget(ApplyMode::Immediate, 0),
             std::time::Duration::from_secs(30)
         );
-        assert_eq!(
-            budget(ApplyMode::CleanQuit, 2),
-            std::time::Duration::from_secs(30)
-        );
         assert!(matches!(
             crate::update_handoff_wake_class(&crate::Wake::UpdateHandoffAwaitingPark {
                 attempt_id: 1,
@@ -8606,11 +9380,10 @@ mod park_gate_tests {
     use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase, automatic_park_refusal};
     use crate::native_updater_service::ApplyMode;
 
-    const MODES: [ApplyMode; 4] = [
+    const MODES: [ApplyMode; 3] = [
         ApplyMode::Automatic,
         ApplyMode::AutomaticPastGrace,
         ApplyMode::Immediate,
-        ApplyMode::CleanQuit,
     ];
     const PHASES: [ApplyPhase; 4] = [
         ApplyPhase::PreferIdle,
@@ -8756,20 +9529,19 @@ mod park_gate_tests {
                 "{mode:?} holds for the user's warm-up even at the bound"
             );
         }
-        for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
-            let facts = ParkGateFacts {
-                activity: ActivityFacts {
-                    hands_off_keys: false,
-                    ..calm(mode, ApplyPhase::PreferIdle).activity
-                },
-                ..calm(mode, ApplyPhase::PreferIdle)
-            };
-            assert_eq!(
-                gate(facts),
-                ParkGate::Park,
-                "{mode:?}: the person asked for this pause"
-            );
-        }
+        let mode = ApplyMode::Immediate;
+        let facts = ParkGateFacts {
+            activity: ActivityFacts {
+                hands_off_keys: false,
+                ..calm(mode, ApplyPhase::PreferIdle).activity
+            },
+            ..calm(mode, ApplyPhase::PreferIdle)
+        };
+        assert_eq!(
+            gate(facts),
+            ParkGate::Park,
+            "{mode:?}: the person asked for this pause"
+        );
     }
 
     /// THE MACHINE THIS LADDER EXISTS FOR: an agent streaming into a focused
@@ -8852,16 +9624,15 @@ mod park_gate_tests {
                 ParkGate::Park
             );
         }
-        for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
-            assert_eq!(prelaunch_hold_cap(mode), None);
-            assert_eq!(
-                gate(ParkGateFacts {
-                    held_for: PRELAUNCH_HOLD_MAX * 10,
-                    ..calm(mode, ApplyPhase::PreferIdle)
-                }),
-                ParkGate::Park
-            );
-        }
+        let mode = ApplyMode::Immediate;
+        assert_eq!(prelaunch_hold_cap(mode), None);
+        assert_eq!(
+            gate(ParkGateFacts {
+                held_for: PRELAUNCH_HOLD_MAX * 10,
+                ..calm(mode, ApplyPhase::PreferIdle)
+            }),
+            ParkGate::Park
+        );
     }
 
     /// WHAT A RE-PARK BUYS. A park that missed its 20 ms budget re-parks on the
@@ -8880,12 +9651,13 @@ mod park_gate_tests {
     #[test]
     fn a_park_miss_buys_the_ladders_next_rung_without_a_relaunch() {
         use super::{
-            PRELAUNCH_MAX_PARK_MISSES, PRELAUNCH_REPARK_DELAY, ParkMissDisposition,
+            FreezeSeed, PRELAUNCH_MAX_PARK_MISSES, PRELAUNCH_REPARK_DELAY, ParkMissDisposition,
             handoff_freeze_budget, park_miss_disposition,
         };
         use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
 
-        let rung = |misses: u8| handoff_freeze_budget(ApplyMode::Automatic, misses);
+        let rung =
+            |misses: u8| handoff_freeze_budget(ApplyMode::Automatic, misses, FreezeSeed::Default);
         assert_eq!(rung(0), std::time::Duration::from_millis(20));
         assert_eq!(rung(1), std::time::Duration::from_millis(80));
         assert_eq!(rung(2), std::time::Duration::from_millis(250));
@@ -8942,11 +9714,15 @@ mod park_gate_tests {
         // A prior physical failure of the same bytes still compounds: an attempt
         // that already failed once starts one rung wider and saturates at 250 ms.
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::Automatic, 1 + 1),
+            handoff_freeze_budget(ApplyMode::Automatic, 1 + 1, FreezeSeed::Default),
             std::time::Duration::from_millis(250)
         );
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::Automatic, 1 + PRELAUNCH_MAX_PARK_MISSES),
+            handoff_freeze_budget(
+                ApplyMode::Automatic,
+                1 + PRELAUNCH_MAX_PARK_MISSES,
+                FreezeSeed::Default
+            ),
             std::time::Duration::from_millis(250)
         );
         assert!(
@@ -8984,16 +9760,15 @@ mod park_gate_tests {
                 }
             }
         }
-        for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
-            assert_eq!(
-                gate(ParkGateFacts {
-                    masters_alive: false,
-                    ..calm(mode, ApplyPhase::PreferIdle)
-                }),
-                ParkGate::Park,
-                "{mode:?}: the person asked; Commit's own liveness check answers them"
-            );
-        }
+        let mode = ApplyMode::Immediate;
+        assert_eq!(
+            gate(ParkGateFacts {
+                masters_alive: false,
+                ..calm(mode, ApplyPhase::PreferIdle)
+            }),
+            ParkGate::Park,
+            "{mode:?}: the person asked; Commit's own liveness check answers them"
+        );
     }
 
     /// Bytes waiting on a master that its reader has not taken hold every
@@ -9067,7 +9842,7 @@ mod handed_set_and_mid_sequence_tests {
     use super::{
         CaptureFailure, ParkAttempt, ParkGate, ParkGateFacts, classify_capture_failure,
         handed_sessions_only, handoff_masters_closed, handoff_masters_have_activity,
-        hold_cap_stand_down_detail, prelaunch_hold_cap, prelaunch_park_admitted,
+        hold_cap_stand_down_detail, prelaunch_hold_cap, prelaunch_park_admitted, stamp_fg_holders,
     };
     use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase};
     use crate::native_updater_service::ApplyMode;
@@ -9299,6 +10074,89 @@ mod handed_set_and_mid_sequence_tests {
         aterm_pty::close_fd(exited_master);
     }
 
+    /// THE FOREGROUND HOLDER CROSSES AT THE REPAINT RUNG (the 2026-09-25
+    /// foreground handback review). A session whose screen the park carries
+    /// blank goes without the control carry, yet the successor restores its
+    /// modes. The first cut carried the holder only in that control carry, so
+    /// such a session reached the adopting reader with holder `0`, the reader
+    /// probed the reclaimed shell, and a job that died during the handoff kept
+    /// its alt screen and mouse under the prompt. The park capture now reads
+    /// every handed session's holder, whatever its rung, and the lanes stamp
+    /// it on the manifest record.
+    ///
+    /// RED on the reviewed design: the capture had no `fg_holders`, and the
+    /// holder rode `carries`, which is empty here.
+    #[test]
+    fn a_repaint_rung_session_still_carries_its_foreground_holder() {
+        let mut app = crate::App::headless_for_test();
+        // Eight one-cell OSC 8 links of 8 KiB each in an 80-column pane: a line
+        // record past the wire's cap at any history depth, carried blank
+        // (the ladder tests' `link_dense`).
+        let mut dense = Vec::new();
+        for link in 0..8 {
+            let mut url = format!("https://example.test/{link}/");
+            url.push_str(&"u".repeat(8192 - url.len()));
+            dense.extend_from_slice(format!("\x1b]8;;{url}\x1b\\L\x1b]8;;\x1b\\ ").as_bytes());
+        }
+        let session = app.pool.get(0).expect("session 0");
+        *crate::term_lock(&session.term) = aterm_core::terminal::Terminal::new(24, 80);
+        crate::term_lock(&session.term).process(&dense);
+        session
+            .fg_holder
+            .store(4242, std::sync::atomic::Ordering::Release);
+
+        let live = app.handoff_live_sessions();
+        let window = std::time::Duration::from_secs(30);
+        let parked = app
+            .capture_parked_screens(
+                &live,
+                std::time::Instant::now() + window,
+                window.as_millis(),
+                window / 2,
+                crate::seamless::WireCaps::current(),
+            )
+            .unwrap_or_else(|failure| panic!("the desk parks: {failure}"));
+        assert_eq!(parked.repaint, vec![0], "carried blank");
+        assert!(
+            parked.carries.is_empty(),
+            "a blank carry goes without the control carry"
+        );
+        assert_eq!(
+            parked.fg_holders,
+            vec![(0, 4242)],
+            "but its foreground holder is read all the same"
+        );
+
+        let manifest = stamp_fg_holders(
+            handed_sessions_only(
+                crate::session_store::SessionHandoff::from_store(
+                    &app.store
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
+                &live,
+            ),
+            &parked.fg_holders,
+        );
+        assert_eq!(manifest.sessions.len(), 1);
+        assert_eq!(
+            manifest.sessions[0].fg_holder,
+            Some(4242),
+            "and rides the manifest record"
+        );
+        let wire = manifest.to_toml().expect("serialize");
+        let read =
+            crate::session_store::SessionHandoff::from_toml(&wire).expect("parse the manifest");
+        assert_eq!(read.sessions[0].fg_holder, Some(4242), "round trip");
+
+        // A holder that is no pgid (nothing seen yet) is not written.
+        let none = stamp_fg_holders(manifest.clone(), &[(0, 0)]);
+        assert_eq!(none.sessions[0].fg_holder, None);
+        assert!(!none.to_toml().expect("serialize").contains("fg_holder"));
+        let absent = stamp_fg_holders(manifest, &[(7, 4242)]);
+        assert_eq!(absent.sessions[0].fg_holder, None, "another session's");
+    }
+
     /// A hold-cap stand-down says what held the park — the ledger used to read
     /// "the terminal never offered a moment to pause in" for an exited pane's
     /// master, blaming the user.
@@ -9324,7 +10182,7 @@ mod handed_set_and_mid_sequence_tests {
 
 #[cfg(test)]
 mod freeze_budget_tests {
-    use super::handoff_freeze_budget;
+    use super::{FreezeSeed, handoff_freeze_budget};
     use crate::native_updater_service::ApplyMode;
     use std::time::Duration;
 
@@ -9334,41 +10192,598 @@ mod freeze_budget_tests {
     #[test]
     fn freeze_budget_widens_on_retries_and_for_an_explicit_apply() {
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::Automatic, 0),
+            handoff_freeze_budget(ApplyMode::Automatic, 0, FreezeSeed::Default),
             Duration::from_millis(20)
         );
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::AutomaticPastGrace, 0),
+            handoff_freeze_budget(ApplyMode::AutomaticPastGrace, 0, FreezeSeed::Default),
             Duration::from_millis(20)
         );
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::Automatic, 1),
+            handoff_freeze_budget(ApplyMode::Automatic, 1, FreezeSeed::Default),
             Duration::from_millis(80)
         );
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::Automatic, 2),
+            handoff_freeze_budget(ApplyMode::Automatic, 2, FreezeSeed::Default),
             Duration::from_millis(250)
         );
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::AutomaticPastGrace, 7),
+            handoff_freeze_budget(ApplyMode::AutomaticPastGrace, 7, FreezeSeed::Default),
             Duration::from_millis(250)
         );
         assert_eq!(
-            handoff_freeze_budget(ApplyMode::Immediate, 0),
-            Duration::from_millis(250)
-        );
-        assert_eq!(
-            handoff_freeze_budget(ApplyMode::CleanQuit, 0),
+            handoff_freeze_budget(ApplyMode::Immediate, 0, FreezeSeed::Default),
             Duration::from_millis(250)
         );
         let mut last = Duration::ZERO;
         for prior in 0..=u8::MAX {
-            let now = handoff_freeze_budget(ApplyMode::Automatic, prior);
+            let now = handoff_freeze_budget(ApplyMode::Automatic, prior, FreezeSeed::Default);
             assert!(
                 now >= last,
                 "the ladder must be monotone: {prior} prior failures gave {now:?} after {last:?}"
             );
             last = now;
+        }
+    }
+
+    /// RUNG 0 IS SEEDED FROM A TIMED CAPTURE (gap #25): `clamp(1.5 × capture,
+    /// 20 ms, 80 ms)`. A desk that captures in 22 ms — what 0.91's park took on
+    /// the owner's desk once it had the room — gets 33 ms at once instead of
+    /// missing 20 ms, re-parking half a second later and parking again. Nothing
+    /// measured, or a measurement under 14 ms, is the 20 ms it always was.
+    #[test]
+    fn rung_zero_is_seeded_from_the_timed_capture_within_its_clamp() {
+        use super::{FREEZE_RUNG0_CEILING, FREEZE_RUNG0_FLOOR, freeze_rung0_from_capture};
+        let ms = Duration::from_millis;
+        for (capture, rung0) in [
+            (0, 20),
+            (12, 20),
+            (14, 21),
+            (20, 30),
+            (22, 33),
+            (40, 60),
+            (52, 78),
+            (54, 80),
+            (100, 80),
+        ] {
+            assert_eq!(
+                freeze_rung0_from_capture(ms(capture)),
+                ms(rung0),
+                "a {capture} ms capture"
+            );
+        }
+        assert_eq!(
+            freeze_rung0_from_capture(Duration::MAX),
+            FREEZE_RUNG0_CEILING,
+            "an absurd reading saturates, never wraps"
+        );
+        let seed = FreezeSeed::DryRun {
+            capture: ms(22),
+            sessions: 2,
+            last_park: None,
+        };
+        for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+            assert_eq!(handoff_freeze_budget(mode, 0, seed), ms(33), "{mode:?}");
+            assert_eq!(handoff_freeze_budget(mode, 1, seed), ms(80), "{mode:?}");
+            assert_eq!(handoff_freeze_budget(mode, 2, seed), ms(250), "{mode:?}");
+        }
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::Immediate, 0, seed),
+            ms(250),
+            "an explicit apply's window is the widest whatever rung 0 is"
+        );
+        assert_eq!(FreezeSeed::Default.rung0(), FREEZE_RUNG0_FLOOR);
+    }
+
+    /// WHATEVER THE SEED, THE LADDER STAYS A LADDER: every rung strictly wider
+    /// than the one before (a re-park never buys the same window twice), rung 0
+    /// inside its clamp, rung 1 never under the 80 ms it always was, the top a
+    /// quarter second.
+    #[test]
+    fn every_seed_keeps_the_ladder_strictly_wider_rung_over_rung() {
+        use super::{FREEZE_RUNG0_CEILING, FREEZE_RUNG0_FLOOR};
+        for capture_ms in 0..=200 {
+            let seed = FreezeSeed::Ledger {
+                capture: Duration::from_millis(capture_ms),
+                build: 1,
+            };
+            let rung = |prior| handoff_freeze_budget(ApplyMode::Automatic, prior, seed);
+            assert!(
+                (FREEZE_RUNG0_FLOOR..=FREEZE_RUNG0_CEILING).contains(&rung(0)),
+                "{capture_ms} ms: rung 0 {:?}",
+                rung(0)
+            );
+            assert!(
+                rung(0) < rung(1) && rung(1) < rung(2),
+                "{capture_ms} ms: {:?} {:?} {:?}",
+                rung(0),
+                rung(1),
+                rung(2)
+            );
+            assert!(rung(1) >= Duration::from_millis(80), "{capture_ms} ms");
+            assert_eq!(rung(2), Duration::from_millis(250), "{capture_ms} ms");
+        }
+    }
+
+    /// The ledger's record is a PRIOR: no record is the default, a record seeds
+    /// rung 0 from its capture and names the build that took it.
+    #[test]
+    fn the_ledgers_last_timed_capture_seeds_a_lane_that_times_none() {
+        assert_eq!(FreezeSeed::from_prior(None), FreezeSeed::Default);
+        let record = aterm_update::HandoffCaptureRecord {
+            capture_us: 22_000,
+            sessions: 2,
+            freeze_seed_ms: 33,
+            build: 1_790_278_596,
+            at: "2026-09-26T00:00:00Z".to_string(),
+            park_us: 0,
+            park_build: 0,
+        };
+        let seed = FreezeSeed::from_prior(Some(&record));
+        assert_eq!(
+            seed,
+            FreezeSeed::Ledger {
+                capture: Duration::from_millis(22),
+                build: 1_790_278_596
+            }
+        );
+        assert_eq!(seed.rung0(), Duration::from_millis(33));
+        assert_eq!(FreezeSeed::last_park_of(Some(&record)), None);
+        let said = seed.to_string();
+        assert!(
+            said.contains("22.0 ms") && said.contains("1790278596"),
+            "the log line names the number and the build it came from: {said}"
+        );
+        // Neither measured: the default, not a zero-millisecond "measurement".
+        let empty = aterm_update::HandoffCaptureRecord::default();
+        assert_eq!(FreezeSeed::from_prior(Some(&empty)), FreezeSeed::Default);
+    }
+
+    /// THE PARK THE DRY RUN CANNOT TIME. The capture itself is about a
+    /// millisecond on the owner's two-session desk (1.1 ms measured at
+    /// opt-level 3), while 0.91's and 0.92's parks took 22 and 20 ms: most of
+    /// the freeze is stopping the readers, which only a real park measures. So
+    /// a landed park's cost is kept, and rung 0 is never budgeted below it —
+    /// from the ledger alone (the fork lane) or beside this attempt's dry run.
+    #[test]
+    fn a_landed_parks_cost_is_the_floor_the_dry_run_cannot_see() {
+        let ms = Duration::from_millis;
+        let beside = |capture, last_park| FreezeSeed::DryRun {
+            capture,
+            sessions: 2,
+            last_park,
+        };
+        assert_eq!(beside(ms(1), None).rung0(), ms(20), "the capture alone");
+        assert_eq!(
+            beside(ms(1), Some(ms(22))).rung0(),
+            ms(33),
+            "0.91's landed park: the next first rung fits it"
+        );
+        assert_eq!(
+            beside(ms(40), Some(ms(22))).rung0(),
+            ms(60),
+            "whichever is larger"
+        );
+        let record = aterm_update::HandoffCaptureRecord {
+            capture_us: 1_100,
+            sessions: 2,
+            freeze_seed_ms: 20,
+            build: 8,
+            at: String::new(),
+            park_us: 22_000,
+            park_build: 9,
+        };
+        assert_eq!(
+            FreezeSeed::from_prior(Some(&record)),
+            FreezeSeed::Ledger {
+                capture: ms(22),
+                build: 9
+            },
+            "the ledger seeds from the larger, named by the build that recorded it"
+        );
+        assert_eq!(FreezeSeed::last_park_of(Some(&record)), Some(ms(22)));
+        let said = beside(ms(1), Some(ms(22))).to_string();
+        assert!(said.contains("22.0 ms"), "{said}");
+        let alone = beside(ms(1), None).to_string();
+        assert!(alone.contains("no landed park"), "{alone}");
+    }
+}
+
+/// The dry run of the park's capture (gap #25), over the shipping capture and
+/// the shipping handed set: what it measures, what it saturates on, what it
+/// cannot measure — and that it parks nothing.
+#[cfg(all(test, unix))]
+mod dry_run_capture_tests {
+    use super::{DRY_RUN_CAPTURE_WINDOW, DryRunCapture, FREEZE_RUNG0_CEILING, FreezeSeed};
+    use crate::native_updater_service::ApplyMode;
+    use std::time::Duration;
+
+    fn caps() -> crate::seamless::WireCaps {
+        crate::seamless::WireCaps::current()
+    }
+
+    /// A desk with history to carry, through the real parser.
+    fn desk_with_history(
+        app: &crate::App,
+    ) -> std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>> {
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let mut terminal = crate::term_lock(&term);
+        for n in 0..400 {
+            terminal.process(format!("line {n}: the history a capture carries\r\n").as_bytes());
+        }
+        drop(terminal);
+        term
+    }
+
+    /// THE DRY RUN TIMES THE PARK'S OWN CAPTURE AND PARKS NOTHING. The reader
+    /// a park would stop is still attached, no attempt record exists, the
+    /// engine is free again and unchanged — and the measurement is over every
+    /// handed session.
+    #[test]
+    fn a_dry_run_times_the_parks_own_capture_and_parks_nothing() {
+        let mut app = crate::App::headless_for_test();
+        let term = desk_with_history(&app);
+        let (scrollback, cursor) = {
+            let terminal = crate::term_lock(&term);
+            (terminal.grid().scrollback_lines(), terminal.cursor())
+        };
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .reader_join = Some(std::thread::spawn(|| {}));
+        let handed = app.handoff_live_sessions().len();
+
+        let dry = app.dry_run_handoff_capture(caps());
+        let (DryRunCapture::Measured { took, sessions }
+        | DryRunCapture::AtLeast { took, sessions }) = dry
+        else {
+            panic!("a quiet desk at parser ground is measured: {dry:?}");
+        };
+        assert_eq!(sessions, handed, "every handed session was captured");
+        assert!(took > Duration::ZERO);
+
+        assert!(
+            app.pool.sessions[&0].session.reader_join.is_some(),
+            "no reader was parked (`park_reader` takes this handle)"
+        );
+        assert!(app.pending_update_handoff.is_none() && app.update_handoff_prelaunch.is_none());
+        let terminal = term.try_lock().expect("the engine is free again");
+        assert_eq!(terminal.grid().scrollback_lines(), scrollback);
+        assert_eq!(terminal.cursor(), cursor, "and read, not written");
+    }
+
+    /// A DRY RUN THAT RUNS OUT OF ITS WINDOW SATURATES THE RUNG. An engine lock
+    /// held for the whole window — here by this thread, which is what a reader
+    /// slice longer than the window would do — ends it as `EngineBusy` at the
+    /// window's end, and 1.5 × the window is the ceiling: a desk that cannot be
+    /// timed inside 53 ms gets the 80 ms rung 0, never the 20 ms it would miss.
+    #[test]
+    fn a_dry_run_that_runs_out_of_its_window_saturates_the_first_rung() {
+        let mut app = crate::App::headless_for_test();
+        let term = desk_with_history(&app);
+        let held = crate::term_lock(&term);
+        let dry = app.dry_run_handoff_capture(caps());
+        drop(held);
+        let DryRunCapture::AtLeast { took, sessions } = dry else {
+            panic!("an engine held for the whole window is not measured: {dry:?}");
+        };
+        assert!(took >= DRY_RUN_CAPTURE_WINDOW, "{took:?}");
+        assert_eq!(sessions, app.handoff_live_sessions().len());
+        assert_eq!(
+            FreezeSeed::DryRun {
+                capture: took,
+                sessions,
+                last_park: None,
+            }
+            .rung0(),
+            FREEZE_RUNG0_CEILING
+        );
+    }
+
+    /// THE SEED, END TO END, over the shipping ledger writers: an automatic
+    /// attempt's measured dry run seeds rung 0 — never below the last park that
+    /// landed — and is kept in the ledger for the next update (read back once
+    /// the writer has finished); an explicit apply spends no dry run; and a dry
+    /// run that measured nothing — a parser mid-sequence over live output —
+    /// falls back to that ledger record.
+    #[test]
+    fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = crate::App::headless_for_test();
+        let term = desk_with_history(&app);
+
+        let (seed, kept) = app.seed_first_freeze_rung(ApplyMode::Immediate, caps());
+        assert_eq!(
+            seed,
+            FreezeSeed::Default,
+            "an explicit apply spends no dry run"
+        );
+        assert!(kept.is_none());
+
+        // A park that LANDED earlier in 30 ms: the part of the freeze the dry
+        // run cannot time. The rung is never budgeted below it.
+        super::keep_landed_park(Duration::from_millis(30))
+            .expect("the park cost is kept")
+            .join()
+            .expect("the ledger writer finished");
+        let (seed, kept) = app.seed_first_freeze_rung(ApplyMode::Automatic, caps());
+        let FreezeSeed::DryRun {
+            capture,
+            sessions,
+            last_park,
+        } = seed
+        else {
+            panic!("a quiet desk seeds from its own dry run: {seed:?}");
+        };
+        assert_eq!(sessions, app.handoff_live_sessions().len());
+        assert_eq!(
+            seed.rung0(),
+            super::freeze_rung0_from_capture(capture.max(last_park.unwrap_or_default()))
+        );
+        kept.expect("the measurement is kept")
+            .join()
+            .expect("the ledger writer finished");
+        let prior = aterm_update::handoff_capture_prior();
+        if cfg!(target_os = "macos") {
+            assert_eq!(last_park, Some(Duration::from_millis(30)));
+            assert!(
+                seed.rung0() >= Duration::from_millis(45),
+                "a 30 ms landed park buys at least 45 ms: {seed}"
+            );
+            let prior = prior.expect("the ledger holds the measurement");
+            assert_eq!(
+                prior.capture_us,
+                u64::try_from(capture.as_micros()).expect("fits").max(1)
+            );
+            assert_eq!(
+                u128::from(prior.freeze_seed_ms),
+                seed.rung0().as_millis(),
+                "and the rung it seeded"
+            );
+            assert_eq!(prior.build, crate::running_build_number());
+            assert_eq!(
+                (prior.park_us, prior.park_build),
+                (30_000, crate::running_build_number())
+            );
+        } else {
+            assert_eq!(last_park, None, "only macOS keeps an apply-lane ledger");
+            assert!(prior.is_none(), "only macOS keeps an apply-lane ledger");
+        }
+
+        // The parser parks mid-sequence with the rest of the sequence queued:
+        // the dry run cannot say how long a capture takes.
+        let (mut master, mut slave) = (-1i32, -1i32);
+        // SAFETY: openpty(3) into two valid out-slots; no termios/winsize.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .master = master;
+        crate::term_lock(&term).process(b"\x1b[38;5;19");
+        // SAFETY: a bounded write of a live slice to a test-owned descriptor.
+        let wrote = unsafe { libc::write(slave, b"6m".as_ptr().cast(), 2) };
+        assert_eq!(wrote, 2);
+        assert!(matches!(
+            app.dry_run_handoff_capture(caps()),
+            DryRunCapture::Unmeasured(_)
+        ));
+        let (fallback, kept) = app.seed_first_freeze_rung(ApplyMode::Automatic, caps());
+        assert!(kept.is_none(), "nothing measured, nothing kept");
+        assert_eq!(
+            fallback,
+            FreezeSeed::from_prior(aterm_update::handoff_capture_prior().as_ref())
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                fallback.rung0(),
+                seed.rung0(),
+                "the fallback is the measurement the ledger kept"
+            );
+        }
+        // SAFETY: closing the two test-owned descriptors exactly once.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .master = -1;
+    }
+
+    /// THE PARK READS THE SEED ITS ATTEMPT CARRIES: the launched lane's budget
+    /// for its next park is rung 0 = the dry run's seed, then the ladder's next
+    /// rungs as the attempt's own misses climb it.
+    #[test]
+    fn the_launched_lanes_park_budget_is_its_attempts_seeded_ladder() {
+        let mut app = crate::App::headless_for_test();
+        assert!(app.prelaunched_park_budget().is_none());
+        let seed = FreezeSeed::DryRun {
+            capture: Duration::from_millis(30),
+            sessions: 1,
+            last_park: None,
+        };
+        let (record, _transferred) = prelaunched(1, ApplyMode::Automatic, seed);
+        app.update_handoff_prelaunch = Some(record);
+        for (misses, budget_ms) in [(0_u8, 45_u64), (1, 90), (2, 250)] {
+            app.update_handoff_prelaunch
+                .as_mut()
+                .expect("prelaunched")
+                .park_misses = misses;
+            assert_eq!(
+                app.prelaunched_park_budget(),
+                Some((misses, Duration::from_millis(budget_ms), seed)),
+                "miss {misses}"
+            );
+        }
+    }
+
+    /// A prelaunched attempt as `prelaunch_out_of_band_handoff` records it,
+    /// carrying `freeze_seed`, and the receiver its park sends the capture to.
+    fn prelaunched(
+        attempt_id: u64,
+        mode: ApplyMode,
+        freeze_seed: FreezeSeed,
+    ) -> (
+        crate::HandoffPrelaunch,
+        std::sync::mpsc::Receiver<super::HandoffTransferJob>,
+    ) {
+        let (transfer, transferred) = std::sync::mpsc::sync_channel(1);
+        let record = crate::HandoffPrelaunch {
+            attempt_id,
+            nonce: "0123456789abcdef0123456789abcdef".to_string(),
+            mode,
+            apply_attempt: None,
+            same_image: Some(super::SameImageHandoff::DebugSeam),
+            target_build: 7,
+            target_commit: String::new(),
+            cancel: std::sync::mpsc::sync_channel(1).0,
+            stand_down: std::sync::mpsc::sync_channel(1).0,
+            stand_down_ack: std::sync::mpsc::sync_channel(1).0,
+            transfer,
+            arbiter: crate::HandoffAttemptArbiter::new(),
+            launched_at: std::time::Instant::now(),
+            dialled: None,
+            park_retry_at: None,
+            park_misses: 0,
+            freeze_seed,
+            land_waits: 0,
+            last_wait: None,
+            stood_down: false,
+            teardown: crate::DeferredHandoffTeardown::None,
+            revoked_by_activity: false,
+            history_export: None,
+        };
+        (record, transferred)
+    }
+
+    /// THE SEED LANDS ON THE ATTEMPT ITS PARKS READ: seeding a prelaunched
+    /// attempt stores what it bought on that attempt, so the park's budget is
+    /// the seeded ladder and not the 20 ms default the record was born with.
+    #[test]
+    fn seeding_stores_the_first_rung_on_the_prelaunched_attempt() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = crate::App::headless_for_test();
+        let _term = desk_with_history(&app);
+        let (record, _transferred) = prelaunched(2, ApplyMode::Automatic, FreezeSeed::Default);
+        app.update_handoff_prelaunch = Some(record);
+        let (seed, kept) = app.seed_first_freeze_rung(ApplyMode::Automatic, caps());
+        if let Some(writer) = kept {
+            writer.join().expect("the ledger writer finished");
+        }
+        assert!(
+            matches!(seed, FreezeSeed::DryRun { .. }),
+            "a quiet desk seeds from its own dry run: {seed:?}"
+        );
+        assert_eq!(
+            app.prelaunched_park_budget(),
+            Some((0, seed.rung0(), seed)),
+            "the park reads the seed the attempt was given"
+        );
+    }
+
+    /// A PARK THAT LANDS KEEPS ITS COST (gap #25). The launched lane's real
+    /// park — through the shipping park cue, over a real PTY — writes what it
+    /// cost into the ledger's landed-park slot: the floor the next update's
+    /// first rung is budgeted from, and the one input that covers the readers'
+    /// stop the dry run cannot time. The slot is written by nothing else, so
+    /// this fails if the park stops keeping it.
+    #[test]
+    fn a_landed_park_keeps_its_cost_for_the_next_updates_first_rung() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        // A sentinel no real park costs, written and joined first: the wait
+        // below is for THIS park's write, not an earlier one.
+        super::keep_landed_park(Duration::from_micros(1))
+            .expect("the sentinel is kept")
+            .join()
+            .expect("the ledger writer finished");
+        let mut app = crate::App::headless_for_test();
+        let (mut master, mut slave) = (-1i32, -1i32);
+        // SAFETY: openpty(3) into two valid out-slots; no termios/winsize.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .master = master;
+        let (record, transferred) = prelaunched(3, ApplyMode::Immediate, FreezeSeed::Default);
+        app.update_handoff_prelaunch = Some(record);
+
+        app.on_update_handoff_awaiting_park(3, Some(4242));
+        let transfer = transferred
+            .try_recv()
+            .expect("the park landed and handed its capture over");
+        assert!(
+            app.pending_update_handoff.is_some(),
+            "the attempt is parked"
+        );
+        if cfg!(target_os = "macos") {
+            // The writer runs detached (the park never waits on the ledger's
+            // file lock): wait for its write, the causal event, bounded only
+            // so a park that never keeps its cost fails instead of hanging.
+            let patience = std::time::Instant::now() + Duration::from_secs(10);
+            let kept = loop {
+                let prior = aterm_update::handoff_capture_prior().expect("the sentinel is held");
+                if prior.park_us != 1 {
+                    break prior;
+                }
+                assert!(
+                    std::time::Instant::now() < patience,
+                    "the landed park's cost never reached the ledger"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert!(
+                kept.park_us > 1 && kept.park_us < 250_000,
+                "a park that landed inside its 250 ms rung: {kept:?}"
+            );
+            assert_eq!(kept.park_build, crate::running_build_number());
+        } else {
+            assert!(
+                aterm_update::handoff_capture_prior().is_none(),
+                "only macOS keeps an apply-lane ledger"
+            );
+        }
+
+        // The capture's descriptors are duplicates it owns; the session's are
+        // the test's, closed once, here.
+        drop(transfer);
+        app.pending_update_handoff = None;
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .master = -1;
+        // SAFETY: closing the two test-owned descriptors exactly once.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
         }
     }
 }
@@ -9588,6 +11003,7 @@ mod commit_layout_topology_tests {
             outer_x: position.map(|(x, _)| x),
             outer_y: position.map(|(_, y)| y),
             maximized: None,
+            show: crate::restore::WindowShow::UNKNOWN,
             tabs: vec![PaneLayout::Leaf {
                 cwd: cwd.map(str::to_string),
                 title: title.to_string(),
@@ -9608,6 +11024,7 @@ mod commit_layout_topology_tests {
                     icon: None,
                     role: None,
                     attention: None,
+                    questions: None,
                     identity: None,
                 })),
                 focused_path: Vec::new(),
@@ -9630,6 +11047,65 @@ mod commit_layout_topology_tests {
             commit_layout_topology(&dragged),
             "a drag during the child's boot must not be reported as changed topology; \
              `WindowEvent::Moved` is classified Tolerated for this very reason"
+        );
+    }
+
+    /// Gap #29: the macOS show state is LIVE, like the position. Entering full
+    /// screen, minimizing, or clicking another window while the successor boots
+    /// changes every one of its fields, and none of them may reject the Commit
+    /// — nor, on the other side, hide a real topology change riding with them.
+    #[test]
+    fn a_show_state_change_while_the_successor_boots_is_not_a_topology_change() {
+        use crate::restore::WindowShow;
+        let shown = |show: WindowShow| {
+            let mut layout = captured(Some((120, 80)), Some("/work"), "zsh");
+            layout.windows[0].show = show;
+            layout
+        };
+        let committed = shown(WindowShow {
+            fullscreen: Some(false),
+            minimized: Some(false),
+            z_order: Some(0),
+            key: Some(true),
+        });
+        let changes = [
+            WindowShow {
+                fullscreen: Some(true),
+                ..committed.windows[0].show
+            },
+            WindowShow {
+                minimized: Some(true),
+                ..committed.windows[0].show
+            },
+            WindowShow {
+                z_order: Some(1),
+                key: Some(false),
+                ..committed.windows[0].show
+            },
+            // A parent that captured nothing (headless, or before the field).
+            WindowShow::UNKNOWN,
+        ];
+        for changed in changes {
+            let live = shown(changed);
+            assert_ne!(
+                committed, live,
+                "PRECONDITION: the derived PartialEq sees the show-state difference {changed:?}"
+            );
+            assert_eq!(
+                commit_layout_topology(&committed),
+                commit_layout_topology(&live),
+                "a show-state change ({changed:?}) is not topology and must not reject Commit"
+            );
+        }
+        let mut resized = shown(WindowShow {
+            fullscreen: Some(true),
+            ..committed.windows[0].show
+        });
+        resized.windows[0].cols = 200;
+        assert_ne!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&resized),
+            "the normalization is of the show state alone: a re-grid riding with it rejects"
         );
     }
 
@@ -9676,6 +11152,7 @@ mod commit_layout_topology_tests {
                 icon: None,
                 role: None,
                 attention: None,
+                questions: None,
                 identity: None,
             }));
         assert_ne!(
@@ -11189,6 +12666,13 @@ mod handoff_process_group_tests {
         assert!(buggy.fire("BuggyWaitBeforeGroupSignal", &mut old_order));
         assert!(!buggy.check_invariant("ProcessGroupSignalPrecedesDirectChildReap", &old_order,));
         assert_eq!(old_order["descendant_live"], 1);
+        // Negative control: a sweep whose signal reaches only the leader
+        // (`kill(pid)` where `kill(-pgid)` was meant) leaves exactly this
+        // descendant running — the one the real sweep below must kill.
+        let mut leader_only = model_state.clone();
+        assert!(buggy.fire("BuggySignalLeaderOnly", &mut leader_only));
+        assert_eq!(leader_only["group_signaled"], 1);
+        assert!(!buggy.check_invariant("GroupSignalEliminatesLiveDescendants", &leader_only));
 
         let candidate = HandoffCandidate::of_unreaped_child(&child);
         let mut handle = HandoffCandidateHandle::Forked(child);
@@ -11691,6 +13175,18 @@ mod returned_handoff_completion_lane_tests {
         build
     }
 
+    /// Whether a latch deadline is a STRUCTURAL verdict's one re-sample, a day
+    /// out (gap 14, 2026-09-26) — the shape a structural convergence takes now
+    /// that it is no longer `retry_at: None`. Named by the schedule it came
+    /// from, not to the second: these are real `Instant`s.
+    fn is_structural_resample(retry_at: Option<std::time::Instant>) -> bool {
+        retry_at.is_some_and(|at| {
+            let wait = at.saturating_duration_since(std::time::Instant::now());
+            wait > crate::app_native::STRUCTURAL_RESAMPLE_AFTER - std::time::Duration::from_secs(60)
+                && wait <= crate::app_native::STRUCTURAL_RESAMPLE_AFTER
+        })
+    }
+
     /// Drive ONE returned handoff for `mode` end to end through the production
     /// reducer: an authorized attempt is pending, the worker reports `outcome`
     /// against the artifact `digest` names, and the reducer decides what that
@@ -11931,9 +13427,9 @@ mod returned_handoff_completion_lane_tests {
                 .retry_at
         };
 
-        // AdoptionMismatch, twice: a confirmation and then the end of the lane for
-        // those bytes. `retry_at: None` is what `arm` reads as `SuppressManualOnly`
-        // until a strictly newer build ships.
+        // AdoptionMismatch, twice: a confirmation and then the end of the lane's
+        // schedule for those bytes — converged onto the ONE re-sample a day out
+        // (gap 14), which `arm` reads as `SuppressManualOnly` until it comes due.
         for _ in 0..2 {
             reduce_one_returned_failure(
                 &mut app,
@@ -11944,12 +13440,13 @@ mod returned_handoff_completion_lane_tests {
                 crate::ChildDeathEvidence::Unobserved,
             );
         }
-        assert_eq!(
-            deadline(&app),
-            None,
+        assert!(
+            is_structural_resample(deadline(&app)),
             "two proofs that these two images disagree is not a busy afternoon; \
-             the lane must be finished with the artifact, not scheduling a third \
-             park/spawn/paint round trip"
+             the lane must be finished with the artifact's schedule — its one \
+             re-sample a day out, not a third park/spawn/paint round trip inside \
+             the hour: {:?}",
+            deadline(&app)
         );
 
         // TimedOut, twice, same `App` and same build — different bytes, so a
@@ -12156,7 +13653,7 @@ mod returned_handoff_completion_lane_tests {
     /// `EMFILE` at the descriptor duplicate — leave the lane on the TRANSIENT
     /// schedule with a deadline to lapse at, where the same two filed as
     /// `PreparationFailed` (the control, and what they were until this change)
-    /// converge to the deadline-less latch after two.
+    /// converge after two, onto a structural verdict's one re-sample a day out.
     #[test]
     fn a_producer_failure_retries_where_a_preparation_failure_converges() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -12180,10 +13677,11 @@ mod returned_handoff_completion_lane_tests {
                 .auto_apply_manual_only
                 .expect("a physical failure latches for its schedule's spacing");
             assert_eq!(
-                latch.retry_at.is_none(),
+                is_structural_resample(latch.retry_at),
                 converges,
-                "{outcome:?}: converged={converges} after {} failures",
-                crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS
+                "{outcome:?}: converged={converges} after {} failures: {:?}",
+                crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS,
+                latch.retry_at
             );
         }
     }
@@ -12199,7 +13697,11 @@ mod returned_handoff_completion_lane_tests {
         let mut app = App::headless_for_test();
         let target = 4_242_u64;
         assert_eq!(
-            super::handoff_freeze_budget(ApplyMode::Automatic, app.fork_park_misses_of(target)),
+            super::handoff_freeze_budget(
+                ApplyMode::Automatic,
+                app.fork_park_misses_of(target),
+                super::FreezeSeed::Default,
+            ),
             std::time::Duration::from_millis(20)
         );
         for (misses, rung_ms) in [(1_u8, 80_u64), (2, 250), (3, 250)] {
@@ -12210,7 +13712,11 @@ mod returned_handoff_completion_lane_tests {
             );
             assert_eq!(app.fork_park_misses_of(target), misses);
             assert_eq!(
-                super::handoff_freeze_budget(ApplyMode::Automatic, app.fork_park_misses_of(target)),
+                super::handoff_freeze_budget(
+                    ApplyMode::Automatic,
+                    app.fork_park_misses_of(target),
+                    super::FreezeSeed::Default,
+                ),
                 std::time::Duration::from_millis(rung_ms)
             );
         }
@@ -12231,9 +13737,8 @@ mod returned_handoff_completion_lane_tests {
         for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
             assert!(miss.stops_routinely(mode), "{mode:?}: a timing miss");
         }
-        for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
-            assert!(!miss.stops_routinely(mode), "{mode:?}: a person asked");
-        }
+        let mode = ApplyMode::Immediate;
+        assert!(!miss.stops_routinely(mode), "{mode:?}: a person asked");
         let activity = crate::UpdateHandoffStartError::activity("typing");
         assert!(activity.stops_routinely(ApplyMode::Immediate));
         for other in [
@@ -12482,12 +13987,17 @@ mod returned_handoff_completion_lane_tests {
                 refused,
             );
         }
-        assert_eq!(
-            deadline(&app),
-            None,
+        assert!(
+            is_structural_resample(deadline(&app)),
             "twice told that this successor will not become our successor is not a \
-             busy afternoon: the lane is done with these bytes, and `retry_at: \
-             None` is what `arm` reads as SuppressManualOnly"
+             busy afternoon: the lane's schedule is done with these bytes, and only \
+             the verdict's ONE re-sample, a day out, is left: {:?}",
+            deadline(&app)
+        );
+        assert!(
+            app.auto_apply_structural_verdict
+                .is_some_and(|verdict| verdict.build == build),
+            "the convergence is recorded as a structural verdict"
         );
     }
 
@@ -12673,9 +14183,9 @@ mod returned_handoff_completion_lane_tests {
 /// This is the decision that says whether the user's next update produces a
 /// survivor with a launchd application job or another pid-1 orphan, and it is
 /// made from facts that are individually cheap and collectively easy to get
-/// wrong. Each test below is one field of [`HandoffLaneFacts`] flipped against
-/// an otherwise-eligible attempt, because a predicate that ignored a field would
-/// otherwise pass every test written against the happy path.
+/// wrong. Each row of the table below is one field of [`HandoffLaneFacts`]
+/// flipped against an otherwise-eligible attempt, because a predicate that
+/// ignored a field would otherwise pass every test written against the happy path.
 #[cfg(all(test, target_os = "macos"))]
 mod handoff_lane_tests {
     use super::{HandoffLaneFacts, app_bundle_root, launch_environment, out_of_band_lane_refusal};
@@ -12692,92 +14202,106 @@ mod handoff_lane_tests {
         }
     }
 
+    /// One field of [`HandoffLaneFacts`] flipped per row against an otherwise
+    /// eligible attempt, each with the refusal it must produce — the table form
+    /// of "a predicate that ignored a field would pass the happy path".
     #[test]
-    fn an_eligible_attempt_takes_the_out_of_band_lane() {
-        assert_eq!(out_of_band_lane_refusal(eligible()), None);
-    }
-
-    /// A dev build, `cargo run`, and the test harness all reach the seamless
-    /// lane; none of them is a bundle, and LaunchServices has nothing to start.
-    #[test]
-    fn an_unbundled_process_forks() {
-        let facts = HandoffLaneFacts {
-            bundled: false,
-            ..eligible()
-        };
-        assert!(out_of_band_lane_refusal(facts).is_some());
-    }
-
-    /// THE 16 BYTES. `$HOME` decides whether the rendezvous path fits
-    /// `sun_path`, so on some perfectly ordinary machines this lane simply does
-    /// not exist — and the fallback has to be silent and total rather than a
-    /// bind that fails after the terminal has parked.
-    #[test]
-    fn a_rendezvous_path_that_does_not_fit_forks() {
-        let facts = HandoffLaneFacts {
-            socket_path_fits: false,
-            ..eligible()
-        };
-        assert!(out_of_band_lane_refusal(facts).is_some());
-    }
-
-    /// THE DOWNGRADE GUARD the retired version advertisement carried. "Presence
-    /// of the transport IS the version" closes old-parent/new-child and says
-    /// NOTHING about new-parent/old-child — so an older authorized target must
-    /// fork, or a successor with no rendezvous code is handed descriptors it
-    /// cannot receive and every session is lost to a hang.
-    #[test]
-    fn an_older_authorized_target_forks() {
-        let facts = HandoffLaneFacts {
-            target_not_older: false,
-            ..eligible()
-        };
-        assert!(out_of_band_lane_refusal(facts).is_some());
-    }
-
-    /// The transport, not the protocol, bounds the pool: one `SCM_RIGHTS`
-    /// message carries 64 descriptors and two of them are the pipes.
-    #[test]
-    fn a_pool_too_wide_for_one_message_forks() {
+    fn each_fact_alone_decides_the_out_of_band_lane() {
         let limit = crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS;
-        assert_eq!(
-            out_of_band_lane_refusal(HandoffLaneFacts {
-                sessions: limit,
-                ..eligible()
-            }),
-            None,
-            "exactly the limit still fits"
-        );
-        assert!(
-            out_of_band_lane_refusal(HandoffLaneFacts {
-                sessions: limit + 1,
-                ..eligible()
-            })
-            .is_some(),
-            "one more does not, and must fall back rather than fail at sendmsg"
-        );
-        assert!(
-            out_of_band_lane_refusal(HandoffLaneFacts {
-                sessions: 0,
-                ..eligible()
-            })
-            .is_some(),
-            "an overlap with no sessions is not an overlap"
-        );
-    }
-
-    /// A LaunchServices launch MERGES its environment and cannot remove a
-    /// variable. `bind_expected_update_artifact` removes three, and a successor
-    /// that inherited a stale `ATERM_UPDATE_EXPECTED_*` would authenticate its
-    /// staged bundle against the wrong artifact — so a removal that would
-    /// actually remove something disqualifies the lane.
-    #[test]
-    fn an_environment_that_needs_a_removal_forks() {
-        let facts = HandoffLaneFacts {
-            environment_is_a_merge: false,
-            ..eligible()
-        };
-        assert!(out_of_band_lane_refusal(facts).is_some());
+        let rows: [(&str, HandoffLaneFacts, Option<&str>); 9] = [
+            // An attempt with nothing wrong with it takes the lane.
+            ("eligible", eligible(), None),
+            // A platform with no LaunchServices launcher has nothing to start.
+            (
+                "no launcher",
+                HandoffLaneFacts {
+                    launcher_available: false,
+                    ..eligible()
+                },
+                Some("this platform has no LaunchServices launcher"),
+            ),
+            // A dev build, `cargo run`, and the test harness all reach the
+            // seamless lane; none of them is a bundle, and LaunchServices has
+            // nothing to start.
+            (
+                "unbundled",
+                HandoffLaneFacts {
+                    bundled: false,
+                    ..eligible()
+                },
+                Some("this process does not run from a .app bundle"),
+            ),
+            // THE 16 BYTES. `$HOME` decides whether the rendezvous path fits
+            // `sun_path`, so on some perfectly ordinary machines this lane simply
+            // does not exist — and the fallback has to be silent and total rather
+            // than a bind that fails after the terminal has parked.
+            (
+                "rendezvous path too long",
+                HandoffLaneFacts {
+                    socket_path_fits: false,
+                    ..eligible()
+                },
+                Some("the rendezvous path does not fit sun_path on this machine"),
+            ),
+            // THE DOWNGRADE GUARD the retired version advertisement carried.
+            // "Presence of the transport IS the version" closes old-parent/new-
+            // child and says NOTHING about new-parent/old-child — so an older
+            // authorized target must fork, or a successor with no rendezvous code
+            // is handed descriptors it cannot receive and every session is lost.
+            (
+                "older target",
+                HandoffLaneFacts {
+                    target_not_older: false,
+                    ..eligible()
+                },
+                Some("the authorized target build is older than this build"),
+            ),
+            // The transport, not the protocol, bounds the pool: one `SCM_RIGHTS`
+            // message carries 64 descriptors and two of them are the pipes.
+            // Exactly the limit still fits…
+            (
+                "sessions == limit",
+                HandoffLaneFacts {
+                    sessions: limit,
+                    ..eligible()
+                },
+                None,
+            ),
+            // …one more does not, and must fall back rather than fail at sendmsg…
+            (
+                "sessions == limit + 1",
+                HandoffLaneFacts {
+                    sessions: limit + 1,
+                    ..eligible()
+                },
+                Some("the session count does not fit one descriptor message"),
+            ),
+            // …and an overlap with no sessions is not an overlap.
+            (
+                "no sessions",
+                HandoffLaneFacts {
+                    sessions: 0,
+                    ..eligible()
+                },
+                Some("the session count does not fit one descriptor message"),
+            ),
+            // A LaunchServices launch MERGES its environment and cannot remove a
+            // variable. `bind_expected_update_artifact` removes three, and a
+            // successor that inherited a stale `ATERM_UPDATE_EXPECTED_*` would
+            // authenticate its staged bundle against the wrong artifact — so a
+            // removal that would actually remove something disqualifies the lane.
+            (
+                "environment needs a removal",
+                HandoffLaneFacts {
+                    environment_is_a_merge: false,
+                    ..eligible()
+                },
+                Some("the launch environment needs a removal a merge cannot express"),
+            ),
+        ];
+        for (label, facts, refusal) in rows {
+            assert_eq!(out_of_band_lane_refusal(facts), refusal, "{label}");
+        }
     }
 
     /// The predicate that produces that fact, against a real `Command`: a

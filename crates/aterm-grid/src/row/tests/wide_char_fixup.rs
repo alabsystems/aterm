@@ -616,9 +616,9 @@ fn clear_range_shrinks_len_on_tail_wide_orphan() {
     );
     assert_eq!(row.len(), 6, "wide char at 4-5 → len 6");
 
-    // clear_range(4, 5): cells[4] is the WIDE head, so its continuation at col 5
+    // clear_range_with(4, 5, EMPTY): cells[4] is the WIDE head, so its continuation at col 5
     // (== end) is the orphan cleared one past the range. old_len (6) == end (5) + 1.
-    row.clear_range(4, 5);
+    row.clear_range_with(4, 5, Cell::EMPTY);
 
     for c in 0..6 {
         assert!(row.get(c).unwrap().is_empty(), "cell {c} should be empty");

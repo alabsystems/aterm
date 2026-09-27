@@ -105,10 +105,6 @@ pub struct SixelImage {
     height: usize,
     /// Row-major packed `0xAARRGGBB`, length == `width * height`.
     pixels: Vec<u32>,
-    /// Grid cursor row at hook time (for placement).
-    cursor_row: u16,
-    /// Grid cursor column at hook time (for placement).
-    cursor_col: u16,
 }
 
 impl SixelImage {
@@ -128,18 +124,6 @@ impl SixelImage {
     #[must_use]
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
-    }
-
-    /// Cursor row at the time the sixel sequence was hooked.
-    #[must_use]
-    pub fn cursor_row(&self) -> u16 {
-        self.cursor_row
-    }
-
-    /// Cursor column at the time the sixel sequence was hooked.
-    #[must_use]
-    pub fn cursor_col(&self) -> u16 {
-        self.cursor_col
     }
 
     /// Number of grid rows this image spans given a cell height in pixels.
@@ -218,8 +202,6 @@ pub struct SixelDecoder {
     declared_h: usize,
     /// Pending DECGRI repeat count for the next data byte (0 = none).
     pending_repeat: u32,
-    /// Grid cursor `(row, col)` captured at `hook` time, for placement.
-    pending_cursor: (u16, u16),
 }
 
 /// Which numeric-parameter introducer the decoder is mid-collecting.
@@ -261,15 +243,13 @@ impl SixelDecoder {
             declared_w: 0,
             declared_h: 0,
             pending_repeat: 0,
-            pending_cursor: (0, 0),
         }
     }
 
-    /// Begin a sixel sequence. `params` are the DCS numeric params
-    /// (`P1`=aspect, `P2`=background-select, `P3`=horizontal-grid; only used
-    /// for documented defaults). `cursor_row`/`cursor_col` are the grid cursor
-    /// at hook time, carried into the produced image for placement.
-    pub fn hook(&mut self, params: &[u16], cursor_row: u16, cursor_col: u16) {
+    /// Begin a sixel sequence. The DCS numeric params (`P1`=aspect,
+    /// `P2`=background-select, `P3`=horizontal-grid) are not load-bearing:
+    /// the documented defaults are what the decoder implements.
+    pub fn hook(&mut self) {
         // Reset transient decode state; keep the default palette fresh so a
         // reused decoder does not inherit colors from a previous image.
         self.palette = default_palette();
@@ -286,9 +266,6 @@ impl SixelDecoder {
         self.declared_w = 0;
         self.declared_h = 0;
         self.pending_repeat = 0;
-        self.pending_cursor = (cursor_row, cursor_col);
-        // P1/P2/P3 are accepted but not load-bearing in this increment.
-        let _ = params;
         self.active = true;
     }
 
@@ -409,14 +386,11 @@ impl SixelDecoder {
         }
         // Rows at/below alloc_height were never painted ⇒ fully transparent.
         pixels.resize(width * height, TRANSPARENT);
-        let (cursor_row, cursor_col) = self.pending_cursor;
         self.release();
         Some(SixelImage {
             width,
             height,
             pixels,
-            cursor_row,
-            cursor_col,
         })
     }
 

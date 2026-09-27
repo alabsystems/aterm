@@ -24,13 +24,13 @@ thread_local! {
 }
 
 /// Test-only: the listing count since [`reset_bin_scans`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn bin_scans() -> usize {
     BIN_SCANS.with(std::cell::Cell::get)
 }
 
 /// Test-only: start counting from zero.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn reset_bin_scans() {
     BIN_SCANS.with(|n| n.set(0));
 }

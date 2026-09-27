@@ -14,7 +14,7 @@ use super::types::ViPoint;
 /// Search match state for vi mode n/N navigation.
 ///
 /// Match positions are stored sorted in document order. The caller
-/// populates matches via [`set_matches`](Self::set_matches); this
+/// populates matches via `set_matches`; this
 /// struct handles circular navigation with [`focus_next`](Self::focus_next)
 /// and [`focus_prev`](Self::focus_prev).
 #[derive(Debug, Clone, Default)]
@@ -28,6 +28,7 @@ pub struct ViSearchState {
 impl ViSearchState {
     /// Create an empty search state.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,12 +38,14 @@ impl ViSearchState {
     /// binary-search the list, so unsorted input yields wrong navigation
     /// (no memory unsafety). No debug_assert here: a caller-contract
     /// assert is a reachable panic the L0 gate cannot prove away.
+    #[cfg(any(test, kani))]
     pub fn set_matches(&mut self, matches: Vec<ViPoint>) {
         self.focused = None;
         self.matches = matches;
     }
 
     /// Clear all matches and reset focus.
+    #[cfg(any(test, kani))]
     pub fn clear(&mut self) {
         self.matches.clear();
         self.focused = None;
@@ -50,24 +53,28 @@ impl ViSearchState {
 
     /// Number of matches.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn match_count(&self) -> usize {
         self.matches.len()
     }
 
     /// Whether there are any matches.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
     }
 
     /// Currently focused match index.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn focused_index(&self) -> Option<usize> {
         self.focused
     }
 
     /// Currently focused match position.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn focused_point(&self) -> Option<ViPoint> {
         // Written as a match (not `and_then`) so the verifier does not have
         // to model a `&self`-capturing closure aggregate (unsupported MIR).
@@ -115,12 +122,14 @@ impl ViSearchState {
 
     /// Check if a point is a match start position.
     #[must_use]
+    #[cfg(test)]
     pub fn is_match(&self, point: ViPoint) -> bool {
         self.matches.binary_search(&point).is_ok()
     }
 
     /// Check if a point is the currently focused match.
     #[must_use]
+    #[cfg(test)]
     pub fn is_focused(&self, point: ViPoint) -> bool {
         self.focused_point() == Some(point)
     }

@@ -12,10 +12,9 @@
 //! observed no-leak state is checked against the model's own `SnapshotIsolated`
 //! invariant. Pure Rust + real code, so it always runs.
 
-use aterm_buffer::{Edit, LineId, Range, ReadCap, Surface, SurfaceId, WriteCap};
+use aterm_buffer::{Edit, LineId, Range, ReadCap, Surface, WriteCap};
 use aterm_spec::derive::snapshot_model;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 
 fn full_range() -> Range {
     Range {
@@ -27,7 +26,7 @@ fn full_range() -> Range {
 #[test]
 fn real_snapshot_isolated_from_later_writes() {
     let m = snapshot_model();
-    let mut s = Surface::new(SurfaceId(NonZeroU64::new(1).unwrap()));
+    let mut s = Surface::new();
     s.apply(&WriteCap, Edit::AppendLine("a".into()));
     s.apply(&WriteCap, Edit::AppendLine("b".into()));
 

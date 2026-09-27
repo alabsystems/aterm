@@ -158,6 +158,7 @@ impl PresentTag {
     /// The tag a stored discriminant names; anything else is `Spaced`, the
     /// arm that claims nothing about pacing.
     #[must_use]
+    #[cfg(any(target_os = "macos", test))]
     const fn from_u8(raw: u8) -> Self {
         match raw {
             1 => Self::HotBurst,
@@ -239,6 +240,7 @@ static ARM_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
 static ARM_PREV_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Registration serials start at 1; 0 means "none".
+#[cfg(any(target_os = "macos", test))]
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 /// The most recent registration, until the presenting thread takes it
 /// (`take_registration`): serial (0 = none) and its registration instant.
@@ -251,9 +253,12 @@ static TAKEABLE_NS: AtomicU64 = AtomicU64::new(0);
 /// layer holds at most three drawables and the frontend opens few windows, so a
 /// slot is reused only after sixteen further registrations — long after any
 /// handler that could ask about it has fired.
+#[cfg(any(target_os = "macos", test))]
 const TAG_RING: usize = 16;
+#[cfg(any(target_os = "macos", test))]
 static TAGS: [AtomicU8; TAG_RING] = [const { AtomicU8::new(PresentTag::Spaced as u8) }; TAG_RING];
 /// The highest serial whose `TAGS` slot is written (0 = none).
+#[cfg(any(target_os = "macos", test))]
 static REGISTERED: AtomicU64 = AtomicU64::new(0);
 
 /// Install the process's one sink. First install wins; `false` when a sink was
@@ -263,10 +268,7 @@ pub fn install_sink(sink: GlassSink) -> bool {
 }
 
 /// Whether a sink is installed — the swapchain registers a handler only then.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "only the macOS Metal present registers handlers")
-)]
+#[cfg(target_os = "macos")]
 pub(crate) fn sink_installed() -> bool {
     SINK.get().is_some()
 }
@@ -298,6 +300,7 @@ pub fn arm_present(armed: ArmedPresent) {
 }
 
 /// `CACurrentMediaTime` seconds → nanoseconds, saturating.
+#[cfg(any(target_os = "macos", test))]
 fn secs_to_ns(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
         u64::try_from(Duration::from_secs_f64(secs).as_nanos()).unwrap_or(u64::MAX)
@@ -310,10 +313,7 @@ fn secs_to_ns(secs: f64) -> u64 {
 /// by the caller immediately before `presentDrawable:`): mint its serial, decide
 /// its tag from the armed facts, publish the tag to the ring, and leave the
 /// registration takeable.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "only the macOS Metal present registers handlers")
-)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn registration_begin(registered_s: f64) -> (u64, PresentTag) {
     let registered_ns = secs_to_ns(registered_s);
     let flags = ARM_FLAGS.load(Ordering::Relaxed);
@@ -343,16 +343,14 @@ pub fn take_registration() -> Option<Registration> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn ring_slot(serial: u64) -> usize {
     usize::try_from(serial % TAG_RING as u64).unwrap_or(0)
 }
 
 /// Hand one handler's outcome to the ledger, naming the registration with the
 /// next serial as its successor when one exists.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "only the macOS Metal present registers handlers")
-)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn deliver_report(serial: u64, tag: PresentTag, sample: GlassSample) {
     DELIVERED.fetch_add(1, Ordering::Relaxed);
     let successor = if REGISTERED.load(Ordering::Acquire) > serial {

@@ -1,0 +1,19 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-25 (no live capture): rows synthesized from the S8-02 capture (claude-2.1.282-question-declined-esc.txt) and the 2.1.282 render code Ufe() (reason `draft`: the dialog is hidden) and its dim notice IXe · a question withheld while the composer holds a draft: the notice over the composer (where it lands is not measured)
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user0000000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /clear
+
+❯ Pick a colour scheme for the demo page, and ask me if you are unsure.
+
+⏺ I will ask which scheme you prefer.
+
+Claude has a question for you — it shows once you send or clear what you're typing.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ also make the header bold
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

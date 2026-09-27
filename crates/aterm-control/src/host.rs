@@ -40,18 +40,6 @@ pub enum SessionState {
     Exited,
 }
 
-impl SessionState {
-    /// The stable wire token.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SessionState::Spawning => "spawning",
-            SessionState::Alive => "alive",
-            SessionState::Exited => "exited",
-        }
-    }
-}
-
 /// One row of [`SessionHost::sessions`] — exactly the fields a `sessions`/`ls`
 /// line carries, so a host can be rostered without the verb reaching past the
 /// seam for a seventh thing.
@@ -277,14 +265,5 @@ mod tests {
         assert_eq!(p.window, None);
         assert!(!p.active_tab && !p.window_focused);
         assert_eq!(p.detail, None);
-    }
-
-    /// The state tokens are wire bytes; a host maps onto them, it does not coin
-    /// its own spellings.
-    #[test]
-    fn session_state_tokens_are_stable() {
-        assert_eq!(SessionState::Spawning.as_str(), "spawning");
-        assert_eq!(SessionState::Alive.as_str(), "alive");
-        assert_eq!(SessionState::Exited.as_str(), "exited");
     }
 }

@@ -1132,6 +1132,8 @@ const MAX_INDEX_ENTRY_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Clone, Copy, Debug)]
 pub enum LockUse<'a> {
     /// No workspace: nothing from a lock is consulted, and the verdict says so.
+    /// Only the tests judge a bundle with no workspace at all; every verb has one.
+    #[cfg(test)]
     None,
     /// The bundle must have been built for this workspace's lock, and its rows
     /// are judged against the edges that lock resolved.
@@ -1146,6 +1148,7 @@ impl<'a> LockUse<'a> {
     /// The workspace to read a lock from, if any.
     fn root(self) -> Option<&'a Path> {
         match self {
+            #[cfg(test)]
             Self::None => Option::None,
             Self::Match(root) | Self::EdgesOnly(root) => Some(root),
         }
@@ -3299,7 +3302,7 @@ mod tests {
 
         // With one: refused by name, and `unbundle` writes nothing.
         let anchor = mirror::RowAnchor::open(&fx.cargo_home());
-        assert!(anchor.available());
+        assert!(anchor.why_absent().is_none());
         let why = refusal(check_bundle(LockUse::None, &path, &anchor));
         assert!(
             why.contains("is NOT upstream's") && why.contains(name),
@@ -3338,7 +3341,7 @@ mod tests {
         good_bundle(&fx);
 
         let anchor = mirror::RowAnchor::open(&fx.cargo_home());
-        assert!(anchor.available());
+        assert!(anchor.why_absent().is_none());
         let anchored = unbundle(
             &fx.bundle_path(),
             &fx.extracted(),

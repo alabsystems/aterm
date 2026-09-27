@@ -55,6 +55,9 @@ const MAX_SOCK_PATH: usize = 100;
 /// never leaks a live aterm or a scratch dir.
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: String,
@@ -136,7 +139,6 @@ fn private_launch_environment_gates_host_maintenance() {
             ("XDG_CACHE_HOME", "cache"),
             ("XDG_DATA_HOME", "data"),
             ("XDG_STATE_HOME", "state"),
-            ("ATERM_CONTROL_SOCK", "run/aterm/aterm.sock"),
         ] {
             assert_eq!(std::env::var_os(name), Some(root.join(relative).into()));
         }
@@ -209,7 +211,6 @@ fn private_launch_environment_gates_host_maintenance() {
         ])
         // Explicit foreign overrides must be removed as well as ambient ones.
         .env("ATERM_PARENT_SESSION_ID", "foreign-session")
-        .env("ATERM_CONTROL_SOCK", base.join("foreign.sock"))
         .env("ATERM_NO_AUTO_UPDATE", "1")
         .env(atpkg::reroute::PASSTHROUGH_ENV, "1");
         hermetic_env(&mut cmd, &root);
@@ -259,11 +260,12 @@ fn boot() -> Option<Instance> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     hermetic_env(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", "120")
+        .args(launch_isolation::control_sock(&tmp))
+        .args(["--lines", "40", "--columns", "120"])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -275,6 +277,7 @@ fn boot() -> Option<Instance> {
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,

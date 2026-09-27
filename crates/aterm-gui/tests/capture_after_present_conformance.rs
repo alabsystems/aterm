@@ -263,6 +263,44 @@ fn stale_capture_negative_control_is_rejected() {
     assert_eq!(rejected, 3);
 }
 
+/// The model's `BuggyRetryAtLimit` slip: the retry arm reads `attempts <= limit`,
+/// so the last dropped present asks for a retry instead of failing closed.
+fn late_retry_mutant(input: Inputs) -> CaptureAfterPresentDecision {
+    if input.present_succeeded {
+        CaptureAfterPresentDecision::Capture
+    } else if input.attempts <= NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT {
+        CaptureAfterPresentDecision::Retry
+    } else {
+        CaptureAfterPresentDecision::FailClosed
+    }
+}
+
+#[test]
+fn late_retry_negative_control_is_rejected_only_at_the_bound() {
+    let model = capture_after_present_model();
+    for attempts in 1..=NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT {
+        let input = Inputs {
+            present_succeeded: false,
+            attempts,
+        };
+        let before = project_before(&model, input);
+        let forged = project_after(&before, input, late_retry_mutant(input));
+        let at_bound = attempts == NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT;
+        // Below the bound the slip agrees with the shipping decision, so the
+        // control is not vacuous: it is the bound itself that is refused.
+        assert_eq!(
+            admits(&model, &before, &forged).is_none(),
+            at_bound,
+            "late-retry decision at attempt {attempts}"
+        );
+        assert_eq!(
+            model.check_invariant("DecisionMatchesOutcome", &forged),
+            !at_bound,
+            "DecisionMatchesOutcome at attempt {attempts}"
+        );
+    }
+}
+
 fn source_decision_code(decision: NativeCaptureSourceDecision) -> i64 {
     match decision {
         NativeCaptureSourceDecision::StitchRenderer => 1,

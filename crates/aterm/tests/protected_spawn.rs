@@ -135,8 +135,8 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
 #[cfg(unix)]
 #[test]
 fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
+    // No containment flag: the default User mode — no sandbox, fast.
     let mut child = session_command("protected")
-        .env_remove("ATERM_CONTAINMENT_MODE") // default User mode: no sandbox, fast
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -171,7 +171,7 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
 /// a full `Terminal` and feed it every PTY byte — an O(bytes) parse and
 /// O(scrollback) memory — for a model nothing in the process could read, and a
 /// change that quietly restores that default would be invisible in every other
-/// test in this repo. The `$ATERM_VERBOSE` epilogue is the one place the session
+/// test in this repo. The `--verbose` epilogue is the one place the session
 /// states which of the two it was, so it is what this pins, in BOTH directions:
 /// unset means unarmed, and `=1` means armed (a test that only checked the
 /// default would pass just as well against a binary that could never arm at all).
@@ -180,8 +180,7 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
 fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
     let run = |model: Option<&str>| -> String {
         let mut cmd = session_command("model");
-        cmd.env("ATERM_VERBOSE", "1") // the epilogue is the observable
-            .env_remove("ATERM_CONTAINMENT_MODE")
+        cmd.arg("--verbose") // the epilogue is the observable
             .env_remove("ATERM_SESSION_MODEL")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -201,17 +200,18 @@ fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
 
     let unarmed = run(None);
     assert!(
-        unarmed.contains("session model off"),
-        "an ordinary session must build NO VT model; stderr={unarmed:?}"
+        unarmed.contains("bytes passed through.") && !unarmed.contains("into the armed VT core"),
+        "an ordinary session must build NO VT model, and its summary says nothing of one \
+         (the seam is dev-only — a shipped binary cannot arm it); stderr={unarmed:?}"
     );
     assert!(
-        !unarmed.contains("ARMED"),
+        !unarmed.contains("session model on"),
         "an unarmed session must not announce a model; stderr={unarmed:?}"
     );
 
     let armed = run(Some("1"));
     assert!(
-        armed.contains("session model ARMED"),
+        armed.contains("session model on"),
         "$ATERM_SESSION_MODEL=1 must arm the model and say so; stderr={armed:?}"
     );
     assert!(
@@ -222,12 +222,12 @@ fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
     // The disabling spelling is the default, not an arming: `=0` must read as OFF.
     let refused = run(Some("0"));
     assert!(
-        refused.contains("session model off"),
+        refused.contains("bytes passed through.") && !refused.contains("into the armed VT core"),
         "$ATERM_SESSION_MODEL=0 must leave the model OFF; stderr={refused:?}"
     );
 }
 
-/// `ATERM_CONTAINMENT_MODE=containment` wraps the spawn in `sandbox-exec` (deny
+/// `--containment containment` wraps the spawn in `sandbox-exec` (deny
 /// network + credential/private-data reads). A basic shell command must STILL run
 /// under the sandbox — the OS confinement must not break normal shell operation.
 /// macOS-only (Seatbelt `sandbox-exec` is the actuated path).
@@ -235,7 +235,7 @@ fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
 #[test]
 fn cli_runs_under_the_os_sandbox_in_containment_mode() {
     let mut child = session_command("containment")
-        .env("ATERM_CONTAINMENT_MODE", "containment")
+        .args(["--containment", "containment"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -260,7 +260,7 @@ fn cli_runs_under_the_os_sandbox_in_containment_mode() {
     );
 }
 
-/// Security: `ATERM_CONTAINMENT_MODE` is attacker-influenceable. A MALFORMED value
+/// Security: the `--containment` value may be attacker-influenced. A MALFORMED value
 /// must FAIL CLOSED to Containment (the most restrictive mode) — never silently
 /// fall through to the unconfined `User` default. The binary still spawns and runs
 /// (Containment is confined, not a refusal-to-start), but in the confined mode, and
@@ -272,7 +272,7 @@ fn cli_runs_under_the_os_sandbox_in_containment_mode() {
 #[test]
 fn malformed_containment_mode_fails_closed_not_open() {
     let mut child = session_command("malformed")
-        .env("ATERM_CONTAINMENT_MODE", "definitely-not-a-real-mode")
+        .args(["--containment", "definitely-not-a-real-mode"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -289,8 +289,9 @@ fn malformed_containment_mode_fails_closed_not_open() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     // It announced the fail-closed fallback — did NOT silently accept the garbage.
     assert!(
-        stderr.contains("failing closed to Containment"),
-        "a malformed mode must announce fail-closed-to-Containment; stderr={stderr:?}"
+        stderr
+            .contains("--containment takes master, user, safety or containment; using containment"),
+        "a malformed mode must announce the fallback to containment; stderr={stderr:?}"
     );
     // And it still ran the shell (Containment is confined, not refuse-to-start).
     assert!(

@@ -1793,6 +1793,143 @@ fn powerline_cells_match_cpu_within_tolerance() {
     }
 }
 
+/// The chain's LAST-RESORT fontless symbols (`font_chain::Tier::Synthetic`):
+/// the Claude Code / Codex footer's `⏵⏵` (U+23F5, covered by no installed face
+/// on a bare Linux), its ⏴⏶⏷ siblings and ⭘ — plus the `⎿` connector, which
+/// is drawn by the PRE-EMPTIVE procedural family on every host. Whatever face
+/// the host resolves them to — a real font on macOS, the synthesis on a bare
+/// Linux — the two backends must draw the same pixels, and every cell must
+/// draw ink (no `.notdef` box, no blank).
+#[test]
+fn synthetic_symbol_cells_match_cpu_within_tolerance() {
+    let theme = Theme::default();
+    let px = 18.0;
+
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let glyphs = [
+        '\u{23F5}', '\u{23F4}', '\u{23F6}', '\u{23F7}', '\u{2B58}', '\u{23BF}',
+    ];
+    let (rows, cols) = (1usize, glyphs.len() * 2);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let mut line = String::from("\x1b[?25l");
+    for g in glyphs {
+        line.push(g);
+        line.push(' ');
+    }
+    term.process(line.as_bytes());
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (cw, ch) = cpu.cell_size();
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "dims"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    eprintln!("synthetic symbol GPU vs CPU max per-channel delta = {delta}");
+    assert!(
+        delta <= 8,
+        "synthetic symbol cells diverge: max per-channel delta {delta} > 8"
+    );
+    for (i, g) in glyphs.iter().enumerate() {
+        let n = non_bg_count(&cell_pixels(&gpu_frame, cw, ch, 0, i * 2));
+        assert!(n > 4, "{g:?} drew no ink on the GPU ({n} non-bg)");
+    }
+}
+
+/// The WIDE (two-cell) branch of the fontless symbol synthesis: an
+/// emoji-presentation symbol (⏩ ⏪ ⏫ ⚪ ⚫) reaches it only when no colour
+/// face exists, and then rasterizes ONE `2 * cell_w` bitmap centred across both
+/// cells — the one geometry the one-cell case above never exercises. The system
+/// pair would resolve these to the colour face on any host that has one, so
+/// this pair is built from the BUNDLED DejaVu Sans Mono alone
+/// (`Renderer::from_bytes` leaves every discovery path empty) with runtime
+/// discovery off: the synthesis is then the only answer on every machine, and
+/// the per-glyph `FaceId::Procedural` assert keeps the case from going vacuous.
+#[test]
+fn wide_synthetic_symbol_cells_match_cpu_within_tolerance() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let ctx = match aterm_gpu::GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: no GPU available: {e}");
+            return;
+        }
+    };
+    // aterm-gpu builds aterm-render without `embedded-font`, so read the
+    // bundled asset directly (the same bytes `embedded_font()` would return).
+    let face: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+    // Runtime discovery OFF on both (the E1 host switch): otherwise a system
+    // face that happens to cover a glyph (⚪ does, on the host this was written
+    // on) answers first and the case silently stops testing the synthesis.
+    let fontless = || {
+        let mut r = Renderer::from_bytes(face, px, theme).expect("bundled face parses");
+        r.set_runtime_font_discovery(false);
+        r
+    };
+    let mut gpu =
+        aterm_gpu::GpuRenderer::from_parts(ctx, fontless(), None, theme).expect("GPU renderer");
+    let mut cpu = fontless();
+
+    let glyphs = ['\u{23E9}', '\u{23EA}', '\u{23EB}', '\u{26AA}', '\u{26AB}'];
+    for &g in &glyphs {
+        let key = cpu.glyph_key(g);
+        assert_eq!(
+            (key.source, key.cell_span),
+            (aterm_render::FaceId::Procedural, 2),
+            "{g:?} must reach the two-cell synthesis in a colour-face-free renderer"
+        );
+    }
+    // Each wide glyph takes two columns, then one blank separator column.
+    let (rows, cols) = (1usize, glyphs.len() * 3);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let mut line = String::from("\x1b[?25l");
+    for g in glyphs {
+        line.push(g);
+        line.push(' ');
+    }
+    term.process(line.as_bytes());
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (cw, ch) = cpu.cell_size();
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "dims"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    eprintln!("wide synthetic symbol GPU vs CPU max per-channel delta = {delta}");
+    assert!(
+        delta <= 8,
+        "wide synthetic symbol cells diverge: max per-channel delta {delta} > 8"
+    );
+    for (i, g) in glyphs.iter().enumerate() {
+        // Centred across BOTH cells: ink in each half, on both backends.
+        for half in 0..2 {
+            let col = i * 3 + half;
+            for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+                let n = non_bg_count(&cell_pixels(frame, cw, ch, 0, col));
+                assert!(
+                    n > 4,
+                    "{name}: {g:?} drew no ink in its cell {half} ({n} non-bg)"
+                );
+            }
+        }
+    }
+}
+
 /// A glyph overflowing into the BLOCK-cursor cell must composite the same on
 /// both paths: the CPU paints the block cursor LAST (over the overflow), and the
 /// GPU now fills the block cursor AFTER the glyph passes too (was: cursor bg in
@@ -3817,5 +3954,347 @@ fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     assert!(
         delta <= 8,
         "grid pixels diverge: max per-channel delta {delta} > 8"
+    );
+}
+
+/// THE PIXEL-RESOLUTION CHROME ROW ON BOTH BACKENDS (design ruling 242):
+/// one chrome row carrying a `ChromeRaster` — a per-pixel ground over its
+/// band and gutters, a rail in its lowest pixels, a cell left to its own
+/// background, and an ink split through one glyph — paints the SAME ground
+/// and rail pixels on the GPU as on the CPU (both place the runs of the one
+/// shared builder, `aterm_render::chrome_raster_runs`), and its glyphs stay
+/// within the usual glyph tolerance, the split one included.
+#[test]
+fn gpu_matches_cpu_with_a_chrome_raster() {
+    let theme = Theme::default();
+    const P: usize = 10;
+    const FILL: u32 = 0x0050_FA7B;
+    const TRACK: u32 = 0x0044_4750;
+    const RAIL: u32 = 0x00F1_FA8C;
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    gpu.set_pad(P);
+    cpu.set_pad(P);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (mut term, rows, cols) = demo_term();
+    let (cw, ch) = cpu.cell_size();
+    let mut input = term.cell_frame(rows, cols);
+    let w = cols * cw + 2 * P;
+    let edge = P + 3 * cw + cw / 3;
+    // A smooth gradient to the edge, one AA pixel, the track after.
+    let ground: std::sync::Arc<[u32]> = (0..w)
+        .map(|x| {
+            if x < edge {
+                let g = 0x80 + u32::try_from(x * 0x7f / edge).unwrap();
+                (0x50 << 16) | (g << 8) | 0x7b
+            } else if x == edge {
+                0x004A_A066
+            } else {
+                TRACK
+            }
+        })
+        .collect();
+    let rail: std::sync::Arc<[u32]> = (0..w)
+        .map(|x| {
+            if x < edge {
+                RAIL
+            } else {
+                aterm_render::ChromeRaster::KEEP
+            }
+        })
+        .collect();
+    input.chrome_rasters.push(aterm_render::ChromeRaster {
+        row: 0,
+        ground,
+        rail,
+        rail_h: 3,
+        clear_rail: false,
+        own: vec![(6, 8)],
+        split: Some(aterm_render::InkSplit {
+            col: 3,
+            x: u32::try_from(edge).unwrap(),
+            ink: 0,
+            bg: FILL,
+        }),
+        rings: Vec::new(),
+        icons: Vec::new(),
+    });
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let h = cpu_frame.height;
+    assert_eq!((gpu_frame.width, gpu_frame.height), (w, h));
+    let top = cpu.grid_top();
+    // The band's top pixel row and its rail rows carry no glyph ink: there the
+    // raster's pixels must be byte-identical across the backends.
+    let mut seen = [false; 3];
+    for y in [top, top + ch - 3, top + ch - 2, top + ch - 1] {
+        for x in 0..w {
+            let (c, g) = (
+                cpu_frame.pixels[y * w + x] & 0x00ff_ffff,
+                gpu_frame.pixels[y * w + x] & 0x00ff_ffff,
+            );
+            assert_eq!(
+                c, g,
+                "raster pixel ({x},{y}) differs: cpu {c:06x} gpu {g:06x}"
+            );
+            for (i, tone) in [TRACK, RAIL, 0x004A_A066].into_iter().enumerate() {
+                seen[i] |= c == tone;
+            }
+        }
+    }
+    assert_eq!(
+        seen, [true; 3],
+        "the track, the rail and the AA pixel painted"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "glyph pixels diverge: max per-channel delta {delta} > 8"
+    );
+}
+
+/// A CHROME ROW THAT KEEPS ITS WORDS CLEAR OF ITS RAIL, ON BOTH BACKENDS
+/// (design ruling 248): the strain row's words lift into the room the face
+/// leaves above its tallest letter and the rail fits, with one clear row,
+/// under their lowest ink. Both backends fit and place through the one
+/// shared rule (`aterm_render::chrome_fit` / `chrome_lifted`, over the inner
+/// CPU renderer's one measured room), so the rail rows and the clear row
+/// above them — where the unlifted descenders reached — are byte-identical
+/// and carry the rail alone, and the lifted glyphs stay within the usual
+/// glyph tolerance.
+#[test]
+fn gpu_matches_cpu_with_a_clear_rail_row() {
+    let theme = Theme::default();
+    const P: usize = 10;
+    const RAIL: u32 = 0x00F2_FD4A;
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    gpu.set_pad(P);
+    cpu.set_pad(P);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (4usize, 12usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"gypq (jgy)'\r\nabc");
+    let (cw, ch) = cpu.cell_size();
+    let mut input = term.cell_frame(rows, cols);
+    for cell in &mut input.cells[0] {
+        cell.fg = [0xd0, 0xd0, 0xd0];
+        cell.bg = [0x30, 0x31, 0x35];
+    }
+    let w = cols * cw + 2 * P;
+    let lit = w * 3 / 5;
+    input.chrome_rasters.push(aterm_render::ChromeRaster {
+        row: 0,
+        ground: std::sync::Arc::from(Vec::new()),
+        rail: (0..w)
+            .map(|x| {
+                if x < lit {
+                    RAIL
+                } else {
+                    aterm_render::ChromeRaster::KEEP
+                }
+            })
+            .collect(),
+        rail_h: 3,
+        clear_rail: true,
+        own: Vec::new(),
+        split: None,
+        rings: Vec::new(),
+        icons: Vec::new(),
+    });
+    let (lift, rail) =
+        aterm_render::chrome_fit(&input.chrome_rasters[0], cpu.chrome_room_for(&input));
+    assert!(lift > 0 && rail > 0, "the face leaves room to lift into");
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    assert_eq!((gpu_frame.width, gpu_frame.height), (w, cpu_frame.height));
+    let top = cpu.grid_top();
+    for y in top + ch - rail - 1..top + ch {
+        for x in 0..w {
+            let (c, g) = (
+                cpu_frame.pixels[y * w + x] & 0x00ff_ffff,
+                gpu_frame.pixels[y * w + x] & 0x00ff_ffff,
+            );
+            assert_eq!(c, g, "clear-rail row ({x},{y}): cpu {c:06x} gpu {g:06x}");
+            if y >= top + ch - rail && x < lit {
+                assert_eq!(c, RAIL, "({x},{y}): the rail, with no glyph ink on it");
+            }
+        }
+    }
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "glyph pixels diverge: max per-channel delta {delta} > 8"
+    );
+}
+
+/// THE BAND'S DRAWN ICONS AND AN OUTLINED CAPSULE ON BOTH BACKENDS (design
+/// rulings 249, 251 and 258): a chrome row whose glyph cells are drawn as
+/// the band's icons — every icon of the set, regular and bold, each between
+/// two blank cells as the band lays it out, so it SPILLS into them — and
+/// whose Primary capsule is a ring over a gradient ground, and a third row
+/// of the icons side by side, each kept to its own cell. The icons are keyed
+/// through the one lookup (`Renderer::chrome_icon_key`) and rasterized once
+/// into the shared cache — a spilled icon's raster three cells wide on both
+/// — so they land within the usual glyph tolerance; the ring is placed by
+/// the one builder (`aterm_render::chrome_ring_runs`), so its pixels —
+/// straight lines, antialiased ends and the inside — are byte-identical. The
+/// cells keep their characters.
+#[test]
+fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
+    let theme = Theme::default();
+    const P: usize = 10;
+    const RING: u32 = 0x00BD_93F9;
+    const INNER: u32 = 0x0030_3135;
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    gpu.set_pad(P);
+    cpu.set_pad(P);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let icons = aterm_render::BandIcon::ALL;
+    // ` G ` per icon (the band's layout): each icon at column 3k + 1.
+    let spaced = 3 * icons.len();
+    let cols = spaced + 10;
+    let rows = 4usize;
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let line: String = icons.iter().flat_map(|i| [' ', i.ch(), ' ']).collect();
+    let tight: String = icons.iter().map(|i| i.ch()).collect();
+    term.process(line.as_bytes());
+    term.process(b"\r\n");
+    term.process(line.as_bytes());
+    term.process(b"\r\n");
+    term.process(tight.as_bytes());
+    let (cw, ch) = cpu.cell_size();
+    let mut input = term.cell_frame(rows, cols);
+    for (r, row) in input.cells.iter_mut().take(3).enumerate() {
+        for cell in row.iter_mut() {
+            cell.fg = [0xf1, 0xfa, 0x8c];
+            cell.bg = [0x30, 0x31, 0x35];
+            cell.bold = r == 1;
+        }
+    }
+    let w = cols * cw + 2 * P;
+    let ground: std::sync::Arc<[u32]> = (0..w)
+        .map(|x| {
+            let g = 0x60 + u32::try_from(x * 0x9f / w).unwrap();
+            (0x50 << 16) | (g << 8) | 0x7b
+        })
+        .collect();
+    let with_icons = |row: u16, ring: bool| aterm_render::ChromeRaster {
+        row,
+        ground: if ring {
+            std::sync::Arc::clone(&ground)
+        } else {
+            std::sync::Arc::from(Vec::new())
+        },
+        rail: std::sync::Arc::from(Vec::new()),
+        rail_h: 0,
+        clear_rail: false,
+        own: Vec::new(),
+        split: None,
+        rings: if ring {
+            vec![aterm_render::ChromeRing {
+                start: u16::try_from(spaced + 1).unwrap(),
+                end: u16::try_from(spaced + 8).unwrap(),
+                ring: RING,
+                inner: INNER,
+                // As on a band's last row: the ring draws the seam across
+                // its end cells (ruling 254).
+                seam: Some(0x00A0_A2A8),
+            }]
+        } else {
+            Vec::new()
+        },
+        icons: icons
+            .iter()
+            .enumerate()
+            .map(|(c, &icon)| aterm_render::ChromeIcon {
+                col: u16::try_from(if row == 2 { c } else { 3 * c + 1 }).unwrap(),
+                icon,
+            })
+            .collect(),
+    };
+    input.chrome_rasters.push(with_icons(0, true));
+    input.chrome_rasters.push(with_icons(1, false));
+    input.chrome_rasters.push(with_icons(2, false));
+    // The capsule's floor is its cells' underline in the ring's colour
+    // (ruling 254), as the band stamps it.
+    let floor_cols = aterm_render::chrome_ring_floor_cols(&input.chrome_rasters[0].rings[0]);
+    let blank = aterm_core::terminal::RenderCell {
+        bg: [0x30, 0x31, 0x35],
+        ..aterm_core::terminal::RenderCell::default()
+    };
+    input.cells[0].resize(cols, blank);
+    for cell in &mut input.cells[0][floor_cols.clone()] {
+        cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+        cell.underline_color = Some([0xBD, 0x93, 0xF9]);
+    }
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    assert_eq!((gpu_frame.width, gpu_frame.height), (w, cpu_frame.height));
+    for (c, &icon) in icons.iter().enumerate() {
+        assert_eq!(
+            input.cells[0][3 * c + 1].ch,
+            icon.ch(),
+            "the cell keeps its character"
+        );
+        assert_eq!(
+            input.cells[2][c].ch,
+            icon.ch(),
+            "the cell keeps its character"
+        );
+        // Spilled between blanks, kept to its cell beside another icon.
+        let key = |r: usize, c: usize| {
+            cpu.chrome_icon_key(input.chrome_raster(r), &input.cells[r], c)
+                .expect("an icon cell")
+        };
+        assert_ne!(
+            key(0, 3 * c + 1).ch_or_id & aterm_render::CHROME_ICON_SPILL_BIT,
+            0
+        );
+        if c > 0 && c + 1 < icons.len() {
+            assert_eq!(key(2, c).ch_or_id & aterm_render::CHROME_ICON_SPILL_BIT, 0);
+        }
+    }
+    let top = cpu.grid_top();
+    // The ring's pixels, from the one builder, are the same on both.
+    let floor = cpu.chrome_ring_floor();
+    let runs = aterm_render::chrome_ring_runs(&input.chrome_rasters[0], w, P, cw, ch, floor);
+    assert!(!runs.is_empty(), "the ring is drawn");
+    let (lx0, lx1) = (P + floor_cols.start * cw, P + floor_cols.end * cw);
+    let mut ring_px = 0usize;
+    for (x0, x1, ya, yb, color) in runs {
+        for y in ya..yb {
+            for x in x0..x1 {
+                // The floor's underline, on both, over the builder's inside.
+                let color = if (floor.0..floor.1).contains(&y) && (lx0..lx1).contains(&x) {
+                    RING
+                } else {
+                    color
+                };
+                let (c, g) = (
+                    cpu_frame.pixels[(top + y) * w + x] & 0x00ff_ffff,
+                    gpu_frame.pixels[(top + y) * w + x] & 0x00ff_ffff,
+                );
+                assert_eq!(c, color, "cpu ring ({x},{y})");
+                assert_eq!(g, color, "gpu ring ({x},{y})");
+                ring_px += usize::from(color == RING);
+            }
+        }
+    }
+    assert!(ring_px > 0, "the ring's own colour is painted");
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "icon pixels diverge: max per-channel delta {delta} > 8"
     );
 }

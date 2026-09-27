@@ -5,15 +5,14 @@
 //! the [`Subject`] / [`Filter`] address grammar, the single canonical
 //! [`assign_partition`] function, and [`Offset`] arithmetic.
 //!
-//! Design rules carried over as *lessons* from the kafka2 audit:
+//! Design rules:
 //!
 //! * **No panics on hostile input.** Decoders return `Result`/`Option`; the
-//!   encode path returns `Result` instead of `.expect()`-ing (kafka2 panicked
-//!   in `frame::encode`).
-//! * **One partitioner.** There is exactly one [`assign_partition`]; kafka2
-//!   shipped a second, divergent round-robin partitioner.
+//!   encode path returns `Result` rather than panicking on an oversized payload.
+//! * **One partitioner.** There is exactly one [`assign_partition`], so every
+//!   router derives the same partition for the same message.
 //! * **Names match behavior.** [`crate::hash::crc32_ieee`] is named for the
-//!   polynomial it computes (kafka2 called an IEEE CRC `compute_crc32c`).
+//!   polynomial it computes (IEEE, not Castagnoli/CRC-32C).
 //! * **Zero dependencies.** This crate pulls in nothing, so it is trivially
 //!   auditable and reproducible.
 

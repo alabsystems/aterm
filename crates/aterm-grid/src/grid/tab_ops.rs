@@ -105,6 +105,7 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col >= old(self.storage.cursor.col)
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn tab_n(&mut self, n: u16) {
         for _ in 0..n {
             self.tab();
@@ -193,6 +194,7 @@ impl Grid {
     ///
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn back_tab_n(&mut self, n: u16) {
         for _ in 0..n {
             self.back_tab();
@@ -240,17 +242,5 @@ impl Grid {
     pub fn reset_tab_stops(&mut self) {
         let cols = self.storage.cols;
         self.storage.reset_tab_stops(cols);
-    }
-
-    /// Check if there is a tab stop at the given column.
-    ///
-    /// Returns `false` if the column is out of bounds.
-    ///
-    /// ENSURES: col >= self.storage.cols implies result == false
-    #[cfg(any(test, kani, feature = "testing"))]
-    #[inline]
-    #[must_use]
-    pub fn is_tab_stop(&self, col: u16) -> bool {
-        self.storage.is_tab_stop(col)
     }
 }

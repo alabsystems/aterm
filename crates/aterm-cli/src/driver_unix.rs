@@ -230,15 +230,16 @@ pub(crate) fn run(
         }
     };
     if verbose {
-        // Say which session this was. The old wording claimed the VT core had
-        // processed every byte, which is now true only when the model is armed —
-        // and a summary that overstates is worse than no summary.
+        // Say which session this was. The VT core clause appears only when the
+        // dev-only seam (`ATERM_SESSION_MODEL=1`) armed it: a shipped binary cannot,
+        // so a constant "session model off" clause was a fact about nothing a
+        // person could change.
         let modelled = if engine.is_some() {
-            "and into the armed VT core"
+            " and into the armed VT core"
         } else {
-            "(session model off: nothing modelled)"
+            ""
         };
-        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through {modelled}.");
+        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through{modelled}.");
     }
     // A failed wait has no status to report: treat it like a non-exit.
     if reaped && libc::WIFEXITED(status) {

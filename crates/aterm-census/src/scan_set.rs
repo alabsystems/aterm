@@ -373,8 +373,6 @@ pub struct ScannedVendored {
     pub scan_dir: String,
     /// Labeled per-platform subtrees to count, never graph.
     pub platform_slices: &'static [PlatformSlice],
-    /// The registry's review note, printed in the transcript.
-    pub audit: &'static str,
 }
 
 /// The derived scan set plus its reported classifications (never silent).
@@ -413,7 +411,10 @@ enum Value {
     /// Anything else (numbers, …) — a hard error wherever a
     /// dependency-bearing section is being interpreted (rendered via the
     /// derived Debug in those diagnostics).
-    #[allow(dead_code)] // read only through the derived Debug in error paths
+    #[expect(
+        dead_code,
+        reason = "read only through the derived Debug in error paths"
+    )]
     Other(String),
 }
 
@@ -1263,7 +1264,6 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                     crate_dir: path.clone(),
                     scan_dir,
                     platform_slices,
-                    audit,
                 });
             }
             VendoredMode::BuildDepOnly { justification } => {
@@ -1489,7 +1489,9 @@ pub(crate) mod test_fixtures {
         "crates/aterm-dirfd/src",
         "crates/aterm-effects/src",
         "crates/aterm-error/src",
-        "crates/aterm-ffi-types/src",
+        // `aterm-ffi-types` LEFT the closure 2026-09-25: aterm-selection never
+        // used it and dropped the edge; only the C-ABI crate `aterm-ffi`
+        // (not a GUI dependency) still depends on it.
         "crates/aterm-gpu/src",
         "crates/aterm-grapheme/src",
         "crates/aterm-grid/src",
@@ -1589,7 +1591,6 @@ pub(crate) mod test_fixtures {
         "crates/aterm-session/src",
         "crates/aterm-shell-integration/src",
         "crates/aterm-sixel/src",
-        "crates/aterm-suggest/src",
         // Entered the closure 2026-09-24 with the strain row
         // (docs/DESIGN-unified-messages-2026-09-21.md §10.14, ruling 210):
         // aterm-gui's strain host reads the machine through it on its probe
@@ -1600,7 +1601,9 @@ pub(crate) mod test_fixtures {
         // (Its sampler method is `reading()`, not `read()`: a zero-argument
         // `.read()` is this census's RwLock token.)
         "crates/aterm-sysprobe/src",
-        "crates/aterm-tempfile/src",
+        // `aterm-tempfile` LEFT the closure 2026-09-25 with aterm-grid's unused
+        // normal edge (it had backed the deleted disk-spill budget); it remains
+        // a dev-dependency only.
         // Entered the closure when the first-party clock replaced
         // `web-time`: aterm-core, -types, -effects, -gpu, -predict,
         // -policy, -observe and -agent all sample time through it now. A

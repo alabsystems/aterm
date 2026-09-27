@@ -2,14 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Core terminal types: capabilities and state snapshot.
+//! Core terminal types: capabilities.
 //!
 //! Extracted from `aterm-core::terminal::types::core` to break circular
 //! dependencies and enable independent compilation (Part of #5663, #2341).
-
-use std::sync::Arc;
-
-use crate::CursorStyle;
 
 // ============================================================================
 // Terminal Capabilities
@@ -160,46 +156,6 @@ impl TerminalCapabilities {
         }
         features.join(";")
     }
-}
-
-// ============================================================================
-// Terminal Snapshot
-// ============================================================================
-
-/// A snapshot of terminal state at a point in time.
-///
-/// This captures the essential state needed for diagnostics, debugging,
-/// or state comparison without the full Terminal struct overhead.
-#[derive(Debug, Clone)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "snapshot captures many terminal boolean states"
-)]
-pub struct TerminalSnapshot {
-    /// Current cursor row (0-based).
-    pub cursor_row: u16,
-    /// Current cursor column (0-based).
-    pub cursor_col: u16,
-    /// Terminal width in columns.
-    pub cols: u16,
-    /// Terminal height in rows.
-    pub rows: u16,
-    /// Current window title.
-    pub title: Arc<str>,
-    /// Current working directory (if set).
-    pub current_working_directory: Option<String>,
-    /// Whether we're on the alternate screen.
-    pub alternate_screen_active: bool,
-    /// Whether origin mode is enabled.
-    pub origin_mode: bool,
-    /// Whether insert mode is enabled.
-    pub insert_mode: bool,
-    /// Whether cursor is visible.
-    pub cursor_visible: bool,
-    /// Current cursor style.
-    pub cursor_style: CursorStyle,
-    /// Total lines in scrollback (ring buffer + tiered).
-    pub total_scrollback_lines: usize,
 }
 
 #[cfg(test)]

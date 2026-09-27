@@ -8,7 +8,7 @@
 
 use std::ptr::NonNull;
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, kani))]
 use super::Offset;
 use super::{PAGE_SIZE, Page, PageSlice};
 
@@ -165,7 +165,7 @@ impl PageStore {
     /// # Safety
     ///
     /// Caller must ensure no `PageSlice` references are used after reset.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     pub fn reset(&mut self) {
         // Build used-byte metadata in page order so it stays aligned when
         // pages are popped in reverse order below.
@@ -272,7 +272,7 @@ impl PageStore {
             ptr,
             len,
             page_id,
-            #[cfg(any(test, kani, feature = "testing"))]
+            #[cfg(any(test, kani))]
             // offset bounded by PAGE_SIZE (64KB) — always fits in u32
             offset: Offset::new(u32::try_from(offset).unwrap_or(u32::MAX)),
         }

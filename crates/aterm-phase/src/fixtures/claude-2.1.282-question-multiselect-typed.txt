@@ -1,0 +1,37 @@
+# claude-code 2.1.282 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm 0.93.0 (180x50) · S3 tab 3 DANGER CHECK: key `2` with focus on the multiSelect free-text row · user and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user0000000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /clear
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this input (copy every string verbatim, change nothing, add nothing): {"questions": [{"question": "On a row
+  with a progress bar, how should its primary button look?", "header": "Button", "multiSelect": false, "options": [{"label": "Outlined on meters (Recommended)", "description": "An
+  accent ring with no solid fill on rows that carry a progress bar."}, {"label": "Solid everywhere", "description": "Keep today's solid accent button on every row."}]},
+  {"question": "What colour should the idle cursor be?", "header": "Grey cursor", "multiSelect": false, "options": [{"label": "Accent colour", "description": "Keep the theme
+  accent even when idle."}, {"label": "Grey (Recommended)", "description": "Fade to grey when the terminal is idle."}, {"label": "Invisible", "description": "Hide the cursor when
+  idle."}]}, {"question": "Which glyph sets should be bundled?", "header": "Glyphs", "multiSelect": true, "options": [{"label": "Box drawing (Recommended)", "description":
+  "Procedural box and line glyphs."}, {"label": "Emoji", "description": "A colour emoji fallback font."}, {"label": "Powerline (Recommended)", "description": "Powerline separators
+  and arrows."}]}, {"question": "Where should the message band sit?", "header": "Placement", "multiSelect": false, "options": [{"label": "Top", "description": "Above the tab
+  strip."}, {"label": "Bottom", "description": "Below the last terminal row."}, {"label": "Floating", "description": "An overlay in the corner."}]}]}  After the tool returns,
+  reply with only the word DONE.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Button  ☒ Grey cursor  ☒ Glyphs  ☐ Placement  ✔ Submit  →
+
+Which glyph sets should be bundled?
+
+  1. [✔] Box drawing (Recommended)
+         Procedural box and line glyphs.
+  2. [ ] Emoji
+         A colour emoji fallback font.
+  3. [✔] Powerline (Recommended)
+         Powerline separators and arrows.
+❯ 4. [✔] 2
+     Next
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to cancel

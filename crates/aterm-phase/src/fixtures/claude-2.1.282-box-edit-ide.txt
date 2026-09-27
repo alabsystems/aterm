@@ -1,0 +1,13 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, the showingDiffInIDE title (`Opened changes in <IDE> ⧉`), on the measured 2.1.280/2.1.281 box geometry · an edit shown in the IDE
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Opened changes in VS Code ⧉
+ src/x.rs
+ Save file to continue…
+ Do you want to make this edit to x.rs?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

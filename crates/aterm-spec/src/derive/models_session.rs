@@ -284,7 +284,10 @@ pub fn transact_model() -> Model {
 /// and bumps the count, so the head seq always equals the number of events — no
 /// gaps, no duplicates. `Buggy` makes an append jump seq by 2 (a gap), so
 /// `seq != count` and `SeqIsCount` is violated. ty proves it (Buggy=0) and catches
-/// the gap (Buggy=1).
+/// the gap (Buggy=1). Tier-1: aterm-buffer's `tests/conformance_kernel.rs` drives
+/// every real edit kind, transactions, the `append_at` spill seam and the eviction
+/// regime, projecting `count` from the writer and `seq` from the seq stamped on
+/// each event the real log stored (every stored event is one `Emit`).
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -359,6 +362,16 @@ pub fn kernel_model() -> Model {
 /// counterexample at `Buggy = 1`, where the reachable `BuggyApplyInflight` tears state.
 /// So the model proves the safety property that the mid-flight apply is FORBIDDEN (a
 /// reachable defect the checker catches), not a liveness claim that requests complete.
+///
+/// Tier-1: in the shipping overlap handoff a "request" is a slice of PTY output the
+/// reader has drained from the kernel and not yet folded into the engine, and the
+/// "apply" is the handoff proceeding past `park_all_readers`, which it does only
+/// when every `spawn::park_reader` returns `true`. aterm-gui's
+/// `spawn::dsu_quiescence_conformance` attaches the REAL reader (the gather + parse
+/// pipeline) to a real pseudo-terminal, holds the engine busy on the terminal lock
+/// so a drained slice stays in flight, and validates every step — both the reader
+/// stopping and `park_reader` ACKing — against this model; an ACK with a drained
+/// slice unapplied is the step it rejects.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -541,6 +554,20 @@ pub fn handoff_roundtrip_model() -> Model {
 /// completion that every prepared master is eventually accounted for (`adopted + closed
 /// == prepared`), which a safety invariant cannot establish. A `prepared` master not yet
 /// adopted/closed is a legal IN-FLIGHT state, not a leak.
+///
+/// Tier-1 binding, two tests in aterm-gui, each classifying every handed master by
+/// a pooled session owning it (`Adopt`) or its witness reading EOF
+/// (`CloseFallback`) — neither is the `BuggyDrop` step:
+/// `app_restore::tests::handed_off_masters_are_adopted_or_closed_never_leaked`
+/// hands socketpair "masters" through the real orphan net
+/// (`App::adopt_orphan_shells_as_tabs`) with and without a window to adopt into,
+/// adopting through the shipping `spawn::HandedMaster::into_sink`; and
+/// `seamless::tests::a_refused_handoff_closes_every_master_it_was_handed` has the
+/// real `take_incoming` refuse a staged two-PTY handoff after claiming one master.
+/// The windowless branch used to be exactly the `BuggyDrop` step;
+/// `spawn::HandedMaster`, which owns an un-adopted master and closes it on drop,
+/// is what removed it. A spawn that fails after taking the handle is closed by
+/// that same ownership and is not driven (it needs a live event loop).
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -802,12 +829,20 @@ pub fn snapshot_model() -> Model {
 ///   2. `SeqIsStaleOrCurrent: snap_seq <= epoch` — the captured seq never exceeds
 ///      the live epoch, so it is MONOTONE (the epoch only grows) and STALENESS is
 ///      always DETECTABLE: a consumer observing `epoch > snap_seq` knows its
-///      snapshot is behind. Holds for both `Buggy` values (it pins the capture to
-///      `= epoch`; a wrong capture would violate it), so it is non-vacuous.
+///      snapshot is behind. `snap_seq` is the ENGINE's stamp (`engine_fill_seq`):
+///      `damage_epoch`'s latch only ever lags a write, so the engine cannot stamp
+///      ahead. The scratch's `snapshot_seq` CAN run ahead — every host mutator
+///      bumps it past the engine stamp (stream fade, prediction ghosts, the find
+///      bar, the Claude footer: the ghost-paint discipline). `Buggy = 1` stamps
+///      the capture one ahead, which is that host-bumped value read as the
+///      engine's: one engine advance lands the live epoch on it, and a stale frame
+///      passes `epoch > snap_seq` as current — the numeric collision
+///      `effect_only_snapshot_reusable`'s `engine_fill_seq == snapshot_seq` clause
+///      exists to refuse. This invariant is that counterexample.
 ///
 /// Conformance-bound to the REAL `Terminal::cell_frame` + `damage_epoch`/
 /// `take_damage` path in `aterm-core/tests/conformance_read_image_seq.rs` (Tier-1),
-/// with a negative control so the pass is never vacuous.
+/// with a negative control per law so neither pass is vacuous.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
@@ -830,8 +865,9 @@ pub fn read_image_seq_model() -> Model {
             }
 
             // read_image: capture snap_seq = damage_epoch atomically, activate.
+            // Buggy: the stamp is a host-bumped seq, one ahead of the engine's.
             action ReadImage when (snapped == 0) {
-                snap_seq = epoch;
+                snap_seq = if Buggy == 1 { epoch + 1 } else { epoch };
                 snapped = 1;
             }
 
@@ -1102,10 +1138,15 @@ pub fn evict_full_model() -> Model {
 /// Function-valued ⇒ Tier-0 `ty`-checked (TLA+ generation), not run through the
 /// scalar interpreter. The keyframe-recoverability clause from the design
 /// (`\E k : k =< n /\ keyframe_at[k] /\ resident(k)`) is intentionally **out of
-/// scope here**: it needs an existential the derive DSL lacks and belongs to the
-/// B.8.3 hydration-faithfulness model, where the keyframe→replay fold lives.
-/// Residency (live ∨ warm ∨ cold) is the complete spill-not-forget property for
-/// this machine.
+/// scope here** (it needs an existential the derive DSL lacks), and it was never
+/// added anywhere: B.8.3's `recording_model` uses a fixed keyframe. The shipped
+/// contract superseded it — re-keyframing keeps the latest instant reachable,
+/// and a needed base that aged out answers `ERR temporal unreachable` rather
+/// than a wrong screen (aterm-gui `temporal.rs` tests
+/// `rekeyframing_keeps_the_latest_reachable_past_the_budget`,
+/// `replay_degrades_to_none_when_needed_blobs_were_evicted`). Residency
+/// (live ∨ warm ∨ cold) is the complete spill-not-forget property for this
+/// machine.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1420,6 +1461,53 @@ pub fn recording_model() -> Model {
     }
 }
 
+/// COALESCE: the streaming write fold must be a pure function of the byte log
+/// regardless of how it is split across `process_at` calls — i.e. the fast
+/// "bulk" lane (a coalesced run through the batched writers) and the reference
+/// "single-char" lane (one byte per call, so every glyph goes through the
+/// per-glyph writer) must agree on every cell after every element of the log.
+///
+/// This is a 2-SAFETY property (a relation between two runs over the SAME input),
+/// which a plain single-execution invariant cannot state — which is exactly why
+/// model-checking missed the wide-char-wrap-tail and ZWJ-join divergences that
+/// shipped. It is lifted by SELF-COMPOSITION to the 1-safety invariant
+/// `LanesAgree` that `ty` can discharge, in the scalar form the interpreter can
+/// judge too: the model keeps only the VERDICT of the composition — `seq`, the
+/// elements folded so far, and `diverged`, whether the two screens differ after
+/// them. The two lanes themselves are not in the model; they are the Tier-1
+/// bind's, which runs both over real bytes and projects that verdict. `Buggy`
+/// reproduces the real class as a verdict: at `SKIPAT` the bulk lane drops the
+/// per-element fixup the single lane applies (the wrap-tail blank / the ZWJ
+/// continuation), so the lanes diverge.
+///
+/// Tier-1: `aterm-core/tests/replay_corpus_probe.rs` drives the SHIPPING
+/// `process_at` down both lanes over every adversarial corpus, projects
+/// `diverged` from the two lanes' real `checkpoint()`s after every
+/// PARSER-GROUND prefix (a record that ends mid-escape or mid-UTF-8 extends the
+/// element into the next record, since a checkpoint is only defined at ground),
+/// and validates each element as this model's `Emit` — so a divergence at any
+/// grounded prefix is a step the model rejects, not only one that survives to
+/// the end of the log.
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
+// models above) — the MODEL it returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn coalesce_model() -> Model {
+    crate::ty_model! {
+        Coalesce {
+            const MaxSeq = 4;
+            const SKIPAT = 2;   // the element at which the buggy bulk lane drops the fixup
+            const Buggy = 0;
+            var seq = 0;        // elements folded down both lanes
+            var diverged = 0;   // the two lanes' screens differ
+            action Emit when (seq <= MaxSeq - 1) {
+                seq = seq + 1;
+                diverged = if Buggy == 1 && seq + 1 == SKIPAT { 1 } else { diverged };
+            }
+            invariant LanesAgree: diverged == 0;
+        }
+    }
+}
+
 /// An ELEVENTH derived model — IN-PROCESS MULTI-WINDOW ROUTING (the GUI window
 /// lifecycle the multi-window work builds: `App` holds `BTreeMap<WindowId,
 /// WindowState>` with a `frontmost_window`; Cmd-N creates a window, closing the
@@ -1430,12 +1518,22 @@ pub fn recording_model() -> Model {
 /// concurrent windows and `MaxId` bounds total creations, keeping `ty`'s search
 /// exhaustive + terminating.
 ///
-/// `Buggy` gates the close-last-window path: with `Buggy = 0` (committed) closing
-/// the LAST window sets `exited`, so exit and an empty window set stay in
-/// lockstep; with `Buggy = 1` the last close fails to exit, reproducing the
-/// "no windows left but the app is still running" defect. So `ty` both PROVES the
-/// routing invariants (Buggy=0) and CATCHES the missed exit (Buggy=1 ->
-/// counterexample on `ExitIffEmpty`).
+/// `Buggy = 1` carries one defect per law, each a one-line slip in the real `App`
+/// seams (Tier-1: `aterm-gui`'s `window_routing_conformance`), so `ty` both
+/// PROVES the routing invariants (Buggy=0) and CATCHES each slip (Buggy=1):
+/// * the last close does not exit (`ExitIffEmpty`);
+/// * `close_window_logical` skips its frontmost re-point, so closing the last
+///   window leaves `frontmost_window` naming the window it just dropped
+///   (`FrontmostLive`). The catch is the LAST close only: there the real app
+///   exits (`CloseOutcome::Exit` → `el.exit()`), so it pins the bookkeeping, not a
+///   live misroute. The harmful form — the front window closes while another
+///   survives and the frontmost keeps the dead id — is invisible to this scalar
+///   projection (any id below `next_id` passes both frontmost laws); the real
+///   `structural_invariant_violation` oracle ("names no live window"),
+///   debug-asserted by `close_window_logical`, is what refuses it;
+/// * `insert_logical_window` bumps `next_window_id` BEFORE reading it, so the new
+///   window — and the frontmost — carries the id the NEXT create will mint again
+///   (`FrontmostAllocated`: never a future or reused id).
 ///
 /// SESSION CONNECTIONS (design §9: the window-routing obligations EXTENDED, not
 /// a new standalone model): two connection-era acts join the machine.
@@ -1461,112 +1559,17 @@ pub fn recording_model() -> Model {
 /// not which specific ids are live (that needs a per-element refinement / the
 /// Tier-1 conformance bind to the real `App`). It is exactly the close→exit +
 /// never-reuse safety core.
-/// COALESCE: the streaming write fold must be a pure function of the byte log
-/// regardless of how it is split across `process_at` calls — i.e. the fast
-/// "bulk" lane and the reference "single-char" lane must agree on every cell.
-///
-/// This is a 2-SAFETY property (a relation between two runs over the SAME input),
-/// which a plain single-execution invariant cannot state — which is exactly why
-/// model-checking missed the wide-char-wrap-tail and ZWJ-join divergences that
-/// shipped. It is encoded here by SELF-COMPOSITION (the same trick
-/// `recording_model` uses for live-vs-replay parity): one machine folds the same
-/// event stream down BOTH lanes and asserts they never diverge, lifting the
-/// 2-safety to a 1-safety invariant `ty` can discharge. The `Buggy` convention
-/// reproduces the real class: at `SKIPAT` the bulk lane drops the per-element
-/// fixup the single lane applies (the wrap-tail blank / the ZWJ continuation),
-/// so the lanes diverge and the invariant is violated.
-///
-/// Tier-1 binds this to the SHIPPING engine: `aterm-core/tests/replay_corpus_probe.rs`
-/// drives the real `process_at` across every chunking of adversarial corpora and
-/// asserts an identical `checkpoint()` — the concrete witness this model abstracts.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn coalesce_model() -> Model {
-    Model {
-        name: "Coalesce",
-        // SKIPAT = the fold index at which the buggy bulk lane drops the fixup.
-        consts: vec![("MaxSeq", 4), ("SKIPAT", 2), ("Buggy", 0)],
-        vars: vec![StateVar {
-            name: "seq",
-            init: 0,
-        }],
-        fn_vars: vec![
-            FnVar {
-                name: "single",
-                range: "MaxSeq",
-            }, // reference (per-char) fold
-            FnVar {
-                name: "bulk",
-                range: "MaxSeq",
-            }, // fast (coalesced) fold
-        ],
-        actions: vec![Action {
-            name: "Emit",
-            guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
-            updates: vec![
-                Update {
-                    var: "seq",
-                    expr: add(var("seq"), int(1)),
-                },
-                // Reference lane: each element flips parity (the per-element fixup).
-                Update {
-                    var: "single",
-                    expr: except(
-                        "single",
-                        add(var("seq"), int(1)),
-                        if_(
-                            eq(var("seq"), int(0)),
-                            bool_lit(true),
-                            neq(fn_access("single", var("seq")), bool_lit(true)),
-                        ),
-                    ),
-                },
-                // Bulk lane: identical fold, EXCEPT the Buggy variant skips the
-                // fixup at SKIPAT (copies the previous cell), diverging — exactly
-                // the wrap-tail / ZWJ class. The skip branch only reads bulk[seq]
-                // when seq+1 = SKIPAT (so seq >= 1); seq = 0 takes the else.
-                Update {
-                    var: "bulk",
-                    expr: except(
-                        "bulk",
-                        add(var("seq"), int(1)),
-                        if_(
-                            and_(
-                                eq(cst("Buggy"), int(1)),
-                                eq(add(var("seq"), int(1)), cst("SKIPAT")),
-                            ),
-                            fn_access("bulk", var("seq")), // BUG: drop the fixup
-                            if_(
-                                eq(var("seq"), int(0)),
-                                bool_lit(true),
-                                neq(fn_access("bulk", var("seq")), bool_lit(true)),
-                            ),
-                        ),
-                    ),
-                },
-            ],
-        }],
-        invariants: vec![Invariant {
-            name: "LanesAgree",
-            // \A n in 1..MaxSeq : (n > seq) \/ (bulk[n] <=> single[n])
-            expr: forall(
-                "n",
-                int(1),
-                cst("MaxSeq"),
-                or_(
-                    gt(var("n"), var("seq")),
-                    iff(fn_access("bulk", var("n")), fn_access("single", var("n"))),
-                ),
-            ),
-        }],
-    }
-}
-
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn window_routing_model() -> Model {
+    // The value `frontmost` takes when the LAST window closes: none (0), or — the
+    // skipped re-point — the id of the window just closed.
+    let emptied = || eq(sub(var("win_count"), int(1)), int(0));
+    let last_close_frontmost = || if_(eq(cst("Buggy"), int(1)), var("frontmost"), int(0));
+    // The id a create mints for the new frontmost window: `next_id`, or — read
+    // after the bump — the one the NEXT create will mint.
+    let minted = || add(var("next_id"), cst("Buggy"));
     Model {
         name: "WindowRouting",
         consts: vec![("MaxWin", 2), ("MaxId", 4), ("Buggy", 0)],
@@ -1608,7 +1611,7 @@ pub fn window_routing_model() -> Model {
                     },
                     Update {
                         var: "frontmost",
-                        expr: var("next_id"),
+                        expr: minted(),
                     },
                     Update {
                         var: "next_id",
@@ -1658,16 +1661,20 @@ pub fn window_routing_model() -> Model {
                     // choice is one such admissible value, so Tier-1 conformance
                     // accepts it. This ADMITS the frontmost-with-a-survivor re-point
                     // the old `frontmost' = frontmost` over-pinned away WITHOUT
-                    // over-committing to an unprojectable policy. ExitIffEmpty (the
-                    // Buggy=1 catch) is independent of this update, so the proof at
-                    // Buggy=0 and the counterexample at Buggy=1 both still hold.
+                    // over-committing to an unprojectable policy. ExitIffEmpty's
+                    // Buggy=1 catch is independent of this update, so the proof at
+                    // Buggy=0 and that counterexample at Buggy=1 both still hold.
+                    //
+                    // The in_range MUST be the top-level RHS (the renderer emits
+                    // `frontmost' \in lo..hi` only there), so the skipped re-point
+                    // (Buggy) is folded into the bounds of the emptied case.
                     Update {
                         var: "frontmost",
                         expr: in_range(
-                            if_(eq(sub(var("win_count"), int(1)), int(0)), int(0), int(1)),
+                            if_(emptied(), last_close_frontmost(), int(1)),
                             if_(
-                                eq(sub(var("win_count"), int(1)), int(0)),
-                                int(0),
+                                emptied(),
+                                last_close_frontmost(),
                                 sub(var("next_id"), int(1)),
                             ),
                         ),
@@ -1704,7 +1711,7 @@ pub fn window_routing_model() -> Model {
                     },
                     Update {
                         var: "frontmost",
-                        expr: var("next_id"),
+                        expr: minted(),
                     },
                     Update {
                         var: "next_id",
@@ -1826,6 +1833,14 @@ pub fn dispatch_complete_model() -> Model {
 /// closed (so both pumps unblock). `ty` proves it at `Buggy = 0` and returns the
 /// parked-reader counterexample (`done = 1` with a read half still open) at
 /// `Buggy = 1`.
+///
+/// Tier-1 binding: aterm-gui's
+/// `proxy::tests::relay_teardown_conforms_to_readers_unblock_after_teardown`
+/// tears the real `relay_bidirectional` down on an injected send fault while
+/// both peers stay open, observes each read half on a clone of the relay's local
+/// socket, and validates the result as this model's `Teardown` — the
+/// `shutdown(Write)`-only teardown leaves both halves open, the step only
+/// `Buggy = 1` admits.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1848,10 +1863,21 @@ pub fn relay_teardown_model() -> Model {
 /// counts live sessions, `registered` counts retained entries, bounded by `MaxN`.
 /// `Spawn` registers + adds a live session; `Close` removes a live session and —
 /// correctly — its entry, but `Buggy = 1` models the original `Drop` that forgot
-/// to deregister (the entry survives a closed session).
+/// to deregister (the entry survives a closed session), once, from a table that
+/// had not leaked yet: the single slip keeps the `Buggy = 1` space finite.
 ///
 /// Invariant `NoRegistryLeak`: `registered =< live`. `ty` proves it at
 /// `Buggy = 0` and catches the leak (`registered = live + 1`) at `Buggy = 1`.
+///
+/// Tier-1 binding: aterm-gui's
+/// `session_pool_tests::session_close_conforms_to_proxy_registry_no_leak` drives
+/// the real provisioning (`spawn::provision_child_proxy`, whose
+/// `proxy::ChildProxy` the session keeps) and the real session drop through a
+/// spawn/close script that fills `MaxN` and drains it, projecting the pool and
+/// `proxy::proxies()` onto `live`/`registered` at every step. Storing the
+/// `ChildProxy` in the session is `spawn_session`'s, which needs a live event
+/// loop; the test stores it as that code does, and the half it cannot drive is
+/// structural: an unstored `ChildProxy` drops, deregistering.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1886,6 +1912,14 @@ pub fn proxy_registry_model() -> Model {
 /// Checked with `CHECK_DEADLOCK TRUE` ([`Model::to_cfg_deadlock_with`]). The
 /// `Done` self-loop is MANDATORY — without it `ty` flags the clean
 /// `client_waiting = 0` terminal itself as a deadlock (stuttering does not count).
+///
+/// Tier-1 binding: aterm-gui's
+/// `control::tests::try_proxy_forward_conforms_to_forward_handshake` sends one
+/// request line through the real `try_proxy_forward` to a stand-in child socket
+/// and validates the observed `Relay` (the child receives the handshake) and
+/// `ClientRecv` (the client is answered) against this model; a forward that
+/// demands a fresh client read first is reported parked in the state only
+/// `Buggy = 1` wedges in.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1911,8 +1945,10 @@ pub fn forward_handshake_model() -> Model {
 /// first, leaving both parties parked in the initial state.
 ///
 /// This is deliberately separate from [`forward_handshake_model`]: the abstract
-/// wedge is the same, but this model is Tier-1-bound to the genuine TLS relay by
-/// `tls::tests::relay_round_trips_guarded_artifact_ack_before_request_half_close`.
+/// wedge is the same, but each is Tier-1-bound to its own relay — this one to the
+/// genuine TLS relay by
+/// `tls::tests::relay_round_trips_guarded_artifact_ack_before_request_half_close`,
+/// that one to the control socket's cross-process forward.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1942,6 +1978,14 @@ pub fn tls_buffered_relay_model() -> Model {
 ///
 /// Invariant `PermitImpliesAllGuards`: a permit implies every guard truly held.
 /// `ty` proves it and catches the dropped-conjunct disclosure.
+///
+/// Tier-1 binding: aterm-session's `tests/conformance_authorize.rs` drives the
+/// real `decide_edge` over all sixteen guard combinations and
+/// `EdgeTable::authorize` over the eight with `op` held (it takes no op, and its
+/// callers compare the one it returns to nothing), validates each real
+/// `Present`/`Authorize` step against this model, and replays the same steps
+/// against `Buggy = 1`, which must reject the shipping gate's denial of the
+/// wrong-destination presentation the mutant permits.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1977,6 +2021,16 @@ pub fn authorize_soundness_model() -> Model {
 /// authorization-soundness class): a forward is permitted only when the connection
 /// is Owner-scoped; `Buggy` waives that guard (the transitive escalation). Invariant
 /// `ForwardImpliesOwner`: a permitted forward implies the connection was Owner.
+///
+/// Tier-1 binding: aterm-gui's
+/// `control::tests::proxy_forward_plan_conforms_to_no_transitive_authority`
+/// drives the real `proxy_forward_plan` across read, write, signal and subscribe
+/// lines aimed at a forwardable child for an Owner connection, a bridge one, and
+/// one that ARRIVED over the forward — whose scope is what the child's real
+/// connect-time auth (`control::first_line_scope`) makes of the exact first line
+/// the Owner's plan sends — stating `owner` from what each scope is rather than
+/// from `is_owner_class`, and replays the steps against `Buggy = 1`, which must
+/// part from the real router on every arrived line.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]

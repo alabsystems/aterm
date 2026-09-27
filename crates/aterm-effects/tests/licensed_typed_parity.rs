@@ -943,7 +943,7 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // FLOWING (`Cohort::flow`, `Ribbon::flow_row`; the owner: *"the
         // previous row's rainbow flows in the direction of typing while the
         // rainbow continues on the next line"*): row 2 slides into its fold
-        // point from its last key over `FLOW_SLIDE_S` instead of holding
+        // point from its last key over `FLOW_TOTAL_S` instead of holding
         // still through its grace. Decomposed: with `Ribbon::flow_cohort`
         // forced to a no-op and every other law of the round in place (the
         // relay's walk, the follow pass, the flush clock, the witness's
@@ -980,7 +980,20 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // merged tree (`ATERM_CAPTURE_TYPED_PARITY=1`) — main's value
         // `18_370_343_873_451_645_674` is what the merged tree reads, entries
         // 0, 1 and 3..=8 came back byte-identical to main's, the control.
-        18_370_343_873_451_645_674,
+        // **RE-BASELINED 2026-09-23, THE DRIFT AND THE SEAM, AND AGAIN ONLY
+        // ENTRY `2`** (was `18_370_343_873_451_645_674`; the owner: *"the
+        // existing line rainbow should beautifully flow and drift and fade
+        // away, not simply abruptly vanish. some subtle visualisation for the
+        // new line would also be welcome"*). The script's one wrap, `(2, 36)
+        // → (3, 0)`, sets row 2 flowing, and the flow is now a rigid drift
+        // with a settle and a far-first fade to a common end
+        // (`FLOW_TOTAL_S` 1.50 s), and the new row carries the seam
+        // (`Ribbon::seam`) along its tail. Decomposed: with `Ribbon::arm_seam`
+        // forced to a no-op entry 2 reads `13_596_216_564_162_636_141` — the
+        // drift alone — and with both it reads the value below; entries 0, 1
+        // and 3..=8 came back byte-identical, the control (neither reaches
+        // another style).
+        13_217_896_978_492_768_086,
         6_434_568_479_864_447_486,
         1_103_233_083_236_013_119,
         10_518_610_175_969_919_396,
@@ -1093,7 +1106,15 @@ fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
     // on the merged tree (`ATERM_CAPTURE_TYPED_PARITY=1`); the `assert_ne!`
     // control below still holds, which is what keeps this a pin on the
     // COLLAPSE rather than on a number.
-    const PRE_COMET: u64 = 14_052_065_336_766_733_923;
+    // RE-CAPTURED 2026-09-23, THE DRIFT AND THE SEAM (was
+    // `14_052_065_336_766_733_923`): neither is a comet branch — the flag
+    // gates the comet profile, the vivid rail and the from-the-hand wipe,
+    // not how a row the hand typed off drifts into its fold or the hot
+    // edge's floor on the continued row — so they move the flat fold with
+    // the comet one (`GOLDEN`'s entry 2 above; with the seam off this reads
+    // `17_897_746_613_815_188_275`). The `assert_ne!` control below still
+    // holds.
+    const PRE_COMET: u64 = 11_050_258_555_939_167_288;
     let mut flat = cfg(GlowStyle::RainbowKitty);
     flat.ribbon_flat = true;
     let a = typed_script_with(&flat, true);

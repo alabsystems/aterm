@@ -36,9 +36,9 @@
 //! It holds only rows `text` already showed, lives in memory, is never part of
 //! a checkpoint, is wiped by RIS, and is read through a clone-out API
 //! ([`AltArchive::read`]) so the caller formats the reply after dropping the
-//! terminal lock. `ATERM_ALT_ARCHIVE=0` (read once per process) turns it off by
-//! default; [`Terminal::set_alt_archive_enabled`] and
-//! [`Terminal::set_alt_archive_budget`] override per session.
+//! terminal lock. It is always on (the `ATERM_ALT_ARCHIVE=0` opt-out is gone,
+//! 2026-09-24); [`Terminal::set_alt_archive_enabled`] and
+//! [`Terminal::set_alt_archive_budget`] set it per session.
 //!
 //! # The budget is one budget
 //!
@@ -115,10 +115,6 @@ pub const ALT_ARCHIVE_ROW_OVERHEAD: usize = size_of::<ArchivedRow>() + 2 * size_
 pub const fn alt_archive_row_charge(len: usize) -> usize {
     len.next_multiple_of(16) + ALT_ARCHIVE_ROW_OVERHEAD
 }
-/// Environment variable that turns the archive OFF by default for every terminal
-/// this process creates: `ATERM_ALT_ARCHIVE=0` (also `off`, `false`, `no`).
-pub const ALT_ARCHIVE_ENV: &str = "ATERM_ALT_ARCHIVE";
-
 /// Minimum visible chars for a row to vote (after trimming both ends).
 const MIN_ANCHOR_CHARS: usize = 4;
 /// Votes a shift needs (fewer when the previous frame has fewer anchors).
@@ -551,12 +547,14 @@ impl AltArchiveBudget {
 
     /// Bytes this pool divides between its archives.
     #[must_use]
+    #[cfg(test)]
     pub fn total(&self) -> usize {
         self.total
     }
 
     /// The floor under one archive's share.
     #[must_use]
+    #[cfg(test)]
     pub fn min_share(&self) -> usize {
         self.min_share
     }
@@ -728,6 +726,7 @@ impl AltArchive {
 
     /// An archive with an explicit byte budget and row cap (tests, embedders).
     #[must_use]
+    #[cfg(test)]
     pub fn with_limits(budget: usize, max_rows: usize) -> Self {
         let mut a = Self::new();
         a.budget = budget;
@@ -764,6 +763,7 @@ impl AltArchive {
 
     /// Bytes charged against the budget.
     #[must_use]
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -772,6 +772,7 @@ impl AltArchive {
     /// before any shared pool. [`Self::effective_budget`] is what it may
     /// actually retain.
     #[must_use]
+    #[cfg(test)]
     pub fn budget(&self) -> usize {
         self.budget
     }
@@ -789,6 +790,7 @@ impl AltArchive {
 
     /// The shared budget this archive draws on, if any.
     #[must_use]
+    #[cfg(test)]
     pub fn shared_budget(&self) -> Option<&Arc<AltArchiveBudget>> {
         self.share.as_ref().map(|s| &s.pool)
     }
@@ -826,6 +828,7 @@ impl AltArchive {
 
     /// Whether the archive is recording.
     #[must_use]
+    #[cfg(test)]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -982,6 +985,7 @@ impl AltArchive {
 
     /// Commit one frame given as row strings (the pure entry point: tests and
     /// embedders). Each row is normalized exactly like extracted grid text.
+    #[cfg(test)]
     pub fn commit_rows<S: AsRef<str>>(&mut self, rows: &[S], cols: u16) {
         if !self.enabled {
             return;
@@ -1902,8 +1906,8 @@ impl AltArchive {
     /// — when any part of it does not fit the frame it describes or the rows
     /// it points at, none of it is, and the next frame starts a new baseline
     /// ([`AltArchiveImport::NoBaseline`]). This archive's own budget then
-    /// evicts what it cannot hold. An archive that is off refuses the carry,
-    /// so `ATERM_ALT_ARCHIVE=0` on the adopting side drops the carried rows.
+    /// evicts what it cannot hold. An archive that is off refuses the carry, so
+    /// an adopting side that switched it off drops the carried rows.
     pub fn import(&mut self, carry: AltArchiveCarry) -> AltArchiveImport {
         if !self.enabled {
             return AltArchiveImport::Refused;
@@ -2158,20 +2162,6 @@ fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     tail.iter().position(|&b| b == needle).map(|i| base + i)
 }
 
-/// Whether `ATERM_ALT_ARCHIVE` turns the archive off for this process (read
-/// once).
-fn env_opted_out() -> bool {
-    static OPT_OUT: OnceLock<bool> = OnceLock::new();
-    *OPT_OUT.get_or_init(|| {
-        std::env::var(ALT_ARCHIVE_ENV).is_ok_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false" | "no"
-            )
-        })
-    })
-}
-
 // =====================================================================
 // The streaming DEC-mode matcher (A2): finds the `CSI ? Pm <final>` sequences
 // that end a frame or switch screens, across read boundaries.
@@ -2399,14 +2389,10 @@ pub(super) struct AltArchiveState {
 }
 
 impl AltArchiveState {
-    /// Enabled unless `ATERM_ALT_ARCHIVE=0` says otherwise.
+    /// Enabled: the archive is on for every terminal.
     pub(super) fn new() -> Self {
-        let mut archive = AltArchive::new();
-        if env_opted_out() {
-            archive.enabled = false;
-        }
         Self {
-            archive,
+            archive: AltArchive::new(),
             matcher: DecModeMatcher::default(),
             seen_sync_seq: 0,
             seen_reset_gen: 0,
@@ -2463,8 +2449,7 @@ impl Terminal {
         }
     }
 
-    /// Turn the archive on or off for this session (overrides
-    /// `ATERM_ALT_ARCHIVE`). Off wipes it.
+    /// Turn the archive on or off for this session. Off wipes it.
     pub fn set_alt_archive_enabled(&mut self, enabled: bool) {
         let was = self.alt_archive.archive.enabled;
         self.alt_archive.archive.set_enabled(enabled);

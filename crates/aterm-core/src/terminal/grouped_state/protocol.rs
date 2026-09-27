@@ -4,8 +4,6 @@
 
 //! Protocol-oriented grouped terminal state.
 
-use super::callbacks::DcsCallback;
-
 /// Type of DCS sequence being processed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(in crate::terminal) enum DcsType {
@@ -37,10 +35,6 @@ pub(in crate::terminal) struct DcsState {
     /// Used to prevent unbounded memory growth from DCS sequences.
     /// Enforced against `MAX_DCS_GLOBAL_BUDGET` in handler.rs.
     pub(in crate::terminal) total_bytes: usize,
-    /// Callback for DCS payloads.
-    pub(in crate::terminal) callback: Option<DcsCallback>,
-    /// Final byte for the active DCS sequence.
-    pub(in crate::terminal) final_byte: Option<u8>,
     /// Bytes consumed by the current DCS sequence (reset in hook, released in unhook).
     /// Separate from `data.len()` because Sixel feeds bytes to the decoder, not `data`.
     pub(in crate::terminal) sequence_bytes: usize,
@@ -53,12 +47,10 @@ impl DcsState {
             data: Vec::new(),
             total_bytes: 0,
             sequence_bytes: 0,
-            callback: None,
-            final_byte: None,
         }
     }
 
-    /// Reset DCS processing state while preserving callback.
+    /// Reset DCS processing state.
     ///
     /// Clears any in-progress DCS sequence, data buffers, and passthrough state.
     /// Budget tracking (`total_bytes`) is reset since all sequences are abandoned.
@@ -67,7 +59,6 @@ impl DcsState {
         self.data.clear();
         self.total_bytes = 0;
         self.sequence_bytes = 0;
-        self.final_byte = None;
     }
 }
 

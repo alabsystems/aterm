@@ -6,15 +6,10 @@
 //! Contains keyboard, cursor, mode, title, icon, security, and snapshot accessors.
 //! Extracted from mod.rs to reduce file size.
 
-#[cfg(test)]
-use super::CharacterSetState;
-#[cfg(test)]
-use super::SavedCursorState;
 use super::{
-    CurrentStyle, Cursor, CursorStyle, KittyKeyboardFlags, KittyKeyboardState, MAX_TITLE_BYTES,
-    Terminal, TerminalSize, TerminalSnapshot, XtermKeyboardState,
+    CurrentStyle, Cursor, CursorStyle, KittyKeyboardFlags, MAX_TITLE_BYTES, Terminal,
+    XtermKeyboardState,
 };
-use crate::scrollback::ScrollbackStorage;
 use aterm_types::PipelineTimestamps;
 use std::sync::Arc;
 
@@ -93,12 +88,6 @@ impl Terminal {
         self.vi.inline_search_repeat_reverse(&self.grid)
     }
 
-    /// Get the Kitty keyboard protocol state.
-    #[must_use]
-    pub fn kitty_keyboard(&self) -> &KittyKeyboardState {
-        &self.kitty_keyboard
-    }
-
     /// Get the current Kitty keyboard enhancement flags.
     #[must_use]
     pub fn kitty_keyboard_flags(&self) -> KittyKeyboardFlags {
@@ -123,6 +112,7 @@ impl Terminal {
     /// Whether the Kitty keyboard protocol capability is enabled
     /// (see [`set_kitty_keyboard_enabled`](Self::set_kitty_keyboard_enabled)).
     #[must_use]
+    #[cfg(test)]
     pub fn is_kitty_keyboard_enabled(&self) -> bool {
         self.modes.kitty_keyboard_enabled
     }
@@ -139,11 +129,6 @@ impl Terminal {
         &self.style
     }
 
-    /// Get a mutable reference to the Kitty keyboard state.
-    pub fn kitty_keyboard_mut(&mut self) -> &mut KittyKeyboardState {
-        &mut self.kitty_keyboard
-    }
-
     /// Set the window title.
     ///
     /// Titles longer than `MAX_TITLE_BYTES` are truncated at a char boundary.
@@ -157,12 +142,6 @@ impl Terminal {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.title.window = title.into();
-        if let Some(ref mut callback) = self.title.callback {
-            callback(&self.title.window);
-        }
-        if let Some(ref mut callback) = self.title.event_callback {
-            callback(aterm_types::TitleType::WindowOnly, &self.title.window);
-        }
     }
 
     /// Get the window title.
@@ -184,7 +163,7 @@ impl Terminal {
     /// A cheap reference-count bump of the title's backing allocation — lets a
     /// caller (e.g. the GUI) hold the title without copying the string or
     /// borrowing the terminal. Mirrors the `Arc::clone(&self.title.window)` the
-    /// [`snapshot`](Self::snapshot) builder already uses.
+    /// `snapshot` builder already uses.
     #[must_use]
     pub fn title_arc(&self) -> std::sync::Arc<str> {
         Arc::clone(&self.title.window)
@@ -210,6 +189,7 @@ impl Terminal {
 
     /// Get the icon name.
     #[must_use]
+    #[cfg(test)]
     pub fn icon_name(&self) -> &str {
         &self.title.icon
     }
@@ -228,17 +208,9 @@ impl Terminal {
     /// This flag is advisory - the terminal library does not implement the
     /// platform-specific security APIs directly. The UI layer must check this
     /// flag and enable the appropriate protection.
+    #[cfg(test)]
     pub fn set_secure_keyboard_entry(&mut self, enabled: bool) {
         self.secure_keyboard_entry = enabled;
-    }
-
-    /// Check if secure keyboard entry mode is enabled.
-    ///
-    /// Returns `true` if the UI layer should have secure input enabled.
-    /// See [`set_secure_keyboard_entry`](Self::set_secure_keyboard_entry) for details.
-    #[must_use]
-    pub fn is_secure_keyboard_entry(&self) -> bool {
-        self.secure_keyboard_entry
     }
 
     /// Report the host OS color scheme (light/dark) to the engine.
@@ -270,36 +242,6 @@ impl Terminal {
     #[must_use]
     pub fn color_scheme(&self) -> aterm_types::Appearance {
         self.modes.color_scheme
-    }
-
-    /// Enable or disable OSC 52 clipboard queries (Pd = "?").
-    ///
-    /// When disabled (default), aterm-core ignores OSC 52 query requests and
-    /// does not invoke the clipboard callback or emit a response. This reduces
-    /// clipboard exfiltration risk from untrusted output streams.
-    ///
-    /// Thin wrapper over [`authorize_clipboard_access`][Self::authorize_clipboard_access] /
-    /// [`revoke_clipboard_access`][Self::revoke_clipboard_access] for
-    /// [`super::clipboard_auth::ClipboardAccess::Query`]. The authoritative
-    /// capability state lives in [`super::clipboard_auth::ClipboardAuth`];
-    /// the `modes.allow_osc52_query` bool is kept in sync as a mirror for
-    /// FFI/config back-compat (#7874, #7878 CF-005).
-    pub fn set_osc52_query_allowed(&mut self, allowed: bool) {
-        self.modes.allow_osc52_query = allowed;
-        if allowed {
-            self.clipboard_auth.authorize_query();
-        } else {
-            self.clipboard_auth.revoke_query();
-        }
-    }
-
-    /// Check whether OSC 52 clipboard queries (Pd = "?") are allowed.
-    ///
-    /// Reads the authoritative capability state via
-    /// [`super::clipboard_auth::ClipboardAuth::is_query_authorized`].
-    #[must_use]
-    pub fn is_osc52_query_allowed(&self) -> bool {
-        self.clipboard_auth.is_query_authorized()
     }
 
     /// Authorize a clipboard access class (#7874, #7878 CF-004/CF-005).
@@ -352,19 +294,6 @@ impl Terminal {
         }
     }
 
-    /// Whether a clipboard access class is currently authorized.
-    #[must_use]
-    pub fn is_clipboard_access_authorized(
-        &self,
-        access: super::clipboard_auth::ClipboardAccess,
-    ) -> bool {
-        use super::clipboard_auth::ClipboardAccess;
-        match access {
-            ClipboardAccess::Write => self.clipboard_auth.is_write_authorized(),
-            ClipboardAccess::Query => self.clipboard_auth.is_query_authorized(),
-        }
-    }
-
     /// Authorize OSC 133 / OSC 633 shell integration with a 32-byte
     /// capability nonce (#7937 F01-2, #7960).
     ///
@@ -394,14 +323,63 @@ impl Terminal {
         self.shell_integration_auth.authorize(nonce);
     }
 
-    /// Revoke the shell-integration nonce (#7937 F01-2, #7960).
-    ///
-    /// Subsequent OSC 133 / OSC 633 sequences, under
-    /// `modes.require_shell_integration_nonce`, can no longer pass the
-    /// capability check until [`authorize_shell_integration`] is called
-    /// again with a fresh nonce.
-    pub fn revoke_shell_integration(&mut self) {
-        self.shell_integration_auth.revoke();
+    /// [`authorize_shell_integration`][Self::authorize_shell_integration] for a
+    /// nonce handed to a shell that has NOT TAKEN IT YET — the re-key of an
+    /// adopted shell whose nonce did not survive an update, delivered through a
+    /// file the shell reads at its next prompt (aterm-gui `shell_rekey`, the
+    /// shell-integration scripts' `__aterm_rekey_check`). Marks signed with it
+    /// verify from now on, exactly as after `authorize_shell_integration`; what
+    /// differs is that the nonce is not IN USE until the first of them arrives,
+    /// which may be hours later while a long program holds the foreground:
+    /// [`shell_integration_posture`][Self::shell_integration_posture] reads
+    /// `Degraded` until then (the shell's marks have not reached the engine
+    /// yet), and the seamless-handoff carry leaves it behind.
+    pub fn authorize_shell_integration_on_first_mark(&mut self, nonce: [u8; 32]) {
+        self.shell_integration_auth.authorize_on_first_mark(nonce);
+    }
+
+    /// [`authorize_shell_integration_on_first_mark`][Self::authorize_shell_integration_on_first_mark]
+    /// for a TYPED re-key (aterm-gui `shell_rekey::typed`, 2026-09-26): a nonce
+    /// left in a one-use file for a line typed at the shell's prompt to read —
+    /// the heal of a shell spawned before the re-key channel, which no hook of
+    /// its own will ever read. Unlike the channel's key it can be TAKEN BACK:
+    /// the authorization it replaced is kept until the host settles the key,
+    /// restored by [`withdraw_shell_integration_rekey`][Self::withdraw_shell_integration_rekey]
+    /// (the line never ran) or forgotten by
+    /// [`settle_shell_integration_rekey`][Self::settle_shell_integration_rekey]
+    /// (the shell read the file). Marks signed with it verify at once, and it
+    /// is in use — `On` — only from the first of them.
+    pub fn authorize_shell_integration_rekey(&mut self, nonce: [u8; 32]) {
+        self.shell_integration_auth.authorize_rekey(nonce);
+    }
+
+    /// Take back the typed re-key `nonce`
+    /// ([`authorize_shell_integration_rekey`][Self::authorize_shell_integration_rekey]),
+    /// restoring the authorization it replaced. `false`, changing nothing,
+    /// when `nonce` is not that key pending: a mark signed with it already
+    /// arrived (a key the shell uses is never moved), or it was replaced or
+    /// settled.
+    pub fn withdraw_shell_integration_rekey(&mut self, nonce: &[u8; 32]) -> bool {
+        self.shell_integration_auth.withdraw_rekey(nonce)
+    }
+
+    /// Keep the typed re-key `nonce`: the shell read its file, so the
+    /// authorization it replaced is forgotten. `false`, changing nothing, when
+    /// `nonce` is not that key pending.
+    pub fn settle_shell_integration_rekey(&mut self, nonce: &[u8; 32]) -> bool {
+        self.shell_integration_auth.settle_rekey(nonce)
+    }
+
+    /// The nonce the shell's marks VERIFY WITH NOW — authorized and taken (a
+    /// re-key the shell has not taken yet is not in use) — or `None`. What the
+    /// seamless carry takes across an update; and what the typed upgrade of a
+    /// HEALTHY shell from before loaders hands back to that shell in its one-use
+    /// file (aterm-gui `shell_rekey::typed`, 2026-09-26), so a relaunch line that
+    /// reads the file's first line as its key — this build's, or an older
+    /// sweep's — keeps the key the shell signs with.
+    #[must_use]
+    pub fn shell_integration_nonce_in_use(&self) -> Option<[u8; 32]> {
+        self.shell_integration_auth.nonce_in_use()
     }
 
     /// Number of OSC 133 / OSC 633 sequences silently dropped by the
@@ -459,26 +437,13 @@ impl Terminal {
     /// `modes.allow_notifications` is the single source of truth for
     /// notification dispatch: the OSC 9 / 99 / 777 handlers read it
     /// directly. This method is the low-level setter; the preferred host
-    /// API is [`Self::authorize_notifications`] /
-    /// [`Self::revoke_notifications`], which set the same bool.
+    /// API is `Self::authorize_notifications`, which sets the same bool.
     ///
-    /// Mirror of the `allow_osc52_query` pattern:
-    /// [`Self::authorize_notifications`] /
-    /// [`Self::revoke_notifications`] are the preferred host API and
-    /// are exposed through FFI as
-    /// `aterm_terminal_set_allow_notifications_v2`. The bool is
-    /// preserved across `Terminal::reset()` and RIS (`\x1Bc`) so a
+    /// The bool is preserved across `Terminal::reset()` and RIS (`\x1Bc`) so a
     /// rogue program cannot re-enable notifications by issuing a full
     /// reset. See `reset.rs` and `handler_esc.rs::reset_terminal_state`.
     pub fn set_allow_notifications(&mut self, allowed: bool) {
         self.modes.allow_notifications = allowed;
-    }
-
-    /// Whether OSC 9 / 99 / 777 desktop notifications are currently
-    /// authorized by the host (#7878 CF-009, #7918).
-    #[must_use]
-    pub fn is_allow_notifications(&self) -> bool {
-        self.modes.allow_notifications
     }
 
     /// Authorize OSC 9 / OSC 99 / OSC 777 desktop notifications
@@ -495,84 +460,9 @@ impl Terminal {
     /// and remains enforced regardless of authorization state. (The
     /// former notification rate-limiter (#7138) was deleted as inert —
     /// see `grouped_state.rs` and git history.)
+    #[cfg(test)]
     pub fn authorize_notifications(&mut self) {
         self.modes.allow_notifications = true;
-    }
-
-    /// Revoke OSC 9 / OSC 99 / OSC 777 desktop notification
-    /// authorization (#7878 CF-009).
-    ///
-    /// Subsequent PTY-origin notification sequences return early at the
-    /// authorization gate in `handle_osc_9` / `handle_osc_99` /
-    /// `handle_osc_777` before any callback invocation — no
-    /// notification is emitted. Does not affect the notification
-    /// callbacks themselves; host-initiated paths outside OSC 9/99/777
-    /// (if any) remain orthogonal.
-    ///
-    /// Sets `modes.allow_notifications = false`.
-    pub fn revoke_notifications(&mut self) {
-        self.modes.allow_notifications = false;
-    }
-
-    /// Whether OSC 9 / OSC 99 / OSC 777 desktop-notification callback
-    /// invocation is currently authorized (#7878 CF-009).
-    ///
-    /// Reads `modes.allow_notifications`, returning the same value as
-    /// [`Self::is_allow_notifications`]. Set via
-    /// [`Self::authorize_notifications`] /
-    /// [`Self::revoke_notifications`] / [`Self::set_allow_notifications`].
-    #[must_use]
-    pub fn is_notifications_authorized(&self) -> bool {
-        self.modes.allow_notifications
-    }
-
-    /// Enable or disable OSC 133 / OSC 633 shell-integration recording
-    /// into `SessionMemory` (#7878 CF-010).
-    ///
-    /// Host policy bit retained for config / checkpoint back-compat.
-    /// The session-memory recording sinks themselves are permanently
-    /// compiled out (the `aterm-memory` integration is not in the
-    /// workspace), so this bit currently gates nothing at runtime.
-    pub fn set_allow_session_memory(&mut self, allowed: bool) {
-        self.modes.allow_session_memory = allowed;
-    }
-
-    /// Whether OSC 133 / OSC 633 → `SessionMemory` recording is
-    /// currently permitted by the host (#7878 CF-010).
-    #[must_use]
-    pub fn is_allow_session_memory(&self) -> bool {
-        self.modes.allow_session_memory
-    }
-
-    /// Authorize OSC 133 / OSC 633 → session-memory recording
-    /// (#7878 CF-010).
-    ///
-    /// Sets `modes.allow_session_memory = true`. The recording sinks
-    /// themselves are permanently compiled out, so this is a policy
-    /// bit with no runtime consumer. Parallel to
-    /// [`authorize_notifications`][Self::authorize_notifications].
-    pub fn authorize_session_memory(&mut self) {
-        self.modes.allow_session_memory = true;
-    }
-
-    /// Revoke OSC 133 / OSC 633 → session-memory recording
-    /// authorization (#7878 CF-010).
-    ///
-    /// Sets `modes.allow_session_memory = false` (policy bit only; the
-    /// recording sinks are permanently compiled out).
-    pub fn revoke_session_memory(&mut self) {
-        self.modes.allow_session_memory = false;
-    }
-
-    /// Whether OSC 133 / OSC 633 → `SessionMemory` recording is
-    /// currently authorized (#7878 CF-010).
-    ///
-    /// Reads the authoritative capability state. Should return the
-    /// same value as [`Self::is_allow_session_memory`] thanks to the
-    /// mirror sync.
-    #[must_use]
-    pub fn is_session_memory_authorized(&self) -> bool {
-        self.modes.allow_session_memory
     }
 
     /// Mint an EXTRA OSC 8 URI scheme onto the safe allowlist (orca
@@ -665,48 +555,6 @@ impl Terminal {
         self.hyperlink_auth.extra_schemes().len()
     }
 
-    /// Authorize raw DCS callback delivery (#8009 CF-013).
-    ///
-    /// Grants the DCS unhook handler structural authorization to
-    /// forward the PTY-origin DCS payload to the registered
-    /// `DcsCallback`. The zero-sized
-    /// [`super::dcs_auth::DcsEmitCapability`] can only be minted while
-    /// the underlying [`super::dcs_auth::DcsAuth`] is authorized.
-    ///
-    /// **Default is authorized** — the pre-refactor behavior was
-    /// unconditional callback invocation. Hosts shipping a hardened
-    /// profile can call [`revoke_dcs`][Self::revoke_dcs] after
-    /// construction to drop raw DCS payloads at the capability gate.
-    ///
-    /// Does **not** affect per-DCS-type handlers (DECRQSS, Sixel,
-    /// DECDLD, tmux / conductor token activation, XTGETTCAP). Those
-    /// paths run before the callback and are gated by their own
-    /// capabilities (e.g. `modal_protocol_auth`).
-    pub fn authorize_dcs(&mut self) {
-        self.dcs_auth.authorize();
-    }
-
-    /// Revoke raw DCS callback delivery (#8009 CF-013).
-    ///
-    /// Subsequent PTY-origin DCS completions fail at the capability
-    /// gate — `invoke_dcs_callback` is unreachable without a minted
-    /// token, and the registered `DcsCallback` is never invoked. This
-    /// is the coarse "deliver raw DCS to the host at all" switch; per-
-    /// DCS-type handlers (DECRQSS / Sixel / tmux / conductor / etc.)
-    /// continue to run under their own capability gates.
-    pub fn revoke_dcs(&mut self) {
-        self.dcs_auth.revoke();
-    }
-
-    /// Whether raw DCS callback delivery is currently authorized
-    /// (#8009 CF-013).
-    ///
-    /// Defaults to `true` on newly constructed `Terminal` instances.
-    #[must_use]
-    pub fn is_dcs_authorized(&self) -> bool {
-        self.dcs_auth.is_authorized()
-    }
-
     /// Install or replace the OSC / escape-sequence policy engine (#7996).
     ///
     /// Called by the FFI shim `aterm_terminal_apply_policy` after parsing a TOML
@@ -722,45 +570,16 @@ impl Terminal {
         self.policy.install(engine);
     }
 
-    /// Borrow the currently installed policy engine, if any (#7996).
-    #[must_use]
-    pub fn policy_engine(&self) -> Option<&aterm_policy::engine::PolicyEngine> {
-        self.policy.engine()
-    }
-
     /// Clear the installed policy engine (#7996).
     ///
     /// Leaves the terminal in its legacy `TerminalModes::allow_*`-only
     /// behavior. Primarily useful for tests and checkpoint restore
     /// (#7997 will serialize the engine so this path stays explicit).
+    #[cfg(test)]
     pub fn clear_policy_engine(&mut self) {
         // `clear` recompiles the gate table back to the legacy posture in the
         // same step — see `apply_policy_engine`.
         self.policy.clear();
-    }
-
-    /// Enable or disable CSI t XTWINOPS window manipulation (#7139).
-    ///
-    /// When disabled (the fail-closed default), every CSI t subcommand in
-    /// the 1-10 state-change / geometry range is silently ignored at the
-    /// capability gate — no window resize, move, raise, lower, iconify,
-    /// etc. Host applications that want xterm-compatible permissive
-    /// behaviour MUST call this with `allowed = true` to opt in.
-    ///
-    /// This is the FFI-facing counterpart to
-    /// `modes_mut().allow_window_ops = allowed`; both paths set the same
-    /// authoritative bit on [`TerminalModes`]. The bool is preserved
-    /// across `Terminal::reset()` and RIS so a rogue program cannot
-    /// re-enable window ops through a full reset.
-    pub fn set_allow_window_ops(&mut self, allowed: bool) {
-        self.modes.allow_window_ops = allowed;
-    }
-
-    /// Whether CSI t XTWINOPS window manipulation is currently allowed
-    /// (#7139).
-    #[must_use]
-    pub fn is_allow_window_ops(&self) -> bool {
-        self.modes.allow_window_ops
     }
 
     /// Enable or disable OSC 4 / OSC 21 indexed palette reconfigure
@@ -779,13 +598,6 @@ impl Terminal {
     /// cannot re-enable palette reconfigure by issuing a full reset.
     pub fn set_allow_palette_reconfigure(&mut self, allowed: bool) {
         self.modes.allow_palette_reconfigure = allowed;
-    }
-
-    /// Whether OSC 4 / OSC 21 indexed palette reconfigure is currently
-    /// allowed (#7937 F01-3).
-    #[must_use]
-    pub fn is_allow_palette_reconfigure(&self) -> bool {
-        self.modes.allow_palette_reconfigure
     }
 
     /// Get cursor position.
@@ -894,8 +706,7 @@ impl Terminal {
     /// NOT clobber an app's live DECSCUSR (e.g. vim insert-mode bar): the live style
     /// only follows the new default while the app has not taken control (the
     /// `was_default` guard), so the preference takes effect immediately at startup yet
-    /// yields to the app afterward. Fires the cursor-style callback if the live style
-    /// changed, matching DECSCUSR.
+    /// yields to the app afterward.
     pub fn set_default_cursor_style(&mut self, style: CursorStyle) {
         let was_default = self.modes.cursor_style == self.default_cursor_style;
         self.default_cursor_style = style;
@@ -903,9 +714,6 @@ impl Terminal {
             self.modes.cursor_style = style;
             // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
             self.modes.cursor_blink = style.blinks();
-            if let Some(callback) = self.cursor_style_callback.as_mut() {
-                callback(style);
-            }
         }
     }
 
@@ -919,41 +727,6 @@ impl Terminal {
     #[must_use]
     pub fn cols(&self) -> u16 {
         self.grid.cols()
-    }
-
-    /// Get the terminal size as a [`TerminalSize`].
-    #[must_use]
-    pub fn size(&self) -> TerminalSize {
-        TerminalSize::new(self.grid.rows(), self.grid.cols())
-    }
-
-    /// Take a snapshot of the current terminal state.
-    ///
-    /// This captures essential state for diagnostics or comparison,
-    /// returning a lightweight struct that can be stored or inspected.
-    #[must_use]
-    pub fn snapshot(&self) -> TerminalSnapshot {
-        let scrollback_lines = self
-            .grid
-            .scrollback()
-            .map_or(0, ScrollbackStorage::line_count);
-
-        TerminalSnapshot {
-            cursor_row: self.grid.cursor().row,
-            cursor_col: self.grid.cursor().col,
-            cols: self.grid.cols(),
-            rows: self.grid.rows(),
-            title: Arc::clone(&self.title.window),
-            current_working_directory: self.current_working_directory.clone(),
-            // The alt buffer persists in `alt_grid` while the main screen is
-            // active, so slot occupancy no longer implies "alt screen active".
-            alternate_screen_active: self.modes.alternate_screen,
-            origin_mode: self.modes.origin_mode,
-            insert_mode: self.modes.insert_mode,
-            cursor_visible: self.modes.cursor_visible,
-            cursor_style: self.modes.cursor_style,
-            total_scrollback_lines: scrollback_lines,
-        }
     }
 
     /// Get pipeline timestamps from the last `process()` call (#5560).
@@ -981,22 +754,6 @@ impl Terminal {
 // Test-only accessors for session serialization and charset tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-impl Terminal {
-    /// Get the character set state.
-    #[must_use]
-    pub fn charset(&self) -> &CharacterSetState {
-        &self.charset
-    }
-
-    /// Get a mutable reference to the character set state.
-    pub fn charset_mut(&mut self) -> &mut CharacterSetState {
-        &mut self.charset
-    }
-}
-
-#[cfg(test)]
-use super::TITLE_STACK_MAX_DEPTH;
 use super::TerminalModes;
 
 impl Terminal {
@@ -1005,105 +762,15 @@ impl Terminal {
         &mut self.modes
     }
 
-    /// Get a mutable reference to the current style.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn style_mut(&mut self) -> &mut CurrentStyle {
-        &mut self.style
-    }
-
-    /// Get saved cursor state for main screen.
-    #[cfg(test)]
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn saved_cursor_main(&self) -> Option<&SavedCursorState> {
-        self.cursor_save.main.as_ref()
-    }
-
-    /// Get saved cursor state for alt screen.
-    #[cfg(test)]
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn saved_cursor_alt(&self) -> Option<&SavedCursorState> {
-        self.cursor_save.alt.as_ref()
-    }
-
-    /// Set saved cursor state for main screen.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn set_saved_cursor_main(&mut self, cursor: Option<SavedCursorState>) {
-        self.cursor_save.main = cursor;
-    }
-
-    /// Set saved cursor state for alt screen.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn set_saved_cursor_alt(&mut self, cursor: Option<SavedCursorState>) {
-        self.cursor_save.alt = cursor;
-    }
-
-    /// Get the title stack.
-    #[cfg(test)]
-    #[must_use]
-    pub fn title_stack(&self) -> &[(Arc<str>, Arc<str>)] {
-        &self.title.stack
-    }
-
-    /// Set the title stack.
-    ///
-    /// Truncates to [`TITLE_STACK_MAX_DEPTH`] for consistency with `push_title()`.
-    #[cfg(test)]
-    pub fn set_title_stack(&mut self, stack: Vec<(Arc<str>, Arc<str>)>) {
-        let len = stack.len().min(TITLE_STACK_MAX_DEPTH);
-        self.title.stack = stack.into_iter().take(len).collect();
-    }
-
-    /// Set the icon name.
-    ///
-    /// Names longer than [`MAX_TITLE_BYTES`] are truncated at a char boundary.
-    #[cfg(test)]
-    pub fn set_icon_name(&mut self, name: &str) {
-        let name = &name[..name.floor_char_boundary(MAX_TITLE_BYTES)];
-        self.title.icon = name.into();
-    }
-
-    /// Set a hyperlink URL.
-    ///
-    /// Convenience method that takes a string slice.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn set_hyperlink(&mut self, url: Option<&str>) {
-        self.transient.current_hyperlink = url.map(Arc::from);
-        self.transient.update_has_transient_extras();
-    }
-
-    /// Set the underline color.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "white-box accessor consumed by the un-wired checkpoint/session test suites"
-    )]
-    pub(crate) fn set_underline_color(&mut self, color: Option<u32>) {
-        self.transient.current_underline_color = color;
-        self.transient.update_has_transient_extras();
+    /// Set the HOST's alternate-scroll default (DEC 1007): the live mode now,
+    /// and the value [`Self::foreground_handback`] restores 1007 to after a
+    /// program that lost the terminal left it changed. A program may still
+    /// move the live mode with `CSI ? 1007 h/l`; this is the host baseline it
+    /// is measured against (2026-09-25: the handback used to restore the
+    /// power-on OFF, so one handback lost aterm-gui's default-ON for good).
+    pub fn set_host_alternate_scroll(&mut self, on: bool) {
+        self.modes.alternate_scroll = on;
+        self.configured_modes.alternate_scroll = on;
     }
 }
 

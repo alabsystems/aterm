@@ -85,8 +85,9 @@ pub struct LiveBuild {
 
 impl LiveBuild {
     /// The program this witness is about.
+    #[cfg(test)]
     #[must_use]
-    pub fn program(&self) -> &str {
+    pub(crate) fn program(&self) -> &str {
         &self.program
     }
 
@@ -669,6 +670,17 @@ pub struct GcReport {
     pub swept_exec_roots: Vec<PathBuf>,
     /// What the exec-root sweep could not remove, one sentence each.
     pub exec_root_errors: Vec<String>,
+    /// `(program, build, who)` for every build this pass would have reclaimed but KEPT
+    /// because a run holds a lease on it ([`crate::lease`]) — a merge-contract run or a cut
+    /// that resolved it and has stages still to run — or because its leases could not be
+    /// read. Its own category: a kept build is disk the owner may wonder about, and the
+    /// line says whose it is and that the next pass after the run takes it.
+    pub leased: Vec<(String, u64, crate::lease::Holders)>,
+    /// `(program, staged file name)` for every archive this pass would have swept but KEPT
+    /// because a Trust toolchain update held for quiet installs from it
+    /// ([`crate::quiet::held_archives`]). Said for the reason `leased` is — and because the
+    /// kept file is gigabytes whose one use is the flip that has not happened yet.
+    pub held_staging: Vec<(String, String)>,
 }
 
 /// Reclaim superseded builds per program: the live build + one rollback are kept, the rest
@@ -805,6 +817,7 @@ fn run_in(
         by_prog.entry(p).or_default().push(b);
     }
     let mut reclaimed = Vec::new();
+    let mut leased = Vec::new();
     for (program, installed) in by_prog {
         if !in_scope(&program) {
             continue;
@@ -814,6 +827,12 @@ fn run_in(
         };
         let mut gone = Vec::new();
         for b in reclaimable(&installed, witness) {
+            // A LEASED build is a run's toolchain between two of its stages: kept, and said.
+            // The guard holds the subject's gate across the delete, so no run can lease it
+            // after this read and before it is gone ([`crate::lease`]).
+            let Some(_gate) = lease_clear(layout, &program, b, &mut leased) else {
+                continue;
+            };
             if in_use.holds(&program, &layout.build_dir(&program, b), Some(b)) {
                 continue;
             }
@@ -832,6 +851,9 @@ fn run_in(
     let debris = interrupted_debris(layout, &claimed, &parked, &in_scope);
     let mut swept_partial: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for (program, build, path) in debris.partial {
+        let Some(_gate) = lease_clear(layout, &program, build, &mut leased) else {
+            continue;
+        };
         if in_use.holds(&program, &path, Some(build)) {
             continue;
         }
@@ -870,6 +892,14 @@ fn run_in(
     // let us in. Removing a file the CURRENT pass is about to write is impossible for
     // the same reason.
     let mut swept_staging: Vec<(String, Vec<String>)> = Vec::new();
+    let mut held_staging: Vec<(String, String)> = Vec::new();
+    // …and every form spares the archive a HELD TOOLCHAIN FLIP installs from, whoever runs
+    // it: the update pass that held the flip resolved it (`pinned_asset`), but an install,
+    // the seed and a plain `atpkg gc` resolve other programs or none, and swept it, so the
+    // flip re-downloaded the toolchain it had already staged. Bounded by the record
+    // ([`crate::quiet::held_archives`]) — which `uninstall` ends: it removes the builds
+    // before its sweep, so the archive goes with them.
+    let held = crate::quiet::held_archives(layout);
     if let Ok(programs) = std::fs::read_dir(layout.prefix.join("staging")) {
         for program in programs.filter_map(Result::ok) {
             let Ok(name) = program.file_name().into_string() else {
@@ -904,6 +934,12 @@ fn run_in(
                 if entry_name.is_some() && (keep_archive == entry_name || keep_part == entry_name) {
                     continue;
                 }
+                if let Some(n) = entry_name.as_ref()
+                    && held.get(&name) == Some(n)
+                {
+                    held_staging.push((name.clone(), n.clone()));
+                    continue;
+                }
                 if std::fs::remove_file(e.path()).is_ok()
                     && let Some(n) = entry_name
                 {
@@ -930,6 +966,14 @@ fn run_in(
     } else {
         crate::compat::Report::default()
     };
+    // …and the lease files of runs that ended without their `Drop` (a killed gate), and
+    // the gates of builds and views that are gone. Whole-prefix passes only, like the exec
+    // roots: a scoped pass leaves every other program's state exactly as it was.
+    if scope.is_none() {
+        crate::lease::sweep(&layout.prefix, &|subject| {
+            std::fs::symlink_metadata(subject.path(layout)).is_ok()
+        });
+    }
 
     GcReport {
         swept_staging,
@@ -943,6 +987,31 @@ fn run_in(
             .collect(),
         swept_exec_roots: exec_roots.swept,
         exec_root_errors: exec_roots.errors,
+        leased,
+        held_staging,
+    }
+}
+
+/// The lease verdict on reclaiming `program`'s `build`: `Some` when no run holds it,
+/// carrying the reclaim guard to hold until the tree is gone ([`crate::lease::reclaim`]) —
+/// `Some(None)` for a program name no lease can carry, which no run could have leased — or
+/// `None`, the build recorded in `leased` with who holds it (or why its leases could not be
+/// read, which keeps it too).
+fn lease_clear(
+    layout: &Layout,
+    program: &str,
+    build: u64,
+    leased: &mut Vec<(String, u64, crate::lease::Holders)>,
+) -> Option<Option<crate::lease::ReclaimGuard>> {
+    let Some(subject) = crate::lease::Subject::build(program, build) else {
+        return Some(None);
+    };
+    match crate::lease::reclaim(&layout.prefix, &subject) {
+        crate::lease::Reclaim::Clear(guard) => Some(Some(guard)),
+        crate::lease::Reclaim::Keep(holders) => {
+            leased.push((program.to_string(), build, holders));
+            None
+        }
     }
 }
 
@@ -954,9 +1023,15 @@ fn run_in(
 /// ([`crate::compat::root_dir`]), which [`crate::store::discard_build`] takes with it.
 ///
 /// The enumeration runs at most once per pass, and only once a build is a candidate.
-/// When it cannot be taken, every AGENT build is kept (the fail-safe it always had) and
-/// every other build is reclaimed under the plain rule, as before — a platform with no
-/// process table must not stop gc for good.
+/// When it cannot be taken, every AGENT build and every trust build is kept (the agents'
+/// fail-safe, which the toolchain joined on 2026-09-26) and every other build is
+/// reclaimed under the plain rule, as before — a platform with no process table must not
+/// stop gc for good.
+///
+/// A process is only half of "in use". A run that resolved a build and runs its stages
+/// from it — the merge contract, a release cut — has no process there between two
+/// stages; it holds a LEASE instead ([`crate::lease`]), which the reclaim asks first
+/// ([`lease_clear`]) and holds the gate of across the delete.
 struct InUse<'a> {
     layout: &'a Layout,
     enumerate: &'a dyn Fn() -> Option<Vec<PathBuf>>,
@@ -969,7 +1044,11 @@ impl InUse<'_> {
     fn holds(&mut self, program: &str, build_dir: &Path, build: Option<u64>) -> bool {
         let enumerate = self.enumerate;
         let Some(running) = self.running.get_or_insert_with(enumerate) else {
-            return crate::stub::is_agent_program(program);
+            // THE TOOLCHAIN TOO (2026-09-26): a `targo build` spawns a fresh `trustc` per
+            // crate from the build it started on, so a superseded trust build reclaimed
+            // under a build nobody could see is that build's next crate failing — the same
+            // loss the agents' keep exists for. Disk is spent before a toolchain in use is.
+            return crate::stub::is_agent_program(program) || program == crate::seam::SEAM_PROGRAM;
         };
         let root = build
             .filter(|_| program == crate::seam::SEAM_PROGRAM)
@@ -1196,35 +1275,38 @@ mod tests {
         }
     }
 
+    /// The retention rule over installed build numbers, one labelled row each, with the
+    /// live build 19: the live build is never reclaimed, the one rollback below it is
+    /// kept, and everything else — older builds, and staged-but-never-activated ones above
+    /// a live build with no rollback — is reclaimable.
     #[test]
-    fn keeps_current_plus_one_rollback() {
-        // live 19, rollback 18 ⇒ reclaim the older 16, 17.
-        assert_eq!(
-            reclaimable(&[16, 17, 18, 19], &live("ay", 19)),
-            vec![16, 17]
-        );
-    }
-
-    #[test]
-    fn current_is_never_reclaimed() {
-        assert!(reclaimable(&[19], &live("ay", 19)).is_empty());
-        // Even a single installed == live, with no rollback, keeps it.
-        assert!(!reclaimable(&[19], &live("ay", 19)).contains(&19));
-    }
-
-    #[test]
-    fn no_rollback_below_current_keeps_only_current() {
-        // live is the lowest installed ⇒ no rollback target ⇒ the higher ones (staged but
-        // never activated) are reclaimable; the live build stays.
-        assert_eq!(reclaimable(&[19, 20, 21], &live("ay", 19)), vec![20, 21]);
-    }
-
-    #[test]
-    fn handles_duplicates_and_unsorted_input() {
-        assert_eq!(
-            reclaimable(&[18, 16, 19, 17, 16], &live("ay", 19)),
-            vec![16, 17]
-        );
+    fn reclaimable_keeps_current_plus_one_rollback() {
+        let rows: [(&[u64], &[u64], &str); 4] = [
+            (
+                &[16, 17, 18, 19],
+                &[16, 17],
+                "live 19, rollback 18: the older 16, 17 go",
+            ),
+            (&[19], &[], "a single installed build that is live is kept"),
+            (
+                &[19, 20, 21],
+                &[20, 21],
+                "no rollback below the live build: only it stays",
+            ),
+            (
+                &[18, 16, 19, 17, 16],
+                &[16, 17],
+                "duplicates and unsorted input",
+            ),
+        ];
+        for (installed, reclaimed, why) in rows {
+            let got = reclaimable(installed, &live("ay", 19));
+            assert_eq!(got, reclaimed, "{why}");
+            assert!(
+                !got.contains(&19),
+                "the live build is never reclaimed: {why}"
+            );
+        }
     }
 
     // --- the imperative executor -------------------------------------------------------
@@ -2260,6 +2342,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// THE ARCHIVE A HELD TOOLCHAIN FLIP WAITS ON SURVIVES EVERY GC (2026-09-26): an
+    /// install's pass-end sweep, which resolved another program, and a plain `atpkg gc`,
+    /// which resolved none, both keep it — and say so — while the record stands and names
+    /// a build still in the store; the other files beside it go as before. Once the record
+    /// outlived the builds it moves off, the archive is swept like any other.
+    #[test]
+    fn a_held_flips_staged_archive_survives_every_gc_while_the_wait_stands() {
+        let l = layout("held-archive");
+        seed(&l, "trust", 9192, true);
+        let staging = l.staging_dir("trust");
+        std::fs::create_dir_all(&staging).unwrap();
+        let held = staging.join("trust-9200.tar.zst");
+        let stray = staging.join("trust-9100.tar.zst");
+        for p in [&held, &stray] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        assert!(crate::quiet::note_deferred(
+            &l,
+            "rustc",
+            1_790_000_000,
+            1_790_000_000,
+            &crate::quiet::Busy::Quiet,
+            &crate::quiet::Moves {
+                from: BTreeMap::from([("trust".to_string(), 9192u64)]),
+                to: BTreeMap::from([("trust".to_string(), 9200u64)]),
+                assets: BTreeMap::from([("trust".to_string(), "trust-9200.tar.zst".to_string())]),
+            },
+        ));
+        // An install of another program: its resolved assets name nothing of trust's.
+        let report = run_keeping_pinned_partials(&l, &|program| {
+            (program == "ay").then(|| "ay-18.tar.zst".to_string())
+        });
+        assert!(held.exists(), "an install's sweep keeps the held archive");
+        assert!(!stray.exists(), "…and takes the rest");
+        assert_eq!(
+            report.held_staging,
+            vec![("trust".to_string(), "trust-9200.tar.zst".to_string())],
+            "and says what it kept"
+        );
+        // A person's `atpkg gc` too — the flip that follows needs no network.
+        let report = run(&l);
+        assert!(held.exists(), "a plain gc keeps the held archive");
+        assert_eq!(report.held_staging.len(), 1);
+        // A record that outlived every build it moves off waits for nothing — which is what
+        // `uninstall` (and `uninstall --all`, per program) makes of it: the program's store
+        // tree goes BEFORE the sweep, and the archive of a flip that can no longer land goes
+        // with it — the disk the owner asked back (review, 2026-09-26).
+        crate::ops::uninstall(&l, "trust").unwrap();
+        assert!(!l.build_dir("trust", 9192).exists());
+        let report = run(&l);
+        assert!(!held.exists(), "a stale record keeps nothing");
+        assert!(report.held_staging.is_empty());
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     /// `codex` live at 20 with 18 and 19 below it: under the plain rule 18 goes.
     fn codex_with_a_reclaimable_build(label: &str) -> Layout {
         let l = layout(label);
@@ -2289,19 +2426,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// FAIL SAFE: a process table that cannot be read keeps every agent build — and
-    /// only those: any other program reclaims under the plain rule, so a platform with
-    /// no process table does not stop gc for good.
+    /// FAIL SAFE: a process table that cannot be read keeps every agent build and every
+    /// trust build (2026-09-26: a toolchain reclaimed under a build nobody could see is
+    /// that build's next crate failing) — and only those: any other program reclaims under
+    /// the plain rule, so a platform with no process table does not stop gc for good.
     #[test]
-    fn an_unreadable_process_table_keeps_every_agent_build() {
+    fn an_unreadable_process_table_keeps_every_agent_and_toolchain_build() {
         let l = codex_with_a_reclaimable_build("agent-unknown");
         for b in [16u64, 17] {
             seed(&l, "ay", b, false);
         }
         seed(&l, "ay", 18, true);
+        for b in [8580u64, 8590] {
+            seed(&l, "trust", b, false);
+        }
+        seed(&l, "trust", 9192, true);
         let report = run_with(&l, &|_| None, &|| None);
         assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64])]);
         assert!(l.build_dir("codex", 18).exists());
+        assert!(
+            l.build_dir("trust", 8580).exists(),
+            "the toolchain is kept too"
+        );
+        // The same store with a table that reads: the toolchain's superseded build goes.
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            report
+                .reclaimed
+                .contains(&("trust".to_string(), vec![8580u64])),
+            "{:?}",
+            report.reclaimed
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A LEASED BUILD IS KEPT, AND SAID (gap #31). A merge-contract run pinned to a
+    /// superseded trust build holds a lease on it between its stages, when no process runs
+    /// from it: gc keeps it, the report names who holds it, and the first pass after the run
+    /// reclaims it. A lease on one build keeps nothing else.
+    #[test]
+    fn a_leased_build_is_kept_until_its_run_ends() {
+        let l = layout("leased");
+        for b in [8580u64, 8590, 8595] {
+            seed(&l, "trust", b, false);
+        }
+        seed(&l, "trust", 9192, true);
+        let subject = crate::lease::Subject::build("trust", 8590).unwrap();
+        let lease = crate::lease::take(
+            &l.prefix,
+            &subject,
+            "aterm-verify (pid 7) — the merge contract in /w",
+            crate::lease::DEFAULT_WAIT,
+        )
+        .unwrap();
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8580u64])]);
+        assert!(crate::store::build_is_complete(&l.build_dir("trust", 8590)));
+        assert_eq!(
+            report.leased,
+            vec![(
+                "trust".to_string(),
+                8590,
+                crate::lease::Holders::Held(vec![
+                    "aterm-verify (pid 7) — the merge contract in /w".to_string()
+                ])
+            )]
+        );
+        drop(lease);
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8590u64])]);
+        assert!(report.leased.is_empty());
+        assert!(!l.build_dir("trust", 8590).exists());
+        // The pass swept the gone build's gate: nothing of 8590 is left under `leases/`.
+        let left: Vec<String> = std::fs::read_dir(crate::lease::dir(&l.prefix))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("store-trust-8590"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A lease whose state cannot be read keeps its build — never read as free.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_lease_directory_keeps_every_candidate() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let l = layout("lease-unreadable");
+        for b in [16u64, 17] {
+            seed(&l, "ay", b, false);
+        }
+        seed(&l, "ay", 18, true);
+        let leases = crate::lease::dir(&l.prefix);
+        std::fs::create_dir_all(&leases).unwrap();
+        std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&leases).is_ok();
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !readable,
+            "NOT RUN as written: this process reads a 0000 directory (root?)"
+        );
+        assert!(report.reclaimed.is_empty(), "{:?}", report.reclaimed);
+        assert_eq!(report.leased.len(), 1, "{:?}", report.leased);
+        assert!(matches!(
+            report.leased[0].2,
+            crate::lease::Holders::Unknown(_)
+        ));
+        assert!(l.build_dir("ay", 16).exists());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -2389,9 +2622,22 @@ mod tests {
         let app = root.join("A.app");
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("layout");
-        std::fs::copy("/bin/sleep", macos.join("sleepy")).expect("copy sleep");
+        let sleepy = macos.join("sleepy");
+        std::fs::copy("/bin/sleep", &sleepy).expect("copy sleep");
+        // A copy of a platform binary off the system volume keeps Apple's signature
+        // but not its standing: the kernel SIGKILLs it (Code Signature Invalid)
+        // within about a second, and `runs_from` does not count the dead child. The
+        // test passed only when its first poll beat that kill, and every run wrote a
+        // `sleepy` crash report (measured 2026-09-27: alive at +260 ms, killed by
+        // +1.3 s). Signed ad hoc, the copy sleeps for as long as it is told to.
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&sleepy)
+            .status()
+            .expect("run codesign");
+        assert!(signed.success(), "sign the sleeper ad hoc");
         let link = root.join("via-link");
-        std::os::unix::fs::symlink(macos.join("sleepy"), &link).expect("symlink");
+        std::os::unix::fs::symlink(&sleepy, &link).expect("symlink");
         std::fs::create_dir_all(root.join("A.app.rollback")).expect("sibling");
 
         assert_eq!(runs_from(&app), Some(false), "nothing runs from it yet");
@@ -2405,9 +2651,14 @@ mod tests {
         }
         let seen = runs_from(&app);
         let sibling = runs_from(&root.join("A.app.rollback"));
+        let alive = child.try_wait().expect("poll the sleeper").is_none();
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            alive,
+            "the process seen is running, not a dead one awaiting its reap"
+        );
         assert_eq!(seen, Some(true), "a symlinked launch runs from the bundle");
         assert_eq!(sibling, Some(false), "`A.app.rollback` is not `A.app`");
     }

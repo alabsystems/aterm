@@ -503,20 +503,6 @@ impl KittyType {
             KittyType::PawClassic => "paw_classic",
         }
     }
-
-    /// A human label — shared by the settings collection book and dumps.
-    pub fn label(self) -> &'static str {
-        match self {
-            KittyType::HeadPeek => "Peeking head",
-            KittyType::HeadTilt => "Tilted head",
-            KittyType::HeadPawLeft => "Left-paw grip",
-            KittyType::HeadPawRight => "Right-paw grip",
-            KittyType::HeadTwoPaws => "Two-paw grip",
-            KittyType::PawSingle => "Single paw",
-            KittyType::PawDouble => "Kneading paws",
-            KittyType::PawClassic => "Classic paw",
-        }
-    }
 }
 
 /// The magic dimension of the aggregation key — [`CatMagic`] plus the
@@ -556,17 +542,6 @@ impl KittyMagic {
         }
     }
 
-    /// A human label for the collection book.
-    pub fn label(self) -> &'static str {
-        match self {
-            KittyMagic::None => "Ordinary",
-            KittyMagic::Fortune => "Fortune",
-            KittyMagic::Nebula => "Nebula",
-            KittyMagic::Butterfly => "Butterfly",
-            KittyMagic::Sakura => "Sakura",
-        }
-    }
-
     /// The recorder's mapping from the (config-gated) genome decode.
     pub fn from_cat(magic: Option<CatMagic>) -> KittyMagic {
         match magic {
@@ -595,6 +570,7 @@ pub enum KittyShownAs {
 
 impl KittyShownAs {
     /// Every cause, in registry order.
+    #[cfg(test)]
     pub const ALL: [KittyShownAs; 4] = [
         KittyShownAs::Cat,
         KittyShownAs::PawFallbackFloor,
@@ -603,22 +579,13 @@ impl KittyShownAs {
     ];
 
     /// The stable `kitty-log.toml` / introspection key for this cause.
+    #[cfg(test)]
     pub fn config_key(self) -> &'static str {
         match self {
             KittyShownAs::Cat => "cat",
             KittyShownAs::PawFallbackFloor => "paw_fallback_floor",
             KittyShownAs::PawFallbackOverflow => "paw_fallback_overflow",
             KittyShownAs::PawStyle => "paw_style",
-        }
-    }
-
-    /// A human label for the collection book.
-    pub fn label(self) -> &'static str {
-        match self {
-            KittyShownAs::Cat => "Cat",
-            KittyShownAs::PawFallbackFloor => "No graphic (ineligible cat)",
-            KittyShownAs::PawFallbackOverflow => "No graphic (cat limit)",
-            KittyShownAs::PawStyle => "No graphic (legacy paw mode)",
         }
     }
 }
@@ -654,6 +621,7 @@ pub const TRAIT_CROWN: u8 = 1 << 7;
 /// Kitty Log persists it as four dedicated counters).
 ///
 /// [`genome::cat_accessory`]: crate::genome::cat_accessory
+#[cfg(test)]
 pub fn accessory_trait_bits(acc: Option<crate::genome::Accessory>) -> u8 {
     use crate::genome::Accessory;
     match acc {

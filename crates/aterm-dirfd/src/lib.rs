@@ -84,7 +84,8 @@ impl Errno {
     /// `EINVAL` — used here for a name that cannot become a C string.
     pub const INVAL: Self = Self(libc::EINVAL);
     /// `ENOSYS` — the platform has no such operation. Returned instead of
-    /// approximating one.
+    /// approximating one, by the flagged rename on a platform with none.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     pub const NOSYS: Self = Self(libc::ENOSYS);
 
     /// The raw `errno` value.
@@ -191,12 +192,6 @@ macro_rules! flags {
             #[must_use]
             pub const fn bits(self) -> $int {
                 self.0
-            }
-
-            /// Whether every bit of `other` is set here.
-            #[must_use]
-            pub const fn contains(self, other: Self) -> bool {
-                self.0 & other.0 == other.0
             }
         }
 
@@ -362,12 +357,6 @@ impl FileType {
     pub const fn is_file(self) -> bool {
         self.0 == libc::S_IFREG as u32
     }
-
-    /// A symbolic link.
-    #[must_use]
-    pub const fn is_symlink(self) -> bool {
-        self.0 == libc::S_IFLNK as u32
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +499,7 @@ pub fn linkat<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
 /// # Errors
 /// The raw `errno` from the syscall — including whatever the kernel returns for
 /// a flag combination it will not accept, which is never second-guessed here;
-/// [`Errno::INVAL`] for an unusable name; [`Errno::NOSYS`] on a platform with no
+/// [`Errno::INVAL`] for an unusable name; `ENOSYS` on a platform with no
 /// flagged rename at all.
 pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
     from_dir: F1,

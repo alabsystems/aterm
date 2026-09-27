@@ -167,23 +167,7 @@ impl Terminal {
             // CSI / UTF-8 / DCS that bytes after the RIS left at the chunk's end, and
             // the next chunk printed that sequence's tail as text.
             if self.transient.pending_parser_reset {
-                // Clear session-only state not accessible from the handler (#7336).
-                self.secure_keyboard_entry = false;
-                // Kill the parked selection HERE, not by leaning on the park/restore
-                // below and not on the `All` that the reset's `erase_scrollback`
-                // happens to record on the way past.
-                //
-                // RIS does swap the main grid back (`reset_common_fields`), but that
-                // does NOT guarantee the restore fires: for `\x1bc\x1b[?1049h` — RIS
-                // then re-enter alt in ONE batch — `was_alt` and
-                // `modes.alternate_screen` are both true at `post_process`, so
-                // neither the park nor the restore runs. That is exactly the case
-                // this line is load-bearing for: without it the stale pre-RIS main
-                // selection sits in the slot and is restored on the NEXT `?1049l`,
-                // over a grid the reset already erased. The reason it must go is the
-                // reset itself.
-                self.parked_text_selection.clear();
-                self.transient.pending_parser_reset = false;
+                self.finish_ris_batch();
             }
             let parse_end = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
 
@@ -215,23 +199,7 @@ impl Terminal {
             // CSI / UTF-8 / DCS that bytes after the RIS left at the chunk's end, and
             // the next chunk printed that sequence's tail as text.
             if self.transient.pending_parser_reset {
-                // Clear session-only state not accessible from the handler (#7336).
-                self.secure_keyboard_entry = false;
-                // Kill the parked selection HERE, not by leaning on the park/restore
-                // below and not on the `All` that the reset's `erase_scrollback`
-                // happens to record on the way past.
-                //
-                // RIS does swap the main grid back (`reset_common_fields`), but that
-                // does NOT guarantee the restore fires: for `\x1bc\x1b[?1049h` — RIS
-                // then re-enter alt in ONE batch — `was_alt` and
-                // `modes.alternate_screen` are both true at `post_process`, so
-                // neither the park nor the restore runs. That is exactly the case
-                // this line is load-bearing for: without it the stale pre-RIS main
-                // selection sits in the slot and is restored on the NEXT `?1049l`,
-                // over a grid the reset already erased. The reason it must go is the
-                // reset itself.
-                self.parked_text_selection.clear();
-                self.transient.pending_parser_reset = false;
+                self.finish_ris_batch();
             }
             damage_class = self.post_process(lines_before, was_alt);
             // Alt-screen archive epilogue: see the gated branch above.
@@ -387,6 +355,37 @@ impl Terminal {
         ts.process_sequence = ts.process_sequence.wrapping_add(1);
     }
 
+    /// RIS side effects the handler cannot reach (#7153), run after the parser
+    /// and BEFORE `post_process`.
+    ///
+    /// Both selection slots die HERE, not by leaning on the park/restore in
+    /// `post_process` and not on the `All` that the reset's `erase_scrollback`
+    /// happens to record on the way past: the reason they must go is the reset
+    /// itself, which erased every grid either one names. That `All` is recorded on
+    /// the MAIN grid, and a batch that ends on the alt screen never drains it —
+    /// which is the whole difficulty, because RIS then a re-entry in ONE batch
+    /// (`\x1bc\x1b[?1049h`) is exactly such a batch:
+    ///
+    /// * from the ALT screen, `was_alt` and `modes.alternate_screen` are both true
+    ///   at `post_process`, so neither the park nor the restore runs, and the
+    ///   parked pre-RIS main selection would wait in the slot for the NEXT
+    ///   `?1049l` to restore it over a grid the reset already erased;
+    /// * from the MAIN screen, the batch is an ordinary enter, so the park runs
+    ///   and takes whatever the LIVE slot holds into the parked one — the same
+    ///   stale selection, parked instead of left behind. (`Terminal::reset` clears
+    ///   the live slot for the same reason; RIS left it to the `All`, which this
+    ///   batch never reads.)
+    ///
+    /// Pinned by `AltSelectionPark`'s conformance, which drives that batch from
+    /// both screens and reads the slot.
+    fn finish_ris_batch(&mut self) {
+        // Clear session-only state not accessible from the handler (#7336).
+        self.secure_keyboard_entry = false;
+        self.text_selection.clear();
+        self.parked_text_selection.clear();
+        self.transient.pending_parser_reset = false;
+    }
+
     /// Post-processing after parser advances: selection adjustment and BiDi sync.
     ///
     /// `was_alt` is which screen the batch STARTED on, captured by the caller
@@ -464,7 +463,6 @@ impl Terminal {
                 update,
                 &mut self.shell,
                 &mut self.marks_state,
-                &mut self.semantic,
                 &mut self.transient,
                 &mut self.absolute_row_revision,
             );
@@ -781,29 +779,6 @@ impl Terminal {
         damage_class
     }
 
-    /// Check if tmux control mode is active (always `false`: the tmux control
-    /// mode integration is permanently compiled out).
-    #[must_use]
-    pub fn is_tmux_mode_active(&self) -> bool {
-        false
-    }
-
-    /// Check if SSH conductor mode is active (always `false`: the SSH
-    /// conductor integration is permanently compiled out).
-    #[must_use]
-    pub fn is_ssh_conductor_mode_active(&self) -> bool {
-        false
-    }
-
-    /// Check and enforce modal protocol timeouts without processing data.
-    ///
-    /// Returns `true` if a modal mode was force-deactivated — always `false`:
-    /// the modal protocol integrations (tmux -CC, SSH conductor) are
-    /// permanently compiled out.
-    pub fn check_modal_timeouts(&mut self) -> bool {
-        false
-    }
-
     /// Backdate the synchronized-output (mode 2026) start timestamp for
     /// testing timeout behavior.
     ///
@@ -855,9 +830,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         kitty_file_resolver: _,
         last_bell_time: _,
         bell_total: _,
-        cursor_style_callback: _,
         default_cursor_style: _,
-        buffer_activation_callback: _,
         notifications: _,
         clipboard: _,
         iterm2: _,
@@ -867,14 +840,12 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         dcs: _,
         shell: _,
         marks_state: _,
-        semantic: _,
         taskbar_progress: _,
         kitty_keyboard: _,
         xterm_keyboard: _,
         #[cfg(feature = "sixel")]
             sixel: _,
         window_callback: _,
-        text_sizing_callback: _,
         bidi_state: _,
         secure_keyboard_entry: _,
         // Repaint-blink epoch: bumped by the DEC dispatcher on a DECTCEM hide
@@ -888,7 +859,6 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         configured_modes: _,
         content_scroll_state: _,
         parser: _,
-        font: _,
         text_selection: _,
         // The OTHER screen's selection, parked across an alt switch. Session-only
         // for the same reason `text_selection` is, and additionally kept out of the
@@ -907,7 +877,6 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         clipboard_auth: _,
         shell_integration_auth: _,
         hyperlink_auth: _,
-        dcs_auth: _,
         policy: _,
         damage_epoch: _,
         damage_epoch_counted: _,
@@ -945,7 +914,7 @@ mod tests {
     use crate::terminal::TerminalBuilder;
     use std::time::Duration;
 
-    /// The RIS clear in the `pending_parser_reset` block, ISOLATED.
+    /// The RIS clear of the PARKED slot (`finish_ris_batch`), ISOLATED.
     ///
     /// `scroll_pin_across_alt_screen::ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight`
     /// pins the user-visible property and cannot isolate this line, and no black-box
@@ -991,6 +960,38 @@ mod tests {
             "the reset must retire the parked selection in its own batch; leaving it \
              for a later restore hands a pre-RIS highlight back over an erased grid"
         );
+    }
+
+    /// The same batch from the MAIN screen, where the RIS clear of the LIVE slot
+    /// is what is load-bearing. `\x1bc\x1b[?1049h` there is an ordinary enter at
+    /// `post_process`, so the park runs and takes whatever the live slot holds —
+    /// and the reset's `All`, recorded on the main grid, is not drained by a batch
+    /// that ends on alt. Before `finish_ris_batch` cleared the live slot this
+    /// parked the pre-RIS selection over the grid the reset had just erased.
+    #[test]
+    fn ris_then_enter_from_main_parks_nothing() {
+        use crate::selection::{SelectionSide, SelectionType};
+
+        let mut term = Terminal::new(6, 24);
+        for i in 0..40 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        {
+            let sel = term.text_selection_mut();
+            sel.start_selection(-3, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(-3, 4, SelectionSide::Right);
+            sel.complete_selection();
+        }
+
+        term.process(b"\x1bc\x1b[?1049h");
+
+        assert!(term.is_alternate_screen());
+        assert!(
+            !term.parked_text_selection.has_selection(),
+            "RIS erased the grid the main selection named; the re-entry in the same \
+             batch must not park it"
+        );
+        assert!(!term.text_selection().has_selection());
     }
 
     /// RIS followed by bytes the PTY read cut mid-sequence: the tail of the chunk

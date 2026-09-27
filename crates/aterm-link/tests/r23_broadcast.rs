@@ -242,6 +242,116 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
     assert!(!old.check_invariant("HeadSkipsEarlierRecord", &stale));
 }
 
+/// A roster of late subscribers must not multiply one replay slice into four
+/// synchronous Fetches PER SID. The historical loop finished each subscriber's
+/// two-page gap in its `topic add` event, so by the time the last add returned
+/// every gap was drained before fresh addressed mail or a fleet halt could be
+/// handled. One bridge-wide allowance leaves backlog owed while those higher
+/// priority messages arrive, then rotates until every sid reaches the record.
+#[test]
+fn many_late_subscribers_leave_room_for_fresh_mail_and_a_halt() {
+    let w = World::boot("r23budget", &[]);
+    w.wait_ready();
+    let (sender, _) = w.two_sessions();
+    let mut god = w.god();
+    let noise = format!("/f/{FLEET}/pub/n-history/s-peer/say/r23.noise");
+    let target = format!("/f/{FLEET}/pub/n-history/s-peer/say/r23.replay");
+    let first = god
+        .publish(8_123, 1, &noise, b"v=1 t=1 kind=note text=noise")
+        .expect("first historical say record")
+        .0;
+    for seq in 2..=400 {
+        god.publish(8_123, seq, &noise, b"v=1 t=1 kind=note text=noise")
+            .expect("historical say record");
+    }
+    let target_off = god
+        .publish(8_123, 401, &target, b"v=1 t=1 kind=note text=r23catchup")
+        .expect("historical target record")
+        .0;
+
+    // A live marker proves the bridge's say subscription has passed that whole
+    // history before any late opt-in is made. Otherwise these records could
+    // arrive live and no backlog Fetch would be needed at all.
+    subscribe(&w, &sender, "r23.frontier since=head");
+    let frontier = format!("/f/{FLEET}/pub/n-history/s-peer/say/r23.frontier");
+    god.publish(8_123, 402, &frontier, b"v=1 t=1 kind=note text=frontier")
+        .expect("frontier marker");
+    until("the bridge's say reader to pass the history", || {
+        topic_rows(&w, &sender, "r23.frontier")
+            .iter()
+            .any(|row| row.contains("text=frontier"))
+            .then_some(())
+    });
+
+    let mut late = Vec::new();
+    for _ in 0..16 {
+        let spawned = w.verb("spawn");
+        assert!(spawned.ok(), "{}", spawned.header());
+        let sid = spawned
+            .header()
+            .split_whitespace()
+            .nth(1)
+            .expect("spawn answers a sid")
+            .to_string();
+        subscribe(&w, &sid, &format!("r23.replay since=@{first}"));
+        late.push(sid);
+    }
+
+    // Both arrive while the sixteen two-page gaps are still outstanding.
+    // The old per-session four-page loop finished every one during the adds,
+    // so the `still_owed` assertion below is its negative control.
+    let receiver = late.last().expect("a late subscriber");
+    god.publish(
+        8_124,
+        1,
+        &format!("/f/{FLEET}/in/{}/{receiver}/h-x/note", w.node),
+        b"v=1 t=1 kind=note text=fresh-during-replay",
+    )
+    .expect("fresh addressed mail");
+    god.publish(
+        8_125,
+        1,
+        &format!("/f/{FLEET}/fleet/h-x/halt"),
+        b"v=1 t=1 state=on reason=stop",
+    )
+    .expect("fleet halt");
+    until("fresh addressed mail and the halt", || {
+        (w.inbox(receiver)
+            .iter()
+            .any(|row| row.contains("fresh-during-replay"))
+            && w.verb(&format!("@{receiver} status"))
+                .header()
+                .contains("hold=1"))
+        .then_some(())
+    });
+    let still_owed = late
+        .iter()
+        .filter(|sid| {
+            persisted_topic_cursor(&w, sid, "r23.replay").is_none_or(|next| next <= target_off)
+        })
+        .count();
+    assert!(
+        still_owed > 0,
+        "fresh mail and halt arrived only after all sixteen gaps were replayed"
+    );
+
+    until("each late subscriber to catch up fairly", || {
+        late.iter()
+            .all(|sid| {
+                persisted_topic_cursor(&w, sid, "r23.replay").is_some_and(|next| next > target_off)
+            })
+            .then_some(())
+    });
+    for sid in &late {
+        assert!(
+            topic_rows(&w, sid, "r23.replay")
+                .iter()
+                .any(|row| row.contains("r23catchup")),
+            "{sid} advanced its durable cursor without delivering the target"
+        );
+    }
+}
+
 /// **A BROADCAST IS DATA, WHATEVER IT SAYS IT IS.**
 ///
 /// The body below is a line that would be a HALT if anything read it as one —

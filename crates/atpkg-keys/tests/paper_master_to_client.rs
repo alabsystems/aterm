@@ -13,19 +13,21 @@
 //! controlling terminal, and a prompt that could be satisfied without one would defeat its
 //! own purpose (leak vector 5 — `join < phrase.txt` must fail). What the prompt
 //! feeds into — `parse_master` — is tested exhaustively in `master.rs`.
+//!
+//! The refusals (wrong master, key off the roster, relabelled identity, revocation,
+//! replay, an unpinned anchor) are proved over the client's own bytes in
+//! `aterm_update_core::roster`'s tests and through a real install in
+//! `owner_to_client.rs`; this file keeps the two acceptance paths.
 
 #![cfg(unix)]
 
 use aterm_update_core::roster::{Roster, RosterReject, verify_roster};
 use atpkg_keys::master::parse_master;
-use atpkg_keys::roster_ops::{add, empty, revoke};
+use atpkg_keys::roster_ops::{add, empty};
 
 /// An obviously synthetic master. Sixty-four characters of a visible repeating pattern —
 /// it could not be mistaken for a generated key, and it appears nowhere outside tests.
 const PAPER: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
-
-/// A different obviously synthetic master, for the "wrong paper" case.
-const OTHER_PAPER: &str = "zyxwvtsrqpnmkjhgfedcba9876543210zyxwvtsrqpnmkjhgfed0";
 
 /// 2026-08-04T00:00:00Z.
 const NOW: u64 = 1_785_801_600;
@@ -85,166 +87,6 @@ fn a_master_phrase_mints_a_machine_whose_release_the_client_accepts() {
     assert_eq!(who.roster_seq, parsed.roster_seq);
     who.bind(Some("m3"), Some(parsed.roster_seq))
         .expect("the manifest's own claim agrees with the key that signed");
-}
-
-/// THE WRONG PAPER. A roster signed by a different master is refused under the pinned one
-/// — the transcription check `join` performs, in its essential form.
-#[test]
-fn a_roster_signed_by_a_different_master_is_refused() {
-    let (_, m3_pub) = atpkg_keys::generate().unwrap();
-    let roster = add(empty(NOW), "m3", &m3_pub, NOW).unwrap();
-    let (bytes, sig, _) = publish(&roster, OTHER_PAPER);
-    let (_, _, real_master) = publish(&roster, PAPER);
-    assert_eq!(
-        verify_roster(&[&real_master], bytes, &sig),
-        Err(RosterReject::Verify),
-        "a roster signed by the wrong master must never verify under the pinned one"
-    );
-}
-
-/// THE WRONG MACHINE KEY. A key that is not on the roster cannot publish, even though the
-/// roster itself is perfectly genuine and the signature is mathematically valid.
-#[test]
-fn a_release_signed_by_a_key_not_on_the_roster_is_refused() {
-    let (_, m3_pub) = atpkg_keys::generate().unwrap();
-    let (thief_key, thief_pub) = atpkg_keys::generate().unwrap();
-    assert_ne!(m3_pub, thief_pub, "the fixture must actually differ");
-
-    let roster = add(empty(NOW), "m3", &m3_pub, NOW).unwrap();
-    let (rb, rs, master) = publish(&roster, PAPER);
-    let parsed = Roster::parse(&verify_roster(&[&master], rb, &rs).unwrap()).unwrap();
-
-    let bytes = appcast("m3", parsed.roster_seq);
-    let forged = atpkg_keys::sign(&thief_key, &bytes).unwrap();
-    assert_eq!(
-        parsed.authorize_appcast(&bytes, &forged, NOW as i64),
-        Err(RosterReject::Verify)
-    );
-}
-
-/// MISMATCHED IDENTITY, both directions. A genuine m11 signature cannot be relabelled as
-/// m3 (the id is inside the signed bytes), and a manifest claiming m3 while signed by m11
-/// is refused at the bind.
-#[test]
-fn a_machine_cannot_sign_under_another_machines_identity() {
-    let (m3_key, m3_pub) = atpkg_keys::generate().unwrap();
-    let (m11_key, m11_pub) = atpkg_keys::generate().unwrap();
-    let roster = add(empty(NOW), "m3", &m3_pub, NOW).unwrap();
-    let roster = add(roster, "m11", &m11_pub, NOW).unwrap();
-    let (rb, rs, master) = publish(&roster, PAPER);
-    let parsed = Roster::parse(&verify_roster(&[&master], rb, &rs).unwrap()).unwrap();
-    let seq = parsed.roster_seq;
-
-    // m11 signs bytes that CLAIM to be m3's. The signature verifies (it is m11's own key)
-    // but the claim is refused, because attribution follows the key.
-    let lying = appcast("m3", seq);
-    let sig = atpkg_keys::sign(&m11_key, &lying).unwrap();
-    let who = parsed.authorize_appcast(&lying, &sig, NOW as i64).unwrap();
-    assert_eq!(who.machine_id, "m11", "the key decides, not the label");
-    assert_eq!(
-        who.bind(Some("m3"), Some(seq)),
-        Err(RosterReject::UnknownMachine)
-    );
-
-    // The other direction: m3's genuine release cannot have its label rewritten to m11,
-    // because rewriting it changes the bytes the signature covers.
-    let honest = appcast("m3", seq);
-    let m3_sig = atpkg_keys::sign(&m3_key, &honest).unwrap();
-    let relabelled = appcast("m11", seq);
-    assert_eq!(
-        parsed.authorize_appcast(&relabelled, &m3_sig, NOW as i64),
-        Err(RosterReject::Verify)
-    );
-    // Negative control: unmodified, it is accepted and attributed to m3.
-    assert_eq!(
-        parsed
-            .authorize_appcast(&honest, &m3_sig, NOW as i64)
-            .unwrap()
-            .machine_id,
-        "m3"
-    );
-}
-
-/// THE STOLEN LAPTOP, played out. m11 is taken; the owner revokes it from a surviving
-/// machine with the paper master. The thief still holds a perfectly good key and a copy of
-/// the OLD roster, whose master signature is valid forever.
-#[test]
-fn a_revoked_machine_is_refused_and_its_old_roster_cannot_be_replayed() {
-    let (m3_key, m3_pub) = atpkg_keys::generate().unwrap();
-    let (m11_key, m11_pub) = atpkg_keys::generate().unwrap();
-    let before = add(empty(NOW), "m3", &m3_pub, NOW).unwrap();
-    let before = add(before, "m11", &m11_pub, NOW).unwrap();
-    let (old_bytes, old_sig, master) = publish(&before, PAPER);
-
-    // The owner revokes m11. Only the paper master can do this; the thief's machine key
-    // signs artifacts, not rosters.
-    let after = revoke(before.clone(), "m11", NOW).unwrap();
-    let (new_bytes, new_sig, _) = publish(&after, PAPER);
-    assert!(after.roster_seq > before.roster_seq, "the counter advanced");
-
-    let current = Roster::parse(&verify_roster(&[&master], new_bytes, &new_sig).unwrap()).unwrap();
-    let bytes = appcast("m11", current.roster_seq);
-    let thief_sig = atpkg_keys::sign(&m11_key, &bytes).unwrap();
-    assert_eq!(
-        current.authorize_appcast(&bytes, &thief_sig, NOW as i64),
-        Err(RosterReject::Verify),
-        "a revoked machine is not in the candidate set, so its valid signature is never \
-         even checked"
-    );
-    // m3 keeps working: revocation is targeted.
-    let m3_bytes = appcast("m3", current.roster_seq);
-    assert!(
-        current
-            .authorize_appcast(
-                &m3_bytes,
-                &atpkg_keys::sign(&m3_key, &m3_bytes).unwrap(),
-                NOW as i64
-            )
-            .is_ok()
-    );
-
-    // REPLAY. The thief serves the OLD roster — still master-signed, still cryptographically
-    // perfect, still listing m11. It verifies...
-    let replayed = verify_roster(&[&master], old_bytes, &old_sig).expect(
-        "an old master signature never stops being valid; documents expire, signatures do not",
-    );
-    let old = Roster::parse(&replayed).unwrap();
-    assert!(old.machines.iter().any(|m| m.id == "m11"));
-    // ...and is refused by the durable floor of any client that has seen the new one.
-    assert_eq!(
-        old.admit(current.roster_seq, NOW as i64),
-        Err(RosterReject::Rollback)
-    );
-    // The residual, asserted rather than glossed — and it is UNBOUNDED, by the owner's
-    // decision: a client with NO floor (a fresh install) accepts the old roster, and
-    // rosters now carry a forever `valid_until`, so no calendar ever closes that window.
-    // Revocation reaches every RUNNING client in minutes; against a fresh install the
-    // only remedy for a stolen key is a full re-key. This test pins that trade so it
-    // stays a decision and never becomes a surprise.
-    assert_eq!(old.admit(0, NOW as i64), Ok(()));
-    let years_later = NOW as i64 + 20 * 365 * 86_400;
-    assert_eq!(
-        old.admit(0, years_later),
-        Ok(()),
-        "keys last forever: the replay window against floor-less clients never lapses"
-    );
-}
-
-/// AN EMPTY MASTER ANCHOR IS INERT: it refuses a genuine, correctly signed roster rather
-/// than waving it through. There is no configuration in which this tier accepts anything.
-#[test]
-fn an_unpinned_master_accepts_nothing_at_all() {
-    let (_, m3_pub) = atpkg_keys::generate().unwrap();
-    let roster = add(empty(NOW), "m3", &m3_pub, NOW).unwrap();
-    let (bytes, sig, master) = publish(&roster, PAPER);
-    // Genuine under its own master...
-    assert!(verify_roster(&[&master], bytes.clone(), &sig).is_ok());
-    // ...and refused with nothing pinned.
-    assert_eq!(
-        verify_roster(&[], bytes, &sig),
-        Err(RosterReject::Disabled),
-        "unpinned means inert, never permissive"
-    );
 }
 
 /// THE SAME ROUND TRIP, BUT NOBODY TYPES A KEY — driven end to end by `setup` and `join`.

@@ -42,12 +42,6 @@ pub fn set_global_scrollback_budget(bytes: usize) {
     GLOBAL_BUDGET_BYTES.store(bytes, Ordering::Relaxed);
 }
 
-/// The module-wide scrollback budget (bytes; `0` = unlimited).
-#[must_use]
-pub fn global_scrollback_budget() -> usize {
-    GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed)
-}
-
 /// One pane's membership in the global scrollback budget.
 ///
 /// Owned by the embedder NEXT TO its `Terminal` (not inside it — most

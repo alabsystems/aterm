@@ -251,7 +251,7 @@ pub fn dither_epoch(tick: u64, dq: u32) -> u32 {
 
 /// Glyph choice + mirror bit from a precomputed epoch:
 /// `rain_hash32(seed ^ pack(r,c) ^ glyph_epoch)` — the single hash site so the
-/// byte layout is shared with [`glyph_at`] and cannot drift. The mirror rides
+/// byte layout is shared with `glyph_at` and cannot drift. The mirror rides
 /// bit 8 of the same hash.
 #[must_use]
 pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u32, bool) {
@@ -273,6 +273,7 @@ pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
 /// Glyph choice + mirror bit: `rain_hash32(seed ^ pack(r,c) ^ tick/mq)`.
 /// Delegates to [`glyph_from_epoch`] (the single byte-layout source of truth).
 #[must_use]
+#[cfg(test)]
 pub fn glyph_at(seed32: u32, row: u32, col: u32, tick: u64, mq: u32) -> (u32, bool) {
     glyph_from_epoch(seed32, row, col, glyph_epoch(tick, mq))
 }

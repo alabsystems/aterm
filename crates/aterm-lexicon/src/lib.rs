@@ -127,6 +127,7 @@ impl LangSet {
 
     /// Whether `id` is in the set.
     #[must_use]
+    #[cfg(test)]
     pub fn contains(self, id: LangId) -> bool {
         self.0 & (1u64 << (u32::from(id.0) % 64)) != 0
     }
@@ -467,9 +468,9 @@ struct RawEntry {
     /// entry is likewise recorded and the entry skipped.
     #[serde(default)]
     species: String,
-    #[serde(default)]
-    #[allow(dead_code, reason = "documentation field for human reviewers")]
-    notes: String,
+    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
+    #[serde(default, rename = "notes")]
+    _notes: String,
     /// NOT a TOML field: set by [`Lexicon::with_languages_and_override`] on
     /// every entry that came from the user's override TOML, so the build can
     /// record its surfaces in [`Lexicon::user_surfaces`] (v3 §6 short-word
@@ -493,12 +494,11 @@ struct RawExceptions {
 #[serde(deny_unknown_fields)]
 struct RawException {
     word: String,
-    #[serde(default)]
-    #[allow(dead_code, reason = "documentation fields for human reviewers")]
-    lang: String,
-    #[serde(default)]
-    #[allow(dead_code, reason = "documentation fields for human reviewers")]
-    meaning: String,
+    /// Reviewer annotations in the TOML; type-checked (`deny_unknown_fields`), never read.
+    #[serde(default, rename = "lang")]
+    _lang: String,
+    #[serde(default, rename = "meaning")]
+    _meaning: String,
 }
 
 /// The set of languages whose `ambiguous` entries are enabled.
@@ -1158,6 +1158,7 @@ impl Lexicon {
     /// `chars` and `out` are reused, but this convenience entry point creates
     /// fresh auxiliary scratch. Hot row-by-row callers should own one
     /// [`ScanScratch`] and call `scan_into_with_scratch` instead.
+    #[cfg(test)]
     pub fn scan_into(
         &self,
         text: &str,

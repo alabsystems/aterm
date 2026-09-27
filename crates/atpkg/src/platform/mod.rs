@@ -19,7 +19,7 @@
 //! * **Bin shims** — a `bin/<tool>.cmd` batch wrapper (`@"<target>.exe" %* & @exit /b`,
 //!   [`CMD_FORWARD_TAIL`], behind the resume-proof frame [`CMD_FRAME_HEAD`] every `.cmd`
 //!   this crate writes starts with since 2026-09-18), not a symlink into the store.
-//!   [`install_shim`] writes it, [`install_tombstone_shim`] writes the failing
+//!   `install_shim` writes it, [`install_tombstone_shim`] writes the failing
 //!   (`exit /b 70`) variant, and [`resolve_shim`] reads a shim's target back (parsing the
 //!   `.cmd`) — the inverse of the Unix `read_link`.
 //! * **Private state** — [`ensure_private_dir`]/[`harden_file`]/[`write`-side mode]
@@ -70,12 +70,6 @@ pub use aterm_update_core::ensure_private_dir;
 /// platforms (Unix `flock(LOCK_EX)`, Windows `share_mode(0)` with bounded retry).
 pub use aterm_update_core::FileLock;
 
-/// Acquire the advisory exclusive [`FileLock`] on `path`, creating it if absent.
-/// Thin, portable wrapper so call sites name `platform::file_lock`.
-pub fn file_lock(path: &Path) -> io::Result<FileLock> {
-    FileLock::acquire(path)
-}
-
 /// Install a `bin/` shim for `tool` pointing at that tool's executable inside a build's
 /// `bin/` directory (`build_bin_dir`). `shim` is the concrete shim path — build it with
 /// [`crate::store::Layout::shim`], never by joining the tool name yourself.
@@ -88,7 +82,8 @@ pub fn file_lock(path: &Path) -> io::Result<FileLock> {
 ///
 /// * **Unix**: a symlink `shim -> build_bin_dir/<tool>` (atomic temp-symlink + rename).
 /// * **Windows**: a `bin/<tool>.cmd` batch wrapper invoking `build_bin_dir\<tool>.exe`.
-pub fn install_shim(
+#[cfg(test)]
+pub(crate) fn install_shim(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
     shim: &Path,
@@ -96,10 +91,10 @@ pub fn install_shim(
     install_shim_to(shim, &build_bin_dir.join(tool.exe_file()))
 }
 
-/// [`install_shim`] whose wrapper also EXPORTS `env` before it execs the target (design
+/// `install_shim` whose wrapper also EXPORTS `env` before it execs the target (design
 /// S7, [`crate::shim_env`]): `export NAME='VALUE'` lines ahead of the `exec` on Unix,
 /// `@set "NAME=VALUE"` lines ahead of the `@"<target>" %*` on Windows. With an empty
-/// `env` the shim is byte-identical to [`install_shim`]'s. Temp + rename like every shim.
+/// `env` the shim is byte-identical to `install_shim`'s. Temp + rename like every shim.
 pub fn install_shim_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
@@ -490,7 +485,7 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
 /// `path` with a Windows VERBATIM prefix taken off — `\\?\C:\…` → `C:\…`, `\\?\UNC\srv\sh`
 /// → `\\srv\sh` — so it can sit inside a `.cmd` line (2026-09-17). `std::fs::canonicalize`
 /// answers a verbatim path on Windows (it goes through `GetFinalPathNameByHandleW`), and
-/// that is what [`crate::stub::embedded_atpkg_path`] embeds: `cmd.exe`'s built-ins and
+/// that is what [`crate::stub::co_located_atpkg_path`] answers: `cmd.exe`'s built-ins and
 /// its command launch do not reliably accept the `\\?\` spelling (`if exist` answering
 /// false would `goto store` on every run and the wait would silently never happen; a
 /// launch refused would strand the tool behind `exit /b`). Pure string work — a path
@@ -656,19 +651,6 @@ fn cmd_embedded_path(path: &Path) -> Option<String> {
     Some(trimmed)
 }
 
-/// The LEGACY landing prelude in this platform's dialect: [`sh_landing_prelude`] on
-/// Unix, [`cmd_landing_prelude`] on Windows — what a twin laid from 2026-09-16 to
-/// 2026-09-22 carries, for the tests that lay one.
-#[cfg(test)]
-#[must_use]
-pub(crate) fn landing_prelude(program: &str, prefix: &Path, marker: &Path, atpkg: &Path) -> String {
-    if cfg!(windows) {
-        cmd_landing_prelude(program, prefix, marker, atpkg)
-    } else {
-        sh_landing_prelude(program, prefix, marker, atpkg)
-    }
-}
-
 /// THE PRELUDE of the `agents/` twin — what [`crate::activate::reconcile_agents`] renders:
 /// the self-update block alone ([`sh_selfupdate_prelude`] on Unix;
 /// [`cmd_selfupdate_prelude`], empty, on Windows). No landing prelude since Phase 2
@@ -677,9 +659,16 @@ pub(crate) fn landing_prelude(program: &str, prefix: &Path, marker: &Path, atpkg
 /// rename; a running `sh` keeps the old inode, a running `.cmd` ends its batch on the
 /// line that runs the program). `verbs` is the program's row
 /// ([`crate::selfupdate::verbs_of`]): empty renders nothing, and the twin is the plain
-/// shim under the twin's name.
+/// shim under the twin's name. `atpkg` is the one [`crate::stub::Embedder`] settled on, or
+/// `None` to name none.
 #[must_use]
-pub(crate) fn twin_prelude(program: &str, prefix: &Path, atpkg: &Path, verbs: &[&str]) -> String {
+pub(crate) fn twin_prelude(
+    program: &str,
+    prefix: &Path,
+    atpkg: Option<&Path>,
+    verbs: &[&str],
+) -> String {
+    let atpkg = crate::stub::named(atpkg);
     if cfg!(windows) {
         cmd_selfupdate_prelude(program, prefix, atpkg, verbs)
     } else {
@@ -797,7 +786,7 @@ pub(crate) fn sh_shim_content_routed(
 }
 
 /// The note line of the LEGACY `sh` landing prelude ([`sh_landing_prelude`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const SH_LANDING_NOTE: &str = "# atpkg agents twin: while a newer build of this program is landing, `atpkg __landing` \
      waits for it and then runs the new one (aterm help pkg).\n";
 
@@ -809,7 +798,7 @@ const SH_LANDING_NOTE: &str = "# atpkg agents twin: while a newer build of this 
 /// variable naming the embedded `atpkg` — which now `exec`s `bin/<program>` at once. No
 /// line of it is a literal `exec '` and none an `export `, so every reader of the twin's
 /// target and env answers over those bytes as over today's.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn sh_landing_prelude(
     program: &str,
@@ -861,7 +850,8 @@ const SH_SELFUPDATE_NOTE: &str =
 ///   the app relocated, the bundle gone — the arm falls through `;;` to the twin's own
 ///   exports and the store `exec`, so the vendor's verb runs exactly as it did before
 ///   this block existed; never `command -v atpkg`, which would exec an OLDER `atpkg` into
-///   `unknown verb` exit 2 with the tool never run.
+///   `unknown verb` exit 2 with the tool never run. An EMPTY `atpkg` (no atpkg to name,
+///   [`crate::stub::named`]) renders `__atpkg=''` and falls through the same way.
 /// * NO LINE HERE IS A LITERAL `exec '` (the one `exec` is `exec "$__atpkg"` on a line
 ///   starting with `if`), NO `export ` line, no pending-stub marker; every embedded
 ///   string goes through [`sh_quote_str`] — so `parse_sh_shim_target`, `resolve_shim`,
@@ -1019,8 +1009,9 @@ pub(crate) fn sh_shim_quote(target: &Path) -> String {
 }
 
 /// [`sh_shim_quote`] over a string: the one quoting rule the shim body uses for its
-/// target AND its exported values (and, on every platform, the self-update block's).
-fn sh_quote_str(s: &str) -> String {
+/// target AND its exported values (and, on every platform, the self-update block's, and
+/// the `ln -sfn` a replaced rustup link prints as its way back — `crate::seam`).
+pub(crate) fn sh_quote_str(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
         if c == '\'' {
@@ -1432,7 +1423,12 @@ mod tests {
         );
         if cfg!(windows) {
             assert_eq!(
-                twin_prelude("claude", prefix, atpkg, &["update", "upgrade", "install"]),
+                twin_prelude(
+                    "claude",
+                    prefix,
+                    Some(atpkg),
+                    &["update", "upgrade", "install"]
+                ),
                 "",
                 "on Windows the twin carries no prelude"
             );
@@ -2262,7 +2258,7 @@ mod sh_shim_tests {
         assert!(!quoted.contains("/it's/"), "{quoted}");
         // The whole prelude is the block: no landing check, no marker, no `__landing`.
         let want = block.clone();
-        let twin_pre = twin_prelude("claude", prefix, atpkg, verbs);
+        let twin_pre = twin_prelude("claude", prefix, Some(atpkg), verbs);
         if cfg!(windows) {
             assert_eq!(twin_pre, "", "the .cmd twin renders no prelude");
         } else {
@@ -2271,7 +2267,7 @@ mod sh_shim_tests {
         assert!(!want.contains(crate::landing::HIDDEN_VERB), "{want}");
         assert!(!want.contains("landing"), "{want}");
         assert_eq!(
-            twin_prelude("claude", prefix, atpkg, &[]),
+            twin_prelude("claude", prefix, Some(atpkg), &[]),
             "",
             "no verbs: no prelude — the twin is the plain shim"
         );

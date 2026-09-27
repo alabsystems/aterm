@@ -98,7 +98,7 @@ pub const HOOK_BASENAME: &str = "00-atpkg";
 /// covers every lane: the GUI exports `ATERM_CHILD` and `ATERM_SESSION_ID` but not
 /// `ATERM_AGENTS_DIR`, and `aterm --session` launched from another terminal carries
 /// `ATERM_AGENTS_DIR` and deliberately neither of the others. `TERM_PROGRAM` is NOT one:
-/// `ATERM_TERM_PROGRAM` makes it user-settable, so it cannot decide which binary runs. No
+/// any shell rc can reset it, so it cannot decide which binary runs. No
 /// escape widens it past aterm (`ATPKG_AGENTS_EVERYWHERE` was one, removed 2026-09-23 with
 /// the other environment knobs); `aterm claude` runs the managed copy from any terminal.
 ///
@@ -125,7 +125,7 @@ pub fn agents_markers_sh() -> String {
 /// bash hook's body uses `${var//pat/rep}`, which a POSIX `sh` (dash) rejects, so a
 /// `$SHELL=/bin/sh` user gets the `PATH` line instead (review finding, 2026-09-16);
 /// `None` for a shell atpkg writes no hook for (nushell, xonsh, cmd). One table for
-/// [`rc_hook_wired`], [`hook_file`] and the remedy `doctor`/`which` print
+/// `rc_hook_wired`, [`hook_file`] and the remedy `doctor`/`which` print
 /// ([`crate::cli::shell_remedy_command`]) — the same four files [`write_hooks`] lays.
 #[must_use]
 pub fn hook_for_shell(shell: &str) -> Option<&'static str> {
@@ -173,7 +173,8 @@ pub fn hook_file(home: &Path, shell: &str) -> Option<(std::path::PathBuf, &'stat
 /// the reader for "is the rc wired" — `doctor`'s shell-integration facts, a test's
 /// witness — and answers no remedy.
 #[must_use]
-pub fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static str)> {
+#[cfg(test)]
+pub(crate) fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static str)> {
     let rcs: &[&str] = match shell {
         "zsh" => &[".zshrc", ".zprofile"],
         "bash" | "sh" => &[".bashrc", ".bash_profile", ".profile"],
@@ -242,8 +243,8 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // deliberately carries neither of the other two (aterm-cli/src/lib.rs: "Deliberately NOT
     // setting `ATERM_CHILD` here: this lane has never carried it") — so a gate on either
     // alone switches the managed copy off in a cell the owner wants it on. TERM_PROGRAM is
-    // NOT in the union on purpose: ATERM_TERM_PROGRAM makes it user-settable, and
-    // net_listen.rs already had to stop trusting it. There is no escape hatch that puts
+    // NOT in the union on purpose: any shell rc can reset it, and net_listen.rs
+    // already had to stop trusting it. There is no escape hatch that puts
     // the managed copy in front in every shell (`ATPKG_AGENTS_EVERYWHERE` was one, removed
     // 2026-09-23 with the other environment knobs: the owner's rule is "NOT ENV VARS" and
     // his ask here was aterm-only). `aterm claude` / `aterm codex` run the managed copy
@@ -635,7 +636,9 @@ fn refresh_at(home: &Path, bin_dir: &Path, agents_dir: &Path, wiring: RcWiring) 
 /// found, refreshed and removed exactly — never matched by content, which drifts.
 /// `pub(crate)` so callers outside this module — the repair report's pin test, `doctor`'s rc
 /// lines — read the marker the code actually writes rather than a copy of it that can drift.
+#[cfg(any(unix, test))]
 pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
+#[cfg(any(unix, test))]
 pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
 /// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
@@ -1193,8 +1196,9 @@ fn ensure_command_links_from(home: &Path, exe: &Path) {
                 let _ = fs::remove_file(&link);
             }
             // Not a link: a binary an install from before the links copied here, or
-            // someone's own build. Never touched unattended — `doctor` names it and
-            // `repair` moves it aside ([`move_aside_copied_commands`]).
+            // someone's own build. Never touched unattended — `doctor` names it, and
+            // `repair` run from the installed app moves it aside
+            // ([`move_aside_copied_commands`]).
             Ok(_) => continue,
             Err(_) => {}
         }
@@ -1210,14 +1214,24 @@ const COMMAND_LINKS: [&str; 2] = ["aterm", "atpkg"];
 /// `None` where it may not lay them.
 #[cfg(unix)]
 fn command_link_source(exe: &Path) -> Option<&Path> {
+    command_link_check(exe).ok()
+}
+
+/// [`command_link_source`], with the reason when this executable may not lay the links —
+/// in words `repair` prints, so an owner running it from the wrong copy learns which.
+#[cfg(unix)]
+fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {
     // Only from inside a bundle: a source build's target/release is the developer's
     // own tree, and linking out of it would outlive the checkout.
-    let macos = exe.parent().filter(|d| d.ends_with("Contents/MacOS"))?;
+    let macos = exe
+        .parent()
+        .filter(|d| d.ends_with("Contents/MacOS"))
+        .ok_or("this atpkg is not inside an app bundle")?;
     // AND ONLY FROM THE RELEASE BUNDLE: never write a link this pass would itself refuse
     // to repoint. From a dev bundle (or any bundle not named `aterm.app`) the PATH names
     // are not ours to take — see [`ensure_command_links`].
     if !in_release_bundle(exe) {
-        return None;
+        return Err("this atpkg is not the release aterm.app's (a dev or renamed copy)");
     }
     // AND NOT FROM A TRANSLOCATED ONE. Gatekeeper runs a quarantined download from a
     // read-only, randomly-named mount that disappears when the app quits, so a link
@@ -1227,9 +1241,21 @@ fn command_link_source(exe: &Path) -> Option<&Path> {
             .to_string_lossy()
             .starts_with("AppTranslocation")
     }) {
-        return None;
+        return Err(
+            "this aterm.app runs from Gatekeeper's temporary copy of a download — move it to \
+             /Applications and open it from there",
+        );
     }
-    Some(macos)
+    // AND NOT FROM A MOUNTED VOLUME. An app run in place from a disk image or a
+    // removable disk goes away with the eject, and a link into it dangles.
+    if exe.starts_with("/Volumes") {
+        return Err(
+            "this aterm.app resolves onto a disk image or a mounted volume (under /Volumes) \
+             — copy the app itself, not a link to it, into /Applications and run it from \
+             there",
+        );
+    }
+    Ok(macos)
 }
 
 /// Names a file in `~/.local/bin` may still carry from an install before the one-binary
@@ -1237,17 +1263,26 @@ fn command_link_source(exe: &Path) -> Option<&Path> {
 #[cfg(unix)]
 const RETIRED_COMMANDS: [&str; 1] = ["aterm-ctl"];
 
+/// The names this platform's install links into `~/.local/bin`: on macOS the app lays both
+/// ([`COMMAND_LINKS`]); elsewhere `tools/install.sh` lays `aterm` alone, and there only when
+/// `ATERM_BIN_DIR` does not name another folder.
+#[cfg(all(unix, target_os = "macos"))]
+const INSTALLED_COMMANDS: &[&str] = &COMMAND_LINKS;
+#[cfg(all(unix, not(target_os = "macos")))]
+const INSTALLED_COMMANDS: &[&str] = &["aterm"];
+
 /// The command paths in `~/.local/bin` that hold a regular file instead of a link: a binary
-/// an install from before the links copied there, or someone's own build, under a name the
-/// pass links ([`COMMAND_LINKS`]) or a retired one ([`RETIRED_COMMANDS`]). It never updates,
-/// and it runs instead of the app wherever `~/.local/bin` leads PATH. No unattended pass
-/// touches it; `doctor` names it and `repair` moves it aside ([`move_aside_copied_commands`]).
+/// an install from before the links copied there, or someone's own build, under a name this
+/// platform's install links ([`INSTALLED_COMMANDS`]) or a retired one ([`RETIRED_COMMANDS`]).
+/// It never updates, and it runs instead of the installed aterm wherever `~/.local/bin` leads
+/// PATH. No unattended pass touches it; `doctor` names it, and on macOS `repair` run from the
+/// installed app moves it aside ([`move_aside_copied_commands`]).
 #[cfg(unix)]
 pub(crate) fn copied_command_links(home: &Path) -> Vec<std::path::PathBuf> {
     let Some(bin) = command_links_dir(home) else {
         return Vec::new();
     };
-    COMMAND_LINKS
+    INSTALLED_COMMANDS
         .iter()
         .chain(RETIRED_COMMANDS.iter())
         .map(|name| bin.join(name))
@@ -1257,17 +1292,97 @@ pub(crate) fn copied_command_links(home: &Path) -> Vec<std::path::PathBuf> {
 
 /// How to run `repair` from the installed app, since a copied `~/.local/bin/aterm` is exactly
 /// what `aterm pkg repair` would run: this process's own `atpkg` when it is the release
-/// bundle's, else a description.
-#[cfg(unix)]
+/// bundle's, else the `atpkg` of an `aterm.app` in `/Applications` or `~/Applications`, else a
+/// description. Only the macOS release bundle lays the links, so only there is there a
+/// command to name.
+#[cfg(all(unix, target_os = "macos"))]
 pub(crate) fn repair_from_app_hint() -> String {
-    std::env::current_exe()
+    let own = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
         .ok()
-        .and_then(|exe| command_link_source(&exe).map(|macos| macos.join("atpkg")))
-        .map_or_else(
-            || "`atpkg repair` from the installed aterm.app".to_string(),
-            |atpkg| format!("`'{}' repair`", atpkg.display()),
-        )
+        .and_then(|exe| command_link_source(&exe).map(|macos| macos.join("atpkg")));
+    let installed = || installed_app_atpkg(&installed_app_dirs(aterm_types::dirs::home_dir()));
+    repair_hint_for(own.or_else(installed).as_deref())
+}
+
+/// Where an installed `aterm.app` is looked for, in order: the system folder first.
+#[cfg(all(unix, target_os = "macos"))]
+fn installed_app_dirs(home: Option<std::path::PathBuf>) -> [Option<std::path::PathBuf>; 2] {
+    [
+        Some(std::path::PathBuf::from("/Applications")),
+        home.map(|home| home.join("Applications")),
+    ]
+}
+
+/// The `atpkg` of the first `aterm.app` in `apps_dirs` that would do the job: its folder
+/// resolved (a link onto a mounted volume would refuse it, as atpkg refuses itself), and
+/// the `atpkg` name kept — in the bundle it is an alias link to `aterm`, and the one binary
+/// picks its tool by that name, so resolving it would name `aterm` instead.
+#[cfg(all(unix, target_os = "macos"))]
+fn installed_app_atpkg(apps_dirs: &[Option<std::path::PathBuf>]) -> Option<std::path::PathBuf> {
+    apps_dirs
+        .iter()
+        .flatten()
+        .filter_map(|apps| apps.join("aterm.app/Contents/MacOS").canonicalize().ok())
+        .find(|macos| {
+            macos.join("atpkg").is_file() && command_link_source(&macos.join("aterm")).is_some()
+        })
+        .map(|macos| macos.join("atpkg"))
+}
+
+/// [`repair_from_app_hint`]'s words for the `atpkg` it found, if any. Pure.
+#[cfg(all(unix, target_os = "macos"))]
+fn repair_hint_for(atpkg: Option<&Path>) -> String {
+    atpkg.map_or_else(
+        || {
+            "`atpkg repair` from aterm.app installed in /Applications or ~/Applications \
+             (a real copy, not one on a disk image or mounted volume)"
+                .to_string()
+        },
+        |atpkg| format!("`{} repair`", sh_single_quote(&atpkg.to_string_lossy())),
+    )
+}
+
+/// What replaces the copy at `path` — a [`copied_command_links`] entry — said to the owner:
+/// on macOS the installed app's `repair`, which moves it aside and links the app in place of
+/// `aterm`/`atpkg` (a retired name gets nothing in its place). Elsewhere no atpkg lays these
+/// links and the installer's own may live in another folder (`ATERM_BIN_DIR`), so the copy is
+/// moved aside by hand — a retired `aterm-ctl` too, whose place `aterm ctl` takes.
+#[cfg(unix)]
+pub(crate) fn copied_command_remedy(path: &Path) -> String {
+    let retired = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| RETIRED_COMMANDS.contains(&name));
+    #[cfg(target_os = "macos")]
+    {
+        if retired {
+            format!(
+                "run {} — it moves this file aside; `aterm ctl` replaces it",
+                repair_from_app_hint()
+            )
+        } else {
+            format!(
+                "run {} — it moves this file aside and links the app in its place",
+                repair_from_app_hint()
+            )
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if retired {
+            "move it aside — `aterm ctl` replaces it".to_string()
+        } else {
+            "move it aside, and install aterm again if its link belongs here".to_string()
+        }
+    }
+}
+
+/// `text` as one POSIX shell word: single-quoted, with each `'` closed, escaped and
+/// reopened, so a folder named `Bob's Apps` still pastes as one argument.
+#[cfg(all(unix, target_os = "macos"))]
+fn sh_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// One file `repair` moved out of a command path.
@@ -1280,19 +1395,27 @@ pub(crate) struct MovedAside {
     pub(crate) linked: bool,
 }
 
-/// `atpkg repair`'s half of the command links: each [`copied_command_links`] path is moved to
-/// `<name>.moved-aside-<unix secs>` beside it, and a name the pass links gets the release
-/// bundle linked in its place. It is the asked-for pass, so it may displace someone's own
-/// build — which is why it moves rather than deletes, and says where the file went. Only
-/// where this process lays the links ([`command_link_source`]).
+/// What `repair`'s command-link step did: each file it moved and each it could not, with
+/// why. (When this process may not lay the links at all, the step answers the reason.)
 #[cfg(unix)]
-pub(crate) fn move_aside_copied_commands() -> Vec<MovedAside> {
-    let Some(home) = aterm_types::dirs::home_dir() else {
-        return Vec::new();
-    };
-    let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) else {
-        return Vec::new();
-    };
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AsideOutcome {
+    pub(crate) moved: Vec<MovedAside>,
+    pub(crate) failed: Vec<(std::path::PathBuf, String)>,
+}
+
+/// `atpkg repair`'s half of the command links: each [`copied_command_links`] path is moved to
+/// `<name>.moved-aside-<unix secs>` beside it, and a name the pass links ([`COMMAND_LINKS`])
+/// gets the release bundle linked in its place; a retired name ([`RETIRED_COMMANDS`]) is only
+/// moved. It is the asked-for pass, so it may displace someone's own build — which is why it
+/// moves rather than deletes, and says where the file went. `Err` says why this process
+/// does not lay the links ([`command_link_check`]).
+#[cfg(unix)]
+pub(crate) fn move_aside_copied_commands() -> Result<AsideOutcome, &'static str> {
+    let home = aterm_types::dirs::home_dir().ok_or("$HOME is not set")?;
+    let exe = std::env::current_exe()
+        .and_then(|e| e.canonicalize())
+        .map_err(|_| "this atpkg could not find its own path")?;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1300,31 +1423,38 @@ pub(crate) fn move_aside_copied_commands() -> Vec<MovedAside> {
 }
 
 #[cfg(unix)]
-fn move_aside_copied_commands_at(home: &Path, exe: &Path, secs: u64) -> Vec<MovedAside> {
-    let Some(macos) = command_link_source(exe) else {
-        return Vec::new();
-    };
-    let mut moved = Vec::new();
+fn move_aside_copied_commands_at(
+    home: &Path,
+    exe: &Path,
+    secs: u64,
+) -> Result<AsideOutcome, &'static str> {
+    let macos = command_link_check(exe)?;
+    let mut outcome = AsideOutcome::default();
     for from in copied_command_links(home) {
         let Some(name) = from.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         let link_to = COMMAND_LINKS.contains(&name).then(|| macos.join(name));
-        if link_to.as_ref().is_some_and(|target| !target.exists()) {
+        if let Some(target) = link_to.as_ref().filter(|target| !target.exists()) {
+            outcome.failed.push((
+                from,
+                format!("this app has no {} to link in its place", target.display()),
+            ));
             continue;
         }
         let mut aside = from.clone().into_os_string();
         aside.push(format!(".moved-aside-{secs}"));
         let aside = std::path::PathBuf::from(aside);
-        if rename_file_aside(&from, &aside, link_to.as_deref()) {
-            moved.push(MovedAside {
+        match rename_file_aside(&from, &aside, link_to.as_deref()) {
+            Ok(()) => outcome.moved.push(MovedAside {
                 from,
                 to: aside,
                 linked: link_to.is_some(),
-            });
+            }),
+            Err(why) => outcome.failed.push((from, why)),
         }
     }
-    moved
+    Ok(outcome)
 }
 
 /// Give the file at `from` the name `aside`, then put a link to `link_to` at `from` (or leave
@@ -1332,32 +1462,42 @@ fn move_aside_copied_commands_at(home: &Path, exe: &Path, secs: u64) -> Vec<Move
 /// `aside`, so an earlier move is never overwritten; the link is made under a temporary name
 /// and renamed over `from` in one step; and on any failure `aside` is dropped, leaving `from`
 /// as it was. `from` must still be the file that was linked — checked by inode — before it
-/// is replaced.
+/// is replaced. `Err` says why nothing changed.
 #[cfg(unix)]
-fn rename_file_aside(from: &Path, aside: &Path, link_to: Option<&Path>) -> bool {
+fn rename_file_aside(from: &Path, aside: &Path, link_to: Option<&Path>) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
     let inode = |path: &Path| fs::symlink_metadata(path).map(|m| (m.dev(), m.ino())).ok();
-    if fs::hard_link(from, aside).is_err() {
-        return false;
-    }
-    let same = inode(from).is_some() && inode(from) == inode(aside);
-    let replaced = same
-        && match link_to {
+    fs::hard_link(from, aside).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            format!("{} already exists", aside.display())
+        } else {
+            format!("it could not be given a second name ({e})")
+        }
+    })?;
+    let replaced = if inode(from).is_none() || inode(from) != inode(aside) {
+        Err("it changed while it was being moved".to_string())
+    } else {
+        match link_to {
             Some(target) => {
                 let mut tmp = from.as_os_str().to_owned();
                 tmp.push(format!(".link-{}", std::process::id()));
                 let tmp = std::path::PathBuf::from(tmp);
                 let _ = fs::remove_file(&tmp);
-                let done = std::os::unix::fs::symlink(target, &tmp).is_ok()
-                    && fs::rename(&tmp, from).is_ok();
-                if !done {
+                let linked = std::os::unix::fs::symlink(target, &tmp)
+                    .and_then(|()| fs::rename(&tmp, from))
+                    .map_err(|e| {
+                        format!("the link to the app could not be put in its place ({e})")
+                    });
+                if linked.is_err() {
                     let _ = fs::remove_file(&tmp);
                 }
-                done
+                linked
             }
-            None => fs::remove_file(from).is_ok(),
-        };
-    if !replaced {
+            None => fs::remove_file(from)
+                .map_err(|e| format!("it could not be removed from its old name ({e})")),
+        }
+    };
+    if replaced.is_err() {
         let _ = fs::remove_file(aside);
     }
     replaced
@@ -1440,6 +1580,7 @@ fn ps_quote(bin_dir: &Path) -> String {
 
 /// Write `content` to `dest` atomically (temp `0600` + rename), so a reader never sees a
 /// half-written hook.
+#[cfg(unix)]
 fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
     let tmp = stage_hook(dest, content)?;
     fs::rename(&tmp, dest).inspect_err(|_| {
@@ -1586,7 +1727,19 @@ mod tests {
     }
 
     fn tmp(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atpkg-hooks-{label}-{}", std::process::id()));
+        // The command-link checks refuse anything on a mounted volume, so a
+        // TMPDIR under /Volumes (a RAM disk, an external build volume) would
+        // refuse these tests' own bundles: build them on the system volume.
+        let base = std::env::temp_dir();
+        let base = if base
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with("/Volumes"))
+        {
+            PathBuf::from("/tmp")
+        } else {
+            base
+        };
+        let d = base.join(format!("atpkg-hooks-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -2447,7 +2600,11 @@ mod tests {
         );
         assert_eq!(copied_command_links(&home), vec![copied.clone()]);
 
-        assert!(move_aside_copied_commands_at(&home, &dev.join("aterm"), 7).is_empty());
+        assert_eq!(
+            move_aside_copied_commands_at(&home, &dev.join("aterm"), 7),
+            Err("this atpkg is not the release aterm.app's (a dev or renamed copy)"),
+            "a dev bundle does not lay the links, and says why"
+        );
         assert!(
             is_file(&copied),
             "from a dev bundle nothing would take the name"
@@ -2455,7 +2612,14 @@ mod tests {
 
         let earlier = bin.join("aterm.moved-aside-7");
         fs::write(&earlier, b"earlier").unwrap();
-        assert!(move_aside_copied_commands_at(&home, &release.join("aterm"), 7).is_empty());
+        let refused = move_aside_copied_commands_at(&home, &release.join("aterm"), 7).unwrap();
+        assert!(refused.moved.is_empty());
+        assert_eq!(refused.failed.len(), 1);
+        assert!(
+            refused.failed[0].1.contains("already exists"),
+            "{:?}",
+            refused.failed
+        );
         assert_eq!(
             fs::read(&earlier).unwrap(),
             b"earlier",
@@ -2468,18 +2632,21 @@ mod tests {
         fs::write(&ctl, b"old ctl").unwrap();
         assert_eq!(
             move_aside_copied_commands_at(&home, &release.join("aterm"), 9),
-            vec![
-                MovedAside {
-                    from: copied.clone(),
-                    to: aside.clone(),
-                    linked: true,
-                },
-                MovedAside {
-                    from: ctl.clone(),
-                    to: bin.join("aterm-ctl.moved-aside-9"),
-                    linked: false,
-                },
-            ]
+            Ok(AsideOutcome {
+                moved: vec![
+                    MovedAside {
+                        from: copied.clone(),
+                        to: aside.clone(),
+                        linked: true,
+                    },
+                    MovedAside {
+                        from: ctl.clone(),
+                        to: bin.join("aterm-ctl.moved-aside-9"),
+                        linked: false,
+                    },
+                ],
+                failed: Vec::new(),
+            })
         );
         assert!(
             fs::symlink_metadata(&ctl).is_err(),
@@ -2489,10 +2656,223 @@ mod tests {
         assert_eq!(fs::read_link(&copied).ok(), Some(release.join("aterm")));
         assert!(copied_command_links(&home).is_empty());
         assert!(
-            move_aside_copied_commands_at(&home, &release.join("aterm"), 10).is_empty(),
+            move_aside_copied_commands_at(&home, &release.join("aterm"), 10)
+                == Ok(AsideOutcome::default()),
             "a second repair has nothing to move"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A move that cannot finish changes nothing: the file keeps its name and no second
+    /// name is left behind. Here the temporary link's name is taken by a directory, so the
+    /// link cannot be made after the file already has its aside name. (Also pinned: an
+    /// earlier aside name is never overwritten, and a retired name that cannot leave its
+    /// folder stays put. Not pinned: a failing rename over the old name and the inode
+    /// check, which need a writer racing this one.)
+    #[cfg(unix)]
+    #[test]
+    fn a_move_aside_that_cannot_finish_changes_nothing() {
+        let dir = tmp("aside-rollback").canonicalize().unwrap();
+        let from = dir.join("aterm");
+        let aside = dir.join("aterm.moved-aside-1");
+        fs::write(&from, b"a build of someone's own").unwrap();
+        let target = dir.join("target");
+        fs::write(&target, b"").unwrap();
+        let blocker = dir.join(format!("aterm.link-{}", std::process::id()));
+        fs::create_dir_all(blocker.join("inside")).unwrap();
+
+        let why = rename_file_aside(&from, &aside, Some(&target)).unwrap_err();
+        assert!(why.contains("link"), "{why}");
+        assert_eq!(fs::read(&from).unwrap(), b"a build of someone's own");
+        assert!(
+            fs::symlink_metadata(&aside).is_err(),
+            "no second name left behind"
+        );
+
+        fs::remove_dir_all(&blocker).unwrap();
+        rename_file_aside(&from, &aside, Some(&target)).unwrap();
+        assert_eq!(fs::read_link(&from).unwrap(), target);
+        assert_eq!(fs::read(&aside).unwrap(), b"a build of someone's own");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A retired name is moved with nothing linked in its place; when its old name
+    /// cannot be removed, the second name is dropped again and the file stays exactly
+    /// where it was. Here the old name's folder is read-only while the aside name is in
+    /// a writable one, which separates the two steps.
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_name_that_cannot_leave_its_folder_stays_put() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: `geteuid` reads this process's own effective uid and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the folder's mode, which is the whole setup
+        }
+        /// Puts the locked folder's mode back however the test ends.
+        struct Unlock(PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let dir = tmp("aside-retired").canonicalize().unwrap();
+        let locked = dir.join("locked");
+        let open = dir.join("open");
+        fs::create_dir_all(&locked).unwrap();
+        fs::create_dir_all(&open).unwrap();
+        let from = locked.join("aterm-ctl");
+        let aside = open.join("aterm-ctl.moved-aside-1");
+        fs::write(&from, b"an old aterm-ctl").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let unlock = Unlock(locked.clone());
+
+        let why = rename_file_aside(&from, &aside, None).unwrap_err();
+        drop(unlock);
+        assert!(why.contains("removed"), "{why}");
+        assert_eq!(fs::read(&from).unwrap(), b"an old aterm-ctl");
+        assert!(
+            fs::symlink_metadata(&aside).is_err(),
+            "no second name left behind"
+        );
+
+        rename_file_aside(&from, &aside, None).unwrap();
+        assert!(
+            fs::symlink_metadata(&from).is_err(),
+            "moved, nothing in its place"
+        );
+        assert_eq!(fs::read(&aside).unwrap(), b"an old aterm-ctl");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Each copied name gets the remedy that really clears it: on macOS the
+    /// installed app's `repair` (which links nothing in place of a retired name),
+    /// elsewhere moving it aside by hand — the installer lays `aterm` alone, so
+    /// `atpkg` is not ours there and is not reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_command_is_given_the_remedy_that_replaces_it() {
+        let bin = Path::new("/home/u/.local/bin");
+        let aterm = copied_command_remedy(&bin.join("aterm"));
+        let ctl = copied_command_remedy(&bin.join("aterm-ctl"));
+        #[cfg(target_os = "macos")]
+        {
+            let hint = repair_from_app_hint();
+            assert_eq!(
+                aterm,
+                format!("run {hint} — it moves this file aside and links the app in its place")
+            );
+            assert_eq!(
+                ctl,
+                format!("run {hint} — it moves this file aside; `aterm ctl` replaces it")
+            );
+            assert!(hint.starts_with('`') && hint.contains("repair`"), "{hint}");
+
+            // The installed-app fallback keeps the `atpkg` alias name, and skips an
+            // app it would not act from.
+            let root = tmp("hint-installed").canonicalize().unwrap();
+            let macos = root.join("Apps/aterm.app/Contents/MacOS");
+            fs::create_dir_all(&macos).unwrap();
+            fs::write(macos.join("aterm"), b"").unwrap();
+            std::os::unix::fs::symlink("aterm", macos.join("atpkg")).unwrap();
+            // `Moved/aterm.app` resolves into a translocated mount, which atpkg
+            // refuses to act from: it is skipped for the one it would act from.
+            let mount = root.join("AppTranslocation/X/d/aterm.app/Contents/MacOS");
+            fs::create_dir_all(&mount).unwrap();
+            fs::write(mount.join("aterm"), b"").unwrap();
+            std::os::unix::fs::symlink("aterm", mount.join("atpkg")).unwrap();
+            fs::create_dir_all(root.join("Moved")).unwrap();
+            std::os::unix::fs::symlink(
+                root.join("AppTranslocation/X/d/aterm.app"),
+                root.join("Moved/aterm.app"),
+            )
+            .unwrap();
+            assert_eq!(installed_app_atpkg(&[Some(root.join("Moved"))]), None);
+            assert_eq!(
+                installed_app_atpkg(&[None, Some(root.join("Moved")), Some(root.join("Apps"))]),
+                Some(macos.join("atpkg")),
+                "the alias, not the binary it links to, from the app it would act from"
+            );
+            assert_eq!(installed_app_atpkg(&[Some(root.join("Nowhere"))]), None);
+            // Two it would act from: the first listed wins.
+            let second = root.join("Second/aterm.app/Contents/MacOS");
+            fs::create_dir_all(&second).unwrap();
+            fs::write(second.join("aterm"), b"").unwrap();
+            std::os::unix::fs::symlink("aterm", second.join("atpkg")).unwrap();
+            assert_eq!(
+                installed_app_atpkg(&[Some(root.join("Second")), Some(root.join("Apps"))]),
+                Some(second.join("atpkg"))
+            );
+            let _ = fs::remove_dir_all(&root);
+            assert_eq!(INSTALLED_COMMANDS, &["aterm", "atpkg"]);
+            assert_eq!(
+                repair_hint_for(Some(Path::new(
+                    "/Bob's Apps/aterm.app/Contents/MacOS/atpkg"
+                ))),
+                "`'/Bob'\\''s Apps/aterm.app/Contents/MacOS/atpkg' repair`"
+            );
+            assert_eq!(
+                repair_hint_for(None),
+                "`atpkg repair` from aterm.app installed in /Applications or ~/Applications (a \
+                 real copy, not one on a disk image or mounted volume)"
+            );
+            assert_eq!(
+                installed_app_dirs(Some(PathBuf::from("/Users//u"))),
+                [
+                    Some(PathBuf::from("/Applications")),
+                    Some(PathBuf::from("/Users//u/Applications"))
+                ],
+                "the system folder first"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                aterm,
+                "move it aside, and install aterm again if its link belongs here"
+            );
+            assert_eq!(ctl, "move it aside — `aterm ctl` replaces it");
+            assert_eq!(INSTALLED_COMMANDS, &["aterm"]);
+        }
+    }
+
+    /// The links are laid only from a bundle that stays: not a translocated copy and
+    /// not one run from a mounted disk image or removable disk. A remedy names the app's
+    /// own atpkg as one shell word, whatever its folder is called.
+    #[cfg(all(unix, target_os = "macos"))]
+    #[test]
+    fn links_come_only_from_a_bundle_that_stays_and_the_remedy_is_one_word() {
+        for (gone, why) in [
+            (
+                "/Volumes/aterm/aterm.app/Contents/MacOS/aterm",
+                "mounted volume",
+            ),
+            (
+                "/private/var/folders/x/AppTranslocation/ABC/d/aterm.app/Contents/MacOS/aterm",
+                "Gatekeeper's temporary copy",
+            ),
+            (
+                "/Apps/aterm (dev).app/Contents/MacOS/aterm",
+                "dev or renamed copy",
+            ),
+            ("/src/target/release/aterm", "not inside an app bundle"),
+        ] {
+            assert_eq!(command_link_source(Path::new(gone)), None, "{gone}");
+            assert!(
+                command_link_check(Path::new(gone))
+                    .unwrap_err()
+                    .contains(why),
+                "{gone}"
+            );
+        }
+        assert!(
+            command_link_source(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"))
+                .is_some()
+        );
+        assert_eq!(sh_single_quote("/Apps/aterm"), "'/Apps/aterm'");
+        assert_eq!(
+            sh_single_quote("/Bob's Apps/atpkg"),
+            "'/Bob'\\''s Apps/atpkg'"
+        );
     }
 
     /// THE SHELL HOOKS ARE THE RELEASE BUNDLE'S TO LAY UNATTENDED (2026-09-23). The same
@@ -2694,8 +3074,8 @@ mod tests {
                 );
                 assert!(
                     !body.contains("TERM_PROGRAM"),
-                    "TERM_PROGRAM is NOT a gate marker: ATERM_TERM_PROGRAM makes it \
-                     user-settable, so it cannot decide which binary runs"
+                    "TERM_PROGRAM is NOT a gate marker: a shell rc can reset it, so it \
+                     cannot decide which binary runs"
                 );
                 // The false arm DEMOTES rather than merely declining to promote, so a
                 // shell that INHERITED an agents-first PATH (an iTerm launched from an

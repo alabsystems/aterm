@@ -91,49 +91,35 @@ pub fn canonical_version(tag: &str, numeric: &[u64]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// One row per spelling: a canonical three-component tag is a candidate, exactly two
+    /// components is the retired scheme, and everything else fails closed.
     #[test]
-    fn canonical_three_component_tags_are_candidates() {
-        assert_eq!(
-            parse_release_tag("v0.10.0"),
-            Ok(TagKind::Candidate(vec![0, 10, 0]))
-        );
+    fn parse_release_tag_classifies_every_spelling() {
+        use TagError::{Malformed, Overflow};
+        let rows: &[(&str, Result<TagKind, TagError>)] = &[
+            ("v0.10.0", Ok(TagKind::Candidate(vec![0, 10, 0]))),
+            ("v0.61", Ok(TagKind::Legacy)),
+            ("0.10.0", Err(Malformed)),
+            ("V0.10.0", Err(Malformed)),
+            ("v", Err(Malformed)),
+            ("v0", Err(Malformed)),
+            ("v0.x.0", Err(Malformed)),
+            ("v0.1.2.3", Err(Malformed)),
+            ("v0..10", Err(Malformed)),
+            ("v0.10.", Err(Malformed)),
+            ("v.10.0", Err(Malformed)),
+            ("v0.10.0-rc1", Err(Malformed)),
+            // Leading zeros give one release two spellings.
+            ("v00.10.0", Err(Malformed)),
+            ("v0.010.0", Err(Malformed)),
+            ("v0.10.00", Err(Malformed)),
+            ("v1.2.99999999999999999999", Err(Overflow)),
+        ];
+        for (tag, want) in rows {
+            assert_eq!(&parse_release_tag(tag), want, "{tag}");
+        }
         // Numeric, never lexicographic: 0.2.9 < 0.2.10.
         assert!(parse_release_tag("v0.2.9").unwrap() < parse_release_tag("v0.2.10").unwrap());
-    }
-
-    #[test]
-    fn two_component_tags_are_the_retired_scheme() {
-        assert_eq!(parse_release_tag("v0.61"), Ok(TagKind::Legacy));
-    }
-
-    #[test]
-    fn everything_else_fails_closed() {
-        for malformed in [
-            "0.10.0",
-            "V0.10.0",
-            "v",
-            "v0",
-            "v0.x.0",
-            "v0.1.2.3",
-            "v0..10",
-            "v0.10.",
-            "v.10.0",
-            "v0.10.0-rc1",
-            // Leading zeros give one release two spellings.
-            "v00.10.0",
-            "v0.010.0",
-            "v0.10.00",
-        ] {
-            assert_eq!(
-                parse_release_tag(malformed),
-                Err(TagError::Malformed),
-                "{malformed}"
-            );
-        }
-        assert_eq!(
-            parse_release_tag("v1.2.99999999999999999999"),
-            Err(TagError::Overflow)
-        );
     }
 
     #[test]

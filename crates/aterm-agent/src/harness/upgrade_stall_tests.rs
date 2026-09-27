@@ -1,0 +1,2011 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! THE STALL OF 2026-09-25/26 (tab `s-d3346b29dd236432b852`, Claude session
+//! `37dffac7-361e-46be-90c2-31589cb40b5c`), replayed through the real driver:
+//! the weekly limit hit at 20:50 on the 24th and Claude Code 2.1.280 parked
+//! the session at `⚠ Usage limit reached · continuing automatically at 6am`;
+//! the upgrade typed its notice into that parked session at 16:02, 16:32,
+//! 17:02 and 17:32 on the 25th (the ledger's `announced:1..4`, a new marker
+//! each time), gave up at 18:02 (`Failed("unanswered")`, waited on as
+//! `failed` for ever), and at 06:00 on the 26th Claude Code delivered all four
+//! notices at once. The agent stopped the work it had just relaunched and
+//! answered the LAST marker at 06:02; nothing acted, and nothing told it to go
+//! on. The three fixes — no notice into a limited session (F1), a late READY
+//! honoured (F2), one release line for every notice abandoned (F3) — what
+//! the review of 2026-09-26 found left in them (a stop after READY that kept
+//! its markers, a release word that owned nothing, a stop's own word taken
+//! as the last, a release typed to another process or over newer direction,
+//! a late READY with no drain, a clock the window's host never held, a limit
+//! held by the upgrade's ownership), and the Tier-1 bind of
+//! `harness_upgrade_never_strands_model` to the real code.
+
+use super::*;
+use aterm_spec::derive::{Model, harness_upgrade_never_strands_model};
+use std::collections::BTreeMap;
+
+/// The incident's conversation, target and salt (its state file, read
+/// 2026-09-26: `"salt":1790372998`, `"to":"2.1.283"`).
+const INCIDENT_SESSION: &str = "37dffac7-361e-46be-90c2-31589cb40b5c";
+const INCIDENT_SALT: u64 = 1_790_372_998;
+
+/// The ledger's four announcements (`t`, marker), 2026-09-25 PDT.
+const LEDGER: [(u64, &str); 4] = [
+    (1_790_377_339, "ATERM-UPGRADE-READY-5182b3fa"),
+    (1_790_379_148, "ATERM-UPGRADE-READY-a39848f9"),
+    (1_790_380_954, "ATERM-UPGRADE-READY-e5bc1bec"),
+    (1_790_382_760, "ATERM-UPGRADE-READY-8cd7f7eb"),
+];
+
+/// `gave-up`, 18:02:42 PDT; the READY answer, 06:02:01 PDT the next morning
+/// (the supervisor's `EVENT idle seq=54190 ATERM-UPGRADE-READY-8cd7f7eb`).
+const GAVE_UP_AT: u64 = 1_790_384_562;
+const READY_AT: u64 = 1_790_427_721;
+
+/// The row the supervisor journaled as `EVENT limited` before each notice.
+const AUTO_CONTINUE: &str =
+    "⚠ Usage limit reached · continuing automatically at 6am · esc to cancel";
+
+fn version(s: &str) -> Version {
+    Version::parse(s).expect("a version")
+}
+
+/// The facts of an idle Claude at an empty, settled composer — at its usage
+/// limit or not.
+fn idle(limited: bool) -> Facts {
+    Facts {
+        status: "idle".to_string(),
+        status_age_s: 3_600,
+        composer_empty: true,
+        quiet_s: 3_600,
+        limited,
+        ..Facts::default()
+    }
+}
+
+/// A transcript user row saying `text`, as Claude Code writes a typed turn.
+fn user(text: &str) -> String {
+    let row = aterm_json::to_string(&Value::from(text)).expect("json");
+    format!(r#"{{"type":"user","isSidechain":false,"message":{{"role":"user","content":{row}}}}}"#)
+}
+
+/// An assistant row of the session's own model saying `text`.
+fn said_by_agent(text: &str) -> String {
+    let row = aterm_json::to_string(&Value::from(text)).expect("json");
+    format!(
+        r#"{{"type":"assistant","isSidechain":false,"message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{row}}}]}},"version":"2.1.280"}}"#
+    )
+}
+
+/// The notice the incident's session was typed, with `marker`.
+fn notice(marker: &str) -> String {
+    upgrade::prepare_prompt(
+        &version("2.1.280"),
+        &version("2.1.283"),
+        Source::Managed,
+        marker,
+    )
+}
+
+/// F2 over the incident's own record: the markers the ledger names are the
+/// ones this build mints from the state's salt; the record the pre-fix build
+/// left (four notices, gave up) hears the READY the agent gave at 06:02 — to
+/// the LAST marker, and to any other of the four — and takes the restart;
+/// the release it owes waits behind that READY. F1 over the same moments: the
+/// notices the incident typed are never typed now, and no give-up comes.
+#[test]
+fn the_incident_replays_to_a_restart_never_a_stall() {
+    let to = version("2.1.283");
+    for (asks, (_, marker)) in (1u64..).zip(LEDGER) {
+        assert_eq!(
+            upgrade::ready_marker(INCIDENT_SESSION, &to, INCIDENT_SALT + asks),
+            marker,
+            "the ledger's marker {asks}"
+        );
+    }
+    // F1: at each moment a notice was typed the session stood at its limit;
+    // now each is a wait, and the give-up is one too.
+    let mut pending = Phase::Pending;
+    for (at, _) in LEDGER {
+        assert_eq!(
+            upgrade::next_step(&pending, &idle(true), false, at),
+            Step::Wait("limited")
+        );
+        pending = upgrade::clock_held(&pending, &idle(true), at);
+    }
+    let four = Phase::Announced {
+        at_s: LEDGER[3].0,
+        asks: upgrade::MAX_ASKS,
+    };
+    assert_eq!(
+        upgrade::next_step(&four, &idle(true), false, GAVE_UP_AT),
+        Step::Wait("limited"),
+        "no give-up at the limit"
+    );
+    // NEGATIVE CONTROL: read without the limit, the same looks are the
+    // incident's — a notice, and the give-up.
+    assert_eq!(
+        upgrade::next_step(&Phase::Pending, &idle(false), false, LEDGER[0].0),
+        Step::Announce
+    );
+    assert_eq!(
+        upgrade::next_step(&four, &idle(false), false, GAVE_UP_AT),
+        Step::GiveUp
+    );
+
+    // F2: the record the pre-fix build left, replayed through this build's
+    // own transitions: four notices, then the give-up.
+    let mut st = St {
+        from: "2.1.280".to_string(),
+        to: "2.1.283".to_string(),
+        salt: INCIDENT_SALT,
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    assert_eq!(st.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
+    assert_eq!(st.release, "gave-up", "the agent is owed its release");
+    // 06:00: the four notices delivered at once, and the agent's answer.
+    let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
+    delivered.push(said_by_agent(
+        "Stopping here: both workflows are saved and nothing of mine runs.\n\
+         ATERM-UPGRADE-READY-8cd7f7eb",
+    ));
+    let tail = delivered.join("\n");
+    assert!(answered(&st, Some(&tail)), "the LAST marker is heard");
+    assert_eq!(
+        upgrade::next_step(&st.phase, &idle(false), true, READY_AT),
+        Step::Terminate,
+        "and the restart is taken"
+    );
+    assert_eq!(
+        upgrade::gate_release(&idle(false), true),
+        upgrade::Gate::Wait("ready"),
+        "the release waits behind the READY the restart acts on"
+    );
+    for (_, marker) in LEDGER {
+        let mut rows = delivered.clone();
+        rows.pop();
+        rows.push(said_by_agent(marker));
+        assert!(
+            answered(&st, Some(&rows.join("\n"))),
+            "{marker} is heard too"
+        );
+    }
+    // A READY given BEFORE a later notice is no answer to it: the rule that the
+    // latest notice ends any READY before it still holds.
+    let early = [
+        user(&notice(LEDGER[0].1)),
+        said_by_agent(LEDGER[0].1),
+        user(&notice(LEDGER[1].1)),
+    ]
+    .join("\n");
+    assert!(!answered(&st, Some(&early)));
+    // Once the release is typed the round's markers are forgotten: the agent
+    // was told nothing will restart it, and nothing does.
+    st.released();
+    assert!(st.release.is_empty());
+    assert!(!answered(&st, Some(&tail)));
+    assert_eq!(
+        upgrade::next_step(&st.phase, &idle(false), false, READY_AT),
+        Step::Wait("failed")
+    );
+}
+
+/// The owner's word holds a gave-up upgrade's late READY too, and a hold
+/// that ends an announcement releases the agent it asked (F3).
+#[test]
+fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
+    let mut announced = St {
+        phase: Phase::Announced { at_s: 10, asks: 1 },
+        ..St::default()
+    };
+    announced.announced("ATERM-UPGRADE-READY-0badf00d".to_string(), 10, 1);
+    let mut stopped = announced.clone();
+    stopped.stop("signal-refused");
+    assert_eq!(stopped.release, "signal-refused");
+    // A relaunch's record, and a Codex one, typed no Claude notice: nothing owed.
+    let mut relaunch = announced.clone();
+    relaunch.cause = crate::harness::relaunch::CAUSE_EXIT.to_string();
+    relaunch.stop("no-resume");
+    assert!(relaunch.release.is_empty());
+    let mut codex = announced.clone();
+    codex.agent = upgrade::Agent::Codex;
+    codex.give_up();
+    assert!(codex.release.is_empty());
+    // Once per abandonment: the first reason kept.
+    let mut twice = announced.clone();
+    twice.give_up();
+    twice.stop("resumed-elsewhere");
+    assert_eq!(twice.release, "gave-up");
+    // A new notice supersedes a release still owed.
+    twice.announced("ATERM-UPGRADE-READY-feedface".to_string(), 20, 1);
+    assert!(twice.release.is_empty());
+    // A notice for another build abandons this one's: owed on the new state.
+    let target = Candidate {
+        exe: PathBuf::from("/x/claude"),
+        version: version("9.9.9"),
+        source: Source::Managed,
+    };
+    let retargeted = St::for_target(
+        Some(St {
+            to: "2.1.283".to_string(),
+            ..announced.clone()
+        }),
+        &version("2.1.280"),
+        &target,
+        None,
+        30,
+    );
+    assert_eq!(retargeted.phase, Phase::Pending);
+    assert_eq!(retargeted.release, "retargeted");
+    assert!(retargeted.marker.is_empty() && retargeted.markers.is_empty());
+}
+
+/// THE OWNER'S `--now` IS SPENT WITH THE ROUND IT ASKED TO MOVE (the second
+/// review of 2026-09-26): an upgrade `--now` re-armed that gives up asking
+/// clears the word, so a late READY hours later restarts under the ordinary
+/// waits — a person at the tab holds the signal. NEGATIVE CONTROLS: the same
+/// late READY under a `--now` still in force is signalled over the person
+/// (what a kept word did), and the owner's skip — a word on a build, not on a
+/// round — is kept.
+#[test]
+fn a_give_up_spends_the_owners_now() {
+    let now = READY_AT;
+    let attended = Facts {
+        attended: true,
+        ..idle(false)
+    };
+    let gave_up = Phase::Failed(upgrade::GAVE_UP.to_string());
+    assert_eq!(
+        upgrade::requested_step(&Request::Now, &gave_up, &attended, true, now, "2.1.283"),
+        Step::Terminate,
+        "a --now in force waives the person at the tab"
+    );
+    let mut st = St {
+        to: "2.1.283".to_string(),
+        request: Request::Now,
+        request_tab: TAB.to_string(),
+        request_at: GAVE_UP_AT - 60,
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    assert_eq!(
+        (st.request.clone(), st.request_tab.as_str(), st.request_at),
+        (Request::None, "", 0)
+    );
+    assert_eq!(
+        upgrade::requested_step(
+            &st.request_for(TAB),
+            &st.phase,
+            &attended,
+            true,
+            now,
+            &st.to
+        ),
+        Step::Wait("attended")
+    );
+    let mut skipped = St {
+        request: Request::Skip("2.1.284".to_string()),
+        request_tab: TAB.to_string(),
+        ..st.clone()
+    };
+    skipped.give_up();
+    assert_eq!(skipped.request, Request::Skip("2.1.284".to_string()));
+}
+
+// ---------------------------------------------------------------- the real visit
+
+/// A limited Claude Code 2.1.280 tab as `text --json` sends it: the
+/// incident's banner over an empty composer, the caret at column 2.
+#[cfg(unix)]
+fn limited_screen() -> String {
+    let rule = "─".repeat(40);
+    format!(
+        r#"{{"rows":["⏺ Both workflows are relaunched.","","{AUTO_CONTINUE}","","{rule}","❯ ","{rule}","  ⏵⏵ auto mode on (shift+tab to cycle)"],"cursor":{{"row":5,"col":2}},"seq":77,"human_ms":null,"first":0}}"#
+    )
+}
+
+/// A tab with a PERSON's half-typed draft in the composer.
+#[cfg(unix)]
+fn draft_screen() -> String {
+    let rule = "─".repeat(20);
+    format!(
+        r#"{{"rows":["{rule}","❯ half a thought","{rule}"],"cursor":{{"row":1,"col":16}},"seq":77,"human_ms":null,"first":0}}"#
+    )
+}
+
+/// A stand-in agent in [`TAB`], its session file, and the upgrade record
+/// `st` filed for its conversation — the notice's fence naming it.
+#[cfg(unix)]
+struct Agent {
+    child: std::process::Child,
+    sf: SessionFile,
+}
+
+#[cfg(unix)]
+impl Agent {
+    fn start(opts: &Opts, st: &St) -> Agent {
+        // Its argv a launch the relaunch can carry (a positional, no flag the
+        // rewrite does not know), so a plan is made as for a real agent.
+        let child = Command::new(std::env::current_exe().expect("exe"))
+            .arg(PARK[0])
+            .env(PARK_ENV, "1")
+            .env("ATERM_PARENT_SESSION_ID", TAB)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("agent");
+        wait_exec(child.id());
+        let sf = register(&opts.home, child.id(), SESSION);
+        let st = St {
+            tab: TAB.to_string(),
+            notice_pid: sf.pid,
+            notice_start: squash(&sf.proc_start),
+            last_seq: 77,
+            seq_since_s: now_s() - 3_600,
+            ..st.clone()
+        };
+        std::fs::create_dir_all(state_dir(opts)).expect("state");
+        std::fs::write(state_path(opts, SESSION), st.to_json()).expect("write");
+        Agent { child, sf }
+    }
+
+    fn visit(&self, opts: &Opts, shell: u32) -> Report {
+        self.visit_with(opts, shell, usize::MAX)
+    }
+
+    /// [`Self::visit`], the agent its shell's foreground job for the first
+    /// `foreground` job reads and suspended after ([`Script`]).
+    fn visit_with(&self, opts: &Opts, shell: u32, foreground: usize) -> Report {
+        let table = vec![(shell, 1, "zsh".to_string())];
+        let args = atpkg::caller_shell::process_args(self.sf.pid).expect("agent argv");
+        let files = session_files(&opts.home);
+        visit_with_claim(
+            opts,
+            &self.sf,
+            files.as_deref(),
+            &table,
+            &newer(),
+            &Script::new(shell, foreground, None),
+            Some(&args),
+            None,
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The conversation's transcript: `rows`, under `<home>/.claude/projects`.
+#[cfg(unix)]
+fn write_transcript(opts: &Opts, rows: &[String]) {
+    let dir = opts.home.join(".claude/projects/-stand-in");
+    std::fs::create_dir_all(&dir).expect("projects");
+    std::fs::write(dir.join(format!("{SESSION}.jsonl")), rows.join("\n") + "\n")
+        .expect("transcript");
+}
+
+/// The requests of `asked` that TYPED a turn saying `words`.
+#[cfg(unix)]
+fn typed(asked: &std::sync::Mutex<Vec<String>>, words: &str) -> usize {
+    asked.lock().map_or(0, |a| {
+        a.iter()
+            .filter(|l| l.contains(" turn ") && l.contains(words))
+            .count()
+    })
+}
+
+/// F1 THROUGH THE REAL VISIT: the incident's screen — the banner over an
+/// empty composer, a session file that says `idle` — types nothing: a pending
+/// upgrade waits `limited`, and so does one that has asked to its bound long
+/// ago, whose clock the look restarts instead of giving up. NEGATIVE CONTROL:
+/// the same tab off its limit is announced to.
+#[cfg(unix)]
+#[test]
+fn a_limited_tab_is_never_typed_into_and_never_given_up_on() {
+    let dir = scratch("limited");
+    let (sock, asked) = instance_with(
+        &dir,
+        Answers {
+            screen: limited_screen(),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let shell = dead_pid();
+    let pending = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    let agent = Agent::start(&opts, &pending);
+    assert_eq!(agent.visit(&opts, shell).step, "wait:limited");
+    assert_eq!(turns(&asked), 0, "nothing typed into the limited tab");
+
+    let long_ago = now_s() - 5 * upgrade::REASK_S;
+    let tired = St {
+        phase: Phase::Announced {
+            at_s: long_ago,
+            asks: upgrade::MAX_ASKS,
+        },
+        marker: "ATERM-UPGRADE-READY-0badf00d".to_string(),
+        markers: vec!["ATERM-UPGRADE-READY-0badf00d".to_string()],
+        ..pending.clone()
+    };
+    drop(agent);
+    let agent = Agent::start(&opts, &tired);
+    let before = now_s();
+    assert_eq!(agent.visit(&opts, shell).step, "wait:limited");
+    assert_eq!(turns(&asked), 0);
+    let kept = load(&opts, SESSION).expect("state");
+    assert!(
+        matches!(kept.phase, Phase::Announced { at_s, asks } if at_s >= before && asks == upgrade::MAX_ASKS),
+        "the clock is held, the asks unspent, nothing given up: {:?}",
+        kept.phase
+    );
+    assert_eq!(ledger_lines(&opts), 0, "no act on the record");
+    drop(agent);
+
+    // NEGATIVE CONTROL: off the limit, the pending upgrade announces.
+    let open = scratch("open");
+    let (sock, asked) = instance(&open);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&open)
+    };
+    let agent = Agent::start(&opts, &pending);
+    assert_eq!(agent.visit(&opts, shell).step, "announced:1");
+    assert_eq!(turns(&asked), 1);
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&open);
+}
+
+/// F3 THROUGH THE REAL VISIT: a READY answer a person's draft held past the
+/// drain's bound is void — the agent stopped for a restart that is not coming
+/// is owed its release, which waits while the draft stands. The person clears
+/// it: ONE release line is typed, ledgered, and never again; the re-ask waits
+/// its window from the void.
+#[cfg(unix)]
+#[test]
+fn a_voided_ready_owes_one_release_typed_once() {
+    let dir = scratch("void-held");
+    let (sock, asked) = instance_with(
+        &dir,
+        Answers {
+            screen: draft_screen(),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let marker = "ATERM-UPGRADE-READY-0badf00d";
+    write_transcript(
+        &opts,
+        &[
+            user(&notice(marker)),
+            said_by_agent(&format!("Saved.\n{marker}")),
+        ],
+    );
+    let now = now_s();
+    let asked_st = St {
+        phase: Phase::Announced {
+            at_s: now - upgrade::DRAIN_S - 60,
+            asks: 1,
+        },
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        marker: marker.to_string(),
+        markers: vec![marker.to_string()],
+        hold_since_s: now - upgrade::HOLD_S - 30,
+        hold_seen_s: now - 30,
+        ..St::default()
+    };
+    let shell = dead_pid();
+    let agent = Agent::start(&opts, &asked_st);
+    let voided = agent.visit(&opts, shell);
+    assert_eq!(voided.step, "drain-expired:draft");
+    assert_eq!(turns(&asked), 0, "nothing typed over the person's draft");
+    let st = load(&opts, SESSION).expect("state");
+    assert_eq!(st.release, "void");
+    assert!(st.marker.is_empty() && st.markers.is_empty());
+
+    // The person clears the draft (the same instance, now idle).
+    let cleared = scratch("void-free");
+    let (sock, asked) = instance(&cleared);
+    let free = Opts {
+        sock: Some(sock),
+        ..opts.clone()
+    };
+    let release = upgrade::release_prompt(upgrade::Agent::Claude);
+    let first = agent.visit(&free, shell);
+    assert_eq!(first.step, "released:void");
+    assert_eq!(typed(&asked, "Upgrade off:"), 1, "{:?}", asked.lock());
+    assert!(
+        asked
+            .lock()
+            .expect("log")
+            .iter()
+            .any(|l| l.contains(" turn ") && l.ends_with(&release)),
+        "the release, word for word"
+    );
+    let second = agent.visit(&free, shell);
+    assert_eq!(
+        second.step, "wait:awaiting-ready",
+        "the re-ask waits its window"
+    );
+    assert_eq!(typed(&asked, "Upgrade off:"), 1, "typed once");
+    assert_eq!(turns(&asked), 1, "and nothing else");
+    let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
+    assert_eq!(
+        ledger.matches(r#""step":"released:void""#).count(),
+        1,
+        "{ledger}"
+    );
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cleared);
+}
+
+/// F2 AND F3 THROUGH THE REAL VISIT, on the record the incident left: gave
+/// up, four markers, the notice's fence on the agent. Its READY to the LAST
+/// marker reaches the restart (a dry run says so and ends nothing); with no
+/// READY, the release is typed once and the markers forgotten; at the limit,
+/// the release waits (`wait:release:limited`) and nothing is typed.
+#[cfg(unix)]
+#[test]
+fn a_gave_up_record_restarts_on_a_late_ready_or_releases_its_agent() {
+    let dir = scratch("gave-up");
+    let (sock, asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let mut st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
+    delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
+    write_transcript(&opts, &delivered);
+    let shell = dead_pid();
+    let agent = Agent::start(&opts, &st);
+    let dry = Opts {
+        dry_run: true,
+        ..opts.clone()
+    };
+    assert_eq!(agent.visit(&dry, shell).step, "would-restart");
+    assert_eq!(turns(&asked), 0);
+    // The real restart, to its last look before the signal (the agent
+    // suspended there): every fence of an announced restart is asked, and a
+    // restart that does not send its signal puts the owed release back.
+    let r = agent.visit_with(&opts, shell, 3);
+    assert_eq!(
+        r.step, "wait:changed-before-signal",
+        "the restart was reached"
+    );
+    let kept = load(&opts, SESSION).expect("state");
+    assert_eq!(kept.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
+    assert_eq!(kept.release, "gave-up", "still owed: nothing was restarted");
+    assert_eq!(turns(&asked), 0);
+
+    // No READY: the agent went on (or never answered). Released, once.
+    delivered.pop();
+    delivered.push(said_by_agent("Still waiting on the workflows."));
+    write_transcript(&opts, &delivered);
+    assert_eq!(agent.visit(&opts, shell).step, "released:gave-up");
+    assert_eq!(typed(&asked, "Upgrade off:"), 1);
+    let after_release = load(&opts, SESSION).expect("state");
+    assert!(after_release.release.is_empty());
+    assert!(after_release.markers.is_empty() && after_release.marker.is_empty());
+    assert_eq!(agent.visit(&opts, shell).step, "wait:failed");
+    assert_eq!(turns(&asked), 1, "typed once");
+    drop(agent);
+
+    // At the limit the release waits, and says so.
+    let limited = scratch("gave-up-lim");
+    let (sock, asked) = instance_with(
+        &limited,
+        Answers {
+            screen: limited_screen(),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&limited)
+    };
+    let agent = Agent::start(&opts, &st);
+    assert_eq!(agent.visit(&opts, shell).step, "wait:release:limited");
+    assert_eq!(turns(&asked), 0);
+    assert_eq!(load(&opts, SESSION).expect("state").release, "gave-up");
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&limited);
+}
+
+// ------------------------------------------- the review of 2026-09-26
+
+/// A RESTART THAT STOPS AFTER READY RELEASES THE AGENT IT ASKED, through the
+/// real visit. The restart's own record transitions — written before the
+/// signal ([`St::signalled`]), then the kernel's refusal
+/// ([`St::signal_failed`], `restart`'s `Terminated::Failed`) — stop the
+/// upgrade, owe the release and FORGET the round's markers: no stopped phase
+/// acts on a READY. The next visit types the release once, and the one after
+/// is the upgrade's last word with nothing owed. NEGATIVE CONTROL, the review's
+/// probe: the record a build before this one left — stopped, markers kept,
+/// READY still the agent's last word — read `wait:release:ready` on every
+/// visit, the agent neither restarted nor released; it is released at once now,
+/// because a READY no phase acts on holds nothing.
+#[cfg(unix)]
+#[test]
+fn a_restart_refused_after_ready_releases_the_agent_it_asked() {
+    let marker = "ATERM-UPGRADE-READY-0badf00d";
+    let base = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    let mut st = base.clone();
+    st.announced(marker.to_string(), now_s() - 60, 1);
+    let back = st.signalled(4242, 1, TAB, "claude --resume x".to_string(), now_s());
+    assert!(matches!(st.phase, Phase::Exiting { .. }), "{:?}", st.phase);
+    assert!(
+        st.markers.is_empty(),
+        "the restart consumes the READY it acts on"
+    );
+    st.signal_failed(back);
+    assert_eq!(st.phase, Phase::Failed("signal-refused".to_string()));
+    assert_eq!(st.release, "signal-refused");
+    assert!(st.marker.is_empty() && st.markers.is_empty());
+    let old = St {
+        phase: Phase::Failed("signal-refused".to_string()),
+        marker: marker.to_string(),
+        markers: vec![marker.to_string()],
+        release: "signal-refused".to_string(),
+        ..base
+    };
+    for (name, record) in [("refused-after-ready", st), ("refused-kept-markers", old)] {
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        write_transcript(
+            &opts,
+            &[
+                user(&notice(marker)),
+                said_by_agent(&format!("Saved.\n{marker}")),
+            ],
+        );
+        let shell = dead_pid();
+        let agent = Agent::start(&opts, &record);
+        let first = agent.visit(&opts, shell);
+        assert_eq!(first.step, "released:signal-refused", "{name}");
+        assert_eq!(typed(&asked, "Upgrade off:"), 1, "{name}");
+        let kept = load(&opts, SESSION).expect("state");
+        assert!(kept.release.is_empty() && kept.markers.is_empty(), "{name}");
+        let second = agent.visit(&opts, shell);
+        assert_eq!(second.step, "wait:failed", "{name}");
+        assert_eq!(after(&second.step, 0), After::Finished, "{name}");
+        assert_eq!(turns(&asked), 1, "{name}: typed once, and nothing else");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A LATE READY WHOSE RESTART'S GATE WAITS KEEPS THE GATE'S WORD, and the
+/// window's host owns the session's turn ends while it settles. The release
+/// a gave-up upgrade owes waits behind the READY — and it is not the step's
+/// word: the restart's gate is (the review of 2026-09-26: every such wait
+/// read `wait:release:ready`, which owns nothing, so the supervisor could
+/// type a continuation over the READY turn while its restart settled, and a
+/// person's draft under it was looked at on the growing pause, not every
+/// [`HOLD_LOOK`]). Nothing is typed either way.
+#[cfg(unix)]
+#[test]
+fn a_late_ready_whose_restart_waits_keeps_its_gates_word() {
+    let mut st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
+    delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
+    for (name, screen, word) in [
+        ("late-settling", None, "wait:settling"),
+        ("late-draft", Some(draft_screen()), "wait:draft"),
+    ] {
+        let dir = scratch(name);
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                screen: screen.unwrap_or_else(idle_screen),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        write_transcript(&opts, &delivered);
+        let agent = Agent::start(&opts, &st);
+        // The screen just moved: its quiet starts now.
+        let mut moved = load(&opts, SESSION).expect("state");
+        moved.last_seq = 1;
+        save(&opts, SESSION, &moved);
+        let r = agent.visit(&opts, dead_pid());
+        assert_eq!(r.step, word, "{name}");
+        assert_eq!(turns(&asked), 0, "{name}: nothing typed");
+        let kept = load(&opts, SESSION).expect("state");
+        assert_eq!(kept.release, "gave-up", "{name}: still owed");
+        assert_eq!(kept.markers.len(), 4, "{name}: the READY still heard");
+        if word == "wait:settling" {
+            assert!(owns_turn_ends(&r.step, 0), "the host owns the turn ends");
+        } else {
+            assert_eq!(after(&r.step, 9), After::Later(HOLD_LOOK));
+        }
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A user row as Claude Code writes one on its own: `extra` fields beside
+/// the message (`"isMeta":true`), its content the JSON `content`.
+fn user_row(extra: &str, content: &str) -> String {
+    format!(
+        r#"{{"type":"user","isSidechain":false,{extra}"message":{{"role":"user","content":{content}}}}}"#
+    )
+}
+
+/// WHO HAS DIRECTED THE CONVERSATION SINCE THE AGENT'S LAST ANSWER
+/// ([`upgrade::directed_since_ready`]), over the user rows the owner's
+/// transcripts hold (measured 2026-09-26): a person's words, a `!` command,
+/// an Esc, a peer's message and a supervisor's continuation are directions;
+/// the harness's own lines, tool results, `isMeta` rows (the limit's reset
+/// the incident's agent answered READY after), compaction summaries, task
+/// notifications and slash commands with their output are not. A direction
+/// counts once the agent has answered it with a row of its own, and only
+/// after the LATEST notice and the agent's latest READY to a marker of the
+/// round. NEGATIVE CONTROL (the second review of 2026-09-26): a direction the
+/// agent answered with READY — a peer's message, then the READY — counts for
+/// nothing; the release-era reading counted it.
+#[test]
+fn a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else() {
+    let notice_row = user(&notice(LEDGER[0].1));
+    let markers = vec![LEDGER[0].1.to_string()];
+    let quiet = [
+        user_row(
+            r#""isMeta":true,"#,
+            r#""Your claude.ai usage limit has reset. Continue the task you were working on""#,
+        ),
+        user_row(
+            "",
+            r#"[{"type":"tool_result","tool_use_id":"t1","content":"scan-done"}]"#,
+        ),
+        user_row("", r#""<task-notification>\n<task-id>w89</task-id> done""#),
+        user_row("", r#""<command-name>/rate-limit-options</command-name>""#),
+        user_row(
+            "",
+            r#""<local-command-stdout>Claude Code will continue automatically at 6am""#,
+        ),
+        user_row(
+            r#""isCompactSummary":true,"#,
+            r#""This session is being continued from a previous conversation""#,
+        ),
+        user(&upgrade::release_prompt(upgrade::Agent::Claude)),
+        said_by_agent("Nothing of mine is running."),
+    ];
+    let with = |rows: &[String]| {
+        let mut all = vec![notice_row.clone()];
+        all.extend_from_slice(rows);
+        all.join("\n")
+    };
+    let directed = |rows: &[String]| upgrade::directed_since_ready(&with(rows), &markers);
+    assert!(!directed(&quiet));
+    let ready = said_by_agent(&format!("Saved.\n{}", LEDGER[0].1));
+    let on_it = said_by_agent("On it.");
+    for direction in [
+        user("Actually, switch to the parser work."),
+        user("keep going"),
+        user("[Request interrupted by user]"),
+        user("[from s-d3346b29] v0.91.0 is out"),
+        user("<bash-input>git status</bash-input>"),
+        user_row(
+            "",
+            r#"[{"type":"text","text":"look at this"},{"type":"image"}]"#,
+        ),
+    ] {
+        let mut rows = quiet.to_vec();
+        rows.push(direction.clone());
+        // Not answered yet: the agent may still answer it with READY.
+        assert!(!directed(&rows), "unanswered: {direction}");
+        rows.push(on_it.clone());
+        assert!(directed(&rows), "{direction}");
+        // Answered by a row the agent did not write: still unanswered.
+        let mut met = quiet.to_vec();
+        met.push(direction.clone());
+        met.push(said_by_agent("x").replace("claude-opus-5-5", "<synthetic>"));
+        assert!(!directed(&met), "<synthetic>: {direction}");
+        // Before the latest notice, it directed nothing since.
+        let before = [
+            direction.clone(),
+            on_it.clone(),
+            notice_row.clone(),
+            said_by_agent("ok"),
+        ]
+        .join("\n");
+        assert!(
+            !upgrade::directed_since_ready(&before, &markers),
+            "{direction}"
+        );
+        // THE NEGATIVE CONTROL: the agent answered it with READY — it holds
+        // for the restart, and only a release can tell it to go on.
+        let then_ready = [direction.clone(), on_it.clone(), ready.clone()];
+        assert!(!directed(&then_ready), "then READY: {direction}");
+        assert!(
+            upgrade::directed_since_ready(&with(&then_ready), &[]),
+            "the READY is a marker of the round: {direction}"
+        );
+        // And after the READY, a direction taken up counts again.
+        let mut past = then_ready.to_vec();
+        past.push(direction.clone());
+        past.push(on_it.clone());
+        assert!(directed(&past), "after READY: {direction}");
+    }
+    // A subagent's own prompts are no direction of the conversation.
+    let side = user("do the thing").replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    assert!(!directed(&[side, on_it]));
+}
+
+/// A RELEASE IS TYPED ONLY TO THE AGENT THE NOTICE REACHED. A restart past
+/// its signal owes none (its agent was ended; the conversation is the
+/// carry-on's, or the person's who resumed it). A retargeted or stopped
+/// record carries the notice's fence with the release it owes.
+#[test]
+fn a_release_follows_only_the_process_the_notice_reached() {
+    for phase in [Phase::Exiting { at_s: 10 }, Phase::Relaunched { at_s: 10 }] {
+        let mut st = St {
+            phase: phase.clone(),
+            ..St::default()
+        };
+        st.stop("resumed-elsewhere");
+        assert!(
+            st.release.is_empty(),
+            "{phase:?}: nothing owed after the signal"
+        );
+    }
+    let mut asked = St {
+        to: "2.1.283".to_string(),
+        tab: TAB.to_string(),
+        notice_pid: 4242,
+        notice_start: "Fri Sep 25 16:00:00 2026".to_string(),
+        ..St::default()
+    };
+    asked.announced("ATERM-UPGRADE-READY-0badf00d".to_string(), 10, 1);
+    let target = Candidate {
+        exe: PathBuf::from("/x/claude"),
+        version: version("9.9.9"),
+        source: Source::Managed,
+    };
+    let mut stopped = asked.clone();
+    stopped.stop("signal-refused");
+    for prior in [asked, stopped] {
+        let st = St::for_target(Some(prior.clone()), &version("2.1.280"), &target, None, 30);
+        assert!(!st.release.is_empty(), "{:?}", prior.phase);
+        assert_eq!(
+            (st.tab.as_str(), st.notice_pid, st.notice_start.as_str()),
+            (TAB, 4242, "Fri Sep 25 16:00:00 2026"),
+            "{:?}: the notice's fence goes with the release",
+            prior.phase
+        );
+    }
+}
+
+/// THROUGH THE REAL VISIT, a release owed is DROPPED — said once in the
+/// ledger, nothing typed — where it is no longer this upgrade's: the process
+/// visited is not the one the notice reached (resumed by hand: on the old
+/// build, the visit's own step; on the new one, `release_visit`), or someone
+/// has directed the conversation since the notice (a person's words after
+/// the notice). NEGATIVE CONTROL: the rows Claude Code writes on its own
+/// after the notice (the limit's reset, a tool's result, a task
+/// notification) direct nothing, and the release is typed.
+#[cfg(unix)]
+#[test]
+fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
+    let mut st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    let mut after_notice: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
+    after_notice.push(user_row(
+        r#""isMeta":true,"#,
+        r#""Your claude.ai usage limit has reset. Continue the task you were working on""#,
+    ));
+    after_notice.push(user_row(
+        "",
+        r#"[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]"#,
+    ));
+    after_notice.push(user_row("", r#""<task-notification>\ndone""#));
+    after_notice.push(said_by_agent("Still waiting on the workflows."));
+    let mut directed = after_notice.clone();
+    directed.push(user("Actually, switch to the parser work."));
+    directed.push(said_by_agent("Switching."));
+    // (name, transcript, the notice's process is another, targets, word)
+    let current = Targets {
+        managed: None,
+        native: None,
+    };
+    for (name, rows, other, targets, word) in [
+        (
+            "rel-typed",
+            &after_notice,
+            false,
+            newer(),
+            "released:gave-up",
+        ),
+        ("rel-directed", &directed, false, newer(), "wait:failed"),
+        ("rel-other", &after_notice, true, newer(), "wait:failed"),
+        ("rel-other-current", &after_notice, true, current, "current"),
+    ] {
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        write_transcript(&opts, rows);
+        let agent = Agent::start(&opts, &st);
+        if other {
+            let mut moved = load(&opts, SESSION).expect("state");
+            moved.notice_pid = dead_pid();
+            save(&opts, SESSION, &moved);
+        }
+        let shell = dead_pid();
+        let table = vec![(shell, 1, "zsh".to_string())];
+        let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
+        let files = session_files(&opts.home);
+        let r = visit_with_claim(
+            &opts,
+            &agent.sf,
+            files.as_deref(),
+            &table,
+            &targets,
+            &Script::new(shell, usize::MAX, None),
+            Some(&args),
+            None,
+        );
+        assert_eq!(r.step, word, "{name}");
+        let kept = load(&opts, SESSION).expect("state");
+        assert!(kept.release.is_empty(), "{name}: nothing owed after");
+        assert!(kept.markers.is_empty(), "{name}: the round is over");
+        let ledger =
+            std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default();
+        if word == "released:gave-up" {
+            assert_eq!(typed(&asked, "Upgrade off:"), 1, "{name}");
+            assert!(!ledger.contains("release-dropped"), "{name}");
+        } else {
+            assert_eq!(turns(&asked), 0, "{name}: nothing typed");
+            let why = if other { "other-process" } else { "directed" };
+            assert_eq!(
+                ledger
+                    .matches(&format!(r#""step":"release-dropped:{why}""#))
+                    .count(),
+                1,
+                "{name}: {ledger}"
+            );
+        }
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A LATE READY THE RESTART'S GATE HOLDS PAST THE DRAIN IS VOIDED, through
+/// the real visit, as an announced one is. The incident's gave-up record
+/// hears the agent's READY; a person's draft that has stood [`upgrade::HOLD_S`]
+/// voids it (`drain-expired:draft`) — nothing typed over the draft, the
+/// release still owed, the round's markers forgotten, so the stale answer can
+/// never end the agent when the draft goes (the review of 2026-09-26: the
+/// gave-up arm honoured a READY of any age). Background work of the agent's
+/// own, still running [`upgrade::DRAIN_S`] after the answer, voids it too, and
+/// the release is typed in the same visit (`released:gave-up`, the void
+/// ledgered). NEGATIVE CONTROL: the same work a minute after the answer is
+/// only waited for.
+#[cfg(unix)]
+#[test]
+fn a_late_ready_held_past_the_drain_is_voided_and_its_agent_released() {
+    let mut st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
+    delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
+    let now = now_s();
+
+    // A person's draft, standing past HOLD_S.
+    let dir = scratch("late-void-draft");
+    let (sock, asked) = instance_with(
+        &dir,
+        Answers {
+            screen: draft_screen(),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    write_transcript(&opts, &delivered);
+    let held = St {
+        hold_since_s: now - upgrade::HOLD_S - 30,
+        hold_seen_s: now - 30,
+        ..st.clone()
+    };
+    let agent = Agent::start(&opts, &held);
+    assert_eq!(agent.visit(&opts, dead_pid()).step, "drain-expired:draft");
+    assert_eq!(turns(&asked), 0, "nothing typed over the person's draft");
+    let kept = load(&opts, SESSION).expect("state");
+    assert_eq!(kept.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
+    assert_eq!(kept.release, "gave-up", "still owed");
+    assert!(kept.markers.is_empty(), "the stale READY can never end it");
+    let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
+    assert!(
+        ledger.contains("a draft nobody sent had held the restart")
+            && ledger.contains("not asked again for this build"),
+        "{ledger}"
+    );
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The agent's own work under it: DRAIN_S after the answer, and a minute.
+    for (name, heard_s, word) in [
+        ("late-void-bg", upgrade::DRAIN_S, "released:gave-up"),
+        ("late-wait-bg", 60, "wait:background"),
+    ] {
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        write_transcript(&opts, &delivered);
+        let heard = St {
+            ready_since: now - heard_s,
+            ..st.clone()
+        };
+        let agent = Agent::start(&opts, &heard);
+        let shell = dead_pid();
+        // A shell the agent left running, under it.
+        let table = vec![
+            (shell, 1, "zsh".to_string()),
+            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".to_string()),
+        ];
+        let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
+        let files = session_files(&opts.home);
+        let r = visit_with_claim(
+            &opts,
+            &agent.sf,
+            files.as_deref(),
+            &table,
+            &newer(),
+            &Script::new(shell, usize::MAX, None),
+            Some(&args),
+            None,
+        );
+        assert_eq!(r.step, word, "{name}");
+        let kept = load(&opts, SESSION).expect("state");
+        let ledger =
+            std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default();
+        if word == "released:gave-up" {
+            assert_eq!(typed(&asked, "Upgrade off:"), 1, "{name}");
+            assert!(kept.release.is_empty() && kept.markers.is_empty());
+            assert!(
+                ledger.contains(r#""step":"drain-expired:background""#)
+                    && ledger.contains("work of the agent's own still running"),
+                "{ledger}"
+            );
+        } else {
+            assert_eq!(turns(&asked), 0, "{name}");
+            assert_eq!(kept.markers.len(), 4, "{name}: the READY still heard");
+            assert_eq!(kept.ready_since, now - heard_s, "{name}: its clock kept");
+        }
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A DIRECTION BEFORE THE READY NEVER DROPS THE RELEASE ITS VOID OWES (the
+/// second review of 2026-09-26), through the real visit: the incident's
+/// gave-up record; after the notices a person's message, the agent's answer
+/// to it, then its READY; the agent's own work under it DRAIN_S after the
+/// answer voids that READY — and the release is TYPED (`released:gave-up`).
+/// Read as a direction since the notice, the message dropped it
+/// (`release-dropped:directed`): no restart, no release, and nothing else
+/// asks again in the gave-up phase — the incident's end state. NEGATIVE
+/// CONTROL: the same message AFTER the READY, taken up by the agent, ends the
+/// READY (nothing to void or restart) and drops the release — it is typed
+/// over nothing the agent is doing now.
+#[cfg(unix)]
+#[test]
+fn a_direction_before_the_ready_never_drops_the_release_its_void_owes() {
+    let mut st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    st.give_up();
+    let notices: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
+    let message = user("[from s-d3346b29] v0.91.0 is out; the parser branch can wait");
+    let answer = said_by_agent("Noted; the parser branch waits.");
+    let ready = said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1));
+    let before = [
+        notices.clone(),
+        vec![message.clone(), answer.clone(), ready.clone()],
+    ]
+    .concat();
+    let after = [notices, vec![ready, message, answer]].concat();
+    let now = now_s();
+    for (name, rows, word, dropped) in [
+        ("dir-before-ready", &before, "released:gave-up", false),
+        ("dir-after-ready", &after, "wait:failed", true),
+    ] {
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        write_transcript(&opts, rows);
+        let heard = St {
+            ready_since: now - upgrade::DRAIN_S,
+            ..st.clone()
+        };
+        let agent = Agent::start(&opts, &heard);
+        let shell = dead_pid();
+        let table = vec![
+            (shell, 1, "zsh".to_string()),
+            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".to_string()),
+        ];
+        let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
+        let files = session_files(&opts.home);
+        let r = visit_with_claim(
+            &opts,
+            &agent.sf,
+            files.as_deref(),
+            &table,
+            &newer(),
+            &Script::new(shell, usize::MAX, None),
+            Some(&args),
+            None,
+        );
+        assert_eq!(r.step, word, "{name}");
+        let kept = load(&opts, SESSION).expect("state");
+        assert!(kept.release.is_empty() && kept.markers.is_empty(), "{name}");
+        let ledger =
+            std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default();
+        assert_eq!(
+            ledger.contains("release-dropped:directed"),
+            dropped,
+            "{name}: {ledger}"
+        );
+        assert_eq!(
+            typed(&asked, "Upgrade off:"),
+            usize::from(!dropped),
+            "{name}"
+        );
+        if !dropped {
+            // The ledger says what the line said ([`upgrade::release_prompt`]).
+            assert!(
+                ledger.contains(r#""step":"drain-expired:background""#)
+                    && ledger.contains(
+                        "nothing will restart the session, nothing the notice asked of it still \
+                         applies, and to carry on as it would have without it"
+                    ),
+                "{name}: {ledger}"
+            );
+        }
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// F1 FROM THE WINDOW: THE LOOP'S LIMIT EPISODE HOLDS THE UPGRADE'S CLOCKS
+/// ([`hold_clock`], what the window's host calls as its loop's episode opens
+/// and closes). The host takes no step during an episode, so the upgrade's
+/// own look never found the limit and never held its clock (the review of
+/// 2026-09-26): a notice whose wind-down turn hit the weekly limit met its
+/// first idle point after the reset hours past its window, and — asked to
+/// its bound — was given up on and released at once. NEGATIVE CONTROL: that
+/// record, unheld, gives up at that point; held, it waits its window. The
+/// READY clock is held too; another tab's record and a pending one are not
+/// touched, no clock is moved back, and a lock another sweep holds applies
+/// nothing (`false`: the host tries again before its next step).
+#[test]
+fn a_limit_episode_holds_the_upgrades_clocks_for_the_window() {
+    let dir = scratch("hold-clock");
+    let opts = Opts {
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    let long_ago = 1_000;
+    let until = 50_000;
+    let base = St {
+        to: "9.9.9".to_string(),
+        tab: TAB.to_string(),
+        ..St::default()
+    };
+    let tired = St {
+        phase: Phase::Announced {
+            at_s: long_ago,
+            asks: upgrade::MAX_ASKS,
+        },
+        ..base.clone()
+    };
+    let late = St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        ready_since: long_ago,
+        ..base.clone()
+    };
+    let elsewhere = St {
+        tab: "s-0ther".to_string(),
+        ..tired.clone()
+    };
+    let pending = base;
+    let records = [
+        ("0badf00d-1111-2222-3333-000000000001", &tired),
+        ("0badf00d-1111-2222-3333-000000000002", &late),
+        ("0badf00d-1111-2222-3333-000000000003", &elsewhere),
+        ("0badf00d-1111-2222-3333-000000000004", &pending),
+    ];
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    for (session, st) in records {
+        save(&opts, session, st);
+    }
+    let first_idle = until + 60;
+    assert_eq!(
+        upgrade::next_step(&tired.phase, &idle(false), false, first_idle),
+        Step::GiveUp,
+        "unheld, the window ran out under the limit"
+    );
+    {
+        let _other = sweep_lock(&opts).expect("lock").expect("a lock");
+        assert!(!hold_clock(&opts, until), "another sweep holds the lock");
+    }
+    assert_eq!(load(&opts, records[0].0).expect("state").phase, tired.phase);
+    assert!(hold_clock(&opts, until));
+    let held = load(&opts, records[0].0).expect("state");
+    assert_eq!(
+        held.phase,
+        Phase::Announced {
+            at_s: until,
+            asks: upgrade::MAX_ASKS
+        }
+    );
+    assert_eq!(
+        upgrade::next_step(&held.phase, &idle(false), false, first_idle),
+        Step::Wait("awaiting-ready"),
+        "held, the agent has its whole window"
+    );
+    assert_eq!(load(&opts, records[1].0).expect("state").ready_since, until);
+    assert_eq!(
+        load(&opts, records[2].0).expect("state").phase,
+        elsewhere.phase
+    );
+    assert_eq!(
+        load(&opts, records[3].0).expect("state").phase,
+        Phase::Pending
+    );
+    assert!(hold_clock(&opts, until - 10));
+    assert_eq!(
+        load(&opts, records[0].0).expect("state").phase,
+        held.phase,
+        "never back"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- Tier-1
+
+/// A model state.
+type S = BTreeMap<&'static str, i64>;
+
+/// The model's notices to its bound, and the real ones: a notice short of the
+/// bound is the one before the last (`MAX_ASKS - 1`), the bound the last.
+const MODEL_MAX_ASKS: i64 = 2;
+const T0: u64 = 1_790_377_339;
+
+/// The agent the notice reached, as its session file names it.
+const AGENT_PID: u32 = 4242;
+const AGENT_START: &str = "Thu Sep 25 23:00:00 2026";
+
+fn real_asks(asks: i64) -> u32 {
+    if asks >= MODEL_MAX_ASKS {
+        upgrade::MAX_ASKS
+    } else {
+        upgrade::MAX_ASKS - 1
+    }
+}
+
+fn model_asks(asks: u32) -> i64 {
+    if asks >= upgrade::MAX_ASKS {
+        MODEL_MAX_ASKS
+    } else {
+        1
+    }
+}
+
+fn marker(k: u64) -> String {
+    upgrade::ready_marker(SESSION, &version("9.9.9"), 7 + k)
+}
+
+/// The session file of the agent the notice reached.
+fn agent_file() -> SessionFile {
+    SessionFile {
+        pid: AGENT_PID,
+        session_id: SESSION.to_string(),
+        cwd: "/".to_string(),
+        version: "1.0.0".to_string(),
+        status: "idle".to_string(),
+        status_updated_at_ms: 0,
+        proc_start: AGENT_START.to_string(),
+        kind: "interactive".to_string(),
+        entrypoint: "cli".to_string(),
+    }
+}
+
+/// What holds the look a model state stands for, beyond an idle, settled
+/// session with an empty composer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holds {
+    /// Nothing: the reducer's own step.
+    Nothing,
+    /// A person's box, standing [`upgrade::HOLD_S`].
+    Person,
+    /// The agent's own background work, under a READY heard
+    /// [`upgrade::DRAIN_S`] ago.
+    Background,
+    /// The restart's signal is refused by the kernel, or a re-ask's plan
+    /// by the relaunch — the round abandoned.
+    Refused,
+}
+
+/// A peer's message to the agent: the direction the model's `Direct`
+/// stands for (a person's words, an Esc and the supervisor's continuation
+/// read the same, [`upgrade::directed_since_ready`]).
+fn direction() -> String {
+    user("[from s-d3346b29] v0.91.0 is out; the parser branch can wait")
+}
+
+/// The agent's READY to the round's first marker.
+fn ready_row() -> String {
+    said_by_agent(&format!("Saved.\n{}", marker(1)))
+}
+
+/// Whether the transcript a model state stands for may carry THE SECOND
+/// REVIEW'S HISTORY — a direction the agent answered with READY, before what
+/// the state says ([`real_of`]): wherever a READY may stand in the tail
+/// without being the answer the state denies — it is the answer, its
+/// markers are forgotten, or someone spoke after it.
+fn history_fits(s: &S) -> bool {
+    s["ready"] == 1 || s["live"] == 0 || s["told"] == 1 || s["directed"] == 1
+}
+
+/// The record, facts, clock and transcript a model state stands for: the
+/// record of the agent the notice reached, its fence on that agent, the
+/// round's marker typed. The transcript: the notice;
+/// with `history` ([`history_fits`]), a peer's message the agent answered
+/// with READY; the READY where the state has one, else the agent's
+/// wind-down; a direction not answered yet (`told`), or one the agent took
+/// up (`directed`).
+fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
+    let phase = match s["phase"] {
+        0 => Phase::Pending,
+        1 => Phase::Announced {
+            at_s: T0,
+            asks: real_asks(s["asks"]),
+        },
+        2 => Phase::Failed(upgrade::GAVE_UP.to_string()),
+        3 => Phase::Done,
+        _ => Phase::Failed("signal-refused".to_string()),
+    };
+    let live = s["live"] == 1;
+    let owed = s["owed"] == 1;
+    let st = St {
+        phase,
+        to: "9.9.9".to_string(),
+        tab: TAB.to_string(),
+        notice_pid: AGENT_PID,
+        notice_start: squash(AGENT_START),
+        marker: if live { marker(1) } else { String::new() },
+        markers: if live { vec![marker(1)] } else { Vec::new() },
+        release: if owed {
+            "owed".to_string()
+        } else {
+            String::new()
+        },
+        asked: if s["phase"] == 0 {
+            Vec::new()
+        } else {
+            vec![marker(1)]
+        },
+        ..St::default()
+    };
+    let now = if s["window"] == 1 {
+        T0 + upgrade::REASK_S
+    } else {
+        T0 + 60
+    };
+    let mut tail = vec![user(&notice(&marker(1)))];
+    if history {
+        tail.extend([direction(), ready_row()]);
+    } else if s["ready"] == 1 {
+        tail.push(ready_row());
+    } else {
+        tail.push(said_by_agent("Winding down."));
+    }
+    if s["told"] == 1 {
+        tail.push(direction());
+    }
+    if s["directed"] == 1 {
+        tail.extend([direction(), said_by_agent("On it.")]);
+    }
+    (st, idle(s["limited"] == 1), now, tail)
+}
+
+/// A record and a transcript projected onto the model's variables — the
+/// record's RAW state, not the driver's reading of it (the review of
+/// 2026-09-26: a projection that zeroed `live` for every stopped phase hid a
+/// stop that kept its markers): `live`, the round's markers kept; `ready`, an
+/// answer to one of them ([`answered`]). The agent's, the conversation's and
+/// the ghosts' are taken from `s`.
+fn project(s: &S, st: &St, tail: &[String]) -> S {
+    let mut p = s.clone();
+    let (phase, asks) = match &st.phase {
+        Phase::Pending => (0, s["asks"]),
+        Phase::Announced { asks, .. } => (1, model_asks(*asks)),
+        Phase::Failed(why) if why == upgrade::GAVE_UP => (2, s["asks"]),
+        Phase::Done | Phase::Exiting { .. } | Phase::Relaunched { .. } => (3, s["asks"]),
+        Phase::Failed(_) => (4, s["asks"]),
+    };
+    p.insert("phase", phase);
+    p.insert("asks", asks);
+    p.insert(
+        "live",
+        i64::from(!(st.marker.is_empty() && st.markers.is_empty())),
+    );
+    p.insert("ready", i64::from(answered(st, Some(&tail.join("\n")))));
+    p.insert("owed", i64::from(!st.release.is_empty()));
+    p
+}
+
+/// What the real visit did at the look a model state stands for.
+#[derive(Debug)]
+struct Decided {
+    /// The model's actions it took, in order (none: it waited).
+    actions: Vec<&'static str>,
+    /// The model state it lands at.
+    next: S,
+    /// The step's word, as the window's host reads it.
+    word: String,
+    /// A release is owed after it.
+    owed: bool,
+}
+
+/// THE REAL VISIT'S DECISION at the look `s` stands for, under `holds`, over
+/// the transcript [`real_of`] writes for it (`history`: the second review's
+/// direction answered with READY), in the driver's order and through the
+/// driver's own code: the look's clock ([`upgrade::clock_held`]); the READY
+/// the step acts on ([`heard`]) and its clock ([`upgrade::ready_since`]); the
+/// step ([`upgrade::requested_step`]); its record transition
+/// ([`St::announced`], [`St::give_up`], [`St::void`], [`St::signalled`] —
+/// refused, [`St::stop`] or [`St::signal_failed`]); the release where it is
+/// the next act ([`release_is_next`]) — DROPPED where [`release_void`] says
+/// the agent took up direction since its last answer ([`St::dropped`]), else
+/// typed under [`upgrade::gate_release`] ([`St::released`]) or the word that
+/// owes it ([`owed_word`]); and the host's reading of the word — its LAST
+/// WORD ([`after`] is Finished) at a point the agent can read is the model's
+/// `Look` (the window's host takes no step at a limit). `None` where `holds`
+/// cannot be met: a refusal needs a restart, or a re-ask, to refuse.
+fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
+    let (mut st, mut f, now, mut tail) = real_of(s, history);
+    let sf = agent_file();
+    match holds {
+        Holds::Person => {
+            f.approval_box = true;
+            f.hold_s = upgrade::HOLD_S;
+        }
+        Holds::Background => {
+            f.background = vec!["zsh".to_string()];
+            st.ready_since = now - upgrade::DRAIN_S;
+        }
+        Holds::Nothing | Holds::Refused => {}
+    }
+    st.phase = upgrade::clock_held(&st.phase, &f, now);
+    let ready = heard(&st, &sf, TAB, Some(&tail.join("\n")));
+    st.ready_since = upgrade::ready_since(st.ready_since, ready, &f, now);
+    if st.ready_since != 0 {
+        f.ready_s = now - st.ready_since;
+    }
+    let step = upgrade::requested_step(&Request::None, &st.phase, &f, ready, now, &st.to);
+    let reask = step == Step::Announce && st.phase != Phase::Pending;
+    if holds == Holds::Refused && !(step == Step::Terminate || reask) {
+        return None;
+    }
+    let mut agent = s.clone();
+    let mut actions = Vec::new();
+    let mut word = match step {
+        Step::Announce if holds == Holds::Refused => {
+            // `unplanned`: the relaunch refuses the plan the re-ask asks first.
+            st.stop("argv:--bogus");
+            actions.push("Abandon");
+            "refused:--bogus".to_string()
+        }
+        Step::Announce => {
+            let asks = match st.phase {
+                Phase::Announced { asks, .. } => asks + 1,
+                _ => 1,
+            };
+            st.announced(marker(2), now, asks);
+            tail.push(user(&notice(&marker(2))));
+            // The agent reads it at once: nothing is typed at a limit. What
+            // the conversation said before it is behind the notice now.
+            agent.insert("holding", 1);
+            agent.insert("told", 0);
+            agent.insert("directed", 0);
+            actions.push("Announce");
+            format!("announced:{asks}")
+        }
+        Step::GiveUp => {
+            st.give_up();
+            actions.push("GiveUp");
+            "gave-up".to_string()
+        }
+        Step::Terminate => {
+            let back = st.signalled(AGENT_PID, 1, TAB, "claude --resume x".to_string(), now);
+            if holds == Holds::Refused {
+                st.signal_failed(back);
+                actions.push("Abandon");
+                "failed:signal-refused".to_string()
+            } else {
+                // Signalled, relaunched and carried on: a new process, and
+                // its conversation the carry-on's.
+                agent.insert("holding", 0);
+                if agent["told"] == 1 {
+                    agent.insert("overrode", 1);
+                }
+                agent.insert("told", 0);
+                agent.insert("directed", 0);
+                actions.push("Restart");
+                "adopted".to_string()
+            }
+        }
+        Step::Void(why) => {
+            st.void(now);
+            actions.push("Void");
+            format!("drain-expired:{why}")
+        }
+        Step::Wait(why) => format!("wait:{why}"),
+    };
+    if release_is_next(&step, &word) && !st.release.is_empty() {
+        let text = tail.join("\n");
+        if let Some(why) = release_void(&st, &sf, TAB, Some(&text)) {
+            assert_eq!(why, "directed", "the model's agent is the notice's");
+            // `drop_release`: nothing owed, the round over; `r` kept.
+            st.dropped();
+            if agent["holding"] == 1 {
+                agent.insert("dropheld", 1);
+            }
+            actions.push("DropRelease");
+        } else {
+            let ready = heard(&st, &sf, TAB, Some(&text));
+            word = match upgrade::gate_release(&f, ready) {
+                upgrade::Gate::Go => {
+                    let why = st.release.clone();
+                    st.released();
+                    agent.insert("holding", 0);
+                    actions.push("Release");
+                    format!("released:{why}")
+                }
+                upgrade::Gate::Wait(held) => {
+                    let r = Report {
+                        pid: AGENT_PID,
+                        tab: TAB.to_string(),
+                        session: SESSION.to_string(),
+                        from: "1.0.0".to_string(),
+                        to: "9.9.9(managed)".to_string(),
+                        step: word,
+                    };
+                    owed_word(r, held).step
+                }
+            };
+        }
+    }
+    if actions.is_empty() && !f.limited && after(&word, 0) == After::Finished {
+        agent.insert("stuck", s["holding"]);
+        actions.push("Look");
+    }
+    let owed = !st.release.is_empty();
+    let mut next = project(&agent, &st, &tail);
+    let window = match st.phase {
+        Phase::Announced { at_s, .. } => i64::from(now.saturating_sub(at_s) >= upgrade::REASK_S),
+        _ => s["window"],
+    };
+    next.insert("window", window);
+    Some(Decided {
+        actions,
+        next,
+        word,
+        owed,
+    })
+}
+
+/// The reducer's actions, the environment's aside; `Void` is a person's or
+/// the agent's own work's, `Abandon` a refusal's.
+const REDUCER: [&str; 6] = [
+    "Announce",
+    "GiveUp",
+    "Restart",
+    "Release",
+    "DropRelease",
+    "Look",
+];
+
+fn reachable(m: &Model) -> Vec<S> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = std::collections::VecDeque::from([m.init_state()]);
+    let mut out = Vec::new();
+    while let Some(s) = queue.pop_front() {
+        if !seen.insert(s.clone()) {
+            continue;
+        }
+        for a in &m.actions {
+            let mut next = s.clone();
+            if m.fire(a.name, &mut next) {
+                queue.push_back(next);
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// Whether `m` admits what the real visit decided at `s` under `holds`: at an
+/// idle look, the reducer's own step is the ONE the model's guards enable (a
+/// wait where none is); held, the void exactly where the model voids;
+/// refused, the round abandoned — and the model, firing the same actions in
+/// the same order, lands where the real record does.
+fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
+    let lands = || {
+        let mut t = s.clone();
+        d.actions.iter().all(|a| m.fire(a, &mut t)) && t == d.next
+    };
+    match holds {
+        Holds::Nothing => {
+            let want: Vec<&str> = REDUCER
+                .into_iter()
+                .filter(|a| m.action_enabled(a, s))
+                .collect();
+            want == d.actions.first().copied().into_iter().collect::<Vec<_>>()
+                && (d.actions.is_empty() || lands())
+        }
+        Holds::Person | Holds::Background => {
+            let voided = d.actions.first() == Some(&"Void");
+            m.action_enabled("Void", s) == voided && (!voided || lands())
+        }
+        Holds::Refused => {
+            d.actions.first() == Some(&"Abandon") && m.action_enabled("Abandon", s) && lands()
+        }
+    }
+}
+
+/// THE CONVERSATION'S OWN MOVES, read by the real code
+/// ([`upgrade::transcript_has_ready`] through [`answered`], and
+/// [`release_void`] over [`upgrade::directed_since_ready`]): the row the
+/// environment action `action` writes — a direction (`Direct`), the agent's
+/// READY (`AgentReady`), its answer that is none (`AgentGoesOn`) — appended to
+/// the transcript `s` stands for (`history`), and read back as the model's
+/// `ready` and as whether the release's point would DROP the release (the
+/// model's own `DropRelease` guard at that point). `None` where `m` does not
+/// enable the action at `s`; else whether the real readings are the model's.
+fn reads_as(m: &Model, s: &S, action: &str, history: bool) -> Option<bool> {
+    let mut t = s.clone();
+    if !m.fire(action, &mut t) {
+        return None;
+    }
+    let (st, _, _, mut tail) = real_of(s, history);
+    tail.push(match action {
+        "Direct" => direction(),
+        "AgentReady" => ready_row(),
+        _ => said_by_agent("On it."),
+    });
+    let text = tail.join("\n");
+    let drops = release_void(&st, &agent_file(), TAB, Some(&text)).is_some();
+    let mut point = t.clone();
+    for (var, value) in [("owed", 1), ("ready", 0), ("limited", 0), ("phase", 2)] {
+        point.insert(var, value);
+    }
+    Some(
+        i64::from(answered(&st, Some(&text))) == t["ready"]
+            && drops == m.action_enabled("DropRelease", &point),
+    )
+}
+
+/// The model with one defect switched on: the incident's reducer (`Buggy`),
+/// and each defect the fix and its reviews found.
+fn defective() -> Vec<(&'static str, Model)> {
+    let model = harness_upgrade_never_strands_model();
+    std::iter::once(("Buggy", aterm_spec::interp::with_buggy(&model, 1)))
+        .chain(
+            [
+                "NoF1",
+                "NoF2",
+                "NoOwe",
+                "NoType",
+                "KeepReady",
+                "LastWhileOwed",
+                "StaleDirection",
+                "UnansweredDirection",
+                "ReadyOverDirection",
+            ]
+            .into_iter()
+            .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
+        )
+        .collect()
+}
+
+/// TIER-1: on EVERY reachable state of `harness_upgrade_never_strands_model`
+/// the real code — its reducer, its gates, its record transitions (the
+/// restart's own [`St::signalled`] and [`St::signal_failed`], the stops'
+/// [`St::stop`], the drop's [`St::dropped`]), the driver's READY, direction
+/// and release rules, and the window's reading of each word ([`after`]) —
+/// takes the step the model's guards allow and lands where the model's
+/// actions land: at an idle look the one reducer step; under a person's hold
+/// or the agent's own work past the drain, the void exactly where the model
+/// voids; under a refused signal or plan, the round abandoned and its release
+/// typed; the release dropped exactly where the model drops it; and the last
+/// word only where the model says it. Each state is decided over its plain
+/// transcript and, where it fits, over THE SECOND REVIEW'S HISTORY — a peer's
+/// message the agent answered with READY — whose release a void owes and the
+/// pre-fix reading dropped. No step says the host's last word over a release
+/// owed. The conversation's own moves (`Direct`, `AgentReady`,
+/// `AgentGoesOn`) are read back by the real transcript readers as the model
+/// says ([`reads_as`]). The clocks: an announced upgrade's window runs out
+/// only off the limit (`Elapse`, the look's hold), and a limit the window's
+/// loop saw starts it again (`LimitResets`, [`St::hold_clock`]). NEGATIVE
+/// CONTROLS: the model with any ONE defect switched on — the incident's
+/// reducer, and each defect the fix and its reviews found — disagrees with
+/// the real code somewhere.
+#[test]
+fn the_real_upgrade_conforms_to_the_never_strands_model() {
+    let model = harness_upgrade_never_strands_model();
+    let defective = defective();
+    let states = reachable(&model);
+    assert!(states.len() > 50, "{} states", states.len());
+    let mut disagree: BTreeMap<&str, usize> = defective.iter().map(|(n, _)| (*n, 0)).collect();
+    let mut taken = std::collections::BTreeSet::new();
+    let mut histories = 0;
+    for s in &states {
+        for history in [false, true] {
+            if history && !history_fits(s) {
+                continue;
+            }
+            histories += usize::from(history);
+            for holds in [
+                Holds::Nothing,
+                Holds::Person,
+                Holds::Background,
+                Holds::Refused,
+            ] {
+                let Some(d) = decide(s, holds, history) else {
+                    continue;
+                };
+                assert!(
+                    !(d.owed && after(&d.word, 0) == After::Finished),
+                    "{holds:?} at {s:?}: `{}` is the host's last word over a release owed",
+                    d.word
+                );
+                assert!(
+                    agrees(&model, s, holds, &d),
+                    "{holds:?} at {s:?} (history {history}): the real visit took {:?} (`{}`) \
+                     to {:?}",
+                    d.actions,
+                    d.word,
+                    d.next
+                );
+                taken.extend(d.actions.iter().copied());
+                for (name, m) in &defective {
+                    if !agrees(m, s, holds, &d) {
+                        *disagree.get_mut(name).expect("a knob") += 1;
+                    }
+                }
+            }
+            for action in ["Direct", "AgentReady", "AgentGoesOn"] {
+                if let Some(reads) = reads_as(&model, s, action, history) {
+                    assert!(reads, "{action} at {s:?} (history {history})");
+                    taken.insert(action);
+                }
+                for (name, m) in &defective {
+                    if reads_as(m, s, action, history) == Some(false) {
+                        *disagree.get_mut(name).expect("a knob") += 1;
+                    }
+                }
+            }
+        }
+        // The clocks. An announced upgrade's window runs out only off the
+        // limit, because every look that finds the limit restarts it.
+        let (st, f, now, _) = real_of(s, false);
+        if s["phase"] == 1 && s["window"] == 0 {
+            let held = upgrade::clock_held(&st.phase, &f, now + upgrade::REASK_S);
+            let runs = matches!(held, Phase::Announced { at_s, .. } if at_s == T0);
+            assert_eq!(runs, model.action_enabled("Elapse", s), "Elapse at {s:?}");
+            for (name, m) in &defective {
+                if runs != m.action_enabled("Elapse", s) {
+                    *disagree.get_mut(name).expect("a knob") += 1;
+                }
+            }
+        }
+        // A limit the window's loop saw holds it too: its close starts the
+        // window again, as `LimitResets` does.
+        if s["phase"] == 1 && s["limited"] == 1 {
+            let mut st = st;
+            let close = T0 + 2 * upgrade::REASK_S;
+            let _ = st.hold_clock(close);
+            let window = match st.phase {
+                Phase::Announced { at_s, .. } => {
+                    i64::from((close + 60).saturating_sub(at_s) >= upgrade::REASK_S)
+                }
+                _ => unreachable!("an announced record stays announced"),
+            };
+            let mut reset = s.clone();
+            assert!(model.fire("LimitResets", &mut reset));
+            assert_eq!(window, reset["window"], "LimitResets at {s:?}");
+            for (name, m) in &defective {
+                let mut t = s.clone();
+                if m.fire("LimitResets", &mut t) && t["window"] != window {
+                    *disagree.get_mut(name).expect("a knob") += 1;
+                }
+            }
+        }
+    }
+    assert!(histories > 0, "the second review's history is decided");
+    assert_eq!(
+        taken.len(),
+        REDUCER.len() + 5,
+        "every step of the upgrade, and every move of the conversation, is taken by the real \
+         code: {taken:?}"
+    );
+    for (name, n) in &disagree {
+        assert!(
+            *n > 0,
+            "the real code has the `{name}` defect: {disagree:?}"
+        );
+    }
+}
+
+/// TIER-1, the incident's schedule: the environment as it ran (the limit
+/// hits, holds past four half-hours, resets; the agent answers READY) and the
+/// REAL decisions between, each transition admitted by the model and every
+/// state within its invariants — one notice after the reset, then the
+/// restart. The pre-fix run (the ledger's notices at the limit, its give-up,
+/// the READY heard by nobody) is admitted only by `Buggy = 1`, refused by the
+/// committed model at its first notice, and ends stranded.
+#[test]
+fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
+    let model = harness_upgrade_never_strands_model();
+    let admit = |m: &Model, prev: &S, next: &S| aterm_spec::interp::admits(m, prev, next);
+    let env = |s: &S, action: &str| {
+        let mut next = s.clone();
+        assert!(model.fire(action, &mut next), "{action} at {s:?}");
+        next
+    };
+    let look = |s: &S| decide(s, Holds::Nothing, false).expect("an idle look");
+    let mut trace = vec![model.init_state()];
+    let push = |trace: &mut Vec<S>, next: S| {
+        let prev = trace.last().expect("a state").clone();
+        assert!(
+            admit(&model, &prev, &next).is_some(),
+            "{prev:?} -> {next:?}"
+        );
+        for inv in ["NoNoticeWhileLimited", "NeverStranded"] {
+            assert!(model.check_invariant(inv, &next), "{inv} at {next:?}");
+        }
+        trace.push(next);
+    };
+    let last = |trace: &Vec<S>| trace.last().expect("a state").clone();
+    let next = env(&last(&trace), "LimitHits");
+    push(&mut trace, next);
+    // 16:02 .. 18:02: the four looks and the give-up's — every one a wait.
+    for _ in 0..5 {
+        assert!(look(&last(&trace)).actions.is_empty());
+    }
+    let next = env(&last(&trace), "LimitResets");
+    push(&mut trace, next);
+    let d = look(&last(&trace));
+    assert_eq!(d.actions, ["Announce"]);
+    push(&mut trace, d.next);
+    let next = env(&last(&trace), "AgentReady");
+    push(&mut trace, next);
+    let d = look(&last(&trace));
+    assert_eq!(d.actions, ["Restart"]);
+    push(&mut trace, d.next);
+    assert_eq!((last(&trace)["phase"], last(&trace)["holding"]), (3, 0));
+
+    // THE PRE-FIX RUN, as the ledger and the journal recorded it (asks scaled
+    // to the model's bound): at the limit, notice, half an hour, notice, half
+    // an hour, give up; the reset; READY; the last word `failed`.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let ran = [
+        "LimitHits",
+        "Announce",
+        "Elapse",
+        "Announce",
+        "Elapse",
+        "GiveUp",
+        "LimitResets",
+        "AgentReady",
+        "Look",
+    ];
+    let mut s = buggy.init_state();
+    let mut refused = None;
+    for action in ran {
+        let prev = s.clone();
+        assert!(buggy.fire(action, &mut s), "{action} at {prev:?}");
+        assert_eq!(admit(&buggy, &prev, &s), Some(action));
+        if refused.is_none() && admit(&model, &prev, &s).is_none() {
+            refused = Some(action);
+            // And the real code, at that very state, does not take it.
+            assert_ne!(look(&prev).actions.first(), Some(&action), "{prev:?}");
+        }
+    }
+    assert_eq!(refused, Some("Announce"), "the first notice at the limit");
+    assert!(!buggy.check_invariant("NeverStranded", &s), "{s:?}");
+    assert!(!buggy.check_invariant("NoNoticeWhileLimited", &s), "{s:?}");
+}

@@ -334,52 +334,14 @@ pub(crate) fn screen_stamp(t: &Terminal) -> (u64, u64) {
     )
 }
 
-/// THE SCREEN'S GENERATION: `(invalidation epoch, content seq)`, spelled
-/// `<epoch>.<seq>` on the wire (`status gen=`, `agent_gen=`, `if-gen=`).
-///
-/// WHY NOT `seq=` ALONE. `content_seq` is the ACTIVE grid's counter, and every
-/// alternate-screen entry installs a fresh grid whose counter starts again at
-/// 1 — so a TUI that leaves and re-enters the alternate screen and draws a
-/// second dialog with the same number of writes shows the first dialog's
-/// `seq=` over a different screen. Measured on a private headless aterm: box A
-/// `ls -la /tmp/work` and box B `rm -rf /tmp/work` both read `seq=15`, and a
-/// fence on that value pressed into B. The epoch is the terminal's
-/// [`ContentScrollState::invalidation_epoch`](aterm_core::terminal::ContentScrollState),
-/// monotonic for the terminal's life and advanced by every screen switch
-/// (aterm-core pins that as
-/// `every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once`)
-/// and by RIS, so within one epoch the grid is one grid and its seq only
-/// grows. The pair therefore names a screen generation that never repeats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ScreenGen {
-    /// The terminal-wide invalidation epoch.
-    pub(crate) epoch: u64,
-    /// The active grid's content seq within that epoch.
-    pub(crate) seq: u64,
-}
-
-impl ScreenGen {
-    /// Parse the wire spelling `<epoch>.<seq>` (two unsigned decimals); any
-    /// other shape — one number, a sign, a third part — is `None`.
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        let (epoch, seq) = value.split_once('.')?;
-        let decimal = |s: &str| {
-            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| s.parse::<u64>().ok())
-                .flatten()
-        };
-        Some(Self {
-            epoch: decimal(epoch)?,
-            seq: decimal(seq)?,
-        })
-    }
-}
-
-impl std::fmt::Display for ScreenGen {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.epoch, self.seq)
-    }
-}
+// THE SCREEN'S GENERATION, `<epoch>.<seq>` on the wire. The type and its one
+// parser live in `aterm-types` so the supervisor that sends `if-gen=` reads a
+// `gen` with the same function this server parses the fence with; the type's
+// doc there says why the epoch is part of it. Here the epoch is the terminal's
+// `ContentScrollState::invalidation_epoch` (`screen_gen` below), which every
+// alternate-screen switch advances (aterm-core pins that as
+// `every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once`).
+pub(crate) use aterm_types::control_verbs::ScreenGen;
 
 /// [`ScreenGen`] of `t` now (the caller holds its lock).
 pub(crate) fn screen_gen(t: &Terminal) -> ScreenGen {
@@ -1112,6 +1074,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          last_redraw_total_ms={:.2} max_redraw_total_ms={:.2} \
          redraw_attempts={} redraw_early_outs={} redraw_sync_holds={} redraw_retry_gated={} \
          frame_refills_scoped={} frame_refills_full={} frame_refills_skipped={} \
+         pet_world_observations={} pet_world_cells={} \
          frame_refill_full_causes={} \
          offscreen_rasters={} last_offscreen_raster_ms={:.2} \
          max_offscreen_raster_ms={:.2} \
@@ -1162,7 +1125,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_cell_pipeline_ms={} \
          effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
          effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1202,6 +1165,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.frame_refills_scoped,
         m.frame_refills_full,
         m.frame_refills_skipped,
+        m.pet_world_observations,
+        m.pet_world_cells,
         refill_cause_pairs(&refill_causes),
         // THE PIXELS THAT NEVER REACH GLASS. `record_offscreen_raster` exists
         // so an `image` / `window` / `snapshot` rasterization stops moving
@@ -1343,6 +1308,10 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // STRAIN (design §10.14, ruling 211): the engine's state and what one
         // reading and one sweep cost the probe thread at worst.
         crate::strain_host::metrics_fields_text(),
+        // THE UPDATE'S PRE-COMMIT INPUT (gap #33): keystrokes the successor's
+        // queue lost, and replays it had to repair — cumulative, so a real
+        // drop is a number, not one more line beside a message on every update.
+        crate::metrics::handoff_input_fields_text(),
     )
 }
 
@@ -1689,6 +1658,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"redraw_sync_holds\":{},\"redraw_retry_gated\":{},\
          \"frame_refills_scoped\":{},\"frame_refills_full\":{},\
          \"frame_refills_skipped\":{},\
+         \"pet_world_observations\":{},\"pet_world_cells\":{},\
          \"frame_refill_full_causes\":{},\
          \"offscreen_rasters\":{},\"last_offscreen_raster_ms\":{:.2},\
          \"max_offscreen_raster_ms\":{:.2},\"pre_present_attempts\":{},\
@@ -1741,7 +1711,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_cell_pipeline_ms\":{},\
          \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
          \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1781,6 +1751,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.frame_refills_scoped,
         m.frame_refills_full,
         m.frame_refills_skipped,
+        m.pet_world_observations,
+        m.pet_world_cells,
         refill_cause_object(&refill_causes),
         // Field-for-field twin of the text form's offscreen-raster ledger.
         m.offscreen_rasters,
@@ -1885,6 +1857,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         crate::watchdog::turn_census_fields_json(),
         // Field-for-field twin of the text summary's strain fragment.
         crate::strain_host::metrics_fields_json(),
+        // Field-for-field twin of the text summary's handoff-input fragment.
+        crate::metrics::handoff_input_fields_json(),
     ))
 }
 
@@ -2032,7 +2006,7 @@ pub(crate) fn offscreen_args(rest: &str) -> Result<OffscreenArgs, String> {
 ///   a header sit above them) — `epoch=` the baseline generation, `alt=` whether
 ///   the alternate screen is active now, and `seq=` the engine's content seq — all
 ///   read under the SAME lock as the rows. `enabled=0` says the archive is OFF
-///   (`ATERM_ALT_ARCHIVE=0`, a budget of 0): nothing that scrolled off was kept,
+///   (switched off for the session, a budget of 0): nothing that scrolled off was kept,
 ///   so an empty reply is not "nothing scrolled off".
 /// * `screen=1` appends the current screen rows `[0, R)` (the `text` rows), taken
 ///   under that same lock, and closes the header with `screen_rows=<m>`. `<n>`
@@ -3740,7 +3714,7 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
 }
 
 /// `modes` -> `OK <n>\n` then `n` `key=value` lines, one per introspected mode —
-/// twelve today, in this order, and the count is in the header so a client
+/// fourteen today, in this order, and the count is in the header so a client
 /// streams the body (the `text`/`search` shape): `alt_screen`, `cursor_visible`,
 /// `app_cursor_keys` (DECCKM), `app_keypad` (DECPAM), `bracketed_paste` (2004),
 /// `mouse_mode` (`none|normal|button|any|x10`), `mouse_encoding`
@@ -3748,7 +3722,11 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
 /// `origin_mode` (DECOM), `kitty_keyboard` (the active progressive-enhancement
 /// flags, a csv drawn from `disambiguate`, `report_events`, `report_alternates`,
 /// `report_all_keys`, `report_text`, or `none`) and `modify_other_keys` (the
-/// xterm level, `0|1|2`). Pinned by `modes_frames_its_count_and_twelve_keys`.
+/// xterm level, `0|1|2`), `focus_reporting` (1004) and `sync_output` (2026).
+/// The last two joined on 2026-09-25 with the foreground handback: they are
+/// two of the modes a program killed while it held the terminal leaves armed,
+/// and a client checking that the handback ran needs to see them. Pinned by
+/// `modes_frames_its_count_and_fourteen_keys`.
 pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
     use aterm_types::mouse::{MouseEncoding, MouseMode};
     let t = term_lock(term);
@@ -3817,6 +3795,11 @@ pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
         // Keyboard input protocol (see above): observe protocol negotiation live.
         format!("kitty_keyboard={kitty_str}"),
         format!("modify_other_keys={modify_other_keys}"),
+        // Focus in/out reports (1004) and synchronized output (2026): both are
+        // left armed by a program that dies holding the terminal, and both are
+        // returned by the foreground handback (2026-09-25).
+        format!("focus_reporting={}", m.focus_reporting),
+        format!("sync_output={}", m.synchronized_output),
     ];
     let mut out = format!("OK {}\n", lines.len());
     for l in &lines {
@@ -3942,7 +3925,9 @@ pub(crate) fn story_usage() -> String {
 /// The grammar of `story <verb> [<text>]`, checked on the control thread so a
 /// junk form is a usage error and never a wake: the verb is one of the CLOSED
 /// SET (design §5: `approved dismissed reconnected timeout exit compacted
-/// warned`), the text is optional, trimmed, at most
+/// warned`, plus `chose` — the in-window supervisor answering Claude Code's
+/// question box by policy, the question-policy contract v3 of 2026-09-24),
+/// the text is optional, trimmed, at most
 /// [`TOLD_TEXT_MAX_BYTES`] bytes, and carries no control byte (a newline could
 /// forge a second reply line; the band would strip it, but the wire refuses
 /// it first). Pure, so every refusal is unit-tested without an event loop.
@@ -3966,8 +3951,9 @@ pub(crate) fn parse_story(rest: &str) -> Result<(crate::presence::StoryVerb, Str
     Ok((verb, text.to_string()))
 }
 
-/// `story <verb> [<text>]` -> `OK story=<n>`: the watcher's decision for the
-/// target session, told to its window (design §5). The write face of the
+/// `story <verb> [<text>]` -> `OK story=<n>`: the watcher's decision (or, for
+/// `chose`, the supervisor's question choice) for the target session, told to
+/// its window (design §5). The write face of the
 /// presence band, beside `appnotice` for the pull-down: watcher decisions live
 /// in another process (`aterm drive watch`'s journal loop) and reach the GUI no
 /// other way. `<n>` is the story point's seq — the number `status story=`
@@ -4009,7 +3995,8 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
     format!("OK {}\n", pct_encode(cwd.as_deref().unwrap_or("")))
 }
 
-/// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S"}`.
+/// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S",
+/// "human_ms":N|null}`.
 /// The rows are the SAME grapheme-faithful, control-collapsed, tail-trimmed lines
 /// `cmd_text` emits, the cursor/dims mirror the `cursor`/`dims` verbs, `seq` is the
 /// engine `content_seq` (so an agent can diff frames without re-reading), and `gen`
@@ -4017,7 +4004,7 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// (`key if-gen=`), so a supervisor binds its press to the very read it judged
 /// rather than to a `status` read taken after it.
 /// The bare form of [`cmd_text_json_opt`] — test-only, like [`cmd_text`], since the
-/// dispatch passes its tail through the `_opt` form (the name stays so the
+/// dispatch passes its tail through [`cmd_text_json_read`] (the name stays so the
 /// `json_ok_sites_match_the_json_capable_verbs` scrape still binds `text`).
 #[cfg(test)]
 pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
@@ -4037,7 +4024,26 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
 /// it qualifies: a `seq` alone repeats after an alternate-screen re-entry, and a
 /// supervisor that fenced its press on the generation of a LATER `status` read
 /// would press into whatever box replaced the one it judged.
+///
+/// The test-side spelling of [`cmd_text_json_read`] for a session no person
+/// has keyed (`"human_ms":null`).
+#[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
+    cmd_text_json_read(term, args, None)
+}
+
+/// [`cmd_text_json_opt`] as the dispatch answers it: `human_ms` (2026-09-25)
+/// is how long ago a PERSON last gave the session input
+/// ([`crate::human_input`], `None` = never, `null` on the wire), written
+/// right after `gen` — like `gen`, every reply carries it, and `trimmed` /
+/// `first` stay last. A supervisor reads it off the very read it decides a
+/// question dialog's key on, and keys nothing until a person has been quiet
+/// long enough (the critique of 2026-09-25, R1).
+pub(crate) fn cmd_text_json_read(
+    term: &Arc<Mutex<Terminal>>,
+    args: TextArgs,
+    human_ms: Option<u64>,
+) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
     // styled frame already uses. Every field is read inside the single hold, so the
     // reply still describes one instant; the escaping and JSON assembly are pure
@@ -4090,10 +4096,12 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
         let _ = write!(
             out,
             "],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
-             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq},\"gen\":\"{generation}\"",
+             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq},\"gen\":\"{generation}\",\
+             \"human_ms\":{human}",
             c.row,
             c.col,
             json_str_field("style", style),
+            human = human_ms.map_or_else(|| "null".to_string(), |ms| ms.to_string()),
         );
         if args.trim {
             let _ = write!(out, ",\"trimmed\":{}", selected.saturating_sub(sent));
@@ -4705,14 +4713,11 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
 }
 
 /// Build the whole styled-screen frame as a single-line JSON object:
-/// `{"seq":N,"dims":{...},"cursor":{...},"rows":[[StyledCell,...],...]}`.
-///
-/// Called with the `Terminal` lock ALREADY HELD (the subscribe `cells` stream
-/// reuses it under one lock so the frame is internally consistent) — gather +
-/// serialize in one call. Callers that CAN drop the lock between the two phases
-/// (the `screen` verb) use [`gather_styled_frame`] / [`serialize_styled_frame`]
-/// directly so the expensive serialization never blocks the mutex.
-#[cfg_attr(not(test), allow(dead_code))] // test parity wrapper; prod splits the phases
+/// `{"seq":N,"dims":{...},"cursor":{...},"rows":[[StyledCell,...],...]}` —
+/// gather + serialize in one call, for the tests. Shipping callers use
+/// [`gather_styled_frame`] / [`serialize_styled_frame`] directly so the
+/// expensive serialization never blocks the `Terminal` mutex.
+#[cfg(test)]
 pub(crate) fn styled_frame_payload(t: &Terminal) -> String {
     serialize_styled_frame(&gather_styled_frame(t))
 }
@@ -4722,10 +4727,9 @@ pub(crate) fn styled_frame_payload(t: &Terminal) -> String {
 /// styled frame, or explicitly omitted with a reason. This destructures
 /// [`RenderInput`](aterm_core::render::RenderInput) WITHOUT `..`, so adding a new
 /// renderer-consumed field fails to compile until someone decides whether
-/// `styled_frame_payload` carries it. That turns "we silently dropped a field"
+/// the styled frame carries it. That turns "we silently dropped a field"
 /// (F1 images, F2 line_sizes, F3 selection — all present in `RenderInput`, all once
 /// missing from the frame) into a build error. Never called; it exists to type-check.
-#[allow(dead_code)]
 fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::RenderInput) {
     let aterm_core::render::RenderInput {
         rows: _,                         // frame "dims.rows"
@@ -4779,12 +4783,14 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         line_sizes: _, // frame "line_sizes" (F2)
         line_size_spans: _, // OMITTED: compose-time per-pane refinement of `line_sizes`. This frame is extracted from ONE Terminal, whose rows are uniform, so it is always empty here; the split-pane composite is not the styled-frame source.
         default_bg_spans: _, // OMITTED: compose-time per-pane refinement of `default_bg`, empty for a single-Terminal frame; each cell already carries its own resolved bg.
-        images: _,           // frame "images" (F1)
+        chrome_rasters: _, // OMITTED: host-owned message-band meter raster (pixel ground, rail, ink split), not engine cell content
+        images: _,         // frame "images" (F1)
         wallpaper: _, // OMITTED: host-owned backdrop base layer (render bling), not engine cell content
         default_bg: _, // OMITTED: engine-resolved live default-bg for padding, not per-cell content (cells carry their own bg)
         default_fg: _, // OMITTED: its twin — the effects layer's tint anchor, not per-cell content
-        cursor_color: _, // frame "cursor.color" (fixed RGB or "default")
-        snapshot_seq: _, // frame "seq" (the engine content version stamp)
+        implicit_blank: _, // OMITTED: exact extraction-time empty cell for host overlays; styled rows carry their own resolved cells
+        cursor_color: _,   // frame "cursor.color" (fixed RGB or "default")
+        snapshot_seq: _,   // frame "seq" (the engine content version stamp)
         content_seq: _, // OMITTED: host effect-attribution clock paired with the exact snapshot, not wire content
         process_sequence: _, // OMITTED: parser-batch provenance used only by host cursor-effect admission
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)
@@ -5325,14 +5331,15 @@ mod tests {
     }
 
     /// The `modes` doc names the frame and the keys; this pins both, so the
-    /// header count and the twelve-key roster cannot drift from the prose again
-    /// (the doc read `OK` and seven keys while the handler sent `OK 12`).
+    /// header count and the key roster cannot drift from the prose again (the
+    /// doc read `OK` and seven keys while the handler sent `OK 12`; fourteen
+    /// since 2026-09-25, when `focus_reporting`/`sync_output` joined).
     #[test]
-    fn modes_frames_its_count_and_twelve_keys() {
+    fn modes_frames_its_count_and_fourteen_keys() {
         let term = term_with(&[]);
         let out = super::cmd_modes(&term);
         let mut lines = out.lines();
-        assert_eq!(lines.next(), Some("OK 12"), "{out}");
+        assert_eq!(lines.next(), Some("OK 14"), "{out}");
         let keys: Vec<&str> = lines
             .map(|l| l.split_once('=').map_or(l, |(k, _)| k))
             .collect();
@@ -5351,6 +5358,8 @@ mod tests {
                 "origin_mode",
                 "kitty_keyboard",
                 "modify_other_keys",
+                "focus_reporting",
+                "sync_output",
             ],
             "{out}"
         );
@@ -6204,6 +6213,12 @@ mod tests {
             // The effect-only reuse gate's honesty term: scoped + full + skipped
             // is still one per presented non-rescan frame.
             "frame_refills_skipped=",
+            // The resident pet's per-frame world walk, as a pair: how many
+            // observations ran, and how many cells they classified between
+            // them. The effects lane's one unconditional O(window) cost, now
+            // readable from a live instance instead of a bench alone.
+            "pet_world_observations=",
+            "pet_world_cells=",
             "frame_refill_full_causes=",
             "last_pre_present_ms=",
             "pre_present_total_ms=",
@@ -6298,6 +6313,8 @@ mod tests {
             "frame_refills_scoped",
             "frame_refills_full",
             "frame_refills_skipped",
+            "pet_world_observations",
+            "pet_world_cells",
             "frame_refill_full_causes",
             "pre_present_attempts",
             "last_pre_present_ms",
@@ -6822,6 +6839,38 @@ mod tests {
             .and_then(aterm_json::Value::as_str)
             .expect("the state is a word");
         assert!(["calm", "suspect", "open", "off"].contains(&word), "{word}");
+    }
+
+    /// THE UPDATE'S PRE-COMMIT INPUT rides both forms (gap #33): the keystrokes
+    /// a successor's queue lost (`input_dropped=`) and the replays it had to
+    /// repair (`input_incoherent=`), read OUT OF the fragment like strain's and
+    /// held still under the counters' lock, so the values are pinned too.
+    #[test]
+    fn the_handoff_input_counts_ride_the_metrics_summary_in_both_forms() {
+        let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (dropped, incoherent) = crate::metrics::handoff_input_counts();
+        let fragment = crate::metrics::handoff_input_fields_text();
+        assert_eq!(
+            fragment,
+            format!(" input_dropped={dropped} input_incoherent={incoherent}")
+        );
+        let text = super::cmd_metrics(None, "");
+        assert!(text.contains(&fragment), "{text}");
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for (name, expected) in [("input_dropped", dropped), ("input_incoherent", incoherent)] {
+            assert_eq!(
+                value.get(name).and_then(aterm_json::Value::as_u64),
+                Some(expected),
+                "{name}: {reply}"
+            );
+        }
     }
 
     /// ITEM 6 wire shape. The per-owner ledger is a self-labelling field in
@@ -7566,6 +7615,29 @@ mod trim_tests {
         assert_eq!(field(&tail, "gen"), field(&b, "gen"), "{tail}");
     }
 
+    /// `"human_ms"` (the person's stamp, R1 of 2026-09-25) rides every reply
+    /// right after `gen`: the milliseconds since a person keyed the session,
+    /// `null` when none ever has; a shaped read keeps `trimmed`/`first` last.
+    #[test]
+    fn text_json_carries_the_persons_stamp_after_gen() {
+        let term = term_with(24, &numbered(22));
+        let never = super::cmd_text_json_read(&term, TextArgs::default(), None);
+        assert!(never.contains(",\"human_ms\":null}"), "{never}");
+        let keyed = super::cmd_text_json_read(&term, TextArgs::default(), Some(12_345));
+        let gen_at = keyed.find("\"gen\":").expect("gen");
+        let human_at = keyed
+            .find(",\"human_ms\":12345}")
+            .expect("human_ms, closing");
+        assert!(gen_at < human_at, "{keyed}");
+        let shaped = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7));
+        assert!(
+            shaped.ends_with(",\"human_ms\":7,\"trimmed\":2,\"first\":19}\n"),
+            "{shaped}"
+        );
+        // NEGATIVE CONTROL: the test spelling is the never-keyed session.
+        assert_eq!(cmd_text_json_opt(&term, TextArgs::default()), never);
+    }
+
     /// `text --json trim`: `rows` stops at the last non-blank row and the object
     /// carries `"trimmed":k`; `dims.rows` stays the grid. The bare JSON is unchanged.
     #[test]
@@ -7849,7 +7921,7 @@ mod offscreen_tests {
     /// its top, archived as indices `1..frames`, where index `i` holds `row(i - 1)`.
     fn scrolled_engine(frames: usize) -> Terminal {
         let mut t = Terminal::new(ROWS, 40);
-        t.set_alt_archive_enabled(true); // whatever ATERM_ALT_ARCHIVE says here
+        t.set_alt_archive_enabled(true); // whatever the default says here
         t.set_alt_archive_origin(ORIGIN);
         t.process(b"\x1b[?1049h");
         for s in 0..frames {
@@ -8307,7 +8379,7 @@ mod offscreen_wire_tests {
         );
     }
 
-    /// An archive that is OFF (ATERM_ALT_ARCHIVE=0, or budget 0) does not read as
+    /// An archive that is OFF (switched off, or budget 0) does not read as
     /// an archive that simply has nothing: nine rows scrolled off here and none
     /// were kept, so the header says `enabled=0` (and an archive that is on never
     /// carries the field).
@@ -8404,8 +8476,9 @@ mod offscreen_wire_tests {
 #[cfg(test)]
 mod story_tests {
     //! The `story` verb's grammar (round 19, item 5): every junk form is the
-    //! usage line, the closed set is exactly the design's seven words, and the
-    //! text cap is the wire cap.
+    //! usage line, the closed set is exactly the design's seven words plus
+    //! `chose` (the question-policy contract v3, 2026-09-24), and the text cap
+    //! is the wire cap.
 
     use super::{parse_story, story_usage};
     use crate::presence::{StoryVerb, TOLD_TEXT_MAX_BYTES};
@@ -8415,7 +8488,7 @@ mod story_tests {
         let usage = story_usage();
         assert_eq!(
             usage,
-            "ERR usage: story <approved|dismissed|reconnected|timeout|exit|compacted|warned> \
+            "ERR usage: story <approved|dismissed|reconnected|timeout|exit|compacted|warned|chose> \
              [<text>]\n",
             "the usage line spells the closed set"
         );
@@ -8442,6 +8515,7 @@ mod story_tests {
             ("exit", StoryVerb::Exit),
             ("compacted", StoryVerb::Compacted),
             ("warned", StoryVerb::Warned),
+            ("chose", StoryVerb::Chose),
         ] {
             assert_eq!(parse_story(word), Ok((verb, String::new())), "{word}");
             assert_eq!(
@@ -8452,9 +8526,17 @@ mod story_tests {
         }
         assert_eq!(
             StoryVerb::TOLD_WORDS.len(),
-            7,
-            "the closed set is the design's seven words"
+            8,
+            "the closed set is the design's seven words and `chose`"
         );
+        assert_eq!(
+            parse_story("chose recommended"),
+            Ok((StoryVerb::Chose, "recommended".to_string())),
+            "the supervisor tells its policy word as the text"
+        );
+        for junk in ["chosen", "CHOSE", "choose"] {
+            assert_eq!(parse_story(junk), Err(usage.clone()), "{junk:?}");
+        }
         for word in StoryVerb::TOLD_WORDS {
             assert!(StoryVerb::parse_told(word).is_some(), "{word}");
         }

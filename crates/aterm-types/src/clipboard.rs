@@ -104,39 +104,3 @@ pub enum ClipboardOperation {
         selections: Vec<ClipboardSelection>,
     },
 }
-
-// ============================================================================
-// OSC 1337 Named Pasteboard Operations (CopyToClipboard/EndCopy)
-// ============================================================================
-
-/// Operation type for OSC 1337 named pasteboard clipboard operations.
-///
-/// These operations differ from OSC 52 in that they use named pasteboards
-/// (macOS-style) and support a text capture mode where all printed output
-/// between CopyToClipboard and EndCopy is accumulated.
-///
-/// # Protocol
-///
-/// - `ESC ] 1337 ; CopyToClipboard=name ST` - Start capturing text to named pasteboard
-/// - `ESC ] 1337 ; EndCopy ST` - Stop capturing and place accumulated text on pasteboard
-/// - `ESC ] 1337 ; Copy=base64 ST` - Direct copy of base64-decoded data to clipboard
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CopyToClipboardOperation {
-    /// Text capture completed (CopyToClipboard + EndCopy sequence).
-    ///
-    /// The host should place the content on the named pasteboard.
-    CaptureComplete {
-        /// Named pasteboard (e.g., "general", "rule", "find", "font")
-        /// Empty string means the general (system) clipboard.
-        pasteboard: String,
-        /// The captured text content
-        content: String,
-    },
-    /// Direct copy (OSC 1337 Copy=base64).
-    ///
-    /// Similar to OSC 52 Set but via OSC 1337 protocol.
-    DirectCopy {
-        /// The text content to copy
-        content: String,
-    },
-}

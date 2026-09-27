@@ -117,8 +117,8 @@ __pycache__/
 # 871,344 — 81% — are that checkout's own `target/`.
 #
 # Nothing in the tree reads this path — `git grep fabric-wt` over all tracked
-# content matches only this rule, and no script under `tools/`, `scripts/` or
-# `.githooks/` names it — so ignoring it hides no tracked or trackable input.
+# content matches only this rule, and no script under `tools/` or `scripts/`
+# names it — so ignoring it hides no tracked or trackable input.
 /.fabric-wt/
 
 # THE DELIVERED LANE 1 MIRROR — 78 MB of `.crate` tarballs that must never
@@ -128,3 +128,10 @@ __pycache__/
 # `cargo forge mirror unbundle --out mirror` lands; unignored, it would stop
 # `cargo ship cut` at `gates::clean_tree` the moment anyone delivered one.
 /mirror/
+
+# `ty`'s result cache (`.ty/cache.json`), written into the working directory of
+# whatever ran it — for the Tier-1 suites, the crate directory. It keys entries
+# by the absolute temp-dir paths of that one run, so it is machine-local residue:
+# the copy once committed under crates/aterm-gui/ was a Windows run's, naming a
+# local user profile directory, and no machine ever read it back.
+.ty/

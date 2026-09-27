@@ -814,7 +814,7 @@ impl VersionedConfigService {
 }
 
 fn parse_config(text: &str) -> Result<crate::app_config::Config, String> {
-    aterm_toml::from_str::<crate::app_config::Config>(text)
+    crate::app_config::Config::parse(text)
         .map_err(|error| format!("aterm.toml is not a valid aterm config: {error}"))
 }
 
@@ -948,6 +948,38 @@ mod tests {
                 value: value.map(str::to_owned),
             }],
         }
+    }
+
+    /// A patch whose base the service never published — zero, or the revision
+    /// the write would produce — is refused before anything moves. No design
+    /// path builds one (a controller copies its base from the snapshot it
+    /// holds), so this is a plain refusal test, not a model law.
+    #[test]
+    fn a_base_revision_the_service_never_published_is_refused_without_a_write() {
+        let mut service =
+            VersionedConfigService::new("theme = \"Nord\"\n".into()).expect("valid config");
+        let before = service.snapshot();
+        for base in [0, before.revision + 1] {
+            assert!(matches!(
+                service.patch(edit(
+                    base,
+                    "theme",
+                    ExpectedValue::Exact(Some("Nord".into())),
+                    None,
+                )),
+                ConfigPatchResult::Rejected { message, .. } if message == "invalid base revision"
+            ));
+            assert_eq!(service.snapshot(), before);
+        }
+        assert!(matches!(
+            service.patch(edit(
+                before.revision,
+                "theme",
+                ExpectedValue::Exact(Some("Nord".into())),
+                None,
+            )),
+            ConfigPatchResult::Applied { .. }
+        ));
     }
 
     #[test]

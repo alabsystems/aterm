@@ -12,6 +12,15 @@
 //! aterm-release --"`), never `cargo install` — a stale installed binary must
 //! not be able to cut a release (spec decision 13).
 //!
+//! Binary-only on purpose — there is no `lib.rs`. Nothing outside the cut tool
+//! may link this code (the release spec's §9 file plan), and because every
+//! module below is a private `mod` of this binary, rustc's `dead_code` judges
+//! every item against what `main()` can reach: code that only a test calls
+//! fails `targo-tippy --all-targets -- -D warnings`. The integration tests
+//! reach the modules by `#[path]`-mounting them into one test binary,
+//! `tests/it/main.rs`; Cargo.toml says why that binary, not this one, runs the
+//! inline unit tests.
+//!
 //! Module map (one module per pipeline stage; each doc comment cites its spec
 //! section):
 

@@ -25,15 +25,6 @@
 //! (#2341) to allow `aterm-editor` and `aterm-core::plugins` to share these
 //! types without a circular dependency.
 
-/// Key event from terminal input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyEvent {
-    /// The key code.
-    pub key: KeyCode,
-    /// Modifier keys held.
-    pub modifiers: KeyModifiers,
-}
-
 /// Key codes for key events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

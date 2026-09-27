@@ -33,6 +33,7 @@ impl GridStorage {
     /// is for callers that already did that arithmetic.
     ///
     /// [`Grid::set_scrollback_line_limit`]: crate::Grid::set_scrollback_line_limit
+    #[cfg(test)]
     pub fn set_store_line_limit(&mut self, limit: Option<usize>) {
         if let Some(scrollback) = &mut self.scrollback {
             scrollback.set_line_limit(limit);
@@ -107,10 +108,6 @@ impl GridStorage {
     }
 
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "accessor pending scrollback_access delegation (#5804)"
-    )]
     pub(crate) fn ring_history_row(&self, ring_idx: usize) -> Option<&Row> {
         if ring_idx >= self.ring_buffer_scrollback() {
             return None;
@@ -126,10 +123,6 @@ impl GridStorage {
 
     #[must_use]
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "accessor pending scrollback_access delegation (#5804)"
-    )]
     pub(crate) fn ring_history_extras(&self, ring_idx: usize) -> Option<&ScrolledRowExtras> {
         self.ring_extras
             .get(ring_idx)

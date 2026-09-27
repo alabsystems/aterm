@@ -12,8 +12,8 @@
 //!   `aterm_spec::derive::{font_chain_seal_independence_model,
 //!   font_key_recovery_lane_model, fallback_convergence_model}`, discharged by
 //!   `cargo test -p aterm-spec --test derived_ring_ty`.
-//! * **Tier-1 (concrete, this file)** — the chain's inputs are 7 coverage bits ×
-//!   2 lazy-parse bits × 3 policy bools = 4096 cases. That is not a sample: it is
+//! * **Tier-1 (concrete, this file)** — the chain's inputs are 8 coverage bits ×
+//!   2 lazy-parse bits × 4 policy bools = 16384 cases. That is not a sample: it is
 //!   the entire domain, so this is a complete proof of P1–P4 for the real policy.
 //! * **Tier-2 (symbolic, trust-mc)** — `aterm_render::font_chain::kani_proofs`,
 //!   discharged by `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`.
@@ -27,7 +27,7 @@ use aterm_render::font_chain::{
 };
 use aterm_render::{FaceId, Renderer, Theme};
 
-/// Every policy in the domain (2^3).
+/// Every policy in the domain (2^4).
 fn all_policies() -> impl Iterator<Item = ChainPolicy> {
     (0u8..16).map(|b| ChainPolicy {
         runtime_discovery: b & 1 == 1,
@@ -39,9 +39,11 @@ fn all_policies() -> impl Iterator<Item = ChainPolicy> {
     })
 }
 
-/// Every (coverage, lazy-parse) input in the domain (2^7 × 2^2).
+/// Every (coverage, lazy-parse) input in the domain (2^8 × 2^2).
 fn all_facts() -> impl Iterator<Item = (u8, u8)> {
-    (0u8..(1 << Tier::COUNT)).flat_map(|covered| (0u8..4).map(move |pending| (covered, pending)))
+    (0u16..(1 << Tier::COUNT))
+        .map(|covered| u8::try_from(covered).expect("Tier::COUNT <= 8"))
+        .flat_map(|covered| (0u8..4).map(move |pending| (covered, pending)))
 }
 
 /// THE MUTANT — the shipped pre-fix resolver, in which sealing a generation also
@@ -65,6 +67,7 @@ fn chain_laws_hold_over_the_complete_input_space() {
     let mut provisional = 0usize;
     let mut runtime_pathname = 0usize;
     let mut runtime_embedded = 0usize;
+    let mut synthetic = 0usize;
 
     for (covered, pending) in all_facts() {
         for policy in all_policies() {
@@ -115,6 +118,26 @@ fn chain_laws_hold_over_the_complete_input_space() {
             match r {
                 Resolution::Runtime(RuntimeLane::Decisions) => runtime_pathname += 1,
                 Resolution::Runtime(RuntimeLane::EmbeddedDecisions) => runtime_embedded += 1,
+                // The last-resort synthesis is answered by the procedural source
+                // WITHOUT the (first-tier) box-drawing bit: it must only ever be
+                // reached when no FONT tier could answer with a real glyph — the
+                // colour face's silhouette of a text point being the one font
+                // answer it outranks.
+                Resolution::Face(FaceId::Procedural) if covered & Tier::Procedural.bit() == 0 => {
+                    synthetic += 1;
+                    assert_ne!(covered & Tier::Synthetic.bit(), 0);
+                    let configured_fonts =
+                        Tier::Primary.bit() | Tier::Fallback.bit() | Tier::Symbol.bit();
+                    let runtime = reachable_mask(policy)
+                        & (Tier::RuntimeDecisions.bit() | Tier::RuntimeEmbedded.bit());
+                    let silhouette_only = covered & Tier::Color.bit() != 0 && !policy.wants_emoji;
+                    assert!(
+                        covered & configured_fonts == 0
+                            && (silhouette_only || covered & (Tier::Color.bit() | runtime) == 0),
+                        "SYNTHETIC outranked a real glyph \
+                         (covered={covered:08b} {policy:?})"
+                    );
+                }
                 _ => {}
             }
 
@@ -154,9 +177,14 @@ fn chain_laws_hold_over_the_complete_input_space() {
         runtime_embedded > 0,
         "the I/O-FREE bundled backstop is unreachable — this is the tofu bug"
     );
+    assert!(
+        synthetic > 0,
+        "the fontless symbol synthesis is unreachable — this is the U+23F5 tofu"
+    );
     eprintln!(
         "font-chain lattice: notdef={notdef} provisional={provisional} \
-         runtime_pathname={runtime_pathname} runtime_embedded={runtime_embedded}"
+         runtime_pathname={runtime_pathname} runtime_embedded={runtime_embedded} \
+         synthetic={synthetic}"
     );
 }
 

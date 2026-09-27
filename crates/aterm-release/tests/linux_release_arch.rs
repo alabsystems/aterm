@@ -151,21 +151,3 @@ fn legacy_archives_wrong_version_foreign_target_and_bad_digests_are_refused() {
         }
     }
 }
-
-#[cfg(unix)]
-#[test]
-fn retired_unsigned_uploader_refuses_without_side_effects() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let out = std::process::Command::new("bash")
-        .arg(root.join("tools/test-linux-auto-release.sh"))
-        .current_dir(&root)
-        .output()
-        .expect("run hermetic retirement guard");
-    assert!(
-        out.status.success()
-            && String::from_utf8_lossy(&out.stdout).contains("test-linux-auto-release: PASS"),
-        "retirement guard failed:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}

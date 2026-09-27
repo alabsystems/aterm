@@ -5,7 +5,8 @@
 //! row whose reporter supplies an [`Amount`] feeds a [`ProgressTrack`]; the
 //! band reads back an honest [`Eta`] — the secant across a window, shown only
 //! once several projections agree, counting down between reads, re-anchored
-//! only on a real change, "stalled" after ten seconds without bytes, and
+//! only on a real change, "stalled" ten seconds after bytes stop (a count
+//! after several of its own gaps between advances), and
 //! blank once it has run out with nothing new ([`ETA_OVERDUE_MIN`]). All of
 //! the math is integer (milliseconds, u64/u128): no floats, so native and wasm
 //! agree to the millisecond, and the crate's clock fence holds — every method
@@ -15,8 +16,8 @@ use std::collections::VecDeque;
 
 use crate::model::{Amount, Unit};
 use crate::{
-    Duration, ELAPSED_AFTER, ETA_OVERDUE_MIN, Instant, PROJECTIONS_CAP, RATE_MIN_SPAN, RATE_WINDOW,
-    SAMPLE_MIN_GAP, SAMPLES_CAP, STABLE_MIN, STABLE_SPAN, STALL_AFTER,
+    COUNT_STALL_GAPS, Duration, ELAPSED_AFTER, ETA_OVERDUE_MIN, Instant, PROJECTIONS_CAP,
+    RATE_MIN_SPAN, RATE_WINDOW, SAMPLE_MIN_GAP, SAMPLES_CAP, STABLE_MIN, STABLE_SPAN, STALL_AFTER,
 };
 
 /// Past this a projection is not a projection (a stalled trickle, a
@@ -64,6 +65,10 @@ pub struct ProgressTrack {
     first_done: Option<u64>,
     advanced: bool,
     last_advance: Option<Instant>,
+    /// When the series began (its first reading), and how many readings
+    /// since moved `done` forward: a count's own pace ([`COUNT_STALL_GAPS`]).
+    began: Option<Instant>,
+    advances: u32,
     projections: VecDeque<(Instant, Instant)>,
     anchor: Option<Instant>,
     /// How long past `anchor` the latch may stand with nothing new: the
@@ -79,7 +84,8 @@ impl ProgressTrack {
     /// time base; the projection is voted only when a sample is kept.
     pub fn observe(&mut self, now: Instant, a: Amount) {
         let regressed = self.newest.is_some_and(|n| a.done < n.done);
-        if self.series != Some(a.series) || self.unit != Some(a.unit) || regressed {
+        let same_count = self.unit.is_some_and(|u| u.count() == a.unit.count());
+        if self.series != Some(a.series) || !same_count || regressed {
             *self = Self {
                 series: Some(a.series),
                 unit: Some(a.unit),
@@ -91,11 +97,19 @@ impl ProgressTrack {
             self.projections.clear();
             self.anchor = None;
         }
+        // A held phase ended (ruling 266): the count's patience restarts
+        // here, so the plateau it sat through is not read as a stall.
+        if self.unit == Some(Unit::HeldSteps) && a.unit != Unit::HeldSteps {
+            self.last_advance = Some(now);
+        }
+        self.unit = Some(a.unit);
         if let Some(n) = self.newest
             && a.done > n.done
         {
             self.last_advance = Some(now);
+            self.advances = self.advances.saturating_add(1);
         }
+        self.began.get_or_insert(now);
         let first = *self.first_done.get_or_insert(a.done);
         if a.done > first {
             self.advanced = true;
@@ -240,20 +254,53 @@ impl ProgressTrack {
         }
     }
 
-    /// When the stream reads "stalled" if nothing arrives: bytes only, and
-    /// only once they have moved at all.
+    /// When the stream reads "stalled" if nothing arrives, once it has moved
+    /// at all: bytes [`STALL_AFTER`] after the last advance; a COUNT (steps,
+    /// items) after [`COUNT_STALL_GAPS`] of its own mean gaps between
+    /// advances, never sooner than bytes (design ruling 265) — a count that
+    /// stopped used to count its estimate down to `<5 s left` at a frozen
+    /// fill and then go blank, never saying it had stalled.
     fn stall_at(&self) -> Option<Instant> {
-        if self.unit != Some(Unit::Bytes) || !self.advanced {
+        if !self.advanced {
             return None;
         }
-        self.last_advance?.checked_add(STALL_AFTER)
+        let last = self.last_advance?;
+        let after = match self.unit? {
+            // A phase that holds the fill by plan never stalls (ruling 266).
+            Unit::HeldSteps => return None,
+            Unit::Bytes => STALL_AFTER,
+            Unit::Items | Unit::Steps => {
+                let pace = last.saturating_duration_since(self.began?) / self.advances.max(1);
+                STALL_AFTER.max(pace.saturating_mul(COUNT_STALL_GAPS))
+            }
+        };
+        last.checked_add(after)
+    }
+
+    /// A QUICK projection of the time left, for the reveal (design ruling
+    /// 265): the secant from the oldest kept reading to the newest, less the
+    /// time since the newest — `None` until `done` has moved. Coarser than
+    /// the ETA (no votes, no latch); it only decides whether a row about to
+    /// be revealed would be on the glass long enough to read.
+    #[must_use]
+    pub(crate) fn quick_left(&self, now: Instant) -> Option<Duration> {
+        let newest = self.newest?;
+        let first = *self.samples.front()?;
+        if self.total == 0 || newest.done <= first.done {
+            return None;
+        }
+        let span = u128::from(ms_between(newest.at, first.at));
+        let left = u128::from(self.total.saturating_sub(newest.done)) * span
+            / u128::from(newest.done - first.done);
+        let left = Duration::from_millis(u64::try_from(left).ok()?);
+        Some(left.saturating_sub(now.saturating_duration_since(newest.at)))
     }
 
     /// The next instant the ETA's WORDS change with no new reading: the
     /// countdown's next boundary, the latch running out, or the stall.
     /// `None` when nothing will change on its own.
     #[must_use]
-    pub fn next_change(&self, now: Instant) -> Option<Instant> {
+    pub(crate) fn next_change(&self, now: Instant) -> Option<Instant> {
         let newest = self.newest?;
         if self.total == 0 || newest.done >= self.total {
             return None;
@@ -272,12 +319,12 @@ impl ProgressTrack {
         self.stall_onset(now).into_iter().chain(word).min()
     }
 
-    /// When a byte stream that has moved turns "stalled" if nothing arrives —
+    /// When a stream that has moved turns "stalled" if nothing arrives —
     /// the one change a bar with no ETA slot still DRAWS (its dim
-    /// [`crate::Tone::STALLED`] ink); `None` for steps and items, before the
-    /// first advance, and once the stall has begun.
+    /// [`crate::Tone::STALLED`] ink); `None` before the first advance and
+    /// once the stall has begun.
     #[must_use]
-    pub fn stall_onset(&self, now: Instant) -> Option<Instant> {
+    pub(crate) fn stall_onset(&self, now: Instant) -> Option<Instant> {
         let newest = self.newest?;
         if self.total == 0 || newest.done >= self.total {
             return None;
@@ -288,7 +335,8 @@ impl ProgressTrack {
     /// Units per minute over the window ending at the newest reading, or
     /// `None` while the rate is not valid.
     #[must_use]
-    pub fn rate_per_min(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn rate_per_min(&self) -> Option<u64> {
         let newest = self.newest?;
         let (oldest, count) = self.window(newest.at)?;
         let span = ms_between(newest.at, oldest.at);
@@ -299,27 +347,23 @@ impl ProgressTrack {
         u64::try_from(per_min).ok()
     }
 
-    /// `true` once a reading has been seen.
-    #[must_use]
-    pub fn is_fed(&self) -> bool {
-        self.newest.is_some()
-    }
-
     /// The series this track follows.
     #[must_use]
-    pub fn series(&self) -> Option<u64> {
+    pub(crate) fn series(&self) -> Option<u64> {
         self.series
     }
 
     /// Samples in the ring (a bound the tests read).
     #[must_use]
-    pub fn samples_len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn samples_len(&self) -> usize {
         self.samples.len()
     }
 
     /// Projections in the ring (a bound the tests read).
     #[must_use]
-    pub fn projections_len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn projections_len(&self) -> usize {
         self.projections.len()
     }
 }
@@ -330,10 +374,11 @@ fn secs_up(d: Duration) -> u64 {
 }
 
 /// The words for `s` whole seconds left; `None` past a day. Under five
-/// seconds the honest word is `<5 s left` (`~5 s` beside 0.5 s left read as
-/// a promise of five more seconds, review 2026-09-23). Every form ends in
-/// `left`: a remaining time is never mistakable for the elapsed CLOCK
-/// (`0:28`) an indeterminate row counts up with (review 2026-09-24).
+/// seconds the honest word is `<5 s left` (`5 s` beside 0.5 s left read as a
+/// promise of five more seconds, review 2026-09-23). Every form ends in
+/// `left`, which already says it is an estimate: the `~` the long form wore
+/// until round 12 said it twice and made the one number the owner reads for
+/// ("how long to wait") the widest thing in its slot (design ruling 241).
 fn eta_words_secs(s: u64, short: bool) -> Option<String> {
     let (n, long_unit, short_unit) = if s < 5 {
         return Some(if short { "<5s left" } else { "<5 s left" }.to_string());
@@ -349,13 +394,13 @@ fn eta_words_secs(s: u64, short: bool) -> Option<String> {
     Some(if short {
         format!("{n}{short_unit} left")
     } else {
-        format!("~{n}{long_unit} left")
+        format!("{n}{long_unit} left")
     })
 }
 
-/// The ETA in words: `<5 s left`, `~5 s left` … `~55 s left`, `~1 min left`
-/// … `~59 min left`, `~1 h left` … `~24 h left`; `None` past a day. Never
-/// says zero, and never reads as a clock.
+/// The ETA in words: `<5 s left`, `5 s left` … `55 s left`, `1 min left` …
+/// `59 min left`, `1 h left` … `24 h left`; `None` past a day. Never says
+/// zero, and never reads as a clock.
 #[must_use]
 pub fn eta_words(remaining: Duration) -> Option<String> {
     eta_words_secs(secs_up(remaining), false)
@@ -366,7 +411,7 @@ pub fn eta_words(remaining: Duration) -> Option<String> {
 /// `24h left` — the same numbers, so the words change at exactly the
 /// instants [`eta_word_change`] names for the long form.
 #[must_use]
-pub fn eta_words_short(remaining: Duration) -> Option<String> {
+pub(crate) fn eta_words_short(remaining: Duration) -> Option<String> {
     eta_words_secs(secs_up(remaining), true)
 }
 
@@ -395,7 +440,7 @@ fn eta_change_below(s: u64) -> Option<u64> {
 /// for exactly this long and differ at its end. `None` when they never change
 /// (`<5 s left` stays `<5 s left` down to nothing).
 #[must_use]
-pub fn eta_word_change(remaining: Duration) -> Option<Duration> {
+pub(crate) fn eta_word_change(remaining: Duration) -> Option<Duration> {
     let r = ms(remaining);
     let s = r.div_ceil(1000);
     let below = eta_change_below(s)?;
@@ -431,52 +476,47 @@ pub fn eta_spoken(eta: Eta) -> Option<String> {
     }
 }
 
-/// How long indeterminate work has run, as a CLOCK: nothing under
-/// [`ELAPSED_AFTER`], then `0:12` … `59:59`, then `1:02 h` … `9:59 h`, then
-/// `10 h` — floored. A clock counting up never reads like the `~25 s left`
-/// counting down (review 2026-09-23: `28 s` and `~25 s` differed by a
-/// tilde; review 2026-09-24: the remaining time now says `left` as well).
+/// How long busy work has run, LABELLED (design ruling 241): nothing under
+/// [`ELAPSED_AFTER`], then `for 12 s` … `for 59 s`, `for 1 min` … `for 59
+/// min`, `for 1 h` … `for 999 h` — floored. Never a bare clock: `0:41` next
+/// to a time slot that later says `30 s left` read as seven seconds LEFT
+/// where it meant seven seconds gone (round-12 critics). `short` is the
+/// slot's sacrifice form ([`crate::ELAPSED_SHORT_W`] cells): `for 12s`,
+/// `for 3m`, `for 2h` — the same numbers, changing at the same instants.
 #[must_use]
-pub fn elapsed_words(e: Duration) -> Option<String> {
-    (e >= ELAPSED_AFTER).then(|| clock_words(e))
+pub(crate) fn elapsed_words(e: Duration, short: bool) -> Option<String> {
+    (e >= ELAPSED_AFTER).then(|| ran_words(e, short))
 }
 
-/// `e` as the elapsed CLOCK with no floor: `0:00` … `59:59`, `1:02 h` …
-/// `9:59 h`, then `10 h` — floored, at most [`crate::ELAPSED_W`] cells. It
-/// is what an indeterminate row's elapsed slot says from [`ELAPSED_AFTER`]
-/// on, and what a determinate row's ETA slot says while its estimate is
-/// hidden, so that slot always answers "how long" (review round 3,
-/// 2026-09-24: `35%` then ten blank cells until the ETA latched).
-#[must_use]
-pub fn clock_words(e: Duration) -> String {
+/// [`elapsed_words`] with no floor.
+fn ran_words(e: Duration, short: bool) -> String {
     let s = e.as_secs();
-    if s < 3600 {
-        format!("{}:{:02}", s / 60, s % 60)
-    } else if s < 36_000 {
-        format!("{}:{:02} h", s / 3600, s % 3600 / 60)
+    let (n, long_unit, short_unit) = if s < 60 {
+        (s, " s", "s")
+    } else if s < 3600 {
+        (s / 60, " min", "m")
     } else {
-        format!("{} h", s / 3600)
+        ((s / 3600).min(999), " h", "h")
+    };
+    if short {
+        format!("for {n}{short_unit}")
+    } else {
+        format!("for {n}{long_unit}")
     }
 }
 
 /// How long until [`elapsed_words`] changes as `e` grows: the first words at
-/// [`ELAPSED_AFTER`], then as [`clock_word_change`].
+/// [`ELAPSED_AFTER`], then the next whole second (under a minute), minute
+/// (under an hour) or hour.
 #[must_use]
-pub fn elapsed_word_change(e: Duration) -> Duration {
+pub(crate) fn elapsed_word_change(e: Duration) -> Duration {
     if e < ELAPSED_AFTER {
         return ELAPSED_AFTER.saturating_sub(e);
     }
-    clock_word_change(e)
-}
-
-/// How long until [`clock_words`] changes as `e` grows: the next whole
-/// second (under an hour), minute (under ten) or hour.
-#[must_use]
-pub fn clock_word_change(e: Duration) -> Duration {
     let e_ms = ms(e);
-    let step = if e_ms < 3_600_000 {
+    let step = if e_ms < 60_000 {
         1000
-    } else if e_ms < 36_000_000 {
+    } else if e_ms < 3_600_000 {
         60_000
     } else {
         3_600_000
@@ -494,8 +534,8 @@ pub fn elapsed_spoken(e: Duration) -> Option<String> {
     clock_spoken(e)
 }
 
-/// [`clock_words`] as a screen reader says it: `running for 4 seconds` —
-/// `None` in the first second, where the clock has not yet moved.
+/// How long work has run as a screen reader says it, with no floor:
+/// `running for 4 seconds` — `None` in the first second.
 #[must_use]
 pub fn clock_spoken(e: Duration) -> Option<String> {
     let s = e.as_secs();
@@ -513,9 +553,60 @@ pub fn clock_spoken(e: Duration) -> Option<String> {
     Some(format!("running for {n} {unit}{plural}"))
 }
 
+/// WHO WAITS on a piece of work — the one question that decides whether it
+/// takes an animated row (design rulings 220 and 224). A host answers it
+/// from what started the work (a press, a menu item, a typed verb, or a
+/// background loop) and passes the answer; the rule itself is here, once,
+/// for every lane and every platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Waiter {
+    /// A person started it and is waiting for what it delivers.
+    Person,
+    /// Nobody: work the person did not ask for (a background check, a
+    /// scheduled pass). R3: "seamless, non-interrupting (ideally silent)".
+    Nobody,
+}
+
+impl Waiter {
+    /// Whether the work takes its animated row (after the progress grace,
+    /// [`crate::PROGRESS_GRACE`], so work that ends inside it never touches
+    /// the glass): a person's always — they asked, and the row says how long
+    /// and for what; nobody's only while it is very heavy system use that
+    /// needs explaining (design §10.6), and otherwise it is silent and its end
+    /// a record.
+    #[must_use]
+    pub const fn takes_row(self, very_heavy: bool) -> bool {
+        matches!(self, Self::Person) || very_heavy
+    }
+
+    /// [`Waiter::Person`] when `person` is true.
+    #[must_use]
+    pub const fn of(person: bool) -> Self {
+        if person { Self::Person } else { Self::Nobody }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHO WAITS DECIDES THE ROW (rulings 220, 224): a person's work always
+    /// takes its row; nobody's only while it is very heavy.
+    #[test]
+    fn who_waits_decides_the_row() {
+        assert!(Waiter::Person.takes_row(false));
+        assert!(Waiter::Person.takes_row(true));
+        assert!(
+            !Waiter::Nobody.takes_row(false),
+            "silent, a record at its end"
+        );
+        assert!(
+            Waiter::Nobody.takes_row(true),
+            "very heavy use is explained"
+        );
+        assert_eq!(Waiter::of(true), Waiter::Person);
+        assert_eq!(Waiter::of(false), Waiter::Nobody);
+    }
 
     fn t0() -> Instant {
         Instant::now()
@@ -671,30 +762,32 @@ mod tests {
         for (s, want) in [
             (1, "<5 s left"),
             (4, "<5 s left"),
-            (5, "~5 s left"),
-            (6, "~10 s left"),
-            (35, "~35 s left"),
-            (55, "~55 s left"),
-            (56, "~1 min left"),
-            (89, "~1 min left"),
-            (90, "~2 min left"),
-            (170, "~3 min left"),
-            (3569, "~59 min left"),
-            (3570, "~1 h left"),
-            (86_400, "~24 h left"),
+            (5, "5 s left"),
+            (6, "10 s left"),
+            (35, "35 s left"),
+            (55, "55 s left"),
+            (56, "1 min left"),
+            (89, "1 min left"),
+            (90, "2 min left"),
+            (170, "3 min left"),
+            (3569, "59 min left"),
+            (3570, "1 h left"),
+            (86_400, "24 h left"),
         ] {
             assert_eq!(w(s).as_deref(), Some(want), "{s} s");
         }
         assert_eq!(w(86_401), None, "past a day");
         assert_eq!(
             eta_words(Duration::from_millis(5_001)).as_deref(),
-            Some("~10 s left"),
+            Some("10 s left"),
             "whole seconds rounded up"
         );
         for s in 0..90_000u64 {
             let words = w(s);
             assert!(
-                words.as_deref().is_none_or(|x| !x.starts_with("~0")),
+                words
+                    .as_deref()
+                    .is_none_or(|x| !x.starts_with('0') && !x.contains('~')),
                 "{s}: {words:?}"
             );
             if let Some(x) = words {
@@ -724,11 +817,13 @@ mod tests {
             );
         }
         for e in [10u64, 28, 59, 60, 599, 3599, 3600, 36_000] {
-            let clock = elapsed_words(Duration::from_secs(e)).unwrap();
-            assert!(
-                !clock.contains("left") && !clock.starts_with('~'),
-                "the elapsed clock is not an ETA: {clock:?}"
-            );
+            for short in [false, true] {
+                let ran = elapsed_words(Duration::from_secs(e), short).unwrap();
+                assert!(
+                    !ran.contains("left") && ran.starts_with("for "),
+                    "the elapsed time is not an ETA: {ran:?}"
+                );
+            }
         }
         assert_eq!(
             eta_spoken(Eta::Remaining(Duration::from_millis(2_500))).as_deref(),
@@ -780,7 +875,7 @@ mod tests {
     /// Bytes that stop for STALL_AFTER read "stalled" — only once they have
     /// moved at all, and never for a count of items.
     #[test]
-    fn stalled_after_ten_seconds_of_no_bytes_and_never_for_items() {
+    fn stalled_after_ten_seconds_of_no_bytes_and_a_counts_own_patience() {
         let base = t0();
         let mut t = ProgressTrack::default();
         t.observe(base, bytes(0, 1000));
@@ -805,16 +900,80 @@ mod tests {
                 },
             );
         }
+        // A COUNT may sit still for its own patience (ruling 265): four of
+        // its mean gaps (here 1 s each), never under the bytes' ten
+        // seconds — and then it says so.
         assert_eq!(
-            items.eta(at(base, 3_600_000)),
+            items.eta(at(base, 4_000 + 9_999)),
             Eta::Hidden,
             "items may sit still"
         );
+        assert_eq!(items.eta(at(base, 4_000 + 10_000)), Eta::Stalled);
+        assert_eq!(
+            items.stall_onset(at(base, 4_000)),
+            Some(at(base, 14_000)),
+            "the onset is a deadline"
+        );
+        // A slow count's patience is its own pace: one item every 5 s
+        // stalls 20 s after the last.
+        let mut slow = ProgressTrack::default();
+        for k in 0..5u64 {
+            slow.observe(
+                at(base, k * 5000),
+                Amount {
+                    unit: Unit::Steps,
+                    ..bytes(k, 100)
+                },
+            );
+        }
+        assert_eq!(slow.eta(at(base, 20_000 + 19_999)), Eta::Hidden);
+        assert_eq!(slow.eta(at(base, 20_000 + 20_000)), Eta::Stalled);
         // Done is done.
         let mut done = ProgressTrack::default();
         done.observe(base, bytes(1000, 1000));
         assert_eq!(done.eta(at(base, 60_000)), Eta::Hidden);
         assert_eq!(done.next_change(base), None);
+    }
+
+    /// A PHASE THAT HOLDS THE FILL IS NOT A STALL (ruling 266): the ALab
+    /// toolchain's fill advanced at 10 Hz through a download, then holds at
+    /// its program's 500‰ share through a minute of verify. Declared
+    /// [`Unit::HeldSteps`] it never reads stalled and arms no deadline; the
+    /// estimator keeps its readings across the switch; and when the phase
+    /// ends the count's patience starts over — a count that then really
+    /// stops still says so.
+    #[test]
+    fn a_held_phase_never_reads_stalled_and_its_end_restarts_the_patience() {
+        let base = t0();
+        let steps = |done: u64, unit: Unit| Amount {
+            unit,
+            ..bytes(done, 1000)
+        };
+        let mut t = ProgressTrack::default();
+        for k in 0..=50u64 {
+            t.observe(at(base, k * 100), steps(k * 10, Unit::Steps));
+        }
+        let samples = t.samples.len();
+        // Verify: the fill holds at 500‰ for a minute, atpkg's heartbeat
+        // re-feeding it every 2 s.
+        for k in 0..=30u64 {
+            let now = at(base, 5_000 + k * 2_000);
+            t.observe(now, steps(500, Unit::HeldSteps));
+            assert_ne!(t.eta(now), Eta::Stalled, "held at {k}");
+            assert_eq!(t.stall_onset(now), None, "no deadline while held");
+        }
+        assert!(t.samples.len() > samples, "the same series: readings kept");
+        // Extract begins at the same share: not stalled on its first frame…
+        let resumed = at(base, 66_000);
+        t.observe(resumed, steps(500, Unit::Steps));
+        assert_ne!(t.eta(resumed), Eta::Stalled);
+        assert!(
+            t.stall_onset(resumed)
+                .is_some_and(|onset| onset >= at(base, 66_000 + 10_000)),
+            "the patience starts at the phase's end"
+        );
+        // …and a count that then really stops still says so.
+        assert_eq!(t.eta(at(base, 66_000 + 60_000)), Eta::Stalled);
     }
 
     /// A new series, a new unit or a regression starts over; a new total
@@ -882,23 +1041,36 @@ mod tests {
         assert!(burst.samples_len() <= SAMPLES_CAP);
     }
 
-    /// Elapsed words: nothing under ten seconds, then a clock to the second
-    /// for an hour, to the minute for nine more, then hours — changing
-    /// exactly at each boundary.
+    /// Elapsed words (design ruling 241): nothing under ten seconds, then
+    /// `for N s`, `for N min`, `for N h` — never a bare clock — changing
+    /// exactly at each boundary, the short form at the same instants.
     #[test]
-    fn elapsed_words_follow_the_presence_cadence() {
-        let w = |s: u64| elapsed_words(Duration::from_secs(s));
+    fn elapsed_words_are_labelled_and_follow_their_cadence() {
+        let w = |s: u64| elapsed_words(Duration::from_secs(s), false);
+        let short = |s: u64| elapsed_words(Duration::from_secs(s), true);
         assert_eq!(w(9), None);
-        assert_eq!(w(10).as_deref(), Some("0:10"));
-        assert_eq!(w(28).as_deref(), Some("0:28"));
-        assert_eq!(w(59).as_deref(), Some("0:59"));
-        assert_eq!(w(60).as_deref(), Some("1:00"));
-        assert_eq!(w(754).as_deref(), Some("12:34"));
-        assert_eq!(w(3599).as_deref(), Some("59:59"));
-        assert_eq!(w(3600).as_deref(), Some("1:00 h"));
-        assert_eq!(w(3720).as_deref(), Some("1:02 h"));
-        assert_eq!(w(35_999).as_deref(), Some("9:59 h"));
-        assert_eq!(w(36_000).as_deref(), Some("10 h"));
+        assert_eq!(short(9), None);
+        for (s, long, sh) in [
+            (10, "for 10 s", "for 10s"),
+            (41, "for 41 s", "for 41s"),
+            (59, "for 59 s", "for 59s"),
+            (60, "for 1 min", "for 1m"),
+            (199, "for 3 min", "for 3m"),
+            (3599, "for 59 min", "for 59m"),
+            (3600, "for 1 h", "for 1h"),
+            (35_999, "for 9 h", "for 9h"),
+            (36_000, "for 10 h", "for 10h"),
+            (99_999_999, "for 999 h", "for 999h"),
+        ] {
+            assert_eq!(w(s).as_deref(), Some(long), "{s}");
+            assert_eq!(short(s).as_deref(), Some(sh), "{s}");
+        }
+        let clock = |x: &str| {
+            let mut parts = x.split(':');
+            matches!((parts.next(), parts.next(), parts.next()),
+                (Some(a), Some(b), None) if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit())
+                    && b.len() == 2 && b.chars().all(|c| c.is_ascii_digit()))
+        };
         for e_ms in (0..=7_300_000u64)
             .step_by(250)
             .chain((35_000_000..=37_000_000u64).step_by(5_000))
@@ -906,14 +1078,25 @@ mod tests {
             let e = Duration::from_millis(e_ms);
             let d = elapsed_word_change(e);
             assert!(d > Duration::ZERO, "{e_ms}");
-            assert_ne!(elapsed_words(e + d), elapsed_words(e), "{e_ms}: changes at");
-            assert_eq!(
-                elapsed_words(e + d - Duration::from_millis(1)),
-                elapsed_words(e),
-                "{e_ms}: holds until"
-            );
-            if let Some(words) = elapsed_words(e) {
+            for sh in [false, true] {
+                assert_ne!(
+                    elapsed_words(e + d, sh),
+                    elapsed_words(e, sh),
+                    "{e_ms}: changes at"
+                );
+                assert_eq!(
+                    elapsed_words(e + d - Duration::from_millis(1), sh),
+                    elapsed_words(e, sh),
+                    "{e_ms}: holds until"
+                );
+            }
+            if let Some(words) = elapsed_words(e, false) {
                 assert!(words.chars().count() <= crate::ELAPSED_W, "{words}");
+                assert!(!clock(&words), "{words}");
+            }
+            if let Some(words) = elapsed_words(e, true) {
+                assert!(words.chars().count() <= crate::ELAPSED_SHORT_W, "{words}");
+                assert!(!clock(&words), "{words}");
             }
         }
         assert_eq!(
@@ -921,24 +1104,6 @@ mod tests {
             Some("running for 3 minutes")
         );
         assert_eq!(elapsed_spoken(Duration::from_secs(3)), None);
-        // The floorless clock a hidden estimate leaves in the ETA slot: from
-        // `0:00`, changing exactly where its change says, never wider than
-        // the SHORT ETA slot, and never a remaining time's `left`.
-        assert_eq!(clock_words(Duration::ZERO), "0:00");
-        assert_eq!(clock_words(Duration::from_millis(12_400)), "0:12");
-        for e_ms in (0..=7_300_000u64).step_by(250) {
-            let e = Duration::from_millis(e_ms);
-            let d = clock_word_change(e);
-            assert_ne!(clock_words(e + d), clock_words(e), "{e_ms}: changes at");
-            assert_eq!(
-                clock_words(e + d - Duration::from_millis(1)),
-                clock_words(e),
-                "{e_ms}: holds until"
-            );
-            let words = clock_words(e);
-            assert!(words.chars().count() <= crate::ETA_SHORT_W, "{words}");
-            assert!(!words.ends_with("left"), "{words}");
-        }
         assert_eq!(clock_spoken(Duration::from_millis(900)), None);
         assert_eq!(
             clock_spoken(Duration::from_secs(4)).as_deref(),

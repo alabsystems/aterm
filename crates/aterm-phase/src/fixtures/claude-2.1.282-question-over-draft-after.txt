@@ -1,0 +1,51 @@
+# claude-code 2.1.282 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm 0.93.0 (80x50) · R5 live, 2.2 s later: the question answered by the harness with one Enter (`Dark (Recommended)`), the turn ended, and the draft `draft` still in the composer, not submitted, under a build of main at 3c61e7765 · user and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /…/00000000-0000-0000-0000-000000000000/scratchpad/e2e/work · /rc
+
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this
+  input (copy every string verbatim, change nothing, add nothing):
+  {"questions": [{"question": "How should the primary button look on a row that
+  carries a live progress meter while a paste is running?", "header":
+  "Button", "multiSelect": false, "options": [{"label": "Keep the outlined
+  accent button on every row that carries a live progress meter (Recommended)",
+  "description": "An accent ring with no solid fill, so the meter is the only
+  solid accent on the row and 0-100% reads cleanly."}, {"label": "Solid
+  everywhere", "description": "Keep today's solid accent button on every row,
+  including over a progress bar."}, {"label": "Hide the button", "description":
+  "Show no button while the meter runs."}]}]}  After the tool returns, reply
+  with only the word DONE.
+
+⏺ User answered Claude's questions:
+  ⎿  · How should the primary button look on a row that carries a live progress
+     meter while a paste is running? → Keep the outlined accent button on every
+     row that carries a live progress meter (Recommended)
+
+⏺ DONE
+
+✻ Cogitated for 4s · done 3:48 PM
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this
+  input (copy every string verbatim, change nothing, add nothing):
+  {"questions": [{"question": "Which color scheme should the demo page use?",
+  "header": "Colors", "multiSelect": false, "options": [{"label": "Dark
+  (Recommended)", "description": "A dark background with light text, matching
+  the terminal."}, {"label": "Light", "description": "A light background with
+  dark text."}, {"label": "High contrast", "description": "Maximum contrast for
+  accessibility."}]}]}  After the tool returns, reply with only the word DONE.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which color scheme should the demo page use? → Dark (Recommended)
+
+⏺ DONE
+
+✻ Baked for 2s · done 3:48 PM
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+❯ draft
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

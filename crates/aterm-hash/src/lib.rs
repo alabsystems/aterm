@@ -54,12 +54,6 @@ pub struct FxHasher {
 }
 
 impl FxHasher {
-    /// Creates an `FxHasher` with a given seed.
-    #[must_use]
-    pub const fn with_seed(seed: usize) -> FxHasher {
-        FxHasher { hash: seed }
-    }
-
     #[inline]
     fn add_to_hash(&mut self, i: usize) {
         self.hash = self.hash.wrapping_add(i).wrapping_mul(K);
@@ -440,26 +434,6 @@ mod tests {
             HashBytes(b"uwu") => if B32 { 2699662140 } else { 7168164714682931527 },
             HashBytes(b"These are some bytes for testing rustc_hash.") =>
                 if B32 { 2303640537 } else { 2349210501944688211 },
-        }
-    }
-
-    #[test]
-    fn test_fxhasher_with_seed_produces_different_hashes() {
-        let seeds = [
-            [1, 2],
-            [42, 17],
-            [124436707, 99237],
-            [usize::MIN, usize::MAX],
-        ];
-
-        for [a_seed, b_seed] in seeds {
-            for x in u8::MIN..=u8::MAX {
-                let mut a = FxHasher::with_seed(a_seed);
-                let mut b = FxHasher::with_seed(b_seed);
-                x.hash(&mut a);
-                x.hash(&mut b);
-                assert_ne!(a.finish(), b.finish());
-            }
         }
     }
 

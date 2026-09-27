@@ -12,9 +12,10 @@
 //!
 //! Ported from the retired shell pipeline: `changelog_real_body` and the roll
 //! awk from `tools/prepare-release.sh`, the section/trim extraction from
-//! `tools/extract-changelog.sh`. The integration tests keep the original awk
-//! programs as an oracle and prove line-for-line parity, real CHANGELOG.md
-//! included.
+//! `tools/extract-changelog.sh`. The awk oracle retired with the scripts;
+//! `tests/changelog.rs` pins, as goldens taken from the port, the behaviour it
+//! kept on purpose — comment, scaffold and blank stripping over `[Unreleased]`
+//! and over a dated section (the recut gate), and the roll's bytes.
 
 use std::process::Command;
 
@@ -42,8 +43,8 @@ pub struct GateSummary {
 /// Line-for-line port of `changelog_real_body` (tools/prepare-release.sh) —
 /// including the awk's LEFTMOST-LONGEST `<!--.*-->` match, which strips from
 /// the FIRST `<!--` to the LAST `-->` of a line (so `a <!-- x --> b <!-- y
-/// --> c` yields `a  c`, not `a  b  c`). The tests hold this function to the
-/// original awk as an oracle; do not "fix" that greediness.
+/// --> c` yields `a  c`, not `a  b  c`). `tests/changelog.rs` pins that
+/// greediness as a golden; do not "fix" it.
 pub fn real_body(text: &str, section: &str) -> Vec<String> {
     let header = format!("## [{section}]");
     let mut in_section = false;
@@ -178,8 +179,8 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
 /// heading is inserted right below the Unreleased header with one blank line
 /// between — the whole current body changes ownership to the release and a
 /// fresh EMPTY `[Unreleased]` scaffold is what remains on top. Exact
-/// behavioral port of prepare-release.sh's roll awk (the tests hold it to
-/// that oracle), so historical rolls and this one are byte-compatible.
+/// behavioral port of prepare-release.sh's roll awk (`tests/changelog.rs`
+/// pins its bytes), so historical rolls and this one are byte-compatible.
 ///
 /// `date` is `YYYY-MM-DD` — pass [`today_la`] for a real cut; injected so
 /// tests are deterministic.

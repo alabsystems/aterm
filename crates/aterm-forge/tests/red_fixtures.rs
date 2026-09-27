@@ -5,7 +5,7 @@
 //!
 //! `crates/xtask/src/gate.rs`'s `NON_VACUITY_REGISTRY` requires every roster
 //! gate to name a real test that PLANTS A VIOLATION and asserts the gate goes
-//! RED. These four do exactly that, and each one drives the VERB —
+//! RED. These five do exactly that, and each one drives the VERB —
 //! [`aterm_forge::check::check_report`], the symbol the roster calls — not a
 //! helper inside it. A fixture that exercises a component and is scored as
 //! proof of the verb is the specific over-claim that registry exists to stop.
@@ -18,7 +18,8 @@
 //! `crates/aterm-gpu-web`, so that all FIVE cells have something to resolve, a
 //! REAL copy of `vendor/indexmap` so the provenance obligations have real
 //! provenance files to find, the repository's own `deny.toml`, a `NOTICE`
-//! naming exactly the forks present, and a generated `Cargo.lock`.
+//! naming exactly the forks present, a `vendor/forge.toml` fork ledger
+//! recording them over the measured matrix, and a generated `Cargo.lock`.
 //!
 //! THE WEB MODULES ARE NOT DECORATION. The matrix roots its two `wasm32` cells
 //! at `aterm-wasm` and `aterm-gpu-web`, because `aterm` is a `[[bin]]` nothing
@@ -64,8 +65,8 @@ struct Fixture {
 
 impl Fixture {
     /// The GREEN baseline: one reviewed, fully-provenanced fork (`indexmap`),
-    /// live in every cell, named in NOTICE, with no carve ledger and no
-    /// ratchet file yet.
+    /// live in every cell, named in NOTICE and in the fork ledger, with no
+    /// carve rows and no ratchet file yet.
     fn baseline(name: &str) -> Self {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("forge-red-{name}"));
         let _ = std::fs::remove_dir_all(&root);
@@ -128,6 +129,7 @@ impl Fixture {
             );
         }
         fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
+        fx.write_ledger("");
 
         // See the module docs: without its own repository, this fixture lives
         // inside the aterm checkout's ignored `target/` and attest's [OB-10]
@@ -181,6 +183,39 @@ impl Fixture {
             ));
         }
         self.write("NOTICE", &text);
+    }
+
+    /// The fork ledger `[OB-17]` holds to the tree: the measured cell matrix,
+    /// one block for `indexmap`, then `extra` (more blocks, or carve rows).
+    fn write_ledger(&self, extra: &str) {
+        let mut text = format!(
+            "[forge]\n\
+             loc_method = \"{}\"\n\
+             graph_method = \"{}\"\n\
+             cells = [\n",
+            aterm_forge::policy::LOC_METHOD,
+            aterm_forge::policy::GRAPH_METHOD
+        );
+        for c in aterm_forge::resolve::default_cells() {
+            text.push_str(&format!(
+                "    {{ name = \"{}\", triple = \"{}\", package = \"{}\" }},\n",
+                c.name, c.triple, c.package
+            ));
+        }
+        text.push_str(
+            "]\n\
+             \n\
+             [[fork]]\n\
+             name = \"indexmap\"\n\
+             version = \"2.14.0\"\n\
+             path = \"vendor/indexmap\"\n\
+             license = \"Apache-2.0 OR MIT\"\n\
+             census.mode = \"scanned\"\n\
+             census.namespace = \"indexmap\"\n\
+             \n",
+        );
+        text.push_str(extra);
+        self.write("vendor/forge.toml", &text);
     }
 
     /// Re-resolve after a manifest edit. `check` resolves with `--locked`, so a
@@ -274,8 +309,7 @@ fn copy_tree(from: &Path, to: &Path) {
 fn a_reinstated_carved_module_reds_the_forge_verb() {
     let fx = Fixture::baseline("carve-ledger");
     fx.remove("vendor/indexmap/src/rayon");
-    fx.write(
-        "vendor/forge.toml",
+    fx.write_ledger(
         "# The carve ledger: paths this repository has deleted and undertakes to\n\
          # keep deleted.\n\
          [[carved]]\n\
@@ -354,6 +388,15 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
         ("indexmap", "2.14.0", "Apache-2.0 OR MIT"),
         ("forge_fixture_fork", "0.1.0", "MIT"),
     ]);
+    fx.write_ledger(
+        "[[fork]]\n\
+         name = \"forge_fixture_fork\"\n\
+         version = \"0.1.0\"\n\
+         path = \"vendor/forge_fixture_fork\"\n\
+         license = \"MIT\"\n\
+         census.mode = \"scanned\"\n\
+         census.namespace = \"forge_fixture_fork\"\n",
+    );
     fx.write(
         "Cargo.toml",
         "[workspace]\n\
@@ -433,6 +476,93 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
     let (ok, log) = check_report(fx.root());
     assert!(ok, "restoring the NOTICE line must restore GREEN:\n{log}");
+}
+
+/// `[OB-17]` — the fork ledger. A `[forge] cells` row forge does not measure
+/// is the edit a judge made on 2026-09-17 (`TOTALLY-BOGUS` /
+/// `sparc64-unknown-none`) that left this verb GREEN while only a unit test
+/// read the ledger; a `[[fork]]` block describing another copy is its twin.
+#[test]
+fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
+    let fx = Fixture::baseline("fork-ledger");
+
+    let (ok, log) = check_report(fx.root());
+    assert!(
+        ok,
+        "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
+    );
+
+    // Plant the violation: a header row nothing measures.
+    let good = std::fs::read_to_string(fx.path("vendor/forge.toml")).expect("ledger");
+    fx.write(
+        "vendor/forge.toml",
+        &good.replacen(
+            "cells = [\n",
+            "cells = [\n    { name = \"TOTALLY-BOGUS\", triple = \"sparc64-unknown-none\", \
+             package = \"does-not-exist\" },\n",
+            1,
+        ),
+    );
+    let (ok, log) = check_report(fx.root());
+    assert!(
+        !ok,
+        "a ledger row forge does not measure must turn the forge verb RED:\n{log}"
+    );
+    assert!(
+        log.contains("[OB-17]") && log.contains("TOTALLY-BOGUS"),
+        "the RED must be the fork-ledger obligation, naming the row:\n{log}"
+    );
+
+    // Its twin: a fork block recording a version the tree does not carry.
+    fx.write(
+        "vendor/forge.toml",
+        &good.replace("version = \"2.14.0\"", "version = \"2.13.0\""),
+    );
+    let (ok, log) = check_report(fx.root());
+    assert!(
+        !ok,
+        "a fork block describing another copy must turn the forge verb RED:\n{log}"
+    );
+    assert!(
+        log.contains("[OB-17]") && log.contains("[[fork]] indexmap"),
+        "the RED must name the fork block:\n{log}"
+    );
+
+    // And the two fields the manifest does not carry: a §4(b) flag the license
+    // does not owe (indexmap is `Apache-2.0 OR MIT`), and a census namespace
+    // REVIEWED_VENDORED_CRATES does not give it.
+    for (planted, names) in [
+        (
+            good.replace(
+                "license = \"Apache-2.0 OR MIT\"\n",
+                "license = \"Apache-2.0 OR MIT\"\napache_notice = true\n",
+            ),
+            "apache_notice = true",
+        ),
+        (
+            good.replace(
+                "census.namespace = \"indexmap\"",
+                "census.namespace = \"not-indexmap\"",
+            ),
+            "not-indexmap",
+        ),
+    ] {
+        assert_ne!(planted, good, "the plant must change the ledger");
+        fx.write("vendor/forge.toml", &planted);
+        let (ok, log) = check_report(fx.root());
+        assert!(
+            !ok,
+            "a fork block that misstates `{names}` must turn the forge verb RED:\n{log}"
+        );
+        assert!(
+            log.contains("[OB-17]") && log.contains(names),
+            "the RED must be [OB-17], naming `{names}`:\n{log}"
+        );
+    }
+
+    fx.write("vendor/forge.toml", &good);
+    let (ok, log) = check_report(fx.root());
+    assert!(ok, "restoring the ledger must restore GREEN:\n{log}");
 }
 
 /// `[OB-12]` — patch liveness, the obligation that justifies this gate. A

@@ -44,11 +44,10 @@
 //! ADDITIONALLY by the external `ty trace validate` wherever the Trust
 //! toolchain is installed. The tiers must agree; disagreement panics.
 
-use aterm_buffer::{Edit, Surface, SurfaceId, WriteCap};
+use aterm_buffer::{Edit, Surface, WriteCap};
 use aterm_spec::derive::ring_model;
 use aterm_spec::verify;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 
 /// The bounded ring's real cap (mirrors `aterm_buffer::MAX_LOG_EVENTS = 1<<16`).
 /// The conformance spec MUST use the SAME cap the code uses, or eviction (which
@@ -97,7 +96,7 @@ fn validate_transition(prev: (u64, u64), next: (u64, u64)) -> (bool, String) {
 /// Drive the real `Surface`/`EventLog` `n` appends and capture projected states
 /// `[(seq, lo); n+1]` (index 0 is the initial empty state).
 fn drive_real_eventlog(n: u64) -> Vec<(u64, u64)> {
-    let mut surface = Surface::new(SurfaceId(NonZeroU64::new(1).unwrap()));
+    let mut surface = Surface::new();
     let mut states = vec![project(&surface)];
     for i in 0..n {
         surface.apply(&WriteCap, Edit::AppendLine(format!("line {i}")));

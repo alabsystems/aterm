@@ -70,6 +70,16 @@ impl Flock {
         Ok(Self(file))
     }
 
+    /// Take `file`'s SHARED lock without blocking: granted beside other shared holders,
+    /// refused while an exclusive one holds it (the vendor head watch's host claim,
+    /// [`crate::vendor_direct::watch::Host`]).
+    pub(crate) fn try_lock_shared(file: File) -> Result<Self, std::fs::TryLockError> {
+        // The census's File evidence, as in `try_lock`.
+        let file: std::fs::File = file;
+        file.try_lock_shared()?;
+        Ok(Self(file))
+    }
+
     /// Take `file`'s exclusive lock, re-trying every [`LOCK_POLL`] for up to `limit`:
     /// `TimedOut` naming `what` once it was not granted in time. Never a blocking `flock`.
     pub(crate) fn lock_within(file: File, limit: Duration, what: &Path) -> io::Result<Self> {
@@ -1288,7 +1298,9 @@ mod tests {
     /// ledger put a real `#[cfg(test)] fn reset()` seam into production code
     /// (2026-09-11) the same split cut the scan to the file's first half, 47 of its
     /// 88 literal sites, with both relayed sites among the unscanned. A truncated
-    /// scan passes for the wrong reason, which is the defect it exists to catch.
+    /// scan passes for the wrong reason, which is the defect it exists to catch. So the
+    /// anchor is the gate together with the `mod tests {` line it gates: that seam now
+    /// carries the module's own `#[cfg(all(test, unix))]` (2026-09-25).
     #[test]
     fn contention_exit_code_is_temp_fail_and_unshared() {
         assert_eq!(CONTENDED_EXIT, 75);
@@ -1297,8 +1309,16 @@ mod tests {
         let mut literal_sites = 0usize;
         let mut relayed = std::collections::BTreeSet::new();
         for (file, src, gate) in [
-            ("cli.rs", include_str!("cli.rs"), "#[cfg(all(test, unix))]"),
-            ("reroute.rs", include_str!("reroute.rs"), "#[cfg(test)]"),
+            (
+                "cli.rs",
+                include_str!("cli.rs"),
+                "#[cfg(all(test, unix))]\nmod tests {",
+            ),
+            (
+                "reroute.rs",
+                include_str!("reroute.rs"),
+                "#[cfg(test)]\nmod tests {",
+            ),
         ] {
             let (production, _) = src
                 .split_once(gate)
@@ -1365,12 +1385,12 @@ mod tests {
         // truncated it and holds the last verb; the scan found more than the
         // truncated half's 47 + 4 sites; both relayed verbs were followed.
         let cli_half = include_str!("cli.rs")
-            .split_once("#[cfg(all(test, unix))]")
+            .split_once("#[cfg(all(test, unix))]\nmod tests {")
             .map(|(p, _)| p)
             .expect("split above");
         assert!(
             cli_half.contains("pub(crate) fn reset()") && cli_half.contains("fn cmd_seed("),
-            "the ledger's `#[cfg(test)] fn reset()` seam and `cmd_seed` are inside the half"
+            "the ledger's test-only `fn reset()` seam and `cmd_seed` are inside the half"
         );
         assert!(
             literal_sites > 51 && [1u8, 2, 3, 127].iter().all(|c| in_use.contains(c)),

@@ -20,22 +20,13 @@
 //! ```
 //!
 
-#[cfg_attr(feature = "safe-encode", forbid(unsafe_code))]
 pub(crate) mod compress;
 pub(crate) mod hashtable;
 
 // The upstream raw-pointer decoder (`decompress.rs`) was never compiled here:
-// every consumer keeps the default `safe-decode`, so it was deleted rather
-// than carried as untested unsafe code. The bounds-checked decoder is the
-// only one, and turning `safe-decode` off is refused at compile time below.
-#[cfg(not(feature = "safe-decode"))]
-compile_error!(
-    "aterm-lz4 carries only the bounds-checked decoder; the `safe-decode` feature is required"
-);
-#[cfg(feature = "safe-decode")]
-#[forbid(unsafe_code)]
+// every consumer built the bounds-checked one, so it was deleted rather than
+// carried as untested unsafe code.
 pub(crate) mod decompress_safe;
-#[cfg(feature = "safe-decode")]
 pub(crate) use decompress_safe as decompress;
 
 pub use compress::*;
@@ -74,18 +65,8 @@ const LZ4_MIN_LENGTH: usize = MFLIMIT + 1;
 const MAXD_LOG: usize = 16;
 const MAX_DISTANCE: usize = (1 << MAXD_LOG) - 1;
 
-#[allow(dead_code)]
-const MATCH_LENGTH_MASK: u32 = (1_u32 << 4) - 1; // 0b1111 / 15
-
 /// The minimum length of a duplicate
 const MINMATCH: usize = 4;
-
-#[allow(dead_code)]
-const FASTLOOP_SAFE_DISTANCE: usize = 64;
-
-/// Switch for the hashtable size byU16
-#[allow(dead_code)]
-static LZ4_64KLIMIT: usize = (64 * 1024) + (MFLIMIT - 1);
 
 /// An error representing invalid compressed data.
 #[derive(Debug)]

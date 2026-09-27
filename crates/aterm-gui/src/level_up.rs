@@ -91,6 +91,7 @@ pub(crate) struct LevelUp {
 
 impl LevelUp {
     /// Begin the rim for `build` at `now`.
+    #[cfg(any(unix, test))]
     pub(crate) fn charging(build: u64, now: Instant, motion: f32) -> Self {
         Self {
             build,

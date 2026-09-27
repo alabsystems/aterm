@@ -7,10 +7,7 @@
 //!
 //! * [`apply_limits`] (the [`crate::Limits::apply`] body): a documented,
 //!   capability-gated NO-OP. POSIX rlimits do not exist here and there is no
-//!   per-process `setrlimit` seam to run before exec (Windows has no `fork`), so
-//!   [`crate::rlimits_actuated`] returns `false` and launchers print the one-line
-//!   posture notice — an unlimited child is never silent (house rule: never
-//!   overstate the security posture).
+//!   per-process `setrlimit` seam to run before exec (Windows has no `fork`).
 //! * [`apply_to_job`] (the [`crate::Limits::apply_to_job`] body): the REAL Job
 //!   Object confinement lane. Given the Job Object the ConPTY spawn seam already
 //!   creates (`aterm-pty`), it folds the requested resource limits (memory, CPU

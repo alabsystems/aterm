@@ -32,9 +32,10 @@ const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const BG: u32 = 0x0011_1318; // Theme::default().bg
 
 // Layout-independent ligature font discovery (same as tests/ligatures.rs):
-// $ATERM_FONT if set, else the committed JetBrains Mono fixture. None -> SKIP.
+// $ATERM_LIGATURE_TEST_FONT if set, else the committed JetBrains Mono fixture.
+// None -> SKIP.
 fn ligature_test_font() -> Option<Vec<u8>> {
-    if let Ok(path) = std::env::var("ATERM_FONT")
+    if let Ok(path) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         && let Ok(bytes) = std::fs::read(&path)
     {
         return Some(bytes);
@@ -120,7 +121,9 @@ fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
 #[test]
 fn cursor_touches_only_its_rect_all_columns_and_styles() {
     let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let (cw, ch) = r.cell_size();
@@ -181,7 +184,9 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
 #[test]
 fn block_on_ligature_tail_leaves_lead_cell_identical() {
     let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let (cw, ch) = r.cell_size();
@@ -220,7 +225,9 @@ fn block_on_ligature_tail_leaves_lead_cell_identical() {
 #[test]
 fn block_on_ligature_lead_recolors_covering_slice() {
     let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let (cw, ch) = r.cell_size();
@@ -258,7 +265,9 @@ fn block_on_ligature_lead_recolors_covering_slice() {
 #[test]
 fn block_on_wide_lead_inverts_both_cells() {
     let Some(mut r) = renderer() else {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     };
     let (cw, ch) = r.cell_size();

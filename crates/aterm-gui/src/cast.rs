@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 /// Default byte budget for the retained event payloads: a flood cannot balloon
 /// RAM past this, and an idle terminal costs nothing (no events ⇒ no bytes).
-pub const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// One recorded asciicast v2 event: program output (`"o"`) or a resize (`"r"`).
 /// `Clone` is an `Arc` refcount bump for `Output` (no byte copy) + a few bytes
@@ -78,7 +78,7 @@ impl Event {
 /// with [`record_output`](Self::record_output) and geometry changes with
 /// [`record_resize`](Self::record_resize); render with
 /// [`to_asciicast`](Self::to_asciicast).
-pub struct CastRecorder {
+pub(crate) struct CastRecorder {
     /// asciicast v2 header width (cols), snapshotted at construction.
     width: u16,
     /// asciicast v2 header height (rows), snapshotted at construction.
@@ -111,12 +111,12 @@ pub struct CastRecorder {
 
 impl CastRecorder {
     /// A recorder for a `cols`×`rows` grid with the default 4 MiB budget.
-    pub fn new(cols: u16, rows: u16) -> Self {
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
         Self::with_budget(cols, rows, DEFAULT_BUDGET_BYTES)
     }
 
     /// A recorder with an explicit retained-payload byte budget (≥ 1).
-    pub fn with_budget(cols: u16, rows: u16, budget: usize) -> Self {
+    pub(crate) fn with_budget(cols: u16, rows: u16, budget: usize) -> Self {
         Self {
             width: cols,
             height: rows,
@@ -134,7 +134,7 @@ impl CastRecorder {
     /// its construction epoch). Both taps call this so a resize event recorded on
     /// the main thread and an output event recorded on the reader thread share
     /// one consistent, monotonic-able timeline.
-    pub fn now(&self) -> Duration {
+    pub(crate) fn now(&self) -> Duration {
         self.epoch.elapsed()
     }
 
@@ -166,7 +166,8 @@ impl CastRecorder {
     /// never the terminal's own query replies (`take_response()`). Thin borrowing
     /// wrapper over [`record_output_shared`](Self::record_output_shared) for
     /// callers that don't already hold the shared burst (tests, small payloads).
-    pub fn record_output(&mut self, t: Duration, bytes: &[u8]) {
+    #[cfg(test)]
+    pub(crate) fn record_output(&mut self, t: Duration, bytes: &[u8]) {
         self.record_output_shared(t, Arc::from(bytes));
     }
 
@@ -175,7 +176,7 @@ impl CastRecorder {
     /// complete character — retains the Arc DIRECTLY (one refcount bump, zero
     /// copy); only the rare UTF-8 reassembly path (a multibyte sequence split
     /// across reads) still builds a fresh buffer. Byte-identical output either way.
-    pub fn record_output_shared(&mut self, t: Duration, bytes: Arc<[u8]>) {
+    pub(crate) fn record_output_shared(&mut self, t: Duration, bytes: Arc<[u8]>) {
         let t = self.monotonic(t);
         // Fast path REQUIRES both checks: an empty `pending` (nothing carried to
         // prepend) AND a complete tail (nothing to peel off) — otherwise a split
@@ -203,20 +204,22 @@ impl CastRecorder {
     }
 
     /// Record a geometry change (`[t, "r", "<cols>x<rows>"]`) at relative `t`.
-    pub fn record_resize(&mut self, t: Duration, cols: u16, rows: u16) {
+    pub(crate) fn record_resize(&mut self, t: Duration, cols: u16, rows: u16) {
         let t = self.monotonic(t);
         self.push(Event::Resize { t, cols, rows });
     }
 
-    /// Number of recorded events (output + resize), for tests/introspection.
-    pub fn event_count(&self) -> usize {
+    /// Number of recorded events (output + resize), for tests.
+    #[cfg(test)]
+    pub(crate) fn event_count(&self) -> usize {
         self.events.len()
     }
 
     /// Count of drop-oldest evictions so far (0 ⇒ the recording is complete from
     /// t0; > 0 ⇒ the head was truncated and `to_asciicast` discloses it).
     #[must_use]
-    pub fn evicted(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn evicted(&self) -> u64 {
         self.evicted
     }
 
@@ -227,7 +230,7 @@ impl CastRecorder {
     /// [`CastSnapshot::fold_frames`]). Folding under the lock would stall the
     /// reader's cast writer thread, which contends this same lock per output burst.
     #[must_use]
-    pub fn snapshot(&self) -> CastSnapshot {
+    pub(crate) fn snapshot(&self) -> CastSnapshot {
         CastSnapshot {
             width: self.width,
             height: self.height,
@@ -246,7 +249,7 @@ impl CastRecorder {
     /// `to_asciicast` is idempotent and never invents a phantom U+FFFD. A live
     /// consumer that needs every byte the instant it lands uses the byte-exact
     /// `subscribe … bytes` channel instead.
-    pub fn to_asciicast(&self) -> String {
+    pub(crate) fn to_asciicast(&self) -> String {
         // On drop-oldest truncation, REBASE the survivors to the first retained
         // event (else a player waits out the whole absolute offset of the first
         // survivor — minutes of phantom leading idle) and DISCLOSE it in the header
@@ -302,7 +305,7 @@ impl CastRecorder {
 /// produced by [`CastRecorder::snapshot`]. Folding the "video" flipbook off this
 /// snapshot keeps the O(events) VTE parse OUT of the recorder lock so it never
 /// stalls the reader's cast writer thread.
-pub struct CastSnapshot {
+pub(crate) struct CastSnapshot {
     /// asciicast v2 header width (cols), snapshotted at recorder construction.
     width: u16,
     /// asciicast v2 header height (rows), snapshotted at recorder construction.
@@ -322,7 +325,7 @@ impl CastSnapshot {
     /// means the leading engine state is incomplete — the early flipbook frames may
     /// render wrong. See [`CastSnapshot::evicted`].
     #[must_use]
-    pub fn evicted(&self) -> u64 {
+    pub(crate) fn evicted(&self) -> u64 {
         self.evicted
     }
 }
@@ -339,7 +342,7 @@ impl CastSnapshot {
     /// span (no run of blank leading frames from a giant t0..first-survivor gap).
     /// Empty recording ⇒ empty vec. Returns `(rebased_elapsed, rows)` oldest-first.
     #[must_use]
-    pub fn fold_frames(&self, count: usize) -> Vec<(Duration, Vec<String>)> {
+    pub(crate) fn fold_frames(&self, count: usize) -> Vec<(Duration, Vec<String>)> {
         use aterm_core::terminal::Terminal;
         let count = count.clamp(1, 240);
         let (Some(first), Some(last)) = (self.events.first(), self.events.last()) else {
@@ -480,7 +483,7 @@ struct ByteSlot {
 /// one atomic load without touching the `slots` mutex, so the common case
 /// (no `subscribe … bytes` client) adds zero lock traffic to the reader's
 /// per-burst hot path.
-pub struct ByteFanout {
+pub(crate) struct ByteFanout {
     slots: Mutex<Vec<Arc<ByteSlot>>>,
     next_id: AtomicU64,
     /// Lock-free mirror of `slots.len()`, maintained by `subscribe`/`deregister`
@@ -503,13 +506,13 @@ impl Default for ByteFanout {
 impl ByteFanout {
     /// A fan-out with the default 4 MiB per-subscriber budget.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// A fan-out with an explicit per-subscriber retained-byte budget (≥ 1).
     #[must_use]
-    pub fn with_budget(budget: usize) -> Self {
+    pub(crate) fn with_budget(budget: usize) -> Self {
         Self {
             slots: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
@@ -527,7 +530,7 @@ impl ByteFanout {
     /// with the registration, exactly as if it ran a moment earlier; a subscriber
     /// is only owed bursts teed after its slot-push completes, which `live`'s
     /// increment-before-push guarantees it sees.
-    pub fn tee(&self, burst: &Arc<[u8]>) {
+    pub(crate) fn tee(&self, burst: &Arc<[u8]>) {
         if self.live.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -548,7 +551,7 @@ impl ByteFanout {
     /// Register a new live subscriber, returning an RAII [`ByteSubscription`] that
     /// drains its queue and deregisters on drop.
     #[must_use]
-    pub fn subscribe(self: &Arc<Self>) -> ByteSubscription {
+    pub(crate) fn subscribe(self: &Arc<Self>) -> ByteSubscription {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(ByteSlot {
             id,
@@ -577,10 +580,10 @@ impl ByteFanout {
         self.live.fetch_sub(1, Ordering::Release);
     }
 
-    /// Number of live subscribers (test/introspection).
+    /// Number of live subscribers (tests).
     #[must_use]
-    #[allow(dead_code)]
-    pub fn subscriber_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
         self.slots.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
@@ -588,7 +591,7 @@ impl ByteFanout {
 /// The consumer end of a byte subscription. `drain` returns every burst queued
 /// since the last call (byte-exact, every-frame) plus the dropped-byte count;
 /// dropping it deregisters so the producer stops teeing to a dead subscriber.
-pub struct ByteSubscription {
+pub(crate) struct ByteSubscription {
     fanout: Arc<ByteFanout>,
     slot: Arc<ByteSlot>,
     id: u64,
@@ -598,7 +601,7 @@ impl ByteSubscription {
     /// Take ALL queued bursts (in arrival order) and the dropped-byte count since
     /// the previous drain, resetting both. Loss-free between drains up to budget.
     #[must_use]
-    pub fn drain(&self) -> (Vec<Arc<[u8]>>, u64) {
+    pub(crate) fn drain(&self) -> (Vec<Arc<[u8]>>, u64) {
         let mut q = self.slot.queue.lock().unwrap_or_else(|p| p.into_inner());
         let bursts: Vec<Arc<[u8]>> = q.bursts.drain(..).collect();
         q.used = 0;

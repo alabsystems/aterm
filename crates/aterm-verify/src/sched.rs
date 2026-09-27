@@ -213,22 +213,6 @@ where
     ordered
 }
 
-/// Human-readable lane name for diagnostics.
-#[must_use]
-pub fn lane_name(lane: Lane) -> &'static str {
-    match lane {
-        Lane::Pure => "pure",
-        Lane::MainTarget => "target/",
-        Lane::TippyTarget => "target-tippy/",
-        Lane::FreezeGateTarget => "tools/freeze-safety-gate/target/",
-        Lane::LibcOracleTarget => "libc-oracle/{target,target-symgate}/",
-        Lane::RegexTarget => "target-regex/",
-        Lane::XtaskTarget => "target-xtask/",
-        Lane::DriverTarget => "target-drivers/",
-        Lane::ConformanceRelease => "target/conformance-release/",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +290,55 @@ mod tests {
         a.0 < b.1 && b.0 < a.1
     }
 
+    /// [`timed_run`] where each stage named in `meet` holds its slot until
+    /// every partner it is paired with there has STARTED, bounded at 10 s —
+    /// a rendezvous, not a window. The stages that must overlap then do on a
+    /// correct scheduler however late their threads are first scheduled; one
+    /// that serialised a pair never starts the second while the first holds
+    /// its slot, so the first times out, ends, and the pair reads disjoint.
+    /// A 30 ms sleep asked a freshly spawned thread to start within 30 ms of
+    /// its partner, eight pairs over (the load-sensitive test audit of
+    /// 2026-09-27).
+    fn met_run(specs: &[StageSpec], meet: &[(&str, &str)]) -> Vec<(usize, Instant, Instant)> {
+        let log: StdMutex<Vec<(usize, Instant, Instant)>> = StdMutex::new(Vec::new());
+        let entered: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+        let arrived = std::sync::Condvar::new();
+        let index = |t: &str| specs.iter().position(|s| s.title == t).expect("stage");
+        let reports = run_stages(
+            specs,
+            |s| {
+                let start = Instant::now();
+                let partners: Vec<&str> = meet
+                    .iter()
+                    .filter_map(|&(a, b)| match s.title.as_str() {
+                        t if t == a => Some(b),
+                        t if t == b => Some(a),
+                        _ => None,
+                    })
+                    .collect();
+                let deadline = start + Duration::from_secs(10);
+                let mut g = entered.lock().expect("entered");
+                g.push(s.title.clone());
+                arrived.notify_all();
+                while !partners.iter().all(|p| g.iter().any(|e| e == p)) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    g = arrived.wait_timeout(g, left).expect("entered").0;
+                }
+                drop(g);
+                std::thread::sleep(Duration::from_millis(30));
+                let end = Instant::now();
+                log.lock().expect("log").push((index(&s.title), start, end));
+                Report::new(s.title.clone())
+            },
+            |_, _| {},
+        );
+        assert_eq!(reports.len(), specs.len(), "every stage produced a report");
+        log.into_inner().expect("log")
+    }
+
     #[test]
     fn output_order_is_the_declared_order_however_the_stages_finish() {
         let specs = plan_shape();
@@ -343,10 +376,10 @@ mod tests {
                 if i < j && specs[*i].lane == specs[*j].lane && specs[*i].lane != Lane::Pure {
                     assert!(
                         !overlaps((*s_i, *e_i), (*s_j, *e_j)),
-                        "{} and {} share {} and must not overlap",
+                        "{} and {} share {:?} and must not overlap",
                         specs[*i].title,
                         specs[*j].title,
-                        lane_name(specs[*i].lane)
+                        specs[*i].lane
                     );
                     assert!(s_i < s_j, "lane order follows declared order");
                 }
@@ -380,7 +413,19 @@ mod tests {
     fn independent_stages_really_do_run_at_the_same_time() {
         // Otherwise this is just a slower script with more lines.
         let specs = plan_shape();
-        let times = timed_run(&specs);
+        let times = met_run(
+            &specs,
+            &[
+                ("build", "grep"),
+                ("build", "tippy"),
+                ("build", "l0"),
+                ("build", "libc"),
+                ("grep", "license"),
+                ("build", "regex"),
+                ("build", "fmt"),
+                ("build", "drivers"),
+            ],
+        );
         let idx = |t: &str| specs.iter().position(|s| s.title == t).expect("stage");
         let at = |i: usize| {
             let (_, s, e) = times.iter().find(|(k, _, _)| *k == i).expect("timed");

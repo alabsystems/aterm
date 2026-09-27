@@ -32,7 +32,7 @@ fn captured() -> &'static Mutex<Vec<CapturedRecord>> {
 }
 
 impl aterm_log::Log for TestLogger {
-    fn enabled(&self, _metadata: &aterm_log::Metadata<'_>) -> bool {
+    fn enabled(&self, _metadata: &aterm_log::Metadata) -> bool {
         true
     }
 

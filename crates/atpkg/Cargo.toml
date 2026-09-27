@@ -98,6 +98,12 @@ zstd = { workspace = true }
 # Tier-1 conformance drives the real index-probe stamp/lock against the derived
 # bounded model; this edge exists only while compiling tests, never in atpkg.
 aterm-spec = { workspace = true }
+# THE LEASE MIRROR'S PIN — tests only. The merge gate takes its run's toolchain lease
+# with std alone (`aterm_verify::lease`; that crate has no dependencies by charter, so
+# it cannot call `crate::lease`), and `tests/lease_mirror.rs` drives the REAL mirror
+# against this crate's readers — gc's reclaim and the flip gate. A first-party crate
+# with zero dependencies of its own: the edge adds nothing to the supply chain.
+aterm-verify = { workspace = true }
 # ORACLE ONLY — never in the shipped graph. The retired compressor, kept so the
 # extraction tests keep building their `tar-gz` and `zip` fixtures with the very
 # encoder the first-party reader replaced: `src/extract.rs`'s `gzip_bytes` /

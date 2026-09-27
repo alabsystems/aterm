@@ -80,8 +80,10 @@ pub enum StageId {
     Tippy,
     Formatting,
     GrepGuards,
-    /// The hermetic suites over the release scripts (`stages::RELEASE_SUITES`).
-    ReleaseTooling,
+    /// The offline suites over the scripts that build, sign, install and
+    /// publish the app (`stages::DELIVERY_SUITES`). "Release tooling" until
+    /// 2026-09-26, when dev-app's signing identity and cargo pin joined it.
+    DeliveryTooling,
     AtpkgTooling,
     TrustGateVerdict,
     TrustContractProbe,
@@ -109,9 +111,21 @@ pub enum StageId {
     ObjcAlertDrive,
     ObjcSwizzleDrive,
     ObjcBoundDrive,
+    /// The aterm-gui unit tests that open a WindowServer connection, run here
+    /// and in no parallel test run (`stages::window_server_tests_args`).
+    WindowServerTests,
+    /// The foreground handback lane (`stages::FOREGROUND_HANDBACK_SUITE`): a
+    /// real shell's job control, in a private headless `aterm` this run built.
+    ForegroundHandback,
     DifferentialOracle,
     KaniFloor,
     CrossCells,
+    /// `--full` ONLY, and run alone: the Codex live upgrade
+    /// (`stages::CODEX_LIVE_UPGRADE_SUITE`), which moves this machine's
+    /// managed-store Codex from an older build to its current one — so its
+    /// verdict reads the machine and the vendor as well as the tree, which is
+    /// why it is not in the per-commit contract (see `plan`).
+    CodexLiveUpgrade,
 }
 
 /// A stage's identity, its ladder header, and its scheduling constraints.
@@ -200,7 +214,7 @@ fn primes_conformance_release(ctx: &Ctx) -> bool {
 ///    `aterm-conformance` the conformance-release prime
 ///    ([`primes_conformance_release`]), because there is nothing for any of them
 ///    to run — the script never printed the regex lane's header either;
-///  * `--fast` drops the two `--full`-only stages.
+///  * `--fast` drops the four `--full`-only stages.
 ///
 /// Nothing else is conditional here. Absent TOOLS produce skips inside a stage,
 /// never a missing stage, because a stage that vanishes is a stage nobody
@@ -263,9 +277,14 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         Lane::XtaskTarget,
     ));
     v.push(spec(StageId::GrepGuards, "grep guards", Lane::Pure));
+    // DELIVERY TOOLING — "release tooling (installer update channel, export
+    // policy, release preflight, after-cut; stubbed)" until 2026-09-26, when
+    // five orphaned suites joined it and two of them made "release" false:
+    // dev-app's signing identity and the cargo pin dev-app shares with the
+    // installer (`stages.rs` section 3.5 has the roster and the reason).
     v.push(spec(
-        StageId::ReleaseTooling,
-        "release tooling (installer update channel, export policy, release preflight, after-cut; stubbed)",
+        StageId::DeliveryTooling,
+        "delivery tooling (installer channel and guards, cargo pin, export policy, release preflight, shape and after-cut, site sync, dev signing identity; offline)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -304,8 +323,9 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "computed proof inventory",
         Lane::XtaskTarget,
     ));
-    // DRIVER BUILDS (2026-09-13): the smoke, redraw and objc binaries,
-    // compiled at t0 in their own lane. Every driver stage below still runs its
+    // DRIVER BUILDS (2026-09-13): the smoke, redraw and objc binaries — and,
+    // since 2026-09-26, aterm-gui's library test binary for the window-server
+    // unit tests — compiled at t0 in their own lane. Every driver stage below still runs its
     // own build argv — a fingerprint no-op after this — so nothing is proven
     // from this row's binaries that its own stage did not ask cargo for. What
     // it removes is those compiles running one after another inside the
@@ -313,7 +333,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // an exclusive barrier could not start until the barrier finished.
     v.push(spec(
         StageId::DriverBuilds,
-        "driver builds (smoke, redraw and objc binaries)",
+        "driver builds (smoke, redraw and objc binaries, the live lanes' aterm, and the window-server test binary)",
         Lane::DriverTarget,
     ));
     // THE CONFORMANCE RELEASE ARTIFACT (2026-09-22) — the driver-builds row's
@@ -328,7 +348,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // TIME, so whichever of the two sorts first pays for
     // that whole release build inside the test stage's own time, with nothing
     // else in the gate running. MEASURED on a `--fast` run of 2026-09-22
-    // (`ATERM_VERIFY_TIMINGS`): `test (--workspace)` was 33 of the run's 36
+    // (`--timings`): `test (--workspace)` was 33 of the run's 36
     // minutes, and its two slowest suites were `untracked_stage` (424 s, deleted
     // 2026-09-24) and `paint` (417 s) out of 581.
     //
@@ -396,7 +416,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // the release one — and a `Lane::Pure` stage starting at t0 can only read
     // those from a PREVIOUS run.
     //
-    // MEASURED on 86381efbf (`ATERM_VERIFY_TIMINGS`): the row ran 2.685 s ->
+    // MEASURED on 86381efbf (`--timings`): the row ran 2.685 s ->
     // 112.393 s and FAILED with "section D (the real pack end to end) cannot
     // run: no atpkg binary", while the workspace build that writes
     // `target/debug/atpkg` ran 2.685 s -> 805.370 s. Three earlier gates passed
@@ -581,6 +601,46 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "objc bound drive (MainThreadBound's main-thread drop against an unsound twin, a declared class's -dealloc, and the needs_drop hang differential)",
         Lane::DriverTarget,
     ));
+    // THE WINDOW-SERVER UNIT TESTS (2026-09-26), unconditional like the drivers
+    // above it and in their lane for their reason: these rows open a
+    // WindowServer connection, which is the one thing AGENTS.md's "Concurrent
+    // sessions" rule 5 keeps out of every parallel test run. On 2026-08-17 and
+    // 2026-09-01 a unit test binary doing that from a bloated
+    // `target/debug/deps` held WindowServer's main thread in a synchronous TCC
+    // preflight past its 40 s watchdog, and the watchdog killed every window on
+    // the machine. The rows are `#[ignore]`d in `mod window_server` blocks
+    // (`tools/grep_guard.sh` B9e); `targo test` skips them everywhere and this
+    // stage runs exactly them, from the driver lane's own target dir, after the
+    // smokes' barrier. Never removed by a narrowing: the rows are aterm-gui's,
+    // and a gate a narrowing can drop stops running when someone is in a hurry.
+    v.push(spec(
+        StageId::WindowServerTests,
+        "window-server unit tests (aterm-gui's AppKit rows that open a WindowServer connection, ignored in every parallel test run)",
+        Lane::DriverTarget,
+    ));
+    // THE FOREGROUND HANDBACK (2026-09-26), the last row of the driver lane.
+    // `tools/test-foreground-handback.sh` drives a private headless `aterm` —
+    // THE one binary, which no other stage builds — and until this row nothing
+    // ran it: by hand it found no `<root>/target/debug/aterm` and answered with
+    // a code that is not a failure (2). The stage builds `-p aterm --bin aterm`
+    // in this lane (the driver builds row has compiled it at t0) and hands the
+    // lane that binary. HERE, behind the smokes' barrier, because every stage
+    // after the barrier in a `--fast` run is in this lane, so nothing else is
+    // in flight while it waits on real shells under deadlines (`ctl await …
+    // timeout=`), and a compile beside it turns a slow machine into a red row.
+    // (In a `--full` run the three tiers below are MainTarget stages after the
+    // same barrier and do overlap it, as they overlap the redraw gate and the
+    // drives; the lane's deadlines are 10-20 s against a ~20 s run.) Declared
+    // after the barrier, it is awaited by nothing. Never removed by a
+    // narrowing.
+    //
+    // Its twin, the Codex live upgrade, ran in this same row for one day and
+    // left it for the `--full` tier below — the reason is written there.
+    v.push(spec(
+        StageId::ForegroundHandback,
+        "foreground handback (a real shell's job control, driving a private headless aterm built this run)",
+        Lane::DriverTarget,
+    ));
     if ctx.mode == Mode::Full {
         v.push(spec(
             StageId::DifferentialOracle,
@@ -633,6 +693,50 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             StageId::CrossCells,
             "cross-cell type-check (forge's five cells, each for its own triple)",
             Lane::MainTarget,
+        ));
+        // THE CODEX LIVE UPGRADE (2026-09-26) — `--full` only, and run alone.
+        //
+        // `tools/test-codex-live-upgrade.sh` starts the managed store's OLDER
+        // Codex in a private headless `aterm` and watches that aterm's harness
+        // host move it onto the store's CURRENT build. It ran in the per-commit
+        // ladder for one day, beside the foreground handback, and left it because
+        // its verdict is not a function of the tree alone. Two inputs are the
+        // MACHINE's and the VENDOR's:
+        //
+        //  * THE STORE. With no Codex older than `current` in it, the lane cannot
+        //    run (exit 77). atpkg keeps the live build plus one rollback
+        //    (`crates/atpkg/src/gc.rs`), so that is every Mac that installed Codex once,
+        //    installed it fresh, or rolled back to its oldest build — and there
+        //    the per-commit gate could never claim the contract, whatever the
+        //    commit.
+        //  * THE VENDOR. Codex is a default-set, vendor-fetched package that atpkg
+        //    moves forward on its own, and the lane asserts one release's internals
+        //    (0.157's daemon, its `auto-update-version` pin). An unchanged commit
+        //    could go from PASS to FAIL overnight.
+        //
+        // `lib.rs` states the rule this broke: "A contract that measures a
+        // different thing depending on who typed the command is not a contract."
+        // Pinning two Codex builds for the lane to upgrade between was the other
+        // way out, and was not taken: the gate is offline, the pins would be a
+        // vendor download per machine, and a pinned pair stops measuring the
+        // Codex people actually run, which is the lane's whole point.
+        //
+        // So it is in the tier that already holds world-dependent evidence (the
+        // alacritty oracle, the trust-mc floor), where a missing prerequisite is
+        // a NAMED SKIP — counted, printed with the lane's own reason, and
+        // forfeiting that run's contract claim, never a pass — and a FAIL after a
+        // vendor update with an unchanged tree is exactly what the tier is for:
+        // aterm's host (or the lane's release-specific checks) has to catch up
+        // with the Codex people now run. EXCLUSIVE and LAST: it waits on real
+        // idle points and ten-second ledger polls for ~10 minutes (581 s on
+        // 2026-09-26), and in `--full` the three tiers above are MainTarget
+        // compiles after the smokes' barrier, so without exclusivity it would
+        // run beside them. Last, so nothing waits behind it. Its own first child
+        // is the handback row's build (a fingerprint no-op by then).
+        v.push(exclusive(
+            StageId::CodexLiveUpgrade,
+            "Codex live upgrade (the managed store's older Codex moved onto its current one by a private headless aterm; reads this machine's store and the vendor's Codex; run alone)",
+            Lane::DriverTarget,
         ));
     }
     v
@@ -692,7 +796,7 @@ mod tests {
                 StageId::Tippy,
                 StageId::Formatting,
                 StageId::GrepGuards,
-                StageId::ReleaseTooling,
+                StageId::DeliveryTooling,
                 StageId::TrustGateVerdict,
                 StageId::TrustContractProbe,
                 StageId::StartCompare,
@@ -717,6 +821,8 @@ mod tests {
                 StageId::ObjcAlertDrive,
                 StageId::ObjcSwizzleDrive,
                 StageId::ObjcBoundDrive,
+                StageId::WindowServerTests,
+                StageId::ForegroundHandback,
             ]
         );
     }
@@ -944,6 +1050,28 @@ mod tests {
                     "{mode:?} / {} lost the objc bound drive",
                     scope.label()
                 );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::WindowServerTests),
+                    "{mode:?} / {} lost the window-server unit tests, the only runner of \
+                     the rows every parallel test run ignores",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ForegroundHandback),
+                    "{mode:?} / {} lost the foreground handback, the only runner of \
+                     tools/test-foreground-handback.sh",
+                    scope.label()
+                );
+                // The Codex live upgrade is `--full`'s, and a narrowing can no
+                // more remove it there than the handback here; the per-commit
+                // ladder never plans it (its verdict reads the machine's store
+                // and the vendor's Codex — `plan` says why).
+                assert_eq!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::CodexLiveUpgrade),
+                    mode == Mode::Full,
+                    "{mode:?} / {}",
+                    scope.label()
+                );
             }
         }
     }
@@ -970,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn full_adds_the_two_opt_in_tiers_at_the_end_and_changes_nothing_else() {
+    fn full_adds_its_opt_in_tiers_at_the_end_and_changes_nothing_else() {
         let fast = ids(&ctx(Mode::Fast, Scope::workspace()));
         let full = ids(&ctx(Mode::Full, Scope::workspace()));
         assert_eq!(full[..fast.len()], fast[..]);
@@ -979,7 +1107,8 @@ mod tests {
             [
                 StageId::DifferentialOracle,
                 StageId::KaniFloor,
-                StageId::CrossCells
+                StageId::CrossCells,
+                StageId::CodexLiveUpgrade,
             ]
         );
     }
@@ -1003,7 +1132,7 @@ mod tests {
     /// whose suites build that artifact (aterm-conformance).
     /// Every mode and scope plans EXACTLY the whole-tree ladder of its mode
     /// minus the lane rows its crates dropped — in the same order, nothing else
-    /// lost. With the literal fast ladder above and `--full`'s three appended
+    /// lost. With the literal fast ladder above and `--full`'s four appended
     /// tiers, that pins every ladder the gate can print.
     #[test]
     fn a_scope_removes_exactly_the_lanes_whose_crates_it_dropped() {
@@ -1149,10 +1278,26 @@ mod tests {
         }
     }
 
+    /// The measuring stages own the machine because they judge timings; the
+    /// Codex live upgrade (`--full` only) because it waits on a real Codex's
+    /// idle points under deadlines while `--full`'s MainTarget tiers would
+    /// otherwise compile beside it. It is LAST, so nothing waits behind it.
     #[test]
-    fn only_the_measuring_stages_are_exclusive() {
+    fn only_the_measuring_stages_and_the_codex_live_upgrade_are_exclusive() {
         let p = plan(&ctx(Mode::Full, Scope::workspace()));
         let ex: Vec<StageId> = p.iter().filter(|s| s.exclusive).map(|s| s.id).collect();
+        assert_eq!(
+            ex,
+            [
+                StageId::MeasuringTests,
+                StageId::ControlSocketSmoke,
+                StageId::GuiSmoke,
+                StageId::CodexLiveUpgrade,
+            ]
+        );
+        assert_eq!(p.last().map(|s| s.id), Some(StageId::CodexLiveUpgrade));
+        let fast = plan(&ctx(Mode::Fast, Scope::workspace()));
+        let ex: Vec<StageId> = fast.iter().filter(|s| s.exclusive).map(|s| s.id).collect();
         assert_eq!(
             ex,
             [
@@ -1221,9 +1366,12 @@ mod tests {
                 | StageId::ObjcEventDrive
                 | StageId::ObjcAlertDrive
                 | StageId::ObjcSwizzleDrive
-                | StageId::ObjcBoundDrive => Lane::DriverTarget,
+                | StageId::ObjcBoundDrive
+                | StageId::WindowServerTests
+                | StageId::ForegroundHandback
+                | StageId::CodexLiveUpgrade => Lane::DriverTarget,
                 StageId::GrepGuards
-                | StageId::ReleaseTooling
+                | StageId::DeliveryTooling
                 | StageId::TrustGateVerdict
                 | StageId::TrustContractProbe
                 | StageId::StartCompare
@@ -1316,6 +1464,11 @@ mod tests {
         // vendored astream-aead is feature-gated and ran on no cadence before it.
         // 34 since 2026-09-22: the conformance-release prime.
         // 35 since 2026-09-23: the measuring tests, out of the test run.
-        assert_eq!(plan(&nothing_installed).len(), 35);
+        // 36 since 2026-09-26: the window-server unit tests, out of every test run.
+        // 37 since 2026-09-26: the live aterm lanes, which nothing ran before.
+        // 38 later that day: the Codex half of those lanes left the per-commit
+        // row for a `--full` stage of its own (its verdict reads the machine's
+        // store and the vendor's Codex).
+        assert_eq!(plan(&nothing_installed).len(), 38);
     }
 }

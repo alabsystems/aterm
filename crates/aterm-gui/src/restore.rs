@@ -129,6 +129,14 @@ pub(crate) struct TerminalLeafRestore {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
+    /// The session's `meta set questions` policy word (2026-09-24; additive,
+    /// absent tolerated, not written when unset): carried like the five
+    /// fields above, so a restored or updated worker keeps the question policy
+    /// a driver gave it. Re-validated on the way in
+    /// (`sanitize_user_metadata`): a hand-edited value outside the four words
+    /// is dropped, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<String>,
     /// IDENTITY (session identities, 2026-09-17; additive, absent tolerated):
     /// the agent identity the session was spawned under, so a cold restore
     /// respawns the leaf's shell under it — `create = false`
@@ -141,7 +149,7 @@ pub(crate) struct TerminalLeafRestore {
 }
 
 impl TerminalLeafRestore {
-    /// The five USER fields this leaf carries, as the values of the
+    /// The six USER fields this leaf carries, as the values of the
     /// [`SessionMeta`](crate::session_timeline::SessionMeta) they were captured
     /// from.
     pub(crate) fn carried_user_meta(&self) -> crate::session_timeline::SessionMeta {
@@ -151,6 +159,7 @@ impl TerminalLeafRestore {
             icon: self.icon.clone(),
             role: self.role.clone(),
             attention: self.attention.clone(),
+            questions: self.questions.clone(),
             ..Default::default()
         }
     }
@@ -199,6 +208,10 @@ impl TerminalLeafRestore {
             .attention
             .as_deref()
             .and_then(|value| crate::session_timeline::sanitize_metadata_value("attention", value));
+        self.questions = self
+            .questions
+            .as_deref()
+            .and_then(|value| crate::session_timeline::sanitize_metadata_value("questions", value));
     }
 
     fn user_metadata_is_canonical(&self) -> bool {
@@ -213,6 +226,7 @@ impl TerminalLeafRestore {
             && canonical("icon", &self.icon)
             && canonical("role", &self.role)
             && canonical("attention", &self.attention)
+            && canonical("questions", &self.questions)
     }
 }
 
@@ -716,6 +730,46 @@ pub(crate) enum TabOrderEntry {
     Native { index: usize },
 }
 
+/// One window's macOS show state at capture time (gap #29). Every field is
+/// `Option`: `None` is "not captured", and restore treats it exactly like the
+/// window's ordinary state — never a forced change off a manifest that did not
+/// say. See `crate::window_show` for what the capture reads and what a restore
+/// does with it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct WindowShow {
+    /// The window was in native full screen (its own Space).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fullscreen: Option<bool>,
+    /// The window was miniaturized into the Dock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimized: Option<bool>,
+    /// Its place in the app's window stack, FRONT TO BACK: 0 is the frontmost.
+    /// A rank, not a count — only the order between windows means anything, and
+    /// restore tolerates gaps and ties (a hand-edited manifest is data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_order: Option<u32>,
+    /// It was the key window — the one typing went to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<bool>,
+}
+
+impl WindowShow {
+    /// Nothing captured: the value every non-macOS capture, headless capture and
+    /// older manifest carries.
+    pub(crate) const UNKNOWN: Self = Self {
+        fullscreen: None,
+        minimized: None,
+        z_order: None,
+        key: None,
+    };
+
+    /// Whether nothing was captured — the `skip_serializing_if` that keeps such
+    /// a window's wire byte-identical to an older build's.
+    pub(crate) fn is_unknown(&self) -> bool {
+        *self == Self::UNKNOWN
+    }
+}
+
 /// One window's persisted state: its size, position, the active tab index, and one pane
 /// tree per tab.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -745,6 +799,22 @@ pub(crate) struct WindowLayout {
     /// there anyway, next to `outer_x`/`outer_y`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximized: Option<bool>,
+    /// The window's macOS SHOW STATE — full screen, minimized, its place in the
+    /// stack and whether it was the key window (gap #29: a seamless update pulled
+    /// a full-screen window out of its Space, and with two or more windows the
+    /// successor keyed whichever it revealed last, so typing landed in the wrong
+    /// one). Captured on macOS only (`App::capture_restore_manifest`); every other
+    /// platform, a headless capture and every older manifest leave it
+    /// [`WindowShow::UNKNOWN`], which restore treats as "change nothing".
+    /// Additive and wire-neutral when unknown: `skip_serializing_if` keeps such a
+    /// window byte-identical to what an older build writes, an older reader
+    /// ignores the `show` table (no `deny_unknown_fields` on this struct), and a
+    /// child's layout digest hashes the WIRE it read, never a re-serialization of
+    /// its own parse (`seamless::layout_digest`), so an older successor re-proves
+    /// a layout that carries it. Live show state, like the position above, so
+    /// `commit_layout_topology` normalizes it out of the Commit comparison.
+    #[serde(default, skip_serializing_if = "WindowShow::is_unknown")]
+    pub show: WindowShow,
     /// Terminal-only compatibility projection. Kept byte-compatible with RESTORE-1.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<PaneLayout>,
@@ -973,6 +1043,7 @@ impl RestoredTab {
                         icon: None,
                         role: None,
                         attention: None,
+                        questions: None,
                         identity: None,
                     }))
                 }
@@ -1189,6 +1260,7 @@ pub(crate) fn write_to(path: &Path, manifest: &RestoreManifest) -> Result<(), St
 /// Only such a name may drop its lock: for a shared one (`session.toml`) a lock
 /// unlinked while another process waits on it lets a third lock a new file beside
 /// it. Kept, these locks piled up in the control directory, one per update.
+#[cfg(any(unix, test))]
 pub(crate) fn write_once_to(path: &Path, manifest: &RestoreManifest) -> Result<(), String> {
     let written = write_to(path, manifest);
     if let Some(lock) = restore_lock_path(path) {
@@ -1506,7 +1578,7 @@ const CELL_METRICS_SCHEMA: u32 = 1;
 
 /// Scales worth remembering. A desktop has a handful of distinct DPI factors;
 /// dropping the OLDEST entry beyond this bounds the file against a pathological
-/// `$ATERM_FORCE_SCALE` sweep writing unbounded rows.
+/// `--scale` sweep writing unbounded rows.
 const MAX_CELL_METRICS_ENTRIES: usize = 16;
 
 /// Sanity bound for one persisted cell edge in device px. A corrupted or
@@ -1565,7 +1637,7 @@ fn read_cell_metrics(path: &Path) -> Option<CellMetricsCache> {
 /// for this launch. `None` = cold launch (keep the hidden-until-ready path).
 /// Unlocked read on the launch critical path: publication is whole-file
 /// atomic (unique temp + rename), so a torn read cannot be observed.
-#[cfg_attr(not(windows), allow(dead_code))] // consumed by the Windows early-reveal path (macOS adoption is future work — its head_pts measure needs the attach-time chrome calls first)
+#[cfg(windows)]
 pub(crate) fn load_cell_metrics(
     font_key: &str,
     scale: f64,
@@ -1574,6 +1646,7 @@ pub(crate) fn load_cell_metrics(
     load_cell_metrics_from(&cell_metrics_path()?, font_key, scale, expected_font_px)
 }
 
+#[cfg(any(windows, test))]
 fn load_cell_metrics_from(
     path: &Path,
     font_key: &str,
@@ -1714,6 +1787,7 @@ mod tests {
                 outer_x: Some(120),
                 outer_y: Some(64),
                 maximized: Some(true),
+                show: WindowShow::UNKNOWN,
                 tabs: vec![
                     PaneLayout::leaf(Some("/home/a".into()), "zsh".into(), true),
                     PaneLayout::Split {
@@ -1735,6 +1809,7 @@ mod tests {
                 outer_x: None,
                 outer_y: None,
                 maximized: None,
+                show: WindowShow::UNKNOWN,
                 tabs: vec![PaneLayout::leaf(Some("/".into()), "sh".into(), true)],
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -1752,6 +1827,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: WindowShow::UNKNOWN,
             tabs: vec![PaneLayout::leaf(Some("/tmp".into()), "shell".into(), true)],
             native_tabs: vec![
                 NativeTabRestore::Settings {
@@ -1820,6 +1896,130 @@ mod tests {
         assert!(!legacy_toml.contains("maximized"));
         let back = RestoreManifest::from_toml(&legacy_toml).expect("parse legacy");
         assert!(back.windows.iter().all(|w| w.maximized.is_none()));
+    }
+
+    /// Gap #29, the wire half. A window's show state round-trips exactly — the
+    /// parent's own pre-flight (`from_toml(to_toml(layout)) == layout`) and the
+    /// byte fixed point a same-build child re-proves — and an UNKNOWN one emits
+    /// nothing at all, so every capture that records none (every platform but
+    /// macOS, every headless capture) writes the wire an older build writes.
+    #[test]
+    fn window_show_state_round_trips_and_unknown_emits_nothing() {
+        let mut shown = sample();
+        shown.windows[0].show = WindowShow {
+            fullscreen: Some(true),
+            minimized: Some(false),
+            z_order: Some(0),
+            key: Some(true),
+        };
+        shown.windows[1].show = WindowShow {
+            fullscreen: Some(false),
+            minimized: Some(true),
+            z_order: Some(1),
+            key: Some(false),
+        };
+        let wire = shown.to_toml().expect("serialize");
+        let back = RestoreManifest::from_toml(&wire).expect("parse");
+        assert_eq!(
+            back, shown,
+            "the show state survives the round trip:\n{wire}"
+        );
+        assert_eq!(
+            back.to_toml().expect("reserialize"),
+            wire,
+            "a manifest carrying show state is a byte fixed point of the codec"
+        );
+
+        let unknown = sample();
+        let wire = unknown.to_toml().expect("serialize");
+        assert!(
+            !wire.contains("show") && !wire.contains("z_order"),
+            "an unknown show state must not reach the wire:\n{wire}"
+        );
+        let back = RestoreManifest::from_toml(&wire).expect("parse");
+        assert!(back.windows.iter().all(|w| w.show.is_unknown()));
+    }
+
+    /// Gap #29, compatibility with an OLDER peer in both directions. FORWARD:
+    /// every checked-in layout an older parent wrote parses with the show state
+    /// unknown (the successor then changes nothing). BACKWARD: an older reader's
+    /// `WindowLayout` has no `show` field and no `deny_unknown_fields`, so it
+    /// skips the table — shown here with a reader that knows only the grid,
+    /// the narrowest older shape. The child's layout digest hashes the wire it
+    /// read (`seamless::layout_wire_digest`), so skipping a key it does not know
+    /// cannot move the proof. And a key a LATER build adds inside `show` is
+    /// skipped by this one.
+    #[test]
+    fn window_show_state_is_compatible_with_older_and_newer_peers() {
+        let mut shown = sample();
+        shown.windows[0].show = WindowShow {
+            fullscreen: Some(true),
+            minimized: Some(false),
+            z_order: Some(0),
+            key: Some(true),
+        };
+        let wire = shown.to_toml().expect("serialize");
+        assert!(wire.contains("[windows.show]"), "wire: {wire}");
+
+        #[derive(Deserialize)]
+        struct OlderWindow {
+            rows: u16,
+            cols: u16,
+        }
+        #[derive(Deserialize)]
+        struct OlderManifest {
+            schema: u32,
+            windows: Vec<OlderWindow>,
+        }
+        let older: OlderManifest =
+            aterm_toml::from_str(&wire).expect("an older reader skips the show table");
+        assert_eq!(older.schema, SCHEMA);
+        assert_eq!(
+            older
+                .windows
+                .iter()
+                .map(|w| (w.rows, w.cols))
+                .collect::<Vec<_>>(),
+            vec![(24, 80), (40, 132)]
+        );
+
+        let later = wire.replacen("[windows.show]\n", "[windows.show]\nspace_index = 3\n", 1);
+        assert_ne!(later, wire, "the later key was spliced in:\n{later}");
+        let back = RestoreManifest::from_toml(&later).expect("a later show key is skipped");
+        assert_eq!(back.windows[0].show, shown.windows[0].show);
+
+        // Every layout an older release's parent really wrote (the checked-in
+        // handoff fixtures, one directory per release and desk).
+        let fixtures = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/handoff"
+        ));
+        let mut layouts = 0;
+        for release in fs::read_dir(fixtures).expect("the handoff fixtures") {
+            let release = release.expect("a release directory").path();
+            if !release.is_dir() {
+                continue;
+            }
+            for desk in fs::read_dir(&release).expect("a release's desks") {
+                let desk = desk.expect("a desk").path();
+                for file in fs::read_dir(&desk).expect("a desk's files") {
+                    let path = file.expect("a fixture file").path();
+                    if !path.to_string_lossy().ends_with(".layout.toml") {
+                        continue;
+                    }
+                    let wire = fs::read_to_string(&path).expect("a fixture layout");
+                    let parsed = RestoreManifest::from_toml(&wire)
+                        .unwrap_or_else(|| panic!("{} parses", path.display()));
+                    assert!(
+                        parsed.windows.iter().all(|w| w.show.is_unknown()),
+                        "{}: an older parent carried no show state, so none is invented",
+                        path.display()
+                    );
+                    layouts += 1;
+                }
+            }
+        }
+        assert!(layouts >= 2, "the fixture walk read {layouts} layouts");
     }
 
     #[test]
@@ -2057,6 +2257,7 @@ metadata = "opaque=copy-me"
                     icon: None,
                     role: None,
                     attention: None,
+                    questions: None,
                     identity: None,
                 },
             ))),
@@ -2081,6 +2282,7 @@ metadata = "opaque=copy-me"
             icon: None,
             role: None,
             attention: None,
+            questions: None,
             identity: None,
         }));
         for _ in 0..=MAX_SPLIT_DEPTH {
@@ -2099,6 +2301,7 @@ metadata = "opaque=copy-me"
                         icon: None,
                         role: None,
                         attention: None,
+                        questions: None,
                         identity: None,
                     },
                 ))),
@@ -2134,6 +2337,7 @@ metadata = "opaque=copy-me"
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: WindowShow::UNKNOWN,
             tabs: vec![PaneLayout::Leaf {
                 cwd: Some("/tmp/a\0b".into()),
                 title: "zsh\0 ~".into(),
@@ -2155,6 +2359,7 @@ metadata = "opaque=copy-me"
                     role: None,
                     attention: None,
                     identity: None,
+                    questions: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -2312,8 +2517,12 @@ metadata = "opaque=copy-me"
         let published = model.successors("PublishManifest", &temporary)[0].clone();
         assert_eq!(published["visible"], 1);
         assert!(model.check_invariant("UniqueTemporaryNeverAliases", &published));
-        let rejected_alias = model.successors("ReuseFixedTemporary", &locked);
-        assert_eq!(rejected_alias, vec![locked]);
+        // The fixed alias is no step of the healthy writer; it is the mutant's.
+        assert!(model.successors("ReuseFixedTemporary", &locked).is_empty());
+        let alias = aterm_spec::interp::with_buggy(&model, 1)
+            .successors("ReuseFixedTemporary", &locked)[0]
+            .clone();
+        assert!(!model.check_invariant("UniqueTemporaryNeverAliases", &alias));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2359,6 +2568,33 @@ metadata = "opaque=copy-me"
         assert_eq!(absent["returned"], 1);
         assert!(model.check_invariant("AtMostOneConsumer", &absent));
         assert!(model.check_invariant("ReturnOnlyAfterDurableClaim", &absent));
+
+        // Negative control: the take 3473ced57 replaced, replayed on real files
+        // in its losing interleaving — no lock; A reads, B reads while the name
+        // survives A's read, A removes, B's remove fails (ignored, as it was),
+        // and both return the manifest. Each step is the mutant's.
+        write_to(&path, &manifest).unwrap();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let initial = buggy.init_state();
+        let read_a = std::fs::read_to_string(&path).ok();
+        let a_read = buggy.successors("HistoricalTakeA", &initial)[0].clone();
+        assert!(path.exists(), "the name survives the read");
+        assert_eq!(a_read["visible"], 1);
+        assert_eq!(aterm_spec::interp::admits(&model, &initial, &a_read), None);
+        assert!(!model.check_invariant("ClaimRemovesVisibleName", &a_read));
+        let read_b = std::fs::read_to_string(&path).ok();
+        let both_read = buggy.successors("HistoricalTakeB", &a_read)[0].clone();
+        assert!(std::fs::remove_file(&path).is_ok());
+        let a_returned = buggy.successors("HistoricalTakeA", &both_read)[0].clone();
+        assert!(std::fs::remove_file(&path).is_err());
+        let b_returned = buggy.successors("HistoricalTakeB", &a_returned)[0].clone();
+        let consumed = [read_a, read_b]
+            .into_iter()
+            .filter_map(|text| RestoreManifest::from_toml(&text?))
+            .collect::<Vec<_>>();
+        assert_eq!(consumed, [manifest.clone(), manifest]);
+        assert_eq!(b_returned["returned"], 2);
+        assert!(!model.check_invariant("AtMostOneConsumer", &b_returned));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

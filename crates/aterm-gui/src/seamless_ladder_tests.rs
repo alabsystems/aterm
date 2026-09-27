@@ -776,6 +776,11 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
             .collect(),
         controls: Vec::new(),
         next_turn_id: None,
+        // THE FOREGROUND HOLDER CROSSES AT EVERY RUNG (the 2026-09-25 review):
+        // the blank carry (session 2) goes without a control carry but still
+        // restores its modes, so its holder must still reach the adopting
+        // reader, or a job that died during the handoff is never an edge.
+        fg_holders: vec![(0, 4100), (2, 4242)],
     };
     let staged = stage_ladder_handoff("ladder", &stage, &repaint);
 
@@ -824,6 +829,16 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
                 "a repainted session carries no control"
             );
         }
+        assert_eq!(
+            adopted.fg_holder,
+            match adopted.local_id {
+                0 => 4100,
+                2 => 4242,
+                _ => 0,
+            },
+            "session {}: the holder the outgoing reader last saw, whatever the rung",
+            adopted.local_id
+        );
     }
     let ((proof, ready, adopted), _) =
         child_proof_from(incoming).expect("the child adopts and proves");

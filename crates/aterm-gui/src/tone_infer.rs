@@ -249,64 +249,6 @@ impl ToneTracker {
 /// place so the WIRE FORMAT is a pure function of plain data (no `App`, no
 /// window, no audio device) and can be pinned by a headless test.
 ///
-/// The audio HOST as the status line reports it. `Live` = the worker is
-/// reachable AND responsive. `Wedged` = ingress is open but the worker has
-/// been stuck inside one platform call past its threshold, so cues are being
-/// dropped — a state a bare `live` bit cannot distinguish (the 2026-08 field
-/// incident printed `live` over a silent synth for hours, whichever state it
-/// was in). `Inert` = sealed headless/test form, non-macOS build, or
-/// permanent failure (including an exhausted wedge-revival budget).
-/// `Live` means a PLATFORM CALL SUCCEEDED — `AudioQueueStart` returned OK —
-/// not merely that an ingress channel exists, which is all it meant until
-/// 2026-09-22. `Opening` is the lazily-dormant host that had never opened a
-/// device and used to print `live`; `Paused`, `Failed` and `Stopped` are the
-/// other three states that used to print it too.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AudioHost {
-    Live,
-    Wedged,
-    Inert,
-    Opening,
-    Paused,
-    Failed,
-    /// A fault was seen and the worker is inside its bounded reopen schedule
-    /// — recoverable, and the state a transient CoreAudio hiccup used to skip
-    /// straight past into permanent silence.
-    Reopening,
-    Stopped,
-}
-
-impl AudioHost {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Live => "live",
-            Self::Wedged => "wedged",
-            Self::Inert => "inert",
-            Self::Opening => "opening",
-            Self::Paused => "paused",
-            Self::Failed => "failed",
-            Self::Reopening => "reopening",
-            Self::Stopped => "stopped",
-        }
-    }
-}
-
-impl From<crate::trail_audio::HostState> for AudioHost {
-    fn from(s: crate::trail_audio::HostState) -> Self {
-        use crate::trail_audio::HostState as H;
-        match s {
-            H::Inert => Self::Inert,
-            H::Opening => Self::Opening,
-            H::Running => Self::Live,
-            H::Paused => Self::Paused,
-            H::Failed => Self::Failed,
-            H::Reopening => Self::Reopening,
-            H::Stopped => Self::Stopped,
-            H::Wedged => Self::Wedged,
-        }
-    }
-}
-
 /// The fields are chosen to answer the ONE question a driver actually asks —
 /// "is the mood steering my typing sounds, and if not, which gate stopped
 /// it?" — so every conjunct of `App::tone_infer_active` appears as its own
@@ -326,8 +268,8 @@ pub(crate) struct ToneStatus {
     /// `trail_sound_volume`, already clamped to 0..1.
     pub(crate) volume: f32,
     /// The audio host's honest state — not merely whether a channel exists
-    /// (see [`AudioHost`]).
-    pub(crate) audio: AudioHost,
+    /// (see [`crate::trail_audio::HostState`]).
+    pub(crate) audio: crate::trail_audio::HostState,
     /// The AND of the four above: whether inference may run at all.
     pub(crate) active: bool,
     /// Chars in the typed window (never the text — see
@@ -609,7 +551,7 @@ mod tests {
             knob: false,
             sounds: true,
             volume: 0.4,
-            audio: AudioHost::Live,
+            audio: crate::trail_audio::HostState::Running,
             active: false,
             window_chars: 27,
             inferences: 5,
@@ -644,7 +586,7 @@ mod tests {
             knob: true,
             sounds: true,
             volume: 0.4,
-            audio: AudioHost::Wedged,
+            audio: crate::trail_audio::HostState::Wedged,
             active: false,
             window_chars: 0,
             inferences: 104,

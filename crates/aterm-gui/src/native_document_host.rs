@@ -10,11 +10,6 @@
 //! same-directory temporary write, file sync, atomic rename, directory sync, and
 //! a final content observation.
 
-#![allow(
-    dead_code,
-    reason = "native document host integration is consumed by the tab opener"
-)]
-
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -39,12 +34,6 @@ const MAX_ATOMIC_SAVE_BYTES: usize = DEFAULT_DOCUMENT_LIMIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DocumentGrantId(NonZeroU64);
-
-impl DocumentGrantId {
-    pub(crate) const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantAccess {
@@ -76,6 +65,7 @@ pub(crate) struct DocumentGrant {
 }
 
 impl DocumentGrant {
+    #[cfg(all(test, unix))]
     pub(crate) fn logical_path(&self) -> &Path {
         self.target.logical_path()
     }
@@ -270,12 +260,6 @@ pub(crate) struct AdmittedDocument {
     pub(crate) observed: ObservedFileVersion,
 }
 
-impl AdmittedDocument {
-    pub(crate) fn target(&self) -> &AtomicFileTarget {
-        &self.target
-    }
-}
-
 /// The blocking half of [`DocumentGrantStore::open_local`]: resolve the URI,
 /// bind the atomic target, read at most `limit` bytes, validate UTF-8. This is
 /// where an evicted iCloud Drive item or an unreachable network volume waits
@@ -318,7 +302,6 @@ pub(crate) enum DocumentHostError {
     },
     InvalidUtf8,
     UnknownGrant,
-    ReadOnlyGrant,
     Io {
         stage: AtomicSaveStage,
         message: String,
@@ -334,6 +317,7 @@ pub(crate) enum DocumentHostError {
     /// `IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES` is OFF for the thread (see
     /// [`crate::dataless_files`]); open/stat/realpath all succeed first, so the
     /// read is the only place it can surface.
+    #[cfg(unix)]
     NotDownloaded {
         path: PathBuf,
     },
@@ -351,7 +335,6 @@ impl std::fmt::Display for DocumentHostError {
             Self::TooLarge { limit } => write!(f, "document exceeds the {limit}-byte limit"),
             Self::InvalidUtf8 => f.write_str("document is not valid UTF-8"),
             Self::UnknownGrant => f.write_str("unknown document grant"),
-            Self::ReadOnlyGrant => f.write_str("document grant is read-only"),
             Self::Io { stage, message } => write!(f, "{stage:?}: {message}"),
             Self::ChangedWhileReading => f.write_str("document changed while it was being read"),
             Self::SymlinkComponent { path } => write!(
@@ -362,6 +345,7 @@ impl std::fmt::Display for DocumentHostError {
             Self::TargetRetargeted => {
                 f.write_str("document path now resolves to a different file; reopen it")
             }
+            #[cfg(unix)]
             Self::NotDownloaded { path } => write!(
                 f,
                 "{} is evicted from iCloud Drive and must be downloaded in Finder first",
@@ -500,6 +484,7 @@ impl DocumentGrantStore {
     }
 
     /// Mint or upgrade the single process-local grant for one canonical file.
+    #[cfg(test)]
     pub(crate) fn open_local(
         &mut self,
         uri: &str,
@@ -511,6 +496,7 @@ impl DocumentGrantStore {
 
     /// Config-Manual grant minting binds a complete logical symlink chain while
     /// retaining the ordinary document host's stricter default.
+    #[cfg(test)]
     pub(crate) fn open_local_config(
         &mut self,
         uri: &str,
@@ -520,6 +506,7 @@ impl DocumentGrantStore {
         self.open_local_with_config_symlinks(uri, access, limit, true)
     }
 
+    #[cfg(test)]
     fn open_local_with_config_symlinks(
         &mut self,
         uri: &str,
@@ -596,10 +583,12 @@ impl DocumentGrantStore {
         self.grants.get(&id).cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn id_for_uri(&self, canonical_uri: &str) -> Option<DocumentGrantId> {
         self.by_uri.get(canonical_uri).copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_save(&self, id: DocumentGrantId, plan: &SavePlan) -> AtomicSaveResult {
         let Some(grant) = self.grants.get(&id) else {
             return failed(AtomicSaveStage::Preflight, "unknown document grant");
@@ -682,6 +671,7 @@ pub(crate) fn file_uri_path(uri: &str) -> Result<PathBuf, DocumentHostError> {
 /// RFC 8089 drive paths carry one URI root slash (`/C:/...`) which is not a
 /// Windows path root. Remove exactly that slash; all other leading-slash forms
 /// retain their meaning and are subsequently accepted/rejected by `Path`.
+#[cfg(any(windows, test))]
 fn windows_file_uri_path_text(decoded: &str) -> Result<String, DocumentHostError> {
     let bytes = decoded.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
@@ -808,10 +798,21 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    // Without BACKUP_SEMANTICS, CreateFileW refuses a DIRECTORY outright with
+    // ERROR_ACCESS_DENIED, so a config path that names a directory surfaced as
+    // "Preflight: could not open …: Access is denied" instead of the
+    // `NotAFile` verdict the Unix arm gives (O_NOFOLLOW|O_NONBLOCK opens the
+    // directory, fstat classifies it) — measured 2026-09-22 by
+    // `observation_rejects_non_utf8_oversize_and_non_file_inputs` on the first
+    // Windows run. With the flag the directory handle opens and the SAME
+    // `is_file()` check below classifies it; for a regular file the flag is
+    // inert (its privilege override needs SE_BACKUP_NAME, which this process
+    // never holds). The proof still comes from the opened handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -932,6 +933,7 @@ fn read_stable_file(
 /// Read one logical path and capture the exact target + file generation later
 /// used by [`commit_atomic_bytes`]. Missing files are represented by empty
 /// bytes only when `allow_missing` is true.
+#[cfg(test)]
 pub(crate) fn read_atomic_file(
     logical_path: &Path,
     limit: usize,
@@ -2047,6 +2049,16 @@ mod tests {
         path_to_file_uri(path).unwrap()
     }
 
+    /// A well-formed URI of a file that does not exist, absolute on the host:
+    /// `/definitely/…` is not absolute on Windows, where it fails as
+    /// `NotAbsolute` before the filesystem is asked — not the arm a
+    /// missing-file check is about.
+    const MISSING_DOC_URI: &str = if cfg!(windows) {
+        "file:///C:/definitely/missing/aterm-doc.md"
+    } else {
+        "file:///definitely/missing/aterm-doc.md"
+    };
+
     /// Regression guard for the Windows defect that silently disabled the entire user
     /// configuration. The component walk used to push and then stat
     /// `Component::Prefix` on its own, and on a canonicalized path that first
@@ -2187,7 +2199,7 @@ mod tests {
         assert_eq!(direct.grant.canonical_uri, first.grant.canonical_uri);
         assert!(
             matches!(
-                admit_local_file("file:///definitely/missing/aterm-doc.md", 16, false),
+                admit_local_file(MISSING_DOC_URI, 16, false),
                 Err(DocumentHostError::Io { .. })
             ),
             "a missing file fails at admission, before any grant state exists"
@@ -2792,7 +2804,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_lock_held_for_one_stalled_device_barrier_is_waited_out_not_reported_busy() {
-        const HELD: std::time::Duration = std::time::Duration::from_millis(200);
+        // 4x the inner `WRITE_LOCK_RETRY_BUDGET`, so it is the outer preflight
+        // retry that must wait the holder out, and a fifth of the 500 ms
+        // `PREFLIGHT_RETRY_BUDGET`, so a spawn and a sleep overshoot under load
+        // cannot push the release past it. It was 200 ms, leaving 300 ms against
+        // a thread-wake tail measured at 523 ms (the load-sensitive test audit
+        // of 2026-09-27).
+        const HELD: std::time::Duration = std::time::Duration::from_millis(100);
 
         let path = unique_file("waited-save-lock", b"before");
         let contents = read_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
@@ -2802,12 +2820,14 @@ mod tests {
         ));
         let holder = open_write_lock(&lock_path).unwrap();
         acquire_write_lock(&holder).unwrap();
+        // Taken BEFORE the spawn: the release is then at or after `started +
+        // HELD` by construction, so `waited >= HELD` below is exact.
+        let started = std::time::Instant::now();
         let released = std::thread::spawn(move || {
             std::thread::sleep(HELD);
             drop(holder);
         });
 
-        let started = std::time::Instant::now();
         let verdict = commit_atomic_bytes(&contents.baseline, b"after");
         let waited = started.elapsed();
         released.join().unwrap();

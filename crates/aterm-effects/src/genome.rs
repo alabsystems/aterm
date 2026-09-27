@@ -90,12 +90,6 @@ pub const SIMHASH_KERNEL: SimhashKernel = SimhashKernel::BitSliced;
 pub enum SimhashKernel {
     /// The §3.2 vote loop (`votes: [i32; 64]`) — the oracle. Selected only if
     /// [`SIMHASH_KERNEL`] is flipped back (certificate-red fallback).
-    #[allow(
-        dead_code,
-        reason = "the equivalence battery's oracle; constructed only when \
-                  SIMHASH_KERNEL is flipped back to Reference on a red \
-                  §7.5 certificate (sparkle-v2 design §3.2/§15.15)"
-    )]
     Reference,
     /// The v2.1 carry-save-adder network (§3.2 bit-sliced note) — shipped
     /// under its green §7.5 equivalence certificate.
@@ -307,11 +301,7 @@ pub struct VoterSet {
 /// `cast_vote` + signed-majority fold of [`simhash_ctx_reference`], factored
 /// so the equivalence battery and `bench_simhash_bitsliced` compare the two
 /// kernels on identical inputs.
-#[allow(
-    dead_code,
-    reason = "the §7.5 equivalence battery's oracle (tests + bench_simhash_bitsliced); \
-              the live reference path stays simhash_ctx_reference"
-)]
+#[cfg(test)]
 pub fn simhash_majority_reference(v: &VoterSet) -> u64 {
     let mut votes = [0i32; 64];
     for (i, &w) in SIMHASH_SLOT_WEIGHTS.iter().enumerate() {
@@ -334,7 +324,7 @@ fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
 }
 
 /// §3.2 bit-sliced majority: the carry-save adder network. Pure function of
-/// the voter set; equals [`simhash_majority_reference`] on every input (the
+/// the voter set; equals `simhash_majority_reference` on every input (the
 /// §7.5 certificate + the 10k-set property battery below).
 pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     // Masked lanes: an absent voter contributes no set bits (and, below, no
@@ -464,35 +454,15 @@ pub fn field(gkey: u64, lo: u32, n: u32) -> u64 {
 /// Gray ENCODE (the exact inverse of [`gray_decode`]): `g = b ^ (b >> 1)`.
 /// v2.2 uses it to write the POST-§5.2-forcing paw count back into a bake art
 /// key, so forced and rolled identities that DRAW the same share a tile.
+#[cfg(test)]
 pub fn gray_encode(b: u64) -> u64 {
     b ^ (b >> 1)
 }
 
 // ───────────────────── §3.4 feature tables (authoritative) ────────────────────
 
-/// Coat overlay pattern, Gray → 8-class similarity-ordered table (§3.4).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(
-    dead_code,
-    reason = "consumed by sparkle-words P3 (the CatBaker art pass)"
-)]
-pub enum CoatPattern {
-    Solid,
-    Smoke,
-    Bicolor,
-    Tuxedo,
-    Calico,
-    Colorpoint,
-    TabbyMackerel,
-    TabbyClassic,
-}
-
 /// Cat age band (§3.4 bits 10–11); `scale()` is the §3.4 body-scale column.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(
-    dead_code,
-    reason = "consumed by sparkle-words P3 (the CatBaker art pass)"
-)]
 pub enum CatAge {
     Kitten,
     Adolescent,
@@ -502,10 +472,6 @@ pub enum CatAge {
 
 impl CatAge {
     /// §3.4 body scale: 0.82 / 0.93 / 1.04 / 1.15.
-    #[allow(
-        dead_code,
-        reason = "consumed by sparkle-words P3 (the CatBaker art pass)"
-    )]
     pub fn scale(self) -> f32 {
         match self {
             CatAge::Kitten => 0.82,
@@ -600,10 +566,6 @@ pub fn ink_pair_nudges(class: Class, gkey: u64) -> (u8, u8) {
 
 /// Rare cat variant (§3.5, low window of `magic`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[allow(
-    dead_code,
-    reason = "consumed by sparkle-words P3 (Fortune/Nebula cat builds)"
-)]
 pub enum CatMagic {
     /// `magic % 4096 < 8` — 1/512.
     Fortune,
@@ -628,10 +590,6 @@ pub enum NovaMagic {
 
 /// §3.5 cat window. Cats consume the LOW window; a genome is never two magics
 /// at once because novas read the shifted window and the classes are disjoint.
-#[allow(
-    dead_code,
-    reason = "consumed by sparkle-words P3 (Fortune/Nebula cat builds)"
-)]
 pub fn cat_magic(magic: u64) -> Option<CatMagic> {
     match magic % 4096 {
         0..=7 => Some(CatMagic::Fortune),
@@ -657,6 +615,7 @@ pub fn nova_magic(magic: u64) -> Option<NovaMagic> {
 /// ([`cat_magic`] `== None`) cats; the gate is structural in
 /// [`cat_accessory`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg(test)]
 pub enum Accessory {
     /// `(magic >> 24) % 4096 ∈ 0..=127` — 1/32, the common-delight rung.
     Bow,
@@ -673,6 +632,7 @@ pub enum Accessory {
 /// Structurally `None` for any magic-build cat (accessories never stack on
 /// Fortune/Nebula/Butterfly/Sakura); rates tests therefore CONDITION on
 /// `cat_magic == None` (the marginal is `(4033/4096)·rate`).
+#[cfg(test)]
 pub fn cat_accessory(magic: u64) -> Option<Accessory> {
     if cat_magic(magic).is_some() {
         return None;

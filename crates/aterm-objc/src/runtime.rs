@@ -1440,7 +1440,7 @@ impl Obj {
 
     /// Give up ownership WITHOUT releasing — the caller inherits the +1.
     #[must_use]
-    pub fn into_raw(self) -> Id {
+    pub(crate) fn into_raw(self) -> Id {
         let id = self.0;
         std::mem::forget(self);
         id

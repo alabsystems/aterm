@@ -9,6 +9,31 @@
 
 use super::*;
 
+use std::time::Duration;
+
+/// Samples per side of every timed ratio below.
+const SAMPLES: usize = 5;
+
+/// The fastest of [`SAMPLES`] timings of each side, taken INTERLEAVED so a
+/// load burst lands on both; every closure builds its own fixture and times
+/// only the operation. A ratio of two single wall-clock samples measures the
+/// scheduler as much as the code: one preemption of the large side alone flips
+/// it, and these windows are microseconds to milliseconds long. The minimum is
+/// the sample least polluted by an unrelated stall, and each regression these
+/// tests guard costs its extra work in EVERY sample (the load-sensitive test
+/// audit of 2026-09-27).
+fn fastest_pair(
+    mut small: impl FnMut() -> Duration,
+    mut large: impl FnMut() -> Duration,
+) -> (Duration, Duration) {
+    let (mut fastest_small, mut fastest_large) = (Duration::MAX, Duration::MAX);
+    for _ in 0..SAMPLES {
+        fastest_small = fastest_small.min(small());
+        fastest_large = fastest_large.min(large());
+    }
+    (fastest_small, fastest_large)
+}
+
 /// Measure `push_line` throughput at different fill levels.
 ///
 /// Production accounting is O(1) per push (cached running totals). In debug/test
@@ -31,8 +56,10 @@ fn push_line_overhead_scales_with_tier_sizes() {
     }
 
     let batch = 500;
-    let small_time = measure_push_batch(500, batch);
-    let large_time = measure_push_batch(10_000, batch);
+    let (small_time, large_time) = fastest_pair(
+        || measure_push_batch(500, batch),
+        || measure_push_batch(10_000, batch),
+    );
 
     let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
     eprintln!(
@@ -105,8 +132,10 @@ fn push_with_line_limit_constant_time_truncate() {
     }
 
     let batch = 500;
-    let small_time = measure_push_with_limit(500, batch);
-    let large_time = measure_push_with_limit(10_000, batch);
+    let (small_time, large_time) = fastest_pair(
+        || measure_push_with_limit(500, batch),
+        || measure_push_with_limit(10_000, batch),
+    );
 
     let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
     eprintln!(
@@ -342,8 +371,8 @@ fn remove_newest_time_sublinear_in_total_size() {
         start.elapsed()
     }
 
-    let small_time = measure_remove(1_000);
-    let large_time = measure_remove(50_000);
+    let (small_time, large_time) =
+        fastest_pair(|| measure_remove(1_000), || measure_remove(50_000));
 
     let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
     eprintln!(
@@ -438,8 +467,19 @@ fn warm_eviction_cost_bounded_with_many_blocks() {
         (warm_blocks, elapsed)
     }
 
-    let (small_blocks, small_time) = measure_warm_eviction(200);
-    let (large_blocks, large_time) = measure_warm_eviction(2000);
+    let (mut small_blocks, mut large_blocks) = (0, 0);
+    let (small_time, large_time) = fastest_pair(
+        || {
+            let (blocks, elapsed) = measure_warm_eviction(200);
+            small_blocks = blocks;
+            elapsed
+        },
+        || {
+            let (blocks, elapsed) = measure_warm_eviction(2000);
+            large_blocks = blocks;
+            elapsed
+        },
+    );
 
     let ratio = large_time.as_nanos() as f64 / small_time.as_nanos().max(1) as f64;
     let block_ratio = large_blocks as f64 / small_blocks.max(1) as f64;

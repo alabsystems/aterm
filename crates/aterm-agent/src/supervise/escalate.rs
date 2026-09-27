@@ -31,52 +31,19 @@
 //! entry, `meta set attention owner=supervisor <text>` / `meta unset
 //! attention owner=supervisor` — never the bare form, which is the human's
 //! (owner `-`) — so a badge a person raised is never cleared by the loop,
-//! and the loop's is never hidden by theirs past its own unset. The loop
-//! knows its entry's text ([`Session::attention_ours`]) and unsets it only
-//! when that text is the kind the closing point raised ([`is_ours`]). A
-//! loop watching behind another supervisor's claim writes none.
+//! and the loop's is never hidden by theirs past its own unset. The KEY is
+//! the proof of ownership, never the text: the loop knows its entry's text
+//! ([`Session::attention_ours`]) only to tell a box's badge from a limit's,
+//! so a box closing does not clear the limit it sits over. A loop watching
+//! behind another supervisor's claim writes none.
 
 use super::*;
 
-/// The kinds an escalation's attention names, besides a limit's.
-const KINDS: &[&str] = &[
-    "bash",
-    "read",
-    "edit",
-    "write",
-    "workflow",
-    "other",
-    "rm-breaker",
-    "trust",
-    "question",
-    "idle",
-    "wall",
-];
 /// How much of the subject (command, path, question) the attention carries,
 /// in terminal cells.
 const SUBJECT_CELLS: usize = APPROVAL_LINE_CELLS;
 /// How much of the reason the attention carries, in terminal cells.
 const REASON_CELLS: usize = 120;
-
-/// Whether a standing attention is one this loop writes: a limit's
-/// (`limited: …`), a point's (`claude <kind>: …`), or the box badge an
-/// earlier build wrote (`claude needs approval: …`).
-pub(crate) fn is_ours(text: &str) -> bool {
-    if text.starts_with(ATTENTION_PREFIX) || text.starts_with(&format!("{PROGRAM}{APPROVAL_MARK}"))
-    {
-        return true;
-    }
-    text.strip_prefix(PROGRAM)
-        .and_then(|t| t.strip_prefix(' '))
-        .and_then(|t| t.split_once(": "))
-        .is_some_and(|(kind, _)| KINDS.contains(&kind))
-}
-
-/// Whether a standing attention is one of this loop's point badges (not a
-/// limit's).
-fn is_our_point(text: &str) -> bool {
-    is_ours(text) && !text.starts_with(ATTENTION_PREFIX)
-}
 
 /// `s` on one line and within `cells` terminal cells ([`cut_cells`]), `…`
 /// (one cell) where it was cut.
@@ -105,6 +72,9 @@ fn trust_path(rows: &[String]) -> Option<&str> {
 /// box: Claude Code's question tool draws its options, a rule, then `4. Chat
 /// about this` over the footer, and the box parser starts at that rule — so
 /// the badge quoted `4. Chat about this` (the live E2E of 2026-09-24, D7).
+/// The FALLBACK only, since aterm-phase reads the dialog whole
+/// ([`aterm_phase::QuestionDialog::question`], 2026-09-25): a question it
+/// did not read whole (form `Unknown`) is still named by this scan.
 /// The nearest row ending in `?` above `first`, over rules and option rows,
 /// stopping at the transcript: a `⏺` row or a user's `❯` row that is not an
 /// option's cursor.
@@ -128,11 +98,15 @@ fn question_above(rows: &[String], first: usize) -> Option<&str> {
     None
 }
 
-/// The kind and subject a point's attention names: a question's last row;
-/// at an idle point the turn-end policy escalated, the wall it ended on
-/// (`wall`) or the worker's last words (`idle`); a box's command, path or
-/// question.
-fn kind_and_subject(point: &Turn) -> (String, String) {
+/// The kind and subject a point's attention names, read by the session's
+/// reader: a question's last row; at an idle point the turn-end policy
+/// escalated, the wall it ended on (`wall`) or the worker's last words
+/// (`idle`); a box's command, path or question. Another program's point
+/// (Codex's) is named from its reading alone ([`kind_and_subject_read`]).
+fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String) {
+    if reader.program() != aterm_phase::Program::Claude {
+        return kind_and_subject_read(reader, point);
+    }
     let rows = &point.screen.rows;
     if point.phase == Phase::Idle {
         if let Some(w) = aterm_phase::wall(rows) {
@@ -157,16 +131,23 @@ fn kind_and_subject(point: &Turn) -> (String, String) {
     let Some(p) = parse_prompt(rows) else {
         return ("other".to_string(), String::new());
     };
-    let kind = if p
-        .notes
-        .join(" ")
-        .starts_with(super::super::policy::approval::RM_BREAKER_NOTE)
-    {
+    // The rm/rmdir breaker family, whatever its kind (aterm-phase's
+    // `PromptV2::rm_breaker`, the one reading the decider uses).
+    let kind = if aterm_phase::parse_prompt_v2(rows).is_some_and(|v| v.rm_breaker().is_some()) {
         "rm-breaker".to_string()
     } else {
         p.kind.name().to_string()
     };
-    let subject = if !p.command.is_empty() {
+    // A question dialog read whole names its question, the `│` gutter
+    // stripped and its rows joined (aterm-phase, 2026-09-25).
+    let asked = (p.kind == PromptKind::Question)
+        .then(|| aterm_phase::parse_prompt_v2(rows))
+        .flatten()
+        .and_then(|v| v.question_dialog)
+        .and_then(|d| d.question().map(|q| q.text.clone()));
+    let subject = if let Some(asked) = asked {
+        asked
+    } else if !p.command.is_empty() {
         p.command.clone()
     } else if p.kind == PromptKind::Workflow && !p.description.is_empty() {
         p.description.clone()
@@ -190,12 +171,49 @@ fn kind_and_subject(point: &Turn) -> (String, String) {
     (kind, subject)
 }
 
+/// [`kind_and_subject`] from a program's [`aterm_phase::Reading`] alone —
+/// its wall, its last words, its box's kind and command, path or title.
+fn kind_and_subject_read(reader: &dyn ScreenReader, point: &Turn) -> (String, String) {
+    let rows = &point.screen.rows;
+    let last_said = || {
+        reader
+            .said_tail(rows)
+            .and_then(|t| t.lines().last().map(|l| l.trim().to_string()))
+            .unwrap_or_default()
+    };
+    match point.phase {
+        Phase::Idle => match reader.wall(rows) {
+            Some(w) => ("wall".to_string(), one_line(&w.message)),
+            None => ("idle".to_string(), last_said()),
+        },
+        Phase::Question => ("question".to_string(), last_said()),
+        _ => match reader.prompt(rows) {
+            Some(p) => {
+                let subject = [&p.command, &p.description, &p.title]
+                    .into_iter()
+                    .find(|t| !t.is_empty())
+                    .cloned()
+                    .unwrap_or_default();
+                let kind = match p.kind {
+                    PromptKind::Trust => "trust",
+                    PromptKind::Question => "question",
+                    k => k.name(),
+                };
+                (kind.to_string(), subject)
+            }
+            None => ("other".to_string(), String::new()),
+        },
+    }
+}
+
 /// `<program> <kind>: <subject>`, the subject cut at 64 cells: what names a
-/// point in its attention, whatever the reason.
-pub(crate) fn point_label(point: &Turn) -> String {
-    let (kind, subject) = kind_and_subject(point);
+/// point in its attention, whatever the reason — the program its reader's
+/// (`claude`, `codex`).
+pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
+    let (kind, subject) = kind_and_subject(reader, point);
     format!(
-        "{PROGRAM} {kind}: {}",
+        "{} {kind}: {}",
+        reader.program().name(),
         or_dash(&clip_to(&subject, SUBJECT_CELLS))
     )
 }
@@ -204,8 +222,8 @@ pub(crate) fn point_label(point: &Turn) -> String {
 /// cut at 120 cells and then to what the label leaves of the server's
 /// [`ATTENTION_BYTES`] — `…` where it was cut and its `)` kept, so the whole
 /// is always one entry the server takes.
-pub(crate) fn attention_text(point: &Turn, reason: &str) -> String {
-    let label = point_label(point);
+pub(crate) fn attention_text(reader: &dyn ScreenReader, point: &Turn, reason: &str) -> String {
+    let label = point_label(reader, point);
     let reason = clip_to(reason, REASON_CELLS);
     let room = ATTENTION_BYTES.saturating_sub(label.len() + " ()".len());
     let reason = if reason.len() <= room {
@@ -231,13 +249,7 @@ fn refused_cap(r: &CtlReply, sent: &str) -> Option<usize> {
         .filter(|&n: &usize| n > 0 && n < sent.len())
 }
 
-/// The `<field>=` word of a `status` reply (`-` and absent are `None`).
-pub(crate) fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
-    let line = stdout.lines().find(|l| l.starts_with("OK"))?;
-    line.split_whitespace()
-        .find_map(|w| w.strip_prefix(field)?.strip_prefix('='))
-        .filter(|v| *v != "-")
-}
+pub(crate) use super::super::screen::status_field;
 
 impl<C: Ctl> Session<'_, C> {
     /// The fabric's state as the worker's `status` says it (`connected`,
@@ -268,7 +280,11 @@ impl<C: Ctl> Session<'_, C> {
     /// the wall again, the episode of seq=<m>`; so does one adopted from a
     /// previous watcher (`mail=skipped: adopted …`). With no manager, or the
     /// fabric not connected: `mail=skipped: no --inbox and no
-    /// $ATERM_PARENT_SESSION_ID`, `mail=skipped: no fabric (fabric=<state>)`.
+    /// $ATERM_PARENT_SESSION_ID`, `mail=skipped: no fabric (fabric=<state>)`;
+    /// an ask whose fabric read reports the worker not reading its input:
+    /// [`stall::ASK_WITHHELD`] (`stall.rs`). An ask raises no badge at all
+    /// while a stall is in hand, and with no manager it reads `status` first
+    /// for that ([`Self::withhold_badge`]).
     /// An `ask` is posted `--wait=0` and its reply journaled by
     /// [`post_word`] (a queued post says `queued id=<n> (…)`).
     pub(super) fn escalate(
@@ -284,6 +300,9 @@ impl<C: Ctl> Session<'_, C> {
                 "ESCALATED seq={seq} attention=skipped: another supervisor ({holder}) answers \
                  this session mail=skipped: the same"
             ));
+            return Ok(());
+        }
+        if self.withhold_badge(seq, kind, review)? {
             return Ok(());
         }
         let mut attention = fit_bytes(text, ATTENTION_BYTES);
@@ -305,6 +324,9 @@ impl<C: Ctl> Session<'_, C> {
             _ if adopted => "skipped: adopted from a previous watcher".to_string(),
             (None, None) => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
             (None, Some(to)) => match self.fabric_state()?.as_str() {
+                "connected" if kind == "ask" && self.stall_in_hand(review) => {
+                    stall::ASK_WITHHELD.to_string()
+                }
                 "connected" => {
                     let to = format!("to={to}");
                     let kind_arg = format!("kind={kind}");
@@ -331,8 +353,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// A box the loop did not approve, a question the worker asked, or a
-    /// point the turn-end policy escalates (`reason`: why), escalated ONCE
+    /// A box the loop did not answer, or a point the turn-end policy
+    /// escalates (`reason`: why — a question the owner's policy may not
+    /// answer among them), escalated ONCE
     /// PER REVIEW POINT: the worker's `attention` set to [`attention_text`] —
     /// `reason`, else the reason the approval policy gave for a box
     /// ([`Session::box_reason`]) — and one `kind=ask` posted to the manager
@@ -369,11 +392,10 @@ impl<C: Ctl> Session<'_, C> {
         }
         let reason = match (reason, &point.phase, &self.box_reason) {
             (Some(why), _, _) => why.to_string(),
-            (None, Phase::Question, _) => "the worker asked a question".to_string(),
             (None, _, Some((k, why))) if *k == key => why.clone(),
             _ => "no approval rule answers this box".to_string(),
         };
-        let text = attention_text(point, &reason);
+        let text = attention_text(self.reader(&point.screen.rows), point, &reason);
         self.escalate(point.screen.seq, &text, None, "ask", review)?;
         self.box_ask = Some(BoxAsk { key });
         Ok(())
@@ -409,7 +431,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.box_ask.take().is_none() {
             return Ok(());
         }
-        let said = self.unset_if_ours(is_our_point)?;
+        let said = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
         review.note(&format!("CLEARED seq={seq} box attention={said}"));
         Ok(())
     }
@@ -427,6 +449,9 @@ impl<C: Ctl> Session<'_, C> {
         if self.limit.take().is_none() {
             return Ok(());
         }
+        if let Some(host) = &self.stall_host {
+            host.limited(false);
+        }
         let said = self.unset_if_ours(|t| t.starts_with(ATTENTION_PREFIX))?;
         review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
         Ok(())
@@ -436,6 +461,9 @@ impl<C: Ctl> Session<'_, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reader these tests' Claude Code screens are named by.
+    const CLAUDE: &dyn ScreenReader = &aterm_phase::ClaudeReader;
 
     fn turn(phase: Phase, rows: Vec<String>) -> Turn {
         Turn {
@@ -455,6 +483,7 @@ mod tests {
             .map(str::to_string)
             .collect();
         let t = attention_text(
+            CLAUDE,
             &turn(Phase::Prompt, rows),
             "rm circuit breaker (newline reading): unresolved $1",
         );
@@ -463,12 +492,11 @@ mod tests {
             "claude rm-breaker: S=$PWD/tmp; for p in a b; do set -- $p; rm -rf $S/$1; done \
              (rm circuit breaker (newline reading): unresolved $1)"
         );
-        assert!(is_ours(&t) && is_our_point(&t));
         let trust: Vec<String> = include_str!("policy/fixtures/cap-trust.txt")
             .lines()
             .map(str::to_string)
             .collect();
-        let t = attention_text(&turn(Phase::Prompt, trust), "x");
+        let t = attention_text(CLAUDE, &turn(Phase::Prompt, trust), "x");
         assert!(
             t.starts_with("claude trust: /private/tmp/claude-502/scratch/work1 (x)"),
             "{t}"
@@ -489,7 +517,7 @@ mod tests {
                    variable path: $S/$1 in `rm -rf $S/$1` (bind $1 and rewrite its $S as \
                    \"${S:?}\" or use a literal path) ⚠ Claude Code will automatically deny \
                    this request in 1:59, to avoid blocking progress on an unattended session";
-        let t = attention_text(&turn(Phase::Prompt, rows), why);
+        let t = attention_text(CLAUDE, &turn(Phase::Prompt, rows), why);
         assert!(t.len() <= 200, "{} bytes: {t}", t.len());
         assert!(t.ends_with("…)"), "{t}");
         assert!(t.starts_with("claude rm-breaker: "), "{t}");
@@ -524,13 +552,32 @@ mod tests {
         ]
         .map(str::to_string)
         .to_vec();
-        let t = attention_text(&turn(Phase::Prompt, rows.clone()), "no rule");
+        let t = attention_text(CLAUDE, &turn(Phase::Prompt, rows.clone()), "no rule");
         assert!(t.contains("What should I do with a.txt?"), "{t}");
         assert!(!t.contains("Chat about this"), "{t}");
         rows[6] = "Pick one.".to_string();
         rows[0] = "⏺ Which one should I do?".to_string();
-        let t = attention_text(&turn(Phase::Prompt, rows), "no rule");
+        let t = attention_text(CLAUDE, &turn(Phase::Prompt, rows), "no rule");
         assert!(!t.contains("Which one should I do?"), "{t}");
+    }
+
+    /// A question aterm-phase reads whole is badged by its QUESTION, the
+    /// `│` gutter stripped (the incident's screen, S6-01): never a transcript
+    /// row, never `4. Chat about this`.
+    #[test]
+    fn a_question_read_whole_is_badged_by_its_question() {
+        use aterm_phase::prompt::fixtures as f;
+        let rows = f::screen(f::QUESTION_TABS_INCIDENT);
+        let t = attention_text(
+            CLAUDE,
+            &turn(Phase::Prompt, rows),
+            "a person has begun answering",
+        );
+        assert!(
+            t.starts_with("claude question: On a row with a progress bar, how should its"),
+            "{t}"
+        );
+        assert!(!t.contains('│') && !t.contains("Chat about this"), "{t}");
     }
 
     #[test]
@@ -541,25 +588,10 @@ mod tests {
             .position(|r| r == "   git log --oneline -5")
             .expect("row");
         rows[at] = format!("   echo {}", "é".repeat(300));
-        let t = attention_text(&turn(Phase::Prompt, rows), &"why ".repeat(100));
+        let t = attention_text(CLAUDE, &turn(Phase::Prompt, rows), &"why ".repeat(100));
         assert!(t.len() <= ATTENTION_BYTES, "{}", t.len());
         assert!(t.starts_with("claude bash: echo é"), "{t}");
         assert!(t.contains('…'));
-    }
-
-    /// Negative controls: another writer's badge, and look-alikes, are not
-    /// ours.
-    #[test]
-    fn only_this_loops_texts_are_ours() {
-        assert!(is_ours("limited: Weekly limit reached reset=Sep 20"));
-        assert!(is_ours("claude needs approval: Bash command"));
-        assert!(is_ours(
-            "claude question: which one? (the worker asked a question)"
-        ));
-        assert!(!is_ours("aterm harness: model bucket"));
-        assert!(!is_ours("claude teapot: x"));
-        assert!(!is_ours("codex bash: ls"));
-        assert!(!is_our_point("limited: x reset=-"));
     }
 
     #[test]
@@ -569,5 +601,28 @@ mod tests {
         assert_eq!(status_field(st, "hold"), Some("0"));
         assert_eq!(status_field(st, "identity"), None);
         assert_eq!(status_field(st, "nope"), None);
+    }
+
+    /// The 2026-09-24 incident box — the rm breaker's statically-unresolvable
+    /// form from a workflow subagent — is badged `rm-breaker`, like the
+    /// possibly-empty-variable form: the family, not one note's prefix.
+    /// Control: a plain Bash box is badged `bash`.
+    #[test]
+    fn every_rm_breaker_kind_is_badged_rm_breaker() {
+        use aterm_phase::prompt::fixtures as f;
+        let incident = f::screen(f::BOX_RM_UNRESOLVABLE_WORKFLOW);
+        let (kind, _) =
+            kind_and_subject(&aterm_phase::ClaudeReader, &turn(Phase::Prompt, incident));
+        assert_eq!(kind, "rm-breaker");
+        let (kind, _) = kind_and_subject(
+            &aterm_phase::ClaudeReader,
+            &turn(Phase::Prompt, f::screen(f::BOX_RM)),
+        );
+        assert_eq!(kind, "rm-breaker");
+        let (kind, _) = kind_and_subject(
+            &aterm_phase::ClaudeReader,
+            &turn(Phase::Prompt, f::bash_one_row()),
+        );
+        assert_eq!(kind, "bash");
     }
 }

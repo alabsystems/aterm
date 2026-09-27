@@ -56,7 +56,7 @@ excludes the toolset, `--no-path` leaves your shell profile untouched,
 every edit — and writes nothing, and `--uninstall` reverses everything it
 installed. The toolset exclusion does not persist yet: `--no-toolchain` writes
 no config, so the app's first launch still installs the toolset unless
-`[packages].seed_install = false` is in `aterm.toml` first (`aterm help pkg`).
+`[packages].auto_install = false` is in `aterm.toml` first (`aterm help pkg`).
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel), from the
@@ -248,11 +248,11 @@ aterm ships as one executable. Invocation chooses the surface:
 | `aterm --session` | Force the PTY session in a pipe or CI | No |
 
 The same binary answers the front-door verbs — `ctl`, `conn`, `pkg`, `fleet`,
-`drive`, `update`, `agents`, `new-tab`, `new-window`, `split-pane` — plus
-`aterm help`, the diagnostic words (`doctor`, `show-config`, `validate-config`,
-`list-themes`, …), and managed-tool dispatch. Compatibility names such as
-`aterm-ctl`, `atpkg`, `aterm-fleet`, and `aterm-drive` are symlinks onto that
-binary, not separate products, and the app bundle ships them beside it.
+`drive`, `fabric`, `link`, `update`, `agents`, `harness`, `new-tab`, `new-window`,
+`split-pane` — plus `aterm help`, the diagnostic words (`doctor`, `show-config`,
+`explain-config`, `list-themes`, …), and managed-tool dispatch. Compatibility
+names such as `aterm-ctl`, `atpkg`, `aterm-fleet`, and `aterm-drive` are symlinks
+onto that binary, not separate products, and the app bundle ships them beside it.
 
 The plain TTY session deliberately serves no socket — use window or headless mode
 when another process needs to observe or drive a session. Those modes enable
@@ -271,9 +271,12 @@ Coding agents learn that aterm exists without anyone running anything: each
 session aterm opens detects the coding agents on the machine — Claude Code,
 Codex CLI, Gemini CLI, and OpenCode — and keeps a short primer current in each
 one's global context file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …).
-The primer only activates when the agent finds itself inside aterm; Claude Code
-also gets bundled `drive-aterm` and `supervise-agent` skills. An agent launched inside an aterm
-window or headless instance then knows to detect it (`TERM_PROGRAM=aterm` /
+The aterm brief in that primer only activates when the agent finds itself inside
+aterm (its Rust note and peer-messaging note gate on the toolchain and the fabric
+instead). Claude Code also gets four bundled skills — `drive-aterm`,
+`supervise-agent`, `rust-in-aterm` and `aterm-fabric` — and the other agents get
+`aterm-fabric` as a command. An agent launched inside an aterm window or headless
+instance then knows to detect it (`TERM_PROGRAM=aterm` /
 `ATERM_CHILD=1`), to run `aterm help` — which there prints the agent operating
 brief with the caller's own session ID already filled in — and to list the
 windows and sessions and read a peer's `status` before typing into it.
@@ -290,8 +293,8 @@ Two facts agent builders ask about first:
 
 - **Env hygiene is unconditional.** Every shell aterm spawns has `CLAUDE*`,
   `ANTHROPIC_*`, `COPILOT_*`, `CODEX_*`, `CURSOR_*`, `AI_*`, and `_DEVTOOL_*`
-  stripped, along with aterm's own socket, containment, and network selectors,
-  so an outer agent's context never leaks into an inner session.
+  stripped, along with aterm's own session identity (re-issued fresh to each
+  child), so an outer agent's context never leaks into an inner session.
 - **There is no MCP server, by design.** The integration surfaces are the CLI
   (`aterm ctl`, `aterm conn`, `aterm drive`, `aterm fleet`) and the Rust library
   API.
@@ -361,9 +364,11 @@ the inverse of `match`, for a turn whose end is a busy footer leaving), `block`
 a cheap one-shot "did anything change?" check, and any timeout exits with code
 124 so a script can tell "not yet" from "failed".
 
-Socket discovery is automatic for ordinary local use: `--sock`, `--pid`,
-`$ATERM_CONTROL_SOCK`, then the instance hosting your own terminal, then the
-per-user socket that always points at the newest instance. `aterm ctl help`
+Socket discovery is automatic for ordinary local use: `--sock`, `--pid`, then
+the instance hosting your own terminal, then the per-user socket that always
+points at the newest instance. (A private instance binds its own path with
+`aterm --headless --control-sock <path>`; no environment variable selects a
+socket.) `aterm ctl help`
 prints the short verb catalog from a running instance, `aterm ctl help <verb>`
 one verb's full entry, and `aterm help introspection` the full catalog
 anywhere. All of them are generated from the one typed verb table the server
@@ -452,26 +457,26 @@ alt-screen and password contexts. Box drawing, blocks, braille, and Powerline
 separators are generated from cell geometry so adjacent shapes meet cleanly.
 When nothing is animating and no deadline is pending, the event loop parks.
 
-The window renders through wgpu — Metal on macOS, Vulkan on Linux, DX12 on
-Windows — with the CPU rasterizer as automatic fallback or explicit `--cpu`
-choice; a parity suite renders the same frames both ways and holds them to a
-small channel tolerance. On macOS the titlebar is the tab strip, the menu bar is
-a real menu bar, and a `❯` status item in the system menu bar gives an operator
-glance across sessions and instances.
+The window renders on the GPU — aterm's own Metal backend on macOS, wgpu over
+Vulkan on Linux and DX12 on Windows — with the CPU rasterizer as automatic
+fallback or explicit `--cpu` choice; a parity suite renders the same frames both
+ways and holds them to a small channel tolerance. On macOS the titlebar is the
+tab strip, the menu bar is a real menu bar, and a `❯` status item in the system
+menu bar gives an operator glance across sessions and instances.
 
 Tabs, split panes, and multiple windows live in one process; tabs carry busy and
 attention badges (a failed command flags its tab), the focused pane is marked in
 the split divider, and the workspace is restored across quit and relaunch. Cmd-,
-opens native Settings as a tab (Appearance, Wallpaper, Text & Fonts, Cursor &
+opens native Settings as a tab (Manual, Appearance, Wallpaper, Text & Fonts, Cursor &
 Motion, Cursor Kitty, Window, Tab Color, Keyboard & Input, Terminal, Security,
-Software Update, Packages, About); Markdown files and a native Editor open as
-tabs too. Cmd-F searches screen and scrollback with regex, Shift-Cmd-P opens the
-command palette, and the built-in chords are rebindable through `[keybindings]`
-(`aterm --window --list-actions` prints the set). Twelve colour themes are built
-in (`aterm list-themes`), `theme = "dark:…,light:…"` follows the OS appearance,
-and `~/.config/aterm/themes/*.conf` adds your own. Typography covers ligatures,
-OpenType features, variable-font weight, ordered fallback fonts, and bundled
-display faces.
+Software Update, Packages, Messages, About); Markdown files and a native Editor
+open as tabs too. Cmd-F searches screen and scrollback with regex, Shift-Cmd-P
+opens the command palette, and the built-in chords are rebindable through
+`[keybindings]` (`aterm --window --list-actions` prints the set). Twelve colour
+themes are built in (`aterm list-themes`), `theme = "dark:…,light:…"` follows the
+OS appearance, and `~/.config/aterm/themes/*.conf` adds your own. Typography
+covers ligatures, OpenType features, variable-font weight, ordered fallback fonts,
+and bundled display faces.
 
 Accessibility is honest about its cost: a Linux build carries the AccessKit tree
 unconditionally, so a screen reader gets the grid and the Settings tree there by
@@ -498,12 +503,12 @@ aterm pkg list
 
 `aterm <tool>` resolves against the managed store — never `$PATH` — so aterm's
 own verbs cannot be shadowed. On `$PATH` itself the managed tools come last, so
-a `trust`, `ty` or `clean` you already had (Homebrew's p11-kit ships a `trust`;
-Homebrew core has formulae named `ty` and `clean`) keeps winning — `alab-<tool>`
-(`alab-trust`, `alab-ty`, …) always names ALab's copy, and `aterm pkg which
-<tool>` says which one runs. Settings ▸ Packages ▸ Install ALab Toolset (or
-`aterm pkg install --default-set`) fetches the whole set at once, and the
-windowed app keeps installed packages current on a six-hour loop.
+a `ty` or `clean` you already had (Homebrew core has formulae with those names)
+keeps winning — `alab-<tool>` (`alab-ty`, `alab-clean`, …) always names ALab's
+copy, and `aterm pkg which <tool>` says which one runs. Settings ▸ Packages ▸
+Install ALab Toolset (or `aterm pkg install --default-set`) fetches the whole
+set at once, and the windowed app keeps installed packages current on a six-hour
+loop.
 
 Packages ride the same trust chain as the app updater (see
 [Security model](#security-model)): every download is verified before it is
@@ -663,26 +668,19 @@ against `alacritty_terminal` (the `ay` bundles stay internal). These prove or
 test named, bounded contracts — not the whole emulator, renderer, or OS. Run
 `cargo run -q -p xtask -- gate counts` for the live inventory; totals are
 computed from source, never maintained in prose. Every gate is a local command —
-`tools/verify.sh --fast` is the merge contract and runs the L0 temporal-safety
+`tools/verify.sh` is the merge contract and runs the L0 temporal-safety
 gate as one of its unconditional stages, the release cutter re-runs those six
 obligations itself before it claims a build number, the full ladder runs by
-hand, and there is no hosted CI. The pinned pre-push hook GATES the push, and
-does it without running anything: `tools/verify.sh` writes a receipt for a
-clean tree — into the repository's git common dir, which every worktree shares —
-naming the commit it verified and what that run discharged, never letting a
-weaker run's replace a whole-tree one, and the hook refuses a push of any commit
-that has no passing receipt (`ATERM_PUSH_NO_GATE=1` is the named, logged
-exception). Passing means a whole-tree run that discharged the merge contract;
-a narrowed run (`--changed`, `--scope`) admits nothing, because other crates'
-tests read files no dependency edge names. Three pushes bring no ungated code and
-owe no receipt of their own: a tag; bookkeeping over the remote's current tip —
-the release cutter's claim (`RELEASES.ledger`, `CHANGELOG.md`) and a pure
-workspace version bump (`Cargo.toml` and `Cargo.lock`, `version` lines only);
-and a clean automatic merge of a receipted commit onto the remote's current tip,
-admitted only when its tree is byte-equal to git's own merge of those two
-parents. Checking a result instead of producing one is microseconds, and it
-cannot lose a ref race. So L0 is enforced at the push and again at the release
-cut.
+hand, and there is no hosted CI and no git hook — by the owner's decision,
+every gate runs inline in the tool being run. `tools/verify.sh` writes a receipt
+for a clean tree — into the repository's git common dir, which every worktree
+shares — naming the commit it verified and what that run discharged, never
+letting a weaker run's replace a whole-tree one; a narrowed run (`--changed`,
+`--scope`) vouches for nothing, because other crates' tests read files no
+dependency edge names. The release cutter reads those receipts itself and states
+in the cut's transcript how many commits the built commit sits above the newest
+one a whole-tree pass vouches for. So L0 is enforced by the merge contract and
+again, unconditionally, at the release cut.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via
@@ -714,9 +712,12 @@ aterm list-kitty-commands    # the words the cursor cat obeys when typed (aterm 
 
 Configuration is loaded from `$XDG_CONFIG_HOME/aterm/aterm.toml`, falling back to
 `%APPDATA%\aterm\aterm.toml` on Windows and `~/.config/aterm/aterm.toml`
-elsewhere. Explicit flags override environment variables, which override the
-file. The window watches the configuration and applies supported changes without
-a restart, and Settings ▸ Manual opens the file in the native editor.
+elsewhere. Explicit flags override the file. No `ATERM_*` or `ATPKG_*` variable is a
+setting in a shipped aterm — the few it reads are what it hands its own children —
+while the standard ones (`$XDG_CONFIG_HOME`, `$HOME`, `$SHELL`) keep their usual
+meaning. The window watches the configuration and applies supported
+changes without a restart, and Settings ▸ Manual opens the file in the native
+editor.
 
 By default the windowed app talks to GitHub for at most two things — the app
 update check (eligible macOS or enrolled Linux installs) and the toolchain package update pass — and contains

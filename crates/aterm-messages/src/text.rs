@@ -28,7 +28,7 @@ use crate::{GLASS_TITLE_CHARS, GLASS_TITLE_WORDS, PIECE_SEP};
 /// crate's own hardening, because the band prints paths and commands that a
 /// reversed run could forge, and the log page copies them to a clipboard).
 #[must_use]
-pub fn sanitize(s: &str, cap: usize) -> String {
+pub(crate) fn sanitize(s: &str, cap: usize) -> String {
     let mut out = String::with_capacity(s.len().min(cap.saturating_add(4)));
     for (i, c) in s.chars().filter(|c| !is_stripped(*c)).enumerate() {
         if i >= cap {
@@ -67,7 +67,7 @@ fn is_stripped(c: char) -> bool {
 /// `s` in at most `max` chars, the last one `…` when it was cut
 /// (`status_bars.rs:2645`). `max == 0` is the empty string.
 #[must_use]
-pub fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     let n = s.chars().count();
     if n <= max {
         return s.to_string();
@@ -83,7 +83,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// Sanitize, then fit in `cap` chars INCLUDING the ellipsis — what every
 /// message field is stored as.
 #[must_use]
-pub fn clip(s: &str, cap: usize) -> String {
+pub(crate) fn clip(s: &str, cap: usize) -> String {
     truncate(&sanitize(s, usize::MAX), cap)
 }
 
@@ -167,6 +167,15 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
     let mut clean = sanitize(detail, usize::MAX);
     if char_width(&clean) <= cap {
         return clean;
+    }
+    // A CORRECTION — `windw_padding → window_padding` — cut is the right
+    // side alone (design ruling 261): the fix is what the person types, and
+    // a cut that kept the typo kept the one word that is wrong.
+    if let Some((_, fix)) = clean.split_once(" \u{2192} ")
+        && !fix.contains(" \u{2192} ")
+        && !fix.trim().is_empty()
+    {
+        return truncate(fix.trim(), cap);
     }
     if clean.contains('`') && clean.contains(PIECE_SEP) {
         let pieces: Vec<&str> = clean.split(PIECE_SEP).collect();
@@ -332,7 +341,7 @@ fn is_path_atom(token: &str) -> bool {
 /// `…/crash.log`); when even the file name is too long, the file name's own
 /// tail. Whole when it fits; `cap < 2` is `…` alone (or nothing at 0).
 #[must_use]
-pub fn shape_path(path: &str, cap: usize) -> String {
+pub(crate) fn shape_path(path: &str, cap: usize) -> String {
     if char_width(path) <= cap {
         return path.to_string();
     }
@@ -377,7 +386,7 @@ fn shape_path_in(clean: &str, cap: usize) -> Option<String> {
 /// Prose cut to at most `cap` chars on a word boundary, ending in `…`:
 /// "these are what…", never "these are wha…".
 #[must_use]
-pub fn trim_words(s: &str, cap: usize) -> String {
+pub(crate) fn trim_words(s: &str, cap: usize) -> String {
     if char_width(s) <= cap {
         return s.to_string();
     }
@@ -395,49 +404,6 @@ pub fn trim_words(s: &str, cap: usize) -> String {
     let mut out = out.trim_end().to_string();
     out.push('\u{2026}');
     out
-}
-
-/// Greedy word wrap to `width` chars per line; a word longer than the width
-/// is split hard. `width == 0` yields the text as one line.
-#[must_use]
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut line_w = 0;
-    for word in text.split(' ') {
-        let mut word = word;
-        let mut w = char_width(word);
-        while w > width {
-            // A word wider than the line: flush what is there, then hard-split.
-            if line_w > 0 {
-                lines.push(std::mem::take(&mut line));
-                line_w = 0;
-            }
-            let cut = word
-                .char_indices()
-                .nth(width)
-                .map_or(word.len(), |(i, _)| i);
-            lines.push(word[..cut].to_string());
-            word = &word[cut..];
-            w = char_width(word);
-        }
-        let need = if line_w == 0 { w } else { line_w + 1 + w };
-        if need > width && line_w > 0 {
-            lines.push(std::mem::take(&mut line));
-            line_w = 0;
-        }
-        if line_w > 0 {
-            line.push(' ');
-            line_w += 1;
-        }
-        line.push_str(word);
-        line_w += w;
-    }
-    lines.push(line);
-    lines
 }
 
 /// The WORDS of a title: whitespace tokens carrying a letter, so a route's
@@ -763,15 +729,5 @@ mod tests {
         assert_eq!(trim_words("aaaa bbbb", 6), "aaaa\u{2026}");
         assert_eq!(trim_words("aaaaaaaa", 4), "aaa\u{2026}");
         assert_eq!(trim_words("aaaa", 0), "");
-    }
-
-    #[test]
-    fn wrap_breaks_on_words_and_splits_long_ones() {
-        assert_eq!(wrap("one two three", 7), vec!["one two", "three"]);
-        assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
-        assert_eq!(wrap("a abcdefgh b", 4), vec!["a", "abcd", "efgh", "b"]);
-        assert_eq!(wrap("", 4), vec![""]);
-        assert_eq!(wrap("x y", 0), vec!["x y"]);
-        assert_eq!(wrap("héllo wörld", 5), vec!["héllo", "wörld"]);
     }
 }

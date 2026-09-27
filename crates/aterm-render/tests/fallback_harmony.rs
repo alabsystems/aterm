@@ -221,6 +221,95 @@ fn fallback_fit_scale_contains_ink_and_preserves_aspect() {
     assert!(shrunk > 0, "the oversize arm must be exercised");
 }
 
+/// The SYMBOL fit contains the centred ink (not the advance), is never
+/// smaller than the text fit, never enlarges — and on a wide-advance symbol
+/// (Noto Sans Symbols 2's `⏺` shape: 0.9 em advance, 0.7 em disc) it is
+/// materially larger. Negative control: the text fit of the same geometry is
+/// the two-thirds size the symbol fit exists to replace.
+#[test]
+fn fallback_ink_fit_scale_contains_the_ink_only() {
+    use aterm_render::fallback_ink_fit_scale;
+    let mut larger = 0usize;
+    for box_w in 1..=32usize {
+        for box_h in 1..=40usize {
+            for width in 1..=48usize {
+                for height in [1usize, 7, 19, 41] {
+                    for xmin in [-8i32, -1, 0, 3, 11] {
+                        for advance in [1.0f32, 8.5, 20.0, 55.25] {
+                            let ink =
+                                fallback_ink_fit_scale(box_w, box_h, width, height, xmin, advance);
+                            let text =
+                                fallback_fit_scale(box_w, box_h, width, height, xmin, advance);
+                            assert!(ink.is_finite() && ink > 0.0 && ink <= 1.0);
+                            assert!(ink >= text, "the ink fit shrank more than the text fit");
+                            let centre = advance * 0.5;
+                            let radius = (xmin as f32 - centre)
+                                .abs()
+                                .max((xmin as f32 + width as f32 - centre).abs());
+                            assert!(
+                                2.0 * radius * ink <= box_w as f32 + 1e-4,
+                                "centred ink escaped: box={box_w} width={width} \
+                                 xmin={xmin} advance={advance} scale={ink}"
+                            );
+                            assert!(height as f32 * ink <= box_h as f32 + 1e-4);
+                            larger += usize::from(ink > text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(larger > 0, "the side-bearing arm must be exercised");
+    // ⏺ at 18 px in an 11 px cell: 13 px advance, a 10 px disc inset 1.5 px.
+    let ink = fallback_ink_fit_scale(11, 24, 10, 10, 1, 13.0);
+    let text = fallback_fit_scale(11, 24, 10, 10, 1, 13.0);
+    assert!(ink >= 0.99, "the disc already fits the cell: {ink}");
+    assert!(
+        text < 0.85,
+        "negative control — the advance fit shrinks it: {text}"
+    );
+}
+
+/// The fit class is the code point's Unicode class: letters (every script,
+/// the Mathematical Alphanumeric block included) and digits are TEXT;
+/// pictographs, media controls, shapes, dingbats and operators are SYMBOLS.
+#[test]
+fn the_fallback_fit_class_follows_the_unicode_class() {
+    use aterm_render::{FallbackFit, fallback_fit_class};
+    for ch in [
+        'A', 'ж', 'ß', '中', 'あ', '𝐖', '𝐌', '𝑊', '𝓜', 'ℵ', '𝟙', '7', '٣', 'Ⅻ',
+    ] {
+        assert_eq!(fallback_fit_class(ch), FallbackFit::Text, "{ch}");
+    }
+    for ch in [
+        '⏺', '⏸', '●', '⬤', '✔', '★', '⚠', '∑', '→', '⊕', '♥', '☃', '⎿',
+    ] {
+        assert_eq!(fallback_fit_class(ch), FallbackFit::Symbol, "{ch}");
+    }
+}
+
+/// The TEXT anchor scales `ymin` about the baseline: a glyph standing on the
+/// line keeps standing on it, a descender keeps a scaled descent. Negative
+/// control: the SYMBOL anchor lifts the same letter off the line.
+#[test]
+fn a_text_shrink_keeps_the_baseline() {
+    use aterm_render::{shrink_ymin_about_baseline, shrink_ymin_about_ink_centre};
+    for s in 1..=100 {
+        let scale = s as f32 / 100.0;
+        assert_eq!(shrink_ymin_about_baseline(0, scale), 0);
+        for ymin in -20i32..0 {
+            let y = shrink_ymin_about_baseline(ymin, scale);
+            assert!(y <= 0 && y >= ymin, "ymin {ymin} x{scale} -> {y}");
+        }
+    }
+    // Noto Sans Math `𝐖` at 18 px: 12 rows on the baseline, shrunk to 8.
+    assert_eq!(shrink_ymin_about_baseline(0, 8.0 / 12.0), 0);
+    assert!(
+        shrink_ymin_about_ink_centre(0, 12, 8, 18, 24) >= 2,
+        "negative control — centring floats the letter"
+    );
+}
+
 /// Cell allocation is Unicode-width/config driven, never inferred from a
 /// fallback font's proportional advance. This is the CJK/combining guard for
 /// the warning-sign fix.
@@ -866,8 +955,11 @@ fn narrow_fallback_symbol_is_bounded_to_one_cell() {
         );
         variants.push(styled);
     }
-    // Non-vacuity: the synthetic style ran BEFORE the final fit; the fitted
-    // masks are contained but not silently collapsed back to regular.
+    // Non-vacuity: the synthetic style is applied to the FITTED mask
+    // (deferred, so it cannot shrink the glyph), and the masks are contained
+    // but never silently collapsed back to regular. The fitted warning fills
+    // its cell's width, which left a style that yielded to the box no room
+    // at all: bold and italic drew exactly the regular mask.
     for (name, styled) in [("bold", &variants[1]), ("italic", &variants[2])] {
         assert!(
             styled.bytes() != variants[0].bytes()
@@ -925,10 +1017,6 @@ fn native_cjk_face_leads_the_macos_chain() {
     use aterm_render::{Renderer, Theme};
     if !std::path::Path::new("/System/Library/Fonts/Hiragino Sans GB.ttc").exists() {
         eprintln!("SKIP: Hiragino Sans GB not installed");
-        return;
-    }
-    if std::env::var_os("ATERM_FALLBACK_FONT").is_some() {
-        eprintln!("SKIP: ATERM_FALLBACK_FONT overrides the builtin chain");
         return;
     }
     let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
@@ -1080,4 +1168,45 @@ fn a_long_arrow_does_not_shear_a_box_drawing_row() {
             "the long arrow painted into col {spill}"
         );
     }
+}
+
+/// A shrink keeps the ink's vertical centre (to within the half-pixel the
+/// integer grid forces), and when the smaller ink fits the row band it is
+/// placed INSIDE it rather than left for `clamp_to_row_band` to crop —
+/// exhaustive over a small geometry lattice.
+#[test]
+fn a_shrink_keeps_the_ink_centre_and_lands_in_the_band() {
+    use aterm_render::shrink_ymin_about_ink_centre as shrink;
+    for cell_h in 8usize..=24 {
+        for baseline in 0..=cell_h as i32 {
+            for h in 1usize..=40 {
+                for dst_h in 1..=h.min(cell_h) {
+                    for ymin in -20i32..=20 {
+                        let y = shrink(ymin, h, dst_h, baseline, cell_h);
+                        let top = baseline - dst_h as i32 - y;
+                        assert!(
+                            top >= 0 && top + dst_h as i32 <= cell_h as i32,
+                            "ymin {ymin} h {h}->{dst_h} baseline {baseline} cell {cell_h}: \
+                             top row {top} leaves the band"
+                        );
+                        // Where the band does not bind, the centre moves by at
+                        // most half a px.
+                        let unclamped = (2 * ymin + h as i32 - dst_h as i32 + 1).div_euclid(2);
+                        let (lo, hi) = (baseline - cell_h as i32, baseline - dst_h as i32);
+                        if (lo..=hi).contains(&unclamped) {
+                            let want2 = 2 * ymin + h as i32;
+                            let got2 = 2 * y + dst_h as i32;
+                            assert!(
+                                (want2 - got2).abs() <= 1,
+                                "ymin {ymin} h {h}->{dst_h}: centre {got2}/2 vs {want2}/2"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The measured case: a disc 16 rows tall resting ON the baseline, shrunk
+    // to 11, is lifted by the 2.5 px the baseline anchor used to drop it.
+    assert_eq!(shrink(0, 16, 11, 25, 34), 3);
 }

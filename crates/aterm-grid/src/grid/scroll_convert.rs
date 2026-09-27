@@ -190,11 +190,6 @@ fn row_has_extractable_cells(cells: &[Cell]) -> bool {
     found
 }
 
-/// Cell layout version guard. If the Cell layout changes, deferred lines
-/// created under the old layout must not be materialized as-is.
-/// Bump this when `Cell`'s `repr(C, packed)` layout changes.
-pub(crate) const CELL_LAYOUT_VERSION: u8 = 1;
-
 // Compile-time guard: DeferredLine depends on Cell being exactly 8 bytes.
 const _: () = assert!(std::mem::size_of::<Cell>() == 8);
 
@@ -223,9 +218,6 @@ pub(crate) struct DeferredLine {
     extras: Option<Box<ScrolledRowExtras>>,
     /// Whether the row was wrapped (soft line continuation).
     wrapped: bool,
-    /// Cell layout version at creation time.
-    #[allow(dead_code, reason = "safety guard for future Cell layout changes")]
-    layout_version: u8,
     /// Cached materialized Line. Populated on first access.
     cached: OnceCell<Line>,
 }
@@ -278,7 +270,6 @@ impl DeferredLine {
             // and the two `materialize` readers see the same shape as before.
             extras: extras.filter(|b| !b.is_empty()),
             wrapped: row.is_wrapped(),
-            layout_version: CELL_LAYOUT_VERSION,
             cached: OnceCell::new(),
         }
     }
@@ -1110,9 +1101,8 @@ impl Grid {
         //
         // NOTE for the next reader: `has_style_id()` is a TEST/KANI-only signal
         // in practice. `RowFlags::HAS_STYLE_ID` is only ever ORIGINATED by
-        // `row/style_id_write.rs`, which is
-        // `#[cfg(any(test, kani, feature = "testing"))]` (`Row::mark_has_style_id`
-        // has no production caller; `Row::set` merely propagates the bit). So in
+        // `row/style_id_write.rs`, which is `#[cfg(any(test, kani))]`
+        // (`Row::set` merely propagates the bit). So in
         // the shipped binary this short-circuit rests entirely on
         // `has_any_data()` — do not build an optimization on the assumption that
         // a styled production row reports `has_style_id()`.

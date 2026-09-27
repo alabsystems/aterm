@@ -1,0 +1,14 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, Xo() (`Edit notebook`, the insert-cell question), on the measured 2.1.280/2.1.281 box geometry · a notebook edit: no path row, the file named by the question
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Edit notebook
+ 
+   cell 3
+
+ Do you want to insert this cell into a.ipynb?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

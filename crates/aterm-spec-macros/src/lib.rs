@@ -9,73 +9,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{DeriveInput, parse_macro_input};
-
-#[proc_macro_derive(SpecState, attributes(spec_machine))]
-pub fn derive_spec_state(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let mut machine_name = None;
-    let mut tla_file = None;
-
-    for attr in &input.attrs {
-        if attr.path().is_ident("spec_machine") {
-            let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("name") {
-                    let value = meta.value()?;
-                    let lit: syn::LitStr = value.parse()?;
-                    machine_name = Some(lit.value());
-                } else if meta.path.is_ident("tla_file") {
-                    let value = meta.value()?;
-                    let lit: syn::LitStr = value.parse()?;
-                    tla_file = Some(lit.value());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    let machine_name_str =
-        machine_name.unwrap_or_else(|| name.to_string().trim_end_matches("Model").to_lowercase());
-    let tla_file_str = tla_file.unwrap_or_default();
-
-    let expanded = quote! {
-        impl #name {
-            pub const SPEC_MACHINE_NAME: &'static str = #machine_name_str;
-            pub const SPEC_TLA_FILE: &'static str = #tla_file_str;
-        }
-    };
-
-    TokenStream::from(expanded)
-}
-
-#[proc_macro_derive(SpecAction)]
-pub fn derive_spec_action(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let variant_names: Vec<String> = match &input.data {
-        syn::Data::Enum(data) => data.variants.iter().map(|v| v.ident.to_string()).collect(),
-        _ => {
-            return syn::Error::new_spanned(name, "SpecAction can only be derived for enums")
-                .to_compile_error()
-                .into();
-        }
-    };
-
-    let count = variant_names.len();
-
-    let expanded = quote! {
-        impl #name {
-            pub const SPEC_ACTIONS: [&'static str; #count] = [
-                #(#variant_names),*
-            ];
-        }
-    };
-
-    TokenStream::from(expanded)
-}
+use syn::parse_macro_input;
 
 // ---------------------------------------------------------------------------
 // Source↔spec ANCHOR EMITTERS (TRUST_NATIVE_TLA, Phase 0).
@@ -136,7 +70,7 @@ fn sanitize_ident(s: &str) -> String {
 // `#[refines]` used to leave the annotated fn 100% unchanged, which is exactly why
 // a green closure gate was a claim about STRINGS: nothing tied the anchor to a fn
 // that performs the action, and an anchor moved onto `Terminal::is_tmux_mode_active()`
-// (body: `false`, callers: none) kept the gate green.
+// (body: `false`, callers: none; since deleted) kept the gate green.
 //
 // So the emitter now ALSO injects, as the FIRST statement of the annotated fn's
 // body, `::aterm_spec::xref::note_entered("<machine>::<action> @ <fn>")`. The id is

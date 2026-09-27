@@ -216,8 +216,8 @@ fn an_interactive_session_launch_over_a_never_checked_store_writes_nothing_to_st
     hold_the_pass(&root);
     let status = prefix(&root).join("status.toml");
     assert!(
-        aterm_update_core::pkg_check::never_checked(&status),
-        "precondition: no pass has completed in this HOME"
+        !status.exists(),
+        "precondition: no pass has written a status record in this HOME"
     );
     let (stderr, screen) = launch(&root, false);
     assert_silent("a never-checked store", &stderr, &screen);

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Trail Packs — user-generated **cursor trails as data** (design v1,
-//! `docs/trail-packs-design.md`). A Trail Pack is one versioned, bounded,
+//! Trail Packs — user-generated **cursor trails as data** (the guide is
+//! `docs/trail-packs.md`). A Trail Pack is one versioned, bounded,
 //! fail-closed TOML file that SELECTS among the engine's EXISTING cursor-glow
 //! emitters/channels: the additive [`aterm_render::custom_beam_quads`] beam,
 //! the [`aterm_render::RainHalo`] crown, ≤3 particle populations, and a colour
@@ -34,6 +34,7 @@
 //! pack field: it is enforced downstream in the interpreter's sole emission
 //! funnel (`cursor_glow::CursorGlow::emit_custom`), so a pack cannot opt out.
 
+#[cfg(test)]
 use std::path::Path;
 
 /// Trail Pack schema version accepted by [`compile_trail_pack_toml`].
@@ -69,7 +70,7 @@ pub const QUANT: f32 = 1024.0;
 // Engine-proven clamp bounds (design §"Validation & safety envelope").
 const MIN_WINDOW_MS: u16 = 30;
 const MAX_WINDOW_MS: u16 = 2000;
-const MAX_LAYER_THICKNESS: f32 = 16.0; // LASER_LAYERS max
+const MAX_LAYER_THICKNESS: f32 = 16.0; // widest proven bloom layer (×core)
 const MAX_VELOCITY_CELLS: f32 = 4.0; // ≤4 cells/s
 const MAX_PARTICLE_LIFE: f32 = 2.0; // ≤2 s
 const MAX_TYPING_BURST: u8 = 44; // the fire ember-column maximum
@@ -413,6 +414,7 @@ pub struct CompiledTrailPack {
 
 impl CompiledTrailPack {
     #[must_use]
+    #[cfg(test)]
     pub fn metadata(&self) -> &TrailPackMetadata {
         &self.metadata
     }
@@ -470,6 +472,7 @@ impl std::error::Error for TrailPackError {}
 /// allocation (the FIFO-safe bounded read, mirroring
 /// [`crate::spec::read_toy_pack_file`]). Hosts call this before
 /// [`compile_trail_pack_toml`].
+#[cfg(test)]
 pub fn read_trail_pack_file(path: &Path) -> std::io::Result<String> {
     crate::file_feed::read_bounded_regular_utf8(path, MAX_TRAIL_PACK_BYTES)
 }

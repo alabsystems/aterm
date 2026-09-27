@@ -242,9 +242,12 @@ struct Take {
 /// The Claude Code takes (`resize 40 120`, 7×14 px cells, recorded
 /// 2026-09-21 under a PTY wrapper inside a headless aterm: the owner's line
 /// at 12 cps, ⌥← and `INTO ` inserted, ⌥→ / End back, three hops each way,
-/// an `@`-mention popup) and Codex's particle take (`resize 32 100`, 7×14 px,
-/// 2026-09-16: a line, ⌥← ×3, a word typed inside it, ⌥→ ×3, two letters).
-const TAKES: [Take; 5] = [
+/// an `@`-mention popup), Codex's particle take (`resize 32 100`, 7×14 px,
+/// 2026-09-16: a line, ⌥← ×3, a word typed inside it, ⌥→ ×3, two letters),
+/// and the plain-arrow insert take (`resize 40 120`, recorded 2026-09-24
+/// under a bare PTY wrapper against Claude Code 2.1.282: a line at 12 cps,
+/// ← ×12 at 150 ms, `NEW words ` typed inside it, ← ×6 at 60 ms, `more`).
+const TAKES: [Take; 6] = [
     Take {
         name: "claude-insert",
         src: include_str!("fixtures/claude-composer-2026-09-21.ptylog"),
@@ -289,6 +292,15 @@ const TAKES: [Take; 5] = [
         cw: 7,
         ch: 14,
         hold: true,
+    },
+    Take {
+        name: "claude-arrow-insert",
+        src: include_str!("fixtures/claude-composer-2026-09-24-left.ptylog"),
+        rows: 40,
+        cols: 120,
+        cw: 7,
+        ch: 14,
+        hold: false,
     },
 ];
 
@@ -405,6 +417,9 @@ struct Replay {
     rest: Rest,
     /// Ms after the last gesture at which the ribbon planned nothing lit.
     dark_after_ms: Option<u64>,
+    /// The composer row at the take's last census frame, while the hand is
+    /// still typing: `(ms, text, lit map)`.
+    last_row: Option<(u64, String, String)>,
 }
 
 struct ReplayHost {
@@ -545,20 +560,31 @@ fn replay(take: &Take, chunking: Chunking) -> Replay {
     let mut composer_row = None;
     let mut holes = Vec::new();
     let mut lit_max = 0usize;
-    let census =
-        |h: &ReplayHost, row: Option<u16>, holes: &mut Vec<HoleFrame>, lit_max: &mut usize| {
-            let Some(row) = row else { return };
-            let ms = h.ms();
-            if ms < first_key || ms > last_key {
-                return;
-            }
-            let cov = coverage(&h.glow, h.g, row);
-            *lit_max = (*lit_max).max(cov.iter().filter(|&&v| v >= LIT_COV).count());
-            let found = holes_of(&cov);
-            if !found.is_empty() {
-                holes.push((ms, lit_map(&cov), found));
-            }
-        };
+    let mut last_row = None;
+    let census = |h: &ReplayHost,
+                  row: Option<u16>,
+                  holes: &mut Vec<HoleFrame>,
+                  lit_max: &mut usize,
+                  last_row: &mut Option<(u64, String, String)>| {
+        let Some(row) = row else { return };
+        let ms = h.ms();
+        if ms < first_key || ms > last_key {
+            return;
+        }
+        let cov = coverage(&h.glow, h.g, row);
+        *lit_max = (*lit_max).max(cov.iter().filter(|&&v| v >= LIT_COV).count());
+        let found = holes_of(&cov);
+        if !found.is_empty() {
+            holes.push((ms, lit_map(&cov), found));
+        }
+        let mut cols = Vec::new();
+        h.term.row_cols_into(usize::from(row), &mut cols);
+        let text = cols
+            .iter()
+            .map(|&c| if c == '\0' { ' ' } else { c })
+            .collect();
+        *last_row = Some((ms, text, lit_map(&cov)));
+    };
     for (ms, ev) in rec {
         if ms >= exit {
             break;
@@ -567,7 +593,7 @@ fn replay(take: &Take, chunking: Chunking) -> Replay {
         while h.now + Duration::from_millis(REPLAY_FRAME_MS) <= t {
             h.now += Duration::from_millis(REPLAY_FRAME_MS);
             if h.frame() {
-                census(&h, composer_row, &mut holes, &mut lit_max);
+                census(&h, composer_row, &mut holes, &mut lit_max, &mut last_row);
             }
         }
         h.now = h.now.max(t);
@@ -587,7 +613,7 @@ fn replay(take: &Take, chunking: Chunking) -> Replay {
                 while let Some(chunk) = chunks.next() {
                     h.term.process(chunk);
                     if h.frame() {
-                        census(&h, composer_row, &mut holes, &mut lit_max);
+                        census(&h, composer_row, &mut holes, &mut lit_max, &mut last_row);
                     }
                     if chunks.peek().is_some() {
                         h.now += Duration::from_millis(1);
@@ -623,6 +649,7 @@ fn replay(take: &Take, chunking: Chunking) -> Replay {
         composer_row: composer_row.unwrap_or(u16::MAX),
         rest: rest_of(&h.glow, h.fp, h.now),
         dark_after_ms,
+        last_row,
     }
 }
 
@@ -694,6 +721,40 @@ fn claude_code_s_popup_take_holds_whole_and_torn_at_every_read_size() {
 #[test]
 fn codex_s_particle_take_holds_whole_and_torn_at_every_read_size() {
     assert_take_holds(&TAKES[4]);
+}
+
+/// **CLAUDE CODE'S BYTES, A PLAIN-ARROW INSERT (2026-09-24).** The owner:
+/// *"when I did a backward movement, the rainbow cursor trail fractured with
+/// black spaces when I started typing in the middle of a line"*. The line
+/// typed, walked back into with ← (Claude Code moves the caret alone, one
+/// `CUP` per press), and typed into twice: every key's diff frame rewrites
+/// the rest of the line one column on. The band from the prompt to the end
+/// of the TEXT must be lit on the take's last typing frame — the tail the
+/// inserts pushed right carries its light with it. Measured before the
+/// shift pass: the lit map ended at the caret and the pushed tail was dark
+/// (`the pushed tail went dark` below), at every read size; the hole census
+/// alone could not see it, because a dark tail is not an interior hole.
+#[test]
+fn claude_code_s_arrow_insert_keeps_the_pushed_tail_lit_at_every_read_size() {
+    let take = &TAKES[5];
+    assert_take_holds(take);
+    for chunking in [Chunking::Whole, Chunking::Reads(1024), Chunking::Reads(512)] {
+        let r = replay(take, chunking);
+        let (ms, text, lit) = r.last_row.expect("the composer row was censused");
+        let text = text.trim_end();
+        let first = text.find("hello").expect("the typed line is on the row");
+        let first = text[..first].chars().count();
+        let end = text.chars().count();
+        let dark: Vec<usize> = (first..end)
+            .filter(|&c| lit.chars().nth(c) != Some('#'))
+            .collect();
+        assert!(
+            dark.is_empty(),
+            "{}/{chunking:?} t={ms}: the pushed tail went dark at {dark:?}\n  txt |{text}|\n  lit |{}|",
+            take.name,
+            lit.trim_end_matches('.')
+        );
+    }
 }
 
 // ===========================================================================

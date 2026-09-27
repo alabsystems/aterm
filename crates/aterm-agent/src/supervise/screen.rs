@@ -2,10 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! The `text --json` reply as the supervisor reads it: the rows, the cursor, the
-//! content sequence and the screen generation. A small std-only JSON reader — the
-//! reply is one object of known shape (`{"rows":[…],"cursor":{"row":r,"col":c,…},
-//! "dims":{…},"seq":n,"gen":"e.s"}`) and this crate's closure stays free of a serde
-//! stack for it.
+//! content sequence, the screen generation and the person's stamp. A small
+//! std-only JSON reader — the reply is one object of known shape (`{"rows":[…],
+//! "cursor":{"row":r,"col":c,…},"dims":{…},"seq":n,"gen":"e.s","human_ms":n|null}`)
+//! and this crate's closure stays free of a serde stack for it.
+
+use aterm_types::control_verbs::ScreenGen;
 
 /// One screen read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -28,6 +30,57 @@ pub struct Screen {
     /// cannot land on a box that replaced the one read. `None` from a host
     /// that does not send it (the press then carries no fence).
     pub generation: Option<String>,
+    /// When a PERSON last gave the session input, as the server stamped it
+    /// at the read (`"human_ms"`, 2026-09-25): what the question answer waits
+    /// on before it keys a dialog a person may be navigating.
+    pub human: HumanInput,
+}
+
+/// The server's person stamp on a read ([`Screen::human`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HumanInput {
+    /// The host does not send it (a build before 2026-09-25): unknown — the
+    /// question answer then waits for the screen to hold still instead.
+    #[default]
+    Unknown,
+    /// No person has given the session input since the host began serving it.
+    Never,
+    /// This many milliseconds before the read.
+    Ago(u64),
+}
+
+impl HumanInput {
+    /// The stamp of one `status` reply (`human_ms=<ms|->`): `-` is
+    /// [`Self::Never`], a count its age, and no such field — a server older
+    /// than the stamp, or any reply but an `OK` — [`Self::Unknown`].
+    #[must_use]
+    pub fn of_status(status: &str) -> Self {
+        let Some(line) = status.lines().find(|l| l.starts_with("OK")) else {
+            return Self::Unknown;
+        };
+        match line
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("human_ms="))
+        {
+            None => Self::Unknown,
+            Some("-") => Self::Never,
+            Some(ms) => ms.parse().map_or(Self::Unknown, Self::Ago),
+        }
+    }
+
+    /// Whether a person gave the session input within `grace_s` seconds
+    /// (`[harness] human_grace_s`): THE one test of a person's hand, for
+    /// every caller. `None` for [`Self::Unknown`] — each caller says what an
+    /// unknown stamp means where it acts (nobody, for a relaunch; someone,
+    /// for the upgrade's notice).
+    #[must_use]
+    pub fn within(self, grace_s: u32) -> Option<bool> {
+        match self {
+            Self::Never => Some(false),
+            Self::Ago(ms) => Some(ms < u64::from(grace_s).saturating_mul(1000)),
+            Self::Unknown => None,
+        }
+    }
 }
 
 impl Screen {
@@ -68,27 +121,28 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         cursor_col: usize::try_from(num(cursor, "col").unwrap_or(0)).unwrap_or(usize::MAX),
         seq: num(Some(&v), "seq").unwrap_or(0),
         first: usize::try_from(num(Some(&v), "first").unwrap_or(0)).unwrap_or(usize::MAX),
+        // Kept only if the server will take it back as a fence: asked of the
+        // SAME reader the server parses `if-gen=` with. Anything else is not
+        // sent (the server would answer `ERR usage`); a local "two runs of
+        // digits" check stood here and passed an epoch past `u64::MAX`.
         generation: v
             .get("gen")
             .and_then(Json::as_str)
-            .filter(|g| is_generation(g))
+            .filter(|g| ScreenGen::parse(g).is_some())
             .map(str::to_string),
-    })
-}
-
-/// The wire shape of a screen generation, `<epoch>.<seq>`: two unsigned
-/// decimals. Anything else is not sent as a fence (the server would answer
-/// `ERR usage`).
-fn is_generation(g: &str) -> bool {
-    g.split_once('.').is_some_and(|(e, s)| {
-        [e, s]
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        // Absent (an older host) is unknown; `null` is never; a number is
+        // its age. Anything else is unknown, never a guess.
+        human: match v.get("human_ms") {
+            None => HumanInput::Unknown,
+            Some(Json::Null) => HumanInput::Never,
+            Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
+        },
     })
 }
 
 /// Parse a plain `text` reply (one row per line) when `--json` is unavailable.
-pub fn parse_text_plain(body: &str) -> Screen {
+#[cfg(test)]
+pub(crate) fn parse_text_plain(body: &str) -> Screen {
     Screen {
         rows: body.lines().map(str::to_string).collect(),
         ..Screen::default()
@@ -289,9 +343,63 @@ fn hex4(c: &[char], i: &mut usize) -> Result<u32, String> {
     u32::from_str_radix(&s, 16).map_err(|_| format!("json: bad \\u escape {s:?}"))
 }
 
+/// Whether one `cell` reply — `OK <grapheme%enc> <fg> <bg> <attrs>[ link=…]`,
+/// the attrs a comma list or `none` (aterm-gui `cmd_cell`) — names `dim`. The
+/// fields are split on single spaces, never on runs: a blank cell's grapheme
+/// is an EMPTY token, and collapsing it would read the bg colour as the attrs.
+/// The ONE reading of a composer's column-2 cell: the dim placeholder (Claude
+/// Code's suggestion, Codex's `Ask Codex…`) against a typed draft whose caret
+/// was moved home — the supervisor's loop and the live upgrade's gate both
+/// ask it (the elegance review of 2026-09-25: the loop took column 2 for the
+/// placeholder with no look, and could type in front of a person's draft).
+#[must_use]
+pub fn cell_is_dim(line: &str) -> bool {
+    line.trim_end()
+        .strip_prefix("OK ")
+        .and_then(|rest| rest.split(' ').nth(3))
+        .is_some_and(|attrs| attrs.split(',').any(|a| a == "dim"))
+}
+
+/// The `<field>=` word of a `status` reply (`-` and absent are `None`).
+pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
+    let line = stdout.lines().find(|l| l.starts_with("OK"))?;
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(field)?.strip_prefix('='))
+        .filter(|v| *v != "-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `status` reply's stamp reads as a `text --json` one does: a count
+    /// its age, `-` never, and no field (an older server) or no `OK`
+    /// unknown — and [`HumanInput::within`] is the one grace test, strictly
+    /// under it. NEGATIVE CONTROLS: the grace's own edge is outside it, and
+    /// `human_ms=` on an `ERR` is no stamp.
+    #[test]
+    fn a_status_stamp_reads_as_the_one_person_fact() {
+        let ok = "OK schema=1 hold=0 hand=- human_ms=5000 level=quiet";
+        assert_eq!(HumanInput::of_status(ok), HumanInput::Ago(5000));
+        assert_eq!(
+            HumanInput::of_status(&ok.replace("5000", "-")),
+            HumanInput::Never
+        );
+        assert_eq!(
+            HumanInput::of_status("OK schema=1 hold=0"),
+            HumanInput::Unknown,
+            "an older server"
+        );
+        assert_eq!(
+            HumanInput::of_status("ERR no such session human_ms=1"),
+            HumanInput::Unknown
+        );
+        assert_eq!(HumanInput::Ago(4999).within(5), Some(true));
+        assert_eq!(HumanInput::Ago(5000).within(5), Some(false), "the edge");
+        assert_eq!(HumanInput::Never.within(u32::MAX), Some(false));
+        assert_eq!(HumanInput::Unknown.within(5), None);
+        assert_eq!(HumanInput::Ago(u64::MAX).within(u32::MAX), Some(false));
+    }
 
     /// The exact shape the server writes (see `cmd_text_json_opt`), with the
     /// header line the wire carries and without it (the client strips it).
@@ -326,9 +434,38 @@ mod tests {
             .generation
         };
         assert_eq!(with("2.15").as_deref(), Some("2.15"));
-        for bad in ["15", "2.", ".15", "2.15.1", "-2.15", "a.b", ""] {
+        for bad in [
+            "15",
+            "2.",
+            ".15",
+            "2.15.1",
+            "-2.15",
+            "a.b",
+            "",
+            "18446744073709551616.15",
+        ] {
             assert_eq!(with(bad), None, "{bad:?}");
         }
+    }
+
+    /// The person's stamp (`"human_ms"`, 2026-09-25): a number is its age,
+    /// `null` is never, and a host that sends none is unknown — so is a value
+    /// that is neither, never a guess.
+    #[test]
+    fn the_persons_stamp_is_read_and_its_absence_is_unknown() {
+        let with = |tail: &str| {
+            parse_text_json(&format!(
+                r#"{{"rows":[],"cursor":{{"row":0,"col":0}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15"{tail}}}"#
+            ))
+            .expect("parses")
+            .human
+        };
+        assert_eq!(with(r#","human_ms":12345"#), HumanInput::Ago(12_345));
+        assert_eq!(with(r#","human_ms":0,"trimmed":1"#), HumanInput::Ago(0));
+        assert_eq!(with(r#","human_ms":null"#), HumanInput::Never);
+        assert_eq!(with(""), HumanInput::Unknown, "an older host");
+        assert_eq!(with(r#","human_ms":"12""#), HumanInput::Unknown);
+        assert_eq!(with(r#","human_ms":-3"#), HumanInput::Unknown);
     }
 
     /// A `tail=` read that does not start at row 0 says where it starts

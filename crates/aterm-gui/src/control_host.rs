@@ -386,6 +386,8 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            rewrap_gauge: std::sync::Arc::default(),
+            human_input: Default::default(),
         });
         SessionHandle {
             sid,

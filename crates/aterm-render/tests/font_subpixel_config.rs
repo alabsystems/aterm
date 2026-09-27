@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! LINUX SUBPIXEL stage 1: the `font_subpixel` config key's renderer seam
-//! ([`Renderer::set_font_subpixel`]) — the live-settable twin of the
-//! construction-time `ATERM_FONT_SUBPIXEL` read, mirroring the
-//! `font_hinting_config` suite.
+//! ([`Renderer::set_font_subpixel`]) — the one way to change the subpixel mode
+//! (the construction-time `ATERM_FONT_SUBPIXEL` read was deleted 2026-09-24),
+//! mirroring the `font_hinting_config` suite.
 //!
 //! Laws under test, on the Linux subpixel seam:
 //! * the DEFAULT is `off` and the getter round-trips every canonical spelling;
@@ -77,7 +77,7 @@ fn default_is_off_and_spellings_round_trip() {
         ("0", "off"),
         ("none", "off"),
         ("false", "off"),
-        ("anything-else", "off"), // forgiving toward the DEFAULT, like the env read
+        ("anything-else", "off"), // forgiving toward the DEFAULT
     ] {
         r.set_font_subpixel(spelling);
         let expect = if LINUX_SEAM { canonical } else { "off" };

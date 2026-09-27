@@ -10,7 +10,7 @@
 //! `dial <name>`, so every remote verb is a fresh TCP+TLS connection).
 //!
 //! TWO-SIDED by construction:
-//! * `drive_setup` — the shipping path: `accept_and_relay` + `dial_and_relay`, i.e.
+//! * `drive_setup` — the shipping path: `accept_and_relay` + `dial_and_relay_pinned`, i.e.
 //!   WITH the unauthenticated-phase watchdog armed on both ends.
 //! * `bare_handshake` — the identical TLS 1.3 handshake, channel-bound capability
 //!   exchange and relay, assembled inline WITHOUT a watchdog.
@@ -25,7 +25,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aterm_net::drive::{accept_and_relay, dial_and_relay};
+use aterm_net::drive::{accept_and_relay, dial_and_relay_pinned};
 use aterm_net::tls::{self, cert_fingerprint, client_config, server_config};
 use aterm_net::{present_capability, verify_capability};
 use aterm_session::EdgeToken;
@@ -86,7 +86,7 @@ fn one_drive_setup(listener: &TcpListener, token: EdgeToken) -> Duration {
     let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
     let t0 = Instant::now();
     let driver = std::thread::spawn(move || {
-        dial_and_relay(addr, ccfg, "bench", "drive", &token, b"", drv_local)
+        dial_and_relay_pinned(addr, ccfg, "bench", "drive", &token, b"", drv_local, None)
     });
     drv_client.write_all(b"P\n").unwrap();
     drv_client.flush().unwrap();

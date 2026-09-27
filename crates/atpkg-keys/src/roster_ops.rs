@@ -294,9 +294,20 @@ mod tests {
         assert_eq!(fresh.valid_until, VALID_UNTIL_FOREVER);
         // The stamp must PARSE under the same strict parser the client gates with —
         // an unparseable forever would read as LAPSED and brick the tier at mint time.
-        assert!(
-            fresh.valid_until_unix().expect("forever parses") > NOW as i64,
-            "9999-12-31 parses and sits in the future"
+        assert_eq!(
+            fresh.admit(0, NOW as i64),
+            Ok(()),
+            "9999-12-31 parses under the client's own gate and sits in the future"
+        );
+        // The owner's decided residual, pinned so it stays a decision: a client with NO
+        // floor (a fresh install) admits this generation decades from now, so against a
+        // floor-less client a replayed pre-revocation roster never lapses and the only
+        // remedy for a stolen key is a full re-key.
+        let years_later = NOW as i64 + 20 * 365 * 86_400;
+        assert_eq!(
+            fresh.admit(0, years_later),
+            Ok(()),
+            "keys last forever: the replay window against floor-less clients never lapses"
         );
     }
 }

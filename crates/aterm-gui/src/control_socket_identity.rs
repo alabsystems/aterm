@@ -9,6 +9,7 @@
 use crate::control_auth::SocketPlan;
 use aterm_uds::CtlListener;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -157,6 +158,7 @@ impl SocketIdentity {
         }
     }
 
+    #[cfg(unix)]
     fn encode(&self) -> Option<String> {
         let wire = aterm_json::to_string(self).ok()?;
         (wire.len() <= MAX_WIRE_BYTES).then_some(wire)
@@ -253,10 +255,12 @@ pub(crate) fn published() -> Option<SocketIdentity> {
 }
 
 /// Clear inherited authority, then carry only this process's bound listener.
+#[cfg(unix)]
 pub(crate) fn bind_command(command: &mut Command) {
     bind_command_identity(command, PUBLISHED.get());
 }
 
+#[cfg(unix)]
 fn bind_command_identity(command: &mut Command, identity: Option<&SocketIdentity>) {
     // LaunchServices accepts merge-only environment additions. Removing a key
     // would force the fork fallback, so an explicit empty value clears inherited

@@ -58,25 +58,6 @@ impl Terminal {
         self.transient.current_hyperlink.as_ref()
     }
 
-    /// Set the current hyperlink URL (OSC 8).
-    ///
-    /// All subsequently printed characters will be linked to this URL.
-    /// Pass `None` to clear the hyperlink.
-    #[cfg(test)]
-    pub fn set_current_hyperlink(&mut self, url: Option<Arc<str>>) {
-        self.transient.current_hyperlink = url;
-        self.transient.update_has_transient_extras();
-    }
-
-    /// Get the current hyperlink ID (OSC 8 `id=` parameter).
-    ///
-    /// Returns the ID used to group cells into the same hyperlink span.
-    #[cfg(test)]
-    #[must_use]
-    pub fn current_hyperlink_id(&self) -> Option<&Arc<str>> {
-        self.transient.current_hyperlink_id.as_ref()
-    }
-
     /// Get the hyperlink URL attached to a rendered cell, if any.
     #[must_use]
     pub fn hyperlink_at(&self, row: u16, col: u16) -> Option<&str> {
@@ -125,16 +106,6 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
-    /// Get the current underline color (SGR 58).
-    ///
-    /// Returns the underline color that will be applied to newly printed characters.
-    /// Format: `0xTT_RRGGBB` where TT is 0x01 for RGB, 0x02 for indexed.
-    #[cfg(test)]
-    #[must_use]
-    pub fn current_underline_color(&self) -> Option<u32> {
-        self.transient.current_underline_color
-    }
-
     /// Get the current working directory (OSC 7).
     ///
     /// Returns the path portion of the working directory URL set by the shell.
@@ -142,14 +113,6 @@ impl Terminal {
     #[must_use]
     pub fn current_working_directory(&self) -> Option<&str> {
         self.current_working_directory.as_deref()
-    }
-
-    /// Set the current working directory.
-    ///
-    /// This is typically set via OSC 7 from the shell.
-    #[cfg(test)]
-    pub fn set_current_working_directory(&mut self, path: Option<String>) {
-        self.current_working_directory = path;
     }
 
     /// Get the color palette.
@@ -165,6 +128,7 @@ impl Terminal {
     ///
     /// Changed slots become both the live colors and their OSC 104/RIS reset
     /// baseline, matching [`Self::set_palette_color`].
+    #[cfg(test)]
     pub fn color_palette_mut(&mut self) -> ColorPaletteMut<'_> {
         // A mutable palette borrow can recolor already-painted indexed cells
         // without touching grid content. Mark before handing the borrow out so
@@ -186,6 +150,7 @@ impl Terminal {
 
     /// Indexed color as primitive RGB components.
     #[must_use]
+    #[cfg(test)]
     pub fn palette_color_components(&self, index: u8) -> (u8, u8, u8) {
         let color = self.palette_color(index);
         (color.r, color.g, color.b)
@@ -213,6 +178,7 @@ impl Terminal {
     }
 
     /// Reset the live and host-configured color palette to built-in defaults.
+    #[cfg(test)]
     pub fn reset_color_palette(&mut self) {
         self.color.palette.reset();
         self.color.configured_palette = None;
@@ -220,6 +186,7 @@ impl Terminal {
     }
 
     /// Reset a single palette slot to the built-in default color.
+    #[cfg(test)]
     pub fn reset_palette_color_to_default(&mut self, index: u8) {
         let default_palette = ColorPalette::new();
         self.set_palette_color(index, default_palette.get(index));
@@ -343,6 +310,31 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_colors_survive_dynamic_color_set_and_reset() {
+        let foreground = Rgb::new(0x11, 0x22, 0x33);
+        let background = Rgb::new(0x44, 0x55, 0x66);
+        let mut terminal = Terminal::new(24, 80);
+        terminal.set_default_foreground(foreground);
+        terminal.set_default_background(background);
+
+        terminal.process(b"\x1b]10;rgb:aa/bb/cc\x07\x1b]11;rgb:77/88/99\x07");
+        assert_ne!(terminal.default_foreground(), foreground);
+        assert_ne!(terminal.default_background(), background);
+
+        terminal.process(b"\x1b]110\x07\x1b]111\x07");
+        assert_eq!(
+            terminal.default_foreground(),
+            foreground,
+            "OSC 110 restores the configured foreground"
+        );
+        assert_eq!(
+            terminal.default_background(),
+            background,
+            "OSC 111 restores the configured background"
+        );
+    }
 
     fn assert_host_color_mutation_marks_damage(
         setup: impl FnOnce(&mut Terminal),

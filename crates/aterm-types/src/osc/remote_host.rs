@@ -20,33 +20,6 @@ pub struct RemoteHost {
     pub hostname: String,
 }
 
-impl RemoteHost {
-    /// Parse "user@hostname" format.
-    ///
-    /// Returns `None` if the format is invalid:
-    /// - Missing `@` symbol
-    /// - Empty user (starts with `@`)
-    /// - Empty hostname (ends with `@`)
-    ///
-    /// If multiple `@` symbols are present, the first one is used as the
-    /// delimiter (e.g., "user@host@domain" -> user="user", hostname="host@domain").
-    pub fn parse(value: &str) -> Option<Self> {
-        // `split_once('@')` is byte-for-byte equivalent to the old
-        // find-then-slice: it splits on the FIRST '@', excludes the delimiter,
-        // and an empty user/hostname reproduces the old `at_pos == 0` /
-        // `at_pos == len - 1` rejects — with no manual index arithmetic for the
-        // Trust gate to discharge.
-        let (user, hostname) = value.split_once('@')?;
-        if user.is_empty() || hostname.is_empty() {
-            return None;
-        }
-        Some(Self {
-            user: user.to_string(),
-            hostname: hostname.to_string(),
-        })
-    }
-}
-
 impl std::fmt::Display for RemoteHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Trust gate: `write_str` instead of `write!` — runtime-argument

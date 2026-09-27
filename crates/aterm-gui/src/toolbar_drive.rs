@@ -64,16 +64,16 @@
 
 /// Every check passed.
 #[cfg(target_os = "macos")]
-pub const PASS: i32 = 0;
+pub(crate) const PASS: i32 = 0;
 /// At least one finding. See the transcript.
 #[cfg(target_os = "macos")]
-pub const FINDING: i32 = 1;
+pub(crate) const FINDING: i32 = 1;
 /// The drive could not execute here. NOT a pass.
 #[cfg(target_os = "macos")]
-pub const NOT_RUN: i32 = 2;
+pub(crate) const NOT_RUN: i32 = 2;
 /// A modal tracking loop never returned; the watchdog killed the process.
 #[cfg(target_os = "macos")]
-pub const HUNG: i32 = 3;
+pub(crate) const HUNG: i32 = 3;
 
 /// Drive the real tab strip and answer the exit code above.
 ///
@@ -950,7 +950,7 @@ mod macos {
                   would thread a dozen raw `Id`s through signatures that say \
                   nothing"
     )]
-    pub fn run() -> i32 {
+    pub(crate) fn run() -> i32 {
         // THE WATCHDOG, and it is not belt-and-braces. This driver enters
         // `-mouseDown:`/`-rightMouseDown:` IMPs directly; a context menu that
         // actually popped would run `-[NSMenu popUpContextMenu:…]`'s modal
@@ -1515,6 +1515,29 @@ mod macos {
                 "the \"+\" button is live before and after".to_owned(),
             );
         }
+        // The chips follow the edge too. `reflow_window_tabs` is what the app runs
+        // in the resize's own turn; before it existed a narrowed window kept the
+        // wide layout, the last chip under the "+", until an unrelated title or
+        // chrome refresh rebuilt the strip.
+        toolbar::reflow_window_tabs(&handle);
+        pump(&mut d, &mut el, 100);
+        // SAFETY: `strip` is live; `chips` walks its subviews.
+        let flowed: Vec<CGRect> = unsafe { chips(strip) }
+            .into_iter()
+            // SAFETY: live views.
+            .map(|c| unsafe { s_rect(c, sel!(frame)) })
+            .collect();
+        // SAFETY: `strip` is live.
+        let plus_x = unsafe { plus_button(strip).map(|p| s_rect(p, sel!(frame)).origin.x) };
+        let last_right = flowed.last().map(|f| f.origin.x + f.size.width);
+        cx.check(
+            flowed.len() == 3
+                && matches!((last_right, plus_x), (Some(r), Some(p)) if r <= p + 0.5),
+            format!(
+                "the resize's re-flow keeps every chip left of the \"+\": {} chips, last ends at {last_right:?}, \"+\" at {plus_x:?}",
+                flowed.len()
+            ),
+        );
         apply(&handle, &m3);
         pump(&mut d, &mut el, 200);
         // SAFETY: `strip` is live.
@@ -1522,6 +1545,32 @@ mod macos {
         cx.check(
             cs2.len() == 3,
             format!("3 chips after the re-layout (got {})", cs2.len()),
+        );
+        // SAFETY: live views.
+        let relaid: Vec<CGRect> = cs2
+            .iter()
+            .map(|c| unsafe { s_rect(*c, sel!(frame)) })
+            .collect();
+        cx.check(
+            relaid.len() == flowed.len()
+                && relaid.iter().zip(&flowed).all(|(a, b)| {
+                    a.origin.x == b.origin.x
+                        && a.size.width == b.size.width
+                        && a.size.height == b.size.height
+                }),
+            format!(
+                "the re-flow landed on the refresh's own cells: {} vs {}",
+                flowed
+                    .iter()
+                    .map(|f| show_rect(*f))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                relaid
+                    .iter()
+                    .map(|f| show_rect(*f))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
         );
         for (i, c) in cs2.iter().enumerate() {
             // SAFETY: live views.

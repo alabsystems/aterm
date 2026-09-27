@@ -17,8 +17,7 @@ mod sealed {
 /// framework-level action (see §3 Hasse diagram).
 ///
 /// Every valid origin marker type exposes its runtime tag via
-/// [`Origin::TAG`], which is used when projecting to a
-/// [`crate::DynProvenance`].
+/// [`Origin::TAG`], which [`crate::Provenance::tag`] reads.
 pub trait Origin: sealed::Sealed + 'static + Copy {
     /// Runtime representation of this origin.
     const TAG: OriginTag;
@@ -34,8 +33,8 @@ pub trait Origin: sealed::Sealed + 'static + Copy {
     fn runtime_tag() -> OriginTag;
 }
 
-/// Runtime-shaped mirror of [`Origin`]. Stored in [`crate::DynProvenance`]
-/// and in per-row grid metadata (Phase 2).
+/// Runtime-shaped mirror of [`Origin`], as [`crate::Provenance::tag`] answers it
+/// and as per-row grid metadata (Phase 2) stores it.
 ///
 /// Discriminants are stable at-rest: checkpoint v4 uses these byte values
 /// directly (see design §5.1).
@@ -56,30 +55,6 @@ pub enum OriginTag {
     /// Bytes from the shell or any program within it — the primary adversary
     /// surface.
     Pty = 5,
-}
-
-impl OriginTag {
-    /// Enumerates every valid origin tag. Useful for exhaustive tests.
-    #[must_use]
-    pub const fn all() -> [OriginTag; 6] {
-        [
-            OriginTag::Host,
-            OriginTag::ConfigFile,
-            OriginTag::User,
-            OriginTag::Ai,
-            OriginTag::NetworkUntrusted,
-            OriginTag::Pty,
-        ]
-    }
-
-    /// Returns the byte representation of this tag.
-    ///
-    /// Used by the FFI bridge (`aterm_grid_cell_origin` in Phase 2) and by
-    /// checkpoint serialization (§5.1). Guaranteed stable across versions.
-    #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        self as u8
-    }
 }
 
 // --- origin marker types ---------------------------------------------------
@@ -150,21 +125,3 @@ impl Origin for Pty {
         OriginTag::Pty
     }
 }
-
-/// Synthetic `Top` sentinel type. Deliberately does **not** implement
-/// [`Origin`] — `Provenance<T, Top>` must not compile. (Asserted by the
-/// `top_is_not_origin` compile-fail test.)
-///
-/// `Top` exists only so that diagnostic / TLA+-facing code can name the
-/// element; its runtime analogue is [`crate::TOP_TAG_U8`] in
-/// [`crate::DynProvenance`].
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Top;
-
-/// Synthetic tag value representing the lattice's `Top` element (mixed
-/// incomparable; cannot be lifted). See §3.2.
-///
-/// This is not a variant of [`OriginTag`] because `Top` is never a valid
-/// static origin — it appears only in `DynProvenance` diagnostics and in the
-/// TLA+ spec.
-pub const TOP_TAG_U8: u8 = 0xFF;

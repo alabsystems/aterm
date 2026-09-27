@@ -176,13 +176,18 @@ pub(crate) const CHECKING: &str = "checking the download";
 /// under a minute.
 pub(crate) const INSTALLS_BY_ITSELF: &str = "installs by itself within a minute";
 /// The outgoing process is handing over.
+#[cfg(any(unix, test))]
 pub(crate) const INSTALLING: &str = "installing\u{2026}";
 /// The successor's frames before Commit: what is typed now is queued and
 /// replayed, never lost — the one sentence about the person's work, said
 /// once, behind `Details ›` (it changes nothing the person does).
 pub(crate) const FINISHING: &str = "almost done \u{2014} what you type is kept";
+/// The lane's ONE promise that it retries, said one way on every surface
+/// (audit 2026-09-24: five phrasings of one promise), with ` later` or ` in
+/// 6 h` after it where a time is known.
+pub(crate) const TRIES_AGAIN: &str = "tries again by itself";
 /// A download that failed: the next check retries it.
-pub(crate) const DOWNLOAD_FAILED: &str = "will try again by itself";
+pub(crate) const DOWNLOAD_FAILED: &str = TRIES_AGAIN;
 
 /// The `Software Update` capsule: the page that holds the durable record.
 fn software_update() -> Intent {
@@ -208,6 +213,12 @@ fn v(version: &str) -> String {
     sanitize_for_tty(version, 32)
 }
 
+/// A version as every update title and record names it: `aterm v0.91.0` —
+/// one spelling, never a bare `aterm 0.91.0` beside it (audit 2026-09-24).
+pub(crate) fn aterm_v(version: &str) -> String {
+    format!("aterm v{}", v(version))
+}
+
 /// A phase title, verb first (§10's form, ruling 143): "Downloading aterm
 /// v0.91.0". Says "Installing update" when there is no version (the re-exec
 /// QA seam applies with none — a bare "aterm v" was measured on glass
@@ -217,7 +228,7 @@ pub(crate) fn flow_title(verb: &str, version: &str) -> String {
     if v.trim().is_empty() {
         format!("{verb} update")
     } else {
-        format!("{verb} aterm v{v}")
+        format!("{verb} {}", aterm_v(&v))
     }
 }
 
@@ -238,7 +249,7 @@ fn flow(title: String, phase: &str, meter: Meter, hold: Hold) -> Message {
 /// `Install now` CAPSULE ([`apply_capsule_for`]), so the words are the same
 /// under every posture.
 pub(crate) fn staged_title(version: &str) -> String {
-    format!("aterm v{} is ready", v(version))
+    format!("{} is ready", aterm_v(version))
 }
 
 /// The `Install now` capsule ONLY where a press is the way the build installs
@@ -279,7 +290,7 @@ pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
         ApplyPosture::ManualByConfig => "automatic install is off".to_string(),
         ApplyPosture::VetoedByEnv { var } => format!("${var} is set \u{2014} {INSTALL_FROM_MENU}"),
         ApplyPosture::ManualOnlyLatched { lapses: true } => {
-            "didn't install \u{2014} will try again later".to_string()
+            format!("didn't install \u{2014} {TRIES_AGAIN} later")
         }
         ApplyPosture::ManualOnlyLatched { lapses: false } => {
             "automatic install didn't work".to_string()
@@ -481,6 +492,7 @@ pub(crate) fn download_postponed(detail: &str) -> Message {
 /// handoff's staleness cap: the readiness deadline that bounds the whole
 /// attempt is env-clamped to 120 s, and every path that ends the freeze
 /// replaces the row explicitly — the cap is the backstop, not the lifetime.
+#[cfg(any(unix, test))]
 pub(crate) fn installing(version: &str) -> Message {
     flow(
         flow_title("Installing", version),
@@ -515,8 +527,10 @@ pub(crate) fn finishing(version: &str) -> Message {
 /// R36 — THE NEW BUILD TOOK OVER (or a cold-lane boot found it already
 /// running): a RECORD (ruling 141) — the flow row's Complete echo, where one
 /// was up, is the moment. "✓ Updated to aterm vX" ("Updated to build
-/// N" with no version), no claim about the shells. How long the update took
-/// is a record of its own ([`installed_after`]).
+/// N" with no version), no claim about the shells. `took` — how long the
+/// update took from THIS build's finished download, when this process (or
+/// the predecessor that handed over) downloaded this very build — is a line
+/// of the same record: one landing, one entry (audit 2026-09-24).
 ///
 /// A REPAINT IS ON THE RECORD (the 2026-09-22/23 update audit, plan P1-5):
 /// when the successor adopted `repainted` sessions onto a blank screen (the
@@ -528,26 +542,72 @@ pub(crate) fn finishing(version: &str) -> Message {
 /// 141), and a blank tab is nothing for the person to do — the handoff sent
 /// it a size pulse (`spawn::adoption_needs_size_pulse`), so its program
 /// redraws its own screen.
-pub(crate) fn landed(version: &str, build: u64, repainted: usize) -> Message {
-    let v = v(version);
-    let title = if v.trim().is_empty() {
+pub(crate) fn landed(
+    version: &str,
+    build: u64,
+    repainted: usize,
+    took: Option<Duration>,
+) -> Message {
+    let title = if v(version).trim().is_empty() {
         format!("Updated to build {build}")
     } else {
-        format!("Updated to aterm v{v}")
+        format!("Updated to {}", aterm_v(version))
     };
-    let msg = row(Severity::Success, title)
+    let mut msg = row(Severity::Success, title)
         .glyph(glyph(READY))
         .hold(Hold::LogOnly);
+    if let Some(took) = took {
+        msg = msg.line(format!("installed {} after the download", span_words(took)));
+    }
     match repainted_words(repainted) {
         Some(words) => msg.line(words).sentence(if repainted == 1 {
-            "its screen could not be carried, so it came over blank and the program in it \
-             was asked to redraw"
+            "its screen was blank after the update; the program in it was asked to redraw"
         } else {
-            "their screens could not be carried, so they came over blank and the programs \
-             in them were asked to redraw"
+            "their screens were blank after the update; the programs in them were asked to \
+             redraw"
         }),
         None => msg,
     }
+}
+
+/// R39 — AN UPDATE THAT COULD NOT CARRY EVERY TAB'S SCROLLBACK (2026-09-26).
+/// An in-session update carries each tab's whole history
+/// (`crate::handoff_history`); a history that changed under its export,
+/// outran it, or whose sidecar did not arrive whole crossed with only the
+/// screen carry's newest lines. The lines left behind are counted per tab —
+/// `status` says each tab's running `history_lost=` — and said HERE, once per
+/// update, as a FAILURE: nothing to press, and a loss is never only a log
+/// line (it was, until this row: 30293eb3a). The count rides the detail,
+/// and the sentence says what did come across and where the per-tab count is.
+pub(crate) fn scrollback_lost(lines: u64, tabs: usize) -> Message {
+    row(Severity::Warn, "Couldn't carry all scrollback")
+        .glyph(glyph(NEEDS_YOU))
+        .line(scrollback_lost_words(lines, tabs))
+        .sentence(
+            "everything on screen and the newest lines came across; `aterm ctl status` in a \
+             tab says history_lost= for it",
+        )
+        .hold(Hold::Default)
+        .key(KEY_SCROLLBACK)
+}
+
+/// The supersede key of R39: one scrollback row per update.
+pub(crate) const KEY_SCROLLBACK: &str = "update.scrollback";
+
+/// "1 older line stayed behind in 1 tab" / "12345 older lines stayed behind
+/// in 3 tabs".
+fn scrollback_lost_words(lines: u64, tabs: usize) -> String {
+    let lines = if lines == 1 {
+        "1 older line".to_string()
+    } else {
+        format!("{lines} older lines")
+    };
+    let tabs = if tabs == 1 {
+        "1 tab".to_string()
+    } else {
+        format!("{tabs} tabs")
+    };
+    format!("{lines} stayed behind in {tabs}")
 }
 
 /// "1 tab repainted" / "3 tabs repainted", or `None` for a handoff that
@@ -558,23 +618,6 @@ fn repainted_words(repainted: usize) -> Option<String> {
         1 => Some("1 tab repainted".to_string()),
         n => Some(format!("{n} tabs repainted")),
     }
-}
-
-/// The landing's RECORD: how long the update took from THIS build's finished
-/// download — "Installed aterm vX 42 s after it downloaded". Words distinct
-/// from the landing's, so Settings ▸ Messages does not read one title
-/// twice. Only when this process (or the predecessor that handed over)
-/// downloaded this very build.
-pub(crate) fn installed_after(version: &str, took: Duration) -> Message {
-    row(
-        Severity::Success,
-        format!(
-            "Installed aterm v{} {} after it downloaded",
-            v(version),
-            span_words(took)
-        ),
-    )
-    .hold(Hold::LogOnly)
 }
 
 /// A span as the durable record says it: "42 s", "1 min", "3 min 5 s", "2 h",
@@ -601,6 +644,7 @@ pub(crate) fn span_words(span: Duration) -> String {
 /// wall clock in Unix milliseconds: what the handoff carry hands the successor
 /// (`WindowCarry::update_verified_unix_ms`). `None` for any other build.
 /// `now` and `wall` are one reading of the two clocks.
+#[cfg(any(unix, test))]
 pub(crate) fn verified_unix_ms(
     verified: Option<(u64, Instant)>,
     build: u64,
@@ -632,29 +676,19 @@ pub(crate) fn carried_verification(
     now.checked_sub(ago).map(|at| (build, at))
 }
 
-/// THE DOWNLOAD, ON RECORD: when a build was downloaded and verified — the
-/// fact that answers "downloaded but didn't install".
-pub(crate) fn downloaded(version: &str, build: u64) -> Message {
-    row(
-        Severity::Success,
-        format!("Downloaded aterm {}", v(version)),
-    )
-    .line(format!("build {build}, verified and ready to install"))
-    .hold(Hold::LogOnly)
-}
-
 /// THE SWITCH TO A NEW VERSION BEGINS, on record — written before the park,
 /// because a line queued for after the process execs is a line never written.
 /// `target` is the version being installed; `None` is a same-image switch (a
 /// reload of this very build), which installs nothing whatever is staged.
-pub(crate) fn switch_started(target: Option<&str>, running: &str, running_build: u64) -> Message {
+#[cfg(any(unix, test))]
+pub(crate) fn switch_started(target: Option<&str>, running: &str) -> Message {
     let title = target.map_or_else(
         || "Reloading aterm in place".to_string(),
-        |version| format!("Installing aterm {}", v(version)),
+        |version| flow_title("Installing", version),
     );
     row(Severity::Info, title)
         .glyph(glyph(FLOW_GLYPH))
-        .line(format!("from aterm {} (build {running_build})", v(running)))
+        .line(format!("from {}", aterm_v(running)))
         .hold(Hold::LogOnly)
 }
 
@@ -663,34 +697,30 @@ pub(crate) fn switch_started(target: Option<&str>, running: &str, running_build:
 /// stood down because the terminal was in use (`routine`) — so the record
 /// never leaves an "Installing" that was not. `why` is the attempt's own
 /// account, whole.
+#[cfg(any(unix, test))]
 pub(crate) fn switch_stopped(
     target: Option<&str>,
     running: &str,
     routine: bool,
     why: &str,
 ) -> Message {
-    let running = v(running);
+    let running = aterm_v(running);
     let (title, detail) = match (target, routine) {
         (Some(version), true) => (
-            format!("Waiting to install aterm {}", v(version)),
-            format!(
-                "the terminal was in use, so the switch stopped safely and aterm \
-                 {running} kept running; it tries again on its own"
-            ),
+            format!("Waiting to install {}", aterm_v(version)),
+            format!("you were typing, so {running} kept running; it {TRIES_AGAIN}"),
         ),
         (Some(version), false) => (
-            format!("aterm {} was not installed", v(version)),
-            format!("the switch stopped safely and aterm {running} kept running: {why}"),
+            format!("{} was not installed", aterm_v(version)),
+            format!("{running} kept running: {why}"),
         ),
         (None, true) => (
             "Waiting to reload aterm".to_string(),
-            "the terminal was in use, so the reload stopped safely; it tries again on its \
-             own"
-            .to_string(),
+            format!("you were typing, so aterm kept running; it {TRIES_AGAIN}"),
         ),
         (None, false) => (
             "aterm was not reloaded".to_string(),
-            format!("the reload stopped safely: {why}"),
+            format!("aterm kept running: {why}"),
         ),
     };
     row(
@@ -736,16 +766,59 @@ pub(crate) fn outcome(glyph_ch: char, title: &str, detail: &str, severity: Sever
 /// glyph, since a done-mark beside `Install now` read as finished while
 /// asking to install (review 2026-09-24). The tone's hold.
 pub(crate) fn needs_install(title: &str, detail: &str, severity: Severity, build: u64) -> Message {
-    let msg = row(severity, sanitize_for_tty(title, 80))
-        .sentence(detail)
-        .action(Intent::ApplyUpdate { build })
-        .key(KEY_OUTCOME)
-        .no_excerpt();
+    needs_install_because(title, None, detail, severity, build)
+}
+
+/// [`needs_install`] with the failure's SHORT CAUSE painted beside the
+/// title, where one is known (`Couldn't install aterm v0.92.0 · disk full`,
+/// design ruling 246): it changes what the person does before pressing
+/// `Install now`. A lane that TRIES AGAIN BY ITSELF asks nothing of the
+/// person — a record, never a row (the owner: "FYI/CYA messages need to go
+/// to the log"); the health lane raises `aterm can't install updates` if the
+/// retries keep failing.
+pub(crate) fn needs_install_because(
+    title: &str,
+    cause: Option<&str>,
+    detail: &str,
+    severity: Severity,
+    build: u64,
+) -> Message {
+    if detail.contains(TRIES_AGAIN) {
+        return outcome(FLOW_GLYPH, title, detail, Severity::Info);
+    }
+    let msg = row(severity, sanitize_for_tty(title, 80));
+    let msg = match cause {
+        Some(cause) => msg.line(cause).sentence(detail),
+        None => msg.sentence(detail).no_excerpt(),
+    }
+    .action(Intent::ApplyUpdate { build })
+    .key(KEY_OUTCOME);
     if severity >= Severity::Warn {
         msg.glyph(glyph(NEEDS_YOU))
     } else {
         msg.glyph(glyph(FLOW_GLYPH))
             .hold(Hold::For(HOLD_STAGED_MANUAL))
+    }
+}
+
+/// The few words a failure's own message comes down to, where they change
+/// what the person does (design ruling 246): `disk full`, `no permission`,
+/// `read-only disk`; `None` for anything else, whose account stays behind
+/// `Details ›` and in the log.
+pub(crate) fn short_cause(message: &str) -> Option<&'static str> {
+    let m = message.to_ascii_lowercase();
+    if m.contains("no space left") || m.contains("enospc") || m.contains("disk full") {
+        Some("disk full")
+    } else if m.contains("read-only file system") || m.contains("erofs") {
+        Some("read-only disk")
+    } else if m.contains("permission denied")
+        || m.contains("operation not permitted")
+        || m.contains("eacces")
+        || m.contains("eperm")
+    {
+        Some("no permission")
+    } else {
+        None
     }
 }
 
@@ -796,9 +869,9 @@ pub(crate) fn health_warning(title: &str, body: &str) -> Message {
 /// said, so the page reads the recovery against it.
 pub(crate) fn health_recovered(said_title: &str, said_line0: &str) -> Message {
     let said = if said_line0.is_empty() {
-        format!("it had said: {said_title}")
+        format!("after \"{said_title}\"")
     } else {
-        format!("it had said: {said_title} \u{2014} {said_line0}")
+        format!("after \"{said_title}\", {said_line0}")
     };
     row(Severity::Success, "aterm updates work again")
         .line(said)
@@ -808,7 +881,7 @@ pub(crate) fn health_recovered(said_title: &str, said_line0: &str) -> Message {
 /// The OS notification's body for the same warning: when it started and where
 /// the rest is. The updater's whole sentence — the count, a raw timestamp, the
 /// cause and a command — is the log's and Software Update's, never a banner's.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn health_notification_body(body: &str) -> String {
     match health_since(body) {
         Some(since) => format!("Since {since}. Details are in Settings \u{25b8} Software Update."),
@@ -828,6 +901,113 @@ pub(crate) fn health_since(body: &str) -> Option<String> {
     Some(format!("{} {day}", MONTHS.get(month.checked_sub(1)?)?))
 }
 
+/// The supersede key of a dev build's standing (gap #30): the newest standing a
+/// process read replaces the last.
+pub(crate) const KEY_DEV_BUILD: &str = "update.dev-build";
+/// The key of a dev build's shared-writes row ([`dev_build_writes`]) — never
+/// [`KEY_DEV_BUILD`]: what this copy writes is its own fact, said at launch, and no
+/// reading of the channel may supersede it.
+pub(crate) const KEY_DEV_BUILD_WRITES: &str = "update.dev-build-writes";
+
+/// What a dev build writes of the shared user state only the release writes
+/// unattended, in words, with what puts it back — or `None` when it writes none of it.
+/// Those writers stand aside in any bundle that is not the release `aterm.app`
+/// (`atpkg::hooks::runs_from_non_release_bundle`, 2026-09-23), so `non_release_bundle`
+/// is `None` at once; a dev build whose bundle is NAMED `aterm.app` passes that name
+/// test and runs them: its ALab tools passes (`packages_lane`, `[packages] enabled`)
+/// lay the PATH links and the shell hooks, and its windows (`agents_prime`,
+/// `agents_auto_prime`) write the agent primer.
+pub(crate) fn dev_shared_writes(
+    non_release_bundle: bool,
+    packages_lane: bool,
+    agents_prime: bool,
+) -> Option<DevSharedWrites> {
+    if non_release_bundle {
+        return None;
+    }
+    let (what, repair) = match (packages_lane, agents_prime) {
+        (true, true) => (
+            "the PATH links, the shell hooks and the agent primer",
+            "`aterm pkg repair` and `aterm agents install`",
+        ),
+        (true, false) => ("the PATH links and the shell hooks", "`aterm pkg repair`"),
+        (false, true) => ("the agent primer", "`aterm agents install`"),
+        (false, false) => return None,
+    };
+    Some(DevSharedWrites { what, repair })
+}
+
+/// What a dev build named `aterm.app` writes of the release's shared setup
+/// ([`dev_shared_writes`]): `what`, in words, and `repair`, the release's verbs that
+/// put it back — `aterm pkg repair` lays the PATH links and the shell hooks again, and
+/// only `aterm agents install` rewrites the agent primer (`pkg repair` never touches
+/// it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevSharedWrites {
+    /// What it writes: `the PATH links, the shell hooks and the agent primer`.
+    pub what: &'static str,
+    /// What puts it back, run from the release: `` `aterm pkg repair` ``.
+    pub repair: &'static str,
+}
+
+/// A DEV BUILD THAT WRITES THE RELEASE'S SETUP (gap #30): a dev-marked copy whose
+/// bundle is named `aterm.app` runs the writers of shared user state only the release
+/// runs unattended ([`dev_shared_writes`]). That is a failure only the person can
+/// undo: a Standing ROW, saying what it writes (the painted excerpt) and what puts it
+/// back. The loss — the release's setup — is the title, as the failure grammar names
+/// one. It is this copy's own fact, read from its bundle and its switches when the
+/// window starts, so it is said whatever the channel answers — offline, or with
+/// automatic checks off — and never waits on [`dev_build`]'s reading.
+pub(crate) fn dev_build_writes(writes: DevSharedWrites) -> Message {
+    let DevSharedWrites { what, repair } = writes;
+    row(Severity::Warn, "Release setup lost to dev build")
+        .glyph(glyph(NEEDS_YOU))
+        .line(format!("it writes {what}"))
+        .line("this dev build's bundle is named aterm.app, which only the release may be")
+        .sentence(format!(
+            "rebuild it with tools/dev-app.sh, which installs it as aterm (dev).app, and remove \
+             this copy, then run {repair} from the release"
+        ))
+        .hold(Hold::Standing)
+        .key(KEY_DEV_BUILD_WRITES)
+}
+
+/// A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30, 2026-09-26). The updater
+/// leaves a dev-marked copy (`tools/dev-app.sh`) alone on purpose, so nothing said
+/// that a weeks-old `aterm (dev).app` launched from the Dock was running old code;
+/// the window now reads the public channel's head once at start and daily
+/// (`aterm_update::dev_channel`) and says where this copy stands, in the dev
+/// channel's own words ([`aterm_update::dev_channel::DevLag::words`]):
+///
+/// * BEHIND — `Dev build, 2 releases behind aterm v0.93.0`, a RECORD: Info, since
+///   running a dev build is the owner's choice and nothing is broken, and an Info row
+///   on the glass is progress or a decision only (the owner's attention rule, ruling
+///   76; "FYI/CYA messages need to go to the log"). It is on Settings ▸ Messages,
+///   `messages.log` and `appstatus`, and `aterm update status` says it too.
+/// * AT or NEWER THAN the newest release — nothing: the watch's log line keeps it.
+///
+/// What a dev build WRITES of the release's shared setup is not the channel's to say:
+/// [`dev_build_writes`] is its own row, said at launch whatever the channel answers.
+pub(crate) fn dev_build(lag: &aterm_update::dev_channel::DevLag) -> Option<Message> {
+    let standing = lag.words();
+    if !lag.is_behind() {
+        return None;
+    }
+    Some(
+        row(
+            Severity::Info,
+            sanitize_for_tty(&format!("Dev build, {standing}"), 80),
+        )
+        .line("the updater leaves a dev build alone, so it stays this old until rebuilt")
+        .sentence(
+            "rebuild it with tools/dev-app.sh, or use the release (tools/install.sh puts it in \
+             Applications)",
+        )
+        .hold(Hold::LogOnly)
+        .key(KEY_DEV_BUILD),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1023,163 @@ mod tests {
 
     fn busy(msg: &Message) -> bool {
         msg.meter.as_ref().is_some_and(|m| m.busy)
+    }
+
+    /// Everything a dev build named aterm.app writes with both switches on.
+    const ALL_WRITES: DevSharedWrites = DevSharedWrites {
+        what: "the PATH links, the shell hooks and the agent primer",
+        repair: "`aterm pkg repair` and `aterm agents install`",
+    };
+
+    /// A dev build two releases behind the channel head.
+    fn dev_behind() -> aterm_update::dev_channel::DevLag {
+        aterm_update::dev_channel::DevLag::Behind {
+            latest: "v0.93.0".into(),
+            releases: Some(2),
+        }
+    }
+
+    /// Every standing the dev-channel watch can report.
+    fn every_dev_standing() -> Vec<aterm_update::dev_channel::DevLag> {
+        use aterm_update::dev_channel::DevLag;
+        vec![
+            dev_behind(),
+            DevLag::Behind {
+                latest: "v0.93.0".into(),
+                releases: Some(1),
+            },
+            DevLag::Behind {
+                latest: "v1.0.0".into(),
+                releases: None,
+            },
+            DevLag::Current {
+                latest: "v0.93.0".into(),
+            },
+            DevLag::Ahead {
+                latest: "v0.93.0".into(),
+            },
+        ]
+    }
+
+    /// A DEV BUILD'S STANDING (gap #30): behind the channel is a RECORD in the dev
+    /// channel's words — `Dev build, 2 releases behind aterm v0.93.0`, Info, what to do
+    /// behind it — because an Info row on the glass must be progress or a decision
+    /// (ruling 76); at or newer than the newest release says nothing.
+    #[test]
+    fn a_dev_builds_standing_is_a_record() {
+        use crate::message_reporters::{Attention, attention};
+        use aterm_update::dev_channel::DevLag;
+        let behind = dev_build(&dev_behind()).expect("behind is recorded");
+        assert_eq!(behind.title, "Dev build, 2 releases behind aterm v0.93.0");
+        assert_eq!(behind.severity, Severity::Info);
+        assert_eq!(behind.hold, Hold::LogOnly);
+        assert_eq!(behind.key.as_deref(), Some(KEY_DEV_BUILD));
+        assert_eq!(attention(&behind), Ok(Attention::Record));
+        assert!(
+            behind.detail.iter().any(|l| l.contains("tools/dev-app.sh")),
+            "what to do rides with it: {:?}",
+            behind.detail
+        );
+        assert_eq!(
+            aterm_messages::text::glass_title_fault(&behind.title),
+            None,
+            "the title keeps the glass form, should the owner rule it onto the glass"
+        );
+        let one = DevLag::Behind {
+            latest: "v0.93.0".into(),
+            releases: Some(1),
+        };
+        assert_eq!(
+            dev_build(&one).map(|m| m.title),
+            Some("Dev build, 1 release behind aterm v0.93.0".to_string())
+        );
+        let major = DevLag::Behind {
+            latest: "v1.0.0".into(),
+            releases: None,
+        };
+        assert_eq!(
+            dev_build(&major).map(|m| m.title),
+            Some("Dev build, older than aterm v1.0.0".to_string())
+        );
+        for quiet in [
+            DevLag::Current {
+                latest: "v0.93.0".into(),
+            },
+            DevLag::Ahead {
+                latest: "v0.93.0".into(),
+            },
+        ] {
+            assert_eq!(dev_build(&quiet), None, "{quiet:?}: nothing to say");
+        }
+    }
+
+    /// A DEV BUILD NAMED aterm.app, which runs the release's unattended writers, is a
+    /// Standing FAILURE row of its own — keyed apart from the standing, so no reading
+    /// of the channel supersedes it — saying what it writes and the release's verb that
+    /// puts EACH thing back: `aterm pkg repair` never touches the agent primer, so a
+    /// row that names the primer names `aterm agents install` (measured: the one row
+    /// seen live said "it writes the agent primer").
+    #[test]
+    fn a_dev_build_that_writes_the_release_setup_says_what_and_what_puts_it_back() {
+        use crate::message_reporters::{Attention, attention};
+        let row = dev_build_writes(ALL_WRITES);
+        assert_eq!(row.severity, Severity::Warn);
+        assert_eq!(row.hold, Hold::Standing);
+        assert_eq!(row.key.as_deref(), Some(KEY_DEV_BUILD_WRITES));
+        assert_ne!(
+            row.key.as_deref(),
+            Some(KEY_DEV_BUILD),
+            "the channel never supersedes it"
+        );
+        assert_eq!(attention(&row), Ok(Attention::Failure));
+        assert!(
+            row.title.contains("lost"),
+            "the loss is named: {}",
+            row.title
+        );
+        assert_eq!(aterm_messages::text::glass_title_fault(&row.title), None);
+        assert_eq!(
+            row.detail[0],
+            format!("it writes {}", ALL_WRITES.what),
+            "it says what it writes"
+        );
+        let said = row.detail.join(" ");
+        assert!(said.contains("`aterm pkg repair`"), "{said}");
+        assert!(said.contains("`aterm agents install`"), "{said}");
+        assert!(said.contains("tools/dev-app.sh"), "{said}");
+        // What it writes is what its switches let it write, each with its own repair,
+        // and nothing from a bundle that is not named aterm.app (the release-bundle
+        // rule stands its writers down).
+        assert_eq!(dev_shared_writes(false, true, true), Some(ALL_WRITES));
+        assert_eq!(
+            dev_shared_writes(false, true, false),
+            Some(DevSharedWrites {
+                what: "the PATH links and the shell hooks",
+                repair: "`aterm pkg repair`",
+            })
+        );
+        let primer = dev_shared_writes(false, false, true).expect("the primer alone is a write");
+        assert_eq!(
+            primer,
+            DevSharedWrites {
+                what: "the agent primer",
+                repair: "`aterm agents install`",
+            }
+        );
+        assert_eq!(dev_shared_writes(false, false, false), None);
+        for packages in [false, true] {
+            for prime in [false, true] {
+                assert_eq!(dev_shared_writes(true, packages, prime), None);
+            }
+        }
+        let only_primer = dev_build_writes(primer);
+        assert_eq!(only_primer.detail[0], "it writes the agent primer");
+        let said = only_primer.detail.join(" ");
+        assert!(said.contains("`aterm agents install`"), "{said}");
+        assert!(
+            !said.contains("pkg repair"),
+            "`aterm pkg repair` does not put the primer back: {said}"
+        );
     }
 
     /// Every posture the App can compute, both vetoes of the disabled handoff
@@ -872,6 +1209,57 @@ mod tests {
             });
         }
         postures
+    }
+
+    /// A LANE THAT TRIES AGAIN BY ITSELF ASKS NOTHING (design ruling 246):
+    /// its `Couldn't install` is a record — FYI goes to the log, never the
+    /// glass (the 11c capture: an empty band) — while a stopped lane keeps its
+    /// row and its `Install now`, with the failure's few words beside the
+    /// title where they change what the person does (the 11b capture:
+    /// `Couldn't install aterm v0.92.0 · disk full`).
+    #[test]
+    fn a_self_retry_is_a_record_and_a_stopped_lane_says_its_cause() {
+        let retry = needs_install(
+            "Couldn't install aterm v0.92.0",
+            TRIES_AGAIN,
+            Severity::Warn,
+            1234,
+        );
+        assert_eq!(retry.hold, Hold::LogOnly, "a record, never a row");
+        let stopped = needs_install_because(
+            "Couldn't install aterm v0.92.0",
+            short_cause("rename: No space left on device (os error 28)"),
+            INSTALL_FROM_MENU,
+            Severity::Warn,
+            1234,
+        );
+        assert_ne!(stopped.hold, Hold::LogOnly, "a row");
+        assert!(stopped.excerpt, "its cause is painted");
+        assert_eq!(
+            stopped.detail.first().map(String::as_str),
+            Some("disk full")
+        );
+        assert_eq!(stopped.actions, [Intent::ApplyUpdate { build: 1234 }]);
+        // No cause known: the title and the press alone, as before.
+        let bare = needs_install(
+            "Couldn't install aterm v0.92.0",
+            INSTALL_FROM_MENU,
+            Severity::Warn,
+            1234,
+        );
+        assert!(!bare.excerpt);
+        for (said, want) in [
+            ("No space left on device", Some("disk full")),
+            ("ENOSPC", Some("disk full")),
+            ("Read-only file system", Some("read-only disk")),
+            (
+                "Operation not permitted (os error 1)",
+                Some("no permission"),
+            ),
+            ("the handoff timed out", None),
+        ] {
+            assert_eq!(short_cause(said), want, "{said}");
+        }
     }
 
     /// EVERY FLOW ROW COMPLETES IN ITS FINISHED FORM (design ruling 154): the
@@ -943,11 +1331,9 @@ mod tests {
             download_failed("0.48.0", "zip sha256 mismatch"),
             installing("0.48.0"),
             finishing("0.48.0"),
-            landed("0.48.0", 7, 0),
-            landed("0.48.0", 7, 2),
-            installed_after("0.48.0", Duration::from_secs(42)),
-            downloaded("0.48.0", 7),
-            switch_started(Some("0.48.0"), "0.47.0", 6),
+            landed("0.48.0", 7, 0, None),
+            landed("0.48.0", 7, 2, Some(Duration::from_secs(42))),
+            switch_started(Some("0.48.0"), "0.47.0"),
             switch_stopped(Some("0.48.0"), "0.47.0", false, "child died"),
             outcome('\u{21bb}', "Update installed", "x", Severity::Info),
             needs_install("Update installed", "x", Severity::Info, 7),
@@ -955,6 +1341,10 @@ mod tests {
             failed("Update didn't finish", "", false),
             health_warning("aterm can't install updates", "3 checks"),
             health_recovered("aterm can't install updates", "since Sep 14"),
+            scrollback_lost(12_345, 3),
+            scrollback_lost(1, 1),
+            dev_build(&dev_behind()).expect("a record"),
+            dev_build_writes(ALL_WRITES),
         ];
         for m in &rows {
             assert_eq!(m.tag, tags::UPDATE, "{}", m.title);
@@ -1129,10 +1519,8 @@ mod tests {
             installing("0.91.0"),
             installing(""),
             finishing("0.91.0"),
-            landed("0.91.0", 7, 0),
-            installed_after("0.91.0", Duration::from_secs(42)),
-            downloaded("0.91.0", 7),
-            switch_started(Some("0.91.0"), "0.90.0", 6),
+            landed("0.91.0", 7, 0, Some(Duration::from_secs(42))),
+            switch_started(Some("0.91.0"), "0.90.0"),
             switch_stopped(Some("0.91.0"), "0.90.0", true, "x"),
             switch_stopped(Some("0.91.0"), "0.90.0", false, "x"),
             outcome(
@@ -1149,7 +1537,7 @@ mod tests {
                 7,
             ),
             needs_install(
-                crate::app_update_screen::UPDATE_INSTALLED_TITLE,
+                &crate::app_update_screen::update_installed_title(Some("9.9.9")),
                 crate::app_update_screen::UPDATE_INSTALLED_DETAIL,
                 Severity::Info,
                 7,
@@ -1168,7 +1556,16 @@ mod tests {
             ),
             health_recovered("aterm can't install updates", "since Sep 14"),
             staged("0.91.0", 7, None),
+            scrollback_lost(12_345, 3),
         ];
+        for lag in every_dev_standing() {
+            all.extend(dev_build(&lag));
+        }
+        for packages in [false, true] {
+            for prime in [false, true] {
+                all.extend(dev_shared_writes(false, packages, prime).map(dev_build_writes));
+            }
+        }
         for posture in every_posture() {
             all.push(staged("0.91.0", 7, Some(posture)));
         }
@@ -1321,7 +1718,7 @@ mod tests {
         assert_eq!(staged_detail(P::ManualByConfig), "automatic install is off");
         assert_eq!(
             staged_detail(P::ManualOnlyLatched { lapses: true }),
-            "didn't install \u{2014} will try again later"
+            "didn't install \u{2014} tries again by itself later"
         );
         assert_eq!(
             staged_detail(P::ManualOnlyLatched { lapses: false }),
@@ -1436,6 +1833,31 @@ mod tests {
         assert_eq!(Intent::ApplyUpdate { build: 3 }.label(), "Install now");
     }
 
+    /// R39 says how much scrollback stayed behind, in how many tabs, and
+    /// where the per-tab count is — a failure on glass, never a record only.
+    #[test]
+    fn the_scrollback_row_counts_the_lines_and_the_tabs() {
+        let m = scrollback_lost(12_345, 3);
+        assert_eq!(m.title, "Couldn't carry all scrollback");
+        assert_eq!(m.severity, Severity::Warn);
+        assert_eq!(
+            m.hold,
+            Hold::Default,
+            "a loss is on glass, not only on record"
+        );
+        assert_eq!(m.key.as_deref(), Some(KEY_SCROLLBACK));
+        assert_eq!(m.detail[0], "12345 older lines stayed behind in 3 tabs");
+        assert!(
+            m.detail.iter().any(|l| l.contains("history_lost=")),
+            "{:?}",
+            m.detail
+        );
+        assert_eq!(
+            scrollback_lost(1, 1).detail[0],
+            "1 older line stayed behind in 1 tab"
+        );
+    }
+
     /// Every flow detail is short and point first: at most 40 characters, so
     /// the phase is read at a glance and survives any ordinary width.
     #[test]
@@ -1491,7 +1913,7 @@ mod tests {
         for m in [
             installing("0.88.0"),
             finishing("0.88.0"),
-            landed("0.88.0", 7, 0),
+            landed("0.88.0", 7, 0, None),
         ] {
             sentences.push(m.title);
             sentences.extend(m.detail);
@@ -1531,7 +1953,7 @@ mod tests {
         assert!(!f.excerpt, "a reassurance changes nothing the person does");
         assert!(busy(&f));
         assert_eq!(f.key, i.key);
-        let l = landed("9.9.9", 7, 0);
+        let l = landed("9.9.9", 7, 0, None);
         assert_eq!(l.title, "Updated to aterm v9.9.9");
         assert!(
             l.detail.is_empty(),
@@ -1546,7 +1968,7 @@ mod tests {
         );
         assert_eq!(l.severity, Severity::Success);
         assert_eq!(l.key, None);
-        assert_eq!(landed("", 7, 0).title, "Updated to build 7");
+        assert_eq!(landed("", 7, 0, None).title, "Updated to build 7");
     }
 
     /// A REPAINT IS NEVER UNSEEN (the 2026-09-22/23 update audit, plan P1-5):
@@ -1557,13 +1979,13 @@ mod tests {
     /// 76, ruling 141), and nothing on a blank tab is the person's to do.
     #[test]
     fn the_landing_names_the_tabs_it_repainted() {
-        let one = landed("0.92.0", 7, 1);
+        let one = landed("0.92.0", 7, 1, None);
         assert_eq!(one.title, "Updated to aterm v0.92.0");
         assert_eq!(one.detail[0], "1 tab repainted");
         assert!(
             one.detail[1..]
                 .join(" ")
-                .starts_with("its screen could not be carried"),
+                .starts_with("its screen was blank after the update"),
             "{:?}",
             one.detail
         );
@@ -1579,40 +2001,44 @@ mod tests {
             "nothing to press: {:?}",
             one.actions
         );
-        let three = landed("0.92.0", 7, 3);
+        let three = landed("0.92.0", 7, 3, None);
         assert_eq!(three.detail[0], "3 tabs repainted");
         assert!(
             three.detail[1..].join(" ").starts_with("their screens"),
             "{:?}",
             three.detail
         );
-        assert!(landed("0.92.0", 7, 0).detail.is_empty());
+        assert!(landed("0.92.0", 7, 0, None).detail.is_empty());
     }
 
-    /// THE UPDATE'S RECORDS: when it downloaded, when the switch began or
-    /// stopped, and how long it took — each a `LogOnly` record with no key.
+    /// THE UPDATE'S RECORDS: when the switch began or stopped, and how long
+    /// it took — each a `LogOnly` record with no key, every version spelled
+    /// `aterm vX`, and the duration a line of the landing, never a second
+    /// entry (audit 2026-09-24).
     #[test]
     fn the_update_records_say_what_happened_when() {
-        let d = downloaded("0.79.0", 7);
-        assert_eq!(d.title, "Downloaded aterm 0.79.0");
-        assert_eq!(d.detail, vec!["build 7, verified and ready to install"]);
-        assert_eq!(d.hold, Hold::LogOnly);
-        assert_eq!(d.key, None);
-        let s = switch_started(Some("0.79.0"), "0.78.0", 6);
-        assert_eq!(s.title, "Installing aterm 0.79.0");
-        assert_eq!(s.detail, vec!["from aterm 0.78.0 (build 6)"]);
+        let s = switch_started(Some("0.79.0"), "0.78.0");
+        assert_eq!(s.title, "Installing aterm v0.79.0");
+        assert_eq!(s.detail, vec!["from aterm v0.78.0"]);
         assert_eq!(s.hold, Hold::LogOnly);
         assert_eq!(
-            switch_started(None, "0.78.0", 6).title,
+            switch_started(None, "0.78.0").title,
             "Reloading aterm in place"
         );
         let waiting = switch_stopped(Some("0.79.0"), "0.78.0", true, "typing");
-        assert_eq!(waiting.title, "Waiting to install aterm 0.79.0");
+        assert_eq!(waiting.title, "Waiting to install aterm v0.79.0");
+        assert_eq!(
+            waiting.detail.join(" "),
+            "you were typing, so aterm v0.78.0 kept running; it tries again by itself"
+        );
         assert_eq!(waiting.severity, Severity::Info);
         let not = switch_stopped(Some("0.79.0"), "0.78.0", false, "the proof timed out");
-        assert_eq!(not.title, "aterm 0.79.0 was not installed");
+        assert_eq!(not.title, "aterm v0.79.0 was not installed");
+        assert_eq!(
+            not.detail.join(" "),
+            "aterm v0.78.0 kept running: the proof timed out"
+        );
         assert_eq!(not.severity, Severity::Warn);
-        assert!(not.detail.join(" ").ends_with("the proof timed out"));
         assert_eq!(
             switch_stopped(None, "0.78.0", true, "x").title,
             "Waiting to reload aterm"
@@ -1621,17 +2047,19 @@ mod tests {
             switch_stopped(None, "0.78.0", false, "x").title,
             "aterm was not reloaded"
         );
-        let took = installed_after("0.79.0", Duration::from_secs(42));
-        assert_eq!(
-            took.title,
-            "Installed aterm v0.79.0 42 s after it downloaded"
-        );
+        for m in [s, waiting, not] {
+            let words = std::iter::once(m.title.clone())
+                .chain(m.detail.clone())
+                .collect::<Vec<_>>()
+                .join(" ");
+            for jargon in ["switch", "carried", "on its own", "build "] {
+                assert!(!words.contains(jargon), "{jargon:?} in {words:?}");
+            }
+        }
+        let took = landed("0.79.0", 7, 0, Some(Duration::from_secs(42)));
+        assert_eq!(took.title, "Updated to aterm v0.79.0");
+        assert_eq!(took.detail, vec!["installed 42 s after the download"]);
         assert_eq!(took.hold, Hold::LogOnly);
-        assert_ne!(
-            took.title,
-            landed("0.79.0", 7, 0).title,
-            "two titles, one each"
-        );
         for (secs, words) in [
             (42, "42 s"),
             (60, "1 min"),
@@ -1699,7 +2127,7 @@ mod tests {
         assert!(!stopped.excerpt, "the capsule is the press");
         assert_ne!(stopped.key, Some(KEY_PROGRESS.to_string()));
         let installed = needs_install(
-            crate::app_update_screen::UPDATE_INSTALLED_TITLE,
+            &crate::app_update_screen::update_installed_title(Some("9.9.9")),
             crate::app_update_screen::UPDATE_INSTALLED_DETAIL,
             Severity::Info,
             7,
@@ -1769,7 +2197,7 @@ mod tests {
         assert_eq!(healed.title, "aterm updates work again");
         assert_eq!(
             healed.detail,
-            vec!["it had said: aterm can't install updates \u{2014} since Sep 14"]
+            vec!["after \"aterm can't install updates\", since Sep 14"]
         );
         assert_eq!(healed.hold, Hold::LogOnly);
     }
@@ -1890,10 +2318,14 @@ mod tests {
         ] {
             surfaces.push(("close-preflight / installed", blocker.to_string()));
         }
-        surfaces.push((
-            "updater outcome",
-            crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(7),
-        ));
+        for version in [Some("9.9.9"), None] {
+            surfaces.push((
+                "updater outcome",
+                crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(
+                    version,
+                ),
+            ));
+        }
         surfaces.push((
             "updater outcome",
             crate::native_updater_service::NativeUpdaterService::apply_attempt_stopped_outcome(
@@ -1902,7 +2334,7 @@ mod tests {
         ));
         for (title, detail) in [
             (
-                crate::app_update_screen::UPDATE_INSTALLED_TITLE,
+                &*crate::app_update_screen::update_installed_title(Some("9.9.9")),
                 crate::app_update_screen::UPDATE_INSTALLED_DETAIL,
             ),
             (
@@ -1910,7 +2342,7 @@ mod tests {
                 INSTALL_FROM_MENU,
             ),
             ("Couldn't install aterm v9.9.9", INSTALL_FROM_MENU),
-            ("Couldn't install aterm v9.9.9", "will try again by itself"),
+            ("Couldn't install aterm v9.9.9", TRIES_AGAIN),
             ("Couldn't download aterm v9.9.9", DOWNLOAD_FAILED),
             ("Update didn't finish", ""),
         ] {
@@ -1919,15 +2351,14 @@ mod tests {
         for m in [
             installing("9.9.9"),
             finishing("9.9.9"),
-            landed("9.9.9", 7, 0),
-            landed("9.9.9", 7, 3),
-            landed("", 7, 0),
+            landed("9.9.9", 7, 0, Some(Duration::from_secs(42))),
+            landed("9.9.9", 7, 1, None),
+            landed("9.9.9", 7, 3, None),
+            landed("", 7, 0, None),
             download_failed("9.9.9", "x"),
             download_postponed("busy"),
-            downloaded("9.9.9", 7),
-            installed_after("9.9.9", Duration::from_secs(42)),
-            switch_started(Some("9.9.9"), "9.9.8", 6),
-            switch_started(None, "9.9.8", 6),
+            switch_started(Some("9.9.9"), "9.9.8"),
+            switch_started(None, "9.9.8"),
             health_recovered("aterm can't install updates", "since Sep 14"),
         ]
         .into_iter()
@@ -1965,225 +2396,5 @@ mod tests {
                 "{surface} asks for a restart: {text:?}"
             );
         }
-    }
-
-    /// NOTHING THIS MODULE SAYS ASKS FOR A RESTART OR A RELAUNCH (owner
-    /// ruling, 2026-08-30): every builder's own words, under every posture.
-    #[test]
-    fn no_update_word_asks_for_a_restart_or_a_relaunch() {
-        let mut sentences: Vec<String> = every_posture()
-            .iter()
-            .map(|posture| staged_detail(*posture))
-            .collect();
-        sentences.push(staged_detail_unknown());
-        for m in [
-            installing("9.9.9"),
-            finishing("9.9.9"),
-            landed("9.9.9", 7, 0),
-            landed("9.9.9", 7, 1),
-            landed("", 7, 0),
-            download_postponed("busy"),
-        ] {
-            sentences.push(m.title);
-            sentences.extend(m.detail);
-        }
-        assert!(sentences.len() >= 20, "the guard covers the lane");
-        for text in sentences {
-            let lower = text
-                .replace("ATERM_DEBUG_RELAUNCH_NUDGE", "<seam>")
-                .to_lowercase();
-            assert!(
-                !lower.contains("restart")
-                    && !lower.contains("relaunch")
-                    && !lower.contains("reopen"),
-                "asks for a restart: {text:?}"
-            );
-        }
-    }
-
-    /// AND THE SOURCE SAYS IT NOWHERE. The fault-word guard above checks the
-    /// VALUES the builders produce, so a surface nobody added to a list, or a
-    /// sentence its needles cannot see — "quit and open aterm again", "activates
-    /// it at the next launch" — passes it. This one reads the SHIPPING lines of every
-    /// update-lane file in this crate, plus every `.rs` file of `aterm-cli` and
-    /// `aterm-update` (test code dropped, comment lines dropped), for the
-    /// shapes a restart prompt takes. The things that genuinely
-    /// apply at the next launch (`columns`/`lines`, the GPU backend, `net.key`,
-    /// the `[packages]` service, the Windows backdrop, the config validator's
-    /// dead worker) are allow-listed by an anchor on the same line, and the
-    /// handoff-off posture's fallback clause ("… or once every terminal is
-    /// closed") carries its own. The shell twin, `tools/grep_guard.sh` B12, reads
-    /// every file in the crate with the same needles and anchors. Both lists are
-    /// assembled at runtime so no test source can trip them.
-    #[test]
-    fn no_update_lane_source_prompts_a_restart() {
-        let join = |parts: &[(&str, &str)]| -> Vec<String> {
-            parts.iter().map(|(a, b)| format!("{a}{b}")).collect()
-        };
-        let needles = join(&[
-            ("restart ", "aterm"),
-            ("restart ", "now"),
-            ("restart ", "to apply"),
-            ("restart ", "to finish"),
-            ("restart ", "to update"),
-            ("relaunch ", "aterm"),
-            ("relaunch ", "once"),
-            ("relaunch ", "now"),
-            ("relaunch ", "to "),
-            ("before ", "relaunch"),
-            (" on ", "relaunch"),
-            ("& ", "relaunch"),
-            ("quit and ", "open"),
-            ("quit and ", "reopen"),
-            ("open aterm ", "again"),
-            ("start aterm ", "again"),
-            ("re-", "launch"),
-            ("re-open ", "aterm"),
-            ("re-open ", "the app"),
-            ("re-open ", "it"),
-            ("re", "boot"),
-            ("next ", "launch"),
-            ("restart ", "required"),
-            ("requires ", "a restart"),
-            ("needs ", "a restart"),
-            ("reopen ", "aterm"),
-            ("reopen ", "the app"),
-            ("relaunch ", "required"),
-            ("needs ", "a relaunch"),
-            ("relaunch ", "the app"),
-        ]);
-        let anchors = join(&[
-            ("once every ", "terminal is closed"),
-            ("applies ", "next launch"),
-            ("closing or ", "next launch"),
-            ("automatic ", "checks"),
-            ("manual ", "now"),
-            ("[", "packages]"),
-            ("next ", "package operation"),
-            ("net", ".key"),
-            ("columns", "/lines"),
-            ("gpu ", "applies"),
-            ("gpu rendering ", "(restart)"),
-            ("this ", "launch"),
-            ("open a new window ", "or restart"),
-            ("config ", "validator"),
-            ("back", "drop"),
-            ("own apply ", "lane"),
-            ("launch is the ", "fallback"),
-            ("retired-wording ", "detector"),
-            // The dead accessibility publisher, added 2026-08-31 alongside
-            // a11y_backend.rs joining the file list below. A restart is the
-            // only recovery there — one backend per process, by `OnceLock` —
-            // and this ruling is about the UPDATE lane, which updates in place.
-            ("restart aterm ", "to retry"),
-        ]);
-        let gui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files: Vec<std::path::PathBuf> = [
-            // a11y_backend.rs was MISSING here until 2026-08-31, and that is how
-            // b571a20b9's restart prompt shipped with this test green: only
-            // tools/grep_guard.sh's B12 — which reads every shipping line of the
-            // crate rather than an enumerated set — ever saw it. An enumerated
-            // list is a list somebody has to remember to extend.
-            "a11y_backend.rs",
-            "update_words.rs",
-            "toolchain_words.rs",
-            "messages_host.rs",
-            "message_band.rs",
-            "message_inbox.rs",
-            "message_reporters.rs",
-            "menu.rs",
-            "palette.rs",
-            "app_palette.rs",
-            "robi_bubble.rs",
-            "consent_card.rs",
-            "relaunch_notice.rs",
-            "app_update_screen.rs",
-            "app_update_handoff.rs",
-            "app_native.rs",
-            "native_settings.rs",
-            "native_ui.rs",
-            "native_updater_service.rs",
-            "native_update_admission.rs",
-            "update_apply_trouble.rs",
-            "control.rs",
-        ]
-        .iter()
-        .map(|file| gui.join(file))
-        .collect();
-        // The CLI and the updater ship update-lane strings of their own (the
-        // `update` verb's output, the updater's log and status lines), which
-        // the include-set above could never see — every `.rs` file of both
-        // crates, derived, so a new module cannot dodge the scan.
-        for dir in ["../aterm-cli/src", "../aterm-update/src"] {
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
-            let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
-                .map(|entry| entry.expect("read_dir entry").path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-                .collect();
-            siblings.sort();
-            assert!(!siblings.is_empty(), "{} scanned no files", dir.display());
-            files.append(&mut siblings);
-        }
-        let mut scanned = 0usize;
-        for path in files {
-            let file = path.display();
-            let source =
-                std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
-            // Test code is not a shipping line. The gui files keep their tests
-            // in one trailing `mod tests`; the CLI and the updater interleave
-            // several `#[cfg(test)] mod …` blocks with production, so gate on
-            // the attribute the way grep_guard's `np_strip` does: a column-0
-            // `#[cfg(test)]` opens a skip that a block ends at its column-0 `}`
-            // and a single item ends at its `;`.
-            let mut in_test_block = false;
-            let mut test_item_armed = false;
-            for (n, line) in source.lines().enumerate() {
-                if in_test_block {
-                    if line == "}" {
-                        in_test_block = false;
-                    }
-                    continue;
-                }
-                if test_item_armed {
-                    if line.ends_with('{') {
-                        in_test_block = true;
-                        test_item_armed = false;
-                    } else if line.ends_with(';') {
-                        test_item_armed = false;
-                    }
-                    continue;
-                }
-                if line == "#[cfg(test)]" {
-                    test_item_armed = true;
-                    continue;
-                }
-                if line == "mod tests {" {
-                    break;
-                }
-                let code = line.trim_start();
-                if code.starts_with("//") || code.starts_with('*') || code.starts_with("/*") {
-                    continue;
-                }
-                scanned += 1;
-                let lower = line.to_lowercase();
-                if anchors.iter().any(|anchor| lower.contains(anchor.as_str())) {
-                    continue;
-                }
-                for needle in &needles {
-                    assert!(
-                        !lower.contains(needle.as_str()),
-                        "{file}:{} prompts a restart ({needle:?}): {}\n\
-                         an update is applied in place by the in-session handoff — the \
-                         shells keep running — and no update surface asks for a restart; \
-                         a setting that genuinely applies at the next launch names its \
-                         anchor on the same line",
-                        n + 1,
-                        line.trim()
-                    );
-                }
-            }
-        }
-        assert!(scanned > 20_000, "the guard read the lane: {scanned} lines");
     }
 }

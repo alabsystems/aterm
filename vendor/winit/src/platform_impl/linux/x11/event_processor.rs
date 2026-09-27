@@ -1,3 +1,4 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
@@ -978,7 +979,12 @@ impl EventProcessor {
                     window_id,
                     event: WindowEvent::KeyboardInput { device_id, event, is_synthetic: false },
                 };
-                callback(&self.target, event);
+                // aterm: publish the server timestamp for exactly this dispatch
+                // (`crate::platform::x11::key_event_server_time`).
+                let target = &self.target;
+                crate::platform::x11::dispatch_with_key_event_server_time(xev.time as u32, || {
+                    callback(target, event)
+                });
             }
 
             // Restore the client's modifiers state after replay.

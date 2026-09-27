@@ -24,7 +24,23 @@ use super::*;
 /// `Buggy=1` combines the regression family deliberately: the UI touches the
 /// platform while enqueuing, blocks and omits drop accounting on a full queue,
 /// and a cue applied to an already-running device retains the pre-cue silence
-/// threshold.
+/// threshold. It also carries one slip per remaining law:
+/// * the idle pause keeps its housekeeping timeout armed — the loop choosing
+///   `recv_timeout` on `output.is_some()` instead of `is_running()`, so a
+///   paused worker polls forever (`RunningOwnsOneDeadline`; the event-loop
+///   frame-tick housekeeping that `4b7e0efc0` moved onto this worker was the
+///   same wake);
+/// * exhaustion latches `STATE_FAILED` but the loop does not `return`, so its
+///   receiver stays alive: ingress stays open and the next cue reopens the
+///   device (`StartFailureIsExplicitAndTerminal`). Both guards read
+///   `failed <= Buggy`, which over the 0..1 flag is `failed == 0` at the
+///   committed config;
+/// * the mailbox is built with `mpsc::channel()` where `4b7e0efc0` wrote
+///   `sync_channel(COMMAND_CAPACITY)` — one token, and an unbounded FIFO that
+///   admits a cue past capacity instead of dropping it
+///   (`WorkerMailboxIsBounded`; `PushCueAvailable`'s guard admits one slot
+///   more). The Tier-1 `shipping_ingress_conforms_to_bounded_drop_newest_model`
+///   fills the real 64 slots and sees the 65th dropped, not queued.
 ///
 /// THE REOPEN LADDER IS A SIBLING MACHINE. Since D5 (2026-09-22) the shipping
 /// worker no longer treats one device fault as terminal: a failed open, a
@@ -46,22 +62,6 @@ use super::*;
 /// `worker_loop`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-/// KNOWN PARTIAL, 2026-09-22. The shipping worker no longer treats one
-/// device fault as terminal: a failed open, a failed start/enqueue, a faulted
-/// callback or a stalled one now spends one of `REOPEN_BUDGET` device
-/// reopens, and only EXHAUSTION latches `STATE_FAILED` and seals ingress
-/// (`aterm-gui/src/trail_audio.rs`, D5). This machine still describes only
-/// the terminal half — `StartFailureIsExplicitAndTerminal` remains TRUE of
-/// the shipping code, because the state it names is still reached and is
-/// still terminal — but it does not yet MODEL the bounded recovery in
-/// between, so a green run here says nothing about whether the budget is
-/// respected. The reopen ladder is covered at Tier-1 instead, by
-/// `worker_device_failure_is_retried_with_backoff_then_terminal_at_budget`
-/// and `reopen_attempts_respect_their_backoff_window`. Extending this
-/// machine with `DeviceFaults` / `ReopenSucceeds` / `ReopenExhausted` and a
-/// `RecoveryIsBounded` invariant is the outstanding work; per the recorded
-/// vacuous-guard-conjunct lesson, `ReopenSucceeds`'s guard must leave
-/// `ReopenExhausted` reachable or the new invariant proves nothing.
 pub fn trail_audio_lifecycle_model() -> Model {
     crate::ty_model! {
         TrailAudioLifecycle {
@@ -86,7 +86,7 @@ pub fn trail_audio_lifecycle_model() -> Model {
             var ui_platform_calls = 0;
 
             action PushCueAvailable when (
-                queued <= CommandCap - 1 && failed == 0
+                queued <= CommandCap - 1 + Buggy && failed <= Buggy
             ) {
                 queued = queued + 1;
                 last_full = 0;
@@ -102,7 +102,7 @@ pub fn trail_audio_lifecycle_model() -> Model {
                 last_full = 1;
                 ui_blocked = if Buggy == 1 { 1 } else { 0 };
             }
-            action WorkerStart when (queued > 0 && running == 0 && failed == 0) {
+            action WorkerStart when (queued > 0 && running == 0 && failed <= Buggy) {
                 queued = queued - 1;
                 last_full = 0;
                 running = 1;
@@ -147,7 +147,7 @@ pub fn trail_audio_lifecycle_model() -> Model {
                 service_deadline == 1 && silent == SilentCap
             ) {
                 running = 0;
-                service_deadline = 0;
+                service_deadline = if Buggy == 1 { 1 } else { 0 };
                 paused = 1;
             }
             action ParkIdle when (running == 0 && queued == 0 && service_deadline == 0) {
@@ -172,12 +172,10 @@ pub fn trail_audio_lifecycle_model() -> Model {
                 };
             invariant RunningOwnsOneDeadline:
                 if running == 1 { service_deadline == 1 } else { service_deadline == 0 };
-            invariant IdlePauseDisarmsDeadline:
-                if paused == 1 {
-                    running == 0 && silent == SilentCap && service_deadline == 0
-                } else {
-                    paused == 0
-                };
+            // No "idle pause disarms" law: PauseIdle is the one writer of
+            // `paused = 1` and writes `running = 0` from `silent == SilentCap`,
+            // every writer of `running = 1` clears `paused`, so its deadline
+            // half is RunningOwnsOneDeadline at `running = 0`.
             invariant StartFailureIsExplicitAndTerminal:
                 if failed == 1 {
                     running == 0 && queued == 0 && service_deadline == 0
@@ -196,14 +194,23 @@ pub fn trail_audio_lifecycle_model() -> Model {
 /// audible samples occupy buffer 1 (`MaxAudibleBuffer`), not buffer 4 behind
 /// three silent priming buffers. Idle uses synchronous immediate stop/reset:
 /// callback recycling is disabled first, and all scheduled buffers are
-/// reclaimed before a resume prime can write them. The idle worker remains
-/// disarmed throughout.
+/// reclaimed before a resume prime can write them. That the parked worker
+/// holds no timeout is not this machine's: it is
+/// [`trail_audio_lifecycle_model`]'s `RunningOwnsOneDeadline`, whose Tier-1
+/// bind watches the real `worker_loop` stop ticking; the fake queue here has
+/// no worker to wake.
 ///
 /// `Buggy=1` reproduces both dangerous alternatives around the regression: the
 /// retired pre-enqueued/pause-retained silence puts sound in buffer 4, while a
 /// naive attempt to overwrite those still-scheduled pointers on resume records
 /// an ownership violation. It also removes the enqueue/stop gate, admitting a
-/// stop while the callback is inside its queue-enqueue critical section. Tier-1 binding:
+/// stop while the callback is inside its queue-enqueue critical section. The
+/// shipping `stop_and_reclaim` refuses exactly that stop (`false`, every buffer
+/// still queued); the mutant ignores the refusal, and its books mark all three
+/// buffers AVAILABLE while the queue still owns them
+/// (`BufferOwnershipConserved`). Only the refused stop miscounts: with no
+/// enqueue in flight the retired pause keeps its buffers queued and its books
+/// say so. Tier-1 binding:
 /// `audio_queue_post_cue_prime_conforms_with_callback_free_fake` drives the
 /// shipping generic prime/stop helpers with an ownership-checking fake queue.
 #[must_use]
@@ -225,7 +232,6 @@ pub fn trail_audio_start_latency_model() -> Model {
             // One-based queue position; zero means no cue has been primed.
             var audible_buffer = 0;
             var unsafe_writes = 0;
-            var idle_wakes = 0;
             var generation = 0;
             var callback_generation = 0;
             var stale_enqueue = 0;
@@ -259,9 +265,11 @@ pub fn trail_audio_start_latency_model() -> Model {
             // With both values bounded to 0..1, `enqueue_in_flight <= Buggy`
             // is exactly `Buggy == 1 OR enqueue_in_flight == 0`, expressed in
             // the intentionally small ty_model expression grammar.
+            // Buggy: the retired pause keeps its buffers queued (and says so),
+            // while the refused mid-enqueue stop's books free them anyway.
             action StopIdle when (phase == 3 && enqueue_in_flight <= Buggy) {
                 phase = 4;
-                available = if Buggy == 1 { 0 } else { BufferCount };
+                available = if Buggy == 1 && enqueue_in_flight == 0 { 0 } else { BufferCount };
                 queued = if Buggy == 1 { BufferCount } else { 0 };
                 recycling = 0;
                 running = 0;
@@ -270,8 +278,8 @@ pub fn trail_audio_start_latency_model() -> Model {
                 stop_overlap = if enqueue_in_flight == 1 { 1 } else { 0 };
                 enqueue_in_flight = 0;
             }
-            action ParkIdle when (phase == 4 && idle_wakes == 0) {
-                idle_wakes = 0;
+            action ParkIdle when (phase == 4) {
+                phase = 4;
             }
             action CueResume when (phase == 4) {
                 phase = 5;
@@ -299,13 +307,9 @@ pub fn trail_audio_start_latency_model() -> Model {
             invariant WritesRequireAvailableOwnership: unsafe_writes == 0;
             invariant StaleCallbackCannotReenqueue: stale_enqueue == 0;
             invariant StopNeverOverlapsEnqueue: stop_overlap == 0;
-            invariant IdleIsCallbackAndWakeFree:
-                if phase == 4 {
-                    running == 0 && recycling == 0 && idle_wakes == 0 &&
-                    enqueue_in_flight == 0
-                } else {
-                    idle_wakes == 0
-                };
+            // No "idle is callback-free" law: `StopIdle` is phase 4's only
+            // entry and writes `running`, `recycling` and `enqueue_in_flight`
+            // to zero at every `Buggy`, and `ParkIdle` writes none of them.
             invariant PhaseBounded: phase <= 8;
         }
     }
@@ -693,7 +697,11 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
 /// the same tab semantics. A carried projection is admitted exactly when it
 /// covers the current columns and remains within the protocol maximum. The
 /// mutant truncates backing storage at shrink/restore and loses the off-width
-/// custom stop.
+/// custom stop. It is also the `restore_tab_stops` from before `46fc93f5a`,
+/// which admitted a projection of ANY length and copied whatever prefix
+/// overlapped the destination's own stops: an undersize vector was applied over
+/// the defaults and an oversize one truncated, where the fix rejects both
+/// (`AdmissionIsCoveringAndBounded`, `InvalidProjectionIsNeverAdmitted`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn tab_stop_handoff_model() -> Model {
@@ -772,17 +780,23 @@ pub fn tab_stop_handoff_model() -> Model {
                 phase = 9;
                 carried_len = MaxCols + 1;
             }
+            // Buggy: the pre-`46fc93f5a` restore admits the invalid vector and
+            // copies its overlapping prefix into the destination's own stops.
             action RejectUndersizeProjection when (
                 phase == 9 && carried_len <= Narrow - 1
             ) {
                 phase = 10;
-                rejected = 1;
+                admitted = if Buggy == 1 { 1 } else { admitted };
+                rejected = if Buggy == 1 { 0 } else { 1 };
+                restored_len = if Buggy == 1 { cols } else { restored_len };
             }
             action RejectOversizeProjection when (
                 phase == 9 && carried_len > MaxCols
             ) {
                 phase = 10;
-                rejected = 1;
+                admitted = if Buggy == 1 { 1 } else { admitted };
+                rejected = if Buggy == 1 { 0 } else { 1 };
+                restored_len = if Buggy == 1 { cols } else { restored_len };
             }
             action SettledPreserved when (phase == 8) {
                 phase = 8;
@@ -836,7 +850,11 @@ pub fn tab_stop_handoff_model() -> Model {
 /// abstracted behind `unbounded_work` and `mutation`; this property is about event
 /// routing, not a claim that emergency reclamation itself has a small bound. The
 /// mutant reintroduces the historical defect by admitting output directly into
-/// the bulk lane, so prove-and-catch is non-vacuous.
+/// the bulk lane: the amortized `enforce_global_scrollback_cap` that `46fc93f5a`
+/// removed from the output-wake arm scanned every session, took their locks and
+/// EVICTED mid-scan, so all four capabilities fire on ordinary output and the
+/// eviction lands with no completed pressure trim behind it
+/// (`MutationRequiresCompletedPressureTrim`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scrollback_maintenance_lane_model() -> Model {
@@ -855,6 +873,7 @@ pub fn scrollback_maintenance_lane_model() -> Model {
                 scan_started = if Buggy == 1 { 1 } else { 0 };
                 blocking_lock = if Buggy == 1 { 1 } else { 0 };
                 unbounded_work = if Buggy == 1 { 1 } else { 0 };
+                mutation = if Buggy == 1 { 1 } else { 0 };
             }
             action ObserveMemoryPressure when (event == 0) {
                 event = 2;
@@ -891,8 +910,8 @@ pub fn scrollback_maintenance_lane_model() -> Model {
                 if blocking_lock == 1 { event == 2 } else { event <= 2 };
             invariant UnboundedWorkRequiresMemoryPressure:
                 if unbounded_work == 1 { event == 2 } else { event <= 2 };
-            invariant MutationRequiresMemoryPressure:
-                if mutation == 1 { event == 2 } else { event <= 2 };
+            // Its first conjunct is the whole of "mutation requires memory
+            // pressure", so that weaker law is not stated separately.
             invariant MutationRequiresCompletedPressureTrim:
                 if mutation == 1 {
                     event == 2 && completed == 1 && scan_started == 0
@@ -914,7 +933,13 @@ pub fn scrollback_maintenance_lane_model() -> Model {
 /// alternate-screen grid remains ephemeral. Rows below the vertical margin are
 /// preserved in every regime. The mutant is the historical aterm behavior: it
 /// silently drops the eligible displaced row merely because the region is not
-/// full-height.
+/// full-height. Its scroll also runs to the SCREEN bottom instead of the DECSTBM
+/// bottom margin, in every regime, displacing the fixed footer
+/// (`FixedFooterIsPreserved`). That slip is hypothetical, not a shipped defect.
+/// `footer` is a flag only the slip writes, so at Tier-0 the law is the flag;
+/// what gives it content is the Tier-1 bind, which reads `footer` off the real
+/// grid's bottom row and replays the slip as a real interior scroll whose bottom
+/// margin is the screen bottom.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn top_anchored_scroll_history_model() -> Model {
@@ -1039,6 +1064,7 @@ pub fn top_anchored_scroll_history_model() -> Model {
                     selection_region_row
                 };
                 selection_footer_row = selection_footer_row;
+                footer = if Buggy == 1 { 0 } else { footer };
             }
             action Settled when (phase == 2) {
                 phase = 2;
@@ -1297,6 +1323,13 @@ pub fn path_feed_snapshot_model() -> Model {
 /// The current config observation must be re-prepared against that newer theme
 /// rather than publishing assets derived from the old theme or being dropped.
 /// The mutant publishes the sequence-current but theme-stale completion.
+///
+/// Tier-1: aterm-gui's
+/// `overtaking_theme_catalog_conforms_to_font_theme_generation_model`
+/// (`native_font_catalog.rs`) drives this model's whole reachable space on a
+/// real headless App and the worker's real `prepare`, reading back which
+/// completion — and so which theme catalog — the config service ended up
+/// holding, and rejects the pre-theme-generation guard.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn font_theme_generation_model() -> Model {
@@ -2150,17 +2183,37 @@ pub fn selection_custody_model() -> Model {
 ///
 /// The one property worth stating is the slot's lifetime: `parked_sel` is alive
 /// only between an enter and the next leave. That is what bounds the clear-site
-/// list to the handful of wholesale destroyers (`Terminal::reset`, byte-stream RIS,
-/// `clear_scrollback`, a width resize, `restore_checkpoint`) instead of making every
-/// future destroyer acquire a second obligation for a selection that outlived it.
+/// list to the handful of destroyers instead of making every future destroyer
+/// acquire a second obligation for a selection that outlived it. They come in
+/// three shapes, one action each:
 ///
-/// `Buggy=1` is the regression family, two members naming two different invariants.
+/// * `Wholesale` — `clear_scrollback` and a width resize destroy what BOTH slots
+///   named and leave the screen where it is;
+/// * `Reset` — `Terminal::reset` and byte-stream RIS destroy both AND drop the
+///   alternate buffer, so they also land on the main screen: for a direct reset an
+///   alt->main switch the restore in `post_process` never sees, and for RIS followed
+///   by a re-entry in the SAME batch a switch it never runs at all;
+/// * `RestoreMain` / `RestoreAlt` — `restore_checkpoint` adopts another session's
+///   grids and whichever screen that session was on. It retires the parked slot,
+///   whose anchors name a lineage this terminal never saw, and deliberately leaves
+///   the LIVE selection standing: that half is the seamless-update adopt path, where
+///   clearing it would make a highlight vanish across an in-place update.
+///
+/// `Buggy=1` is the regression family, two members naming different invariants.
 /// The first is the obvious alternative implementation — a symmetric SWAP instead of
 /// an asymmetric take — under which the alt screen's own selection stays parked
 /// after the leave and reappears on the next round trip, over a buffer the user
-/// cannot see. The second is the wholesale destroyer that clears the live selection
-/// and forgets the parked one, which is exactly the failure mode of five of the six
-/// coordinated clear sites: nothing in the compiler notices.
+/// cannot see. The second is the destroyer that forgets the parked slot, at every
+/// one of the three shapes, which is exactly the failure mode of the coordinated
+/// clear sites: nothing in the compiler notices.
+///
+/// Tier-1: `aterm-core/src/terminal/alt_selection_park_conformance.rs` walks
+/// this model's whole reachable space on the real `Terminal` — real `?1049h` /
+/// `?1049l` bytes, `clear_scrollback`, a width resize, `Terminal::reset`,
+/// byte-stream RIS alone and RIS then `?1049h` in one batch, and
+/// `restore_checkpoint` from a main-screen and an alt-screen checkpoint — from
+/// BOTH screens, reading the parked slot itself, and rejects each `Buggy = 1`
+/// member injected into the same real trace at its own action.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn alt_selection_park_model() -> Model {
@@ -2174,8 +2227,8 @@ pub fn alt_selection_park_model() -> Model {
             var live_sel = 0;
             // The OTHER screen's selection, held across the switch.
             var parked_sel = 0;
-            // What just fired: 0 a user gesture, 1 an enter, 2 a wholesale
-            // destroyer, 3 a leave.
+            // What just fired: 0 a user gesture, 1 an enter, 2 an in-place
+            // destroyer, 3 a leave, 4 a reset, 5 a checkpoint restore.
             var last_event = 0;
 
             action Select {
@@ -2203,24 +2256,47 @@ pub fn alt_selection_park_model() -> Model {
                 on_alt = 0;
                 last_event = 3;
             }
-            // RIS, clear_scrollback, a width resize, restore_checkpoint: the content
-            // under BOTH selections is gone, so both slots must go.
+            // clear_scrollback, a width resize: the content under BOTH selections
+            // is gone, so both slots must go. The screen stays where it is.
             action Wholesale {
                 live_sel = 0;
                 parked_sel = if Buggy == 1 { parked_sel } else { 0 };
                 last_event = 2;
             }
+            // `Terminal::reset`, RIS: both slots go, and so does the alt buffer.
+            action Reset {
+                on_alt = 0;
+                live_sel = 0;
+                parked_sel = if Buggy == 1 { parked_sel } else { 0 };
+                last_event = 4;
+            }
+            // `restore_checkpoint` of a session that was on the main screen / on
+            // the alternate screen. The live selection is left standing.
+            action RestoreMain {
+                on_alt = 0;
+                parked_sel = if Buggy == 1 { parked_sel } else { 0 };
+                last_event = 5;
+            }
+            action RestoreAlt {
+                on_alt = 1;
+                parked_sel = if Buggy == 1 { parked_sel } else { 0 };
+                last_event = 5;
+            }
 
             invariant ParkedEmptyOffAlt:
                 if on_alt == 0 { parked_sel == 0 } else { parked_sel <= 1 };
-            invariant WholesaleLeavesNothingParked:
-                if last_event == 2 {
+            invariant DestroyerLeavesNothingSelected:
+                if last_event == 2 || last_event == 4 {
                     live_sel == 0 && parked_sel == 0
                 } else {
-                    last_event <= 3
+                    last_event <= 5
                 };
+            // Caught on its own by a forgetful restore of an ALT checkpoint, which
+            // `ParkedEmptyOffAlt` cannot see: the stale slot is still "on alt".
+            invariant RestoreRetiresTheParkedSlot:
+                if last_event == 5 { parked_sel == 0 } else { last_event <= 5 };
             invariant StateBounds:
-                on_alt <= 1 && live_sel <= 1 && parked_sel <= 1 && last_event <= 3;
+                on_alt <= 1 && live_sel <= 1 && parked_sel <= 1 && last_event <= 5;
         }
     }
 }
@@ -2245,6 +2321,13 @@ pub fn alt_selection_park_model() -> Model {
 /// closing an overlay clears its still-needed tracker entry, an overlay swallows
 /// the untracked release owed to a pre-overlay forwarded press, or repeat/release
 /// routing re-resolves current focus instead of retaining the original target.
+/// The literal (`[key_sequences]`) release is decided again at RELEASE time —
+/// the chord re-lookup `3742a3b44` removed: a modifier let go mid-hold misses
+/// the chord, and the release falls through to the encoder as an orphan Kitty
+/// report for a press the PTY never saw. The local-repeat release gets the same
+/// slip by analogy: its release helper arrived later (`4b7e0efc0`) and never
+/// re-looked-up, but a `[keybindings]` re-lookup at release time would leak
+/// the same way.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_release_pairing_model() -> Model {
@@ -2388,6 +2471,8 @@ pub fn input_release_pairing_model() -> Model {
             ) {
                 phase = 2;
                 tracker = 0;
+                release_emitted = if Buggy == 1 { 1 } else { release_emitted };
+                orphan_csi_u = if Buggy == 1 { 1 } else { orphan_csi_u };
                 release_arrival_window = focused_window;
             }
             action ReleaseLocalRepeatPress when (
@@ -2395,6 +2480,8 @@ pub fn input_release_pairing_model() -> Model {
             ) {
                 phase = 2;
                 tracker = 0;
+                release_emitted = if Buggy == 1 { 1 } else { release_emitted };
+                orphan_csi_u = if Buggy == 1 { 1 } else { orphan_csi_u };
                 release_arrival_window = focused_window;
             }
             action PhysicalFocusLoss when (
@@ -2532,8 +2619,12 @@ pub fn input_release_pairing_model() -> Model {
 ///
 /// `Buggy=1` admits the regression family: partial/stale proof Commit, reader
 /// release on ProofReady, legacy ACK for ambiguous/scrolled state, parent resume
-/// before reap, and the old wait-before-group-signal ordering that could strand a
-/// live descendant after its leader exited.
+/// before reap, the old wait-before-group-signal ordering that could strand a
+/// live descendant after its leader exited, a parent that exits after its Commit
+/// write without checking the result (an EPIPE from a child already gone still ends
+/// the parent, and nobody owns the terminal), and a reject sweep whose signal
+/// reaches only the leader — `kill(pid)` where `kill(-pgid)` was meant, the mirror
+/// of 4a660aded's group-only sweep that missed a candidate outside its own group.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_overlap_handoff_model() -> Model {
@@ -2938,6 +3029,14 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 parent_exited = 1;
                 child_readers = 1;
             }
+            action BuggyExitIgnoringFailedCommitWrite when (
+                Buggy == 1 && protocol == 0 && phase == 3 && child_live == 1 &&
+                arbiter == 1 && commit_admission_exact == 1 && commit == 0
+            ) {
+                phase = 4;
+                parent_exited = 1;
+                commit_write_failed = 1;
+            }
             action BuggyReleaseReadersOnProof when (
                 Buggy == 1 && phase == 3 && proof_complete == 1 && proof_exact == 1
             ) {
@@ -2951,6 +3050,16 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 phase = 6;
                 child_live = 0;
                 descendant_live = 0;
+                child_killed = 1;
+                group_signaled = 1;
+            }
+            action BuggySignalLeaderOnly when (
+                Buggy == 1 && phase > 1 && phase <= 6 && child_reaped == 0 &&
+                failure == 1 && commit == 0 && legacy_ack == 0 && arbiter == 2 &&
+                group_signaled == 0
+            ) {
+                phase = 6;
+                child_live = 0;
                 child_killed = 1;
                 group_signaled = 1;
             }
@@ -3186,7 +3295,17 @@ pub fn native_update_overlap_handoff_model() -> Model {
 /// complete token activates and creates an episode; harmless continuations,
 /// non-token contexts, ignore rules, and a delimiter-settled `fuc` stay
 /// inactive. The mutant reproduces the predictive-prefix regression by
-/// activating one character early.
+/// activating one character early, and carries two consequences of an early
+/// activation: the cue that fired at `fuc` cannot be taken back, so a `fuchsia`
+/// continuation or a delimiter retracts the highlight but keeps the episode
+/// (`HarmlessAndSettledAreInactive`); and the completing `k` mints a fresh
+/// episode instead of continuing the prefix's, so `fuck` cues twice
+/// (`CompletionCreatesExactlyOneEpisode`). The second is the restart the
+/// predictive design had to engineer away rather than something it shipped:
+/// its `fuc` borrowed `fuck`'s form identity precisely so the `k` would
+/// continue one episode, the retired `LiveFucPrefix` model's mutant replayed
+/// the restart ("a fresh episode when the final `k` arrives"), and its Tier-1
+/// asserted `restarts == 0` until `28481bac6` removed the prefix preview.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_profanity_completion_model() -> Model {
@@ -3222,7 +3341,7 @@ pub fn exact_profanity_completion_model() -> Model {
                 phase = 4;
                 active = 1;
                 canonical_identity = 1;
-                episode = 1;
+                episode = if Buggy == 1 { episode + 1 } else { 1 };
             }
             action TypeFixAfterF when (phase == 1) {
                 phase = 5;
@@ -3237,7 +3356,7 @@ pub fn exact_profanity_completion_model() -> Model {
                 phase = 5;
                 active = 0;
                 canonical_identity = 0;
-                episode = 0;
+                episode = if Buggy == 1 { episode } else { 0 };
             }
             action TypeOtherAfterF when (phase == 1) {
                 phase = 5;
@@ -3252,7 +3371,7 @@ pub fn exact_profanity_completion_model() -> Model {
                 phase = 6;
                 active = 0;
                 canonical_identity = 0;
-                episode = 0;
+                episode = if Buggy == 1 { episode } else { 0 };
             }
             action SuppressedFucContext when (phase == 0) {
                 phase = 5;
@@ -3276,12 +3395,9 @@ pub fn exact_profanity_completion_model() -> Model {
                 } else {
                     active == 0
                 };
-            invariant ActiveUsesCanonicalIdentity:
-                if active == 1 {
-                    canonical_identity == 1 && episode == 1
-                } else {
-                    canonical_identity == 0 && episode == 0
-                };
+            // `active`, `canonical_identity` and `episode` move together in
+            // every phase: the prefix, completion and settled laws pin all three
+            // at once, so no separate law ties them to each other.
             invariant HarmlessAndSettledAreInactive:
                 if phase > 4 {
                     active == 0 && canonical_identity == 0 && episode == 0
@@ -3312,11 +3428,18 @@ pub fn exact_profanity_completion_model() -> Model {
 /// GCs rollback after a real first-present, health proof, and successful disarm.
 /// Startup consumes inherited re-exec/expected-artifact authority before any
 /// verifier can inherit it, then observes an armed trial before interpreting that
-/// authority. `Buggy=1` enables independent historical-shortcut controls:
-/// inexact legacy synthesis, build-only OLD or mismatched prior-receipt
+/// authority. `Buggy=1` enables independent historical-shortcut controls, each
+/// its own action dead at `Buggy=0`: build-only OLD or mismatched prior-receipt
 /// authority, an inherited-authority early return, a superseded swap,
 /// pre-present disarm, proof-failed early GC, and failed receipt restoration
-/// that leaves NEW's receipt authoritative.
+/// that leaves NEW's receipt authoritative. Seven more are the slips the
+/// remaining recovery laws refuse: a legacy refusal that disarms the trial it
+/// was deferring for; a receipt written ahead of the swap it describes; a two-rename "swap" failing between its
+/// renames with NEW installed and OLD off the fixed path (`RENAME_SWAP` exists to
+/// make that cut impossible); a failed restore that disarms the trial to stop the
+/// crash loop; an exec failure that runs the rollback GC before any restore; a
+/// crash-loop restore of an unverified rollback; and a restored rollback GC'd while
+/// its trial is still armed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_disk_transaction_model() -> Model {
@@ -3577,6 +3700,16 @@ pub fn native_update_disk_transaction_model() -> Model {
                 startup_phase = 3;
                 startup_returned = 1;
             }
+            action BuggyDeferLegacyAndDisarmTrial when (
+                Buggy == 1 && legacy_postswap == 1 && startup_phase == 1 &&
+                receipt == 0 && ready_present == 0
+            ) {
+                startup_phase = 3;
+                startup_deferred = 1;
+                boot_health_attempted = 1;
+                trial = 0;
+                disarmed = 1;
+            }
             action ObserveBootHealth when (
                 startup_phase == 1 && inherited_env_live == 0 &&
                 (if legacy_postswap == 1 {
@@ -3759,6 +3892,23 @@ pub fn native_update_disk_transaction_model() -> Model {
                 swap_identity = staged_identity;
                 first_present_done = 0;
             }
+            action BuggyWriteReceiptBeforeSwap when (
+                Buggy == 1 && phase == 2 && trial == 1 && fixed == 2 &&
+                fixed_exact == 1 && receipt == 0
+            ) {
+                receipt = 1;
+                receipt_exact = 1;
+            }
+            action BuggyTwoRenameSwapFailsMidway when (
+                Buggy == 1 && phase == 2 && trial == 1 && fixed == 2 &&
+                fixed_exact == 1 && swap_failed == 0 && disarm_failed == 0 &&
+                staged_identity == authorized_new
+            ) {
+                installed = authorized_new;
+                fixed = 0;
+                fixed_exact = 0;
+                swap_failed = 1;
+            }
             action SwapFailsAndDisarms when (
                 phase == 2 && trial == 1 && fixed == 2 && fixed_exact == 1 &&
                 swap_failed == 0 && disarm_failed == 0
@@ -3920,6 +4070,33 @@ pub fn native_update_disk_transaction_model() -> Model {
             ) {
                 rollback_failed = 1;
             }
+            action BuggyRestoreFailureDisarmsTrial when (
+                Buggy == 1 && phase == 8 && trial == 1 && installed == 2 &&
+                fixed == 1 && fixed_exact == 1 && rollback_verified == 1
+            ) {
+                rollback_failed = 1;
+                trial = 0;
+                disarmed = 1;
+            }
+            action BuggyGcRollbackAfterExecFailure when (
+                Buggy == 1 && phase == 8 && exec_failed == 1 &&
+                rollback_restored == 0 && fixed == 1
+            ) {
+                fixed = 0;
+                fixed_exact = 0;
+                gc = 1;
+            }
+            action BuggyRestoreUnverifiedRollback when (
+                Buggy == 1 && phase == 4 && trial == 1 && receipt_exact == 1 &&
+                fixed == 1 && rollback_verified == 0 && health_proved == 0 &&
+                startup_phase == 3
+            ) {
+                phase = 9;
+                installed = 1;
+                fixed = 2;
+                rollback_restored = 1;
+                first_present_done = 0;
+            }
             action RestoreExactOld when (
                 phase == 8 && trial == 1 && fixed == 1 && fixed_exact == 1 &&
                 rollback_verified == 1
@@ -3936,6 +4113,14 @@ pub fn native_update_disk_transaction_model() -> Model {
                 rollback_restored == 1 && trial == 1
             ) {
                 disarm_failed = 1;
+            }
+            action BuggyGcRestoredBeforeDisarm when (
+                Buggy == 1 && phase == 9 && installed == 1 && fixed == 2 &&
+                rollback_restored == 1 && trial == 1
+            ) {
+                fixed = 0;
+                fixed_exact = 0;
+                rollback_gc = 1;
             }
             action DisarmRestoredTrialAndRestoreBoundReceipt when (
                 phase == 9 && installed == 1 && fixed == 2 &&
@@ -4056,14 +4241,16 @@ pub fn native_update_disk_transaction_model() -> Model {
                 } else {
                     startup_deferred <= 1
                 };
-            invariant ModernReadyRecoveryRequiresReadyAndIsExact:
+            // A receipt rebuilt from Ready stays exact until a crash-loop restore
+            // retires it with its rollback. (That it needs a Ready record at all is
+            // `RecoverModernReceiptFromReady`'s guard, the flag's only writer.)
+            invariant ModernReadyRecoveryIsExact:
                 if modern_receipt_recovered == 1 {
-                    ready_present == 1 &&
-                    (if rollback_restored == 1 {
+                    if rollback_restored == 1 {
                         if rollback_gc == 1 { receipt_exact == 0 } else { receipt_exact == 1 }
                     } else {
                         receipt_exact == 1
-                    })
+                    }
                 } else {
                     modern_receipt_recovered == 0
                 };
@@ -4278,17 +4465,60 @@ pub fn settings_page_scroll_model() -> Model {
 /// failure, owner loss, and a live opacity transition all remove it.
 ///
 /// Mode is honest about the presentation source: a swapchain tap requires
-/// glass, an offscreen present-real recording requires no glass, and only the
-/// latter owns a pacing timer. A translucent transition aborts a live tap before
-/// another frame can be accepted.
+/// glass, and an offscreen present-real recording requires no glass and owns a
+/// pacing timer, its sole redraw driver. A glass recording owns one exactly when
+/// the request asked for `pace` (`video <seconds> ... pace`), because the
+/// post-present hook alone starves once an unchanged frame is skipped;
+/// `video_initial_next_frame` arms both (`RecordingOwnsItsPacingTimer`). The
+/// timer lives in the recording itself, so outside the recording phase it does
+/// not exist. A translucent transition aborts a live tap before another frame
+/// can be accepted.
 ///
 /// `Buggy=1` exposes independently reachable historical failure classes:
 /// cleanup may strand the private directory, a windowed request may take the
 /// headless arm, and a second recording may acquire ownership while the first is
-/// still exporting. It also exposes publication without winning the cancellation
-/// CAS and retention of a tap after the glass becomes translucent. Tier-0
-/// exercises each mutant directly in addition to the exhaustive prove-and-catch
-/// check.
+/// still exporting (the begin guard testing `video_rec` without
+/// `video_export.is_busy()`). It also exposes publication without winning the
+/// cancellation CAS and retention of a tap after the glass becomes translucent.
+/// Six more dead mutants are each one line of the shipping lifecycle written
+/// wrong:
+/// * `BuggyExportRetainsVirtualTarget` — `video_finalize` hands the take to the
+///   exporter without `ws.present = None`, so a headless window keeps its
+///   recording-only `Virtual` target after recording ended (the idle-zero law
+///   `finalize_drops_virtual_target_and_timer` pins). `ModeMatchesRecordingPhase`.
+/// * `BuggyFinalizeKeepsRecordingSlot` — `video_finalize` reading `video_rec`
+///   through `as_mut()` instead of `take()`: the export runs while the recording
+///   slot still reads occupied, and every later `video` request is refused as
+///   "already in progress". `SlotMatchesPhase`.
+/// * `BuggyDetachGlassDuringTap` — a window close drops its glass without
+///   `video_abort_window_close`, so the swapchain tap outlives the surface it
+///   copies. `TapOnlyOnGlass`.
+/// * `BuggyBeginHeadlessUntimed` — `video_initial_next_frame` written as
+///   `pace.then_some(now)`: an unpaced offscreen loop begins with no deadline
+///   and records nothing. `RecordingOwnsItsPacingTimer`.
+/// * `BuggyPacedTapUntimed` — the same function returning `None` for every
+///   swapchain tap: a paced glass recording starves on its first skipped
+///   unchanged frame. `RecordingOwnsItsPacingTimer`.
+/// * `BuggyLateCancelRevokes` — `VideoCancellation::cancel` as a blind store of
+///   `VIDEO_CANCELLED` instead of the CAS from `VIDEO_CANCEL_LIVE`, so a timeout
+///   after `authorize_commit` revokes an export already past its rename
+///   boundary. Plausible rather than historical (the token was a CAS from its
+///   first commit); `CancelledOwnsNothing` catches it, since a won cancellation
+///   has ended the lifecycle while this one is still exporting.
+///
+/// No law restates another. "Recording and export never overlap" and "at most
+/// one lifecycle is live" are `SlotMatchesPhase` and
+/// `PrivateDirectoryOwnedByLifecycle`, which the second-recording mutant breaks
+/// on its first step; "a published take owns nothing" is
+/// `CommitAuthorizationScope` (published only at phase 0) read through the
+/// same two laws, and "a cancelled lifecycle owns nothing" is
+/// `CancelledOwnsNothing` (cancelled only at phase 0) read through them too.
+/// An `active` counter of the two slots, and a `late_cancel` witness of a
+/// cancellation that lost the CAS, were bookkeeping no shipping code keeps: a
+/// losing cancel changes nothing, so `CancelAfterAuthorization` is a stutter.
+///
+/// Tier-0 exercises each mutant directly in addition to the exhaustive
+/// prove-and-catch check.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_recording_lifecycle_model() -> Model {
@@ -4298,6 +4528,8 @@ pub fn video_recording_lifecycle_model() -> Model {
             // 0 Idle, 1 Reserved/pending, 2 Recording, 3 Exporting.
             var phase = 0;
             var glass = 0;
+            // The request's `pace` flag.
+            var pace = 0;
             // 0 None, 1 SwapchainTap, 2 OffscreenPresentReal.
             var mode = 0;
             var timer = 0;
@@ -4306,41 +4538,37 @@ pub fn video_recording_lifecycle_model() -> Model {
             // lifecycle. They must never overlap.
             var recording_slot = 0;
             var export_permit = 0;
-            var active = 0;
             // Private, server-owned directories for the current lifecycle.
             var private_dirs = 0;
             // The current lifecycle completed its atomic publication.
             var published = 0;
             // Publication CAS: 0 Live, 1 Cancelled, 2 CommitAuthorized.
             var cancel_state = 0;
-            // A bounded witness that cancellation lost to commit authorization.
-            var late_cancel = 0;
 
             action AttachGlass when (phase == 0) { glass = 1; }
             action DetachGlass when (phase == 0) { glass = 0; }
+            action RequestPaced when (phase == 0) { pace = 1; }
+            action RequestUnpaced when (phase == 0) { pace = 0; }
             action MakeOpaque when (phase == 0 && translucent == 1) {
                 translucent = 0;
             }
             action Reserve when (
-                phase == 0 && recording_slot == 0 &&
-                export_permit == 0 && active == 0
+                phase == 0 && recording_slot == 0 && export_permit == 0
             ) {
                 phase = 1;
                 mode = 0;
                 timer = 0;
                 recording_slot = 1;
-                active = 1;
                 private_dirs = 1;
                 published = 0;
                 cancel_state = 0;
-                late_cancel = 0;
             }
             action BeginOnGlass when (
                 phase == 1 && glass == 1 && translucent == 0
             ) {
                 phase = 2;
                 mode = 1;
-                timer = 0;
+                timer = pace;
             }
             action BeginHeadless when (phase == 1 && glass == 0) {
                 phase = 2;
@@ -4354,7 +4582,7 @@ pub fn video_recording_lifecycle_model() -> Model {
                 mode = 2;
                 timer = 1;
             }
-            action Tick when (phase == 2 && mode == 2 && timer == 1) {
+            action Tick when (phase == 2 && timer == 1) {
                 timer = 1;
             }
             action BeginExport when (phase == 2) {
@@ -4369,11 +4597,12 @@ pub fn video_recording_lifecycle_model() -> Model {
             ) {
                 cancel_state = 2;
             }
+            // The losing side of the CAS: a cancel after authorization changes
+            // nothing.
             action CancelAfterAuthorization when (
-                phase == 3 && cancel_state == 2 && late_cancel == 0
+                phase == 3 && cancel_state == 2
             ) {
                 cancel_state = 2;
-                late_cancel = 1;
             }
             action PublishSuccess when (
                 phase == 3 && cancel_state == 2
@@ -4382,10 +4611,8 @@ pub fn video_recording_lifecycle_model() -> Model {
                 mode = 0;
                 timer = 0;
                 export_permit = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 1;
-                late_cancel = 0;
             }
             action BuggyPublishWithoutAuthorization when (
                 Buggy == 1 && phase == 3 && cancel_state == 0
@@ -4394,21 +4621,17 @@ pub fn video_recording_lifecycle_model() -> Model {
                 mode = 0;
                 timer = 0;
                 export_permit = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 1;
-                late_cancel = 0;
             }
             action RejectBegin when (phase == 1) {
                 phase = 0;
                 mode = 0;
                 timer = 0;
                 recording_slot = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 0;
                 cancel_state = 1;
-                late_cancel = 0;
             }
             action CancelLive when (phase > 0 && cancel_state == 0) {
                 phase = 0;
@@ -4416,11 +4639,9 @@ pub fn video_recording_lifecycle_model() -> Model {
                 timer = 0;
                 recording_slot = 0;
                 export_permit = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 0;
                 cancel_state = 1;
-                late_cancel = 0;
             }
             action Fail when (phase > 0) {
                 phase = 0;
@@ -4428,11 +4649,9 @@ pub fn video_recording_lifecycle_model() -> Model {
                 timer = 0;
                 recording_slot = 0;
                 export_permit = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 0;
                 cancel_state = 1;
-                late_cancel = 0;
             }
             action OwnerLost when (phase > 0) {
                 phase = 0;
@@ -4440,11 +4659,9 @@ pub fn video_recording_lifecycle_model() -> Model {
                 timer = 0;
                 recording_slot = 0;
                 export_permit = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 0;
                 cancel_state = 1;
-                late_cancel = 0;
             }
             // Why: the mutant must be its OWN action, not a `Buggy` arm inside a
             // live one — the strict-vacuity audit removes the dead set and
@@ -4458,11 +4675,9 @@ pub fn video_recording_lifecycle_model() -> Model {
                 timer = 0;
                 recording_slot = 0;
                 export_permit = 0;
-                active = 0;
                 private_dirs = 1;
                 published = 0;
                 cancel_state = 1;
-                late_cancel = 0;
             }
             action MakeTapTranslucent when (
                 phase == 2 && mode == 1 && translucent == 0
@@ -4472,11 +4687,9 @@ pub fn video_recording_lifecycle_model() -> Model {
                 mode = 0;
                 timer = 0;
                 recording_slot = 0;
-                active = 0;
                 private_dirs = 0;
                 published = 0;
                 cancel_state = 1;
-                late_cancel = 0;
             }
             action BuggyRetainTapWhenTranslucent when (
                 Buggy == 1 && phase == 2 && mode == 1 && translucent == 0
@@ -4487,15 +4700,55 @@ pub fn video_recording_lifecycle_model() -> Model {
                 Buggy == 1 && phase == 3 && export_permit == 1
             ) {
                 recording_slot = 1;
-                active = 2;
                 private_dirs = 2;
+            }
+            action BuggyExportRetainsVirtualTarget when (
+                Buggy == 1 && phase == 2 && mode == 2
+            ) {
+                phase = 3;
+                timer = 0;
+                recording_slot = 0;
+                export_permit = 1;
+            }
+            action BuggyDetachGlassDuringTap when (
+                Buggy == 1 && phase == 2 && mode == 1
+            ) {
+                glass = 0;
+            }
+            action BuggyBeginHeadlessUntimed when (
+                Buggy == 1 && phase == 1 && glass == 0
+            ) {
+                phase = 2;
+                mode = 2;
+                timer = pace;
+            }
+            action BuggyLateCancelRevokes when (
+                Buggy == 1 && phase == 3 && cancel_state == 2
+            ) {
+                cancel_state = 1;
+            }
+            action BuggyFinalizeKeepsRecordingSlot when (
+                Buggy == 1 && phase == 2
+            ) {
+                phase = 3;
+                mode = 0;
+                timer = 0;
+                export_permit = 1;
+            }
+            action BuggyPacedTapUntimed when (
+                Buggy == 1 && phase == 1 && glass == 1 && translucent == 0 &&
+                pace == 1
+            ) {
+                phase = 2;
+                mode = 1;
+                timer = 0;
             }
 
             invariant Bounds:
-                phase <= 3 && glass <= 1 && mode <= 2 && timer <= 1 &&
-                translucent <= 1 && recording_slot <= 1 &&
-                export_permit <= 1 && active <= 2 && private_dirs <= 2 &&
-                published <= 1 && cancel_state <= 2 && late_cancel <= 1;
+                phase <= 3 && glass <= 1 && pace <= 1 && mode <= 2 &&
+                timer <= 1 && translucent <= 1 && recording_slot <= 1 &&
+                export_permit <= 1 && private_dirs <= 2 &&
+                published <= 1 && cancel_state <= 2;
             invariant ModeMatchesRecordingPhase:
                 if phase == 2 { mode > 0 } else { mode == 0 };
             invariant OffscreenOnlyWithoutGlass:
@@ -4504,36 +4757,28 @@ pub fn video_recording_lifecycle_model() -> Model {
                 (if mode == 1 { glass } else { 1 }) == 1;
             invariant NoTranslucentTap:
                 (if mode == 1 { translucent } else { 0 }) == 0;
-            invariant OffscreenTimerExact:
-                if phase == 2 && mode == 2 { timer == 1 } else { timer == 0 };
-            invariant RecordingExportSerialized:
-                recording_slot + export_permit <= 1;
-            invariant ActiveAccounting:
-                active == recording_slot + export_permit;
-            invariant AtMostOneActiveLifecycle:
-                active <= 1 && private_dirs <= 1;
+            invariant RecordingOwnsItsPacingTimer:
+                if phase == 2 && mode == 2 {
+                    timer == 1
+                } else if phase == 2 && mode == 1 {
+                    timer == pace
+                } else {
+                    timer <= 1
+                };
             invariant PrivateDirectoryOwnedByLifecycle:
                 if phase > 0 { private_dirs == 1 } else { private_dirs == 0 };
+            // Phase 0 owns no slot, permit, or directory
+            // (`SlotMatchesPhase`, `PrivateDirectoryOwnedByLifecycle`) and a
+            // cancelled take publishes nothing (`CommitAuthorizationScope`), so
+            // "a won cancellation has ended the lifecycle" is all this law adds.
             invariant CancelledOwnsNothing:
-                if cancel_state == 1 {
-                    phase == 0 && active == 0 && private_dirs == 0 &&
-                    recording_slot == 0 && export_permit == 0 &&
-                    published == 0
-                } else {
-                    cancel_state == 0 || cancel_state == 2
-                };
+                if cancel_state == 1 { phase == 0 } else { cancel_state <= 2 };
             invariant CommitAuthorizationScope:
                 if cancel_state == 2 {
                     (phase == 3 && published == 0) ||
                     (phase == 0 && published == 1)
                 } else {
                     published == 0
-                };
-            invariant LateCancellationCannotRevoke:
-                if late_cancel == 1 {
-                    cancel_state == 2 && phase == 3 && export_permit == 1
-                } else {
-                    late_cancel == 0
                 };
             invariant SlotMatchesPhase:
                 if phase == 1 || phase == 2 {
@@ -4542,14 +4787,6 @@ pub fn video_recording_lifecycle_model() -> Model {
                     recording_slot == 0 && export_permit == 1
                 } else {
                     recording_slot == 0 && export_permit == 0
-                };
-            invariant PublishedOnlyAfterOwnershipTransfer:
-                if published == 1 {
-                    phase == 0 && active == 0 && private_dirs == 0 &&
-                    recording_slot == 0 && export_permit == 0 &&
-                    cancel_state == 2
-                } else {
-                    published == 0
                 };
         }
     }
@@ -4565,8 +4802,12 @@ pub fn video_recording_lifecycle_model() -> Model {
 /// staleness and is removed even if its recorded PID has since been reused.
 /// Only the missing-legacy case falls back to the coarse PID probe.
 ///
-/// `Buggy=1` independently recreates removal of held/malformed namespaces and
-/// the PID-reuse leak that keeps a free lease when the numeric PID is alive.
+/// `Buggy=1` independently recreates removal of held/malformed namespaces, the
+/// PID-reuse leak that keeps a free lease when the numeric PID is alive, and a
+/// legacy namespace kept even though its PID is dead — the
+/// `InstanceLeaseState::Missing if !pid_alive => Remove` arm of
+/// `decide_instance_namespace_sweep` lost into the fail-closed `Keep` arm, so
+/// every pre-lease capture namespace leaks forever.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_instance_retention_model() -> Model {
@@ -4589,7 +4830,7 @@ pub fn exact_instance_retention_model() -> Model {
             }
             action Decide when (decision == 0) {
                 decision = if lease == 0 {
-                    if pid_alive == 1 { 1 } else { 2 }
+                    if pid_alive == 1 || Buggy == 1 { 1 } else { 2 }
                 } else if lease == 1 {
                     if Buggy == 1 { 2 } else { 1 }
                 } else if lease == 2 {
@@ -4630,9 +4871,29 @@ pub fn exact_instance_retention_model() -> Model {
 /// unchanged identity may be certified; a swap fails closed, whether it happened
 /// before the operation or in the operation-to-reply interval.
 ///
-/// `Buggy=1` exposes both forbidden TOCTOU classes: re-resolving a swapped path
-/// can read/write the outside object, and reply construction can certify the
-/// swapped identity despite having pinned a different object.
+/// `Buggy=1` exposes both forbidden TOCTOU classes. Re-resolving a swapped path
+/// reads or writes the outside object (`BuggyReresolveRead`/`Write`): that is
+/// every operation under path-only confinement, as it was before 6aeae4606
+/// anchored publication to retained handles (`AnchoredAccessNeverOutside`). And
+/// reply construction certifies the swapped identity despite having pinned a
+/// different object (`BuggyCertifySwapped`), which is also what a reply built
+/// without `validate_for_reply` says once the ancestor has moved.
+///
+/// No state records THAT the transaction is pinned or THAT the reply was
+/// validated. Each such flag would be written only by the action it names,
+/// together with `phase`, so a law over it restates that assignment and its
+/// only mutant flips the flag — a confinement that pins nothing but can still
+/// only operate through the pin, a validation-free reply that still names the
+/// right object. The harm behind both slips is the outside effect and the
+/// false certificate, and the two laws below judge exactly those. More
+/// restatements are absent for the same reason: "an operation targets the
+/// pinned object" (`ReadPinned`/`WritePinned`'s guard and paired assignment),
+/// "the path identity tracks the ancestor" (`SwapAncestor` sets both), "a
+/// successful reply follows an operation" (`ValidateReply`'s guard), and "a
+/// swapped path is never certified" beside "a successful reply certifies the
+/// original": no slip breaks one without the other, since a reply can only
+/// certify something other than the pinned original once the path has moved,
+/// so `SuccessfulReplyCertifiesOriginal` states both at once.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn anchored_artifact_transaction_model() -> Model {
@@ -4641,7 +4902,6 @@ pub fn anchored_artifact_transaction_model() -> Model {
             const Buggy = 0;
             // 0 Unconfined, 1 Pinned, 2 Operated, 3 Replied.
             var phase = 0;
-            var pinned = 0;
             var swapped = 0;
             // 0 None, 1 OriginalInside, 2 SwappedOutside.
             var path_identity = 0;
@@ -4649,7 +4909,6 @@ pub fn anchored_artifact_transaction_model() -> Model {
             var operation = 0;
             // 0 None/fail-closed, 1 OriginalInside, 2 Outside.
             var effect_target = 0;
-            var validated = 0;
             // 0 Pending, 1 Success, 2 FailClosed.
             var reply = 0;
             // 0 None, 1 OriginalInside, 2 SwappedOutside.
@@ -4657,12 +4916,10 @@ pub fn anchored_artifact_transaction_model() -> Model {
 
             action ConfinePin when (phase == 0) {
                 phase = 1;
-                pinned = 1;
                 swapped = 0;
                 path_identity = 1;
                 operation = 0;
                 effect_target = 0;
-                validated = 0;
                 reply = 0;
                 certified_identity = 0;
             }
@@ -4672,12 +4929,12 @@ pub fn anchored_artifact_transaction_model() -> Model {
                 swapped = 1;
                 path_identity = 2;
             }
-            action ReadPinned when (phase == 1 && pinned == 1) {
+            action ReadPinned when (phase == 1) {
                 phase = 2;
                 operation = 1;
                 effect_target = 1;
             }
-            action WritePinned when (phase == 1 && pinned == 1) {
+            action WritePinned when (phase == 1) {
                 phase = 2;
                 operation = 2;
                 effect_target = 1;
@@ -4686,7 +4943,6 @@ pub fn anchored_artifact_transaction_model() -> Model {
                 (phase == 1 && swapped == 1) || phase == 2
             ) {
                 phase = 3;
-                validated = 1;
                 reply = if swapped == 1 { 2 } else { 1 };
                 certified_identity = if swapped == 1 { 0 } else { 1 };
             }
@@ -4708,57 +4964,21 @@ pub fn anchored_artifact_transaction_model() -> Model {
                 Buggy == 1 && phase == 2 && swapped == 1
             ) {
                 phase = 3;
-                validated = 1;
                 reply = 1;
                 certified_identity = 2;
             }
 
             invariant Bounds:
-                phase <= 3 && pinned <= 1 && swapped <= 1 &&
-                path_identity <= 2 && operation <= 2 &&
-                effect_target <= 2 && validated <= 1 && reply <= 2 &&
+                phase <= 3 && swapped <= 1 && path_identity <= 2 &&
+                operation <= 2 && effect_target <= 2 && reply <= 2 &&
                 certified_identity <= 2;
-            invariant ActiveTransactionIsPinned:
-                if phase > 0 { pinned == 1 } else { pinned == 0 };
-            invariant PathIdentityTracksAncestor:
-                if phase > 0 {
-                    if swapped == 1 {
-                        path_identity == 2
-                    } else {
-                        path_identity == 1
-                    }
-                } else {
-                    path_identity == 0
-                };
-            invariant OperationRequiresPinnedObject:
-                if operation > 0 {
-                    pinned == 1 && phase > 1 && effect_target > 0
-                } else {
-                    effect_target == 0
-                };
             invariant AnchoredAccessNeverOutside:
                 effect_target <= 1;
-            invariant CompletedReplyWasValidated:
-                if phase == 3 {
-                    validated == 1 && reply > 0
-                } else {
-                    validated == 0 && reply == 0 && certified_identity == 0
-                };
-            invariant FailedReplyCertifiesNothing:
-                if reply == 2 { certified_identity == 0 } else { reply <= 1 };
             invariant SuccessfulReplyCertifiesOriginal:
                 if reply == 1 {
-                    operation > 0 && effect_target == 1 &&
-                    path_identity == 1 && swapped == 0 &&
-                    certified_identity == 1
+                    swapped == 0 && certified_identity == 1
                 } else {
-                    reply == 0 || reply == 2
-                };
-            invariant SwappedPathNeverCertified:
-                if swapped == 1 {
-                    reply == 0 || (reply == 2 && certified_identity == 0)
-                } else {
-                    certified_identity <= 1
+                    certified_identity == 0
                 };
         }
     }
@@ -4777,10 +4997,34 @@ pub fn anchored_artifact_transaction_model() -> Model {
 /// frame receipt guarantee was never established. A pre-wire abort remains the
 /// only direct cleanup path because it removes an unpublished artifact.
 ///
-/// `Buggy=1` exposes six independently audited failures: publishing after timeout
-/// won, dropping a queued guard before the reply reaches the wire, pruning a
-/// leased artifact, releasing without a valid ACK, accepting a pre-pipelined ACK
-/// before the server's causal challenge, or releasing quarantine before expiry.
+/// `Buggy=1` exposes ten independently audited failures: publishing after
+/// timeout won, dropping a queued guard before the reply reaches the wire,
+/// pruning a leased artifact, releasing without a valid ACK, reading an ACK
+/// before the server's causal challenge exists, releasing quarantine before
+/// expiry, and four lines of the shipping writer or guard written wrong:
+/// * `BuggyChallengeBeforeBody` — `write_control_reply_with_timeout_arm` with
+///   its two `write_all_until` calls swapped, so an echo no longer proves the
+///   client read the complete frame (`ChallengeRequiresCompleteWire`);
+/// * `BuggyOkBeforeRevalidation` — the same function writing the OK body before
+///   `retention.prepare_write()`: when revalidation then fails, the client has
+///   read OK for a file the abort removes (`CommitRequiresWirePreparation`);
+/// * `BuggyTrailerErrorIgnored` — the trailer's `write_all_until` error dropped,
+///   so a frame whose challenge never went out awaits an ACK that cannot come,
+///   instead of entering quarantine (`CompleteReplyPrecedesAck`);
+/// * `BuggyAbortRetainsArtifact` — `CaptureReplyRetention`'s drop without its
+///   uncommitted `remove_exact` arm (`AbortReleaseRemovesUncommittedArtifact`).
+///
+/// Each law is one claim, placed by `phase`; none repeats another's clause.
+/// "A failed ACK or partial write enters quarantine" is not a law of its own:
+/// every other exit is refused by the law of the phase it would land in — an
+/// immediate release needs a valid ACK (`ImmediateReleaseRequiresValidAck`), a
+/// committed reply never takes the abort path (`CommitRequiresWirePreparation`),
+/// and a quarantined guard is held (`OwnedThroughClassifiedExitRetainsGuard`)
+/// until the delay has run (`QuarantineReleaseRequiresExpiry`). Flags a law
+/// could only restate are gone: "quarantined" and "expired" were phases 7 and
+/// 8/11 under other names. The verdicts `ack_failed`/`write_error` stay as the
+/// ACK wait's and writer's observations, which the Tier-1 binds compare step by
+/// step.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reply_publication_model() -> Model {
@@ -4802,9 +5046,7 @@ pub fn artifact_reply_publication_model() -> Model {
             var ack = 0;
             var ack_failed = 0;
             var write_error = 0;
-            var quarantine = 0;
             var quarantine_age = 0;
-            var expired = 0;
 
             action Cancel when (phase == 0) {
                 phase = 1;
@@ -4846,7 +5088,6 @@ pub fn artifact_reply_publication_model() -> Model {
             ) {
                 phase = 7;
                 write_error = 1;
-                quarantine = 1;
                 quarantine_age = 0;
             }
             action AcknowledgePeer when (
@@ -4862,22 +5103,17 @@ pub fn artifact_reply_publication_model() -> Model {
             ) {
                 phase = 7;
                 ack_failed = 1;
-                quarantine = 1;
                 quarantine_age = 0;
             }
             action AdvanceQuarantine when (
-                phase == 7 && quarantine == 1 &&
-                quarantine_age <= QuarantineDelay - 1
+                phase == 7 && quarantine_age <= QuarantineDelay - 1
             ) {
                 quarantine_age = quarantine_age + 1;
             }
             action ExpireQuarantine when (
-                phase == 7 && quarantine == 1 &&
-                quarantine_age == QuarantineDelay
+                phase == 7 && quarantine_age == QuarantineDelay
             ) {
                 phase = 8;
-                quarantine = 0;
-                expired = 1;
             }
             action ReleaseGuard when (
                 guard == 1 && (phase == 6 || phase == 8 || phase == 9)
@@ -4897,7 +5133,6 @@ pub fn artifact_reply_publication_model() -> Model {
             }
             action BuggyPublishAfterCancel when (Buggy == 1 && phase == 1) {
                 artifact = 1;
-                committed = 1;
             }
             action BuggyDropBeforeWrite when (
                 Buggy == 1 && phase == 3 && guard == 1
@@ -4918,46 +5153,53 @@ pub fn artifact_reply_publication_model() -> Model {
             }
             action BuggyAcceptPreChallengeAck when (
                 Buggy == 1 && phase == 4 && artifact == 1 &&
-                guard == 1 && committed == 1 && challenge == 0
+                guard == 1 && committed == 1 && challenge == 0 && ack == 0
             ) {
-                phase = 6;
                 ack = 1;
             }
             action BuggyReleaseQuarantineEarly when (
-                Buggy == 1 && phase == 7 && quarantine == 1 &&
+                Buggy == 1 && phase == 7 &&
                 quarantine_age <= QuarantineDelay - 1 && guard == 1
             ) {
                 phase = 11;
                 guard = 0;
-                quarantine = 0;
+            }
+            action BuggyChallengeBeforeBody when (
+                Buggy == 1 && phase == 4 && guard == 1 && committed == 1 &&
+                challenge == 0
+            ) {
+                challenge = 1;
+            }
+            action BuggyOkBeforeRevalidation when (
+                Buggy == 1 && phase == 3 && artifact == 1 && guard == 1
+            ) {
+                phase = 9;
+                committed = 1;
+            }
+            action BuggyTrailerErrorIgnored when (
+                Buggy == 1 && phase == 4 && guard == 1 && committed == 1 &&
+                challenge == 0
+            ) {
+                phase = 5;
+            }
+            action BuggyAbortRetainsArtifact when (
+                Buggy == 1 && phase == 9 && guard == 1
+            ) {
+                phase = 12;
+                guard = 0;
             }
 
             invariant Bounds:
                 phase <= 12 && artifact <= 1 && guard <= 1 &&
                 committed <= 1 && reply <= 1 &&
                 challenge <= 1 && ack <= 1 && ack_failed <= 1 &&
-                write_error <= 1 && quarantine <= 1 &&
-                quarantine_age <= QuarantineDelay && expired <= 1 &&
-                ack + ack_failed <= 1 &&
-                ack_failed + write_error <= 1;
+                write_error <= 1 && quarantine_age <= QuarantineDelay;
             invariant CancelledPublishesNothing:
-                if phase == 1 {
-                    artifact == 0 && guard == 0 && committed == 0 &&
-                    reply == 0 && challenge == 0 &&
-                    ack == 0 && ack_failed == 0 && write_error == 0 &&
-                    quarantine == 0 &&
-                    quarantine_age == 0 && expired == 0
-                } else {
-                    artifact <= 1
-                };
+                if phase == 1 { artifact == 0 } else { artifact <= 1 };
             invariant OwnedThroughClassifiedExitRetainsGuard:
                 if phase > 1 && phase <= 9 { guard == 1 } else { guard <= 1 };
             invariant LeasedArtifactSurvivesRetention:
-                if phase > 1 && phase <= 11 {
-                    artifact == 1
-                } else {
-                    if phase == 12 { artifact == 0 } else { artifact <= 1 }
-                };
+                if phase > 1 && phase <= 11 { artifact == 1 } else { artifact <= 1 };
             invariant CommitRequiresWirePreparation:
                 if committed == 1 {
                     (phase > 3 && phase <= 8) ||
@@ -4965,102 +5207,34 @@ pub fn artifact_reply_publication_model() -> Model {
                 } else {
                     phase <= 3 || phase == 9 || phase == 12
                 };
-            invariant ReplyRequiresCommittedArtifact:
+            // The ACK phases (5, 6, 10) carry the complete frame, and the frame
+            // exists only once it was written after preparation.
+            invariant CompleteReplyPrecedesAck:
                 if reply == 1 {
-                    (phase == 5 || phase == 6 || phase == 7 ||
-                    phase == 8 || phase == 10 || phase == 11) &&
-                    artifact == 1 && committed == 1 && challenge == 1
+                    phase == 5 || phase == 6 || phase == 7 ||
+                    phase == 8 || phase == 10 || phase == 11
                 } else {
                     phase <= 4 || phase == 7 || phase == 8 ||
                     phase == 9 || phase == 11 || phase == 12
                 };
             invariant ChallengeRequiresCompleteWire:
-                if challenge == 1 {
-                    reply == 1 &&
-                    (phase == 5 || phase == 6 || phase == 7 ||
-                    phase == 8 || phase == 10 || phase == 11)
-                } else {
-                    challenge == 0
-                };
+                if challenge == 1 { reply == 1 } else { challenge == 0 };
             invariant SuccessfulAckRequiresCausalChallenge:
-                if ack == 1 {
-                    challenge == 1 && reply == 1 && committed == 1 &&
-                    artifact == 1 && (phase == 6 || phase == 10)
-                } else {
-                    ack == 0
-                };
-            invariant AckFailureEntersQuarantine:
-                if ack_failed == 1 {
-                    challenge == 1 && reply == 1 && committed == 1 &&
-                    artifact == 1 &&
-                    (phase == 7 || phase == 8 || phase == 11)
-                } else {
-                    ack_failed == 0
-                };
-            invariant WriteFailureEntersQuarantine:
-                if write_error == 1 {
-                    reply == 0 && challenge == 0 && committed == 1 &&
-                    artifact == 1 &&
-                    (phase == 7 || phase == 8 || phase == 11)
-                } else {
-                    write_error == 0
-                };
-            invariant QuarantineRetainsClassifiedGuard:
-                if quarantine == 1 {
-                    phase == 7 && guard == 1 && artifact == 1 &&
-                    expired == 0 && ack_failed + write_error == 1
-                } else {
-                    quarantine == 0
-                };
-            invariant QuarantineAgeMatchesPhase:
-                if phase == 7 {
-                    quarantine_age <= QuarantineDelay
-                } else {
-                    if phase == 8 || phase == 11 {
-                        quarantine_age == QuarantineDelay
-                    } else {
-                        quarantine_age == 0
-                    }
-                };
-            invariant QuarantineExpiryIsCausal:
-                if expired == 1 {
-                    (phase == 8 || phase == 11) &&
-                    quarantine == 0 &&
-                    quarantine_age == QuarantineDelay &&
-                    ack_failed + write_error == 1
-                } else {
-                    phase <= 7 || phase == 9 ||
-                    phase == 10 || phase == 12
-                };
+                if ack == 1 { challenge == 1 } else { ack == 0 };
             invariant ImmediateReleaseRequiresValidAck:
-                if phase == 10 {
-                    guard == 0 && reply == 1 && committed == 1 &&
-                    artifact == 1 && challenge == 1 &&
-                    ack == 1 && ack_failed == 0 && write_error == 0 &&
-                    quarantine == 0 && expired == 0 &&
-                    quarantine_age == 0
-                } else {
-                    phase <= 9 || phase > 10
-                };
+                if phase == 10 { ack == 1 } else { ack <= 1 };
             invariant QuarantineReleaseRequiresExpiry:
-                if phase == 11 {
-                    guard == 0 && artifact == 1 && committed == 1 &&
-                    ack == 0 && ack_failed + write_error == 1 &&
-                    quarantine == 0 && expired == 1 &&
+                if phase == 8 || phase == 11 {
                     quarantine_age == QuarantineDelay
                 } else {
-                    phase <= 10 || phase > 11
+                    quarantine_age <= QuarantineDelay
                 };
+            // Only the file. Everything else it once listed at phase 12 is
+            // another law's: the commit/reply/challenge/ACK laws each place
+            // their variable in phases that exclude 12, and the guard's drop IS
+            // the release that enters phase 12.
             invariant AbortReleaseRemovesUncommittedArtifact:
-                if phase == 12 {
-                    guard == 0 && artifact == 0 && committed == 0 &&
-                    reply == 0 && challenge == 0 &&
-                    ack == 0 && ack_failed == 0 && write_error == 0 &&
-                    quarantine == 0 &&
-                    quarantine_age == 0 && expired == 0
-                } else {
-                    phase <= 11
-                };
+                if phase == 12 { artifact == 0 } else { artifact <= 1 };
         }
     }
 }
@@ -5075,6 +5249,22 @@ pub fn artifact_reply_publication_model() -> Model {
 /// reconciliation order without collapsing heterogeneous permits into one
 /// unsound "last charge" scalar. `Charge` is the representative acquisition
 /// cost, chosen so descriptor saturation occurs while the count still has room.
+///
+/// `Buggy=1` enables four dead negative controls, each one line of
+/// `ArtifactHandoffPermit` written wrong:
+/// * `BuggyOverbook` admits past either cap (`Bounded`);
+/// * `BuggyReconcileOverbook` grows a permit past the unit cap (`Bounded`);
+/// * `BuggyRefuseLeaksSlot` is `try_acquire_from` taking the count slot before
+///   the unit check and returning `None` without giving it back — each refusal
+///   at the unit cap leaks one slot until the pool answers busy forever
+///   (`CountMatchesCharges`);
+/// * `BuggyReleaseProvisionalCharge` is `try_reconcile_descriptor_units`
+///   updating the pool without `self.descriptor_units = descriptor_units`, so the
+///   grown permit's drop returns its provisional charge and strands the unit
+///   reconciliation added (`UnitsMatchCharges`).
+///
+/// No separate "each live permit owns a unit" law: every bucket charges at
+/// least one unit, so that follows from the two conservation laws.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_handoff_capacity_model() -> Model {
@@ -5210,6 +5400,34 @@ pub fn artifact_handoff_capacity_model() -> Model {
                 charge_three = charge_three + 1;
                 selected = RequestedCharge;
             }
+            action BuggyRefuseLeaksSlot when (
+                Buggy == 1 && live <= Cap - 1 &&
+                descriptor_units > DescriptorCap - Charge
+            ) {
+                live = live + 1;
+                descriptor_units = descriptor_units;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three;
+                selected = selected;
+            }
+            // Fires only while the charges still balance: the slip strands one
+            // unit per firing, and letting it repeat would grow
+            // `descriptor_units` without bound and leave the Buggy=1 space
+            // unenumerable.
+            action BuggyReleaseProvisionalCharge when (
+                Buggy == 1 && selected == 3 && charge_three > 0 &&
+                descriptor_units ==
+                    charge_one + charge_two + charge_two +
+                    charge_three + charge_three + charge_three
+            ) {
+                live = live - 1;
+                descriptor_units = descriptor_units - Charge;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three - 1;
+                selected = selected;
+            }
 
             invariant Bounded:
                 live <= Cap && descriptor_units <= DescriptorCap &&
@@ -5220,8 +5438,6 @@ pub fn artifact_handoff_capacity_model() -> Model {
                 descriptor_units ==
                     charge_one + charge_two + charge_two +
                     charge_three + charge_three + charge_three;
-            invariant LiveOwnsCharge:
-                if live == 0 { descriptor_units == 0 } else { descriptor_units > live - 1 };
         }
     }
 }
@@ -5232,6 +5448,15 @@ pub fn artifact_handoff_capacity_model() -> Model {
 /// later member invalidates that coverage until another barrier completes. The
 /// reader-visible marker may be published only while the barrier covers the
 /// complete current batch.
+///
+/// `Buggy=1` enables two dead-at-`Buggy=0` negative controls. `BuggyPublishBeforeSync`
+/// shows the marker over members no barrier covers (`MarkerCoversEveryMember`).
+/// `BuggySyncAhead` records a barrier that covers members not yet written — the
+/// projection of `ConfinedVideoDir::write_batch_member_authorized` dropping its
+/// `batch_synced.set(false)`: a flag that stays set claims every later member
+/// too. `MarkerCoversEveryMember` cannot see it (once the batch fills, the
+/// counts agree and the marker publishes over a member written after the
+/// barrier), so `BarrierCoversOnlyWrittenMembers` is its counterexample.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_batch_publication_durability_model() -> Model {
@@ -5263,9 +5488,14 @@ pub fn video_batch_publication_durability_model() -> Model {
             ) {
                 marker = 1;
             }
+            action BuggySyncAhead when (
+                Buggy == 1 && marker == 0 && members > 0
+            ) {
+                synced_members = MaxMembers;
+            }
 
-            invariant Bounds:
-                members <= MaxMembers && synced_members <= members && marker <= 1;
+            invariant Bounds: members <= MaxMembers && marker <= 1;
+            invariant BarrierCoversOnlyWrittenMembers: synced_members <= members;
             invariant MarkerCoversEveryMember:
                 if marker == 1 {
                     members > 0 && synced_members == members
@@ -5289,6 +5519,44 @@ pub fn video_batch_publication_durability_model() -> Model {
 /// `StartSweep`. Shipping code performs both under one registry mutex, so no
 /// acquisition can observe the seam. Keeping it explicit makes the ordering
 /// obligation checkable instead of hiding it inside one large action.
+///
+/// Two variables are not registry fields, and each is what makes a law
+/// independent of the entry it judges:
+/// * `requested` is the obligation `arm_video_retention_sweep` created — set by
+///   `Arm`, discharged only by a finished sweep. The registry's own record of it
+///   (`armed`, the entry's `video_sweep_requested`) disappears with the entry, so
+///   a law over `armed` alone could not see a release that REMOVES an armed entry
+///   instead of sweeping it.
+/// * `admission_spent` is an entry whose reserved retention admission
+///   (`video_retention`) the last release has taken. `join_video_artifact_state`
+///   refuses every reader of such an entry, replacement or not.
+///
+/// `Buggy=1` enables six dead negative controls. Three were there already: a
+/// sweep started before the last release, an acquisition during the sweep, and
+/// a replaced recording joining the lease group. Three are one line of the
+/// registry written wrong:
+/// * `BuggyArmedReleaseDropsEntry` — `ArtifactPathLease::drop` removing an armed
+///   entry at count zero instead of sweeping it: the `video_sweep_requested`
+///   case folded into the `else { held.remove(&key) }` branch, or the `_ =>` arm
+///   a release build takes when the capability or admission is missing. The
+///   retention that marker publication or reader validation asked for never runs
+///   (`RequestedRetentionRunsAtLastRelease`).
+/// * `BuggyReleaseSweepsUnarmed` — `ArtifactPathLease::drop` without its
+///   `state.video_sweep_requested` test, so the last release of a recording
+///   that no marker publication or reader validation ever armed schedules the
+///   convergence sweep: retention runs around a publication nothing confirmed
+///   (`MaintenanceRequiresArm`).
+/// * `BuggyFinishKeepsEntry` — `finish_video_retention_sweep` resetting the
+///   entry's `sweeping` and `video_sweep_requested` instead of
+///   `held.remove(key)`. The kept entry has spent its admission, so every later
+///   reader is refused with `WouldBlock`, and after a same-name replacement with
+///   the stale identity's `NotFound` too (`IdleNameAdmitsReaders`).
+///
+/// Neither "one maintenance phase at a time" nor "a finished sweep leaves the
+/// entry unarmed" is a law of its own: both branches of
+/// `RequestedRetentionRunsAtLastRelease` bound `pending + sweeping` by one, and
+/// an armed count-zero entry with neither pending nor sweeping is exactly what
+/// that law refuses.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reader_lease_model() -> Model {
@@ -5298,15 +5566,16 @@ pub fn artifact_reader_lease_model() -> Model {
             const Buggy = 0;
             var leases = 0;
             var armed = 0;
+            var requested = 0;
             var pending = 0;
             var sweeping = 0;
-            var swept = 0;
+            var admission_spent = 0;
             var identity_mismatch = 0;
             var replacement_joined = 0;
 
             action Acquire when (
                 leases <= Cap - 1 && pending == 0 && sweeping == 0 &&
-                identity_mismatch == 0
+                identity_mismatch == 0 && admission_spent == 0
             ) {
                 leases = leases + 1;
             }
@@ -5315,6 +5584,7 @@ pub fn artifact_reader_lease_model() -> Model {
                 identity_mismatch == 0
             ) {
                 armed = 1;
+                requested = 1;
             }
             action ReplaceIdentity when (
                 leases > 0 && identity_mismatch == 0 &&
@@ -5339,6 +5609,7 @@ pub fn artifact_reader_lease_model() -> Model {
             ) {
                 pending = 0;
                 sweeping = 1;
+                admission_spent = 1;
             }
             action RejectAcquireWhileSweeping when (
                 pending + sweeping > 0
@@ -5349,8 +5620,9 @@ pub fn artifact_reader_lease_model() -> Model {
                 leases == 0 && armed == 1 && pending == 0 && sweeping == 1
             ) {
                 armed = 0;
+                requested = 0;
                 sweeping = 0;
-                swept = 1;
+                admission_spent = 0;
                 identity_mismatch = 0;
             }
             action BuggyStartSweepEarly when (
@@ -5372,29 +5644,50 @@ pub fn artifact_reader_lease_model() -> Model {
                 leases = leases + 1;
                 replacement_joined = 1;
             }
+            action BuggyArmedReleaseDropsEntry when (
+                Buggy == 1 && leases == 1 && armed == 1 &&
+                pending == 0 && sweeping == 0
+            ) {
+                leases = 0;
+                armed = 0;
+                identity_mismatch = 0;
+            }
+            action BuggyReleaseSweepsUnarmed when (
+                Buggy == 1 && leases == 1 && armed == 0 &&
+                pending == 0 && sweeping == 0
+            ) {
+                leases = 0;
+                pending = 1;
+                identity_mismatch = 0;
+            }
+            action BuggyFinishKeepsEntry when (
+                Buggy == 1 && leases == 0 && armed == 1 && pending == 0 &&
+                sweeping == 1
+            ) {
+                armed = 0;
+                requested = 0;
+                sweeping = 0;
+            }
 
             invariant Bounds:
-                leases <= Cap && armed <= 1 && pending <= 1 &&
-                sweeping <= 1 && swept <= 1 && identity_mismatch <= 1 &&
-                replacement_joined <= 1;
-            invariant OneMaintenancePhase:
-                pending + sweeping <= 1;
+                leases <= Cap && armed <= 1 && requested <= 1 &&
+                pending <= 1 && sweeping <= 1 && admission_spent <= 1 &&
+                identity_mismatch <= 1 && replacement_joined <= 1;
             invariant MaintenanceExcludesLeases:
                 if pending + sweeping > 0 { leases == 0 } else { leases <= Cap };
             invariant MaintenanceRequiresArm:
                 if pending + sweeping > 0 { armed == 1 } else { armed <= 1 };
-            invariant ArmedLastReleaseSchedulesSweep:
-                if leases == 0 && armed == 1 {
+            invariant RequestedRetentionRunsAtLastRelease:
+                if leases == 0 && requested == 1 {
                     pending + sweeping == 1
                 } else {
                     pending + sweeping <= 1
                 };
-            invariant FinishedSweepReopensIdle:
-                if swept == 1 && leases == 0 &&
-                    pending == 0 && sweeping == 0 {
-                    armed == 0 && identity_mismatch == 0
+            invariant IdleNameAdmitsReaders:
+                if leases == 0 && pending + sweeping == 0 {
+                    admission_spent == 0 && identity_mismatch == 0
                 } else {
-                    armed <= 1
+                    admission_spent <= 1
                 };
             invariant ReplacementNeverJoinsLeaseGroup:
                 replacement_joined == 0;
@@ -5445,9 +5738,19 @@ pub fn snapshot_generation_commit_model() -> Model {
 /// present. Screenshot capture is authorized only after that present succeeds.
 /// A capture makes at most `AttemptLimit` present attempts and then fails closed;
 /// dropped attempts before that bound may retry, but they never fall through to
-/// reading the previous composited frame. `Buggy=1`
-/// reproduces that stale-capture defect by treating a dropped present as capture
-/// authorization.
+/// reading the previous composited frame.
+///
+/// `Buggy=1` enables two independent slips in `capture_after_present_decision`,
+/// each a dead-at-`Buggy=0` negative-control action beside the healthy `Decide`:
+/// * `BuggyStaleCapture` treats a dropped present as capture authorization —
+///   the stale-capture defect (`NoStaleCapture`, `CaptureRequiresPresent`);
+/// * `BuggyRetryAtLimit` is the retry arm read as `attempts <= attempt_limit`
+///   for the shipping `attempts < attempt_limit`. Below the bound the two
+///   agree, so the slip is exactly this one decision: the last dropped present
+///   asks for a retry instead of failing closed (`DecisionMatchesOutcome`'s
+///   fail-closed arm). The barrier loop's own `while attempts < attempt_limit`
+///   still stops it — `Retry` keeps that guard — which is why only the DECISION
+///   law sees it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn capture_after_present_model() -> Model {
@@ -5481,21 +5784,34 @@ pub fn capture_after_present_model() -> Model {
             ) {
                 decision = if present_succeeded == 1 {
                     1
-                } else if Buggy == 1 {
-                    1
                 } else if attempts <= AttemptLimit - 1 {
                     2
                 } else {
                     3
                 };
-                captured = if present_succeeded + Buggy > 0 { 1 } else { 0 };
+                captured = present_succeeded;
                 failed = if (
-                    present_succeeded == 0 && Buggy == 0 && attempts == AttemptLimit
+                    present_succeeded == 0 && attempts == AttemptLimit
                 ) { 1 } else { 0 };
-                stale_capture = if (
-                    present_succeeded == 0 && Buggy == 1
-                ) { 1 } else { stale_capture };
                 staged = if present_succeeded == 1 { 0 } else { staged };
+            }
+            // A dropped present authorizes capture, and the pixels read are the
+            // previous composited frame's.
+            action BuggyStaleCapture when (
+                Buggy == 1 && staged == 1 && decision == 0 &&
+                attempts > 0 && present_succeeded == 0
+            ) {
+                decision = 1;
+                captured = 1;
+                stale_capture = 1;
+            }
+            // The retry arm's `<` read as `<=`: at the bound a dropped present
+            // decides Retry, not FailClosed.
+            action BuggyRetryAtLimit when (
+                Buggy == 1 && staged == 1 && decision == 0 &&
+                attempts == AttemptLimit && present_succeeded == 0
+            ) {
+                decision = 2;
             }
             action Retry when (decision == 2 && attempts <= AttemptLimit - 1) {
                 attempts = attempts + 1;
@@ -5519,8 +5835,13 @@ pub fn capture_after_present_model() -> Model {
                 } else {
                     decision == 3 && captured == 0 && failed == 1
                 };
-            invariant AttemptsBounded: attempts <= AttemptLimit;
+            // The attempt bound only restates `Retry`'s guard (the barrier
+            // loop's `while attempts < attempt_limit`), so it is the space, not a
+            // law; Tier-1 binds the real loop's call bound. The fail-closed-at-
+            // the-bound DECISION is `DecisionMatchesOutcome`'s, and
+            // `BuggyRetryAtLimit` is its counterexample.
             invariant ValuesBounded:
+                attempts <= AttemptLimit &&
                 staged <= 1 && present_succeeded <= 1 && decision <= 3 &&
                 captured <= 1 && failed <= 1 && stale_capture <= 1;
         }
@@ -5634,8 +5955,23 @@ pub fn native_capture_source_model() -> Model {
 /// map/conversion produces a frame. Geometry/metadata rejection and every async
 /// completion failure terminate explicitly with an error.
 ///
-/// `Buggy=1` recreates a fail-open map callback by publishing a frame result from
-/// the error transition without any successful mapping.
+/// `Buggy=1` enables three dead negative controls, each one arm of the shipping
+/// `presented_frame_transition` gate written wrong:
+/// * `BuggyMapErrorPublishesFrame` — the `MapError` arm returning
+///   `(Complete, Frame)`: the fail-open map callback publishes a frame without
+///   any successful mapping (`SuccessRequiresMappedCopy`);
+/// * `BuggyRejectReservesSlot` — the `RejectEnqueue` arm copied from
+///   `EnqueueValid`, `(Pending, None)`, so a rejected destination reserves the
+///   staging buffer with no copy in it and maps whatever an earlier capture
+///   left there (`ReservedPhaseRequiresAcceptedCopy`);
+/// * `BuggyMapErrorWithoutOutcome` — the `MapError` arm returning
+///   `(Complete, None)`: the one-shot ends with no error for its waiter to take
+///   (`TerminalPhaseHasResult`).
+///
+/// "A result exists only at the terminal" is `TerminalPhaseHasResult` read
+/// backwards, so it is not stated twice; nor is "a frame is published only at
+/// the terminal, from an accepted copy" beside `SuccessRequiresMappedCopy`: a
+/// result lives only at phase 3, and only an accepted copy is ever mapped.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn presented_frame_tap_model() -> Model {
@@ -5671,24 +6007,30 @@ pub fn presented_frame_tap_model() -> Model {
             action MapError when (phase == 2) {
                 phase = 3;
                 mapped = 0;
-                result = if Buggy == 1 { 1 } else { 2 };
+                result = 2;
+            }
+            action BuggyMapErrorPublishesFrame when (Buggy == 1 && phase == 2) {
+                phase = 3;
+                mapped = 0;
+                result = 1;
+            }
+            action BuggyRejectReservesSlot when (Buggy == 1 && phase == 0) {
+                phase = 1;
+                accepted = 0;
+                mapped = 0;
+                result = 0;
+            }
+            action BuggyMapErrorWithoutOutcome when (Buggy == 1 && phase == 2) {
+                phase = 3;
+                mapped = 0;
+                result = 0;
             }
             invariant SuccessRequiresMappedCopy:
-                if result == 1 {
-                    phase == 3 && accepted == 1 && mapped == 1
-                } else {
-                    mapped == 0
-                };
+                if result == 1 { mapped == 1 } else { mapped <= 1 };
             invariant ReservedPhaseRequiresAcceptedCopy:
-                if phase > 0 && phase <= 2 {
-                    accepted == 1 && result == 0
-                } else {
-                    phase == 0 || phase == 3
-                };
+                if phase > 0 && phase <= 2 { accepted == 1 } else { phase <= 3 };
             invariant TerminalPhaseHasResult:
                 if phase == 3 { result > 0 } else { result == 0 };
-            invariant ResultOnlyAtTerminal:
-                if result > 0 { phase == 3 } else { phase <= 2 };
             invariant ValuesBounded:
                 phase <= 3 && accepted <= 1 && mapped <= 1 && result <= 2;
         }
@@ -5704,10 +6046,25 @@ pub fn presented_frame_tap_model() -> Model {
 /// `3,1,2`: insertion must publish sorted `1,2,3`, and a two-frame budget must
 /// evict the lowest sequence and retain tail `2,3`.
 ///
-/// `Buggy=1` recreates all three fail-open classes: a failed map leaks the slot
-/// in `InFlight`, invalid metadata is silently discarded without incrementing
-/// the honest `dropped` count, and callback-order append produces `3,1` then
-/// evicts the wrong head to retain `1,2`.
+/// `Buggy=1` enables five dead negative controls, one fail-open slip each, so
+/// every law is the first thing its own slip breaks:
+/// * `BuggyMapErrorLeaksSlot` — a failed map counts its loss but leaves the
+///   slot `InFlight` (`ErrorResolutionFreesSlot`);
+/// * `BuggyRejectInvalidUncounted` — invalid metadata discarded as though it
+///   were client decimation, `dropped` untouched (`InvalidMetadataIsCounted`,
+///   which counts losses by cause, so the slip is caught whatever error or
+///   abort was counted before it);
+/// * `BuggyHarvestCallbackOrder` — the historical append in callback order,
+///   `3,1` (`HarvestedStoreSorted`);
+/// * `BuggyEvictNewest` — `ordered_capture_store_push` with `pop_back` for
+///   `pop_front`: the budget drops the newest capture and keeps `1,2`
+///   (`BudgetKeepsNewestTail`);
+/// * `BuggyEvictionUnreported` — the same push with its `evicted += 1` lost, so
+///   the take's `head_truncated` reads false over a recording whose head is
+///   gone (`EvictionMatchesOverflow`).
+///
+/// "A reserved slot carries no resolved error" is not stated beside
+/// `ErrorResolutionFreesSlot`: it is the same law read backwards.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_tap_slot_model() -> Model {
@@ -5718,7 +6075,9 @@ pub fn video_tap_slot_model() -> Model {
             // 0 Free, 1 Pending, 2 InFlight.
             var phase = 0;
             var dropped = 0;
-            // Bounded one-shot witness that invalid metadata was rejected.
+            // The losses by cause: map errors and aborts, and a bounded
+            // one-shot witness that invalid metadata was rejected.
+            var errors = 0;
             var invalid = 0;
             // The immediately preceding slot resolution was an error/abort.
             var last_error = 0;
@@ -5739,20 +6098,22 @@ pub fn video_tap_slot_model() -> Model {
                 last_error = 0;
             }
             action MapError when (phase == 2 && dropped <= MaxDrops - 1) {
-                phase = if Buggy == 1 { 2 } else { 0 };
+                phase = 0;
                 dropped = dropped + 1;
+                errors = errors + 1;
                 last_error = 1;
             }
             action Abort when (phase > 0 && dropped <= MaxDrops - 1) {
                 phase = 0;
                 dropped = dropped + 1;
+                errors = errors + 1;
                 last_error = 1;
             }
             action RejectInvalidMetadata when (
                 invalid == 0 && dropped <= MaxDrops - 1
             ) {
                 invalid = 1;
-                dropped = if Buggy == 1 { dropped } else { dropped + 1 };
+                dropped = dropped + 1;
             }
             action HarvestThree when (harvest_phase == 0) {
                 harvest_phase = 1;
@@ -5762,22 +6123,54 @@ pub fn video_tap_slot_model() -> Model {
             }
             action HarvestOne when (harvest_phase == 1) {
                 harvest_phase = 2;
-                store_first = if Buggy == 1 { 3 } else { 1 };
-                store_second = if Buggy == 1 { 1 } else { 3 };
+                store_first = 1;
+                store_second = 3;
                 evicted = 0;
             }
             action HarvestTwo when (harvest_phase == 2) {
                 harvest_phase = 3;
-                store_first = if Buggy == 1 { 1 } else { 2 };
-                store_second = if Buggy == 1 { 2 } else { 3 };
+                store_first = 2;
+                store_second = 3;
                 evicted = 1;
+            }
+            action BuggyMapErrorLeaksSlot when (
+                Buggy == 1 && phase == 2 && dropped <= MaxDrops - 1
+            ) {
+                dropped = dropped + 1;
+                errors = errors + 1;
+                last_error = 1;
+            }
+            action BuggyRejectInvalidUncounted when (
+                Buggy == 1 && invalid == 0 && dropped <= MaxDrops - 1
+            ) {
+                invalid = 1;
+            }
+            action BuggyHarvestCallbackOrder when (
+                Buggy == 1 && harvest_phase == 1
+            ) {
+                harvest_phase = 2;
+                store_first = 3;
+                store_second = 1;
+                evicted = 0;
+            }
+            action BuggyEvictNewest when (Buggy == 1 && harvest_phase == 2) {
+                harvest_phase = 3;
+                store_first = 1;
+                store_second = 2;
+                evicted = 1;
+            }
+            action BuggyEvictionUnreported when (
+                Buggy == 1 && harvest_phase == 2
+            ) {
+                harvest_phase = 3;
+                store_first = 2;
+                store_second = 3;
+                evicted = 0;
             }
             invariant ErrorResolutionFreesSlot:
                 if last_error == 1 { phase == 0 } else { phase <= 2 };
-            invariant ReservedSlotHasNoResolvedError:
-                if phase > 0 { last_error == 0 } else { phase == 0 };
-            invariant InvalidMetadataIsCounted: invalid <= dropped;
-            invariant DropCountBounded: dropped <= MaxDrops;
+            invariant InvalidMetadataIsCounted: dropped == errors + invalid;
+            invariant DropCountBounded: dropped <= MaxDrops && errors <= MaxDrops;
             invariant HarvestedStoreSorted:
                 if harvest_phase > 1 {
                     store_first <= store_second
@@ -5872,8 +6265,25 @@ pub fn layout_coordinate_reset_model() -> Model {
 /// The semantic preview font worker owns one replacement queue slot and tags
 /// every job/result with the live renderer generation. Reload clears an obsolete
 /// queued fork while an already-running old parse may finish; polling must ignore
-/// that stale result and install only the current generation. `Buggy=1` recreates
-/// the stale-worker installation defect by accepting every completed generation.
+/// that stale result and install only the current generation. `Buggy=1` enables
+/// four dead negative controls:
+/// * `BuggyInstallStaleResult` — the stale-worker installation defect, accepting
+///   an obsolete generation's result: the classification is wrong
+///   (`CurrentResultOnly`) and the stale renderer installs
+///   (`ReadyGenerationIsCurrent`);
+/// * `BuggyReloadKeepsInstalled` — `install_chrome_faces_locked` without
+///   `fonts.semantic = semantic`: the reload bumps the generation but the
+///   previous generation's renderer keeps painting under the new configuration
+///   (`ReadyGenerationIsCurrent`);
+/// * `BuggyIgnoreCurrentResult` — `semantic_prewarm_result_is_current` written
+///   strictly (`result_generation > current_generation`): the current
+///   generation's result is dropped with the stale ones and the semantic preview
+///   never installs (`CurrentResultOnly`, whose other direction this is);
+/// * `BuggyReloadKeepsQueued` — `reload_chrome_fonts_locked`, the one reload
+///   body `set_chrome_fonts` and `set_prepared_chrome_fonts` share, without
+///   `worker.cancel_queued()`: the obsolete fork stays queued
+///   (`QueueContainsOnlyCurrent`). Tier-1 drives that body on a local font
+///   context (`tray_raster`'s `chrome_font_reload_conforms_to_the_generation_queue_reset`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn semantic_prewarm_generation_model() -> Model {
@@ -5917,29 +6327,46 @@ pub fn semantic_prewarm_generation_model() -> Model {
             action Decide when (result > 0) {
                 observed_current = current;
                 observed_result = result;
-                decision = if result == current {
-                    1
-                } else if Buggy == 1 {
-                    1
-                } else {
-                    0
-                };
-                ready = if result == current {
-                    1
-                } else if Buggy == 1 {
-                    1
-                } else {
-                    ready
-                };
-                installed = if result == current {
-                    result
-                } else if Buggy == 1 {
-                    result
-                } else {
-                    installed
-                };
+                decision = if result == current { 1 } else { 0 };
+                ready = if result == current { 1 } else { ready };
+                installed = if result == current { result } else { installed };
                 result = 0;
                 resolved = 1;
+            }
+            action BuggyInstallStaleResult when (
+                Buggy == 1 && result > 0 && (result > current || current > result)
+            ) {
+                observed_current = current;
+                observed_result = result;
+                decision = 1;
+                ready = 1;
+                installed = result;
+                result = 0;
+                resolved = 1;
+            }
+            action BuggyIgnoreCurrentResult when (
+                Buggy == 1 && result > 0 && result == current
+            ) {
+                observed_current = current;
+                observed_result = result;
+                decision = 0;
+                result = 0;
+                resolved = 1;
+            }
+            action BuggyReloadKeepsQueued when (
+                Buggy == 1 && current <= MaxGeneration - 1
+            ) {
+                current = current + 1;
+                ready = 0;
+                installed = 0;
+                resolved = 0;
+            }
+            action BuggyReloadKeepsInstalled when (
+                Buggy == 1 && current <= MaxGeneration - 1
+            ) {
+                current = current + 1;
+                queued = 0;
+                resolved = 0;
             }
             invariant CurrentResultOnly:
                 if resolved == 0 {
@@ -5963,14 +6390,100 @@ pub fn semantic_prewarm_generation_model() -> Model {
     }
 }
 
+/// A static Settings preview must retain its convergence cadence until the
+/// completed font epoch reaches the retained raster. Polling completion can
+/// happen while arming OR firing a deadline; neither may silently abandon the
+/// last repaint. `Buggy=1` restores the former pending-only predicate.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_preview_font_convergence_model() -> Model {
+    crate::ty_model! {
+        NativePreviewFontConvergence {
+            const Buggy = 0;
+            var pending = 1;
+            var ready = 0;
+            var retained = 0;
+            var dirty = 0;
+            var decision = 0;
+            var resolved = 0;
+            action Finish when (pending == 1) {
+                pending = 0;
+                ready = 1;
+                resolved = 0;
+            }
+            action Decide {
+                decision = if pending == 1 { 1 }
+                    else if Buggy == 0 && ready > retained { 1 }
+                    else { 0 };
+                resolved = 1;
+            }
+            action Invalidate when (resolved == 1 && decision == 1) {
+                dirty = 1;
+                resolved = 0;
+            }
+            action Paint when (dirty == 1) {
+                retained = ready;
+                dirty = 0;
+                resolved = 0;
+            }
+            invariant CadenceMatchesRetainedFont:
+                if resolved == 1 {
+                    decision == if pending == 1 || ready > retained { 1 } else { 0 }
+                } else { 0 == 0 };
+        }
+    }
+}
+
 /// The semantic preview font worker has two coupled ownership decisions beyond
 /// its generation guard. Replacing a queued, not-yet-started install job must
 /// carry its unique committed renderer base into the newest candidate job. At
 /// completion, only an exact generation + request + candidate match may become
 /// active; an exact-match construction failure clears the active renderer, while
-/// superseded successes are cache-only. `Buggy=1` recreates both historical bug
-/// shapes: replacement keeps only the new job's optional base (dropping the
-/// displaced base), and a ready mixed/superseded candidate installs as current.
+/// superseded successes are cache-only and leave the active slot alone.
+///
+/// `DecideResult` is the shipping `poll_semantic_renderer` over
+/// `semantic_prewarm_result_decision`, and each law judges one arm of that
+/// match: `DecisionMatchesIdentity` the pure classification,
+/// `InstallOnlyLatestReady` the `InstallCurrent` arm, `CurrentFailureFailsClosed`
+/// the `FailClosedCurrent` arm, `CacheOnlySupersededReady` the `CacheSuperseded`
+/// arm, and `NoncurrentPreservesActive` every arm that is not an exact-current
+/// one. No law restates the classification: each is conditioned on the decision
+/// and says what its arm does to the slot or the cache.
+///
+/// `Buggy=1` enables seven dead negative controls. Two recreate the historical
+/// bug shapes: `BuggyReplacementKeepsOnlyNewBase` (replacement keeps only the
+/// new job's optional base, dropping the displaced one — `ReplacementCarriesBase`)
+/// and `BuggyMixedCandidateInstalls` (a ready mixed/superseded candidate installs
+/// as current). Five are one line of the main-thread boundary written wrong:
+/// * `BuggyReadinessBeforeGeneration` — `semantic_prewarm_result_decision`
+///   testing readiness before generation, so a ready renderer forked from an
+///   obsolete generation's base is filed as `CacheSuperseded` and later served
+///   for a candidate under the new configuration (`DecisionMatchesIdentity`);
+/// * `BuggyInstallKeepsStaleIdentity` — the `InstallCurrent` arm without
+///   `self.semantic_identity = Some(result.candidate)`: the new renderer paints
+///   under no candidate identity, so the preview never recognises its own
+///   install (`InstallOnlyLatestReady`);
+/// * `BuggyFailClosedKeepsPrevious` — the `FailClosedCurrent` arm without
+///   `self.semantic = None`, so an exact-current construction failure leaves the
+///   previous candidate painting (`CurrentFailureFailsClosed`);
+/// * `BuggyDropSuperseded` — the `CacheSuperseded` arm folded into the ignore
+///   arms: a ready superseded renderer is dropped instead of cached, and its
+///   warmup is paid again (`CacheOnlySupersededReady`);
+/// * `BuggyCacheParksActive` — the `CacheSuperseded` arm opening with the
+///   `InstallCurrent` arm's `cache_active_semantic()`: a superseded result parks
+///   the active renderer and leaves nothing painting (`NoncurrentPreservesActive`).
+///
+/// Tier-1 is in aterm-gui, in two halves: `tests/semantic_prewarm_conformance.rs`
+/// enumerates the pure `semantic_prewarm_result_decision` over the lattice, and
+/// `tray_raster`'s `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects`
+/// lands every lattice point through the real `poll_semantic_renderer` and reads
+/// the active slot (`active_after`, `active_after_latest`) back off the fonts.
+///
+/// The input and output bounds are per-variable. "The latest active renderer is
+/// an active renderer" is a definition, not a law the others imply: the `Mark*`
+/// inputs are built that way, every decision arm assigns the two fields
+/// together, and the Tier-1 projection defines `latest` as `active` and the
+/// requested identity.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn semantic_prewarm_handshake_model() -> Model {
@@ -5994,8 +6507,6 @@ pub fn semantic_prewarm_handshake_model() -> Model {
             // generation, 2 Install current, 3 Fail closed current, 4 Cache
             // superseded, 5 Ignore failed superseded.
             var decision = 0;
-            var installed = 0;
-            var failed_closed = 0;
             var cached = 0;
             var active_after = 0;
             var active_after_latest = 0;
@@ -6007,13 +6518,7 @@ pub fn semantic_prewarm_handshake_model() -> Model {
                 replaced_base = 1;
             }
             action ResolveReplacement when (replacement_resolved == 0) {
-                replacement_base = if Buggy == 1 {
-                    new_base
-                } else if new_base + replaced_base > 0 {
-                    1
-                } else {
-                    0
-                };
+                replacement_base = if new_base + replaced_base > 0 { 1 } else { 0 };
                 replacement_resolved = 1;
             }
             action MarkGenerationCurrent when (result_resolved == 0) {
@@ -6043,50 +6548,93 @@ pub fn semantic_prewarm_handshake_model() -> Model {
                     1
                 } else if request_matches == 1 && candidate_matches == 1 {
                     if renderer_ready == 1 { 2 } else { 3 }
-                } else if Buggy == 1 && renderer_ready == 1 {
-                    2
                 } else if renderer_ready == 1 {
                     4
                 } else {
                     5
                 };
-                installed = if generation_matches == 1 && renderer_ready == 1 {
-                    if request_matches == 1 && candidate_matches == 1 {
-                        1
-                    } else if Buggy == 1 {
-                        1
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-                failed_closed = if (
-                    generation_matches == 1 && request_matches == 1 &&
-                    candidate_matches == 1 && renderer_ready == 0
-                ) { 1 } else { 0 };
                 cached = if (
                     generation_matches == 1 && renderer_ready == 1 &&
-                    request_matches + candidate_matches <= 1 && Buggy == 0
+                    request_matches + candidate_matches <= 1
                 ) { 1 } else { 0 };
-                active_after = if generation_matches == 0 {
-                    active_before
-                } else if request_matches == 1 && candidate_matches == 1 {
-                    if renderer_ready == 1 { 1 } else { 0 }
-                } else if Buggy == 1 && renderer_ready == 1 {
-                    1
+                active_after = if (
+                    generation_matches == 1 && request_matches == 1 &&
+                    candidate_matches == 1
+                ) {
+                    renderer_ready
                 } else {
                     active_before
                 };
-                active_after_latest = if generation_matches == 0 {
-                    active_before_latest
-                } else if request_matches == 1 && candidate_matches == 1 {
-                    if renderer_ready == 1 { 1 } else { 0 }
-                } else if Buggy == 1 && renderer_ready == 1 {
-                    0
+                active_after_latest = if (
+                    generation_matches == 1 && request_matches == 1 &&
+                    candidate_matches == 1
+                ) {
+                    renderer_ready
                 } else {
                     active_before_latest
                 };
+                result_resolved = 1;
+            }
+            action BuggyReplacementKeepsOnlyNewBase when (
+                Buggy == 1 && replacement_resolved == 0
+            ) {
+                replacement_base = new_base;
+                replacement_resolved = 1;
+            }
+            action BuggyMixedCandidateInstalls when (
+                Buggy == 1 && result_resolved == 0 && generation_matches == 1 &&
+                request_matches + candidate_matches <= 1 && renderer_ready == 1
+            ) {
+                decision = 2;
+                cached = 0;
+                active_after = 1;
+                active_after_latest = 0;
+                result_resolved = 1;
+            }
+            action BuggyReadinessBeforeGeneration when (
+                Buggy == 1 && result_resolved == 0 && generation_matches == 0 &&
+                renderer_ready == 1
+            ) {
+                decision = 4;
+                cached = 1;
+                result_resolved = 1;
+            }
+            action BuggyInstallKeepsStaleIdentity when (
+                Buggy == 1 && result_resolved == 0 && generation_matches == 1 &&
+                request_matches == 1 && candidate_matches == 1 &&
+                renderer_ready == 1
+            ) {
+                decision = 2;
+                cached = 0;
+                active_after = 1;
+                active_after_latest = 0;
+                result_resolved = 1;
+            }
+            action BuggyFailClosedKeepsPrevious when (
+                Buggy == 1 && result_resolved == 0 && generation_matches == 1 &&
+                request_matches == 1 && candidate_matches == 1 &&
+                renderer_ready == 0
+            ) {
+                decision = 3;
+                cached = 0;
+                result_resolved = 1;
+            }
+            action BuggyDropSuperseded when (
+                Buggy == 1 && result_resolved == 0 && generation_matches == 1 &&
+                request_matches + candidate_matches <= 1 && renderer_ready == 1
+            ) {
+                decision = 4;
+                cached = 0;
+                result_resolved = 1;
+            }
+            action BuggyCacheParksActive when (
+                Buggy == 1 && result_resolved == 0 && generation_matches == 1 &&
+                request_matches + candidate_matches <= 1 && renderer_ready == 1
+            ) {
+                decision = 4;
+                cached = 1;
+                active_after = 0;
+                active_after_latest = 0;
                 result_resolved = 1;
             }
             invariant ReplacementCarriesBase:
@@ -6110,55 +6658,33 @@ pub fn semantic_prewarm_handshake_model() -> Model {
                     decision == 5
                 };
             invariant InstallOnlyLatestReady:
-                if installed == 1 {
-                    generation_matches == 1 && request_matches == 1 &&
-                    candidate_matches == 1 && renderer_ready == 1 &&
-                    decision == 2 && active_after == 1 && active_after_latest == 1
-                } else {
-                    installed == 0
-                };
-            invariant CurrentFailureFailsClosed:
-                if (
-                    result_resolved == 1 && generation_matches == 1 &&
-                    request_matches == 1 && candidate_matches == 1 &&
-                    renderer_ready == 0
-                ) {
-                    decision == 3 && installed == 0 && failed_closed == 1 &&
-                    active_after == 0 && active_after_latest == 0
-                } else {
-                    failed_closed == 0
-                };
-            invariant CacheOnlySupersededReady:
-                if cached == 1 {
-                    result_resolved == 1 && generation_matches == 1 &&
-                    request_matches + candidate_matches <= 1 && renderer_ready == 1 &&
-                    decision == 4 && installed == 0
-                } else if decision == 4 {
-                    cached == 1
-                } else {
-                    cached == 0
-                };
-            invariant NoncurrentPreservesActive:
-                if result_resolved == 0 {
-                    active_after == active_before &&
-                    active_after_latest == active_before_latest
-                } else if generation_matches == 0 {
-                    active_after == active_before &&
-                    active_after_latest == active_before_latest && installed == 0
-                } else if request_matches + candidate_matches <= 1 {
-                    active_after == active_before &&
-                    active_after_latest == active_before_latest && installed == 0
+                if decision == 2 {
+                    active_after == 1 && active_after_latest == 1
                 } else {
                     active_after <= 1
+                };
+            invariant CurrentFailureFailsClosed:
+                if decision == 3 {
+                    active_after == 0 && active_after_latest == 0
+                } else {
+                    active_after <= 1
+                };
+            invariant CacheOnlySupersededReady:
+                if decision == 4 { cached == 1 } else { cached == 0 };
+            invariant NoncurrentPreservesActive:
+                if decision == 2 || decision == 3 {
+                    active_after <= 1
+                } else {
+                    active_after == active_before &&
+                    active_after_latest == active_before_latest
                 };
             invariant InputsBounded:
                 new_base <= 1 && replaced_base <= 1 && generation_matches <= 1 &&
                 request_matches <= 1 && candidate_matches <= 1 && renderer_ready <= 1 &&
-                active_before <= 1 && active_before_latest <= active_before;
+                active_before <= 1 && active_before_latest <= 1;
             invariant OutputsBounded:
                 replacement_base <= 1 && replacement_resolved <= 1 && decision <= 5 &&
-                installed <= 1 && failed_closed <= 1 && cached <= 1 &&
-                active_after <= 1 && active_after_latest <= active_after &&
+                cached <= 1 && active_after <= 1 && active_after_latest <= 1 &&
                 result_resolved <= 1;
         }
     }
@@ -6217,20 +6743,12 @@ pub fn semantic_prewarm_request_swap_model() -> Model {
                 } else {
                     should_cache == 0 && active_after == 0
                 };
-            invariant RetainedPaintIsExactOrHostSeed:
-                if resolved == 1 && active_after == 1 {
-                    candidate_matches == 1 || active_ready == 0
-                } else {
-                    active_after <= 1
-                };
-            invariant InputsWellFormed:
-                if active_present == 0 {
-                    active_ready == 0 && candidate_matches == 0
-                } else if active_ready == 0 {
-                    candidate_matches == 0
-                } else {
-                    candidate_matches <= 1
-                };
+            // No "inputs are well formed" law: the three `Mark*` inputs are the
+            // only writers of `active_present`/`active_ready`/`candidate_matches`,
+            // each guarded on an empty slot, so such a law restates their guards.
+            // Nor "retained paint is exact or the host seed": once resolved, the
+            // law above keeps the active renderer exactly when it is not a
+            // ready mismatch, which is that sentence.
             invariant FlagsBounded:
                 active_present <= 1 && active_ready <= 1 && candidate_matches <= 1 &&
                 should_cache <= 1 && active_after <= 1 && resolved <= 1;
@@ -6342,8 +6860,19 @@ pub fn session_chrome_expiry_model() -> Model {
 /// covered by local/Kani invariants. `Rows`/`MaxTotal` are trace-window bounds
 /// (the offload `produced <= W - 1` idiom), NOT engine claims; `MaxResults`
 /// mirrors the engine's memory bound (at capacity a hit COUNTS but does not
-/// STORE). `Buggy = 1` drops the invalidation clamp — the pre-#7472/#7244
-/// index-out-of-range class — so `CurrentIndexValid` catches it.
+/// STORE). `Buggy = 1` is one slip per law, each in a branch the engine
+/// really has:
+/// * the invalidation clamp is dropped — the pre-#7472/#7244
+///   index-out-of-range class (`CurrentIndexValid`);
+/// * the capacity test reads `results.len() > max_results` for `>=`, so the
+///   hit at capacity STORES one past the bound (`MemoryBounded` — the
+///   store-past-capacity variant `at_capacity_hit_counts_but_does_not_store`
+///   rejects at Tier-1);
+/// * `content_added`'s store arm pushes the match but skips its
+///   `total_matches` increment — the four add-a-match sites each carry both
+///   arms (`TotalMatchesConsistent`);
+/// * `complete_search` drops its `scan_progress = -1`, so a finished search
+///   still reports the row count as progress (`ScanProgressConsistent`).
 ///
 /// Invariants carry the module's historical IDs: `CurrentIndexValid`
 /// (INV-SEARCH-1), `MemoryBounded` (INV-SEARCH-3), `ScanProgressConsistent`
@@ -6366,7 +6895,7 @@ pub fn streaming_search_model() -> Model {
             const MaxResults = 2;  // memory bound, deliberately < max reachable matches
             const MaxTotal = 4;    // bounds Add/ScanHit fan-out so the space is finite
             const Wrap = 1;        // wraparound nav config; Tier-0 also checked at Wrap=0
-            const Buggy = 0;       // 1 = drop the invalidation clamp (pre-#7472/#7244 class)
+            const Buggy = 0;       // 1 = the one-slip-per-law family documented above
             var state = 0;
             var scanp = 0;
             var stored = 0;
@@ -6381,18 +6910,18 @@ pub fn streaming_search_model() -> Model {
             // scan_row finding one match; folds the auto-complete on the last row.
             // At capacity the hit COUNTS but does not STORE (INV-SEARCH-3 discipline).
             action ScanHit when (state == 1 && scanp <= Rows && total <= MaxTotal - 1) {
-                stored = if stored <= MaxResults - 1 { stored + 1 } else { stored };
+                stored = if stored <= MaxResults - 1 + Buggy { stored + 1 } else { stored };
                 total = total + 1;
                 state = if scanp > Rows - 1 { 2 } else { 1 };
                 cur   = if scanp > Rows - 1 { 1 } else { 0 };
-                scanp = if scanp > Rows - 1 { 0 } else { scanp + 1 };
+                scanp = if scanp > Rows - 1 { if Buggy > 0 { scanp + 1 } else { 0 } } else { scanp + 1 };
             }
             // scan_row finding nothing; completion picks HasResults/NoResults by
             // whether anything was stored earlier in the scan.
             action ScanMiss when (state == 1 && scanp <= Rows) {
                 state = if scanp > Rows - 1 { if stored > 0 { 2 } else { 3 } } else { 1 };
                 cur   = if scanp > Rows - 1 { if stored > 0 { 1 } else { 0 } } else { cur };
-                scanp = if scanp > Rows - 1 { 0 } else { scanp + 1 };
+                scanp = if scanp > Rows - 1 { if Buggy > 0 { scanp + 1 } else { 0 } } else { scanp + 1 };
             }
             // next_match / prev_match: 1-based cycle over the STORED results;
             // Wrap=0 clamps at the boundary instead (the engine's wrap_enabled).
@@ -6407,17 +6936,21 @@ pub fn streaming_search_model() -> Model {
             // content_added with a fresh matching row: store-or-count, NoResults
             // revives to HasResults, first result claims cur = 1.
             action Add when ((state == 2 || state == 3) && total <= MaxTotal - 1) {
-                stored = if stored <= MaxResults - 1 { stored + 1 } else { stored };
-                total = total + 1;
+                stored = if stored <= MaxResults - 1 + Buggy { stored + 1 } else { stored };
+                // Buggy's store arm skips the count; its count-only arm still counts.
+                total = if Buggy > 0 && stored <= MaxResults - 1 + Buggy { total } else { total + 1 };
                 state = 2;
                 cur = if cur == 0 { 1 } else { cur };
             }
             // content_invalidated of ONE stored match's row: the engine subtracts
-            // removed STORED matches only (operations.rs), and clamps cur to the
-            // new length — the clamp Buggy=1 drops.
+            // removed STORED matches only, saturating (`operations.rs`:
+            // `total_matches.saturating_sub(removed_count)`), and clamps cur to the
+            // new length — the clamp Buggy=1 drops. The saturation never binds at
+            // Buggy=0 (`stored <= total`); under the uncounted-store slip it is
+            // the engine's own floor, which also keeps that space finite.
             action Invalidate when (state == 2 && stored > 0) {
                 stored = stored - 1;
-                total = total - 1;
+                total = if total > 0 { total - 1 } else { 0 };
                 state = if stored > 1 { 2 } else { 3 };
                 cur = if Buggy > 0 { cur } else { if cur > stored - 1 { stored - 1 } else { cur } };
             }
@@ -6461,9 +6994,19 @@ pub fn streaming_search_model() -> Model {
 /// * `search_id` and `reset` are projected directly from the returned step;
 /// * `delivery` counts a bounded dense-result trace: the scan turn delivers the
 ///   first delta, one drain turn leaves a backlog, and the final drain completes;
-/// * `issued` and `prior_id` are trace ghosts. Real process-global `u64` IDs are
-///   normalized to first-seen rank, proving freshness without assuming that IDs
-///   are contiguous within one `Terminal`.
+/// * `issued`, `prior_id` and `stream_id` are trace ghosts. Real process-global
+///   `u64` IDs are normalized to first-seen rank, proving freshness without
+///   assuming that IDs are contiguous within one `Terminal`; `stream_id` is the
+///   identity the host last saw `reset` announce.
+///
+/// The live cursor and `search_id` are one field in the shipping step
+/// (`cursor: (!complete).then_some(state.cursor)`, `search_id: state.cursor`),
+/// and a fresh identity is minted only where the new state is installed, so
+/// "the cursor is the stream's identity" and "the identity is the latest one
+/// minted" are the step's shape, not laws: every action here writes the two
+/// together. What a slip CAN break is that the identity changes only with
+/// `reset` (`IdentityStableWithoutReset`) — the doc's "stable identity of this
+/// logical search".
 ///
 /// `Rows = 3` is the real three-row Tier-1 terminal. `DeliveryTurns = 3` is a
 /// bounded representative of an arbitrary match backlog, not the shipping
@@ -6481,8 +7024,37 @@ pub fn streaming_search_model() -> Model {
 ///
 /// `Buggy = 1` reproduces stale continuation: restart actions preserve the old
 /// identity/progress instead of minting/resetting. `ResetMintsFresh` and
-/// `ResetStartsAtBeginning` catch it. Tier-1 binding and transition negative
-/// controls live in `aterm-core/tests/conformance_budgeted_search.rs`.
+/// `ResetStartsAtBeginning` catch it. It carries two more slips, each applied
+/// at every step it touches:
+/// * `cursor: Some(state.cursor)` without its `(!complete).then_some` gate, so
+///   every completing turn (`StartComplete`, `FinishScan`, `DrainComplete`,
+///   `RestartComplete`) hands back a live token for a completed stream
+///   (`LifecycleShape`; `DeliveryShape` also rejects the final drain's, but
+///   only through the live-means-incomplete conjunct the two share);
+/// * a resume that allocates a fresh token each turn (the usual replay
+///   hardening, `state.cursor = allocate_cursor(..)` on the resume path),
+///   rotating cursor and `search_id` together without `reset`, so a host keyed
+///   on `search_id` discards live results as a superseded snapshot
+///   (`IdentityStableWithoutReset`).
+///
+/// A third slip is an ALTERNATIVE to `StartBacklog`, not a branch of it, so it
+/// is its own action (a stutter at `Buggy=0`) and the healthy backlog (with its
+/// gate-free final drain) stays reachable beside it. `BuggyScanOnlyCompletion`
+/// is the dense scan turn under `complete = engine.is_complete()`, the rule
+/// `f7a2ca812` shipped while every step returned the whole accumulated set,
+/// kept without the `&& emitted_matches >= result_count` term `809076ce2` added
+/// when it bounded each delta. The first bounded delta comes back complete and
+/// cursorless, and the host never sees the rest (`DeliveryShape`'s own clause:
+/// a completed stream that delivered has drained its whole backlog).
+///
+/// All three are states the Tier-1 projection can produce, and the Tier-1
+/// replays them on real steps (a completing step that keeps its token, a resume
+/// that carries a freshly minted one, a dense scan turn that reports complete
+/// with its backlog still held — `delivery` is read from the host's delivery
+/// ledger against the snapshot's real match count, not from `complete`).
+///
+/// Tier-1 binding and transition negative controls live in
+/// `aterm-core/tests/conformance_budgeted_search.rs`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn budgeted_search_resume_model() -> Model {
@@ -6491,7 +7063,7 @@ pub fn budgeted_search_resume_model() -> Model {
             const Rows = 3;          // real bounded Terminal row window in Tier-1
             const DeliveryTurns = 3; // scan delta + repeated drain + final drain
             const MaxTokens = 10;    // bounded fresh-start/restart trace budget
-            const Buggy = 0;         // 1 = preserve stale identity/progress on restart
+            const Buggy = 0;         // 1 = the stale-continuation family documented above
 
             var live = 0;
             var progress = 0;
@@ -6504,6 +7076,7 @@ pub fn budgeted_search_resume_model() -> Model {
             var reset = 0;
             var prior_id = 0;
             var delivery = 0;
+            var stream_id = 0;
 
             // Unit-budget fresh start: mint a logical stream, expose reset, and
             // consume the first row. This action is also used after cancellation or
@@ -6520,21 +7093,23 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 1;
                 prior_id = search_id;
                 delivery = 0;
+                stream_id = issued + 1;
             }
 
             // A sparse fresh search may scan and deliver all rows in one call.
             action StartComplete when (live == 0 && issued <= MaxTokens - 1) {
-                live = 0;
+                live = if Buggy == 1 { 1 } else { 0 };
                 progress = Rows;
                 total = Rows;
                 scan_done = 1;
                 complete = 1;
-                cursor = 0;
+                cursor = if Buggy == 1 { issued + 1 } else { 0 };
                 search_id = issued + 1;
                 issued = issued + 1;
                 reset = 1;
                 prior_id = search_id;
                 delivery = 0;
+                stream_id = issued + 1;
             }
 
             // A dense fresh search scans all rows and emits its first bounded
@@ -6551,6 +7126,7 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 1;
                 prior_id = search_id;
                 delivery = 1;
+                stream_id = issued + 1;
             }
 
             // A valid unit-budget resume preserves stream identity and advances one
@@ -6558,15 +7134,20 @@ pub fn budgeted_search_resume_model() -> Model {
             // cursor retirement is explicit.
             action Resume when (live == 1 && scan_done == 0 && progress <= Rows - 2) {
                 progress = progress + 1;
+                // Buggy mints a fresh token per turn: cursor and search_id move
+                // together, as the one field they are, and `reset` stays off.
+                cursor = if Buggy == 1 && issued <= MaxTokens - 1 { issued + 1 } else { cursor };
+                search_id = if Buggy == 1 && issued <= MaxTokens - 1 { issued + 1 } else { search_id };
+                issued = if Buggy == 1 && issued <= MaxTokens - 1 { issued + 1 } else { issued };
                 reset = 0;
                 prior_id = 0;
             }
             action FinishScan when (live == 1 && scan_done == 0 && progress == Rows - 1) {
-                live = 0;
+                live = if Buggy == 1 { 1 } else { 0 };
                 progress = progress + 1;
                 scan_done = 1;
                 complete = 1;
-                cursor = 0;
+                cursor = if Buggy == 1 { cursor } else { 0 };
                 reset = 0;
                 prior_id = 0;
             }
@@ -6586,6 +7167,7 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 1;
                 prior_id = search_id;
                 delivery = if Buggy == 1 { delivery } else { 0 };
+                stream_id = if Buggy == 1 { search_id } else { issued + 1 };
             }
             action ContentRestart when (live == 1 && issued <= MaxTokens - 1) {
                 live = 1;
@@ -6599,6 +7181,7 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 1;
                 prior_id = search_id;
                 delivery = if Buggy == 1 { delivery } else { 0 };
+                stream_id = if Buggy == 1 { search_id } else { issued + 1 };
             }
             action QueryRestart when (live == 1 && issued <= MaxTokens - 1) {
                 live = 1;
@@ -6612,6 +7195,7 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 1;
                 prior_id = search_id;
                 delivery = if Buggy == 1 { delivery } else { 0 };
+                stream_id = if Buggy == 1 { search_id } else { issued + 1 };
             }
             action ForgedRestart when (live == 1 && issued <= MaxTokens - 1) {
                 live = 1;
@@ -6625,23 +7209,45 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 1;
                 prior_id = search_id;
                 delivery = if Buggy == 1 { delivery } else { 0 };
+                stream_id = if Buggy == 1 { search_id } else { issued + 1 };
             }
 
             // A stale/superseding call may scan and deliver its fresh snapshot in
             // one turn. There is no cursor, but reset + fresh search_id remain
             // observable so hosts discard the superseded stream before appending.
             action RestartComplete when (live == 1 && issued <= MaxTokens - 1) {
-                live = 0;
+                live = if Buggy == 1 { 1 } else { 0 };
                 progress = Rows;
                 total = Rows;
                 scan_done = 1;
                 complete = 1;
-                cursor = 0;
+                cursor = if Buggy == 1 { search_id } else { 0 };
                 search_id = if Buggy == 1 { search_id } else { issued + 1 };
                 issued = if Buggy == 1 { issued } else { issued + 1 };
                 reset = 1;
                 prior_id = search_id;
                 delivery = 0;
+                stream_id = if Buggy == 1 { search_id } else { issued + 1 };
+            }
+
+            // The dense scan turn with completion read from the scan alone: the
+            // same step as StartBacklog, except that it reports complete, hands
+            // back no cursor, and so strands the undelivered backlog. A stutter
+            // at `Buggy=0`, so no action is dead at the committed config (the
+            // strict-vacuity rule for negative controls).
+            action BuggyScanOnlyCompletion when (live == 0 && issued <= MaxTokens - 1) {
+                live = live;
+                progress = if Buggy == 1 { Rows } else { progress };
+                total = if Buggy == 1 { Rows } else { total };
+                scan_done = if Buggy == 1 { 1 } else { scan_done };
+                complete = if Buggy == 1 { 1 } else { complete };
+                cursor = cursor;
+                search_id = if Buggy == 1 { issued + 1 } else { search_id };
+                issued = if Buggy == 1 { issued + 1 } else { issued };
+                reset = if Buggy == 1 { 1 } else { reset };
+                prior_id = if Buggy == 1 { search_id } else { prior_id };
+                delivery = if Buggy == 1 { 1 } else { delivery };
+                stream_id = if Buggy == 1 { issued + 1 } else { stream_id };
             }
 
             // Once scanning has finished, a valid resume can make pure delivery
@@ -6658,9 +7264,9 @@ pub fn budgeted_search_resume_model() -> Model {
             action DrainComplete when (
                 live == 1 && scan_done == 1 && delivery == DeliveryTurns - 1
             ) {
-                live = 0;
+                live = if Buggy == 1 { 1 } else { 0 };
                 complete = 1;
-                cursor = 0;
+                cursor = if Buggy == 1 { cursor } else { 0 };
                 reset = 0;
                 prior_id = 0;
                 delivery = delivery + 1;
@@ -6679,6 +7285,7 @@ pub fn budgeted_search_resume_model() -> Model {
                 reset = 0;
                 prior_id = 0;
                 delivery = 0;
+                stream_id = 0;
             }
 
             invariant LifecycleShape:
@@ -6693,12 +7300,8 @@ pub fn budgeted_search_resume_model() -> Model {
                         progress <= Rows - 1 && delivery == 0) ||
                      (scan_done == 1 && progress == Rows && delivery > 0 &&
                         delivery <= DeliveryTurns - 1)));
-            invariant CursorMatchesSearchId:
-                if live == 1 {
-                    cursor == search_id && search_id == issued
-                } else {
-                    cursor == 0
-                };
+            invariant IdentityStableWithoutReset:
+                reset == 1 || search_id == stream_id;
             invariant ResetMintsFresh:
                 if reset == 1 {
                     search_id == issued && search_id > prior_id
@@ -6717,13 +7320,12 @@ pub fn budgeted_search_resume_model() -> Model {
                     ((live == 1 && complete == 0 && delivery > 0 &&
                         delivery <= DeliveryTurns - 1) ||
                      (live == 0 && complete == 1 && delivery == DeliveryTurns)));
-            invariant IdentityIsLatest:
-                search_id == 0 || search_id == issued;
             invariant ValuesBounded:
                 live <= 1 && scan_done <= 1 && complete <= 1 && reset <= 1 &&
                 progress <= Rows && total <= Rows && delivery <= DeliveryTurns &&
                 issued <= MaxTokens && cursor <= MaxTokens &&
-                search_id <= MaxTokens && prior_id <= MaxTokens;
+                search_id <= MaxTokens && prior_id <= MaxTokens &&
+                stream_id <= MaxTokens;
         }
     }
 }

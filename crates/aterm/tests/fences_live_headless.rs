@@ -44,6 +44,9 @@ const MAX_SOCK_PATH: usize = 100;
 /// exit path (Drop runs on panic too).
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: String,
@@ -107,11 +110,12 @@ fn boot(tag: &str) -> Option<Instance> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", "120")
+        .args(launch_isolation::control_sock(&tmp))
+        .args(["--lines", "40", "--columns", "120"])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -123,6 +127,7 @@ fn boot(tag: &str) -> Option<Instance> {
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,
@@ -229,6 +234,22 @@ fn status(inst: &Instance, sid: &str) -> String {
     ctl_ok(inst, &[&format!("@{sid}"), "status"])
 }
 
+/// Wait for the process-name resolver before asserting supervisor behavior.
+/// The fake worker's screen can be ready before its asynchronous name lookup.
+fn await_program(inst: &Instance, sid: &str, wanted: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = status(inst, sid);
+    while field(&last, "program") != Some(wanted) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        last = status(inst, sid);
+    }
+    assert_eq!(
+        field(&last, "program"),
+        Some(wanted),
+        "foreground program did not resolve: {last}"
+    );
+}
+
 /// `who`'s `watchers=` for `sid`: the live subscribers on the session, one of
 /// which each parked `await` registers right after it arms its watcher.
 fn watchers(inst: &Instance, sid: &str) -> usize {
@@ -260,9 +281,11 @@ stty raw -echo
 # the terminal through a duplicate.
 exec 3<&0
 ( while :; do dd bs=1 count=1 <&3 2>/dev/null >> "$log"; done ) &
+rule=$(printf '%120s' '' | sed 's/ /─/g')
 put() { printf '\033[%d;1H\033[2K%s' "$1" "$2"; }
 box() {
   printf '\033[2J'
+  put 1 "$rule"
   put 2 " Bash command"
   put 4 "   $1"
   put 6 " Do you want to proceed?"
@@ -352,14 +375,67 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
                 "await",
                 "match",
                 "rm.-rf./tmp/work",
-                "timeout=10000",
+                // This wait must outlive the arm backstop below: a loaded full
+                // workspace run can take longer than ten seconds to observe
+                // the watcher even though the same test passes alone.
+                "timeout=150000",
             ],
         );
         std::thread::spawn(move || cmd.output().expect("await match"))
     };
-    let armed_by = Instant::now() + Duration::from_secs(5);
-    while watchers(&inst, &sid) == 0 {
-        assert!(Instant::now() < armed_by, "the await never armed");
+    // Armed, or the waiter ended without arming: the two events that decide
+    // it. A wall-clock bound alone read a client starved of its spawn under a
+    // loaded lane as "never armed" (red 1 in 4 under `verify-lane.sh -p aterm
+    // --tests` on 2026-09-26, green 3/3 alone); the backstop is only for a
+    // server that neither arms nor answers.
+    //
+    // Every `who` sample is kept — when it started, how long the call took,
+    // what it read — and a failure prints them. This red was seen once in a
+    // full gate (2026-09-27: the await answered its own 150 s `OK timeout`
+    // while no sample had seen it armed, and the 120 s backstop never fired)
+    // and never alone or under a 24-way CPU stress, so the next one has to
+    // explain itself: slow calls say the client was starved, fast zeros say
+    // the server never counted the watcher.
+    let started = Instant::now();
+    let armed_by = started + Duration::from_secs(120);
+    let mut samples: Vec<(Duration, Duration, usize)> = Vec::new();
+    let timeline = |samples: &[(Duration, Duration, usize)]| {
+        let slowest = samples.iter().map(|s| s.1).max().unwrap_or_default();
+        let tail: Vec<String> = samples
+            .iter()
+            .rev()
+            .take(8)
+            .rev()
+            .map(|(at, took, n)| format!("{at:.1?}+{took:.1?}={n}"))
+            .collect();
+        format!(
+            "{} `who` samples over {:.1?}, slowest {slowest:.1?}; last: {}",
+            samples.len(),
+            started.elapsed(),
+            tail.join(" ")
+        )
+    };
+    loop {
+        let at = started.elapsed();
+        let n = watchers(&inst, &sid);
+        samples.push((at, started.elapsed().saturating_sub(at), n));
+        if n > 0 {
+            break;
+        }
+        if waiter.is_finished() {
+            let ended = waiter.join().expect("the waiter");
+            panic!(
+                "the await ended before it armed: {}{} ({})",
+                String::from_utf8_lossy(&ended.stdout).trim_end(),
+                String::from_utf8_lossy(&ended.stderr).trim_end(),
+                timeline(&samples)
+            );
+        }
+        assert!(
+            Instant::now() < armed_by,
+            "the await never armed ({})",
+            timeline(&samples)
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     std::fs::write(&go, b"").expect("create the go file");
@@ -496,7 +572,20 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
         "OK\n"
     );
     let row = supervisor_until(&inst, &sid, "sup-live");
-    assert!(row.trim_end().ends_with("supervisor=sup-live"), "{row}");
+    // `supervisor=` is followed only by the OWNER'S COLUMNS (2026-09-24,
+    // `help sessions`: `path_evidence= copy= upgrade=`, last): it is the column
+    // the agent verdict's block ends with, and nothing else moved in between.
+    let tail = ["path_evidence", "copy", "upgrade"];
+    let words: Vec<&str> = row.split_whitespace().collect();
+    let at = words
+        .iter()
+        .position(|w| *w == "supervisor=sup-live")
+        .unwrap_or_else(|| panic!("no supervisor column: {row}"));
+    let after: Vec<&str> = words[at + 1..]
+        .iter()
+        .map(|w| w.split_once('=').map_or(*w, |(k, _)| k))
+        .collect();
+    assert_eq!(after, tail, "{row}");
     assert_eq!(field(&status(&inst, &sid), "supervisor"), Some("sup-live"));
     // Still the same connection: other clients' connections closing (every
     // `aterm ctl` above) did not release it, and a second holder is refused.
@@ -550,14 +639,22 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
 
     // A `ttl=` claim nobody renews LAPSES, and the lapse is recorded — the
     // `meta-change field=supervisor value=-` a dead supervisor never writes
-    // itself — by the instance's own timer.
-    let lapses = || {
+    // itself — by the instance's own timer. Both ends are read off the
+    // TIMELINE, which keeps them after the lease is gone. A roster poll cannot
+    // witness this claim: it is shown for 400 ms from the instant the server
+    // takes it (`live_supervisor` filters on the expiry), and one poll has to
+    // fit this client's exit, the next `aterm ctl`'s spawn and `sessions`' own
+    // main-thread hop (allowed 500 ms) inside that window. On a loaded gate it
+    // misses, and every later poll reads `-`. The `sup-ttl` claim above is the
+    // roster's witness for a `ttl=` claim, and that it outlives its client.
+    let changes = || -> Vec<String> {
         ctl_ok(&inst, &[&format!("@{sid}"), "timeline"])
             .lines()
-            .filter(|l| l.contains("field=supervisor value=-"))
-            .count()
+            .filter_map(|l| l.split_once(" kind=meta-change field=supervisor "))
+            .map(|(_, value)| value.to_string())
+            .collect()
     };
-    let before = lapses();
+    let before = changes().len();
     ctl_ok(
         &inst,
         &[
@@ -569,13 +666,20 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
             "ttl=400",
         ],
     );
-    supervisor_until(&inst, &sid, "sup-dies");
-    supervisor_until(&inst, &sid, "-");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while lapses() == before && Instant::now() < deadline {
+    let mut since = changes().split_off(before);
+    while !since.iter().any(|v| v == "value=-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
+        since = changes().split_off(before);
     }
-    assert_eq!(lapses(), before + 1, "the lapse is recorded once");
+    // Claimed (recorded only when a claim moves the SHOWN holder), then
+    // lapsed, the lapse recorded exactly once — and the roster agrees.
+    assert_eq!(
+        since,
+        ["value=sup-dies", "value=-"],
+        "the claim, then its one lapse"
+    );
+    supervisor_until(&inst, &sid, "-");
 
     // Two attention owners, set and cleared independently.
     let meta = |args: &[&str]| {
@@ -602,18 +706,35 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
 struct Recording<C> {
     inner: C,
     requests: Vec<String>,
+    /// Once a `key` has gone out, every later `await` answers `ERR exited`
+    /// — the session gone, as the engine's own mock ends a watch — so the
+    /// loop ends after its press instead of at its budget, and the budget can
+    /// be one only a hang reaches.
+    end_after_press: bool,
 }
 
 impl<C: aterm_agent::supervise::run::Ctl> aterm_agent::supervise::run::Ctl for Recording<C> {
     fn call(&mut self, args: &[&str]) -> Result<aterm_agent::supervise::run::CtlReply, String> {
+        let pressed = self
+            .requests
+            .iter()
+            .any(|r| r.split_whitespace().any(|w| w == "key"));
         self.requests.push(args.join(" "));
+        if self.end_after_press && pressed && args.contains(&"await") {
+            return Ok(aterm_agent::supervise::run::CtlReply {
+                code: 1,
+                stdout: String::new(),
+                stderr: "aterm-ctl: ERR exited\n".to_string(),
+            });
+        }
         self.inner.call(args)
     }
 }
 
 /// THE MERGED ENGINE'S FENCED PRESS, live (harness/integrate, 2026-09-24):
-/// lane B's `supervise --auto-reads`, over its real persistent transport,
-/// reads the fake worker's read-only Bash box, decides it, and presses
+/// the engine's `supervise` at its default (every box its answer), over its
+/// real persistent transport, reads the fake worker's read-only Bash box,
+/// decides it, and presses
 /// `key if-gen=<the read's generation> if=<the judged row> 1` — the
 /// generation taken from its own `text --json` read (`"gen"`), the fence
 /// found in the server's real `help key` answer — and the server takes it:
@@ -646,6 +767,7 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     );
     await_match(&inst, &sid, "ls.-la./tmp/work");
     await_match(&inst, &sid, "Esc.to.cancel");
+    await_program(&inst, &sid, "claude");
     // PRECONDITION: the server's own read carries the generation.
     let json = ctl_ok(&inst, &[&format!("@{sid}"), "text", "--json"]);
     assert!(
@@ -656,20 +778,34 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     let mut ctl = Recording {
         inner: RelayCtl::new(Endpoint::Socket(inst.sock.clone()), None),
         requests: Vec::new(),
+        end_after_press: true,
     };
+    // The budget is a hang discriminator: the loop ends once it has pressed
+    // (`end_after_press`). It was 4 s, spent on read, settle, read, status,
+    // `help key` and the press — each a round trip to the live instance's main
+    // thread — so a contended gate returned before the press, and the fence
+    // assertion failed on a correct engine (the load-sensitive test audit of
+    // 2026-09-27).
     let opts = SuperviseOpts {
-        auto_reads: true,
-        max: Duration::from_secs(4),
+        max: Duration::from_secs(30),
         ..SuperviseOpts::default()
     };
-    {
+    let ran = {
         let mut s = Session::new(&mut ctl, Some(format!("@{sid}")));
         // The approval ledger goes to the scratch world, never the real HOME.
         s.set_approval_ledger(Some(inst.tmp.join("approvals.jsonl")));
         let ran = s.supervise(&opts);
         drop(s);
-        assert!(ran.is_ok(), "supervise ran: {ran:?} {:?}", ctl.requests);
-    }
+        // Ended by `end_after_press` (a wait answered `ERR exited` after the
+        // press), or by the budget; anything else is the loop failing.
+        assert!(
+            ran.as_ref()
+                .map_or_else(|e| e.ends_with("ERR exited"), |_| true),
+            "supervise ran: {ran:?} {:?}",
+            ctl.requests
+        );
+        ran
+    };
     let presses: Vec<&String> = ctl
         .requests
         .iter()
@@ -686,8 +822,10 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
             }) && words.get(at + 2).is_some_and(|w| w.starts_with("if=^"))
                 && words.last() == Some(&"1")
         }),
-        "a press fenced on the read's generation: {:?}",
-        ctl.requests
+        "a press fenced on the read's generation: {:?}; result={ran:?}; status={}; text={}",
+        ctl.requests,
+        status(&inst, &sid),
+        ctl_ok(&inst, &[&format!("@{sid}"), "text"])
     );
     assert!(
         !ctl.requests.iter().any(|r| r.contains("if-seq=")),

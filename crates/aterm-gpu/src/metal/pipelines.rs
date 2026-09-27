@@ -51,9 +51,11 @@ use super::ffi::{
     self, BlendFactor, BlendOperation, BlendState, ColorWriteMask, Device, Library, Obj,
     PixelFormat, RenderPipelineDescriptor, VertexDescriptor, VertexFormat,
 };
+#[cfg(test)]
+use crate::pipeline_table::Topology;
 use crate::pipeline_table::{
-    AttrFormat, Blend, BlendOp, Factor, PipelineSpec, ShaderLibrary, TargetRole, Topology,
-    VertexLayout, WriteMask,
+    AttrFormat, Blend, BlendOp, Factor, PipelineSpec, ShaderLibrary, TargetRole, VertexLayout,
+    WriteMask,
 };
 
 /// The Metal spelling of one [`Factor`]. Total, so the table's closed factor
@@ -183,6 +185,7 @@ pub(crate) fn metal_vertex_descriptor(layout: VertexLayout) -> Option<VertexDesc
 /// `spec.topology`. This mapping is what a [`ffi::DrawCall`] takes its
 /// `primitive` from, and the tray is the row that dies without it: its
 /// 4-vertex quad drawn as a `TriangleList` is one triangle and half the card.
+#[cfg(test)]
 pub(crate) const fn metal_primitive_type(t: Topology) -> ffi::PrimitiveType {
     match t {
         Topology::TriangleList => ffi::PrimitiveType::Triangle,
@@ -233,6 +236,7 @@ pub(crate) fn compile_library(device: &Device, library: ShaderLibrary) -> Result
 /// [`compile_library`] for the library one row names. Six libraries serve
 /// eighteen rows, so a sweep compiles per LIBRARY and holds the map rather than
 /// calling this eighteen times.
+#[cfg(test)]
 pub(crate) fn compile(device: &Device, spec: &PipelineSpec) -> Result<Library, String> {
     compile_library(device, spec.library)
 }
@@ -245,7 +249,7 @@ mod tests {
 
     /// Every test here needs a GPU; a machine without one SKIPs loudly.
     fn device() -> Option<Device> {
-        let d = Device::system_default();
+        let d = Device::preferred();
         if d.is_none() {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }

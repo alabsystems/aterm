@@ -134,6 +134,7 @@ const ROWS: &[(&str, &str)] = &[
     // ---- W13, the modal-alert subsystem ----
     ("NS_EVENT_MASK_KEY_DOWN",                "NSEventMaskKeyDown"),
     ("NS_ALERT_FIRST_BUTTON_RETURN",          "NSAlertFirstButtonReturn"),
+    ("NS_ALERT_SECOND_BUTTON_RETURN",         "NSAlertSecondButtonReturn"),
     // ---- W13, the `chrome` introspection reader ----
     ("NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC",     "NSWindowToolbarStyleAutomatic"),
     ("NS_WINDOW_TOOLBAR_STYLE_EXPANDED",      "NSWindowToolbarStyleExpanded"),

@@ -88,6 +88,105 @@ fn steady_state_alloc_calls(measure_input: &[u8]) -> u64 {
     ALLOC_CALLS.load(Ordering::Relaxed)
 }
 
+/// Reuse this binary's serialized allocation probe for render extraction too.
+fn count_allocations(f: impl FnOnce()) -> u64 {
+    ALLOC_CALLS.store(0, Ordering::Relaxed);
+    ACTIVE.store(true, Ordering::Relaxed);
+    f();
+    ACTIVE.store(false, Ordering::Relaxed);
+    ALLOC_CALLS.load(Ordering::Relaxed)
+}
+
+fn render_extras_avoid_temporary_allocations() {
+    use aterm_core::render::RenderInput;
+    use aterm_core::terminal::Terminal;
+    use aterm_grid::{CellDataView, CellExtra};
+    use std::hint::black_box;
+    use std::sync::Arc;
+
+    // Materialized history may contain BOTH a complete complex string and
+    // separately stored combining marks. The borrowed view must keep both,
+    // in order, without constructing a temporary Vec<char> for every read.
+    let mut extra = CellExtra::default();
+    extra.set_complex_char(Some(Arc::from("👩\u{200D}💻")));
+    extra.add_combining('\u{0301}');
+    extra.add_combining('\u{0323}');
+    let data = CellDataView::History(Some(&extra));
+    const TAIL: &str = "\u{200D}💻\u{0301}\u{0323}";
+    let mut identical = true;
+    let borrowed = count_allocations(|| {
+        for _ in 0..128 {
+            identical &= black_box(data).marks().eq(TAIL.chars());
+        }
+    });
+    assert!(identical, "the history tail lost or reordered marks");
+    // This process-wide counter permits two harness allocations, independent
+    // of the 128 reads. The historical per-read Vec far exceeds that margin.
+    assert!(
+        borrowed <= 2,
+        "borrowed history marks allocated {borrowed} times"
+    );
+    let historical = count_allocations(|| {
+        for _ in 0..128 {
+            let mut marks: Vec<char> = extra.complex_char().unwrap().chars().skip(1).collect();
+            marks.extend_from_slice(extra.combining());
+            black_box(marks);
+        }
+    });
+    assert!(
+        historical >= 128,
+        "the allocating negative control must fire"
+    );
+
+    // The caller-owned frame buffers are already warm. Only the required
+    // owned cluster strings may allocate; reserving scalar counts as bytes
+    // used to grow each string repeatedly and then shrink it into its Box.
+    const CLUSTERS: [&str; 5] = [
+        "👨\u{200D}👩\u{200D}👧",
+        "👍🏽",
+        "1\u{FE0F}\u{20E3}",
+        "🇺🇸",
+        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+    ];
+    let mut terminal = Terminal::new(2, 32);
+    terminal.process(CLUSTERS.join(" ").as_bytes());
+    let mut frame = RenderInput::empty();
+    terminal.cell_frame_into(&mut frame, 2, 32);
+    assert_eq!(frame.clusters[0].len(), CLUSTERS.len());
+    assert!(
+        frame.clusters[0]
+            .iter()
+            .map(|(_, s)| s.as_ref())
+            .eq(CLUSTERS)
+    );
+    let cluster_allocations = count_allocations(|| {
+        for _ in 0..16 {
+            terminal.cell_frame_into(black_box(&mut frame), 2, 32);
+        }
+    });
+    assert!(
+        cluster_allocations <= 16 * CLUSTERS.len() as u64 + 2,
+        "warm extraction made {cluster_allocations} allocations for {} required cluster strings",
+        16 * CLUSTERS.len()
+    );
+    let historical_clusters = count_allocations(|| {
+        for _ in 0..16 {
+            for cluster in CLUSTERS {
+                let mut scalars = cluster.chars();
+                let base = scalars.next().unwrap();
+                let mut text = String::with_capacity(2 + scalars.clone().count());
+                text.push(base);
+                text.extend(scalars);
+                black_box(text.into_boxed_str());
+            }
+        }
+    });
+    assert!(
+        historical_clusters > cluster_allocations,
+        "the scalar-count reservation negative control must allocate more"
+    );
+}
+
 // Orders of magnitude below the line count, far above the observed handful: noise
 // never flaps, but a per-line/per-cell regression (≈ thousands of allocs) is caught.
 const CEILING: u64 = 64;
@@ -129,4 +228,6 @@ fn engine_steady_state_processing_is_allocation_free() {
          — the CJK/emoji write path has a quadratic-allocation regression",
         u_n.max(1) * 3
     );
+
+    render_extras_avoid_temporary_allocations();
 }

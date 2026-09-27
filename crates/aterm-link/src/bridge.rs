@@ -87,19 +87,10 @@
 //! `tests/bridge_e2e.rs` is the claim over it, and it is now a claim about an
 //! absence rather than about a check.
 //!
-//! (The name is PINNED by
-//! `this_modules_doc_and_unsafe_surface_match_what_it_ships`: aterm ships no
-//! evidence manifest, so a doc comment IS the claim, and this header once
-//! cited a test that had never existed under that name — an auditor following
-//! it got `0 passed; 0 filtered out`, a green run over an empty set.)
-//!
-//! THE SUBJECT STAYS RESERVED. `subject::parse_term_in` and
-//! `subject::term_filter` remain, and the node ring still carries both `term`
-//! grants, because an older node on this wire may still publish one and a
-//! fleet that forgot the shape of the subject could not tell a stranger's
-//! forgery from a peer's. Nothing in this crate parses or serves it: the
-//! filter's only in-tree reference is its own test, which is the intended
-//! end state.
+//! THE SUBJECT STAYS RESERVED. The node ring still carries both `term` grants,
+//! because an older node on this wire may still publish one. Nothing in this
+//! crate parses or serves it (its parser and filter, whose only callers were
+//! their own tests, were deleted 2026-09-25).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -110,8 +101,9 @@ use astream_broker::Record as BrokerRecord;
 
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
-use crate::mailbox::{Item, Mailbox, Source};
+use crate::mailbox::{Item, Mailbox, ReplayPressure, Source};
 use crate::presence::{Fields, Mode, Slot};
+use crate::render::trust_of;
 use crate::state::{Asked, Deadline, StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP};
 use crate::subject::{self, Reject};
 use crate::transport::{self, Closer, Conn, Transport};
@@ -191,7 +183,7 @@ const REFILL_FLOOR_SPAN: u64 = 4096;
 /// `EVENT … agent` push, and reads `meta` (`attention=` — the field `notify
 /// --on attention` and `glance` read — `role=`, `title=`) for a session no
 /// `EVENT … meta` push has covered: one never read, one a `GAP` marked
-/// unread, or one whose re-read on a push or an adoption failed
+/// unread, or one whose re-read on a push or a watch's `sub` ack failed
 /// ([`Bridge::refresh_meta`]). A peer posting four times a second is enough
 /// to hold a node in that state indefinitely. (It was also the only producer
 /// of §6.6's rows 4 and 5, the conservative pause and the local-lease mirror;
@@ -210,15 +202,78 @@ const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 /// is only what NO round could have published.
 const GHOST_SWEEP: Duration = Duration::from_secs(60);
 
-/// How many `Fetch` pages one topic's backlog may walk per roster round.
+/// How many backlog `Fetch` pages the WHOLE bridge may walk per two-second
+/// replay interval.
 ///
-/// A bound, not a budget: the scheduling loop is single-threaded and it is what
-/// takes the fleet halt, so a late subscriber asking for `since=@0` against a
-/// year of broadcasts must not be able to hold it. Four pages of 256 is up to a
-/// thousand records a round — a deeper backlog simply takes more rounds, and
-/// the cursor is persisted between them, so it also survives a restart
-/// mid-catch-up.
+/// The scheduling loop is single-threaded and takes fleet halts and addressed
+/// mail. Four pages PER SESSION still let a large roster block it for minutes.
+/// Four pages in total bound that delay independently of roster size. A deeper
+/// backlog takes more intervals; the durable topic cursors survive a restart.
 const SAY_REPLAY_PAGES: usize = 4;
+
+/// Which late subscriber gets the next page, and how many pages this bridge can
+/// spend before the next roster interval. A pushed opt-in may spend an unused
+/// page immediately; it cannot mint another budget by arriving repeatedly.
+/// The cursor is a sid, not a map index, so departures never invalidate it.
+struct SayReplay {
+    pages_left: usize,
+    refill_at: Instant,
+    after: Option<String>,
+}
+
+impl SayReplay {
+    fn new(now: Instant) -> Self {
+        Self {
+            pages_left: SAY_REPLAY_PAGES,
+            refill_at: now + ROSTER_REFRESH,
+            after: None,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        if now >= self.refill_at {
+            self.pages_left = SAY_REPLAY_PAGES;
+            self.refill_at = now + ROSTER_REFRESH;
+        }
+    }
+
+    /// The next owed sid strictly after the last one, wrapping once. Spending
+    /// the page HERE makes a failed Fetch count toward the same bound.
+    fn take(&mut self, owed: &BTreeSet<String>) -> Option<String> {
+        if self.pages_left == 0 {
+            return None;
+        }
+        let sid = self
+            .after
+            .as_ref()
+            .and_then(|after| {
+                owed.range((
+                    std::ops::Bound::Excluded(after.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+            })
+            .or_else(|| owed.iter().next())?
+            .clone();
+        self.pages_left -= 1;
+        self.after = Some(sid.clone());
+        Some(sid)
+    }
+}
+
+/// Replay is below every live control and addressed input. The roster's one
+/// exception follows its own control/outbox work and preserves catch-up under
+/// sustained higher-priority traffic; pushed opt-ins get no such exception.
+fn may_take_replay_page(mailbox: &Mailbox, roster: bool, taken: usize) -> bool {
+    if !roster && taken > 0 {
+        return false;
+    }
+    match mailbox.replay_pressure() {
+        ReplayPressure::Clear => true,
+        ReplayPressure::Pending => roster && taken == 0,
+        ReplayPressure::Urgent => false,
+    }
+}
 
 /// Irrelevant broadcast records advance a topic's in-memory read position but
 /// need no per-record durable commit: replaying them after a crash delivers
@@ -346,15 +401,30 @@ fn idle_wait(
 /// stale prompts until the absolute retry deadline, while still exiting as soon
 /// as either inherited aterm lane closes. The deadline is not restarted by a
 /// new event: traffic cannot postpone recovery either.
-fn wait_for_retry_or_aterm_close(mailbox: &Mailbox, backoff: Duration) -> bool {
+///
+/// Every push-lane line taken while parked is shown to `on_event` before it is
+/// dropped — the run loop keeps a watch's `sub` ack out of them, as
+/// bookkeeping ([`Bridge::park_detached`]) — and every other item is dropped
+/// unseen.
+fn wait_for_retry_or_aterm_close(
+    mailbox: &Mailbox,
+    backoff: Duration,
+    mut on_event: impl FnMut(&str),
+) -> bool {
     let deadline = Instant::now() + backoff;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match mailbox.take(remaining) {
             Some(Item::Closed(Source::Aterm)) => return true,
             None => return false,
-            Some(_) if Instant::now() >= deadline => return false,
-            Some(_) => {}
+            Some(item) => {
+                if let Item::Event(line) = &item {
+                    on_event(line);
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -539,9 +609,9 @@ fn parse_batch_rows<'a>(
 }
 
 /// TEST-ONLY fault injection, armed by `$ATERM_LINK_FAULT` — and TEST-ONLY is
-/// enforced, not merely documented: [`Fault::from_env`] reads the variable only
-/// in a build with `debug_assertions`, so a released `aterm-link serve` honours
-/// no fault at all.
+/// enforced, not merely documented: [`Fault::from_env`] reads the variable through
+/// `aterm_types::dev_seam!`, which a release build compiles to `None`, so a released
+/// `aterm-link serve` honours no fault at all.
 ///
 /// It had to become enforcement. The knob was documented test-only and shipped
 /// in every build, while `ATERM_LINK_FAULT` is on neither `ENV_DENY_VARS` nor
@@ -670,27 +740,28 @@ impl Fault {
     /// step forever — the test would then be asserting about a bridge that never
     /// got past it, which is not the property.
     fn from_env(state: &StateDir) -> Self {
-        // A RELEASED BINARY HONOURS NO FAULT. See the type's own doc: the knob is
-        // documented test-only and was gated by nothing, in a process whose death
-        // is the fail-closed halt of every session it governs.
-        if !cfg!(debug_assertions) {
+        // A RELEASED BINARY HONOURS NO FAULT: `dev_seam!` is `None` there. See the
+        // type's own doc — the knob was documented test-only and gated by nothing,
+        // in a process whose death is the fail-closed halt of every session it
+        // governs.
+        let Some(fault) = aterm_types::dev_seam!("ATERM_LINK_FAULT") else {
             return Fault::None;
-        }
+        };
         if state.root().join("fault-fired").exists() {
             return Fault::None;
         }
-        match std::env::var("ATERM_LINK_FAULT").as_deref() {
-            Ok("kill-after-deliver") => Fault::KillAfterDeliver,
-            Ok("kill-after-publish") => Fault::KillAfterPublish,
-            Ok("lose-aterm-before-deliver") => Fault::LoseAtermBeforeDeliver,
-            Ok("fail-status-while-marked") => Fault::FailStatusWhileMarked,
-            Ok("fail-post-publish-while-marked") => Fault::FailPostPublishWhileMarked,
-            Ok("drop-session-exited-while-marked") => Fault::DropSessionExitedWhileMarked,
-            Ok("drop-post-event-while-marked") => Fault::DropPostEventWhileMarked,
-            Ok("skip-roster-outbox-while-marked") => Fault::SkipRosterOutboxWhileMarked,
-            Ok("oversize-deliver-line") => Fault::OversizeDeliverLine,
-            Ok("sweep-ghosts-at-once-while-marked") => Fault::SweepGhostsAtOnceWhileMarked,
-            Ok("drop-meta-event-while-marked") => Fault::DropMetaEventWhileMarked,
+        match fault.to_str() {
+            Some("kill-after-deliver") => Fault::KillAfterDeliver,
+            Some("kill-after-publish") => Fault::KillAfterPublish,
+            Some("lose-aterm-before-deliver") => Fault::LoseAtermBeforeDeliver,
+            Some("fail-status-while-marked") => Fault::FailStatusWhileMarked,
+            Some("fail-post-publish-while-marked") => Fault::FailPostPublishWhileMarked,
+            Some("drop-session-exited-while-marked") => Fault::DropSessionExitedWhileMarked,
+            Some("drop-post-event-while-marked") => Fault::DropPostEventWhileMarked,
+            Some("skip-roster-outbox-while-marked") => Fault::SkipRosterOutboxWhileMarked,
+            Some("oversize-deliver-line") => Fault::OversizeDeliverLine,
+            Some("sweep-ghosts-at-once-while-marked") => Fault::SweepGhostsAtOnceWhileMarked,
+            Some("drop-meta-event-while-marked") => Fault::DropMetaEventWhileMarked,
             _ => Fault::None,
         }
     }
@@ -949,9 +1020,11 @@ pub struct Bridge {
     ///
     /// The set is aterm's (`topic add`/`topic drop`); this is the bridge's copy
     /// of it — PUSHED as `EVENT <local> topic add|drop …` the moment it moves
-    /// ([`Bridge::topic_change`]), and read off `topic ls` once after each
-    /// attach for whatever moved while no bridge was listening
-    /// ([`Bridge::sample_topics`]) — plus the one thing aterm cannot know:
+    /// ([`Bridge::topic_change`]), and read off `topic ls`
+    /// ([`Bridge::sample_topics`]) wherever a push may not have covered a
+    /// change: after each attach for whatever moved while no bridge was
+    /// listening, and at the points [`Bridge::topics_sampled`] lists — plus
+    /// the one thing aterm cannot know:
     /// where on the bus each topic resumes. A `since=head` entry is resolved
     /// ONCE, against the head at the moment this bridge learns it; a
     /// `since=@<off>` entry starts at that offset. Every delivery moves the
@@ -960,19 +1033,61 @@ pub struct Bridge {
     /// and checkpoint by shard; a restart may reread those irrelevant records
     /// but cannot skip a delivered one or broadcasts published while down.
     topics: BTreeMap<String, BTreeMap<String, TopicCursor>>,
-    /// The sessions whose opt-ins have been read off `topic ls` since this
-    /// attach — the once-per-session backstop ([`Bridge::sample_topics`]). A
-    /// session is sampled when this bridge first learns of it, at attach or
-    /// on its `session-created`, and AGAIN when the push lane adopts it if
-    /// that read came first (the `sub` arm of [`Bridge::on_event`]); from then
-    /// on its changes arrive pushed. Reset by every attach, pruned to the
-    /// roster like every per-sid map.
+    /// The sessions whose opt-ins this bridge has READ off `topic ls` — a
+    /// read the endpoint answered ([`Bridge::sample_topics`]) — since each was
+    /// last struck from this set. A listed session not in it is read at the
+    /// next chance any of these gives: a `session-created`, a roster round, a
+    /// `GAP`, an attach ([`Bridge::sample_unsampled_topics`]). A `GAP` or an
+    /// attach clears the whole set; a session is struck by its watch's `sub
+    /// <local> <sid>` ack, and — on an inherited bridge, the one that holds a
+    /// push lane — on every roster round while [`Bridge::watched`] holds no ack
+    /// for the `<local> <sid>` the roster lists. An observer holds no push lane,
+    /// so no session is ever acked to it and it never strikes: it makes only the
+    /// owed reads. A read that fails inserts nothing, so it stays owed until one
+    /// succeeds.
+    ///
+    /// THE ACK'S READ IS THE ONE THAT COUNTS. The watch pushes only what the
+    /// session records after the watch is SEEDED, so a read made before the
+    /// seed leaves a window — an add between the read and the seed is in
+    /// neither — and a read is made before the seed whenever something other
+    /// than the session's own ack prompts it: another session's
+    /// `session-created`, a roster round, a `GAP` or an attach reads every
+    /// listed session not in this set, watched or not. aterm writes every
+    /// `sub` line — the handshake's and each adoption's — only after that
+    /// watch is seeded (aterm-gui `subscribe.rs`,
+    /// `push_loop_with_peer_probe` and `drain_membership`), so the read the
+    /// ack prompts, or leaves owed, follows the seed and covers the window.
+    /// Pruned to the roster like every per-sid map.
     topics_sampled: BTreeSet<String>,
+    /// `sid -> local id` of every session whose watch this bridge's push lane
+    /// has ACKED — a `sub <local> <sid>` line, from the handshake or from an
+    /// `@*` adoption — the one evidence that the session's changes arrive
+    /// pushed.
+    ///
+    /// "NOT WATCHED" IS THE ABSENCE OF AN ENTRY, RE-DERIVED EVERY ROUND, not an
+    /// event this process must not miss: [`Bridge::roster_backstop`] reads
+    /// the opt-ins of every listed session whose `<local> <sid>` pair is not
+    /// here, on every round — on a bridge that holds the push lane; an
+    /// observer holds none and delivers no broadcast, so it does not poll. So
+    /// a session aterm's cap leaves unwatched — at
+    /// the handshake (`@*` seeds at most `MAX_SUBSCRIBE_TARGETS`, 256) or
+    /// after it — is read every round until its ack, which may never come,
+    /// whether or not any line about it reached this process: its `topic
+    /// add` is learned by the next read the endpoint answers, and a
+    /// `since=head` one resolves against the head then ([`Bridge::topics`]).
+    /// The `watch=deferred` marker aterm puts on such a session's
+    /// `session-created` is therefore not read here at all. A line that never
+    /// arrives can only leave an entry out, which costs a read per round and
+    /// loses nothing; the acks are kept even while the broker is unreachable
+    /// ([`Bridge::park_detached`]), so a session adopted then is not read
+    /// every round for the life of the process. Pruned to the roster like
+    /// every per-sid map.
+    watched: BTreeMap<String, u64>,
     /// THE DRAIN POSITION of the broadcast face: the next offset the live
     /// subscription is expected to hand over.
     ///
     /// Everything at or above it is covered by the subscription; everything
-    /// below a topic's cursor down to here is a GAP [`Bridge::catch_up_topics`]
+    /// below a topic's cursor down to here is a GAP [`Bridge::replay_topics`]
     /// owns. It starts at the subscription's `from` — which after a restart is
     /// the lowest cursor any topic still owes, well below the bus head — and
     /// climbs as records arrive.
@@ -980,6 +1095,8 @@ pub struct Bridge {
     /// One tick per accounted live broadcast, used only to spread durable
     /// checkpoints of irrelevant cursor movement across subscribers.
     say_checkpoint_tick: u64,
+    /// One bridge-wide budget and a rotating sid for the late-subscriber gap.
+    say_replay: SayReplay,
     /// THE BUS HEAD of the broadcast face, as last known: the head read at
     /// attach or for a new `since=head` opt-in, then one past the highest say
     /// record taken.
@@ -1170,8 +1287,10 @@ impl Bridge {
             ghosts: BTreeMap::new(),
             topics: BTreeMap::new(),
             topics_sampled: BTreeSet::new(),
+            watched: BTreeMap::new(),
             say_drained_to: 0,
             say_checkpoint_tick: 0,
+            say_replay: SayReplay::new(Instant::now()),
             say_bus_head: 0,
             presence: BTreeMap::new(),
             halts: BTreeMap::new(),
@@ -1185,12 +1304,6 @@ impl Bridge {
             mailbox: Arc::new(Mailbox::default()),
             cfg,
         })
-    }
-
-    /// This node's id.
-    #[must_use]
-    pub fn node(&self) -> &str {
-        &self.node
     }
 
     // -----------------------------------------------------------------------
@@ -1696,6 +1809,7 @@ impl Bridge {
         }
         self.topics.retain(|sid, _| live.contains(sid));
         self.topics_sampled.retain(|sid| live.contains(sid));
+        self.watched.retain(|sid, _| live.contains(sid));
         self.pending_admit.retain(|sid| live.contains(sid));
         // AND THE DEADLINES OF SESSIONS THAT ARE GONE. A verdict for an ask
         // whose asker has exited would land on a lane nobody drains; dropping
@@ -1721,13 +1835,38 @@ impl Bridge {
         if self.conn.is_none() {
             return;
         }
-        for sid in std::mem::take(&mut self.pending_admit) {
+        if !self.refill_pending_admissions(true) {
+            // The live group reader may already have queued newer mail for
+            // this sid. Reconnect before taking another inbox item: attach
+            // refills the old offsets before it opens a replacement reader,
+            // and reset_broker_sources discards that old reader's queue.
+            // `Unaccounted` can leave the publisher connection open, so the
+            // failed refill must force this transition itself.
+            self.conn = None;
+        }
+    }
+
+    /// Keep an admission owed until its whole refill reaches the broker head.
+    /// A failed Fetch drops the publisher connection; a reconnect in this same
+    /// process must retry the sid even though the roster still knows its epoch.
+    /// The attach calls this before opening the live inbox subscription, so
+    /// old records still reach the endpoint before newer group records.
+    fn refill_pending_admissions(&mut self, publish_presence: bool) -> bool {
+        let pending: Vec<String> = self.pending_admit.iter().cloned().collect();
+        for sid in pending {
             if !self.epochs.contains_key(&sid) {
+                self.pending_admit.remove(&sid);
                 continue;
             }
-            self.publish_session_presence(&sid, "live");
-            self.refill(&sid);
+            if publish_presence {
+                self.publish_session_presence(&sid, "live");
+            }
+            if !self.refill(&sid) {
+                return false;
+            }
+            self.pending_admit.remove(&sid);
         }
+        true
     }
 
     /// REFILL one session's ring after an instance relaunch (§6.2).
@@ -1755,19 +1894,19 @@ impl Bridge {
     /// dir that is usually intact. [`REFILL_FLOOR_SPAN`] behind the head is
     /// bounded, is strictly more than the nothing A3 offered, and covers the
     /// window a lost watermark can actually be hiding rows in.
-    fn refill(&mut self, sid: &str) {
+    fn refill(&mut self, sid: &str) -> bool {
         let filter = format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node);
         let from = match self.state.seen_off(sid) {
             Some(off) => off + 1,
             None => {
                 // `max=0` is the broker's head query and scans nothing.
                 let Some(conn) = self.conn.as_mut() else {
-                    return;
+                    return false;
                 };
                 let started = Instant::now();
                 let answer = conn.fetch(0, &filter, 0);
                 let Ok((_, (_, head))) = self.observe(started, answer, Some("read")) else {
-                    return;
+                    return false;
                 };
                 head.saturating_sub(REFILL_FLOOR_SPAN)
             }
@@ -1776,7 +1915,7 @@ impl Bridge {
         loop {
             let page = {
                 let Some(conn) = self.conn.as_mut() else {
-                    return;
+                    return false;
                 };
                 let started = Instant::now();
                 let answer = conn.fetch(cursor, &filter, 256);
@@ -1784,7 +1923,7 @@ impl Bridge {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("aterm-link: refill of {sid} stopped: {e}");
-                        return;
+                        return false;
                     }
                 }
             };
@@ -1798,11 +1937,15 @@ impl Bridge {
                 // session's whole post-relaunch recovery on every relaunch,
                 // forever.
                 if self.deliver_record(off, &subj, &body) == Delivery::Unaccounted {
-                    return;
+                    return false;
                 }
             }
-            if next >= head || next <= cursor {
-                return;
+            if next >= head {
+                return true;
+            }
+            if next <= cursor {
+                eprintln!("aterm-link: refill of {sid} made no progress at {cursor}");
+                return false;
             }
             cursor = next;
         }
@@ -1842,6 +1985,27 @@ impl Bridge {
     /// see [`Bridge::refuse_locally`].
     fn on_inbox_record(&mut self, rec: &BrokerRecord) {
         let (off, subject, body) = rec;
+        if self.conn.is_none() {
+            // A failed live admission left this old subscription's record
+            // queued. The group has not committed it; reconnect will reoffer
+            // it after the pending session's refill.
+            return;
+        }
+        if let Ok(addr) = subject::parse_in(&self.cfg.fleet, &self.node, subject) {
+            if !self.epochs.contains_key(&addr.sid) && self.refresh_sessions().is_err() {
+                // Do not call the still-unknown sid unhosted while the roster
+                // is unreadable. Retry the uncommitted group record.
+                self.conn = None;
+                return;
+            }
+        }
+        // Discovery can race this inbox item: the session-created push may be
+        // behind it. Admit every new sid before this newer group record can
+        // advance the endpoint's durable seen offset past older mail.
+        self.admit_fresh_sessions();
+        if self.conn.is_none() {
+            return;
+        }
         let outcome = self.deliver_record(*off, subject, body);
         if self.fault == Fault::KillAfterDeliver {
             self.fault.fire(Fault::KillAfterDeliver, &self.state);
@@ -1872,7 +2036,7 @@ impl Bridge {
     /// in the loop below.
     ///
     /// A SESSION THAT IS BEHIND IS NOT A RECIPIENT EITHER: a cursor below the
-    /// drain position owns a backlog [`Bridge::catch_up_topics`] has not walked,
+    /// drain position owns a backlog [`Bridge::replay_topics`] has not walked,
     /// and delivering this record to it would move the cursor past that
     /// backlog. The catch-up delivers this record too, in offset order.
     fn on_say_record(&mut self, rec: &BrokerRecord) {
@@ -3578,11 +3742,6 @@ impl Bridge {
             self.observe_local_control(sid, sample);
         }
         for (_, sid) in locals {
-            // AND WHATEVER BROADCAST BACKLOG IS STILL OWED, one bounded walk per
-            // round ([`SAY_REPLAY_PAGES`]). The opt-ins themselves arrive
-            // pushed, not sampled: see [`Bridge::topic_change`].
-            self.catch_up_topics(&sid);
-
             // THE ROW'S MEANING RIDES PUSHES NOW, and this round is their
             // backstop. `detail=` and `phase=` came off the `status` above
             // (the read the hold reconciliation pays for anyway); `attention=`,
@@ -3648,7 +3807,7 @@ impl Bridge {
                     .entry(topic.to_string())
                     .or_insert(TopicCursor { next });
                 self.persist_topics(sid);
-                self.catch_up_topics(sid);
+                self.replay_topics(false);
             }
             Some("drop") => {
                 let Some(by_topic) = self.topics.get_mut(sid) else {
@@ -3666,29 +3825,37 @@ impl Bridge {
         }
     }
 
-    /// THE BACKSTOP: one session's whole opt-in set off `topic ls`, read once
-    /// after an attach.
+    /// THE BACKSTOP: one session's whole opt-in set off `topic ls`, read after
+    /// an attach and at the other points [`Bridge::topics_sampled`] lists.
     ///
     /// A pushed change reaches this bridge only while it holds the event lane
-    /// AND a broker: the run loop drops every item but aterm's own closure
-    /// while the broker is unreachable, and a bridge that was not running
-    /// heard nothing at all. So each attach reconciles against the endpoint's
-    /// answer: a name it holds keeps its cursor (records were delivered against
-    /// it), a name it does not is resolved from the row's `since=`, a name the
-    /// endpoint no longer lists is dropped. What this cannot tell apart is a
-    /// `drop` and a re-`add` of the same name both made while no bridge was
-    /// listening — that entry resumes from the old cursor, which the verb's
-    /// help says.
+    /// AND a broker: the run loop drops every pushed change while the broker
+    /// is unreachable ([`Bridge::park_detached`]), and a bridge that was not
+    /// running heard nothing at all. So each attach reconciles against the
+    /// endpoint's answer: a name it holds keeps its cursor (records were
+    /// delivered against it), a name it does not is resolved from the row's
+    /// `since=`, a name the endpoint no longer lists is dropped. What this
+    /// cannot tell apart is a `drop` and a re-`add` of the same name both made
+    /// while no bridge was listening — that entry resumes from the old cursor,
+    /// which the verb's help says.
     ///
     /// AN ENDPOINT THAT DOES NOT KNOW THE VERB ANSWERS `ERR`, and that is not a
     /// reason to forget what this bridge is holding: only an `OK` — the
     /// session's own answer — replaces the set.
-    fn sample_topics(&mut self, sid: &str) {
+    ///
+    /// Answers whether the read HAPPENED: `true` once the endpoint's `OK` is
+    /// reconciled into [`Bridge::topics`], `false` when the verb lane failed,
+    /// the endpoint answered anything but `OK`, or a new `since=head` row
+    /// found no bus head to resolve against. A `false` read changed nothing,
+    /// so the caller must leave it owed ([`Bridge::topics_sampled`]) — on an
+    /// endpoint that answers `ERR` to the verb, that is one refused read per
+    /// listed session per roster round.
+    fn sample_topics(&mut self, sid: &str) -> bool {
         let Ok(reply) = self.ctl_request(&format!("@{sid} topic ls")) else {
-            return;
+            return false;
         };
         if !reply.ok() {
-            return;
+            return false;
         }
         let have = self.topics.get(sid).cloned().unwrap_or_default();
         let mut parsed = Vec::new();
@@ -3711,7 +3878,7 @@ impl Bridge {
         let head = if needs_head {
             match self.fresh_broadcast_head() {
                 Some(head) => head,
-                None => return,
+                None => return false,
             }
         } else {
             self.say_bus_head
@@ -3732,7 +3899,9 @@ impl Bridge {
                 self.persist_topics(sid);
             }
         }
-        self.catch_up_topics(sid);
+        // The read only records intent. A shared replay budget chooses which
+        // session gets a page, after all outstanding opt-ins have been sampled.
+        true
     }
 
     /// THE LATE SUBSCRIBER'S BACKLOG: everything between a topic's cursor and
@@ -3748,70 +3917,118 @@ impl Bridge {
     /// the live face uses, so a replay arrives in offset order exactly as the
     /// live path does.
     ///
-    /// BOUNDED, AND RESUMABLE: at most [`SAY_REPLAY_PAGES`] pages per session
-    /// per roster round, and every cursor is persisted as it moves, so a deep
-    /// backlog is caught up over several rounds — and across a restart —
-    /// instead of parking the scheduling loop, which would delay the halt this
-    /// whole mailbox is ordered around.
-    fn catch_up_topics(&mut self, sid: &str) {
+    /// BOUNDED, AND RESUMABLE: one broker page for the sid chosen by
+    /// [`Bridge::replay_topics`]. The shared budget bounds all sessions together;
+    /// every delivered cursor is persisted as it moves.
+    fn catch_up_topic_page(&mut self, sid: &str) -> bool {
         let filter = subject::say_filter(&self.cfg.fleet);
-        for _ in 0..SAY_REPLAY_PAGES {
-            let owed: BTreeMap<String, u64> = self
+        let owed: BTreeMap<String, u64> = self
+            .topics
+            .get(sid)
+            .map(|by_topic| {
+                by_topic
+                    .iter()
+                    .filter(|(_, c)| c.next < self.say_drained_to)
+                    .map(|(t, c)| (t.clone(), c.next))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(from) = owed.values().copied().min() else {
+            return true;
+        };
+        let Some(conn) = self.conn.as_mut() else {
+            return false;
+        };
+        let started = Instant::now();
+        let page = conn.fetch(from, &filter, 256);
+        let Ok((rows, (next, _))) = self.observe(started, page, Some("read")) else {
+            return false;
+        };
+        for (off, subject, raw) in rows {
+            // STRICTLY BELOW THE DRAIN POSITION. A record at or past it is
+            // one the subscription will deliver (or already has), and
+            // delivering it here too would spend a `deliver` the ring is
+            // only going to dedup.
+            if off >= self.say_drained_to {
+                break;
+            }
+            let Some(say) = subject::parse_say(&self.cfg.fleet, &subject) else {
+                continue;
+            };
+            let Some(expect) = owed.get(&say.topic).copied().filter(|c| *c <= off) else {
+                continue;
+            };
+            let (body, _raw_tail) = Body::decode(&raw);
+            if !body.via.as_deref().is_none_or(via_ok) {
+                continue;
+            }
+            if self.deliver_broadcast(sid, &say, &body, off, expect) == Delivery::Unaccounted {
+                return false;
+            }
+        }
+        // `next` is one past the last offset the broker SCANNED, so the walk
+        // advances even through a stretch that matched nothing. All owed
+        // topics have now been read up to there.
+        let reached = next.max(from.saturating_add(1)).min(self.say_drained_to);
+        for (topic, expect) in owed {
+            let now = self
                 .topics
                 .get(sid)
-                .map(|by_topic| {
-                    by_topic
-                        .iter()
-                        .filter(|(_, c)| c.next < self.say_drained_to)
-                        .map(|(t, c)| (t.clone(), c.next))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let Some(from) = owed.values().copied().min() else {
-                return;
-            };
-            let Some(conn) = self.conn.as_mut() else {
-                return;
-            };
-            let started = Instant::now();
-            let page = conn.fetch(from, &filter, 256);
-            let Ok((rows, (next, _))) = self.observe(started, page, Some("read")) else {
-                return;
-            };
-            for (off, subject, raw) in rows {
-                // STRICTLY BELOW THE DRAIN POSITION. A record at or past it is
-                // one the subscription will deliver (or already has), and
-                // delivering it here too would spend a `deliver` the ring is
-                // only going to dedup.
-                if off >= self.say_drained_to {
-                    break;
-                }
-                let Some(say) = subject::parse_say(&self.cfg.fleet, &subject) else {
-                    continue;
-                };
-                let Some(expect) = owed.get(&say.topic).copied().filter(|c| *c <= off) else {
-                    continue;
-                };
-                let (body, _raw_tail) = Body::decode(&raw);
-                if !body.via.as_deref().is_none_or(via_ok) {
-                    continue;
-                }
-                if self.deliver_broadcast(sid, &say, &body, off, expect) == Delivery::Unaccounted {
-                    return;
-                }
+                .and_then(|m| m.get(&topic))
+                .map_or(expect, |c| c.next);
+            self.advance_topic(sid, &topic, now, reached);
+        }
+        true
+    }
+
+    /// Spend at most one bridge-wide slice of broker Fetches, rotating after
+    /// each page so one ancient topic cannot starve the other sessions. The
+    /// roster calls this after control/status, topic reads, and addressed
+    /// outbox work. Pushes can use remaining pages promptly, but cannot create
+    /// a new allowance until the two-second interval has elapsed. A queued
+    /// higher-priority input stops the slice; the roster alone may take one
+    /// page after control handling so sustained mail cannot starve catch-up.
+    /// A pushed opt-in takes at most one page per event even on an empty queue.
+    fn replay_topics(&mut self, roster: bool) {
+        if self.conn.is_none() || self.attachment == Attachment::Observer {
+            return;
+        }
+        self.say_replay.refill(Instant::now());
+        if self.say_replay.pages_left == 0 {
+            return;
+        }
+        let mut owed: BTreeSet<String> = self
+            .topics
+            .iter()
+            .filter(|(_, by_topic)| {
+                by_topic
+                    .values()
+                    .any(|cursor| cursor.next < self.say_drained_to)
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        let mut taken = 0;
+        while !owed.is_empty() {
+            // A pushed opt-in is an Event, which outranks the addressed Inbox
+            // in the mailbox. Without this check it could spend all four pages
+            // while fresh mail was already waiting. A message arriving during
+            // a Fetch waits for that page only; the next check yields to it.
+            if !may_take_replay_page(&self.mailbox, roster, taken) {
+                break;
             }
-            // `next` is one past the last offset the broker SCANNED, so the
-            // walk advances even through a stretch that matched nothing — and
-            // every owed topic has now been read up to there, whether or not
-            // this page held anything for it.
-            let reached = next.max(from.saturating_add(1)).min(self.say_drained_to);
-            for (topic, expect) in owed {
-                let now = self
-                    .topics
-                    .get(sid)
-                    .and_then(|m| m.get(&topic))
-                    .map_or(expect, |c| c.next);
-                self.advance_topic(sid, &topic, now, reached);
+            let Some(sid) = self.say_replay.take(&owed) else {
+                break;
+            };
+            taken += 1;
+            if !self.catch_up_topic_page(&sid) {
+                break;
+            }
+            if !self.topics.get(&sid).is_some_and(|by_topic| {
+                by_topic
+                    .values()
+                    .any(|cursor| cursor.next < self.say_drained_to)
+            }) {
+                owed.remove(&sid);
             }
         }
     }
@@ -4058,7 +4275,9 @@ impl Bridge {
     }
 
     /// THE PERIODIC BACKSTOP: the local observations, the roster re-read, the
-    /// halt reassert for anything new, and the outbox drain.
+    /// halt reassert for anything new, the opt-ins of every listed session no
+    /// acked watch covers and of every one whose read is owed, and the outbox
+    /// drain.
     ///
     /// Every part of it is a thing DISCOVERED BY LOOKING rather than by an
     /// arrival, which is why it cannot live on the idle arm (see
@@ -4085,6 +4304,32 @@ impl Bridge {
         if before != after {
             self.reassert_halt();
         }
+        // AND THE OPT-INS NO PUSH WILL CARRY. Every listed session this push
+        // lane has not acked a watch of is read on every round, whatever was
+        // or was not said about it on the lane ([`Bridge::watched`]); and
+        // every read still owed is made — a session this roster read lists for
+        // the first time, one whose ack came before any roster read listed it
+        // (the `sub` arm of [`Bridge::on_event`]), one whose last read failed.
+        // The roster is the last one READ: a round whose `sessions bridge`
+        // failed — refused, or rejected whole as misframed
+        // ([`parse_bridge_roster`]) — reads against the one before, and the
+        // round that next succeeds lists whatever arrived in between. An
+        // OBSERVER holds no push lane, so nothing is ever acked to it, and it
+        // delivers no broadcast ([`Bridge::on_say_record`]): polling it would
+        // read every session every round for nothing, so it makes only the
+        // owed reads.
+        if self.attachment == Attachment::Inherited {
+            let unwatched: Vec<String> = self
+                .locals
+                .iter()
+                .filter(|(local, sid)| self.watched.get(*sid) != Some(*local))
+                .map(|(_, sid)| sid.clone())
+                .collect();
+            for sid in &unwatched {
+                self.topics_sampled.remove(sid);
+            }
+        }
+        self.sample_unsampled_topics();
         // AND THE OUTBOX, WHICH THE RUN LOOP HAS BEEN CLAIMING THIS FUNCTION
         // DRAINED. It said so in as many words — the outbox "has its prompt
         // trigger on the push lane (`EVENT <sid> post`) and its own backstop in
@@ -4103,6 +4348,9 @@ impl Bridge {
         {
             self.drain_outbox();
         }
+        // Only after the control and addressed-mail backstops: an old say
+        // backlog may consume broker round trips, but at most one shared slice.
+        self.replay_topics(true);
     }
 
     /// Read all hosted sessions' status fields in one Lines-framed reply.
@@ -4181,8 +4429,9 @@ impl Bridge {
     }
 
     /// RE-READ one session's `meta` because something says the read on file
-    /// may be stale: an `EVENT <local> meta …` push, or an adoption whose watch
-    /// starts past a change made after that read. The slot is marked unread
+    /// may be stale: an `EVENT <local> meta …` push, or a watch's `sub` ack
+    /// (the handshake's or an adoption's) whose watch starts past a change
+    /// made after that read. The slot is marked unread
     /// FIRST, so a read that fails is retried by the next roster round rather
     /// than leaving the stale fields standing as read; a session still queued
     /// for admission (or not yet on this bridge's roster) is only marked, and
@@ -4722,7 +4971,7 @@ impl Bridge {
     // aterm's events digest
     // -----------------------------------------------------------------------
 
-    /// One `EVENT …`, `GAP …` or adoption `sub …` line off the push lane.
+    /// One `EVENT …`, `GAP …` or `sub …` (a watch's ack) line off the push lane.
     fn on_event(&mut self, line: &str) {
         let mut toks = line.split_whitespace();
         match toks.next() {
@@ -4751,24 +5000,26 @@ impl Bridge {
                 self.roster_backstop();
                 // AND EVERY SESSION'S OPT-INS: a `topic add|drop` is one
                 // timeline record, and the hole may have held it.
-                self.topics_sampled.clear();
-                self.sample_unsampled_topics();
+                self.resample_topics();
                 self.roster_due = Instant::now() + ROSTER_REFRESH;
                 return;
             }
-            // `sub <local> <sid>`: the push lane has ADOPTED `<sid>`, and its
-            // watch starts at the session's timeline high as of now (see
-            // [`spawn_event_reader`]). A read of that session's topics taken
-            // BEFORE now — an attach's or a `GAP`'s, which read every session
-            // the store lists, or a `session-created` announced one wake ahead
-            // of its adoption — cannot have seen a `topic add` recorded after
-            // it, and the watch starts past that add, so it is read again. A
-            // session not yet read needs nothing here: its first read comes
-            // later, and so after the watch.
+            // `sub <local> <sid>`: aterm's ack that the push lane WATCHES this
+            // session from now on — the handshake's, or an `@*` adoption's,
+            // each written after that watch was seeded. So the session's
+            // opt-ins are read again here, whether or not an earlier read
+            // exists: see [`Bridge::topics_sampled`] for the window that
+            // earlier read leaves. A session no roster read has listed yet is
+            // left owed, for the read that first lists it; so is one whose
+            // read here fails.
             Some("sub") => {
-                let Some(sid) = toks.nth(1) else { return };
-                if self.topics_sampled.remove(sid) {
-                    self.sample_topics(sid);
+                let Some((local, sid)) = watch_ack(line) else {
+                    return;
+                };
+                self.note_watch_ack(local, sid);
+                if self.locals.get(&local).is_some_and(|listed| listed == sid)
+                    && self.sample_topics(sid)
+                {
                     self.topics_sampled.insert(sid.to_string());
                 }
                 // AND ITS `meta`, by the same argument: a read taken before
@@ -4778,6 +5029,7 @@ impl Bridge {
                 if self.presence.get(sid).is_some_and(|slot| slot.sampled) {
                     self.refresh_meta(sid);
                 }
+                self.replay_topics(false);
                 return;
             }
             _ => return,
@@ -4832,6 +5084,9 @@ impl Bridge {
                 }
             }
             "session-created" => {
+                // `EVENT * session-created <sid> [watch=deferred]`. Neither the
+                // sid nor the marker is read: whether a session is watched is
+                // [`Bridge::watched`]'s answer, re-derived every round.
                 let _ = self.refresh_sessions();
                 // A session with a REMEMBERED watermark is a relaunched
                 // instance's session, and its ring needs refilling before the
@@ -4842,11 +5097,11 @@ impl Bridge {
                 // A halt already in force must reach a session that appeared
                 // after it.
                 self.reassert_halt();
-                // And its opt-ins: see [`Bridge::sample_unsampled_topics`]. This
-                // usually runs after the push lane has adopted the session, but
-                // not always — the endpoint announces and adopts in two store
-                // reads — and the adoption's `sub` line re-reads it if not.
+                // And every read owed: see [`Bridge::sample_unsampled_topics`].
+                // An adopted session's ack came first, and either read its
+                // opt-ins or left the read owed for this one, which follows it.
                 self.sample_unsampled_topics();
+                self.replay_topics(false);
             }
             // `EVENT <local> hold <0|1> reason=<pct> origin=<>` (§11.2). The
             // endpoint says its hold moved; if that disagrees with the standing
@@ -5027,8 +5282,8 @@ impl Bridge {
         // are re-offered in offset order ahead of anything new.
         self.pending_admit
             .retain(|sid| self.epochs.contains_key(sid));
-        for sid in std::mem::take(&mut self.pending_admit) {
-            self.refill(&sid);
+        if !self.refill_pending_admissions(false) {
+            return false;
         }
         let fleet_filter = subject::fleet_filter(&self.cfg.fleet);
         let group = subject::inbox_group(&self.cfg.fleet, &self.node);
@@ -5158,25 +5413,36 @@ impl Bridge {
         // alternative is the minute timer this gating exists to remove.
         self.retire_ghost_presence();
         self.ghost_due = Instant::now() + GHOST_SWEEP;
-        // THE ONCE-PER-SESSION BACKSTOP for the opt-ins: whatever moved while
-        // no bridge was listening. From here on they arrive pushed.
-        self.topics_sampled.clear();
-        self.sample_unsampled_topics();
+        // THE BACKSTOP for the opt-ins: whatever moved while no bridge was
+        // listening. From here on a watched session's arrive pushed; see
+        // [`Bridge::topics_sampled`] for the reads that follow.
+        self.resample_topics();
         true
     }
 
-    /// Read the opt-ins of every local session this bridge has not yet sampled
-    /// since its attach — at attach, when a session appears, and (every
+    /// Read EVERY listed session's opt-ins again: [`Bridge::topics_sampled`]
+    /// cleared, then [`Bridge::sample_unsampled_topics`].
+    fn resample_topics(&mut self) {
+        self.topics_sampled.clear();
+        self.sample_unsampled_topics();
+        self.replay_topics(false);
+    }
+
+    /// Read the opt-ins of every listed session not in
+    /// [`Bridge::topics_sampled`], and record each read that succeeded — at
+    /// attach, on a `session-created`, on every roster round, and (every
     /// session, `topics_sampled` cleared) after a `GAP`: a `topic add` made
-    /// before the push lane's `@*` watch seeded that session's timeline, or
-    /// evicted from it while this reader was not draining, is one the watch
-    /// will never push.
+    /// before the push lane's `@*` watch seeded that session's timeline, made
+    /// while no watch covers the session at all, or evicted from the timeline
+    /// while this reader was not draining, is one no watch will push.
     ///
     /// `locals` is the store's roster, which runs AHEAD of the push lane: a
     /// session is listed from the moment it registers and watched only from
-    /// the push loop's next wake. So a read taken here can precede the watch,
-    /// and an add landing between the two would be in neither — which is why
-    /// the adoption's `sub` line re-reads a session sampled before it.
+    /// the push loop's next wake that adopts it — or, at aterm's cap, not at
+    /// all. So a read taken here can precede the watch, and an add landing
+    /// between the two would be in neither — which is why a watch's `sub` ack
+    /// strikes its session and reads it again ([`Bridge::note_watch_ack`]),
+    /// and why a listed session with no ack is read on every roster round.
     fn sample_unsampled_topics(&mut self) {
         let fresh: Vec<String> = self
             .locals
@@ -5185,9 +5451,45 @@ impl Bridge {
             .cloned()
             .collect();
         for sid in fresh {
-            self.sample_topics(&sid);
-            self.topics_sampled.insert(sid);
+            if self.sample_topics(&sid) {
+                self.topics_sampled.insert(sid);
+            }
         }
+    }
+
+    /// Record the push lane's ack of a watch of `sid` — its `<local>` in
+    /// [`Bridge::watched`] — and strike the session from
+    /// [`Bridge::topics_sampled`], so its opt-ins are read again after the
+    /// ack, which aterm writes after the watch is seeded.
+    fn note_watch_ack(&mut self, local: u64, sid: &str) {
+        self.watched.insert(sid.to_string(), local);
+        self.topics_sampled.remove(sid);
+    }
+
+    /// ONE BACK-OFF STEP WITH NO BROKER: park on the mailbox until the
+    /// retry's deadline rather than sleeping through it, and answer whether
+    /// aterm went away ([`wait_for_retry_or_aterm_close`]). However many items
+    /// arrive meanwhile, the park lasts the whole back-off: a busy push lane
+    /// must not turn it into a rapid broker dial loop.
+    ///
+    /// The one thing that must not be slept through is aterm going away: a
+    /// bridge that missed it would spin forever as an orphan, holding nothing
+    /// and reachable by nobody. The broker items are from the connection that
+    /// just died and are dropped with it, and so is every push-lane line but
+    /// one — the re-attach reads every listed session's opt-ins, which
+    /// covers whatever a dropped `topic` line said. The one kept is a watch's
+    /// `sub <local> <sid>` ack, and only as bookkeeping
+    /// ([`Bridge::note_watch_ack`]): nothing rests on it (a session with no
+    /// ack on record is read every round, [`Bridge::watched`]), but a session
+    /// adopted during the outage would otherwise be read every round for the
+    /// life of the process.
+    fn park_detached(&mut self, backoff: Duration) -> bool {
+        let mailbox = Arc::clone(&self.mailbox);
+        wait_for_retry_or_aterm_close(&mailbox, backoff, |line| {
+            if let Some((local, sid)) = watch_ack(line) {
+                self.note_watch_ack(local, sid);
+            }
+        })
     }
 
     /// Close every live subscription. Called before a reconnect and on the way
@@ -5227,10 +5529,11 @@ impl Bridge {
                     self.drain_outbox();
                 } else {
                     self.conn = None;
-                    // Park until this retry's deadline even if other mailbox
-                    // items arrive. They cannot accelerate a failed dial, but
-                    // an inherited aterm-lane close must still end the bridge.
-                    if wait_for_retry_or_aterm_close(&self.mailbox, backoff) {
+                    // PARK ON THE MAILBOX until this retry's deadline, even if
+                    // other items arrive: they cannot accelerate a failed dial,
+                    // but aterm going away must still end the bridge. See
+                    // [`Bridge::park_detached`].
+                    if self.park_detached(backoff) {
                         eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                         return Ok(());
                     }
@@ -5277,6 +5580,12 @@ impl Bridge {
                 self.expire_deadlines();
                 self.arm_deadline_sweep(true, true);
             }
+            // A roster round may have discovered a new session whose refill
+            // then failed. Do not take a queued live inbox record on that old
+            // subscription before the attach path refills and replaces it.
+            if self.conn.is_none() {
+                continue;
+            }
             // EACH OF THE DUTIES ABOVE CARRIES ITS OWN DEADLINE, and none of
             // them lives on the idle branch, because a busy bridge never idles
             // and every one of them is discovered by LOOKING rather than by
@@ -5318,6 +5627,18 @@ impl Bridge {
             }
         }
     }
+}
+
+/// `sub <local> <sid>` — the push lane's ack of a watch — as `(local, sid)`;
+/// `None` for any other line.
+fn watch_ack(line: &str) -> Option<(u64, &str)> {
+    let mut toks = line.split_whitespace();
+    if toks.next() != Some("sub") {
+        return None;
+    }
+    let local = toks.next()?.parse::<u64>().ok()?;
+    let sid = toks.next().filter(|s| subject::is_principal(s))?;
+    Some((local, sid))
 }
 
 /// Whether a record on this node's own lane at `off` is a FORGERY, or one of
@@ -5739,20 +6060,6 @@ fn replier_of(subject: &str) -> Option<String> {
     subject::is_principal(owner).then(|| owner.to_string())
 }
 
-/// TRUST is a pure function of `(sender class, relay)` — never read from a body
-/// (§4.3). There is no `attested` token and no "downgrade only" rule to police,
-/// because no sender ever writes the label.
-fn trust_of(src: &str, relayed: bool) -> &'static str {
-    if relayed {
-        return "relayed";
-    }
-    if src.starts_with("h-") {
-        "human"
-    } else {
-        "agent"
-    }
-}
-
 /// This host's name, for the presence row's `host=` — §7's second column of the
 /// cross-host `ls`, and the field `main.rs`'s header calls "the real answer"
 /// a session row's `-` points at.
@@ -5774,7 +6081,7 @@ fn trust_of(src: &str, relayed: bool) -> &'static str {
 /// `gethostname(2)` would be one call rather than three attempts, and it is not
 /// used: §11.2 confines this crate's raw-descriptor and `libc` surface to
 /// `aterm-uds`, and `ctl.rs`'s adoption is the ONE `unsafe` block the crate
-/// ships (`this_modules_doc_and_unsafe_surface_match_what_it_ships` fails on a
+/// ships (`the_crates_unsafe_surface_is_exactly_the_ctl_adoption` fails on a
 /// second). A `uname` a bridge runs at most once is the cheaper promise to
 /// keep.
 ///
@@ -5908,9 +6215,10 @@ fn parse_receipt_line(line: &str) -> Option<OwedReceipt> {
 ///
 /// TOTAL: a truncated or malformed frame yields the posts that parsed and stops.
 /// The alternative — refusing the whole frame — would wedge the outbound queue on
-/// one bad row forever.
+/// one bad row forever. Test-only: the bridge reads [`parse_drain`] whole.
+#[cfg(test)]
 #[must_use]
-pub fn parse_outbox(frame: &[u8]) -> Vec<QueuedPost> {
+pub(crate) fn parse_outbox(frame: &[u8]) -> Vec<QueuedPost> {
     parse_drain(frame).posts
 }
 
@@ -6051,10 +6359,6 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
             let _ = push.get_ref().flush();
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
-            // The `sub` lines still owed by the handshake: `OK subscribe <n>`
-            // is followed by one `sub <local> <sid>` per target it started
-            // with, and every `sub` after those is an ADOPTION.
-            let mut handshake_subs = 0usize;
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
@@ -6064,36 +6368,19 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
                     }
                     Ok(_) => {
                         let trimmed = line.trim_end().to_string();
-                        if let Some(n) = trimmed.strip_prefix("OK subscribe ") {
-                            handshake_subs = n
-                                .split_whitespace()
-                                .next()
-                                .and_then(|n| n.parse().ok())
-                                .unwrap_or(0);
-                            continue;
-                        }
-                        // AN ADOPTION'S `sub` IS FORWARDED, the handshake's are
-                        // not. The push loop writes an adoption's line only
-                        // after that session's watch has recorded where it
-                        // starts, so it is the one signal that says "from here
-                        // on, this session's changes are pushed" — the moment
-                        // [`Bridge::on_event`]'s `sub` arm re-reads what an
-                        // earlier read may have missed. The handshake's lines
-                        // are written BEFORE the loop seeds its first watches,
-                        // so they say nothing of the kind.
-                        if trimmed.starts_with("sub ") {
-                            if handshake_subs > 0 {
-                                handshake_subs -= 1;
-                            } else {
-                                mailbox.push_event(trimmed);
-                            }
-                            continue;
-                        }
                         // `EVENT` is the digest; `GAP` is the digest ADMITTING it
                         // dropped frames, which §4.2 says must be published as an
                         // `ev` record rather than dropped ("a `GAP` frame is
-                        // published, not dropped"). Both go through the loop.
-                        if trimmed.starts_with("EVENT") || trimmed.starts_with("GAP") {
+                        // published, not dropped"); `sub <local> <sid>` is a
+                        // watch's ack — the handshake's and every adoption's
+                        // alike, each written only after its watch is seeded —
+                        // the line after which that session's changes arrive
+                        // pushed ([`Bridge::watched`]). All three go through
+                        // the loop.
+                        if trimmed.starts_with("EVENT")
+                            || trimmed.starts_with("GAP")
+                            || trimmed.starts_with("sub ")
+                        {
                             mailbox.push_event(trimmed);
                         }
                     }
@@ -6105,6 +6392,126 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_scheduler_refines_shared_budget_and_rotation() {
+        // Tier-1: the exact selector the bridge uses, with both sids owed
+        // across a refill. The derived model supplies the enabled decisions;
+        // the old per-sid choice would take A twice and fail FairRotation.
+        let model = aterm_spec::derive::say_replay_budget_model();
+        let mut state = model.init_state();
+        let now = Instant::now();
+        let mut replay = SayReplay::new(now);
+        let owed = BTreeSet::from(["s-a".to_string(), "s-b".to_string()]);
+
+        assert!(model.fire("Control", &mut state));
+        for _ in 0..SAY_REPLAY_PAGES {
+            let sid = replay.take(&owed).expect("one shared page remains");
+            let action = if sid == "s-a" { "FetchA" } else { "FetchB" };
+            assert!(model.action_enabled(action, &state), "{action}: {state:?}");
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!((state["got_a"], state["got_b"]), (2, 2));
+        // A pushed add in the same interval cannot replenish the allowance.
+        replay.refill(now + ROSTER_REFRESH - Duration::from_millis(1));
+        assert!(replay.take(&owed).is_none());
+
+        let old = aterm_spec::interp::with_buggy(&model, 1);
+        let mut unfair = old.init_state();
+        assert!(old.fire("Control", &mut unfair));
+        assert!(old.fire("FetchA", &mut unfair));
+        assert!(old.fire("FetchA", &mut unfair));
+        assert!(!old.check_invariant("FairRotation", &unfair));
+
+        replay.refill(now + ROSTER_REFRESH);
+        assert!(model.fire("Refill", &mut state));
+        for _ in 0..SAY_REPLAY_PAGES {
+            let sid = replay.take(&owed).expect("the next interval has pages");
+            let action = if sid == "s-a" { "FetchA" } else { "FetchB" };
+            assert!(model.action_enabled(action, &state), "{action}: {state:?}");
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!((state["got_a"], state["got_b"]), (4, 4));
+
+        // Tier-1 of the priority guard: the genuine mailbox has fresh mail
+        // queued. A pushed add gets no replay page, while the roster gets one
+        // after its control work and must then yield to that mail.
+        let mailbox = Mailbox::default();
+        mailbox.push_inbox((1, "mail".to_string(), Vec::new()), 0);
+        let mut queued = model.init_state();
+        assert!(model.fire("Control", &mut queued));
+        assert!(model.fire("QueuePriority", &mut queued));
+        assert!(
+            !may_take_replay_page(&mailbox, false, 0),
+            "a pushed opt-in cannot fetch ahead of queued mail"
+        );
+        assert!(may_take_replay_page(&mailbox, true, 0));
+        assert!(model.action_enabled("FetchA", &queued));
+        assert!(model.fire("FetchA", &mut queued));
+        assert_eq!(
+            may_take_replay_page(&mailbox, true, 1),
+            model.action_enabled("FetchB", &queued),
+            "the roster yields after one page"
+        );
+        assert!(matches!(mailbox.take(Duration::ZERO), Some(Item::Inbox(_))));
+        assert!(model.fire("HandlePriority", &mut queued));
+        assert_eq!(
+            may_take_replay_page(&mailbox, false, 0),
+            model.action_enabled("FetchB", &queued),
+            "replay resumes once addressed mail was handled"
+        );
+        mailbox.push_fleet((2, "halt".to_string(), Vec::new()), 0);
+        assert!(
+            !may_take_replay_page(&mailbox, true, 0),
+            "even the roster's one-page exception must yield to a halt"
+        );
+
+        let quiet = Mailbox::default();
+        let mut pushed = model.init_state();
+        assert!(model.fire("Control", &mut pushed));
+        assert!(model.fire("BeginPush", &mut pushed));
+        assert_eq!(
+            may_take_replay_page(&quiet, false, 0),
+            model.action_enabled("FetchA", &pushed)
+        );
+        assert!(model.fire("FetchA", &mut pushed));
+        assert_eq!(
+            may_take_replay_page(&quiet, false, 1),
+            model.action_enabled("FetchB", &pushed),
+            "a pushed add cannot use a second page in the same event"
+        );
+        assert!(model.fire("EndPush", &mut pushed));
+        assert!(model.fire("BeginPush", &mut pushed));
+        assert_eq!(
+            may_take_replay_page(&quiet, false, 0),
+            model.action_enabled("FetchB", &pushed)
+        );
+    }
+
+    #[test]
+    fn many_backlogged_sessions_get_one_turn_before_any_get_a_second() {
+        let now = Instant::now();
+        let mut replay = SayReplay::new(now);
+        let owed: BTreeSet<String> = (0..12).map(|n| format!("s-{n:02}")).collect();
+        let mut served = Vec::new();
+        for round in 0..3 {
+            replay.refill(now + ROSTER_REFRESH * round);
+            for _ in 0..SAY_REPLAY_PAGES {
+                served.push(replay.take(&owed).expect("a page remains"));
+            }
+            assert!(
+                replay.take(&owed).is_none(),
+                "round {round} exceeds its Fetch bound"
+            );
+        }
+        assert_eq!(served.into_iter().collect::<BTreeSet<_>>(), owed);
+
+        // A retired sid after the saved cursor cannot wedge the next round.
+        let mut reduced = owed;
+        reduced.remove("s-11");
+        replay.refill(now + ROSTER_REFRESH * 3);
+        assert_eq!(replay.take(&reduced).as_deref(), Some("s-00"));
+    }
 
     #[test]
     fn bridge_roster_accepts_only_complete_unique_identity_rows() {
@@ -6230,7 +6637,8 @@ mod tests {
         let start = Instant::now();
         assert!(!wait_for_retry_or_aterm_close(
             &mailbox,
-            Duration::from_millis(100)
+            Duration::from_millis(100),
+            |_| {}
         ));
         assert!(
             start.elapsed() >= Duration::from_millis(90),
@@ -6253,7 +6661,8 @@ mod tests {
         let start = Instant::now();
         assert!(wait_for_retry_or_aterm_close(
             &mailbox,
-            Duration::from_secs(5)
+            Duration::from_secs(5),
+            |_| {}
         ));
         assert!(
             start.elapsed() < Duration::from_secs(3),
@@ -6522,21 +6931,6 @@ mod tests {
         );
     }
 
-    /// TRUST IS COMPUTED, and it is computed from the two things a sender cannot
-    /// choose: the cap-forced class of its `<src>` segment, and whether the
-    /// record went through a relay. Nothing in a body can reach it.
-    #[test]
-    fn trust_is_a_function_of_the_address_and_nothing_else() {
-        assert_eq!(trust_of("h-andrew", false), "human");
-        assert_eq!(trust_of("s-abc", false), "agent");
-        assert_eq!(trust_of("n-abc", false), "agent");
-        assert_eq!(trust_of("a-svc", false), "agent");
-        // A RELAY DEMOTES A HUMAN TOO. `via=` is the relayer's word, so a relayed
-        // message from a human is `relayed`, never `human`: the human's authority
-        // did not travel with it.
-        assert_eq!(trust_of("h-andrew", true), "relayed");
-    }
-
     /// **AN OLDER LIVE SIBLING'S ROWS ARE NEVER RETIRED — the two-bridges,
     /// one-node case, at unit level.**
     ///
@@ -6663,53 +7057,24 @@ mod tests {
             "the field scan matched no `epochs` — this loop has stopped reading \
              the struct and is checking nothing: {checked:?}"
         );
-        // AND THE QUEUE BESIDE THEM, which is a set rather than a map and would
-        // have slipped through the loop above.
-        assert!(src.contains("self.pending_admit.retain(|sid| live.contains(sid))"));
+        // AND THE SETS BESIDE THEM, which are not maps and would have slipped
+        // through the loop above.
+        for set in ["pending_admit", "topics_sampled"] {
+            assert!(
+                src.contains(&format!("self.{set}.retain(|sid| live.contains(sid))")),
+                "`{set}` is keyed by a sid and nothing reconciles it with the roster"
+            );
+        }
     }
 
-    /// **THE CLAIMS THIS CRATE MAKES ABOUT ITSELF, WHERE THEY HAVE NO OTHER
-    /// GUARD.**
-    ///
-    /// aterm has no evidence manifest: its doc comments ARE its claims, and
-    /// three of them said more than the code did. A doc test is the only thing
-    /// that can fail when a sentence stops being true.
+    /// **AN IDLE TIMEOUT ISSUES NO CONTROL ROUND TRIP.** The old idle arm
+    /// drained the outbox every 250 ms even when nothing was queued; the pushed
+    /// `post` event and the roster backstop now own outbox discovery
+    /// (`tests/r1_bridge_backstop.rs` drives the backstop on the real bridge),
+    /// so the arm a quiet bridge wakes into must stay empty of control traffic.
     #[test]
-    fn the_docs_that_have_no_other_guard_still_match_the_code() {
+    fn an_idle_timeout_issues_no_control_round_trip() {
         let src = include_str!("bridge.rs");
-        // §6.6's `serial=` fingerprint is deliberately NOT aterm's `turn` `hash=`,
-        // and the design says the two "must never be compared". Both doc
-        // comments used to say the opposite — an invitation to fence a keystroke
-        // with a `hash=` a driver already has and have every one refused
-        // `reason=gen` for a units mismatch.
-        assert!(
-            src.contains("IT IS NOT aterm's `turn` `hash=`, AND THE TWO MUST NEVER BE COMPARED."),
-            "`live_gen` must say what the design says about `serial=` versus `hash=`"
-        );
-        // SPLIT, so this test's own prose is not the counterexample — the same
-        // care `this_modules_doc_and_unsafe_surface_match_what_it_ships` takes.
-        assert!(
-            !src.contains(concat!(
-                "exactly as aterm's own turn ",
-                "path hashes its screen"
-            )),
-            "the two hashes take the same algorithm over DIFFERENT bytes"
-        );
-        // The roster round must drain a post whose push event was lost. The
-        // old idle arm did that every 250 ms, even when nothing was queued;
-        // the backstop now carries the recovery without idle control traffic.
-        let backstop = src
-            .split_once("fn roster_backstop(&mut self) {")
-            .expect("the backstop exists")
-            .1
-            .split_once("\n    }\n")
-            .expect("and it ends")
-            .0;
-        assert!(
-            backstop.contains("self.drain_outbox();"),
-            "`cmd_outbox`'s drain budget names this function as the outbox's \
-             backstop; it must actually drain it"
-        );
         let timeout_arm = src
             .split_once("match self.mailbox.take(wait) {")
             .expect("the bridge parks until its next real duty")
@@ -6725,13 +7090,6 @@ mod tests {
             "an idle timeout must not issue a control round trip; a pushed `post` \
              and the roster backstop own outbox discovery"
         );
-        // THE ROW-4/ROW-5 PIN WENT WITH ROWS 4 AND 5. It asserted the local
-        // sweep's header did not describe a pre-`LOCAL_OBSERVE` shape, and named
-        // `watch_held_control` as where row 4 had moved to. Round 21 cut the
-        // drive face, and both rows and that function with it, so the negative
-        // pin now guards prose that cannot come back and names a function that
-        // does not exist — the same "green run over an empty set" this test
-        // removed for `SCREEN_PERIOD` a few lines above.
     }
 
     /// **`host=` HAS A WRITER ON THE PLATFORM THIS SHIPS ON.**
@@ -7109,91 +7467,20 @@ mod tests {
         }
     }
 
-    /// THIS MODULE'S DOC IS ITS CLAIM, and aterm has no evidence manifest to
-    /// check it against — so two claims that were false are pinned here.
+    /// **aterm-link's `unsafe` surface is exactly the one adoption in `ctl.rs`.**
     ///
-    /// `resolve_pending_feed` used to close by claiming it ran exactly once and
-    /// that an entry which re-armed itself would be the silent retry §6.5
-    /// forbids — attached to one of the two functions on the path to a PTY,
-    /// while the same commit shipped a retry budget of eight and the run loop's
-    /// own comment said so. An auditor asked "can a bus record be written to a
-    /// PTY more than once?" was told by the function itself that it could not.
-    ///
-    /// And §11.2 pins aterm's unsafe surface to the `aterm-uds` cordon, so a raw
-    /// `kill(2)` FFI in the bridge's run loop is an audit-surface defect even
-    /// though it never misbehaved: a reviewer auditing by the documented rule
-    /// would not look here. `notify.rs` solved the identical one-shot fault with
-    /// `abort()` and said why.
-    ///
-    /// ## THE SCAN IS THE WHOLE CRATE NOW, AND THE PROMISE IS THE NARROWER ONE
-    ///
-    /// The cordon claim is made crate-wide by three docs, and this test used to
-    /// check ONE FILE — the file that never had the problem. `ctl.rs` holds an
-    /// one adoption of an inherited raw descriptor, which is exactly what the
-    /// cordon exists for, so a reviewer auditing by the documented rule ("the
-    /// raw-descriptor work is in aterm-uds") greps the cordon, finds it clean,
-    /// and never opens the file where the crate's one block actually is.
-    ///
-    /// The right home is `aterm_uds::spawnfd`, beside the `BRIDGE_VERB_FD` /
-    /// `BRIDGE_PUSH_FD` constants that place the very descriptor being adopted —
-    /// that is a change in another crate. What is fixed HERE is the promise and
-    /// its guard: the scan reads every file this crate ships, and the claim is
-    /// the true narrow one — aterm-link's unsafe surface is EXACTLY the one
-    /// adoption in `ctl.rs`, documented in place. A second block anywhere, or a
-    /// second call site for that one, fails this test rather than falling silent.
+    /// §11.2 pins aterm's unsafe surface to the `aterm-uds` cordon, and the
+    /// cordon claim is made crate-wide, so the scan reads every file this crate
+    /// ships rather than one: a reviewer auditing by the documented rule greps
+    /// the cordon, finds it clean, and never opens the file where the crate's
+    /// one block is. The right home for that block is `aterm_uds::spawnfd`,
+    /// beside the `BRIDGE_VERB_FD` / `BRIDGE_PUSH_FD` constants that place the
+    /// descriptor it adopts; until it moves, a second block anywhere, or a
+    /// second call site for that one, fails here. (A raw `kill(2)` FFI in the
+    /// run loop was the defect that first put this scan here; `notify.rs`
+    /// solved the same one-shot fault with `abort()`.)
     #[test]
-    fn this_modules_doc_and_unsafe_surface_match_what_it_ships() {
-        let src = include_str!("bridge.rs");
-        // THE CITED TEST EXISTS. aterm ships no evidence manifest, so the header's
-        // named guard is its evidence — and a name nothing answers to is worse
-        // than no name, because `cargo test <name>` passes over an empty set.
-        // SPLIT, and read out of the HEADER rather than the whole file. `src` is
-        // this very file, so a single literal here satisfied `src.contains` by
-        // itself: the assertion passed unchanged on a tree whose header still
-        // cited the name that never existed, which is the exact defect it was
-        // added to close.
-        let cited = concat!("no_bus_record_ever", "_reaches_a_pty");
-        let header: String = src
-            .lines()
-            .take_while(|l| l.starts_with("//") || l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            header.contains(cited),
-            "the module header must cite the test that holds the claim that NO bus \
-             record reaches a PTY"
-        );
-        assert!(
-            include_str!("../tests/bridge_e2e.rs").contains(&format!("fn {cited}")),
-            "the cited guard must exist under exactly that name"
-        );
-        // AND NOTHING FEEDS A PTY ANY MORE, which is a claim this test can check
-        // over the source rather than take on trust. Round 21 cut `feed`,
-        // `on_term_record` and `resolve_pending_feed`; the two assertions that
-        // used to pin the replay's retry budget went with them, because a bound
-        // on a thing that no longer exists is the "green run over an empty set"
-        // this test was written against. Split so this prose is not the
-        // counterexample.
-        for gone in [
-            concat!("fn ", "feed", "("),
-            concat!("fn ", "on_term_record"),
-            concat!("fn ", "resolve_pending_feed"),
-        ] {
-            assert!(
-                !src.contains(gone),
-                "`{gone}` is back: the module header claims no bus record reaches a \
-                 PTY by any path, and that claim is now the absence of these"
-            );
-        }
-        // THE SCREEN FACE'S RATE PIN WENT WITH THE SCREEN FACE. It asserted
-        // that the header did NOT restate §3.3's per-subject "≤ 4/s" as a
-        // per-node aggregate — a real defect while `--screen all` could publish
-        // 4N/s of screen CONTENT onto an append-forever log. Round 21 deleted
-        // `SCREEN_PERIOD`, `publish_screens` and the flag, so the assertion
-        // became a negative pin over prose that cannot come back: a green run
-        // over an empty set, which is the exact thing the paragraph twelve lines
-        // above says this test removed. It is removed here rather than left to
-        // read as coverage.
+    fn the_crates_unsafe_surface_is_exactly_the_ctl_adoption() {
         // EVERY FILE THIS CRATE SHIPS, read from the directory rather than from a
         // list — a list would silently stop covering the next file added, which
         // is the same shape of gap as scanning one file for a crate-wide claim.
@@ -7395,5 +7682,1133 @@ mod tests {
         assert_eq!(id.len(), 18);
         assert!(id.starts_with("n-"));
         assert_ne!(id, mint_node_id(), "the CSPRNG is not a constant");
+    }
+
+    /// A stand-in for aterm's VERB lane, behind a bridge built in OBSERVER
+    /// mode (`--sock`) and then treated as the inherited bridge it stands in
+    /// for: the lane refuses `outbox` and every other verb it does not model —
+    /// so the probe makes the bridge an observer, and the inherited bridge's
+    /// status and `meta` reads and outbox drain find nothing — and answers
+    /// `sessions bridge` and `@<sid> topic ls` from state the test moves,
+    /// recording every `topic ls` it is asked. Either answer can be made an `ERR`
+    /// ([`FakeVerbLane::refuse_roster`], [`FakeVerbLane::refuse_reads`]).
+    struct FakeVerbLane {
+        dir: std::path::PathBuf,
+        sessions: Arc<std::sync::Mutex<Vec<(u64, String)>>>,
+        topics: Arc<std::sync::Mutex<BTreeMap<String, Vec<String>>>>,
+        reads: Arc<std::sync::Mutex<Vec<String>>>,
+        /// An empty endpoint ring at construction, with `off=` idempotency.
+        delivered: Arc<std::sync::Mutex<Vec<u64>>>,
+        /// `sessions bridge` answers `ERR` while this is set.
+        roster_refused: Arc<std::sync::atomic::AtomicBool>,
+        /// `sid -> how many more of its `topic ls` answer `ERR`.
+        reads_refused: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    }
+
+    impl FakeVerbLane {
+        /// The lane, and a bridge attached to it with no broker: every opt-in
+        /// here is `since=@<off>`, which resolves without asking a broker for
+        /// its head.
+        fn bridge(sessions: &[(u64, &str)]) -> (Self, Bridge) {
+            use std::io::{BufRead, BufReader, Write};
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("al-v{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("the fixture dir");
+            let sock = dir.join("v.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the lane");
+            let lane = FakeVerbLane {
+                dir: dir.clone(),
+                sessions: Arc::new(std::sync::Mutex::new(
+                    sessions.iter().map(|(l, s)| (*l, s.to_string())).collect(),
+                )),
+                topics: Arc::default(),
+                reads: Arc::default(),
+                delivered: Arc::default(),
+                roster_refused: Arc::default(),
+                reads_refused: Arc::default(),
+            };
+            let (roster, topics, reads, delivered) = (
+                lane.sessions.clone(),
+                lane.topics.clone(),
+                lane.reads.clone(),
+                lane.delivered.clone(),
+            );
+            let (roster_refused, reads_refused) =
+                (lane.roster_refused.clone(), lane.reads_refused.clone());
+            std::thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut out = stream.try_clone().expect("the lane's write half");
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { return };
+                    let reply = if line.starts_with("AUTH ") {
+                        continue;
+                    } else if line == "sessions bridge"
+                        && roster_refused.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        "ERR busy\n".to_string()
+                    } else if line == "sessions bridge" {
+                        // The bridge's identity-only roster: `<local> <sid>
+                        // nonce=<32 lowercase hex>`, nothing else on the row.
+                        let rows = roster.lock().unwrap();
+                        let mut r = format!("OK {}\n", rows.len());
+                        for (local, sid) in rows.iter() {
+                            r.push_str(&format!("{local} {sid} nonce={local:032x}\n"));
+                        }
+                        r
+                    } else if let Some(rest) = line.strip_prefix("deliver ") {
+                        let off = rest
+                            .split_whitespace()
+                            .find_map(|word| word.strip_prefix("off="))
+                            .and_then(|word| word.parse::<u64>().ok());
+                        match off {
+                            Some(off) => {
+                                let mut ring = delivered.lock().unwrap();
+                                let id = match ring.iter().position(|have| *have == off) {
+                                    Some(i) => i + 1,
+                                    None => {
+                                        ring.push(off);
+                                        ring.len()
+                                    }
+                                };
+                                format!("OK {id}\n")
+                            }
+                            None => "ERR invalid deliver\n".to_string(),
+                        }
+                    } else if let Some(sid) = line
+                        .strip_prefix('@')
+                        .and_then(|l| l.strip_suffix(" topic ls"))
+                    {
+                        reads.lock().unwrap().push(sid.to_string());
+                        let refused = reads_refused
+                            .lock()
+                            .unwrap()
+                            .get_mut(sid)
+                            .filter(|left| **left > 0)
+                            .map(|left| *left -= 1)
+                            .is_some();
+                        if refused {
+                            if out.write_all(b"ERR busy\n").is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let rows = topics.lock().unwrap().get(sid).cloned().unwrap_or_default();
+                        let mut r = format!("OK {}\n", rows.len());
+                        for row in rows {
+                            r.push_str(&row);
+                            r.push('\n');
+                        }
+                        r
+                    } else {
+                        "ERR denied\n".to_string()
+                    };
+                    if out.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+            let bridge = Bridge::new(Config {
+                fleet: "f".to_string(),
+                broker: dir.join("no-broker").to_string_lossy().into_owned(),
+                transport: Transport::Unix,
+                cap_files: Vec::new(),
+                state_dir: dir.join("state").to_string_lossy().into_owned(),
+                accept_from: Vec::new(),
+                sock: Some(sock.to_string_lossy().into_owned()),
+                token: Some("t".to_string()),
+                presence: Mode::default(),
+                receipts: true,
+            })
+            .expect("a bridge on the fake lane");
+            assert_eq!(bridge.attachment, Attachment::Observer);
+            // The fake refuses `outbox`, so the probe made the bridge an
+            // observer; the push lane these tests attach is an INHERITED
+            // bridge's, and so is every rule they drive.
+            let mut bridge = bridge;
+            bridge.attachment = Attachment::Inherited;
+            (lane, bridge)
+        }
+
+        /// The session's opt-ins, as `topic ls` will answer them from now on.
+        fn opt_in(&self, sid: &str, rows: &[&str]) {
+            self.topics.lock().unwrap().insert(
+                sid.to_string(),
+                rows.iter().map(|r| (*r).to_string()).collect(),
+            );
+        }
+
+        /// `sessions bridge` answers `ERR` from now on while `refused` is set.
+        fn refuse_roster(&self, refused: bool) {
+            self.roster_refused
+                .store(refused, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The next `n` reads of `sid`'s opt-ins answer `ERR`.
+        fn refuse_reads(&self, sid: &str, n: usize) {
+            self.reads_refused
+                .lock()
+                .unwrap()
+                .insert(sid.to_string(), n);
+        }
+
+        /// How many times the bridge has asked for `sid`'s opt-ins, answered
+        /// or refused.
+        fn reads_of(&self, sid: &str) -> usize {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| *s == sid)
+                .count()
+        }
+
+        fn delivery_offsets(&self) -> Vec<u64> {
+            self.delivered.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeVerbLane {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Tier-1 for `FabricRefillRetry`: the group's durable cursor has already
+    /// passed old mail, while this endpoint starts with an empty inbox. A
+    /// broker-side Fetch failure must leave admission owed across a reconnect;
+    /// otherwise the group can offer only the newer record and the old one is
+    /// absent forever from the ordinary inbox path. Closing the real broker
+    /// connection before the first Fetch is the deterministic failure seam.
+    #[cfg(unix)]
+    #[test]
+    fn failed_refill_retries_old_mail_before_live_group_delivery() {
+        const SID: &str = "s-refill";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let socket = lane.dir.join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+
+        let (mut writer, _) = bridge.connect().unwrap();
+        let subject = format!("/f/f/in/{}/{SID}/h-writer/note", bridge.node);
+        let (old, _) = writer
+            .publish(81, 1, &subject, b"v=1 t=1 text=old")
+            .unwrap();
+        let group = subject::inbox_group("f", &bridge.node);
+        writer.commit(&group, old).unwrap();
+        assert!(bridge.refresh_sessions().is_ok());
+        assert!(bridge.pending_admit.contains(SID));
+        assert_eq!(
+            lane.delivery_offsets(),
+            [],
+            "the endpoint ring starts empty"
+        );
+
+        let model = aterm_spec::derive::fabric_refill_retry_model();
+        let mut state = model.init_state();
+        assert!(model.fire("Discover", &mut state));
+        let (first, closer) = bridge.connect().unwrap();
+        bridge.conn = Some(first);
+        assert!(model.fire("Attach", &mut state));
+        closer.close();
+        assert!(!bridge.refill_pending_admissions(false));
+        assert!(model.fire("FetchFails", &mut state));
+        assert!(bridge.conn.is_none(), "a failed Fetch discards the socket");
+        assert_eq!(state["owed"], 1);
+        assert!(
+            bridge.pending_admit.contains(SID),
+            "the failed refill remains owed"
+        );
+        assert_eq!(lane.delivery_offsets(), []);
+
+        let (new, _) = writer
+            .publish(81, 2, &subject, b"v=1 t=2 text=new")
+            .unwrap();
+        let (second, _) = bridge.connect().unwrap();
+        bridge.conn = Some(second);
+        assert!(model.fire("Attach", &mut state));
+        assert!(bridge.refill_pending_admissions(false));
+        assert!(model.fire("RefillCompletes", &mut state));
+        assert!(!bridge.pending_admit.contains(SID));
+        assert_eq!(lane.delivery_offsets(), [old, new]);
+
+        let (consumer, closer) = bridge.connect().unwrap();
+        closer
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut sub = consumer
+            .subscribe_group(&group, &subject::inbox_filter("f", &bridge.node))
+            .unwrap();
+        assert!(model.fire("Subscribe", &mut state));
+        let live = sub.recv().unwrap().expect("a newer group record");
+        assert_eq!(live.0, new, "the committed group cursor excludes old mail");
+        bridge.on_inbox_record(&live);
+        assert!(model.fire("DeliverNew", &mut state));
+        assert_eq!(
+            lane.delivery_offsets(),
+            [old, new],
+            "the old row arrived first and the live duplicate added no row"
+        );
+        for name in ["RefillDebtSurvivesFailure", "OldBeforeLive", "OldBeforeNew"] {
+            assert!(model.check_invariant(name, &state));
+        }
+    }
+
+    /// A newly discovered session can need a refill after the group reader is
+    /// already live. If that refill fails, a queued newer group record must
+    /// wait for reconnect: delivering it first lets the endpoint's seen offset
+    /// leap past the old record. The old subscription's queued record is also
+    /// discarded on reconnect, then the broker refill reoffers both in order.
+    #[cfg(unix)]
+    #[test]
+    fn failed_live_admission_keeps_new_group_mail_behind_old_refill() {
+        const SID: &str = "s-live-refill";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let socket = lane.dir.join("broker.sock");
+        let broker = astream_broker::Broker::open(lane.dir.join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+
+        let (mut writer, _) = bridge.connect().unwrap();
+        let subject = format!("/f/f/in/{}/{SID}/h-writer/note", bridge.node);
+        let (old, _) = writer
+            .publish(82, 1, &subject, b"v=1 t=1 text=old")
+            .unwrap();
+        let group = subject::inbox_group("f", &bridge.node);
+        writer.commit(&group, old).unwrap();
+        let model = aterm_spec::derive::fabric_refill_retry_model();
+        let mut state = model.init_state();
+        let (first, first_closer) = bridge.connect().unwrap();
+        bridge.conn = Some(first);
+        assert!(model.fire("Attach", &mut state));
+        let (consumer, closer) = bridge.connect().unwrap();
+        closer
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut sub = consumer
+            .subscribe_group(&group, &subject::inbox_filter("f", &bridge.node))
+            .unwrap();
+        assert!(model.fire("Subscribe", &mut state));
+
+        // Discovery is deliberately after subscription, as for a tab opened
+        // while Fabric was already running. The publisher fails at its Fetch.
+        assert!(bridge.refresh_sessions().is_ok());
+        assert!(bridge.pending_admit.contains(SID));
+        assert!(model.fire("Discover", &mut state));
+        first_closer.close();
+        bridge.admit_fresh_sessions();
+        assert!(model.fire("FetchFails", &mut state));
+        assert!(bridge.pending_admit.contains(SID));
+        assert!(bridge.conn.is_none());
+
+        let (new, _) = writer
+            .publish(82, 2, &subject, b"v=1 t=2 text=new")
+            .unwrap();
+        let live = sub
+            .recv()
+            .unwrap()
+            .expect("the live group offered new mail");
+        assert_eq!(live.0, new);
+        bridge.on_inbox_record(&live);
+        assert!(!model.fire("DeliverNew", &mut state));
+        assert_eq!(
+            lane.delivery_offsets(),
+            [],
+            "new live mail cannot overtake a failed old-mail refill"
+        );
+
+        let stale_generation = bridge.mailbox.broker_generation();
+        bridge.mailbox.push_inbox(live.clone(), stale_generation);
+        bridge.mailbox.reset_broker_sources();
+        assert!(
+            bridge.mailbox.take(Duration::ZERO).is_none(),
+            "the previous subscription's queued copy is gone"
+        );
+        let (second, _) = bridge.connect().unwrap();
+        bridge.conn = Some(second);
+        assert!(model.fire("Attach", &mut state));
+        assert!(bridge.refill_pending_admissions(false));
+        assert!(model.fire("RefillCompletes", &mut state));
+        assert_eq!(lane.delivery_offsets(), [old, new]);
+        assert!(model.fire("DeliverNew", &mut state));
+        bridge.on_inbox_record(&live);
+        assert_eq!(
+            lane.delivery_offsets(),
+            [old, new],
+            "a broker redelivery remains idempotent"
+        );
+        for name in ["RefillDebtSurvivesFailure", "OldBeforeLive", "OldBeforeNew"] {
+            assert!(model.check_invariant(name, &state));
+        }
+    }
+
+    /// aterm's PUSH lane, through the shipped reader ([`spawn_event_reader`])
+    /// into the bridge's own mailbox, so a line the reader drops is dropped here
+    /// too.
+    struct FakePushLane {
+        ours: std::os::unix::net::UnixStream,
+        barriers: usize,
+    }
+
+    impl FakePushLane {
+        fn attach(bridge: &Bridge) -> Self {
+            Self::attach_with(bridge, &[])
+        }
+
+        /// [`FakePushLane::attach`] with a handshake that watches the
+        /// sessions `acks` name — each a `sub <local> <sid>` line after the
+        /// `OK subscribe <n>`, as aterm writes them. The reader forwards them
+        /// to the mailbox; the next [`FakePushLane::deliver`] hands them over.
+        fn attach_with(bridge: &Bridge, acks: &[&str]) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a push lane");
+            spawn_event_reader(
+                Ctl::from_stream(theirs).expect("the reader's half"),
+                bridge.mailbox.clone(),
+            );
+            let mut asked = String::new();
+            BufReader::new(ours.try_clone().expect("a read half"))
+                .read_line(&mut asked)
+                .expect("the reader subscribes");
+            assert_eq!(asked, "subscribe @* events,sessions\n");
+            let mut handshake = format!("OK subscribe {}\n", acks.len());
+            for ack in acks {
+                handshake.push_str(ack);
+                handshake.push('\n');
+            }
+            ours.write_all(handshake.as_bytes()).expect("the handshake");
+            FakePushLane { ours, barriers: 0 }
+        }
+
+        /// Write `lines` as aterm would, and hand the bridge nothing: the
+        /// reader forwards them to the mailbox, where whatever takes the next
+        /// item finds them.
+        fn write(&mut self, lines: &[&str]) {
+            use std::io::Write;
+            for line in lines {
+                self.ours
+                    .write_all(format!("{line}\n").as_bytes())
+                    .expect("the push lane");
+            }
+        }
+
+        /// Write `lines` as aterm would while the broker is unreachable, and
+        /// run the parked loop ([`Bridge::park_detached`]) until it has taken
+        /// every one. A park lasts its whole back-off however many lines
+        /// arrive, so the observation is a barrier written after them: an ack
+        /// of a session no roster lists, which the parked loop records in
+        /// [`Bridge::watched`] like any ack. It is struck again before this
+        /// returns.
+        fn park_through(&mut self, bridge: &mut Bridge, lines: &[&str]) {
+            self.barriers += 1;
+            let sid = format!("s-park-barrier-{}", self.barriers);
+            let barrier = format!("sub {} {sid}", 1_000_000 + self.barriers);
+            let mut all = lines.to_vec();
+            all.push(&barrier);
+            self.write(&all);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !bridge.watched.contains_key(&sid) {
+                assert!(
+                    !bridge.park_detached(Duration::from_millis(20)),
+                    "aterm is still there"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "the parked loop never took {barrier:?}"
+                );
+            }
+            bridge.watched.remove(&sid);
+        }
+
+        /// Write `lines` as aterm would, then hand the bridge every item the
+        /// reader delivers until a barrier line written after them comes back —
+        /// the run loop's own dispatch, minus its scheduling.
+        fn deliver(&mut self, bridge: &mut Bridge, lines: &[&str]) {
+            use std::io::Write;
+            self.barriers += 1;
+            let barrier = format!("EVENT * test-barrier {}", self.barriers);
+            for line in lines.iter().copied().chain([barrier.as_str()]) {
+                self.ours
+                    .write_all(format!("{line}\n").as_bytes())
+                    .expect("the push lane");
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match bridge.mailbox.take(Duration::from_millis(50)) {
+                    Some(Item::Event(line)) if line == barrier => return,
+                    Some(Item::Event(line)) => bridge.on_event(&line),
+                    Some(Item::Closed(source)) => panic!("{source:?} closed mid-test"),
+                    Some(_) => {}
+                    None => assert!(
+                        Instant::now() < deadline,
+                        "the reader never delivered {barrier:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Whether the bridge holds `topic` for `sid`.
+    fn holds(bridge: &Bridge, sid: &str, topic: &str) -> bool {
+        bridge
+            .topics
+            .get(sid)
+            .is_some_and(|t| t.contains_key(topic))
+    }
+
+    /// THE WATCH'S ACK IS THE READ THAT COUNTS. A `topic add` reaches the bridge
+    /// pushed, on the session's watch, or in a `topic ls` it reads — and the
+    /// watch pushes only what its session records after the watch is seeded.
+    /// So a read made BEFORE the seed leaves a window: an add between that read
+    /// and the seed is in neither. The bridge reads a session before its watch
+    /// exists whenever something other than that session's own lines prompts
+    /// the read — here another session's `session-created`, which re-reads the
+    /// roster — and the only line aterm writes after a watch's seed is the
+    /// watch's `sub <local> <sid>` ack. So the ack makes the bridge read the
+    /// session again, and the add made in the window is learned.
+    #[test]
+    fn a_session_read_before_its_watch_is_read_again_on_the_watch_ack() {
+        const T: &str = "s-t";
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, T), (2, S)]);
+        let mut push = FakePushLane::attach(&bridge);
+
+        push.deliver(&mut bridge, &["sub 1 s-t", "EVENT * session-created s-t"]);
+        assert_eq!(
+            lane.reads_of(S),
+            1,
+            "REACH: T's announcement read S, which no watch covers yet"
+        );
+        // S's agent opts in after that read and before S's watch is seeded.
+        lane.opt_in(S, &["topic probe since=@5"]);
+
+        push.deliver(&mut bridge, &["sub 2 s-s", "EVENT * session-created s-s"]);
+        assert!(
+            holds(&bridge, S, "probe"),
+            "the add made between the first read and the watch's seed reached the bridge \
+             by no road: the ack did not make it read S again"
+        );
+        assert_eq!(lane.reads_of(S), 2, "one read per ack, not one per line");
+    }
+
+    /// A SESSION THE CAP LEAVES UNWATCHED, AND THE SLOT THAT FREES LATER.
+    /// aterm announces it at once, marked `watch=deferred`, which the bridge
+    /// does not read: no watch will push its opt-ins until a slot frees and
+    /// the watch's `sub` ack arrives, which may be never, and the missing ack
+    /// is what the roster backstop goes by — it reads the opt-ins every
+    /// round, so an add is learned by the next round's read instead of at an
+    /// adoption that may not come. The ack reads them once more, after the
+    /// seed, and ends the polling: from then on they arrive pushed.
+    #[test]
+    fn an_unwatched_session_is_read_every_round_until_its_watch_is_acked() {
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, S)]);
+        let mut push = FakePushLane::attach(&bridge);
+
+        push.deliver(&mut bridge, &["EVENT * session-created s-s watch=deferred"]);
+        assert_eq!(lane.reads_of(S), 1, "REACH: the announcement read S once");
+        lane.opt_in(S, &["topic probe since=@5"]);
+        bridge.roster_backstop();
+        assert!(
+            holds(&bridge, S, "probe"),
+            "an add by a session no watch covers waited for an adoption that may never come"
+        );
+
+        lane.opt_in(S, &["topic probe since=@5", "topic late since=@7"]);
+        push.deliver(&mut bridge, &["sub 2 s-s"]);
+        assert!(
+            holds(&bridge, S, "late"),
+            "the ack's read, after the seed, is what closes the window between the last \
+             poll and the seed"
+        );
+        let reads = lane.reads_of(S);
+        bridge.roster_backstop();
+        assert_eq!(
+            lane.reads_of(S),
+            reads,
+            "a watched session's opt-ins arrive pushed; the backstop stops reading them"
+        );
+    }
+
+    /// A LOST ANNOUNCEMENT COSTS NOTHING: THE BROKER OUTAGE. While the broker
+    /// is unreachable the run loop parks on the mailbox and drops every
+    /// push-lane line but a watch's ack ([`Bridge::park_detached`]), so a
+    /// `session-created … watch=deferred` that arrives then is never seen. The
+    /// re-attach reads every listed session once — and S, which no watch
+    /// covers, must go on being read after that, or an add it makes later is
+    /// pushed by nobody and read by nobody.
+    #[test]
+    fn a_session_whose_announcement_an_outage_dropped_is_still_read_every_round() {
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, S)]);
+        let mut push = FakePushLane::attach(&bridge);
+        let _ = bridge.refresh_sessions();
+
+        // REACH: the parked loop took the announcement, and it is not aterm's
+        // closure.
+        push.park_through(&mut bridge, &["EVENT * session-created s-s watch=deferred"]);
+        push.deliver(&mut bridge, &[]);
+        bridge.resample_topics();
+        assert_eq!(lane.reads_of(S), 1, "REACH: the re-attach read S once");
+
+        lane.opt_in(S, &["topic probe since=@5"]);
+        bridge.roster_backstop();
+        assert!(
+            holds(&bridge, S, "probe"),
+            "an add by a session no watch covers was lost with the line the outage dropped"
+        );
+    }
+
+    /// A LOST ANNOUNCEMENT COSTS NOTHING: THE FAILED ROSTER READ. The
+    /// `session-created` arm re-reads the roster before it acts, and a roster
+    /// read can fail. S then reaches the bridge's roster only on a later
+    /// round — which reads it once, as it reads every session it lists for the
+    /// first time — and S must go on being read after that.
+    #[test]
+    fn a_session_announced_while_the_roster_read_fails_is_still_read_every_round() {
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, S)]);
+        let mut push = FakePushLane::attach(&bridge);
+
+        lane.refuse_roster(true);
+        push.deliver(&mut bridge, &["EVENT * session-created s-s watch=deferred"]);
+        assert_eq!(
+            lane.reads_of(S),
+            0,
+            "REACH: with no roster the bridge listed nothing"
+        );
+        lane.refuse_roster(false);
+        bridge.roster_backstop();
+        assert_eq!(
+            lane.reads_of(S),
+            1,
+            "REACH: the round that first listed S read it"
+        );
+
+        lane.opt_in(S, &["topic probe since=@5"]);
+        bridge.roster_backstop();
+        assert!(
+            holds(&bridge, S, "probe"),
+            "an add by a session no watch covers was lost with the roster read that failed"
+        );
+    }
+
+    /// STARTUP AT THE CAP. aterm's `@*` handshake watches at most
+    /// `MAX_SUBSCRIBE_TARGETS` sessions, and a session left over is in the
+    /// stream's baseline: it is never announced, marked or not, and has no
+    /// ack until a slot frees. The attach reads it once, and it must go on
+    /// being read after that — while the session the handshake DID watch is
+    /// not polled at all.
+    #[test]
+    fn a_session_the_handshake_did_not_watch_is_read_every_round() {
+        const T: &str = "s-t";
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, T), (2, S)]);
+        let mut push = FakePushLane::attach_with(&bridge, &["sub 1 s-t"]);
+        let _ = bridge.refresh_sessions();
+        push.deliver(&mut bridge, &[]);
+        bridge.resample_topics();
+        assert_eq!(lane.reads_of(S), 1, "REACH: the attach read S once");
+
+        lane.opt_in(S, &["topic probe since=@5"]);
+        let t_reads = lane.reads_of(T);
+        bridge.roster_backstop();
+        assert!(
+            holds(&bridge, S, "probe"),
+            "an add by a session the handshake left unwatched was read by nobody"
+        );
+        assert_eq!(
+            lane.reads_of(T),
+            t_reads,
+            "a session the handshake watches has its changes pushed; the round does not poll it"
+        );
+    }
+
+    /// A READ THAT FAILS IS NOT A READ. The watch's ack prompts the read that
+    /// covers the window between an earlier read and the watch's seed; if the
+    /// endpoint refuses it, the add made in that window is in no read and was
+    /// never pushed, so the read is owed until one succeeds.
+    #[test]
+    fn a_read_that_fails_is_retried_rather_than_recorded_as_done() {
+        const T: &str = "s-t";
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, T), (2, S)]);
+        let mut push = FakePushLane::attach(&bridge);
+
+        push.deliver(&mut bridge, &["sub 1 s-t", "EVENT * session-created s-t"]);
+        assert_eq!(
+            lane.reads_of(S),
+            1,
+            "REACH: T's announcement read S, which no watch covers yet"
+        );
+        lane.opt_in(S, &["topic probe since=@5"]);
+        lane.refuse_reads(S, 1);
+        push.deliver(&mut bridge, &["sub 2 s-s"]);
+        assert!(
+            lane.reads_of(S) == 2 && !holds(&bridge, S, "probe"),
+            "REACH: the ack prompted a read, and the endpoint refused it"
+        );
+
+        bridge.roster_backstop();
+        assert!(
+            holds(&bridge, S, "probe"),
+            "the refused read was recorded as done, so the add in the window was never learned"
+        );
+    }
+
+    /// A REFUSED ROUND READ IS NOT RECORDED EITHER. The test above refuses one
+    /// read, the ack's; the retry it proves happens on the round path. This
+    /// refuses the ack's read AND the next round's, so the round's read path —
+    /// the one the attach, a GAP and a `session-created` share — is the one that
+    /// must not record a refusal as done. Found by the round-3 review: with that
+    /// path recording a refused read, every other test here still passed, and a
+    /// watched session whose reads were refused twice was never read again.
+    #[test]
+    fn a_refused_round_read_stays_owed_like_a_refused_ack_read() {
+        const T: &str = "s-t";
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, T), (2, S)]);
+        let mut push = FakePushLane::attach(&bridge);
+        push.deliver(&mut bridge, &["sub 1 s-t", "EVENT * session-created s-t"]);
+        lane.opt_in(S, &["topic probe since=@5"]);
+        lane.refuse_reads(S, 2);
+        push.deliver(&mut bridge, &["sub 2 s-s"]);
+        bridge.roster_backstop();
+        assert_eq!(
+            lane.reads_of(S),
+            3,
+            "REACH: the first read, the ack's read and the round's read"
+        );
+        assert!(
+            !holds(&bridge, S, "probe"),
+            "REACH: the endpoint refused both"
+        );
+        bridge.roster_backstop();
+        assert!(
+            holds(&bridge, S, "probe"),
+            "a refused round read was recorded as done, so the add was never learned"
+        );
+    }
+
+    /// AN OBSERVER DOES NOT POLL. It holds no push lane, so no session is
+    /// ever acked to it, and it delivers no broadcast: reading every session
+    /// every round would be load for nothing. It makes the owed reads only —
+    /// each session once, when a roster read first lists it.
+    #[test]
+    fn an_observer_reads_each_session_once_and_does_not_poll() {
+        const S: &str = "s-s";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, S)]);
+        bridge.attachment = Attachment::Observer;
+        bridge.roster_backstop();
+        assert_eq!(lane.reads_of(S), 1, "REACH: the first round read S");
+        bridge.roster_backstop();
+        bridge.roster_backstop();
+        assert_eq!(lane.reads_of(S), 1, "an observer polled a session");
+    }
+
+    /// The laws of aterm-spec's `SubscribeAnnouncementOrder`.
+    const ANNOUNCEMENT_LAWS: [&str; 3] = [
+        "NotAnnouncedBeforeItsWatchOrExit",
+        "StoppedOnlyWhileWatched",
+        "NoTopicAddLostSilently",
+    ];
+
+    /// The BRIDGE half of aterm-spec's `SubscribeAnnouncementOrder`: one
+    /// session S (local 2) seen by a real [`Bridge`] over the fake lanes.
+    ///
+    /// The model's ENDPOINT half is fired in the model itself — aterm-gui's
+    /// `membership_passes_refine_the_announcement_model` binds it to the real
+    /// push loop — and the fakes are moved to agree with it: S is in the
+    /// `sessions bridge` answer while it is live, and its opt-in is in `topic ls`
+    /// once it is added. The two lines the model puts on the wire (`ackwire`,
+    /// `pushed`) are written when the bridge is to take them.
+    struct BridgeWorld {
+        lane: FakeVerbLane,
+        push: FakePushLane,
+        bridge: Bridge,
+        model: aterm_spec::derive::Model,
+        state: aterm_spec::interp::State,
+    }
+
+    impl BridgeWorld {
+        const LOCAL: u64 = 2;
+        const S: &'static str = "s-s";
+        const ACK: &'static str = "sub 2 s-s";
+        const PUSH: &'static str = "EVENT 2 topic add probe since=@5";
+
+        fn new() -> Self {
+            let (lane, bridge) = FakeVerbLane::bridge(&[]);
+            let push = FakePushLane::attach(&bridge);
+            let model = aterm_spec::derive::subscribe_announcement_order_model();
+            let state = model.init_state();
+            let w = BridgeWorld {
+                lane,
+                push,
+                bridge,
+                model,
+                state,
+            };
+            assert_eq!(w.project(), w.state, "the world starts at Init");
+            w
+        }
+
+        /// The model's state with the bridge's variables read off the real
+        /// bridge: `listed` from its roster, `acked` from
+        /// [`Bridge::watched`], `known` from [`Bridge::topics`], `stopped` as
+        /// acked and read ([`Bridge::topics_sampled`]). A read is never in
+        /// flight between two calls.
+        fn project(&self) -> aterm_spec::interp::State {
+            let b = &self.bridge;
+            let acked = b.watched.get(Self::S) == Some(&Self::LOCAL);
+            let listed = b.locals.get(&Self::LOCAL).is_some_and(|sid| sid == Self::S);
+            let mut s = self.state.clone();
+            s.insert("listed", i64::from(listed));
+            s.insert("acked", i64::from(acked));
+            s.insert("known", i64::from(holds(b, Self::S, "probe")));
+            s.insert(
+                "stopped",
+                i64::from(acked && b.topics_sampled.contains(Self::S)),
+            );
+            s.insert("asking", 0);
+            s.insert("seen", 0);
+            s
+        }
+
+        fn step(
+            &self,
+            prev: &aterm_spec::interp::State,
+            next: &aterm_spec::interp::State,
+            action: &str,
+        ) {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &self.model,
+                &[],
+                prev,
+                next,
+                Some(action),
+                &format!("bridge {action}"),
+            );
+            assert!(
+                ok,
+                "the real {action} is not the model's: {prev:?} -> {next:?}\n{why}"
+            );
+            for law in ANNOUNCEMENT_LAWS {
+                assert!(
+                    self.model.check_invariant(law, next),
+                    "{law} fails at {next:?}"
+                );
+            }
+        }
+
+        /// An ENDPOINT or environment move, fired in the model, with the fakes
+        /// moved to agree.
+        fn endpoint(&mut self, action: &str) {
+            assert!(
+                self.model.fire(action, &mut self.state),
+                "{action}: {:?}",
+                self.state
+            );
+            for law in ANNOUNCEMENT_LAWS {
+                assert!(self.model.check_invariant(law, &self.state), "{law}");
+            }
+            let mut rows = self.lane.sessions.lock().unwrap();
+            rows.retain(|(local, _)| *local != Self::LOCAL);
+            if self.state["live"] == 1 {
+                rows.push((Self::LOCAL, Self::S.to_string()));
+            }
+            drop(rows);
+            if action == "Add" {
+                self.lane.opt_in(Self::S, &["topic probe since=@5"]);
+            }
+        }
+
+        /// Run `call` against the bridge and report the read of S it made:
+        /// `None`, or `Some(answered)`.
+        fn reading(&mut self, call: impl FnOnce(&mut Self)) -> Option<bool> {
+            let before = self.lane.reads_of(Self::S);
+            let refusing = self
+                .lane
+                .reads_refused
+                .lock()
+                .unwrap()
+                .get(Self::S)
+                .is_some_and(|left| *left > 0);
+            call(self);
+            match self.lane.reads_of(Self::S) - before {
+                0 => None,
+                1 => Some(!refusing),
+                n => panic!("one call read S {n} times"),
+            }
+        }
+
+        /// The read that followed `from`, if any, checked as `Ask` then
+        /// `Answer`/`Fail` into the projection `after` — and, first, that the
+        /// bridge read S exactly when the model says it still reads it.
+        fn read_tail(
+            &mut self,
+            from: aterm_spec::interp::State,
+            read: Option<bool>,
+            after: aterm_spec::interp::State,
+        ) {
+            assert_eq!(
+                self.model.action_enabled("Ask", &from),
+                read.is_some(),
+                "the bridge reads S exactly when the rule says it still reads it: {from:?}"
+            );
+            match read {
+                None => assert_eq!(from, after, "no read, and nothing else moved"),
+                Some(answered) => {
+                    let mut asking = from.clone();
+                    asking.insert("asking", 1);
+                    asking.insert("seen", from["added"]);
+                    self.step(&from, &asking, "Ask");
+                    self.step(&asking, &after, if answered { "Answer" } else { "Fail" });
+                }
+            }
+            self.state = after;
+        }
+
+        /// ONE ROSTER ROUND, the real [`Bridge::roster_backstop`]: `Roster`
+        /// when its `sessions bridge` read succeeds, then the read the rule owes.
+        fn round(&mut self) {
+            let prev = self.state.clone();
+            let roster_read = !self
+                .lane
+                .roster_refused
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let read = self.reading(|w| w.bridge.roster_backstop());
+            let after = self.project();
+            let mut listed = prev.clone();
+            if roster_read {
+                listed.insert("listed", after["listed"]);
+                if after["listed"] == 0 {
+                    for gone in ["acked", "stopped", "known"] {
+                        listed.insert(gone, after[gone]);
+                    }
+                }
+                self.step(&prev, &listed, "Roster");
+            }
+            self.read_tail(listed, read, after);
+        }
+
+        /// The run loop taking S's ack off the push lane.
+        fn hear_ack(&mut self) {
+            assert_eq!(self.state["ackwire"], 1, "S's ack is on the wire");
+            let prev = self.state.clone();
+            let read = self.reading(|w| w.push.deliver(&mut w.bridge, &[Self::ACK]));
+            self.state.insert("ackwire", 0);
+            let after = self.project();
+            let mut heard = prev.clone();
+            heard.insert("ackwire", 0);
+            heard.insert("acked", after["acked"]);
+            heard.insert("stopped", 0);
+            self.step(&prev, &heard, "HearAck");
+            self.read_tail(heard, read, after);
+        }
+
+        /// The run loop taking the add's push line.
+        fn hear_push(&mut self) {
+            assert_eq!(self.state["pushed"], 1, "the add's push is on the wire");
+            let prev = self.state.clone();
+            let read = self.reading(|w| w.push.deliver(&mut w.bridge, &[Self::PUSH]));
+            assert_eq!(read, None, "a pushed change is not a read");
+            self.state.insert("pushed", 0);
+            let after = self.project();
+            self.step(&prev, &after, "HearPush");
+            self.state = after;
+        }
+
+        /// The broker going away with lines on the push lane, and coming
+        /// back: the parked loop takes each ([`Bridge::park_detached`]), and
+        /// the re-attach reads every listed session
+        /// ([`Bridge::resample_topics`], the attach's own last step).
+        fn outage(&mut self) {
+            let prev = self.state.clone();
+            let mut lines = Vec::new();
+            if prev["ackwire"] == 1 {
+                lines.push(Self::ACK);
+            }
+            if prev["pushed"] == 1 {
+                lines.push(Self::PUSH);
+            }
+            self.push.park_through(&mut self.bridge, &lines);
+            self.state.insert("ackwire", 0);
+            self.state.insert("pushed", 0);
+            let read = self.reading(|w| w.bridge.resample_topics());
+            let after = self.project();
+            let mut down = prev.clone();
+            down.insert("ackwire", 0);
+            down.insert("pushed", 0);
+            down.insert("acked", after["acked"]);
+            down.insert("stopped", 0);
+            self.step(&prev, &down, "Outage");
+            self.read_tail(down, read, after);
+        }
+    }
+
+    /// TIER-1 for `SubscribeAnnouncementOrder` (aterm-spec
+    /// `derive::subscribe_announcement_order_model`), its BRIDGE half: the real
+    /// [`Bridge`] driven through every bridge action the model has but
+    /// `DropAck` (no path in this crate drops an ack) — the roster round, the
+    /// read answered and refused, the ack, the push, the outage — in the
+    /// scenarios the level-triggered rule exists for: a session the endpoint
+    /// never acks, a roster read that fails, a slot that frees later, an ack
+    /// whose read is refused, an outage with the ack and a push on the lane.
+    /// Every step is checked against the machine
+    /// ([`aterm_spec::verify::validate_transition_tiered`], with `ty trace
+    /// validate` where `ty` is installed) with every law on every state, and
+    /// every call that may read is required to read S exactly when the model
+    /// says the bridge still reads it.
+    ///
+    /// THE NEGATIVE CONTROL is the historical read-once rule, rebuilt from the
+    /// real [`Bridge::sample_topics`] and the unconditional insert the old
+    /// `sample_unsampled_topics` made: S read once before any watch exists,
+    /// and again with the endpoint refusing the read. The healthy machine must
+    /// REJECT the step it takes, and `Buggy=1` must admit it and reach a state
+    /// the laws refute.
+    #[test]
+    fn bridge_rounds_refine_the_announcement_model() {
+        // A session the endpoint never acks — at the cap, marked or not — and
+        // a roster read that fails: read every round the roster lists it.
+        let mut w = BridgeWorld::new();
+        for e in ["Register", "Read", "Drain", "Seed", "Write"] {
+            w.endpoint(e);
+        }
+        assert_eq!(
+            w.state["told"], 2,
+            "REACH: S was announced `watch=deferred`"
+        );
+        w.lane.refuse_roster(true);
+        w.round();
+        w.lane.refuse_roster(false);
+        w.round();
+        w.endpoint("Add");
+        w.round();
+        w.round();
+        assert_eq!(
+            (w.state["known"], w.state["stopped"]),
+            (1, 0),
+            "REACH: learned by a round, and still read"
+        );
+
+        // A slot that frees later, and an ack whose read the endpoint refuses:
+        // the read stays owed, the next round makes it, and the one after
+        // leaves S to its watch.
+        let mut w = BridgeWorld::new();
+        w.endpoint("Register");
+        w.round();
+        for e in ["Read", "Drain", "Seed", "Write", "Add", "FreeSlot"] {
+            w.endpoint(e);
+        }
+        for e in ["Read", "Drain", "Seed", "Write"] {
+            w.endpoint(e);
+        }
+        assert_eq!(w.state["ackwire"], 1, "REACH: the freed slot adopted S");
+        w.lane.refuse_reads(BridgeWorld::S, 1);
+        w.hear_ack();
+        assert_eq!(
+            (w.state["acked"], w.state["known"]),
+            (1, 0),
+            "REACH: the ack's read was refused"
+        );
+        w.round();
+        w.round();
+        assert_eq!((w.state["known"], w.state["stopped"]), (1, 1));
+
+        // An outage with S's ack and a push on the lane: the ack is kept, the
+        // push is dropped, and the re-attach's read learns the add.
+        let mut w = BridgeWorld::new();
+        w.endpoint("FreeSlot");
+        w.endpoint("Register");
+        w.round();
+        for e in ["Read", "Drain", "Seed", "Write", "Add"] {
+            w.endpoint(e);
+        }
+        assert_eq!(
+            (w.state["ackwire"], w.state["pushed"]),
+            (1, 1),
+            "REACH: both lines are on the wire"
+        );
+        w.outage();
+        assert_eq!(
+            (w.state["acked"], w.state["known"], w.state["stopped"]),
+            (1, 1, 1)
+        );
+        w.round();
+
+        // The ordinary path: acked before the roster lists S, read by the
+        // round that does, the add pushed, and S's exit pruning it all.
+        let mut w = BridgeWorld::new();
+        for e in ["FreeSlot", "Register", "Read", "Drain", "Seed", "Write"] {
+            w.endpoint(e);
+        }
+        w.hear_ack();
+        w.round();
+        w.endpoint("Add");
+        w.hear_push();
+        assert_eq!((w.state["known"], w.state["stopped"]), (1, 1));
+        w.endpoint("Exit");
+        w.round();
+        assert_eq!(
+            (w.state["listed"], w.state["acked"], w.state["known"]),
+            (0, 0, 0)
+        );
+
+        // THE NEGATIVE CONTROL: the read-once rule, answered and refused.
+        for refused in [false, true] {
+            let mut w = BridgeWorld::new();
+            w.endpoint("Register");
+            if refused {
+                w.endpoint("Add");
+                w.lane.refuse_reads(BridgeWorld::S, 1);
+            }
+            let _ = w.bridge.refresh_sessions();
+            let mut listed = w.state.clone();
+            listed.insert("listed", 1);
+            assert_eq!(w.project(), listed, "REACH: the roster lists S");
+            let read = w.reading(|w| {
+                let _ = w.bridge.sample_topics(BridgeWorld::S);
+                w.bridge.topics_sampled.insert(BridgeWorld::S.to_string());
+            });
+            assert_eq!(read, Some(!refused), "REACH: S was read once");
+            let mut asking = listed.clone();
+            asking.insert("asking", 1);
+            asking.insert("seen", listed["added"]);
+            // The old rule's meaning of `stopped`: read, and never again.
+            let mut once = asking.clone();
+            once.insert("asking", 0);
+            once.insert("seen", 0);
+            once.insert("stopped", 1);
+            let action = if refused { "Fail" } else { "Answer" };
+            let admits = |overrides: &[(&'static str, i64)]| {
+                aterm_spec::verify::validate_transition_tiered(
+                    &w.model,
+                    overrides,
+                    &asking,
+                    &once,
+                    Some(action),
+                    "bridge read-once",
+                )
+            };
+            assert!(
+                !admits(&[]).0,
+                "refused={refused}: the healthy machine admitted the read-once rule"
+            );
+            let (old, why) = admits(&[("Buggy", 1)]);
+            assert!(old, "refused={refused}: Buggy=1 must reproduce it\n{why}");
+            let buggy = aterm_spec::interp::with_buggy(&w.model, 1);
+            let mut end = once.clone();
+            if !refused {
+                assert!(buggy.fire("Add", &mut end));
+            }
+            assert!(
+                !buggy.check_invariant("NoTopicAddLostSilently", &end),
+                "refused={refused}: an add read by nobody and pushed by nobody: {end:?}"
+            );
+        }
     }
 }

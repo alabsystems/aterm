@@ -117,10 +117,11 @@ pub fn shaping_min_run(has_user_features: bool) -> usize {
 /// (`n_out > n_in`), or a collapse while `admit_collapsed` is off — is
 /// [`ShapeVerdict::Reject`]. This is the CONSERVATIVE gate: it never lets a
 /// non-grid-mappable shape reach the blitter. Proven total + conservative over the
-/// whole small-count lattice by `tests/ligature_slice.rs::classify_shape_lattice`
-/// (Tier-1, the SAME policy the `gate_*` kani proofs and the `LigatureGate` ty
-/// model carry) and caught at `Buggy=1` (a gate that admits collapse without the
-/// flag) by the derived ty model.
+/// whole small-count lattice by `tests/ligature_slice.rs::classify_shape_lattice`,
+/// bound to the `LigatureGate` ty model by
+/// `classify_shape_conforms_to_ligature_gate_model` (Tier-1: the model's own
+/// `Classify` rule judges every real verdict), and caught at `Buggy=1` (a gate
+/// that admits collapse without the flag) by the derived ty model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeVerdict {
     /// Not grid-mappable — use the per-cell path (byte-identical to no-ligature).

@@ -10,7 +10,7 @@
 //! - Agent workflows that reference specific blocks as context
 //!
 //! Key methods:
-//! - [`Terminal::output_blocks`] - completed blocks in order
+//! - [`Terminal::all_blocks`] - completed blocks in order, then the current one
 //! - [`Terminal::current_block`] - in-progress block
 //! - [`Terminal::block_output`] - extract output text from a block
 
@@ -36,16 +36,6 @@ pub enum BlockText {
 }
 
 impl BlockText {
-    /// The text if fully readable, else `None` (evicted or not-yet-available).
-    /// Convenience for callers that only care about the happy path.
-    #[must_use]
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            BlockText::Text(s) => Some(s.as_str()),
-            BlockText::Evicted | BlockText::NotAvailable => None,
-        }
-    }
-
     /// True iff the block's content was evicted from scrollback.
     #[must_use]
     pub fn is_evicted(&self) -> bool {
@@ -66,23 +56,6 @@ impl Terminal {
     // =========================================================================
     // Block-Based Output Model API (Gap 31)
     // =========================================================================
-
-    /// Get all completed output blocks.
-    ///
-    /// Output blocks represent atomic units of command+output. Each block
-    /// contains a prompt, optional command, and optional output. This enables:
-    /// - Navigation between commands (jump to next/previous block)
-    /// - Block-level copy operations (copy just command, or just output)
-    /// - Agent workflows that reference specific blocks as context
-    ///
-    /// # Returns
-    ///
-    /// A slice of completed blocks, ordered from oldest to newest.
-    #[cfg(test)]
-    #[must_use]
-    pub fn output_blocks(&mut self) -> &[OutputBlock] {
-        self.shell.output_blocks.make_contiguous()
-    }
 
     /// Get the current (in-progress) output block, if any.
     ///
@@ -121,12 +94,6 @@ impl Terminal {
             .chain(self.shell.current_block.as_ref())
     }
 
-    /// Get the total number of blocks (completed + current).
-    #[must_use]
-    pub fn block_count(&self) -> usize {
-        self.shell.output_blocks.len() + usize::from(self.shell.current_block.is_some())
-    }
-
     /// Get a block by its ID.
     ///
     /// Block IDs are unique within a session and are assigned sequentially.
@@ -137,156 +104,6 @@ impl Terminal {
             .iter()
             .find(|b| b.id == id)
             .or_else(|| self.shell.current_block.as_ref().filter(|b| b.id == id))
-    }
-
-    /// Get a block by index (0 = oldest block).
-    ///
-    /// Returns the block at the given index, treating completed blocks
-    /// and the current block as a unified sequence.
-    #[must_use]
-    pub fn block_by_index(&self, index: usize) -> Option<&OutputBlock> {
-        use std::cmp::Ordering;
-        match index.cmp(&self.shell.output_blocks.len()) {
-            Ordering::Less => Some(&self.shell.output_blocks[index]),
-            Ordering::Equal => self.shell.current_block.as_ref(),
-            Ordering::Greater => None,
-        }
-    }
-
-    /// Get the block containing a given row.
-    ///
-    /// This is useful for determining which command produced a given line
-    /// of output, or for highlighting block boundaries.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert
-    ///   screen-relative row coordinates)
-    ///
-    /// # Returns
-    ///
-    /// The block containing that row, or `None` if no block covers it.
-    #[must_use]
-    pub fn block_at_row(&self, row: u64) -> Option<&OutputBlock> {
-        // Check current block first (most likely to be queried)
-        if let Some(ref block) = self.shell.current_block {
-            if block.contains_row(row) {
-                return Some(block);
-            }
-        }
-        // Search completed blocks in reverse (recent blocks more likely to be queried)
-        self.shell
-            .output_blocks
-            .iter()
-            .rev()
-            .find(|b| b.contains_row(row))
-    }
-
-    /// Find the next block after a given row.
-    ///
-    /// Useful for "jump to next command" navigation.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert
-    ///   screen-relative row coordinates)
-    ///
-    /// # Returns
-    ///
-    /// The first block that starts after the given row, or `None` if there
-    /// are no more blocks.
-    #[cfg(test)]
-    #[must_use]
-    pub fn next_block_after_row(&self, row: u64) -> Option<&OutputBlock> {
-        // First check completed blocks
-        if let Some(block) = self
-            .shell
-            .output_blocks
-            .iter()
-            .find(|b| b.prompt_start_row > row)
-        {
-            return Some(block);
-        }
-        // Check current block
-        if let Some(ref block) = self.shell.current_block {
-            if block.prompt_start_row > row {
-                return Some(block);
-            }
-        }
-        None
-    }
-
-    /// Find the previous block before a given row.
-    ///
-    /// Useful for "jump to previous command" navigation.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert
-    ///   screen-relative row coordinates)
-    ///
-    /// # Returns
-    ///
-    /// The last block that starts before the given row, or `None` if there
-    /// are no previous blocks.
-    #[cfg(test)]
-    #[must_use]
-    pub fn previous_block_before_row(&self, row: u64) -> Option<&OutputBlock> {
-        // Check current block first (it might start before this row)
-        if let Some(ref block) = self.shell.current_block {
-            if block.prompt_start_row < row {
-                // But there might be a completed block that's even closer
-                if let Some(completed) = self
-                    .shell
-                    .output_blocks
-                    .iter()
-                    .rev()
-                    .find(|b| b.prompt_start_row < row)
-                {
-                    // Return whichever is closer (larger prompt_start_row)
-                    if completed.prompt_start_row > block.prompt_start_row {
-                        return Some(completed);
-                    }
-                }
-                return Some(block);
-            }
-        }
-        // Search completed blocks in reverse
-        self.shell
-            .output_blocks
-            .iter()
-            .rev()
-            .find(|b| b.prompt_start_row < row)
-    }
-
-    /// Get the most recent successful block (exit code 0).
-    #[cfg(test)]
-    #[must_use]
-    pub fn last_successful_block(&self) -> Option<&OutputBlock> {
-        // Check current block first
-        if let Some(ref block) = self.shell.current_block {
-            if block.succeeded() {
-                return Some(block);
-            }
-        }
-        self.shell
-            .output_blocks
-            .iter()
-            .rev()
-            .find(|b| b.succeeded())
-    }
-
-    /// Get the most recent failed block (exit code != 0).
-    #[cfg(test)]
-    #[must_use]
-    pub fn last_failed_block(&self) -> Option<&OutputBlock> {
-        // Check current block first
-        if let Some(ref block) = self.shell.current_block {
-            if block.failed() {
-                return Some(block);
-            }
-        }
-        self.shell.output_blocks.iter().rev().find(|b| b.failed())
     }
 
     /// The newest ARCHIVED block — the youngest block whose row extent is
@@ -302,8 +119,7 @@ impl Terminal {
     ///
     /// `&self` on purpose (CM-A3): reads `VecDeque::back`, never
     /// `make_contiguous`, so read-only facade surfaces (the wasm
-    /// `last_command_output` binding) can call it without a mutable borrow —
-    /// unlike [`output_blocks`](Self::output_blocks).
+    /// `last_command_output` binding) can call it without a mutable borrow.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
@@ -325,8 +141,7 @@ impl Terminal {
     /// Equivalent to that forward walk by construction: `all_blocks()` yields the
     /// archived blocks oldest-first and then `current_block`, so the LAST
     /// `Complete` forward is the FIRST `Complete` backward. Checking
-    /// `current_block` first mirrors [`block_at_row`](Self::block_at_row) /
-    /// `last_successful_block` and makes the common case (a command that just
+    /// `current_block` first makes the common case (a command that just
     /// emitted OSC 133;D, before the next prompt's A archives it) a single
     /// compare instead of a scan of up to `OUTPUT_BLOCKS_MAX` blocks.
     ///
@@ -350,150 +165,6 @@ impl Terminal {
             .iter()
             .rev()
             .find(|b| b.is_complete())
-    }
-
-    /// Clear all output blocks.
-    ///
-    /// This does not affect the current shell state, only clears the history
-    /// of completed blocks. The current block (if any) is also cleared.
-    #[cfg(test)]
-    pub fn clear_blocks(&mut self) {
-        self.shell.output_blocks.clear();
-        self.shell.current_block = None;
-    }
-
-    /// Toggle the collapsed state of a block by ID.
-    ///
-    /// Returns `true` if the block was found and toggled, `false` otherwise.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The block ID to toggle
-    #[cfg(test)]
-    pub fn toggle_block_collapsed(&mut self, id: u64) -> bool {
-        // Check completed blocks first
-        for block in &mut self.shell.output_blocks {
-            if block.id == id {
-                block.collapsed = !block.collapsed;
-                return true;
-            }
-        }
-        // Check current block
-        if let Some(ref mut block) = self.shell.current_block {
-            if block.id == id {
-                block.collapsed = !block.collapsed;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Set the collapsed state of a block by ID.
-    ///
-    /// Returns `true` if the block was found and updated, `false` otherwise.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The block ID to update
-    /// * `collapsed` - Whether the block should be collapsed
-    #[cfg(test)]
-    pub fn set_block_collapsed(&mut self, id: u64, collapsed: bool) -> bool {
-        // Check completed blocks first
-        for block in &mut self.shell.output_blocks {
-            if block.id == id {
-                block.collapsed = collapsed;
-                return true;
-            }
-        }
-        // Check current block
-        if let Some(ref mut block) = self.shell.current_block {
-            if block.id == id {
-                block.collapsed = collapsed;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Collapse all completed blocks.
-    ///
-    /// This is useful for "collapse all" functionality.
-    #[cfg(test)]
-    pub fn collapse_all_blocks(&mut self) {
-        for block in &mut self.shell.output_blocks {
-            block.collapsed = true;
-        }
-        if let Some(ref mut block) = self.shell.current_block {
-            if block.is_complete() {
-                block.collapsed = true;
-            }
-        }
-    }
-
-    /// Expand all blocks.
-    ///
-    /// This is useful for "expand all" functionality.
-    #[cfg(test)]
-    pub fn expand_all_blocks(&mut self) {
-        for block in &mut self.shell.output_blocks {
-            block.collapsed = false;
-        }
-        if let Some(ref mut block) = self.shell.current_block {
-            block.collapsed = false;
-        }
-    }
-
-    /// Collapse all failed blocks (exit code != 0).
-    ///
-    /// Useful for hiding error output when it's not relevant.
-    #[cfg(test)]
-    pub fn collapse_failed_blocks(&mut self) {
-        for block in &mut self.shell.output_blocks {
-            if block.failed() {
-                block.collapsed = true;
-            }
-        }
-        if let Some(ref mut block) = self.shell.current_block {
-            if block.failed() {
-                block.collapsed = true;
-            }
-        }
-    }
-
-    /// Collapse all successful blocks (exit code == 0).
-    ///
-    /// Useful for focusing on errors.
-    #[cfg(test)]
-    pub fn collapse_successful_blocks(&mut self) {
-        for block in &mut self.shell.output_blocks {
-            if block.succeeded() {
-                block.collapsed = true;
-            }
-        }
-        if let Some(ref mut block) = self.shell.current_block {
-            if block.succeeded() {
-                block.collapsed = true;
-            }
-        }
-    }
-
-    /// Get the total number of hidden rows across all collapsed blocks.
-    ///
-    /// This is useful for UI layers that need to adjust scroll positions
-    /// or display "N lines hidden" indicators.
-    #[cfg(test)]
-    #[must_use]
-    pub fn total_hidden_rows(&self) -> usize {
-        let mut total = self
-            .shell
-            .output_blocks
-            .iter()
-            .map(OutputBlock::hidden_row_count)
-            .sum();
-        if let Some(ref block) = self.shell.current_block {
-            total += block.hidden_row_count();
-        }
-        total
     }
 
     /// Text content for a range of MONOTONIC ABSOLUTE rows from the grid.
@@ -582,6 +253,7 @@ impl Terminal {
     /// Number of block command/output reads that found the block's rows already
     /// evicted from scrollback, over this session's lifetime (DL-1).
     #[must_use]
+    #[cfg(test)]
     pub fn block_eviction_read_count(&self) -> u64 {
         self.shell.eviction_reads.get()
     }
@@ -685,24 +357,6 @@ impl Terminal {
     #[must_use]
     pub fn block_output(&self, block: &OutputBlock) -> Option<String> {
         self.block_output_text(block).into_text()
-    }
-
-    /// The full text of a block (prompt + command + output).
-    ///
-    /// # Arguments
-    ///
-    /// * `block` - The block to extract text from
-    ///
-    #[cfg(test)]
-    #[must_use]
-    pub fn block_full_text(&self, block: &OutputBlock) -> String {
-        let start = block.prompt_start_row;
-        let end = block.end_row.unwrap_or(
-            block
-                .output_start_row
-                .unwrap_or(block.command_start_row.unwrap_or(start + 1)),
-        );
-        self.text_range(start, end).into_text().unwrap_or_default()
     }
 }
 

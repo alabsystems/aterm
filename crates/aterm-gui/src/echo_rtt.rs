@@ -264,7 +264,7 @@ fn close_at(session: u64, now_us: u64) -> Option<u64> {
 ///
 /// Hot path: a single relaxed load when no keystroke is outstanding, which is
 /// every burst of a flood.
-pub fn note_output_burst(session: u64) {
+pub(crate) fn note_output_burst(session: u64) {
     if ARMED.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -273,7 +273,7 @@ pub fn note_output_burst(session: u64) {
 
 /// Zero every counter and the window. Wired to `metrics reset` so the echo
 /// facts obey the same window semantics as the rest of the verb.
-pub fn reset() {
+pub(crate) fn reset() {
     ARMED.store(0, Ordering::Relaxed);
     ARMS.store(0, Ordering::Relaxed);
     COALESCED.store(0, Ordering::Relaxed);
@@ -290,7 +290,7 @@ pub fn reset() {
 /// Everything the `metrics percentiles` verb publishes. Microseconds
 /// throughout; the verb converts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EchoSnapshot {
+pub(crate) struct EchoSnapshot {
     /// Samples in the trailing window the percentiles were computed over.
     pub n: u64,
     pub p50_us: u64,
@@ -314,7 +314,7 @@ pub struct EchoSnapshot {
 /// else); a poisoned lock reports an empty window rather than panicking a
 /// control connection.
 #[must_use]
-pub fn snapshot() -> EchoSnapshot {
+pub(crate) fn snapshot() -> EchoSnapshot {
     let (n, p50_us, p95_us, p99_us) = RING.lock().map_or((0, 0, 0, 0), |ring| {
         let (a, b, c) = ring.percentiles();
         (ring.len as u64, a, b, c)
@@ -346,7 +346,7 @@ pub fn snapshot() -> EchoSnapshot {
 /// blind one (`expired` climbing, the program is not answering) from a biased
 /// one (`coalesced` high, keys outrunning echoes).
 #[must_use]
-pub fn percentile_fields_text() -> String {
+pub(crate) fn percentile_fields_text() -> String {
     let s = snapshot();
     let ms = |us: u64| us as f64 / 1e3;
     format!(
@@ -372,7 +372,7 @@ pub fn percentile_fields_text() -> String {
 /// form; automation must never have to scrape the line to read a fact the text
 /// verb has.
 #[must_use]
-pub fn percentile_fields_json() -> String {
+pub(crate) fn percentile_fields_json() -> String {
     let s = snapshot();
     let ms = |us: u64| us as f64 / 1e3;
     format!(

@@ -3,17 +3,11 @@
 
 //! Canonical command identity and authority classification.
 //!
-//! Menus, keybindings, the palette, native semantic actions, and control verbs
-//! are adapters onto this registry.  The adapter matches are exhaustive: a new
-//! shipping action cannot compile until it receives a stable command id and an
-//! authority decision.
+//! Menus, native semantic actions and editor commands are adapters onto this
+//! registry.  The adapter matches are exhaustive: a new shipping action cannot
+//! compile until it receives a stable command id and an authority decision.
 
-#![allow(
-    dead_code,
-    reason = "registry adapters replace legacy command surfaces incrementally"
-)]
-
-use crate::{keybinding, menu};
+use crate::menu;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CommandId(&'static str);
@@ -23,6 +17,7 @@ impl CommandId {
         Self(id)
     }
 
+    #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         self.0
     }
@@ -38,9 +33,7 @@ pub(crate) enum CommandScope {
     App,
 }
 
-/// Maximum capability a command may request from the host. Reducer effects are
-/// checked again against this ceiling, so a benign action cannot tunnel a file,
-/// clipboard, process, or update operation.
+/// Maximum capability a command may request from the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionAuthority {
     Observe,
@@ -50,23 +43,9 @@ pub(crate) enum ActionAuthority {
     DocumentRead,
     DocumentWrite,
     ExternalOpen,
-    Spawn,
     UpdateStage,
     UpdateApply,
     Owner,
-}
-
-impl ActionAuthority {
-    #[must_use]
-    pub(crate) fn permits(self, required: Self) -> bool {
-        self == required
-            || matches!(self, Self::Owner)
-            || matches!(required, Self::Observe)
-            || matches!(
-                (self, required),
-                (Self::DocumentWrite, Self::DocumentRead) | (Self::UpdateApply, Self::UpdateStage)
-            )
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,8 +174,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::FontActualSize => spec("window.text_scale_reset", S::Window, A::LocalUi, C::Any),
         M::SplitVertical => spec("view.split_vertical", S::View, A::LocalUi, C::Any),
         M::SplitHorizontal => spec("view.split_horizontal", S::View, A::LocalUi, C::Any),
-        // Same identity as the keybinding face (K::ToggleMatrixRain below):
-        // one command, two faces, converging on the per-session toggle.
         M::ToggleMatrixRain => spec("effects.rain.toggle", S::Process, A::LocalUi, C::Any),
         // Promotes the front window's promotable kitty (its tenured program
         // cat, else the LAUNCH kitty) into the durable registry and pins it.
@@ -225,8 +202,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::Zoom => spec("window.maximize", S::Window, A::LocalUi, C::Any),
         M::NextTab => spec("tab.next", S::Window, A::LocalUi, C::Any),
         M::PrevTab => spec("tab.previous", S::Window, A::LocalUi, C::Any),
-        // Same identity as the keybinding face (K::RenameSession below): one
-        // command, two faces, converging on the inline pin editor. Scoped to
+        // The inline pin editor. Scoped to
         // the Tab because the gesture names a tab and the editor is tab chrome;
         // the WRITE it eventually performs targets that tab's FOCUSED session.
         // `LocalUi` (not `ConfigMutate`) for the same reason the control layer
@@ -243,8 +219,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // A session's mail metadata on the human's screen: Owner (the same
         // class as the map), terminal content (the inbox is a session's).
         M::Inbox => spec("session.inbox.open", S::Tab, A::Owner, C::Terminal),
-        // Same identity as the keybinding face (K::OpenLedger below): one
-        // command, two faces, converging on `App::open_session_ledger`.
+        // Converges on `App::open_session_ledger`.
         M::LedgerForSession => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
         // The halt pair: the `hold` verb's two acts, Owner-class like the verb.
         M::HoldSession => spec("session.hold", S::Tab, A::Owner, C::Terminal),
@@ -258,70 +233,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Serious Mode class.
         M::TogglePresenceBand => spec("presence.band.toggle", S::Process, A::ConfigMutate, C::Any),
         M::TogglePresenceRim => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
-    }
-}
-
-/// Exhaustive adapter for user-configurable keybindings.
-pub(crate) const fn keybinding_command(action: keybinding::Action) -> CommandSpec {
-    use ActionAuthority as A;
-    use CommandScope as S;
-    use ContentRequirement as C;
-    use keybinding::Action as K;
-
-    match action {
-        K::NewTab => spec("tab.new_terminal", S::Window, A::LocalUi, C::Any),
-        K::ReopenClosedTab => spec("tab.reopen_closed", S::Window, A::LocalUi, C::Any),
-        K::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
-        K::NewWindow => spec("window.new", S::Process, A::LocalUi, C::Any),
-        K::NextTab => spec("tab.next", S::Window, A::LocalUi, C::Any),
-        K::PrevTab => spec("tab.previous", S::Window, A::LocalUi, C::Any),
-        K::SwitchTab(_) => spec("tab.select_index", S::Window, A::LocalUi, C::Any),
-        K::SplitVertical => spec("view.split_vertical", S::View, A::LocalUi, C::Any),
-        K::SplitHorizontal => spec("view.split_horizontal", S::View, A::LocalUi, C::Any),
-        K::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),
-        K::Paste => spec("selection.paste", S::View, A::Clipboard, C::Any),
-        K::Find => spec("view.find", S::View, A::LocalUi, C::Any),
-        K::FontIncrease => spec("window.text_scale_increase", S::Window, A::LocalUi, C::Any),
-        K::FontReset => spec("window.text_scale_reset", S::Window, A::LocalUi, C::Any),
-        K::FontDecrease => spec("window.text_scale_decrease", S::Window, A::LocalUi, C::Any),
-        K::FocusPaneLeft => spec("view.focus_left", S::Tab, A::LocalUi, C::Any),
-        K::FocusPaneRight => spec("view.focus_right", S::Tab, A::LocalUi, C::Any),
-        K::FocusPaneUp => spec("view.focus_up", S::Tab, A::LocalUi, C::Any),
-        K::FocusPaneDown => spec("view.focus_down", S::Tab, A::LocalUi, C::Any),
-        K::TogglePaneZoom => spec("view.zoom_toggle", S::Tab, A::LocalUi, C::Any),
-        K::ScrollPageUp => spec("view.scroll_page_up", S::View, A::LocalUi, C::Any),
-        K::ScrollPageDown => spec("view.scroll_page_down", S::View, A::LocalUi, C::Any),
-        K::ScrollLineUp => spec("view.scroll_line_up", S::View, A::LocalUi, C::Any),
-        K::ScrollLineDown => spec("view.scroll_line_down", S::View, A::LocalUi, C::Any),
-        K::ScrollToTop => spec("view.scroll_top", S::View, A::LocalUi, C::Any),
-        K::ScrollToBottom => spec("view.scroll_bottom", S::View, A::LocalUi, C::Any),
-        K::JumpPrevPrompt => spec("terminal.prompt_previous", S::View, A::LocalUi, C::Terminal),
-        K::JumpNextPrompt => spec("terminal.prompt_next", S::View, A::LocalUi, C::Terminal),
-        K::ToggleSettings => spec("app.settings.open", S::App, A::ConfigMutate, C::Any),
-        K::ToggleAbout => spec("app.settings.about", S::App, A::LocalUi, C::Any),
-        K::ToggleMatrixRain => spec("effects.rain.toggle", S::Process, A::LocalUi, C::Any),
-        K::ToggleSeriousMode => spec(
-            "effects.serious.toggle",
-            S::Process,
-            A::ConfigMutate,
-            C::Any,
-        ),
-        K::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
-        K::ToggleViMode => spec("terminal.vi.toggle", S::View, A::LocalUi, C::Terminal),
-        K::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
-        // Same identities as the menu faces (M::SelectAll / M::ToggleFullScreen
-        // / M::FindNext / M::FindPrev above): one command each, two faces,
-        // converging on the same verbs — the join `menu_binding` (app_palette)
-        // rides to label a palette row with the chord that actually fires it.
-        K::SelectAll => spec("selection.select_all", S::View, A::Clipboard, C::Any),
-        K::ToggleFullscreen => spec("window.fullscreen", S::Window, A::LocalUi, C::Any),
-        K::FindNext => spec("view.find_next", S::View, A::LocalUi, C::Any),
-        K::FindPrev => spec("view.find_previous", S::View, A::LocalUi, C::Any),
-        // The ledger key (round 19): runs `aterm drive ledger` for the tab's
-        // focused session and opens the HTML in the browser — a child process
-        // and an external open, so `ExternalOpen` like Help; the session is a
-        // terminal's.
-        K::OpenLedger => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
     }
 }
 
@@ -453,11 +364,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_menu_and_keybinding_faces_have_one_identity() {
-        assert_eq!(
-            menu_command(menu::MenuAction::NewTab).id,
-            keybinding_command(keybinding::Action::NewTab).id
-        );
+    fn menu_faces_carry_stable_identities() {
         assert_eq!(
             menu_command(menu::MenuAction::CloseTab).id.as_str(),
             "view.close_focused"
@@ -515,13 +422,6 @@ mod tests {
         let disconnect = menu_command(menu::MenuAction::DisconnectSession);
         assert_eq!(disconnect.id.as_str(), "session.disconnect");
         assert_eq!(disconnect.authority, ActionAuthority::Owner);
-    }
-
-    #[test]
-    fn authority_is_monotone_and_owner_is_the_ceiling() {
-        assert!(ActionAuthority::Owner.permits(ActionAuthority::UpdateApply));
-        assert!(ActionAuthority::DocumentWrite.permits(ActionAuthority::DocumentRead));
-        assert!(!ActionAuthority::LocalUi.permits(ActionAuthority::Clipboard));
     }
 
     #[test]

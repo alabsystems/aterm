@@ -4,32 +4,61 @@
 //! The harness core: the PURE judgments behind the aterm wrapper
 //! (`docs/DESIGN-aterm-wrapper-2026-09-17.md`), and the read verbs over them.
 //! Nothing here types into a session or answers a hook; the one engine that
-//! ACTS is [`crate::supervise`], which calls [`rm_policy`] through its
-//! approval policy.
+//! ACTS is [`crate::supervise`]. (The hook-era `rm_policy` went 2026-09-25:
+//! the supervisor's rm breaker, `supervise::policy::rm_breaker`, keeps the
+//! two tables it reused.)
 //!
-//! * [`rm_policy`] — is this Bash command an `rm` the owner's policy approves?
-//!   (design §5.1). Built ON [`crate::supervise::classify`]: the shell
-//!   segmentation, quote stripping and wrapper see-through there were each paid
-//!   for by a misclassification in a real session, and are not re-derived here.
 //! * [`source`] — WHERE DID THIS FACT COME FROM, once: the one [`source::Source`]
-//!   vocabulary [`usage`] and [`limits`] print.
-//! * [`usage`] — the statusLine JSON and the transcript's usage rows, read into
-//!   one view; the HUD line and the `harness usage --json` shape (design §5.2).
-//! * [`limits`] — the failure classifier and the ordered recovery table
-//!   (design §5.8, `FailureRecovery` in §11). Screen evidence comes from
-//!   `aterm_phase::phase::limit_notice` and [`crate::supervise::limit`], the
-//!   reset clock the supervisor already reads; neither is re-implemented.
-//!   `harness limits` runs [`limits::classify`] over one screen read. The
-//!   ladder ([`limits::step`]) lost its only production driver with `watch`
-//!   on 2026-09-23; it is tested and model-bound, and reached by nothing.
+//!   vocabulary [`usage`] and `harness limits` print.
+//! * [`usage`] — the transcript's usage rows, read into one view; the HUD
+//!   line and the `harness usage --json` shape (design §5.2). Its statusLine
+//!   reader has had NO live producer since the `harness statusline` bridge
+//!   retired (decision B): only the vendor-corpus canary and the
+//!   `harness_try` example feed it, so the view's account windows are empty
+//!   in every live `harness usage`; deleting it reshapes that verb's JSON
+//!   (`windows`), which is the owner's call;
+//!   and the `/usage` panel's painted windows `harness limits` prints beside
+//!   the wall the engine's own reader names (`aterm_phase::wall`, the one
+//!   wall classifier). The second classifier that used to live here
+//!   (`limits`: hook values, a pair rule, a banner table that disagreed with
+//!   aterm-phase's) was deleted 2026-09-25; its recovery ladder had gone
+//!   with its only driver, `harness watch`.
 //! * [`disk`] — DISK WATCH AND CLEANUP (design §5.5): the free-space figure
 //!   and the stale targets, each row carrying the WITNESS that makes it safe
 //!   to remove. Report-only is the shape of the function, not a flag.
 //! * [`align`] — the bounded child runner [`disk`] reads `df` through. It
 //!   was the packaging contract and the alignment verdict; that part is
 //!   deleted (the module doc says why) and the name stays for its caller.
+//! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
+//!   permission-mode row: model + effort, repository, branch, read from the
+//!   files Claude Code already keeps (owner direction, 2026-09-24).
+//! * [`lights`] — the row of lights at the footer's end (auto-approve, auto
+//!   mode, fast mode, thinking): read from what Claude Code draws,
+//!   toggled through its own inputs, read back after every toggle.
 //! * [`cli`] — THE COMMAND: `aterm harness usage|limits|disk|ledger`, the
-//!   read views, plus the retired hook-bridge verbs answered as tombstones.
+//!   read views, `upgrade` (one hand-run pass of the live upgrade) and
+//!   `upgrade models` (its model priority list), plus the retired hook-bridge
+//!   verbs answered as tombstones.
+//! * [`upgrade`], [`upgrade_drive`], [`upgrade_wake`] — THE LIVE UPGRADE of a
+//!   running Claude Code or Codex onto a newer build: the pure plan, its steps
+//!   over one tab or every session, and atpkg's activation notice as a push.
+//!   The window's supervisor host takes the steps at each session's idle
+//!   points.
+//! * [`upgrade_codex`] — the same step's CODEX branch, its pure half (the
+//!   daemon rule, the flag table, the exit hint, the rollout and composer
+//!   readers); its I/O half is `upgrade_drive`'s `codex` module. Codex's
+//!   shared daemon is moved first by the vendor's own verb, then each TUI by
+//!   a typed `/exit` and `codex resume` through [`relaunch`]'s line — never a
+//!   signal.
+//! * [`upgrade_models`], [`upgrade_catalog`] — THE MODEL HALF of the live
+//!   upgrade: the priority list (grown from Claude Code's own
+//!   recommendations), the managed build's baked catalog, and THE MODEL
+//!   LADDER that moves a session onto the list's best available model on its
+//!   relaunch line (`--model`, never `/model`).
+//! * [`relaunch`] — THE RELAUNCH PRIMITIVE both the upgrade and relaunch on
+//!   exit use: an agent that no longer runs started again in its own tab, on
+//!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
+//!   the host's per-session back-off.
 //!
 //! # What was deleted, 2026-09-23
 //!
@@ -46,22 +75,54 @@
 //! and it duplicated the engine in [`crate::supervise`], which is the one
 //! supervisor now. Design §0.4 is the record.
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; TWO bounded
+//! STATUS (docs/README.md honesty ratchet): unit-tested; NINE bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
-//! real code — `harness_failure_recovery_model` ([`limits`], in
-//! `aterm-agent/tests/conformance_harness.rs`) and
-//! `harness_capture_worker_lifecycle_model` ([`align`]'s runner, in its
-//! tests). Nothing here has run against a REAL limit or exhausted window: the
-//! ladder is exercised against fixtures.
+//! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
+//! in its tests), `harness_upgrade_notice_owner_model` ([`upgrade_drive`]'s
+//! tests), `harness_upgrade_drain_bound_model` ([`upgrade::next_step`], in
+//! [`upgrade`]'s tests), `harness_upgrade_never_strands_model` (no notice into
+//! a session at its usage limit, a late READY honoured, every agent asked
+//! restarted or released — a release dropped only once the agent took up
+//! direction given after its last READY, never a restart over direction given
+//! after it; one stated exception, an agent no job of a job-control shell,
+//! refused and owed no line: [`upgrade_drive`]'s tests, over the real reducer,
+//! gates, record transitions, READY, direction and release rules and the
+//! window's reading of each step's word), `harness_worker_lifecycle_model` and
+//! `harness_relaunch_on_exit_model` ([`relaunch`]'s and the window host's
+//! tests), `harness_exit_record_model` (what an exit left of Claude's own
+//! record, read as it is seen: [`upgrade_drive`]'s tests, over the real
+//! [`relaunch::exit_record`] and [`relaunch::after_exit`]),
+//! `harness_model_priority_model` ([`upgrade_models`], in
+//! `aterm-agent/tests/conformance_upgrade_models/priority.rs`), and
+//! `harness_codex_daemon_update_model` ([`upgrade_codex::daemon_step`] over
+//! every reachable state, in [`upgrade_codex`]'s tests). The Codex branch
+//! has run end to end against a REAL Codex (0.157.0 → 0.157.1, a private
+//! headless aterm, network denied) through the window's OWN HOST, no sweep
+//! (`tools/test-codex-live-upgrade.sh`, 2026-09-26): a background terminal
+//! held a daemon-mode tab and its daemon until it was stopped; an embedded
+//! session got its notice at that break and no `/exit` until the terminal
+//! was stopped; then the daemon moved, each TUI was exited, relaunched,
+//! adopted and carried on, and so was an inline TUI at a two-row prompt. One
+//! of three full runs had the embedded session's carry-on still owed ten
+//! minutes after its adoption (the cause was not captured; the script now
+//! dumps the host's log and journals on a failure). Nothing here has run
+//! against a REAL exhausted
+//! window: the `/usage` panel reader is exercised against captured and
+//! hand-built fixtures.
 
 pub mod align;
 pub mod cli;
 pub mod disk;
-pub mod limits;
-pub mod rm_policy;
+pub mod footer;
+pub mod lights;
+pub mod relaunch;
 pub mod source;
 pub mod upgrade;
+pub mod upgrade_catalog;
+pub mod upgrade_codex;
 pub mod upgrade_drive;
+pub mod upgrade_models;
+pub mod upgrade_wake;
 pub mod usage;
 
 /// The longest prefix of `s` that is at most `max` BYTES and ends on a

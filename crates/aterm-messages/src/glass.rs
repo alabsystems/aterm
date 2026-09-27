@@ -26,10 +26,13 @@
 //! §10.4.5 for the live words, amended by ruling 136):
 //!
 //! 1. `fixed = head + A + BEFORE_CAPSULES + capsules(long)`, where `A` is the
-//!    ACTIVITY's words: [`PCT_W`] for a row with a fill (the right-aligned
-//!    percent), `1 + ELAPSED_W` for a busy one (the elapsed slot), 0
-//!    otherwise — and, on a moving row that carries the load SLOT, `3 +` the
-//!    widest load words' width more, whether its words show yet or not: for
+//!    ACTIVITY's words: [`PCT_W`] for a row with a fill (two cells of gap and
+//!    the right-aligned percent), `1 + ELAPSED_SHORT_W` for a busy one (the
+//!    elapsed slot's short form; its long form is the first extra, ruling
+//!    241), 0 otherwise — and, on a moving row that carries the load SLOT, `2 +` the
+//!    widest words among the loads the row DECLARED ([`crate::Message::loads`];
+//!    every load's when it declared none, design ruling 221) more, whether
+//!    its words show yet or not: for
 //!    a routine pass the load is the one reason the row is on the glass at
 //!    all, so the words are paid for by the capsules' short forms and the
 //!    title's elision before they drop (review 2026-09-23), and the slot is
@@ -64,38 +67,47 @@
 //!    room`, else shaped to `room − 3` CELLS if `room ≥ 3 + DETAIL_FLOOR`,
 //!    else dropped — never a stub (an action excerpt adds its reserved
 //!    floor to the room, and a starved one keeps just the floor); (b′) an
-//!    action excerpt's row's load slot, `3 +` the widest load words, beside a
+//!    action excerpt's row's load slot, `3 +` its widest load words, beside a
 //!    WHOLE excerpt when it fits; (c) stats if `2 + len` fits after the
-//!    excerpt — beside a WHOLE excerpt (or none at all). An extra asked for
-//!    that does not fit starves every extra after it.
+//!    excerpt, else their short form ([`short_stats`]: `3 of 10 programs` →
+//!    `3/10 programs`, never a bare `3/10`) if that fits — beside a WHOLE
+//!    excerpt (or none at all). An extra asked for that does not fit starves
+//!    every extra after it.
 //!
-//! Sacrifice order, therefore, as the row narrows: stats → excerpt (shaped,
-//! then dropped) → ETA → capsule short forms → title elision → the activity
-//! words with the load words (on an action excerpt's row: stats → load
+//! Sacrifice order, therefore, as the row narrows: stats (short, then gone) → excerpt (shaped,
+//! then dropped) → ETA (long, then short) → capsule short forms → title
+//! elision → the activity words with the load words; on a row with an ETA
+//! the load words go before the short ETA does — where no ETA fits the room
+//! the load slot's cells, which the head paid for, buy the short one, and it
+//! then goes with the activity's words (ruling 229: how long outranks the
+//! load words) (on an action excerpt's row: stats → load
 //! slot → excerpt shaped → ETA → capsule short forms → title elision → the
 //! excerpt → the activity words); each a monotone flag while the row narrows
 //! (what is gone at one width is gone at every narrower one). The meter is
 //! never on that list.
 //!
-//! Cells on a row: `glyph title · excerpt ␠pct|elapsed ␠eta ·␠load ␠␠stats …
-//! capsules`, all over the meter. The percent is right-aligned in its four
-//! cells and the time words are left-aligned in theirs, so nothing after
-//! them moves as the numbers change.
+//! Cells on a row: `glyph title · excerpt ␠␠pct|␠elapsed ␠eta ␠␠stats …
+//! load ␠␠capsules`, all over the meter. The percent is right-aligned in its
+//! four cells and the time words are left-aligned in theirs, so nothing after
+//! them moves as the numbers change; the load slot sits at the TAIL of the
+//! words, right-aligned against the capsules (ruling 246), so it never moves
+//! as the stats do. Beside a percent the stats paint only the job's size
+//! ([`job_stats`]).
 
 use std::cmp::Reverse;
 
 use crate::center::Live;
-use crate::model::{ActionIndex, Hold, Intent, Load, MessageId, Severity};
+use crate::model::{ActionIndex, Hold, Intent, Load, Loads, MessageId, Severity};
 use crate::text::{shape_detail, truncate};
 use crate::{
-    BEFORE_CAPSULES, CAPSULE_GAP, DETAIL_FLOOR, ELAPSED_W, ETA_SHORT_W, ETA_W, GLYPH_COL, Instant,
-    MARGIN, PCT_W, TITLE_COL, TITLE_MIN,
+    BEFORE_CAPSULES, CAPSULE_GAP, DETAIL_FLOOR, ELAPSED_SHORT_W, ELAPSED_W, ETA_SHORT_W, ETA_W,
+    GLYPH_COL, Instant, MARGIN, PCT_W, TITLE_COL, TITLE_MIN,
 };
 
 /// The glass rank of a live row, highest first: asks, then the severity
 /// CLASS ([`severity_class`]), then live/standing before held, then the
 /// earlier post (ties by the lower id).
-pub type Rank = (bool, u8, bool, Reverse<Instant>, Reverse<MessageId>);
+pub(crate) type Rank = (bool, u8, bool, Reverse<Instant>, Reverse<MessageId>);
 
 /// The rank's severity term: Error above Warn above the quiet tones, and
 /// Success WITH Info — one class, so the two order by `posted_at` alone.
@@ -106,7 +118,7 @@ pub type Rank = (bool, u8, bool, Reverse<Instant>, Reverse<MessageId>);
 /// own consequence — "rank ties break on `posted_at`" for an `↻` row
 /// before a `✓` row — presumes exactly this class.
 #[must_use]
-pub const fn severity_class(severity: Severity) -> u8 {
+pub(crate) const fn severity_class(severity: Severity) -> u8 {
     match severity {
         Severity::Success | Severity::Info => 0,
         Severity::Warn => 1,
@@ -114,12 +126,15 @@ pub const fn severity_class(severity: Severity) -> u8 {
     }
 }
 
-/// The rank tuple of one row.
+/// The rank tuple of one row. A RETROSPECTIVE row — a record about a
+/// previous run, `aterm crashed last time` ([`crate::Message::retrospective`])
+/// — ranks one severity class below its own (design ruling 259): what
+/// happened last time never takes the row of what is happening now.
 #[must_use]
-pub fn rank(live: &Live) -> Rank {
+pub(crate) fn rank(live: &Live) -> Rank {
     (
         live.msg.is_ask(),
-        severity_class(live.msg.severity),
+        severity_class(live.msg.severity).saturating_sub(u8::from(live.msg.retrospective)),
         matches!(live.msg.hold, Hold::Live { .. } | Hold::Standing),
         Reverse(live.posted_at),
         Reverse(live.id),
@@ -128,7 +143,7 @@ pub fn rank(live: &Live) -> Rank {
 
 /// `true` when `a` outranks `b` strictly.
 #[must_use]
-pub fn outranks(a: &Live, b: &Live) -> bool {
+pub(crate) fn outranks(a: &Live, b: &Live) -> bool {
     rank(a) > rank(b)
 }
 
@@ -162,6 +177,10 @@ pub enum RowKind {
 /// `detail`'s column (and `load`'s), the space before `pct`'s, `elapsed`'s
 /// and `eta`'s, and the two before `stats`'. The meter (or a busy row's
 /// track) is the whole row, under every piece (ruling 136).
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "four independent facts the painter reads — live ink, busy, and each time slot's short form — each set once by the width law"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowLayout {
     /// Message or overflow.
@@ -184,7 +203,7 @@ pub struct RowLayout {
     /// fill onto the window's full pixel width.
     pub meter: Option<(usize, usize, u16)>,
     /// Work in flight with no fill ([`crate::Meter::busy`]): the motion
-    /// layer spins the glyph cell and sweeps the comet along the track.
+    /// layer sweeps the comet along the track.
     pub busy: bool,
     /// `(col, width)` of a busy row's track — always `(0, cols)`, THE WHOLE
     /// ROW, like a meter (ruling 75): the host lays it under every other
@@ -193,20 +212,27 @@ pub struct RowLayout {
     pub track: Option<(usize, usize)>,
     /// The `NN%` text and its column (right-aligned in its four cells).
     pub pct: Option<(usize, String)>,
-    /// The elapsed slot's column ([`ELAPSED_W`] cells) of a busy row; the
-    /// motion layer writes the words.
+    /// The elapsed slot's column ([`Self::elapsed_width`] cells: [`ELAPSED_W`],
+    /// or [`ELAPSED_SHORT_W`] where the long form did not fit) of a busy row;
+    /// the motion layer writes the words.
     pub elapsed: Option<usize>,
+    /// The elapsed slot is in its SHORT form (`for 3m`, [`ELAPSED_SHORT_W`]
+    /// cells).
+    pub elapsed_short: bool,
     /// The ETA slot's column ([`Self::eta_width`] cells: [`ETA_W`], or
     /// [`ETA_SHORT_W`] where the long form did not fit); the motion layer
     /// writes the words.
     pub eta: Option<usize>,
     /// The ETA slot is in its SHORT form (`59m left`, [`ETA_SHORT_W`] cells).
     pub eta_short: bool,
-    /// The heavy-load words and their column (the ` · ` joint before them),
-    /// when they show.
+    /// The heavy-load words and their column, right-aligned in the load
+    /// slot, when they show. No joint: the slot sits at the TAIL of the word
+    /// cluster, before the capsules (design ruling 246), two cells clear of
+    /// whatever precedes it.
     pub load: Option<(usize, &'static str)>,
     /// The reserved load slot's column and width, words or not — the cells
-    /// the row keeps for them (the joint in the three before).
+    /// the row keeps for them at the tail of its words, so an empty
+    /// reservation reads as track, never as a hole mid-row.
     pub load_slot: Option<(usize, usize)>,
     /// The stats text and its column.
     pub stats: Option<(usize, String)>,
@@ -344,6 +370,7 @@ impl Presentation {
             h.num(row.elapsed.map_or(0, |c| c as u64 + 1));
             h.num(row.eta.map_or(0, |c| c as u64 + 1));
             h.byte(u8::from(row.eta_short));
+            h.byte(u8::from(row.elapsed_short));
             match row.load {
                 Some((col, words)) => {
                     h.num(col as u64 + 1);
@@ -423,6 +450,17 @@ impl RowLayout {
         }
     }
 
+    /// The elapsed slot's cells: [`ELAPSED_W`], or [`ELAPSED_SHORT_W`] in its
+    /// short form; 0 with no slot.
+    #[must_use]
+    pub fn elapsed_width(&self) -> usize {
+        match (self.elapsed, self.elapsed_short) {
+            (None, _) => 0,
+            (Some(_), false) => ELAPSED_W,
+            (Some(_), true) => ELAPSED_SHORT_W,
+        }
+    }
+
     /// The spoken sentence: `title` or `title · <detail[0] whole>` —
     /// width-independent, so a resize that re-shapes or drops the painted
     /// excerpt never re-announces a row (design §3.5) — with the band's
@@ -444,7 +482,7 @@ impl RowLayout {
 /// you mean `, ` ▸ ` (a Settings route) `, `, and `×` between two digits (a
 /// pane's size) ` by `. The paint is unchanged.
 #[must_use]
-pub fn speakable(words: &str) -> String {
+pub(crate) fn speakable(words: &str) -> String {
     let chars: Vec<char> = words.chars().collect();
     let mut out = String::with_capacity(words.len());
     let mut i = 0;
@@ -494,7 +532,7 @@ pub enum Links {
 
 /// One capsule before layout: both forms.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapsuleSpec {
+pub(crate) struct CapsuleSpec {
     /// The long form.
     pub long: String,
     /// The short form the width law falls back to; EMPTY for a capsule
@@ -511,7 +549,7 @@ pub struct CapsuleSpec {
 impl CapsuleSpec {
     /// The capsule for an authored intent at `index`.
     #[must_use]
-    pub fn authored(intent: &Intent, index: u8) -> Self {
+    pub(crate) fn authored(intent: &Intent, index: u8) -> Self {
         Self {
             long: intent.label().to_string(),
             short: intent.short().to_string(),
@@ -525,13 +563,30 @@ impl CapsuleSpec {
         }
     }
 
+    /// This capsule with its cells kept and nothing drawn in them (design
+    /// ruling 235): both forms become blanks of their own widths, in the
+    /// `Details` ink, which paints no chip ground, and nothing to say. The
+    /// row it sits on does not reflow when a capsule stops meaning anything
+    /// — an echo's `Stop paste`, once the paste is over.
+    #[must_use]
+    pub fn blanked(self) -> Self {
+        let blank = |s: &str| " ".repeat(s.chars().count());
+        Self {
+            long: blank(&self.long),
+            short: blank(&self.short),
+            full_label: "",
+            role: CapsuleRole::Details,
+            action: self.action,
+        }
+    }
+
     /// The implicit `Details ›`; with `hidden > 0` behind a single committed
     /// row it reads `+N ›`. `Details ›` has NO short form: below its long
     /// width it goes, rather than painting a lone `›` — the row body
     /// performs Details (§2.2), and the cells go to the title and the
     /// activity (review round 2, 2026-09-23). `+N›` keeps its count.
     #[must_use]
-    pub fn details(hidden: usize) -> Self {
+    pub(crate) fn details(hidden: usize) -> Self {
         let (long, short) = if hidden > 0 {
             (format!("+{hidden} \u{203a}"), format!("+{hidden}\u{203a}"))
         } else {
@@ -545,18 +600,6 @@ impl CapsuleSpec {
             action: ActionIndex::DETAILS,
         }
     }
-
-    /// The overflow row's one capsule.
-    #[must_use]
-    pub fn messages() -> Self {
-        Self {
-            long: "Messages \u{203a}".to_string(),
-            short: "\u{203a}".to_string(),
-            full_label: "Messages \u{203a}",
-            role: CapsuleRole::Details,
-            action: ActionIndex::DETAILS,
-        }
-    }
 }
 
 /// One row before layout — the pure input to the width law, so the law is
@@ -566,7 +609,7 @@ impl CapsuleSpec {
     clippy::struct_excessive_bools,
     reason = "five independent inputs to the width law (live ink, busy, moving fill, ETA slot, load slot), each read once; a state enum would multiply them"
 )]
-pub struct RowSpec<'a> {
+pub(crate) struct RowSpec<'a> {
     /// Message or overflow.
     pub kind: RowKind,
     /// For the ink.
@@ -599,9 +642,11 @@ pub struct RowSpec<'a> {
     pub eta: bool,
     /// The heavy-load words, when they show.
     pub load: Option<Load>,
-    /// The row reserves the load slot (it has declared a load): the slot is
-    /// laid out whether or not `load` shows, at the widest words' width.
-    pub load_slot: bool,
+    /// The loads the row reserves the load slot for (it has declared a
+    /// load): the slot is laid out whether or not `load` shows, at the widest
+    /// of THESE loads' words (design ruling 221). Empty: no slot, unless
+    /// `load` shows (then every load's width).
+    pub load_slot: Loads,
     /// The capsules, left to right (authored first, `Details ›` last).
     pub capsules: Vec<CapsuleSpec>,
 }
@@ -645,21 +690,30 @@ impl Activity {
         match self {
             Self::None => 0,
             Self::LiveBar | Self::HeldBar => PCT_W,
-            Self::LiveBusy | Self::LiveLevel => 1 + ELAPSED_W,
+            // The SHORT elapsed form is the head's: the long one is an
+            // extra, the first sacrificed (ruling 241).
+            Self::LiveBusy | Self::LiveLevel => 1 + ELAPSED_SHORT_W,
         }
     }
 }
 
-/// The overflow row's spec: `… N more messages`, with its `Messages ›`
-/// link when links are painted.
+/// The overflow row's spec (design ruling 259): ONE LINK to Settings ▸
+/// Messages, its words the whole row — `… N more ›` — with no capsule of its
+/// own. When a live progress row is among the hidden ones (two rows, two
+/// downloads), the row names it first: `+ Downloading aterm v0.91.0 45% ·
+/// 2 more ›` — the `+` in the glyph's cell, `N` then the OTHER hidden rows —
+/// and falls back to `N more ›` where that does not fit whole. `progress` is
+/// the hidden row's title and its percent, already joined. The `›` is the
+/// link's, so it is painted only with the links ([`Links::Painted`]).
+/// `words` is [`overflow_words`]' long form.
 #[must_use]
-pub fn overflow_spec(hidden: usize, links: Links) -> RowSpec<'static> {
+pub(crate) fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
     RowSpec {
         kind: RowKind::Overflow { hidden },
         severity: Severity::Info,
         live: false,
-        glyph: '\u{2026}',
-        title: "",
+        glyph: OVERFLOW_GLYPH,
+        title: words,
         detail0: None,
         meter: None,
         busy: false,
@@ -667,11 +721,72 @@ pub fn overflow_spec(hidden: usize, links: Links) -> RowSpec<'static> {
         level: false,
         eta: false,
         load: None,
-        load_slot: false,
-        capsules: match links {
-            Links::Withheld => Vec::new(),
-            Links::Painted => vec![CapsuleSpec::messages()],
-        },
+        load_slot: Loads::NONE,
+        capsules: Vec::new(),
+    }
+}
+
+/// The overflow row's glyph: `…` for `N more ›`.
+const OVERFLOW_GLYPH: char = '\u{2026}';
+/// The overflow row's glyph when it names a hidden progress row: `+`.
+const OVERFLOW_PROGRESS_GLYPH: char = '+';
+
+/// The link's arrow, painted with the links only.
+fn overflow_arrow(links: Links) -> &'static str {
+    match links {
+        Links::Painted => " \u{203a}",
+        Links::Withheld => "",
+    }
+}
+
+/// `N more ›` — the overflow row's short form, and its only form when no
+/// progress row is hidden.
+fn overflow_short(hidden: usize, arrow: &str) -> String {
+    format!("{hidden} more{arrow}")
+}
+
+/// The overflow row's long form ([`overflow_spec`]): the hidden progress row's words, then how
+/// many OTHER rows are hidden (`+ Downloading … 45% · 2 more ›`, or `+
+/// Downloading … 45% ›` when it is the only one); the short form when no
+/// progress row is hidden.
+#[must_use]
+pub(crate) fn overflow_words(hidden: usize, links: Links, progress: Option<&str>) -> String {
+    let arrow = overflow_arrow(links);
+    match progress.filter(|p| !p.is_empty()) {
+        Some(p) if hidden > 1 => format!("{p} \u{b7} {} more{arrow}", hidden - 1),
+        Some(p) => format!("{p}{arrow}"),
+        None => overflow_short(hidden, arrow),
+    }
+}
+
+/// The overflow row's words at `budget` cells: the long form whole when it
+/// fits (with the `+` glyph when it names a progress row), else `N more ›`.
+fn overflow_fit(
+    hidden: usize,
+    long: &str,
+    budget: usize,
+    width: &dyn Fn(&str) -> usize,
+) -> (String, char) {
+    let arrow = if long.ends_with('\u{203a}') {
+        " \u{203a}"
+    } else {
+        ""
+    };
+    let short = overflow_short(hidden, arrow);
+    if long != short && 2 + width(long) <= budget {
+        (long.to_string(), OVERFLOW_PROGRESS_GLYPH)
+    } else {
+        (short, OVERFLOW_GLYPH)
+    }
+}
+
+/// What a screen reader says for the overflow row: its words without the
+/// arrow, `more` read as `more messages`.
+fn overflow_spoken(words: &str) -> String {
+    let bare = words.trim_end_matches('\u{203a}').trim_end();
+    match bare.strip_suffix(" more") {
+        Some(head) => format!("{head} more messages"),
+        None => bare.to_string(),
     }
 }
 
@@ -699,7 +814,7 @@ fn next_piece(row: &RowLayout, cols: usize) -> usize {
     }
     row.elapsed.into_iter().chain(row.eta).for_each(&mut at);
     if let Some((c, _)) = row.load_slot {
-        at(c.saturating_sub(2));
+        at(c);
     }
     if let Some((c, _)) = &row.stats {
         at(*c);
@@ -715,7 +830,12 @@ fn next_piece(row: &RowLayout, cols: usize) -> usize {
 /// the laid title's cells, padded with blanks when shorter, and may run on
 /// into the blank cells before the next piece (one kept clear) before it
 /// elides; the spoken title is `words` whole.
-pub fn finish_title(row: &mut RowLayout, words: &str, cols: usize, width: &dyn Fn(&str) -> usize) {
+pub(crate) fn finish_title(
+    row: &mut RowLayout,
+    words: &str,
+    cols: usize,
+    width: &dyn Fn(&str) -> usize,
+) {
     let laid = width(&row.title.1);
     if laid == 0 {
         return;
@@ -762,6 +882,8 @@ fn clearance(caps: &[CapsuleSpec], short: bool) -> usize {
 struct Fit {
     short: bool,
     title: String,
+    /// The glyph: the spec's, or the overflow row's for the form it took.
+    glyph: char,
     /// The activity that survived (none in the degenerate step).
     activity: Activity,
     details_dropped: bool,
@@ -775,31 +897,33 @@ struct Fit {
     action_excerpt: bool,
 }
 
-/// The load slot's width: the widest load words under `width`, so a
-/// resource change never re-lays the row.
-fn load_slot_width(width: &dyn Fn(&str) -> usize) -> usize {
-    Load::ALL
-        .iter()
-        .map(|l| width(l.words()))
-        .max()
-        .unwrap_or(0)
+/// The load slot's width: the widest words among the loads the row reserves
+/// the slot for, under `width`, so a resource change within them never
+/// re-lays the row (design ruling 221) — every load's when it declared none.
+fn load_slot_width(spec: &RowSpec<'_>, width: &dyn Fn(&str) -> usize) -> usize {
+    let reserved = match spec.load {
+        Some(l) if !spec.load_slot.is_empty() => spec.load_slot.with(l),
+        _ if !spec.load_slot.is_empty() => spec.load_slot,
+        _ => Loads::ALL,
+    };
+    reserved.iter().map(|l| width(l.words())).max().unwrap_or(0)
 }
 
 /// Whether the row lays out the load slot: a moving activity on a row that
 /// reserves one (or shows words now).
 fn reserves_load(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    matches!(
-        activity,
-        Activity::LiveBar | Activity::LiveBusy | Activity::LiveLevel
-    ) && (spec.load_slot || spec.load.is_some())
+    // A measured LEVEL (the strain row) never has one: its title already
+    // names the load (design ruling 243).
+    matches!(activity, Activity::LiveBar | Activity::LiveBusy)
+        && (!spec.load_slot.is_empty() || spec.load.is_some())
 }
 
-/// The load slot's cells, joint included, when the row lays it out in the
+/// The load slot's cells, its two-cell gap included, when the row lays it out in the
 /// fixed head (module doc, step 1) — not on a row whose excerpt is an ACTION
 /// excerpt ([`action_excerpt`]), where the slot is an extra after it.
 fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> usize) -> usize {
     if reserves_load(spec, activity) && !action_excerpt(spec, activity) {
-        3 + load_slot_width(width)
+        2 + load_slot_width(spec, width)
     } else {
         0
     }
@@ -830,9 +954,12 @@ fn excerpt_floor(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) ->
 /// Step 1: capsules long → short, then the title, then the degenerate step.
 fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> Fit {
     let budget = cols.saturating_sub(2 * MARGIN);
-    let overflow_title = match spec.kind {
-        RowKind::Overflow { hidden } => Some(format!("{hidden} more messages")),
-        RowKind::Message(_) | RowKind::Echo(_) => None,
+    let (overflow_title, glyph) = match spec.kind {
+        RowKind::Overflow { hidden } => {
+            let (words, glyph) = overflow_fit(hidden, spec.title, budget, width);
+            (Some(words), glyph)
+        }
+        RowKind::Message(_) | RowKind::Echo(_) => (None, spec.glyph),
     };
     let full_title = overflow_title.as_deref().unwrap_or(spec.title);
     let mut title = full_title.to_string();
@@ -900,6 +1027,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     Fit {
         short,
         title,
+        glyph,
         activity,
         details_dropped,
         room,
@@ -933,6 +1061,9 @@ fn shape_to_cells(detail0: &str, target: usize, width: &dyn Fn(&str) -> usize) -
 
 /// What the extras won, in cells, before placement.
 struct Extras {
+    /// The elapsed slot's cells ([`ELAPSED_W`] or [`ELAPSED_SHORT_W`]); 0
+    /// for none.
+    elapsed_w: usize,
     /// The ETA slot's cells ([`ETA_W`] or [`ETA_SHORT_W`]); 0 for none.
     eta_w: usize,
     load_slot: bool,
@@ -943,7 +1074,11 @@ struct Extras {
 
 /// Lay one row out at `cols` under the injected cell measure.
 #[must_use]
-pub fn layout_row(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> RowLayout {
+pub(crate) fn layout_row(
+    spec: &RowSpec<'_>,
+    cols: usize,
+    width: &dyn Fn(&str) -> usize,
+) -> RowLayout {
     let fit = fit_fixed(spec, cols, width);
     let extras = allocate_extras(spec, &fit, width);
     place(spec, cols, width, &fit, extras)
@@ -957,14 +1092,43 @@ fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize)
     // it: they are sacrificed first as the row narrows, so none of them may
     // come back in the cells the starved one left.
     let mut starved = false;
+    // a0. the elapsed slot's LONG form (`for 3 min`), else its short one
+    //    (`for 3m`, paid for in the head) — which starves the rest, as a
+    //    short ETA does (ruling 241).
+    let mut elapsed_w = 0;
+    if matches!(fit.activity, Activity::LiveBusy | Activity::LiveLevel) {
+        if ELAPSED_W - ELAPSED_SHORT_W <= room {
+            elapsed_w = ELAPSED_W;
+            room -= ELAPSED_W - ELAPSED_SHORT_W;
+        } else {
+            elapsed_w = ELAPSED_SHORT_W;
+            starved = true;
+        }
+    }
     // a. the ETA slot: long, else short — and a short slot starves the
     //    extras after it, as a short capsule does, so the cells it saved
     //    never re-buy an excerpt or stats a wider row gave up.
     let mut eta_w = 0;
+    // The load slot and its words: paid for in the fixed head, so a moving
+    // row that kept its activity keeps them — except beside an action
+    // excerpt, where the slot is an extra after it (below), and on a row
+    // whose ETA they would cost: HOW LONG outranks the load words (the
+    // owner: "how long to wait and for what" — ruling 229), so where no
+    // ETA fits the room the slot's cells buy the short one. The slot is one
+    // width for the row's life, so the trade is a fact of the width alone:
+    // words arriving or leaving never re-lay the row, and once traded it
+    // stays traded at every narrower width (the ETA short: the cells a
+    // wider row gave the long one never come back).
+    let mut load_slot = reserves_load(spec, fit.activity) && !fit.action_excerpt;
     if spec.eta && fit.activity == Activity::LiveBar {
         if ETA_W < room {
             eta_w = ETA_W;
         } else if ETA_SHORT_W < room {
+            eta_w = ETA_SHORT_W;
+            starved = true;
+        } else if load_slot && ETA_SHORT_W < room + 2 + load_slot_width(spec, width) {
+            load_slot = false;
+            room += 2 + load_slot_width(spec, width);
             eta_w = ETA_SHORT_W;
             starved = true;
         } else {
@@ -974,10 +1138,6 @@ fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize)
             room -= 1 + eta_w;
         }
     }
-    // The load slot and its words: paid for in the fixed head, so a moving
-    // row that kept its activity keeps them — except beside an action
-    // excerpt, where the slot is an extra after it (below).
-    let mut load_slot = reserves_load(spec, fit.activity) && !fit.action_excerpt;
     // b. the excerpt: whole, shaped at or above the floor, else dropped. An
     //    action excerpt has its floor from the fixed head (a starved extra
     //    before it leaves it that floor, no more), and none once that floor
@@ -1021,31 +1181,69 @@ fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize)
         && detail_whole
         && !starved
         && reserves_load(spec, fit.activity)
-        && 3 + load_slot_width(width) <= room
+        && 2 + load_slot_width(spec, width) <= room
     {
         load_slot = true;
-        room -= 3 + load_slot_width(width);
+        room -= 2 + load_slot_width(spec, width);
     }
     let load = spec.load.map(Load::words).filter(|_| load_slot);
     // c. stats beside a whole excerpt (or none): a cut excerpt already
     //    said the row is short, and the stats never come back below that.
+    //    Long, else short: the count is the one word that agrees with the
+    //    bar, so it goes last (ruling 223).
     let mut stats: Option<String> = None;
-    if let Some((_, s)) = spec
-        .meter
-        .filter(|(_, s)| !s.is_empty() && detail_whole && !starved)
-    {
-        let sw = width(s);
-        if 2 + sw <= room {
-            stats = Some(s.to_string());
+    let painted = spec.meter.and_then(|(_, s)| {
+        if matches!(fit.activity, Activity::LiveBar | Activity::HeldBar) {
+            job_stats(spec.title, s)
+        } else {
+            Some(s.to_string()).filter(|s| !s.is_empty())
         }
+    });
+    if let Some(s) = painted.filter(|_| detail_whole && !starved) {
+        let short = short_stats(&s);
+        stats = [Some(s), short]
+            .into_iter()
+            .flatten()
+            .find(|s| 2 + width(s) <= room);
     }
     Extras {
+        elapsed_w,
         eta_w,
         load_slot,
         load,
         detail,
         stats,
     }
+}
+
+/// The stats' SHORT form, where the long one does not fit (design rulings
+/// 223 and 248): a count `A of B unit …` as `A/B unit` — `3 of 10 programs`
+/// → `3/10 programs`, `6 of 8 cores` → `6/8 cores`, `23 of 24 GB used` →
+/// `23/24 GB` — the same numbers, changing at the same instants, and never
+/// without the word that says what they count: a count with no unit word
+/// (`1,200 of 3,400`) has no short form, so the width law drops it whole
+/// rather than paint a bare fraction. Else stats of several ` · ` clauses
+/// keep their LAST, where a reporter writes how big the wait is: `10
+/// programs · ~3 GB` → `~3 GB` (ruling 229). `None` for stats with no such
+/// count or clause (`31 MB / 74 MB` is its own short form).
+#[must_use]
+pub(crate) fn short_stats(stats: &str) -> Option<String> {
+    let count = |w: &str| {
+        w.starts_with(|c: char| c.is_ascii_digit())
+            && w.chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+    };
+    let mut words = stats.split(' ');
+    if let (Some(done), Some("of"), Some(total), Some(unit)) =
+        (words.next(), words.next(), words.next(), words.next())
+        && count(done)
+        && count(total)
+        && unit.starts_with(char::is_alphabetic)
+    {
+        return Some(format!("{done}/{total} {unit}"));
+    }
+    let (_, last) = stats.rsplit_once(" \u{b7} ")?;
+    (!last.trim().is_empty()).then(|| short_stats(last).unwrap_or_else(|| last.to_string()))
 }
 
 /// Placement: the left flow, then the capsules right-aligned, all over the
@@ -1058,7 +1256,7 @@ fn place(
     extras: Extras,
 ) -> RowLayout {
     let full_title = match spec.kind {
-        RowKind::Overflow { hidden } => format!("{hidden} more messages"),
+        RowKind::Overflow { .. } => overflow_spoken(&fit.title),
         RowKind::Message(_) | RowKind::Echo(_) => spec.title.to_string(),
     };
     let fill = spec.fill();
@@ -1079,19 +1277,21 @@ fn place(
     let mut elapsed = None;
     match (fit.activity, fill) {
         (Activity::LiveBar | Activity::HeldBar, Some(p)) => {
+            // Two cells of gap, then the percent right-aligned in four, so
+            // `100%` keeps the standard two-space gap (ruling 246).
             let text = format!("{}%", p / 10);
-            col += 1;
-            let slot = PCT_W - 1;
-            pct = Some((col + slot.saturating_sub(width(&text)), text));
-            col += slot;
+            col += PCT_W - PCT_SLOT;
+            pct = Some((col + PCT_SLOT.saturating_sub(width(&text)), text));
+            col += PCT_SLOT;
         }
         (Activity::LiveBusy | Activity::LiveLevel, _) => {
             col += 1;
             elapsed = Some(col);
-            col += ELAPSED_W;
+            col += extras.elapsed_w.max(ELAPSED_SHORT_W);
         }
         _ => {}
     }
+    let elapsed_short = elapsed.is_some() && extras.elapsed_w != ELAPSED_W;
     let eta = (extras.eta_w > 0).then(|| {
         col += 1;
         let at = col;
@@ -1099,24 +1299,35 @@ fn place(
         at
     });
     let eta_short = extras.eta_w == ETA_SHORT_W;
-    let load_slot = extras.load_slot.then(|| {
-        col += 3;
-        let at = col;
-        let w = load_slot_width(width);
-        col += w;
-        (at, w)
-    });
-    let load = load_slot.and_then(|(at, _)| extras.load.map(|words| (at, words)));
     let stats = extras.stats.map(|s| {
         col += 2;
-        (col, s)
+        let at = col;
+        col += width(&s);
+        (at, s)
     });
     let capsules = place_capsules(spec, cols, width, fit);
+    // THE LOAD SLOT SITS AT THE TAIL of the words (ruling 246): right-aligned
+    // against the capsules' clearance (the right margin on a row with none),
+    // so it never moves as the stats or the time words change, and an empty
+    // reservation reads as track before the capsules rather than as a hole
+    // in the middle of the row. Its words are right-aligned in it.
+    let load_slot = extras.load_slot.then(|| {
+        let w = load_slot_width(spec, width);
+        let end = capsules.first().map_or(cols.saturating_sub(MARGIN), |c| {
+            c.col.saturating_sub(BEFORE_CAPSULES)
+        });
+        (end.saturating_sub(w).max(col + 2), w)
+    });
+    let load = load_slot.and_then(|(at, w)| {
+        extras
+            .load
+            .map(|words| (at + w.saturating_sub(width(words)), words))
+    });
     RowLayout {
         kind: spec.kind,
         severity: spec.severity,
         live: spec.live,
-        glyph: (GLYPH_COL, spec.glyph),
+        glyph: (GLYPH_COL, fit.glyph),
         title: (TITLE_COL, fit.title.clone()),
         full_title,
         detail,
@@ -1125,6 +1336,7 @@ fn place(
         track,
         pct,
         elapsed,
+        elapsed_short,
         eta,
         eta_short,
         load,
@@ -1132,6 +1344,88 @@ fn place(
         stats,
         capsules,
     }
+}
+
+/// The percent's own cells inside [`PCT_W`]: `100%` right-aligned in four.
+const PCT_SLOT: usize = 4;
+
+/// What a row WITH A PERCENT paints in its stats slot (design ruling 246):
+/// only the SIZE OF THE WHOLE JOB, and only where the title does not already
+/// say it. The percent already says how far along the work is, so the bytes
+/// done so far repeat it in a second unit: they ride the description, the
+/// `messages` verb and Details, never the glass. Clause by clause (` · `):
+/// a pair `A / B` paints `B`; a count `A of B unit` keeps its one grammar
+/// (`3 of 10 programs` — the count is the one word that agrees with the bar);
+/// a clause whose first figure is still zero (`0 B / 200 MB`, `0 of 10`) is
+/// hidden until the first unit arrives; and a clause whose total the title
+/// already states (`Pasting 4.2 MB` beside `1.1 MB / 4.2 MB`, `Rewrapping
+/// 3.4M lines` beside `1.2M of 3.4M lines`) goes. `None` when nothing is
+/// left.
+#[must_use]
+pub fn job_stats(title: &str, stats: &str) -> Option<String> {
+    let zero = |a: &str| {
+        let a = a.trim();
+        let digits: String = a
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        !digits.is_empty() && digits.chars().all(|c| c == '0' || c == '.')
+    };
+    let clauses: Vec<String> = stats
+        .split(crate::PIECE_SEP)
+        .filter_map(|clause| {
+            let clause = clause.trim();
+            if clause.is_empty() {
+                return None;
+            }
+            let (first, total) = if let Some((a, b)) = clause.split_once(" / ") {
+                (a, b.trim().to_string())
+            } else {
+                let mut w = clause.splitn(3, ' ');
+                match (w.next(), w.next(), w.next()) {
+                    (Some(a), Some("of"), Some(rest)) => (a, rest.to_string()),
+                    _ => ("", clause.to_string()),
+                }
+            };
+            if zero(first) || says_whole(title, &total) {
+                return None;
+            }
+            // A count keeps its grammar; a pair becomes one — a size never
+            // stands bare beside the percent, it says what it is part of
+            // (`33 of 74 MB`, ruling 259; `74 MB` alone read as the size done).
+            Some(match clause.split_once(" / ") {
+                Some((done, _)) => size_of(done.trim(), &total),
+                None => clause.to_string(),
+            })
+        })
+        .collect();
+    (!clauses.is_empty()).then(|| clauses.join(crate::PIECE_SEP))
+}
+
+/// A pair `done / total` as one count (design ruling 259): `33 MB / 74 MB`
+/// → `33 of 74 MB` when both figures share a unit, `512 KB / 1.2 GB` →
+/// `512 KB of 1.2 GB` when they do not.
+fn size_of(done: &str, total: &str) -> String {
+    fn split(s: &str) -> Option<(&str, &str)> {
+        s.rsplit_once(' ')
+            .filter(|(n, u)| n.starts_with(|c: char| c.is_ascii_digit()) && !u.is_empty())
+    }
+    match (split(done), split(total)) {
+        (Some((a, ua)), Some((b, ub))) if ua == ub => format!("{a} of {b} {ub}"),
+        _ => format!("{done} of {total}"),
+    }
+}
+
+/// Whether `title` states `words` as WHOLE words: an occurrence with no
+/// letter, digit or decimal point against either end — `Uploading 12 GB`
+/// does not say `2 GB`, `Pasting 4.2 MB` says `4.2 MB`.
+fn says_whole(title: &str, words: &str) -> bool {
+    let joins = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '.' || c == ',');
+    !words.is_empty()
+        && title.match_indices(words).any(|(at, _)| {
+            !joins(title[..at].chars().next_back())
+                && !joins(title[at + words.len()..].chars().next())
+        })
 }
 
 /// The capsules, right-aligned: long or short as fitted, the implicit
@@ -1213,7 +1507,7 @@ pub(crate) mod tests {
             put(*col, p);
         }
         if let Some((col, words)) = row.load {
-            put(col - 2, "\u{00b7}");
+            // At the tail, no joint (ruling 246).
             put(col, words);
         }
         if let Some((col, s)) = &row.stats {
@@ -1267,7 +1561,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[Intent::OpenPath { path: "/x".into() }]),
                 },
             ),
@@ -1286,7 +1580,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[
                         Intent::OpenSystemPane {
                             pane: "full-disk-access".into(),
@@ -1312,7 +1606,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[Intent::ApplyUpdate { build: 1234 }]),
                 },
             ),
@@ -1331,7 +1625,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[]),
                 },
             ),
@@ -1350,7 +1644,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[Intent::OpenConfigEditor { line: None }]),
                 },
             ),
@@ -1369,7 +1663,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[Intent::OpenSettings {
                         route: "/packages".into(),
                     }]),
@@ -1392,13 +1686,13 @@ pub(crate) mod tests {
                     glyph: '\u{21bb}',
                     title: "Downloading aterm v0.92.0",
                     detail0: None,
-                    meter: Some((Some(420), "45 MB / 74 MB")),
+                    meter: Some((Some(420), "31 MB / 74 MB")),
                     animated: true,
                     level: false,
                     busy: false,
                     eta: true,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[]),
                 },
             ),
@@ -1417,7 +1711,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: true,
                     load: Some(Load::Disk),
-                    load_slot: true,
+                    load_slot: Loads::ALL,
                     capsules: caps(&[]),
                 },
             ),
@@ -1438,7 +1732,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: true,
                     load: None,
-                    load_slot: true,
+                    load_slot: Loads::ALL,
                     capsules: caps(&[]),
                 },
             ),
@@ -1460,7 +1754,7 @@ pub(crate) mod tests {
                     busy: true,
                     eta: false,
                     load: Some(Load::Disk),
-                    load_slot: true,
+                    load_slot: Loads::ALL,
                     capsules: caps(&[]),
                 },
             ),
@@ -1479,7 +1773,7 @@ pub(crate) mod tests {
                     busy: true,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[]),
                 },
             ),
@@ -1498,7 +1792,7 @@ pub(crate) mod tests {
                     busy: false,
                     eta: false,
                     load: None,
-                    load_slot: false,
+                    load_slot: Loads::NONE,
                     capsules: caps(&[Intent::OpenSettings {
                         route: "/packages".into(),
                     }]),
@@ -1621,17 +1915,17 @@ pub(crate) mod tests {
             (
                 "toolchain",
                 160,
-                " ⇣ Installing ALab tools · trust · extracting  42%  512 MB / 1.2 GB                                                                       Packages   Details ›  ",
+                " ⇣ Installing ALab tools · trust · extracting   42%  512 MB of 1.2 GB                                                                     Packages   Details ›  ",
             ),
             (
                 "toolchain",
                 120,
-                " ⇣ Installing ALab tools · trust · extracting  42%  512 MB / 1.2 GB                               Packages   Details ›  ",
+                " ⇣ Installing ALab tools · trust · extracting   42%  512 MB of 1.2 GB                             Packages   Details ›  ",
             ),
             (
                 "toolchain",
                 80,
-                " ⇣ Installing ALab tools · trust · extracting  42%        Packages   Details ›  ",
+                " ⇣ Installing ALab tools · trust · extracting   42%       Packages   Details ›  ",
             ),
             // A moving row's painted excerpt is an ACTION excerpt (the host
             // paints one only where it changes what the person does, ruling
@@ -1641,7 +1935,7 @@ pub(crate) mod tests {
             (
                 "toolchain",
                 60,
-                " ⇣ Installing ALab t… · trust · extracting  42%   Packages  ",
+                " ⇣ Installing ALab … · trust · extracting   42%   Packages  ",
             ),
         ];
         let fixtures = fixtures();
@@ -1722,18 +2016,18 @@ pub(crate) mod tests {
                     spans.push((c - 1, c + chars(p)));
                 }
                 if let Some(c) = row.elapsed {
-                    spans.push((c - 1, c + crate::ELAPSED_W));
+                    spans.push((c - 1, c + row.elapsed_width()));
                 }
                 if let Some(c) = row.eta {
                     spans.push((c - 1, c + row.eta_width()));
                 }
                 if let Some((c, w)) = row.load_slot {
-                    spans.push((c - 3, c + w));
+                    spans.push((c - 2, c + w));
                 }
                 if let (Some((c, w)), Some((slot, sw))) = (row.load, row.load_slot) {
                     assert!(
-                        c == slot && chars(w) <= sw,
-                        "{name}@{cols}: the words sit in their slot"
+                        c + chars(w) == slot + sw && chars(w) <= sw,
+                        "{name}@{cols}: the words sit right-aligned in their slot"
                     );
                 }
                 if let Some((c, s)) = &row.stats {
@@ -1799,7 +2093,10 @@ pub(crate) mod tests {
                         "{name}@{cols}: the action excerpt went before the capsules' long forms: {painted:?}"
                     );
                 }
-                if moving && activity && !action {
+                // The load slot is the activity's — except on a row whose
+                // ETA it bought where none fit the room (ruling 229).
+                let traded = spec.eta && row.eta_short && row.load_slot.is_none();
+                if moving && activity && !action && !traded {
                     assert_eq!(
                         row.load.is_some(),
                         spec.load.is_some(),
@@ -1807,7 +2104,7 @@ pub(crate) mod tests {
                     );
                     assert_eq!(
                         row.load_slot.is_some(),
-                        spec.load.is_some() || spec.load_slot,
+                        spec.load.is_some() || !spec.load_slot.is_empty(),
                         "{name}@{cols}: the load slot is the activity's: {painted:?}"
                     );
                 }
@@ -1852,16 +2149,30 @@ pub(crate) mod tests {
                     }
                     // Every extra goes before the capsules' long forms do (the
                     // meter is not an extra: it is the row's surface) — an
-                    // action excerpt is not one either: it is paid for there.
+                    // action excerpt is not one either: it is paid for there,
+                    // nor a short ETA in the load slot's cells, which the
+                    // head paid for (ruling 229).
                     if short_now {
                         assert!(
                             (row.detail.is_none() || action)
                                 && row.stats.is_none()
-                                && row.eta.is_none()
+                                && (row.eta.is_none() || traded)
                                 && (row.load_slot.is_none() || !action),
                             "{name}@{cols}: an extra beside short capsules: {painted:?}"
                         );
                     }
+                    // The stats' long form goes before their short one, and
+                    // never comes back while narrowing.
+                    let long_stats = spec.meter.map(|(_, s)| s);
+                    let is_short = |r: &RowLayout| {
+                        r.stats
+                            .as_ref()
+                            .is_some_and(|(_, s)| Some(s.as_str()) != long_stats)
+                    };
+                    assert!(
+                        !(is_short(&p) && row.stats.is_some() && !is_short(&row)),
+                        "{name}@{cols}: the stats went long again while narrowing"
+                    );
                     // The ETA's long form goes before its short one, and
                     // never comes back while narrowing.
                     assert!(
@@ -1935,7 +2246,8 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(_, s)| layout_row(s, cols, &chars))
                 .collect();
-            rows.push(layout_row(&overflow_spec(3, Links::Painted), cols, &chars));
+            let words = overflow_words(3, Links::Painted, None);
+            rows.push(layout_row(&overflow_spec(3, &words), cols, &chars));
             let p = Presentation { cols, rows };
             for (r, row) in p.rows.iter().enumerate() {
                 let RowKind::Message(id) = row.kind else {
@@ -1996,7 +2308,12 @@ pub(crate) mod tests {
             "a tick inside the percent is the same key"
         );
         assert_ne!(base, at(430, "512 MB / 1.2 GB"), "a whole percent moves it");
-        assert_ne!(base, at(420, "513 MB / 1.2 GB"), "stats are folded");
+        assert_ne!(
+            base,
+            at(420, "513 MB / 1.2 GB"),
+            "the bytes done are painted as part of the job (`512 MB of 1.2 GB`, ruling 259)"
+        );
+        assert_ne!(base, at(420, "513 MB / 1.3 GB"), "the job's size is folded");
         let other_cols = Presentation {
             cols: 120,
             rows: vec![layout_row(&spec, 120, &chars)],
@@ -2044,7 +2361,7 @@ pub(crate) mod tests {
             level: false,
             eta: false,
             load: None,
-            load_slot: false,
+            load_slot: Loads::NONE,
             capsules: caps(&[]),
         };
         let with_stats = RowSpec {
@@ -2069,16 +2386,17 @@ pub(crate) mod tests {
                     "{cols}: exactly cols wide"
                 );
                 assert_eq!(row.glyph.0, GLYPH_COL, "{cols}");
-                assert!(row.busy, "{cols}: the glyph cell spins wherever the row is");
+                assert!(row.busy, "{cols}: the comet runs wherever the row is");
                 assert!(row.meter.is_none() && row.pct.is_none(), "{cols}: no fill");
                 assert_eq!(row.track, Some((0, cols)), "{cols}: the track is the row");
                 let plain = layout_row(&still, cols, &chars);
                 assert!(!plain.busy && plain.track.is_none(), "{cols}: not busy");
                 // The words pay for the elapsed slot and nothing else: the
-                // busy row's words are the still row's at `1 + ELAPSED_W`
-                // fewer columns, outside the degenerate clip.
-                if row.elapsed.is_some() && cols > 1 + ELAPSED_W {
-                    let narrower = layout_row(&still, cols - 1 - ELAPSED_W, &chars);
+                // busy row's words are the still row's at `1 +` the slot's
+                // width fewer columns, outside the degenerate clip.
+                let slot = 1 + row.elapsed_width();
+                if row.elapsed.is_some() && cols > slot {
+                    let narrower = layout_row(&still, cols - slot, &chars);
                     let excerpt = |r: &RowLayout| r.detail.as_ref().map_or(0, |d| chars(&d.1));
                     assert!(
                         excerpt(&row) >= excerpt(&narrower),
@@ -2191,7 +2509,7 @@ pub(crate) mod tests {
             busy: false,
             eta: false,
             load: None,
-            load_slot: false,
+            load_slot: Loads::NONE,
             capsules: vec![CapsuleSpec::details(0)],
         };
         let mut pattern = String::new();
@@ -2247,7 +2565,7 @@ pub(crate) mod tests {
                 level: false,
                 eta: false,
                 load: None,
-                load_slot: false,
+                load_slot: Loads::NONE,
                 capsules: vec![
                     CapsuleSpec::authored(&Intent::OpenConfigEditor { line: None }, 0),
                     CapsuleSpec::details(0),
@@ -2296,62 +2614,62 @@ pub(crate) mod tests {
             (
                 "download",
                 60,
-                " ↻ Downloading aterm v0.92.0  42%                Details ›  ",
+                " ↻ Downloading aterm v0.92.0   42%               Details ›  ",
             ),
             (
                 "download",
                 80,
-                " ↻ Downloading aterm v0.92.0  42%               45 MB / 74 MB        Details ›  ",
+                " ↻ Downloading aterm v0.92.0   42%              31 of 74 MB          Details ›  ",
             ),
             (
                 "download",
                 120,
-                " ↻ Downloading aterm v0.92.0  42%               45 MB / 74 MB                                                Details ›  ",
+                " ↻ Downloading aterm v0.92.0   42%              31 of 74 MB                                                  Details ›  ",
             ),
             (
                 "download",
                 160,
-                " ↻ Downloading aterm v0.92.0  42%               45 MB / 74 MB                                                                                        Details ›  ",
+                " ↻ Downloading aterm v0.92.0   42%              31 of 74 MB                                                                                          Details ›  ",
             ),
             (
                 "first-run",
                 60,
-                " ⇣ Installing ALab tools  42% · disk busy        Details ›  ",
+                " ⇣ Installing ALab tools   42%                   Details ›  ",
             ),
             (
                 "first-run",
                 80,
-                " ⇣ Installing ALab tools  42%              · disk busy               Details ›  ",
+                " ⇣ Installing ALab tools   42%                           disk busy   Details ›  ",
             ),
             (
                 "first-run",
                 120,
-                " ⇣ Installing ALab tools  42%              · disk busy     3 of 10 programs                                  Details ›  ",
+                " ⇣ Installing ALab tools   42%              3 of 10 programs                                     disk busy   Details ›  ",
             ),
             (
                 "first-run",
                 160,
-                " ⇣ Installing ALab tools  42%              · disk busy     3 of 10 programs                                                                          Details ›  ",
+                " ⇣ Installing ALab tools   42%              3 of 10 programs                                                                             disk busy   Details ›  ",
             ),
             (
                 "first-run-lull",
                 60,
-                " ⇣ Installing ALab tools  42%                    Details ›  ",
+                " ⇣ Installing ALab tools   42%                   Details ›  ",
             ),
             (
                 "first-run-lull",
                 80,
-                " ⇣ Installing ALab tools  42%                                        Details ›  ",
+                " ⇣ Installing ALab tools   42%                                       Details ›  ",
             ),
             (
                 "first-run-lull",
                 120,
-                " ⇣ Installing ALab tools  42%                              3 of 10 programs                                  Details ›  ",
+                " ⇣ Installing ALab tools   42%              3 of 10 programs                                                 Details ›  ",
             ),
             (
                 "first-run-lull",
                 160,
-                " ⇣ Installing ALab tools  42%                              3 of 10 programs                                                                          Details ›  ",
+                " ⇣ Installing ALab tools   42%              3 of 10 programs                                                                                         Details ›  ",
             ),
             // An ACTION excerpt (M13, ruling 148) outranks the load slot and
             // `Details ›`, and the title elides for it — at 80 it used to be
@@ -2359,7 +2677,7 @@ pub(crate) mod tests {
             (
                 "action-excerpt",
                 60,
-                " ⇣ Installing Command Line T… · enter your password…        ",
+                " ⇣ Installing Command Line… · enter your password…          ",
             ),
             (
                 "action-excerpt",
@@ -2374,7 +2692,7 @@ pub(crate) mod tests {
             (
                 "action-excerpt",
                 160,
-                " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog        · disk busy                                           Details ›  ",
+                " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog                                                  disk busy   Details ›  ",
             ),
             (
                 "busy-excerpt",
@@ -2384,7 +2702,7 @@ pub(crate) mod tests {
             (
                 "busy-excerpt",
                 80,
-                " ↑ Finishing aterm v0.92.0 · keys typed now arrive in a…             Details ›  ",
+                " ↑ Finishing aterm v0.92.0 · keys typed now arrive in…               Details ›  ",
             ),
             (
                 "busy-excerpt",
@@ -2399,22 +2717,22 @@ pub(crate) mod tests {
             (
                 "held-meter",
                 60,
-                " ⚠ ALab tools  43%                    Packages   Details ›  ",
+                " ⚠ ALab tools   43%                   Packages   Details ›  ",
             ),
             (
                 "held-meter",
                 80,
-                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB  43%   Packages   Details ›  ",
+                " ⚠ ALab tools · trust — extracting 120 MB / 900…   43%    Packages   Details ›  ",
             ),
             (
                 "held-meter",
                 120,
-                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB  43%  3 of 10                                  Packages   Details ›  ",
+                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB   43%  3 of 10                                 Packages   Details ›  ",
             ),
             (
                 "held-meter",
                 160,
-                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB  43%  3 of 10                                                                          Packages   Details ›  ",
+                " ⚠ ALab tools · trust — extracting 120 MB / 900 MB   43%  3 of 10                                                                         Packages   Details ›  ",
             ),
         ];
         let fixtures = motion_fixtures();
@@ -2456,19 +2774,35 @@ pub(crate) mod tests {
         assert!(wide.eta.is_some() && !wide.eta_short, "long at 120");
         assert_eq!(wide.eta_width(), ETA_W);
         // Narrowing: long, then short (beside the load words, starving the
-        // excerpt and the stats), then gone.
+        // excerpt and the stats), then short in the load slot's cells (how
+        // long outranks the load words, ruling 229), then gone with the
+        // activity's words.
         let short: Vec<usize> = (20..=120).filter(|c| at(*c).eta_short).collect();
         assert!(
             !short.is_empty(),
             "the short form is laid out at some width"
         );
-        for cols in short {
+        for &cols in &short {
             let narrow = at(cols);
             assert_eq!(narrow.eta_width(), ETA_SHORT_W, "@{cols}");
             assert!(narrow.detail.is_none() && narrow.stats.is_none(), "@{cols}");
-            assert!(narrow.load.is_some(), "@{cols}: …beside the load words");
         }
-        assert_eq!(at(40).eta, None, "and gone at 40");
+        assert!(
+            short.iter().any(|c| at(*c).load.is_some()),
+            "short beside the load words"
+        );
+        assert!(
+            short.iter().any(|c| at(*c).load_slot.is_none()),
+            "short in the load slot's cells"
+        );
+        for cols in 20..=120 {
+            let row = at(cols);
+            assert_eq!(
+                row.eta.is_some(),
+                row.pct.is_some(),
+                "@{cols}: the ETA goes only with the activity's words"
+            );
+        }
     }
 
     /// An echo row is not pressable: every column of it is `Hit::Nothing`.
@@ -2487,5 +2821,281 @@ pub(crate) mod tests {
         for col in 0..90 {
             assert_eq!(p.hit(0, col), Hit::Nothing, "col {col}");
         }
+    }
+
+    /// THE LOAD SLOT IS SIZED TO THE ROW'S OWN LOADS (design ruling 221): a
+    /// busy row that declared `CPU busy` reserves 2 + 8 cells at the tail
+    /// of its words (ruling 246), not the 2 + 12 of `network busy`, so at the
+    /// default 80 columns its stats keep their cells where the slot sized for
+    /// every load starved them. A row whose loads include the
+    /// network (the ALab tools pass) keeps the widest slot, and at 80 its
+    /// ETA outranks its stats (the owner's "how long to wait"): its count's
+    /// short form, `3/10 programs`, does not fit there, so the count goes
+    /// whole rather than as a bare `3/10` (rulings 223 and 248), and is
+    /// whole at 120.
+    #[test]
+    fn the_load_slot_is_sized_to_the_rows_declared_loads() {
+        // A busy build that declared its CPU (a measured level — the strain
+        // row — has no load slot at all: its title names the load, ruling
+        // 243).
+        let strain = |slot: Loads| RowSpec {
+            kind: RowKind::Message(id(20)),
+            severity: Severity::Info,
+            live: true,
+            glyph: '\u{2139}',
+            title: "Building aterm and tools",
+            detail0: None,
+            meter: Some((None, "3 of 10 targets")),
+            animated: false,
+            level: false,
+            busy: true,
+            eta: false,
+            load: Some(Load::Cpu),
+            load_slot: slot,
+            capsules: caps(&[]),
+        };
+        let cpu = Loads::NONE.with(Load::Cpu);
+        let pinned: &[(Loads, usize, &str)] = &[
+            (
+                cpu,
+                60,
+                " ℹ Building aterm and tools           CPU busy   Details ›  ",
+            ),
+            (
+                cpu,
+                80,
+                " ℹ Building aterm and tools             3 of 10 targets   CPU busy   Details ›  ",
+            ),
+            (
+                cpu,
+                120,
+                " ℹ Building aterm and tools             3 of 10 targets                                           CPU busy   Details ›  ",
+            ),
+            (
+                Loads::ALL,
+                80,
+                " ℹ Building aterm and tools             3/10 targets      CPU busy   Details ›  ",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for &(slot, cols, want) in pinned {
+            let row = layout_row(&strain(slot), cols, &chars);
+            if render(&row, cols) != want {
+                failures.push(format!("{slot:?}@{cols}: {:?}", render(&row, cols)));
+            }
+            assert_eq!(render(&row, cols).chars().count(), cols);
+        }
+        assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
+        // The slot's width is the declared words', joint apart…
+        let slot_w = |slot: Loads, cols: usize| {
+            layout_row(&strain(slot), cols, &chars)
+                .load_slot
+                .map(|(_, w)| w)
+        };
+        assert_eq!(slot_w(cpu, 80), Some(chars("CPU busy")));
+        assert_eq!(slot_w(Loads::ALL, 80), Some(chars("network busy")));
+        assert_eq!(
+            slot_w(cpu.with(Load::Memory), 80),
+            Some(chars("memory full")),
+            "a second kind widens it to the wider words"
+        );
+        // …and the words leaving keep the declared slot: nothing moves.
+        let mut lull = strain(cpu);
+        lull.load = None;
+        let (with, without) = (
+            layout_row(&strain(cpu), 80, &chars),
+            layout_row(&lull, 80, &chars),
+        );
+        assert_eq!(with.load_slot, without.load_slot);
+        assert_eq!(with.stats, without.stats);
+        assert!(without.load.is_none());
+        // The pass declares network, disk and CPU: `network busy` wide.
+        let pass = |cols: usize| {
+            layout_row(
+                &RowSpec {
+                    kind: RowKind::Message(id(21)),
+                    severity: Severity::Info,
+                    live: true,
+                    glyph: '\u{21e3}',
+                    title: "Installing ALab tools",
+                    detail0: None,
+                    meter: Some((Some(420), "3 of 10 programs")),
+                    animated: true,
+                    level: false,
+                    busy: false,
+                    eta: true,
+                    load: Some(Load::Disk),
+                    load_slot: [Load::Network, Load::Disk, Load::Cpu].into_iter().collect(),
+                    capsules: caps(&[]),
+                },
+                cols,
+                &chars,
+            )
+        };
+        assert_eq!(
+            pass(80).load_slot.map(|(_, w)| w),
+            Some(chars("network busy"))
+        );
+        // 80 keeps the ETA; the count's short form, `3/10 programs`, does
+        // not fit beside it, and a bare `3/10` never stands in for it
+        // (ruling 248): the stats go whole. 120 keeps the long count; 60
+        // neither.
+        assert_eq!(
+            render(&pass(80), 80),
+            " \u{21e3} Installing ALab tools   42%                           disk busy   Details ›  "
+        );
+        assert!(pass(80).eta.is_some(), "80: the ETA first");
+        assert_eq!(pass(80).stats, None);
+        assert!(
+            pass(120).eta.is_some()
+                && pass(120).stats.map(|s| s.1).as_deref() == Some("3 of 10 programs"),
+            "120: both, long"
+        );
+        assert!(pass(60).stats.is_none());
+        // The short form is a count's with its unit word (ruling 248): the
+        // numbers never stand without what they count.
+        assert_eq!(
+            short_stats("3 of 10 programs").as_deref(),
+            Some("3/10 programs")
+        );
+        assert_eq!(
+            short_stats("5.9 of 8 cores").as_deref(),
+            Some("5.9/8 cores")
+        );
+        assert_eq!(short_stats("23 of 24 GB used").as_deref(), Some("23/24 GB"));
+        for none in [
+            "31 MB / 74 MB",
+            "  5 MB / 1.2 GB",
+            "one of two",
+            "3 of",
+            "",
+            "of 3 of 4",
+            "10 programs \u{b7} ",
+            // A count with no unit has no short form: it goes whole.
+            "1,200 of 3,400",
+            "3 of 10",
+        ] {
+            assert_eq!(short_stats(none), None, "{none:?}");
+        }
+        // Several clauses keep the last, where the size of the wait is
+        // written (ruling 229); a leading count with its unit still wins.
+        assert_eq!(
+            short_stats("10 programs \u{b7} ~3 GB").as_deref(),
+            Some("~3 GB")
+        );
+        assert_eq!(
+            short_stats("16 GB \u{b7} 3 of 10 programs").as_deref(),
+            Some("3/10 programs")
+        );
+        assert_eq!(
+            short_stats("throttled \u{b7} 6 of 8 cores").as_deref(),
+            Some("6/8 cores")
+        );
+        // A unit-less leading count is no short form; the last clause is.
+        assert_eq!(
+            short_stats("3 of 10 \u{b7} 512 MB / 1.2 GB").as_deref(),
+            Some("512 MB / 1.2 GB")
+        );
+    }
+
+    /// HOW LONG OUTRANKS THE LOAD WORDS (ruling 229; the owner: "how long to
+    /// wait and for what"). A moving row with an ETA and a load slot keeps
+    /// both while the ETA fits the room; where no ETA fits, the slot's cells
+    /// buy the short one — at 60 `Updating ALab tools 66% ~1 min` rather
+    /// than `66% · network busy`. Each is a monotone flag as the row
+    /// narrows, and the load words arriving or leaving never move a cell. A
+    /// busy Install's announced size survives at 80 in its short form.
+    #[test]
+    fn the_eta_outranks_the_load_words_as_the_row_narrows() {
+        let spec = |load: Option<Load>| RowSpec {
+            kind: RowKind::Message(id(22)),
+            severity: Severity::Info,
+            live: true,
+            glyph: '\u{2193}',
+            title: "Updating ALab tools",
+            detail0: None,
+            meter: Some((Some(660), "1 of 2 programs")),
+            animated: true,
+            level: false,
+            busy: false,
+            eta: true,
+            load,
+            load_slot: [Load::Network, Load::Disk, Load::Cpu].into_iter().collect(),
+            capsules: caps(&[]),
+        };
+        let at60 = layout_row(&spec(Some(Load::Network)), 60, &chars);
+        assert!(at60.eta.is_some() && at60.eta_short, "60: the short ETA");
+        assert!(
+            at60.load.is_none() && at60.load_slot.is_none(),
+            "60: no load words"
+        );
+        let at80 = layout_row(&spec(Some(Load::Network)), 80, &chars);
+        assert!(at80.eta.is_some() && !at80.eta_short, "80: the long ETA");
+        assert!(at80.load.is_some(), "80: and the load words");
+        let (mut eta_gone, mut load_gone, mut short) = (false, false, false);
+        for cols in (1..=160).rev() {
+            let with = layout_row(&spec(Some(Load::Network)), cols, &chars);
+            let without = layout_row(&spec(None), cols, &chars);
+            assert_eq!(
+                with.load_slot, without.load_slot,
+                "{cols}: words never re-lay"
+            );
+            assert_eq!(with.eta, without.eta, "{cols}");
+            assert_eq!(with.stats, without.stats, "{cols}");
+            if with.pct.is_some() {
+                assert!(
+                    with.eta.is_some() || with.load_slot.is_none(),
+                    "{cols}: {with:?}"
+                );
+            }
+            assert!(
+                !(eta_gone && with.eta.is_some()),
+                "{cols}: the ETA came back"
+            );
+            assert!(
+                !(load_gone && with.load_slot.is_some()),
+                "{cols}: the load came back"
+            );
+            assert!(
+                !(short && with.eta.is_some() && !with.eta_short),
+                "{cols}: long again"
+            );
+            eta_gone |= with.eta.is_none();
+            load_gone |= with.load_slot.is_none();
+            short |= with.eta_short;
+            assert!(
+                render(&with, cols).chars().count() == cols,
+                "{cols}: exactly the row"
+            );
+        }
+        // The busy Install: `10 programs · ~3 GB` at 120, `~3 GB` at 80.
+        let install = |cols: usize| {
+            layout_row(
+                &RowSpec {
+                    kind: RowKind::Message(id(23)),
+                    severity: Severity::Info,
+                    live: true,
+                    glyph: '\u{21e3}',
+                    title: "Installing ALab tools",
+                    detail0: None,
+                    meter: Some((None, "10 programs \u{b7} ~3 GB")),
+                    animated: false,
+                    level: false,
+                    busy: true,
+                    eta: false,
+                    load: Some(Load::Network),
+                    load_slot: [Load::Network, Load::Disk, Load::Cpu].into_iter().collect(),
+                    capsules: caps(&[]),
+                },
+                cols,
+                &chars,
+            )
+        };
+        assert_eq!(
+            install(120).stats.map(|s| s.1).as_deref(),
+            Some("10 programs \u{b7} ~3 GB")
+        );
+        assert_eq!(install(80).stats.map(|s| s.1).as_deref(), Some("~3 GB"));
+        assert!(install(80).load.is_some(), "80: the load words too");
     }
 }

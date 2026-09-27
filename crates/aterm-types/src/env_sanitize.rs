@@ -32,8 +32,7 @@ pub const ENV_DENY_PREFIXES: &[&str] = &[
 // it spawned. ALL of these are deny-listed (below) so an INHERITED copy never
 // transitively leaks past one hop; each direct child gets a FRESH set re-injected
 // via `env_add` (which `build_child_env` applies on top of the stripped inherited
-// env). The control-socket vars are deny-listed too so a child never inherits —
-// and thus never hijacks — the parent's explicit socket path.
+// env).
 // ---------------------------------------------------------------------------
 
 /// The child adopts this as its ROOT session id (`s-<20hex>`), so the outer's
@@ -83,13 +82,15 @@ pub const ENV_MUX_BASE: &str = "ATERM_MUX_BASE";
 /// Deny-listing keeps cross-hop inheritance stripped; only the same-shell relaunch
 /// re-reads it.
 pub const ENV_EDGE_TOKENS: &str = "ATERM_EDGE_TOKENS";
-/// A `ReadScreen` `EdgeToken` (`<64hex>`), parent → child. FALLBACK env channel
-/// used only when no private socket dir exists for the [`ENV_EDGE_TOKENS`] file
-/// (then the tokens are env-visible, with the documented same-uid caveat).
+/// The RETIRED env channel for a `ReadScreen` `EdgeToken` (`<64hex>`). No aterm
+/// writes or reads it any more — the secrets travel only through the
+/// [`ENV_EDGE_TOKENS`] file (audit finding F1; the env fallback was deleted
+/// 2026-09-25) — but a value an older aterm injected is still a bearer secret,
+/// so the name stays deny-listed and never propagates past one hop.
 pub const ENV_EDGE_READ: &str = "ATERM_EDGE_READ";
-/// A `WriteInput` `EdgeToken` (`<64hex>`), parent → child. Fallback env channel.
+/// The retired env channel for a `WriteInput` `EdgeToken`; see [`ENV_EDGE_READ`].
 pub const ENV_EDGE_WRITE: &str = "ATERM_EDGE_WRITE";
-/// A `Signal` `EdgeToken` (`<64hex>`), parent → child. Fallback env channel.
+/// The retired env channel for a `Signal` `EdgeToken`; see [`ENV_EDGE_READ`].
 pub const ENV_EDGE_SIGNAL: &str = "ATERM_EDGE_SIGNAL";
 
 /// The sid a CONTROLLER session was spawned to observe (session connections,
@@ -101,43 +102,23 @@ pub const ENV_EDGE_SIGNAL: &str = "ATERM_EDGE_SIGNAL";
 /// hint never leaks past one hop — a grandchild is not the controller.
 pub const ENV_OBSERVE_SESSION_ID: &str = "ATERM_OBSERVE_SESSION_ID";
 
-// ---------------------------------------------------------------------------
-// L3 network-drive selectors (aterm-gui `net_listen`): the bind address + the
-// operator's TLS cert/key PATHS that opt a ROOT instance into a network control
-// endpoint. ALL deny-listed so a nested aterm never (a) inherits the address and
-// stands up a SECOND network-reachable Owner-control surface, nor (b) fans the
-// operator's private-key path into every descendant. Only a top-level process
-// the operator explicitly configured ever sees them.
-// ---------------------------------------------------------------------------
-
-/// The network-drive listener bind address (e.g. `0.0.0.0:7100`). Deny-listed.
-pub const ENV_NET_LISTEN: &str = "ATERM_NET_LISTEN";
-/// Path to the operator's server certificate (DER) for the network listener.
-pub const ENV_NET_CERT: &str = "ATERM_NET_CERT";
-/// Path to the operator's server private key (PKCS#8 DER) for the listener.
-pub const ENV_NET_KEY: &str = "ATERM_NET_KEY";
-
 /// Exact env vars that should not leak into child shells.
 ///
 /// These are denied by exact name because other `ATERM_*` variables are
-/// required for shell integration inside the child shell. Beyond the containment
-/// vars, the recursion-provisioning identity/edge vars and the control-socket
-/// selectors are denied so they are never INHERITED across a hop (each direct
-/// child is re-injected a fresh set; see the consts above and `build_child_env`).
+/// required for shell integration inside the child shell. The
+/// recursion-provisioning identity/edge vars are denied so they are never
+/// INHERITED across a hop (each direct child is re-injected a fresh set; see the
+/// consts above and `build_child_env`), and the retired edge-secret names so a
+/// value an older aterm injected stops at the hop.
+///
+/// The launch KNOBS that used to sit here — `ATERM_CONTAINMENT_MODE`, the
+/// control-socket selectors (now `--control-sock`/`--no-control-sock`), the
+/// network listener's `ATERM_NET_LISTEN`/`_CERT`/`_KEY` — are gone (2026-09-24):
+/// each is a launch flag or an aterm.toml key now, read by nothing from the
+/// environment, so there is no decision of a nested aterm to protect.
 pub const ENV_DENY_VARS: &[&str] = &[
-    "ATERM_CONTAINMENT_MODE",
-    // (There is no `ATERM_CONTAINMENT_ALLOWLIST`. It was deny-listed here and
-    // advertised in aterm-gui(1) as a containment knob, but no parser, field, or
-    // env read for it has ever existed in `aterm-containment` — the allowlist is
-    // loaded from TOML via `AllowlistConfig`, never from the environment.
-    // Denying a name nothing reads defends nothing and documented a knob users
-    // could not use.)
-    // Control-socket selectors: never inherit, so a nested aterm rebinds its OWN
-    // per-instance socket and never unlinks/steals the parent's explicit path.
-    "ATERM_CONTROL_SOCK",
-    "ATERM_NO_CONTROL_SOCK",
     // The update DEVELOPMENT SEAMS (`dev_seam!`): never inherit into child SHELLS,
-    // for the same one-hop reason as the socket selectors — an aterm launched from an
+    // for the same one-hop reason as the provisioning vars below — an aterm launched from an
     // aterm shell makes its own update decisions, never under a QA seam the parent's
     // environment happened to carry. The 2026-09-01 field bug was exactly this shape:
     // an inherited-but-empty selector rerouted the updater of a daily driver for its
@@ -155,6 +136,12 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // The strain row's fake saturated reading: a nested aterm never inherits a
     // demo's fake load.
     "ATERM_DEBUG_STRAIN",
+    // The Paste gesture's file-fed clipboard (lib.rs `debug_paste_text`), for live
+    // checks of a large paste without the owner's clipboard.
+    "ATERM_DEBUG_PASTE_FILE",
+    // A fresh shell spawned as a lost-nonce adopted one (spawn.rs
+    // `debug_lost_shell_nonce`): a nested aterm's shells are its own.
+    "ATERM_DEBUG_LOST_SHELL_NONCE",
     "ATERM_UPDATE_ROOT",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
@@ -169,18 +156,16 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // instructions. A token a shell should carry belongs in that shell's own rc.
     "ATERM_UPDATE_TOKEN",
     "ATPKG_TOKEN",
-    // Network-drive selectors: never inherit, so a nested aterm cannot open a
-    // second network control surface and the operator's key path is not fanned
-    // into every descendant (only the explicitly-configured root binds).
-    ENV_NET_LISTEN,
-    ENV_NET_CERT,
-    ENV_NET_KEY,
     // Recursion provisioning (re-injected fresh per direct child via env_add).
     ENV_SESSION_ID,
     ENV_LAUNCH_NONCE,
     ENV_PARENT_SESSION_ID,
     ENV_MUX_BASE,
     ENV_EDGE_TOKENS,
+    // The RETIRED edge-secret env channel (2026-09-25): nothing injects or reads
+    // these any more — the secrets travel only in the `ENV_EDGE_TOKENS` file — but
+    // a value an older aterm injected is still a bearer secret, so, like the
+    // retired credentials above, the names stay denied.
     ENV_EDGE_READ,
     ENV_EDGE_WRITE,
     ENV_EDGE_SIGNAL,
@@ -218,7 +203,7 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_FABRIC_COMMAND",
 ];
 
-/// Returns `true` if `key` matches a deny-listed AI or containment env var.
+/// Returns `true` if `key` matches a deny-listed AI or provisioning env var.
 #[must_use]
 // #[inline] so the MIR crosses the crate boundary: callers' Trust gates
 // (aterm-pty) bundle and VERIFY this body instead of assuming an absent
@@ -267,8 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ai_env_var_strips_containment_vars_but_preserves_shell_integration_vars() {
-        assert!(is_ai_env_var("ATERM_CONTAINMENT_MODE"));
+    fn test_is_ai_env_var_preserves_shell_integration_vars() {
         assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
         assert!(!is_ai_env_var("ATERM_ORIGINAL_ZDOTDIR"));
         assert!(!is_ai_env_var("ATERM_UNSET_ZDOTDIR"));
@@ -296,14 +280,13 @@ mod tests {
         assert!(!is_ai_env_var("ATERM_REROUTE_DIR"));
     }
 
-    /// Item 4/5: the recursion-provisioning identity/edge vars and the
-    /// control-socket selectors are denied by exact name, so an INHERITED copy
-    /// never leaks past one hop (each direct child is re-injected a fresh set).
+    /// Item 4/5: the recursion-provisioning identity/edge vars are denied by
+    /// exact name, so an INHERITED copy never leaks past one hop (each direct
+    /// child is re-injected a fresh set) — and so are the retired edge-secret
+    /// names, which nothing injects any more but an older aterm did.
     #[test]
     fn test_recursion_provisioning_vars_are_denied_by_name() {
         for v in [
-            "ATERM_CONTROL_SOCK",
-            "ATERM_NO_CONTROL_SOCK",
             ENV_SESSION_ID,
             ENV_LAUNCH_NONCE,
             ENV_PARENT_SESSION_ID,
@@ -336,6 +319,7 @@ mod tests {
             "ATERM_DEBUG_RELAUNCH_NUDGE",
             "ATERM_DEBUG_STATUS_BARS",
             "ATERM_DEBUG_STRAIN",
+            "ATERM_DEBUG_LOST_SHELL_NONCE",
             "ATERM_UPDATE_ROOT",
             "ATERM_HANDOFF_READY_TIMEOUT_MS",
             "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
@@ -367,16 +351,19 @@ mod tests {
         }
     }
 
-    /// L3 network drive: the listener bind address + the operator's TLS cert/key
-    /// PATHS must be stripped on every child hop, so a nested aterm can neither
-    /// open a second network control surface nor inherit the operator's key path.
+    /// The launch knobs retired on 2026-09-24 are read by nothing, so they have
+    /// no inheritance to stop: none stays on the list.
     #[test]
-    fn test_network_drive_selectors_are_denied_by_name() {
-        for v in [ENV_NET_LISTEN, ENV_NET_CERT, ENV_NET_KEY] {
-            assert!(
-                is_ai_env_var(v),
-                "{v} must be deny-listed so children never inherit it"
-            );
+    fn retired_launch_knobs_are_not_deny_listed() {
+        for retired in [
+            "ATERM_CONTAINMENT_MODE",
+            "ATERM_CONTROL_SOCK",
+            "ATERM_NO_CONTROL_SOCK",
+            "ATERM_NET_LISTEN",
+            "ATERM_NET_CERT",
+            "ATERM_NET_KEY",
+        ] {
+            assert!(!ENV_DENY_VARS.contains(&retired), "{retired}");
         }
     }
 

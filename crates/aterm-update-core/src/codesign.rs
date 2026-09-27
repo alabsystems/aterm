@@ -128,17 +128,14 @@ pub fn developer_id_requirement(team: &str) -> Result<String, CodesignError> {
     ))
 }
 
-/// Verify that `path` is signed with a Developer ID of `team`, within [`VERIFY_TIMEOUT`].
-/// `deep` also verifies nested code (a bundle); a single Mach-O needs none.
-///
-/// # Errors
-/// See [`verify_developer_id_until`].
-pub fn verify_developer_id(path: &Path, team: &str, deep: bool) -> Result<(), CodesignError> {
+/// [`verify_developer_id_until`] within [`VERIFY_TIMEOUT`] — the tests' spelling.
+#[cfg(test)]
+fn verify_developer_id(path: &Path, team: &str, deep: bool) -> Result<(), CodesignError> {
     verify_developer_id_until(path, team, deep, Instant::now() + VERIFY_TIMEOUT)
 }
 
-/// [`verify_developer_id`], finished by `deadline` — for a caller whose own budget binds
-/// sooner than [`VERIFY_TIMEOUT`].
+/// Verify that `path` is signed with a Developer ID of `team`, finished by `deadline`.
+/// `deep` also verifies nested code (a bundle); a single Mach-O needs none.
 ///
 /// # Errors
 /// [`CodesignError::InvalidTeam`] before anything runs; [`CodesignError::Unsupported`]

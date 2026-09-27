@@ -31,11 +31,12 @@
 //!     the freeze-safety-gate build (line 111 of the hook) … So the CENSUS does
 //!     run pre-push". From 2026-08-24 to 2026-09-17 that hook ran NOTHING: its
 //!     whole body was one printf and `exit 0`, so this census had no pre-push
-//!     enforcement at all while this file said it did. Since 2026-09-17 the
-//!     hook gates again by READING A RECEIPT rather than running a build
-//!     (`crates/aterm-verify/src/receipt.rs`), so the census reaches a push
-//!     through the merge contract that wrote the receipt — never through the
-//!     hook running it.
+//!     enforcement at all while this file said it did. From 2026-09-17 the
+//!     hook read a RECEIPT rather than running a build
+//!     (`crates/aterm-verify/src/receipt.rs`), and on 2026-09-25 it was
+//!     deleted (no hooks, by the owner's mandate): the census reaches a commit
+//!     through the merge contract and the release cut's freeze-safety gate —
+//!     never through a hook.
 //!   * `tools/freeze-safety-gate/build.rs` — the SAME `cargo build` that runs
 //!     the temporal proof gate runs this census and fails the compile on any
 //!     obligation violation. That fusion is what makes the census AUTOMATIC:

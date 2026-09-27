@@ -857,11 +857,6 @@ impl RowAnchor {
         }
     }
 
-    /// Whether row content can be judged against upstream here at all.
-    pub fn available(&self) -> bool {
-        matches!(self.source, AnchorSource::Cache(_))
-    }
-
     /// The reason there is no anchor, for the verdict text.
     pub fn why_absent(&self) -> Option<&str> {
         match &self.source {
@@ -2627,7 +2622,10 @@ mod tests {
         let fx = good_fixture("row-features");
         assert!(emit_fx(&fx).0.ok);
         let anchor = RowAnchor::open(&fx.cargo_home());
-        assert!(anchor.available(), "the fixture cargo home must anchor");
+        assert!(
+            anchor.why_absent().is_none(),
+            "the fixture cargo home must anchor"
+        );
         assert!(verify(&fx.root(), &fx.out(), &anchor).unwrap().ok);
 
         let (name, _, _) = PKGS[0];

@@ -16,3 +16,10 @@ description = "aterm's first-party Objective-C runtime layer: typed message send
 
 [lints]
 workspace = true
+
+# TEST-ONLY. The shipped layer keeps its zero dependencies; the Tier-1 bind of
+# the run-loop wake timer (`tests/conformance_wake_timer.rs`) steps the derived
+# `run_loop_waker_model` beside the real timer, and that model lives in
+# `aterm-spec` (first-party, no dependency on this crate).
+[dev-dependencies]
+aterm-spec = { workspace = true }

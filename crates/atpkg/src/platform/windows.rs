@@ -615,3 +615,28 @@ pub fn exec_or_run(command: &mut Command) -> io::Error {
         Err(e) => e,
     }
 }
+
+/// [`exec_or_run`]'s rule for a holder that waits on its child (`aterm pkg lease`): the
+/// console's Ctrl-C belongs to the child ([`swallow_ctrl_c`], installed after the spawn),
+/// and this process lives on to collect its status. Unverified on a Windows host, like
+/// everything here.
+///
+/// # Errors
+/// The wait's.
+pub fn wait_standing_aside(
+    child: &mut std::process::Child,
+) -> io::Result<std::process::ExitStatus> {
+    let _ = add_ctrl_handler(swallow_ctrl_c);
+    child.wait()
+}
+
+/// The child's exit code as this process's (a Windows status is always a code).
+#[must_use]
+pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCode {
+    std::process::ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code & 0xff).ok())
+            .unwrap_or(1),
+    )
+}

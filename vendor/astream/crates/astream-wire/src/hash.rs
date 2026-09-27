@@ -17,12 +17,15 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The CRC-32/IEEE lookup table (Sarwate's algorithm), built at COMPILE TIME
-/// from the reflected polynomial. `const fn`, so the 1 KiB table lands in
-/// `.rodata` with zero runtime init and no `once_cell`/`lazy_static` — the
-/// per-byte bit-loop is paid once, by the compiler, not on every frame.
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
+/// The CRC-32/IEEE slicing-by-8 tables, built at COMPILE TIME from the
+/// reflected polynomial. `const fn`, so the 8 KiB of tables land in `.rodata`
+/// with zero runtime init and no `once_cell`/`lazy_static`.
+///
+/// `T[0]` is the classic Sarwate table (the CRC of each single byte);
+/// `T[k][i]` is the CRC of byte `i` followed by `k` zero bytes, so one
+/// lookup in each of the eight tables advances the CRC by eight bytes at once.
+const fn crc32_tables() -> [[u32; 256]; 8] {
+    let mut t = [[0u32; 256]; 8];
     let mut i = 0usize;
     while i < 256 {
         let mut crc = i as u32;
@@ -32,29 +35,54 @@ const fn crc32_table() -> [u32; 256] {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
             j += 1;
         }
-        table[i] = crc;
+        t[0][i] = crc;
         i += 1;
     }
-    table
+    let mut k = 1usize;
+    while k < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev >> 8) ^ t[0][(prev & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
 }
 
-const CRC32_TABLE: [u32; 256] = crc32_table();
+const CRC32_TABLES: [[u32; 256]; 8] = crc32_tables();
 
 /// CRC-32, IEEE 802.3 polynomial (reflected `0xEDB88320`). Used for frame
 /// payload integrity — computed on every frame encode and decode, so this is
 /// the broker's per-record hot path.
 ///
-/// Table-driven (one lookup per byte) rather than bitwise (eight shifts per
-/// byte); the index `(crc ^ byte) & 0xFF` is always in `0..=255`, so the
-/// `[u32; 256]` lookup is total. Output is byte-identical to the bitwise
-/// reference — the canonical `123456789 -> 0xCBF43926` vector and a differential
-/// test against that reference both pin it.
+/// Slicing-by-8: eight independent table lookups per 8-byte chunk, so the
+/// loads are not one serial dependency chain as in the one-lookup-per-byte
+/// Sarwate form (still used for the final `len % 8` bytes). Every index is a
+/// byte (`& 0xFF` or `>> 24`), so each `[u32; 256]` lookup is total. Output is
+/// byte-identical to the bitwise reference — the canonical
+/// `123456789 -> 0xCBF43926` vector and a differential test against that
+/// reference both pin it.
 #[must_use]
 pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let t = &CRC32_TABLES;
     let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        let idx = ((crc ^ b as u32) & 0xFF) as usize;
-        crc = (crc >> 8) ^ CRC32_TABLE[idx];
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let lo = crc ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+        crc = t[7][(lo & 0xFF) as usize]
+            ^ t[6][((lo >> 8) & 0xFF) as usize]
+            ^ t[5][((lo >> 16) & 0xFF) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xFF) as usize]
+            ^ t[2][((hi >> 8) & 0xFF) as usize]
+            ^ t[1][((hi >> 16) & 0xFF) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = (crc >> 8) ^ t[0][((crc ^ b as u32) & 0xFF) as usize];
     }
     !crc
 }
@@ -77,8 +105,8 @@ mod tests {
         assert_eq!(crc32_ieee(b""), 0x0000_0000);
     }
 
-    /// The original bitwise CRC-32/IEEE — the reference the table-driven
-    /// [`crc32_ieee`] must reproduce byte-for-byte.
+    /// The bitwise CRC-32/IEEE (eight shifts per byte) — the reference the
+    /// table-driven [`crc32_ieee`] must reproduce byte-for-byte.
     fn crc32_bitwise_reference(data: &[u8]) -> u32 {
         let mut crc: u32 = 0xFFFF_FFFF;
         for &b in data {
@@ -93,9 +121,10 @@ mod tests {
 
     #[test]
     fn crc32_table_equals_bitwise_reference() {
-        // Every length from empty to past the 256-byte frame payload, filled
-        // from a seeded xorshift so the input covers all byte values and the
-        // carry across the table lookup is exercised, plus a few fixed vectors.
+        // Every length from empty to 600 -- every `len % 8` tail after any
+        // number of 8-byte chunks -- filled from a seeded xorshift so the input
+        // covers all byte values and the carry across the table lookups is
+        // exercised, plus a few fixed vectors.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || {
             state ^= state << 13;

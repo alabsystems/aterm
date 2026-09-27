@@ -8,14 +8,13 @@
 
 use crate::grid::Grid;
 use crate::parser::Parser;
-use crate::platform::FontDescriptor;
 use crate::scrollback::Scrollback;
 
 #[cfg(feature = "sixel")]
 use super::grouped_state::SixelState;
 use super::grouped_state::{
     BiDiGroupState, ClipboardState, ColorState, CursorSaveState, DcsState, Iterm2State, MarksState,
-    NotificationState, SemanticState, ShellIntegrationState, TitleState,
+    NotificationState, ShellIntegrationState, TitleState,
 };
 use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TerminalModes, TerminalSize};
@@ -61,9 +60,7 @@ impl Terminal {
             kitty_file_resolver: None,
             last_bell_time: None,
             bell_total: 0,
-            cursor_style_callback: None,
             default_cursor_style: aterm_types::CursorStyle::default(),
-            buffer_activation_callback: None,
             notifications: NotificationState::new(),
             clipboard: ClipboardState::new(),
             iterm2: Iterm2State::new(),
@@ -73,12 +70,10 @@ impl Terminal {
             alt_archive: super::alt_archive::AltArchiveState::new(),
             current_working_directory: None,
             color: ColorState::new(),
-            font: FontDescriptor::default(),
             bidi_state: BiDiGroupState::new(),
             dcs: DcsState::new(),
             shell: ShellIntegrationState::new(),
             marks_state: MarksState::new(),
-            semantic: SemanticState::new(),
             taskbar_progress: None,
             kitty_keyboard: KittyKeyboardState::new(),
             xterm_keyboard: XtermKeyboardState::new(),
@@ -86,7 +81,6 @@ impl Terminal {
             #[cfg(feature = "sixel")]
             sixel: SixelState::new(),
             window_callback: None,
-            text_sizing_callback: None,
             text_selection: crate::selection::TextSelection::new(),
             parked_text_selection: crate::selection::TextSelection::new(),
             last_custody: None,
@@ -98,7 +92,6 @@ impl Terminal {
             clipboard_auth: super::clipboard_auth::ClipboardAuth::new(),
             shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth::new(),
             hyperlink_auth: super::hyperlink_auth::HyperlinkAuth::new(),
-            dcs_auth: super::dcs_auth::DcsAuth::new(),
             policy: super::policy_gates::PolicyState::new(),
             damage_epoch: 0,
             damage_epoch_counted: false,
@@ -154,30 +147,5 @@ impl Terminal {
             ring_buffer_size,
             scrollback,
         ))
-    }
-
-    /// Create a terminal from a restored grid.
-    ///
-    /// Used by checkpoint restore to recreate terminal state.
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "checkpoint-restore constructor consumed by the checkpoint test-support layer"
-    )]
-    pub(crate) fn from_grid(grid: Grid) -> Self {
-        Self::with_grid(grid)
-    }
-
-    /// Create a terminal from a restored grid and scrollback.
-    ///
-    /// Used by checkpoint restore to recreate terminal state with scrollback history.
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "checkpoint-restore constructor consumed by the checkpoint test-support layer"
-    )]
-    pub(crate) fn from_grid_and_scrollback(mut grid: Grid, scrollback: Scrollback) -> Self {
-        grid.attach_scrollback(scrollback);
-        Self::with_grid(grid)
     }
 }

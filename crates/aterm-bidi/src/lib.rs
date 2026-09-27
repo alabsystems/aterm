@@ -51,11 +51,12 @@
 //! ## Example
 //!
 //! ```
-//! use aterm_bidi::{reorder_str, BaseDirection};
+//! use aterm_bidi::{reorder_visual_to_logical, BaseDirection};
 //! // "abc" is pure LTR → identity order.
-//! assert_eq!(reorder_str("abc", BaseDirection::Auto), vec![0, 1, 2]);
+//! assert_eq!(reorder_visual_to_logical(&['a', 'b', 'c'], BaseDirection::Auto), vec![0, 1, 2]);
 //! // A pure-RTL line (Hebrew aleph-bet-gimel) displays reversed.
-//! assert_eq!(reorder_str("\u{05D0}\u{05D1}\u{05D2}", BaseDirection::Auto), vec![2, 1, 0]);
+//! let hebrew = ['\u{05D0}', '\u{05D1}', '\u{05D2}'];
+//! assert_eq!(reorder_visual_to_logical(&hebrew, BaseDirection::Auto), vec![2, 1, 0]);
 //! ```
 
 #![forbid(unsafe_code)]
@@ -143,6 +144,7 @@ pub fn reorder_visual_to_logical(text: &[char], base: BaseDirection) -> Vec<usiz
 /// The permutation is over Unicode scalar values (`char`s), in `str::chars`
 /// order — the caller is responsible for any grapheme grouping.
 #[must_use]
+#[cfg(test)]
 pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
     let chars: Vec<char> = s.chars().collect();
     reorder_visual_to_logical(&chars, base)
@@ -165,6 +167,7 @@ pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
 /// with no preceding lead) degrades gracefully — that cell is treated as its own
 /// single-width character — and the result stays a valid permutation.
 #[must_use]
+#[cfg(test)]
 pub fn reorder_cells(
     cell_chars: &[char],
     is_wide_continuation: &[bool],
@@ -375,6 +378,7 @@ pub fn resolve_levels_from_classes_into(
 
 /// The base paragraph level for `text` (0 = LTR, 1 = RTL).
 #[must_use]
+#[cfg(test)]
 pub fn paragraph_level(text: &[char], base: BaseDirection) -> u8 {
     if text.is_empty() {
         return matches!(base, BaseDirection::Rtl) as u8;

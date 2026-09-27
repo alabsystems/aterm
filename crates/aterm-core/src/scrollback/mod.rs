@@ -13,7 +13,7 @@
 // do not become part of aterm_core::scrollback::* without review.
 pub use aterm_scrollback::{
     CellAttrs, ColdTierCodec, HyperlinkSpan, Line, Rle, Scrollback, ScrollbackIter,
-    ScrollbackRevIter, ScrollbackStorage, TierCapabilities, WatermarkLevel,
+    ScrollbackStorage, TierCapabilities, WatermarkLevel,
 };
 // The construction-default TOTAL retention cap (audit E1): embedders that brand
 // budgets/limits (wasm exports, the daemon builder) need the same number the

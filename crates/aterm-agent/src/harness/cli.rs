@@ -22,8 +22,11 @@
 //! * `usage` folds the vendor's transcript for this working directory — a
 //!   filesystem fact no hook is needed for.
 //! * `limits` reads the session's SCREEN over the control socket (the one
-//!   interface) and runs [`super::limits::classify`] over the banner and the
-//!   painted `/usage` windows on it.
+//!   interface) through the engine's own readers: the wall the last turn
+//!   ended on ([`aterm_phase::wall`], the one wall classifier — the engine's
+//!   turn-end policy acts on the same reading) and the windows the vendor
+//!   painted on its `/usage` panel ([`usage::usage_panel_windows`]), each
+//!   reset placed by the supervisor's own clock ([`limit::parse_reset`]).
 //! * `disk` measures, and removes only a named safelist class under
 //!   `disk.apply = true`; every measurement, removal and refusal is appended
 //!   to `<state>/disk.jsonl`, cut back to its newest rows past
@@ -33,11 +36,15 @@
 //!   `ledger disk`, the file above.
 //! * `upgrade` is the one verb here that ACTS: it moves a live Claude Code
 //!   session onto a newer build in place, cooperatively
-//!   ([`super::upgrade_drive`]). It is not a supervisor policy — it restarts
+//!   ([`super::upgrade_drive`]) — and a live Codex, its shared daemon first
+//!   and then each TUI by a typed `/exit` and `codex resume`
+//!   ([`super::upgrade_codex`]). It is not a supervisor policy — it restarts
 //!   the agent process, never answers a box or continues a turn — and the
-//!   window runs the same sweep on its own tabs under aterm.toml's
-//!   `[harness] upgrade` switch. A hand-run sweep obeys `[harness] enabled`
-//!   ([`toml_switch`]).
+//!   window's host takes the same steps on its own tabs, at each session's
+//!   idle points, under aterm.toml's `[harness] upgrade` switch. A hand-run
+//!   sweep obeys `[harness] enabled`
+//!   ([`crate::supervise::SupervisorConfig::from_path`], the table's one
+//!   reader).
 //!
 //! The hook bridge — `hook`, `statusline`, `install`, `uninstall` — is RETIRED
 //! by decision "B" (2026-09-22, [`RETIRED`]) and answered before anything is
@@ -62,7 +69,7 @@
 //!   later".
 //!
 //! STATUS (docs/README.md honesty ratchet): unit-tested, `limits` against a
-//! scripted control connection as well as the pure classifier.
+//! scripted control connection.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -73,13 +80,12 @@ use std::process::ExitCode;
 use aterm_json::{Map, Value};
 
 use super::disk;
-use super::limits::{self, Evidence};
 use super::source::Source;
 use super::usage::{self, AccountView, UsageView, rfc3339_utc};
 use crate::supervise::journal::Journal;
 use crate::supervise::run::{Ctl, Session};
 use crate::supervise::transport::{Endpoint, RelayCtl};
-use crate::supervise::{approvals, limit};
+use crate::supervise::{SupervisorConfig, approvals, limit};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -90,10 +96,8 @@ pub const HARNESS: &str = "claude-harness";
 
 /// Why `hook`, `statusline`, `install` and `uninstall` are retired — the one
 /// decision-"B" sentence (docs/FABRIC-LITERALLY-2026-09-19.md §13).
-pub const RETIRED: &str = "aterm installs nothing into an agent (decision \"B\", 2026-09-22): no hook, \
-     no statusLine, no plugin — the window's supervisor (aterm.toml [harness]; `aterm drive \
-     watch` from a terminal) reads the screen over the control socket, and the window removes \
-     what an older build installed when it starts";
+pub const RETIRED: &str =
+    "aterm installs nothing into an agent; a starting window removes what an older build installed";
 
 /// The verbs deleted with the second harness stack on 2026-09-23. They are
 /// named in the refusal so a script that still calls one learns where the
@@ -146,9 +150,10 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// under it, and the top-level dotted `table.key = value` — and ignores `#`
 /// comments. [`toml_int`] takes the LAST assignment that is an integer, as
 /// TOML's own last-wins would read, and a value of any other type is not an
-/// answer. The booleans do not come through here: `disk.apply` is
-/// [`toml_bool`] and the switches are [`toml_switch`], both over the parser
-/// the window reads aterm.toml with.
+/// answer. The boolean does not come through here: `disk.apply` is
+/// [`toml_bool`], over the parser the window reads aterm.toml with, and the
+/// `[harness]` switches are the supervisor policy's own reader
+/// ([`crate::supervise::SupervisorConfig::from_aterm_toml`]).
 ///
 /// Until 2026-09-23 the two numeric knobs went through the harness
 /// contract's fail-closed TOML reader. That reader went with the contract
@@ -180,10 +185,11 @@ fn toml_assignments<'a>(text: &'a str, table: &str, key: &str) -> Vec<&'a str> {
 ///
 /// The reader for `disk.apply`, the one BOOLEAN knob this module answers out
 /// of `aterm.toml`; the ON/OFF switches that gate acts on the owner's
-/// sessions are [`toml_switch`]. `false` is its SAFE answer — nothing
-/// removed — and any key added here must have the same polarity, because
-/// every reading below that is not TOML's own can only ever answer `false`.
-/// The numeric knobs go through [`toml_int`].
+/// sessions are `[harness]`'s, read by the supervisor policy's own reader
+/// ([`crate::supervise::SupervisorConfig::from_aterm_toml`]). `false` is its
+/// SAFE answer — nothing removed — and any key added here must have the same
+/// polarity, because every reading below that is not TOML's own can only
+/// ever answer `false`. The numeric knobs go through [`toml_int`].
 ///
 /// TWO READERS, in order:
 ///
@@ -217,20 +223,6 @@ pub fn toml_bool(text: &str, table: &str, key: &str) -> Option<bool> {
     }
 }
 
-/// Where a file the TOML parser READS says `<table>.<key> = false` somewhere
-/// other than the root key, while the root key itself does not say `false`:
-/// the dotted path TOML files it under (`theme.harness.enabled`). That is the
-/// one place [`toml_bool`] and [`toml_switch`] read OFF although TOML, and so
-/// Settings, read the key as unset or ON, and the verb that acts under the
-/// switch names it ([`Env::misplaced_switch`]) so the disagreement is SAID.
-/// `None` on a file the parser refuses: the window then runs escalate-only
-/// and its own launch notice says why.
-#[must_use]
-pub fn misplaced_false(text: &str, table: &str, key: &str) -> Option<String> {
-    let doc = aterm_toml::from_str::<aterm_toml::Value>(text).ok()?;
-    false_at(&doc, table, key).filter(|at| *at != format!("{table}.{key}"))
-}
-
 /// The dotted path of a `<table>.<key> = false` in `v` — at `v`'s own root
 /// first, else under the first table (or array-of-tables element, `name[i]`)
 /// that holds one, at any depth.
@@ -259,202 +251,20 @@ fn false_at(v: &aterm_toml::Value, table: &str, key: &str) -> Option<String> {
 }
 
 /// Whether a file the TOML parser refused still says `<table>.<key> = false`
-/// on some line ([`toml_bool`]'s fallback).
-///
-/// Line by line: a `[a.b]` header names the table the keys below it belong
-/// to, a `[[a]]` array-of-tables header names an ELEMENT of `a` (so its own
-/// `enabled` is never `a.enabled`), and `k = v` assigns `<header>.<k>`. It
-/// reads every one-line spelling TOML gives the key — under its `[table]`
-/// header, dotted (`table.key`, spaces around a dot allowed), with quoted
-/// segments, and inside a one-line inline table (`table = { key = false }`)
-/// — cutting a line only where TOML would ([`top_level`]), and it ignores `#`
-/// comments. It follows no multi-line string or array.
+/// on some line ([`toml_bool`]'s fallback), in any one-line spelling TOML
+/// gives the key ([`crate::supervise::config::assignments`], the line reader
+/// the `[harness]` policy reads such a file with).
 ///
 /// ONE `false` WINS, filed under any path that ENDS in `<table>.<key>`, as
 /// in [`toml_bool`]'s parsed reading. A refused file can say the key twice,
 /// or carry a line this reader attributes wrongly; either way the ambiguity
 /// resolves to the safe side. Last-assignment-wins, which this reader used
-/// to be, let a stray `enabled = true` below the owner's `false` switch the
-/// harness back on.
+/// to be, let a stray `apply = true` below the owner's `false` switch the
+/// removal back on.
 fn salvage_false(text: &str, table: &str, key: &str) -> bool {
-    let want = [table, key];
-    // The table path the next keys belong to.
-    let mut header: Vec<&str> = Vec::new();
-    for raw in text.strip_prefix('\u{feff}').unwrap_or(text).lines() {
-        let line = top_level(raw, '#')[0].trim();
-        if let Some(h) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            header = match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-                // `[]` names the element, as `false_at`'s `name[i]` does.
-                Some(array) => {
-                    let mut path = key_path(array);
-                    path.push("[]");
-                    path
-                }
-                None => key_path(h),
-            };
-            continue;
-        }
-        if let [lhs, rhs] = top_level(line, '=')[..] {
-            let mut path = header.clone();
-            path.extend(key_path(lhs));
-            if says_false(&path, rhs, &want) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Whether `<path> = <value>` sets a path ending in `want` to `false`:
-/// directly, or through a one-line inline table (`harness = { enabled =
-/// false }`, nested or not).
-fn says_false<'a>(path: &[&'a str], value: &'a str, want: &[&str]) -> bool {
-    let value = value.trim();
-    if path.ends_with(want) && value == "false" {
-        return true;
-    }
-    let Some(inner) = value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) else {
-        return false;
-    };
-    top_level(inner, ',')
-        .into_iter()
-        .any(|pair| match top_level(pair, '=')[..] {
-            [k, v] => {
-                let mut deeper = path.to_vec();
-                deeper.extend(key_path(k));
-                says_false(&deeper, v, want)
-            }
-            _ => false,
-        })
-}
-
-/// A TOML key as its segments: cut at the dots [`top_level`] sees, each one
-/// trimmed and stripped of ONE layer of basic or literal quotes, so
-/// `"harness" . 'enabled'` is `[harness, enabled]` and `"a.b"` is one segment.
-fn key_path(key: &str) -> Vec<&str> {
-    top_level(key, '.')
-        .into_iter()
-        .map(|seg| {
-            let seg = seg.trim();
-            ['"', '\'']
-                .into_iter()
-                .find_map(|q| seg.strip_prefix(q)?.strip_suffix(q))
-                .unwrap_or(seg)
-        })
-        .collect()
-}
-
-/// `s` cut at every `sep` TOML itself would see on one line: never inside a
-/// quoted string (a basic string's `\"` escape included), never inside a
-/// nested `{…}` or `[…]`.
-fn top_level(s: &str, sep: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let (mut start, mut depth, mut quote, mut escaped) = (0, 0i32, None, false);
-    for (i, c) in s.char_indices() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' && q == '"' {
-                escaped = true;
-            } else if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '{' | '[' => depth += 1,
-            '}' | ']' => depth -= 1,
-            _ if c == sep && depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&s[start..]);
-    parts
-}
-
-/// `[<table>] <key>` as an ON/OFF switch that gates ACTS on the owner's
-/// sessions — aterm.toml's `[harness] enabled` and `[harness] upgrade` — read
-/// the way the window reads its own `[harness]` table wherever that reading is
-/// knowable here, and toward OFF wherever it is not:
-///
-/// * The file goes through [`aterm_toml`], the parser the window loads
-///   aterm.toml and seeds Settings with, and the answer is TOML's for the
-///   root key: an inline `harness = { upgrade = false }`, a quoted or a
-///   spaced key all read as the window reads them. Until 2026-09-24 this was
-///   a line reader that knew a `[table]` header and a top-level `table.key`
-///   and nothing else, so an inline table the window read as OFF read ON here
-///   (main's audit found the same flaw in its own switch reader that day).
-/// * Absent is `default_on`. `true`/`false`, bare or quoted, is itself — the
-///   value's text under the rule the window's policy applies
-///   ([`crate::supervise::SupervisorConfig::set`]) — and any other value
-///   (`"no"`, `0`, a `harness` that is not a table) is OFF, as the window
-///   resolves a value its policy refuses: a switch that gates acts must not
-///   read a refused value as consent.
-/// * A file the parser REFUSES is OFF: the window starts escalate-only on it
-///   ([`crate::supervise::SupervisorConfig::escalate_only`]), whose sweep does
-///   not run, and a file nothing can read is not consent. A key said twice is
-///   such a file, so the last-assignment-wins the line reader applied is gone
-///   with it.
-/// * ONE `false` WINS, as in [`toml_bool`] (main, 2026-09-24): a
-///   `<table>.<key> = false` filed under ANOTHER table — appended below
-///   `[theme]`, TOML's `theme.harness.enabled` — reads OFF, even beside a root
-///   `true` ([`false_at`]). A kill switch that stops working because of WHERE
-///   in the file it was written is the unsafe answer.
-///
-/// So this and the window can disagree, and — but for one case — only toward
-/// OFF. On that misplaced `false` the window reads past the line when the
-/// table it landed in is one the window knows (it names the key among those
-/// it ignored) and fails the whole load when it is not (`[theme]`, a string
-/// to the window: escalate-only, the sweep off); `upgrade` names the line on
-/// stderr ([`misplaced_false`]). The one case toward ON: a file TOML reads
-/// whose TYPED configuration the window refuses for a type error in some
-/// other key starts the window escalate-only, with its launch notice saying
-/// so, while this still reads the switch from the file.
-#[must_use]
-pub fn toml_switch(text: &str, table: &str, key: &str, default_on: bool) -> bool {
-    let Ok(doc) = aterm_toml::from_str::<aterm_toml::Value>(text) else {
-        return false;
-    };
-    if false_at(&doc, table, key).is_some() {
-        return false;
-    }
-    let Some(t) = doc.get(table) else {
-        return default_on;
-    };
-    let Some(t) = t.as_table() else {
-        return false;
-    };
-    match t.get(key) {
-        None => default_on,
-        Some(v) => v
-            .as_bool()
-            .or_else(|| match v.as_str().map(str::trim) {
-                Some("true") => Some(true),
-                Some("false") => Some(false),
-                _ => None,
-            })
-            .unwrap_or(false),
-    }
-}
-
-/// aterm.toml's `[harness] <key>` at `path`, as [`toml_switch`] reads it
-/// (default ON) — the reading every caller without the window's parsed table
-/// makes: [`super::upgrade_drive::host_enabled`] and a hand-run `upgrade`.
-/// No path (neither `$XDG_CONFIG_HOME` nor `$HOME` set) or no file is a
-/// fresh machine, and ON; a file that exists and cannot be read is OFF.
-#[must_use]
-pub fn harness_switch(path: Option<&Path>, key: &str) -> bool {
-    let Some(path) = path else {
-        return true;
-    };
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml_switch(&text, "harness", key, true),
-        Err(e) => e.kind() == io::ErrorKind::NotFound,
-    }
+    crate::supervise::config::assignments(text)
+        .iter()
+        .any(|(path, value)| path.ends_with(&[table, key]) && *value == "false")
 }
 
 /// `[<table>] <key>` as a decimal integer, or `None`.
@@ -469,27 +279,38 @@ pub fn toml_int(text: &str, table: &str, key: &str) -> Option<i64> {
 /// The usage text.
 pub const USAGE: &str = "\
 aterm harness — read views of the Claude Code harness, and the live agent
-upgrade. The supervisor that acts on a session is `aterm drive watch|supervise`
-(and the window's own host).
+upgrade. The supervisor that acts on a session is the window's own host, by
+default, for every Claude Code and Codex session (`aterm drive watch|supervise`
+runs the same engine from a terminal).
 
 USAGE:
     aterm harness usage [--json]                 this directory's transcript spend (design 5.2)
-    aterm harness limits [@<sid>] [--json]       the limit classifier over the session's screen
+    aterm harness limits [@<sid>] [--json]       the wall and the painted /usage windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
     aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger
     aterm harness ledger disk [<n>] [--json]     the disk journal
-    aterm harness upgrade [<sid>] [--dry-run] [--every <s>] [--json]
+    aterm harness ledger upgrade [<n>] [--json]  the live upgrade's ledger: every act, and the owner's word
+    aterm harness upgrade [<sid>] [--dry-run] [--json]
                                                  move live Claude Code sessions onto a newer build
+                                                 and the priority list's best available model, and
+                                                 live Codex sessions (their daemon first) onto the
+                                                 managed Codex
+    aterm harness upgrade [<sid>] --status [--json]
+                                                 each upgrade: how long behind, what it waits on
+    aterm harness upgrade <sid> --now | --defer <dur> | --skip [--json]
+                                                 the owner's word on one tab's upgrade
+    aterm harness upgrade models [set <id>,<id>,...]
+                                                 the model priority list: show it (availability,
+                                                 target, Claude Code's recommendations) or set it
 
-`hook`, `statusline`, `install` and `uninstall` are RETIRED (decision \"B\", 2026-09-22):
-aterm installs nothing into an agent. `install`/`uninstall` refuse (exit 2); `hook` and
-`statusline` do nothing and exit 0, for a bridge an older build installed. The agents
-pass removes the entries that install wrote from ~/.claude/settings.json.
+`hook`, `statusline`, `install` and `uninstall` are RETIRED: aterm installs nothing into
+an agent. `install`/`uninstall` refuse (exit 2); `hook` and `statusline` do nothing and
+exit 0, for a bridge an older build installed. A starting window removes what `install`
+wrote to ~/.claude/settings.json.
 
 `status`, `mark`, `enable`, `disable`, `align`, `caps`, `accounts`, `liveness`, `recover`,
-`nudge`, `switch`, `watch` and `config` were DELETED on 2026-09-23 with the second harness
-stack; the engine behind `aterm drive` is the one supervisor, and aterm.toml's [harness]
-table is its policy.
+`nudge`, `switch`, `watch` and `config` are GONE: the engine behind `aterm drive` is the
+one supervisor, and aterm.toml's [harness] table is its policy.
 
 OPTIONS:
     --state <path>      the harness state directory, where the disk journal lives
@@ -502,7 +323,10 @@ OPTIONS:
                         claude-purge are surfaced and never removed from here;
                         they name the command that owns them
     --dry-run           upgrade: print each session's next step, type and signal nothing
-    --every <s>         upgrade: sweep again every s seconds (at least 10; default: once)
+    --status            upgrade: print each recorded upgrade, sweep nothing
+    --now               upgrade <sid>: restart it at its next turn end (the quiet waits waived)
+    --defer <dur>       upgrade <sid>: not for <dur> (90s, 30m, 6h, 2d; at most 30d)
+    --skip              upgrade <sid>: stay on the running build until a newer target comes
     --json              the JSON form
     -h, --help          this text
 
@@ -511,7 +335,8 @@ OPTIONS:
 share it, so the newest file may be the other one's. It carries spend, never a window.
 
 `limits` reads the session's screen once over the control socket (`text --json tail=40`)
-and classifies the limit banner and any painted /usage windows on it. With no @<sid> it
+and prints the wall the last turn ended on (the kind the supervisor acts on, its words and
+its reset) and any windows a painted /usage panel shows. With no @<sid> it
 reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it refuses (exit 2)
 rather than read whichever session the socket defaults to. No session answering is exit 1.
 
@@ -526,7 +351,7 @@ its newest 1024 rows once it passes 1 MiB.
 
 `ledger` prints the newest rows of the approval ledger the supervisor keeps for one
 session (<aterm state>/drive/<sid>.jsonl: every box its approval policy decided —
-approved, skipped, escalated or refused — with the rule and the command). With no @<sid>
+approved, typed, skipped, escalated or deferred — with the rule and the command). With no @<sid>
 it reads the session it runs in.
 
 `upgrade` MOVES A LIVE CLAUDE CODE SESSION ONTO A NEWER BUILD without losing
@@ -534,7 +359,8 @@ the conversation or anything it has running. A newer build is aterm's managed
 twin, or — for a session that runs Claude's own native install, the one whose
 footer shows Claude Code's own `Update installed` notice — that install's
 current version; never an older one. Each sweep moves each session one step: when the
-agent is idle, its composer empty and no approval box up, it TYPES a notice
+agent is idle, its composer empty, no approval box up and nobody typing into the tab
+(`[harness] human_grace_s`), it TYPES a notice
 asking the agent to reach a stopping point — let its background tasks finish,
 never cancel them — and answer with a one-time READY marker. Only after that
 answer is in the transcript, with no shell still running under the agent and
@@ -557,24 +383,150 @@ one waits. Each session's step lands in
 picks up where this one stopped — between the exit and the relaunch too, for
 5 minutes and while the agent's shell lives; past that the restart is
 recorded as failed and nothing more is typed into the tab.
-THE WINDOW RUNS IT BY DEFAULT: every minute, on its own tabs only, while
-aterm.toml's `[harness] enabled` and `[harness] upgrade` are not turned off (a
-value other than `true` or `false`, or a file TOML cannot read, reads as off);
-one lock keeps it and a hand-run sweep apart.
-A HAND-RUN sweep obeys `[harness] enabled` too, re-read before every sweep:
-with it off it prints `step=refused:bypassed`, types and signals nothing
+THE WINDOW DOES IT BY DEFAULT, with no sweep: each of its own tabs' supervisors
+takes the step at its session's idle points once atpkg, or Claude Code's own
+updater, installs a newer build, while aterm.toml's `[harness] enabled` and
+`[harness] upgrade` are not turned off; one lock keeps it and a hand-run sweep
+apart. It hands the relaunched agent straight back to its supervisor, which types
+the carry-on at its first idle point. It also RELAUNCHES an agent that crashed
+(its session record left behind, read as the exit is seen — a graceful exit is
+someone's), on its conversation (`[harness] relaunch`).
+THE MODEL goes with it: a session behind the priority list's best model available
+on the managed build (`aterm harness upgrade models`) is moved onto it on the
+relaunch line (`--model`, session-only — never `/model`, which also saves the
+person's default), riding a build restart when there is one, else by itself once
+its prompt cache is cold, or at most an hour after the move came due. A turn that
+ended with the agent's own background work in flight (Claude's `Waiting for N
+dynamic workflow`, a shell it left running, a Codex background terminal) is a
+NATURAL BREAK: once it has stood 20 s the window types the notice there — it
+interrupts the agent's orchestration once — and the restart still waits for an
+idle point with nothing running under the agent (a re-ask waits for one too), so
+running work is never ended.
+A HAND-RUN sweep obeys `[harness] enabled` too: with it off it prints `step=refused:bypassed`, types and signals nothing
 and exits 1 (a `--dry-run` says so on stderr, still prints its plan, and
 exits 0); naming the verb is the consent `[harness] upgrade` would give.
 The refusal also names, on stderr, every restart an earlier sweep left part
 way (its agent already signalled): that conversation stays where it stopped
 until the switch is back on. A `false` wins wherever it is: the line written
-below another `[table]` header, which TOML files under that table and
-Settings therefore shows as ON, still turns the sweep off, and `upgrade` says
-on stderr where it found it.
+below another `[table]` header, which TOML files under that table, still turns
+the sweep off, and `upgrade` says on stderr where it found it.
 A sweep that did not run exits non-zero: `step=busy:another-sweep` (another
 sweeper holds the lock — often the window's own) exits 75, try again later;
-`step=busy:state-unwritable` or `busy:lock-unopenable` exits 1. Under
-`--every` each of these is one line and the loop sweeps again next time.
+`step=busy:state-unwritable` or `busy:lock-unopenable` exits 1.
+A `--dry-run` line also says `pending_for=` (how long the session has been
+behind) and `wait_for=` (how long its current wait has lasted), as the last
+step recorded them.
+
+AND CODEX, by the same step under the same lock and ledger — a hand-run
+sweep's, and in the window each Codex tab's own worker at its session's idle
+points (Codex 0.157 runs TWO processes: a shared app-server DAEMON per
+$CODEX_HOME that holds every conversation, and the TUI in the tab, a client of
+it). THE DAEMON FIRST: for ~/.codex (a hand-run sweep) and every home a live
+Codex TUI runs with, a daemon on an older
+build than the managed Codex — or on the same build with the vendor's own
+updater armed (`packages/app-server-daemon/auto-update-version`, which re-runs
+chatgpt.com's installer outside atpkg) — is moved by the vendor's verb,
+`<managed codex> app-server daemon update --from-cli --yes`, run with the
+environment the daemon itself was started with: the managed build is copied
+in and PINNED, the updater goes, the daemon restarts, and every attached TUI
+reconnects (`• Reconnected. No input was resent.`). Only while NOTHING RUNS
+in it — every thread it holds idle and settled, attached to a tab or not (its
+locks reveal them), and no BACKGROUND TERMINAL a finished turn left running
+under it (a unified-exec command leads a session of its own under the
+daemon; the restart would end it) — no person is at a Codex tab on that home,
+none is held, the OWNER'S WORD on none keeps it (a `--skip` of this build or
+a `--defer` on a Codex tab holds the daemon that runs its conversation too;
+that tab's `--now` waives its own attended guard here as well), and every
+Codex attached to the daemon is one the pass sees — the window's step asks
+every Codex tab of its window, whichever tab's step reaches the daemon first
+(a TUI in another window or a pane was asked none of this): `wait:busy-thread`,
+`background-terminal`, `owner-held`, `unseen-client`, `held`, `attended`,
+`settling`. A daemon ahead of the managed Codex is never moved back
+(`wait:vendor-ahead`). THEN EACH TUI that is a tab's foreground job on an
+older build: a DAEMON-MODE client at an idle point (no turn running on
+screen, its composer's dim placeholder, no box, quiet 20 s, nobody at the tab
+— the same gates, the same `--now`) is ended by a TYPED `/exit` — fenced on
+the screen it was judged by, its Enter guarded on the composer's row — and
+relaunched at the returned prompt as `<managed codex> resume <the same flags>
+<thread>`, the thread read from the TUI's own exit hint (`Reconnect: codex
+resume <id>`: its command block's output, else the rows directly above the
+new prompt's FIRST row, so a prompt of two rows is no obstacle — which is why
+the `/exit` waits for the shell integration's marks, `wait:no-shell-integration`);
+its work never stops, in the daemon, so nothing is announced and nothing
+continued. It waits for its daemon to be on the build it moves to, and says
+what the daemon waits on (`wait:daemon-first:<why>`). An EMBEDDED session
+(`--no-daemon`, or a launch Codex keeps out of the daemon; the kernel proves
+it by the `thread-writer-locks/<id>.lock` it holds) gets Claude's protocol —
+the notice, its READY answer in the rollout, nothing running under it, a
+background terminal included (`wait:background-terminal`: it would end with
+the TUI) — then the same `/exit`, the relaunch through the one relaunch line
+Claude Code's restart types, and a carry-on line (the window hands the new
+TUI back to its supervisor, which types it at its next idle point). NO
+SIGNAL IS EVER SENT TO CODEX: SIGTERM leaves its tab in the alternate screen
+with kitty keyboard, mouse and bracketed paste on. What the lane types and
+does not submit (a guarded Enter that missed) is said on the ledger
+(`left-typed:<notice|exit>`) and cleared while it alone is in the composer
+(`left-typed-cleared`), never read as a person's draft; a `/exit` the TUI
+outlives is never waited on again (`wait:exit-not-taken`, then
+`failed:stale-exit`). A TUI that names no thread as it exits is not
+relaunched (`failed:no-resume-hint`: its conversation runs on in the daemon;
+`codex resume` in the tab takes it back). Its state is per TAB: `codex-<sid>`
+in `--status`, the ledger and the `upgrade=` column — a move that stopped
+after its `/exit` stays listed though no Codex holds it any more (in the
+window for a day).
+
+`upgrade --status` READS the recorded upgrades and sweeps nothing: one line
+for each a live Claude Code or Codex still holds on a build older than its
+target, in that tab (a conversation that ended, or was moved onto the build by hand,
+leaves its file behind; it is not listed) — the tab, the conversation, from
+and to, the phase, `pending_for=`,
+`wait=` (what the last step waited on: `settling`, `awaiting-ready`,
+`background`, `draft`, `attended`, `held`, `terminal:<owner>`, `not-idle:busy`
+for a turn a hand-run sweep found in progress …) with `wait_for=`, the owner's
+`request=`, and `stalled=` — `-` while the upgrade will move on its own, else
+why it will not: `gave-up` (no READY answer after the last notice),
+`refused:<why>`, `failed:<why>`, `held-back:<owner>` (a multiplexer pane), or
+`overdue` (6 hours behind, whatever it waits on, unless the owner's `--now`
+came in the last 30 minutes). The window shows the same per tab as `upgrade=`
+in `aterm ctl status`/`sessions`, records it in Settings ▸ Messages, and marks
+a STALLED tab (`meta attention owner=upgrade`) — never a tab that is merely
+waiting for its turn end.
+
+THE OWNER'S WORD on one tab's upgrade — `upgrade <sid> --now|--defer
+<dur>|--skip` — is written into that upgrade's state under the sweep's own
+lock (waiting up to 10 s for a step in progress; past that it exits 75 and
+writes nothing) and put on the ledger as `requested:<word>`, and it wakes the
+window's worker for that tab, which takes it at the session's next idle
+point. The word is on the TAB named: the same conversation resumed in another
+tab is asked afresh. `--now` waives the two waits that keep a person from
+being typed over — the quiet window, and the hold on a tab a person gave input
+to within `[harness] human_grace_s` (its `status human_ms=`) — the word IS
+that person — and nothing else (an idle status, an empty composer, no box, no
+hold, the READY answer and nothing running under the agent are still
+required, and what is typed is still fenced on the screen it was judged by).
+Every word arms a NEW ROUND of the upgrade: a notice after it asks for a READY
+marker no earlier answer carries. An upgrade the owner holds (`--defer`,
+`--skip`) owns none of its session's turn ends: the tab's supervisor goes on
+continuing the worker as if none were pending, and a notice already typed is
+ended — the hold's end brings a fresh notice and needs a fresh READY. ONE
+PLACE `--now` adds an act: an upgrade that GAVE UP (no READY answer after the
+last notice) is re-armed, so the notice is typed again and, after its READY
+answer, the agent is restarted. An upgrade that was REFUSED or FAILED is not
+re-armed — `--now` exits 1 and names why; what stopped it still holds. `--now`
+cannot reach an agent HELD BACK in a multiplexer pane either (typing into the
+tab does not reach it; stderr says so). `--defer` holds it until the time runs
+out; `--skip` holds it on the running build until a newer target than this
+one comes, and is what ends a stall the harness cannot move. A restart
+already under way is neither held nor hurried (exit 1).
+
+The window writes the same words, on the same path, with no shell: a
+stalled upgrade's band row offers two of them (Upgrade now where `--now`
+moves it, Not today — a one-day `--defer` — and Skip version), Settings ▸
+Messages offers them on the waiting record while exactly one session waits,
+and the tab's context menu offers every word that does something for the
+upgrade of the pane it was opened on. Each is for the session and the build
+it names: pressed after the upgrade moved on to a newer one, nothing is
+written.
 ";
 
 // ---------------------------------------------------------------------------
@@ -670,25 +622,6 @@ impl Env {
         let sid = sid.map_or(self.sid.as_str(), |s| s.trim_start_matches('@'));
         (!sid.is_empty()).then(|| format!("@{sid}"))
     }
-
-    /// The sentence `upgrade` owes on stderr when the `false` it read the
-    /// master switch OFF from is filed under ANOTHER table
-    /// ([`misplaced_false`]): the harness reads OFF there while Settings ▸
-    /// Harness shows ON, and that disagreement is said, never left for the
-    /// owner to find.
-    #[must_use]
-    pub fn misplaced_switch(&self) -> Option<String> {
-        let path = self.config.as_ref()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        let at = misplaced_false(&text, "harness", "enabled")?;
-        Some(format!(
-            "aterm harness: the harness is OFF because {} sets `harness.enabled` to `false` \
-             below another table's header, which TOML files as `{at}` — so Settings ▸ Harness \
-             reads the switch as ON while the harness reads it OFF. Delete that line and set the \
-             switch in Settings ▸ Harness (or `enabled` under [harness]).",
-            path.display()
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +635,22 @@ pub enum LedgerFile {
     Approvals(Option<String>),
     /// The disk journal.
     Disk,
+    /// The live upgrade's ledger (`<state>/upgrade/ledger.jsonl`).
+    Upgrade,
+}
+
+/// The owner's word on the live upgrade (`upgrade [<sid>] --status`, `upgrade
+/// <sid> --now|--defer <dur>|--skip`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerAsk {
+    /// Print the recorded upgrades; change nothing.
+    Status,
+    /// [`super::upgrade_drive::Ask::Now`].
+    Now,
+    /// [`super::upgrade_drive::Ask::Defer`], in seconds.
+    Defer(u64),
+    /// [`super::upgrade_drive::Ask::Skip`].
+    Skip,
 }
 
 /// One parsed invocation.
@@ -753,10 +702,24 @@ pub enum Cmd {
         sid: String,
         /// Plan and print; type, signal and write nothing.
         dry_run: bool,
-        /// Sweep again every this many seconds; `None` sweeps once.
-        every: Option<u64>,
-        /// The JSON form: one object per session per sweep.
+        /// The JSON form: one object per session.
         json: bool,
+    },
+    /// The owner's view of, and word on, the live upgrade: nothing is swept.
+    UpgradeOwner {
+        /// The tab (`s-<hex>`); empty (only with `Status`) means every one.
+        sid: String,
+        /// What the owner asks.
+        ask: OwnerAsk,
+        /// The JSON form.
+        json: bool,
+    },
+    /// THE MODEL PRIORITY LIST of the live upgrade: print it, with each
+    /// model's availability on the managed build, the target, and Claude
+    /// Code's own recommendations; or `set` it (best first).
+    UpgradeModels {
+        /// `Some(list)`: replace the list with this comma-separated one.
+        set: Option<String>,
     },
     /// Print [`USAGE`] and exit 0.
     Help,
@@ -788,7 +751,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut help = false;
     let mut apply: Option<disk::Class> = None;
     let mut dry_run = false;
-    let mut every: Option<u64> = None;
+    let mut owner: Vec<OwnerAsk> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -801,6 +764,14 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "-h" | "--help" | "help" => help = true,
             "--json" => json = true,
             "--dry-run" => dry_run = true,
+            "--status" => owner.push(OwnerAsk::Status),
+            "--now" => owner.push(OwnerAsk::Now),
+            "--skip" => owner.push(OwnerAsk::Skip),
+            "--defer" => {
+                let v = value(i, "--defer")?;
+                owner.push(OwnerAsk::Defer(parse_defer(&v)?));
+                i += 1;
+            }
             "--config" => {
                 over.config = Some(PathBuf::from(value(i, "--config")?));
                 i += 1;
@@ -819,20 +790,6 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     Some(v.parse::<i64>().map_err(|_| {
                         format!("--utc-offset wants a number of seconds, not {v:?}")
                     })?);
-                i += 1;
-            }
-            "--every" => {
-                let v = value(i, "--every")?;
-                let n = v
-                    .parse::<u64>()
-                    .map_err(|_| format!("--every wants a number of seconds, not {v:?}"))?;
-                if n < UPGRADE_MIN_EVERY_S {
-                    return Err(format!(
-                        "--every {n} is under the {UPGRADE_MIN_EVERY_S} s floor: a sweep reads \
-                         every session's screen and process table"
-                    ));
-                }
-                every = Some(n);
                 i += 1;
             }
             "--apply" => {
@@ -892,20 +849,31 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             for op in &rest[1..] {
                 if *op == "disk" {
                     file = LedgerFile::Disk;
+                } else if *op == "upgrade" {
+                    file = LedgerFile::Upgrade;
                 } else if op.starts_with('@') && op.len() > 1 {
                     file = LedgerFile::Approvals(Some((*op).to_string()));
                 } else if let Ok(n) = op.parse::<usize>() {
                     count = n;
                 } else {
                     return Err(format!(
-                        "ledger takes `disk`, an @<sid> and a row count, not {op:?} (the \
-                         hook-era rings rm|event|statusline|recovery|actuation were deleted \
-                         with the second harness stack)"
+                        "ledger takes `disk`, `upgrade`, an @<sid> and a row count, not {op:?}"
                     ));
                 }
             }
             Cmd::Ledger { file, count, json }
         }
+        "upgrade" if rest.get(1) == Some(&"models") => match (rest.get(2), rest.get(3)) {
+            (None, None) => Cmd::UpgradeModels { set: None },
+            (Some(&"set"), Some(list)) if rest.len() == 4 => Cmd::UpgradeModels {
+                set: Some((*list).to_string()),
+            },
+            _ => {
+                return Err(
+                    "upgrade models takes nothing, or `set <id>,<id>,...` (best first)".to_string(),
+                );
+            }
+        },
         "upgrade" => {
             let sid = rest.get(1).map_or(String::new(), |s| (*s).to_string());
             if !sid.is_empty() && !sid.starts_with("s-") {
@@ -914,12 +882,43 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                      prints it), not {sid:?}"
                 ));
             }
-            Cmd::Upgrade {
-                sid,
-                dry_run,
-                every,
-                json,
+            if rest.len() > 2 {
+                return Err(format!(
+                    "upgrade takes one tab at most, not {:?}",
+                    &rest[1..]
+                ));
             }
+            match owner.as_slice() {
+                [] => {}
+                [ask] => {
+                    if dry_run {
+                        return Err(
+                            "--status, --now, --defer and --skip sweep nothing: they take no \
+                             --dry-run"
+                                .to_string(),
+                        );
+                    }
+                    if sid.is_empty() && *ask != OwnerAsk::Status {
+                        return Err(
+                            "--now, --defer and --skip are the owner's word on ONE tab: name it \
+                             (`aterm harness upgrade s-<hex> --now`; `--status` lists them)"
+                                .to_string(),
+                        );
+                    }
+                    return Ok((
+                        Cmd::UpgradeOwner {
+                            sid,
+                            ask: *ask,
+                            json,
+                        },
+                        over,
+                    ));
+                }
+                _ => {
+                    return Err("one of --status, --now, --defer and --skip at a time".to_string());
+                }
+            }
+            Cmd::Upgrade { sid, dry_run, json }
         }
         deleted if DELETED.contains(&deleted) => {
             // `config` was also where main's live upgrade kept its switch
@@ -930,14 +929,51 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 ""
             };
             return Err(format!(
-                "`harness {deleted}` was deleted on 2026-09-23 with the second harness stack: \
-                 the supervisor is `aterm drive watch|supervise` and aterm.toml's [harness] table \
-                 is its policy{upgrade}"
+                "`harness {deleted}` is gone: the supervisor is `aterm drive watch|supervise` \
+                 and aterm.toml's [harness] table is its policy{upgrade}"
             ));
         }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
+    if !owner.is_empty() {
+        return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
+    }
     Ok((cmd, over))
+}
+
+/// The longest `--defer`: a month. Longer is a skip or the switch.
+pub const UPGRADE_MAX_DEFER_S: u64 = 30 * 86_400;
+
+/// `--defer`'s value: a count with a unit — `90s`, `30m`, `6h`, `2d` — or bare
+/// seconds; more than zero and at most [`UPGRADE_MAX_DEFER_S`].
+///
+/// # Errors
+///
+/// Anything else, named.
+pub fn parse_defer(v: &str) -> Result<u64, String> {
+    let (digits, unit) = match v.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => v.split_at(at),
+        None => (v, "s"),
+    };
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => 0,
+    };
+    let secs = digits
+        .parse::<u64>()
+        .ok()
+        .filter(|_| scale > 0)
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| format!("--defer wants a span like 90s, 30m, 6h or 2d, not {v:?}"))?;
+    if secs == 0 || secs > UPGRADE_MAX_DEFER_S {
+        return Err(format!(
+            "--defer {v} is outside 1s..30d: longer is `--skip`, or the `[harness] upgrade` switch"
+        ));
+    }
+    Ok(secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,9 +1106,8 @@ fn run_usage(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         Some((path, fold)) => {
             let _ = writeln!(
                 out,
-                "SPEND folded from {} ({} assistant rows), the newest transcript in this project \
-                 directory: if two Claude Code sessions share this working directory it may be \
-                 the other one's. A transcript carries no rate-limit window.",
+                "spend from {} ({} assistant rows), the newest transcript for this directory; \
+                 if two Claude Code sessions share the directory, it may be the other one's",
                 path.display(),
                 fold.assistant_rows,
             );
@@ -1091,99 +1126,120 @@ fn run_usage(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
 // limits
 // ---------------------------------------------------------------------------
 
-/// Every piece of limit evidence ONE screen read carries: the banner
-/// (`limit_notice`) and the windows the vendor painted on its `/usage` panel,
-/// each reset placed on the clock with `local_offset_s` for a notice that
-/// names no zone. Both are [`Source::Grid`] — one frame, one channel.
-#[must_use]
-pub fn evidence_from_screen(rows: &[String], now: i64, local_offset_s: i64) -> Vec<Evidence> {
-    let mut evidence: Vec<Evidence> =
-        Evidence::banner_from_screen(rows, now, local_offset_s, limit::zone_offset_s)
-            .into_iter()
-            .collect();
-    evidence.extend(Evidence::windows_from_screen(
-        rows,
-        now,
-        local_offset_s,
-        limit::zone_offset_s,
-    ));
-    evidence
+/// What ONE screen read says about a limit: the wall the worker's last turn
+/// ended on, read by the engine's own reader ([`aterm_phase::wall`], the one
+/// wall classifier — the turn-end policy decides on the same reading), and
+/// the windows the vendor painted on its `/usage` panel
+/// ([`usage::usage_panel_windows`]). Every reset is placed on the clock by
+/// the supervisor's grammar ([`limit::parse_reset`], [`limit::reset_at`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitsView {
+    /// The wall, when the screen shows one.
+    pub wall: Option<aterm_phase::Wall>,
+    /// The wall's reset as Unix seconds, when its words place one.
+    pub resets_at: Option<i64>,
+    /// Each painted window, with its reset placed.
+    pub windows: Vec<(usage::PanelWindow, Option<i64>)>,
 }
 
-/// Read `target`'s screen once through `ctl` and classify it.
-///
-/// # Errors
-///
-/// The screen could not be read (no session, no socket, a refused request).
-pub fn limits_of<C: Ctl>(
-    ctl: &mut C,
-    target: Option<String>,
+/// [`LimitsView`] of `rows` as of `now`: a reset that names no zone (or one
+/// `zone_offset` does not know) is at `local_offset_s`.
+#[must_use]
+pub fn limits_view(
+    rows: &[String],
     now: i64,
     local_offset_s: i64,
-) -> Result<Option<limits::Classification>, String> {
-    let screen = Session::new(ctl, target).read_screen()?;
-    Ok(limits::classify(
-        &evidence_from_screen(&screen.rows, now, local_offset_s),
-        now,
-    ))
+    zone_offset: fn(&str) -> Option<i64>,
+) -> LimitsView {
+    let place = |text: &str| {
+        limit::parse_reset(text)
+            .map(|spec| limit::reset_at(&spec, now, local_offset_s, zone_offset))
+    };
+    let wall = aterm_phase::wall(rows);
+    let resets_at = wall
+        .as_ref()
+        .and_then(|w| w.reset.as_deref())
+        .and_then(place);
+    let windows = usage::usage_panel_windows(rows)
+        .into_iter()
+        .map(|w| {
+            let at = w.reset_text.as_deref().and_then(place);
+            (w, at)
+        })
+        .collect();
+    LimitsView {
+        wall,
+        resets_at,
+        windows,
+    }
 }
 
-/// The `harness limits` text for one classification (or the absence of one).
+/// The `harness limits` line: `wall=<kind> resets_at=<rfc3339|-> source=grid
+/// message=<words> windows=<name>=<pct>%@<rfc3339|->,…`, or `wall=none …`.
 #[must_use]
-pub fn limits_text(class: Option<&limits::Classification>, source: Source) -> String {
-    match class {
+pub fn limits_text(view: &LimitsView) -> String {
+    let at = |r: Option<i64>| r.map_or("-".to_string(), rfc3339_utc);
+    let windows = if view.windows.is_empty() {
+        "-".to_string()
+    } else {
+        view.windows
+            .iter()
+            .map(|(w, r)| format!("{}={}%@{}", w.name, w.used_pct, at(*r)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match &view.wall {
         None => format!(
-            "class=none source={} — no limit banner or exhausted window on the screen",
-            source.as_str()
+            "wall=none source={} windows={windows} — no wall on the screen",
+            Source::Grid.as_str()
         ),
-        Some(c) => format!(
-            "class={} unpaired={} storm={} no_response={} resets_at={} source={} reasons={}",
-            c.class.as_str(),
-            c.unpaired,
-            c.storm,
-            c.no_response,
-            c.resets_at.map_or("-".to_string(), rfc3339_utc),
-            source.as_str(),
-            if c.reasons.is_empty() {
-                "-".to_string()
-            } else {
-                c.reasons.join(";")
-            },
+        Some(w) => format!(
+            "wall={} resets_at={} source={} windows={windows} message={}",
+            w.kind.name(),
+            at(view.resets_at),
+            Source::Grid.as_str(),
+            super::one_line(&w.message, usize::MAX),
         ),
     }
 }
 
-/// The `harness limits --json` document, schema 1.
+/// The `harness limits --json` document, schema 2: `{schema, kind:"limits",
+/// source, wall: null | {kind, message, reset, resets_at}, windows: [{name,
+/// used_pct, reset, resets_at}]}`. (Schema 1 was the deleted classifier's
+/// `class`/`unpaired`/`storm` verdict.)
 #[must_use]
-pub fn limits_json(class: Option<&limits::Classification>, source: Source) -> String {
+pub fn limits_json(view: &LimitsView) -> String {
+    let at = |r: Option<i64>| r.map_or(Value::Null, |r| Value::from(rfc3339_utc(r)));
+    let text = |t: Option<&str>| t.map_or(Value::Null, |t| Value::from(t.to_owned()));
     let mut o = Map::new();
-    o.insert("schema".to_owned(), Value::from(1u64));
+    o.insert("schema".to_owned(), Value::from(2u64));
     o.insert("kind".to_owned(), Value::from("limits".to_owned()));
-    o.insert("source".to_owned(), Value::from(source.as_str().to_owned()));
-    match class {
-        None => {
-            // "none" is not a [`limits::Class`]: the classifier answers `None`
-            // when no evidence names a class, and saying so is not the same as
-            // naming `unknown`, which is its fail-closed class.
-            o.insert("class".to_owned(), Value::from("none".to_owned()));
-            o.insert("reasons".to_owned(), Value::Array(Vec::new()));
-        }
-        Some(c) => {
-            o.insert("class".to_owned(), Value::from(c.class.as_str().to_owned()));
-            o.insert("unpaired".to_owned(), Value::from(c.unpaired));
-            o.insert("storm".to_owned(), Value::from(c.storm));
-            o.insert("no_response".to_owned(), Value::from(c.no_response));
-            o.insert(
-                "resets_at".to_owned(),
-                c.resets_at
-                    .map_or(Value::Null, |r| Value::from(rfc3339_utc(r))),
-            );
-            o.insert(
-                "reasons".to_owned(),
-                Value::Array(c.reasons.iter().map(|r| Value::from(r.clone())).collect()),
-            );
-        }
-    }
+    o.insert(
+        "source".to_owned(),
+        Value::from(Source::Grid.as_str().to_owned()),
+    );
+    let wall = view.wall.as_ref().map_or(Value::Null, |w| {
+        let mut m = Map::new();
+        m.insert("kind".to_owned(), Value::from(w.kind.name().to_owned()));
+        m.insert("message".to_owned(), Value::from(w.message.clone()));
+        m.insert("reset".to_owned(), text(w.reset.as_deref()));
+        m.insert("resets_at".to_owned(), at(view.resets_at));
+        Value::Object(m)
+    });
+    o.insert("wall".to_owned(), wall);
+    let windows = view
+        .windows
+        .iter()
+        .map(|(w, r)| {
+            let mut m = Map::new();
+            m.insert("name".to_owned(), Value::from(w.name.clone()));
+            m.insert("used_pct".to_owned(), Value::from(u64::from(w.used_pct)));
+            m.insert("reset".to_owned(), text(w.reset_text.as_deref()));
+            m.insert("resets_at".to_owned(), at(*r));
+            Value::Object(m)
+        })
+        .collect();
+    o.insert("windows".to_owned(), Value::Array(windows));
     aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
 }
 
@@ -1202,19 +1258,16 @@ fn run_limits_with<C: Ctl>(
     // unaddressed read that classifies whichever session the socket defaults
     // to and print a verdict that does not say whose it is.
     let Some(target) = env.target(sid) else {
-        let _ = writeln!(
-            err,
-            "aterm harness limits: no session to read — name one (@<sid>), or run this \
-             inside an aterm session ($ATERM_PARENT_SESSION_ID is empty)"
-        );
+        let _ = writeln!(err, "aterm harness limits: no session named; pass @<sid>");
         return ExitCode::from(2);
     };
-    match limits_of(ctl, Some(target.clone()), env.now, local_offset_s) {
-        Ok(class) => {
+    match Session::new(ctl, Some(target.clone())).read_screen() {
+        Ok(screen) => {
+            let view = limits_view(&screen.rows, env.now, local_offset_s, limit::zone_offset_s);
             let text = if json {
-                limits_json(class.as_ref(), Source::Grid)
+                limits_json(&view)
             } else {
-                limits_text(class.as_ref(), Source::Grid)
+                limits_text(&view)
             };
             let _ = writeln!(out, "{text}");
             ExitCode::SUCCESS
@@ -1396,10 +1449,7 @@ fn run_disk(
         let _ = writeln!(out, "  note: {note}");
     }
     if rep.rows.is_empty() {
-        let _ = writeln!(
-            out,
-            "  nothing with a witness — a directory with no proof that a build tool laid it is never a candidate"
-        );
+        let _ = writeln!(out, "  nothing to reclaim");
     }
     match &done {
         None => {
@@ -1504,6 +1554,11 @@ pub fn bound_ledger(path: &Path, max_bytes: u64, keep: usize) -> io::Result<bool
 fn ledger_path(env: &Env, file: &LedgerFile) -> Result<PathBuf, String> {
     match file {
         LedgerFile::Disk => Ok(env.disk_ledger()),
+        LedgerFile::Upgrade => Ok(super::upgrade_drive::ledger_path(&upgrade_opts(
+            env,
+            "",
+            &SupervisorConfig::default(),
+        )?)),
         LedgerFile::Approvals(sid) => {
             let state = env
                 .aterm_state
@@ -1543,6 +1598,34 @@ fn approval_line(row: &str) -> String {
     }
 }
 
+/// One upgrade ledger row as a line a person reads: time, step, tab and
+/// conversation, from and to, then the detail (the marker, the relaunch line,
+/// the outcome, the reason).
+fn upgrade_ledger_line(row: &str) -> String {
+    let Ok(doc) = aterm_json::from_str::<Value>(row) else {
+        return row.to_string();
+    };
+    let s = |k: &str| doc.get(k).and_then(Value::as_str).unwrap_or("-");
+    let ts = doc
+        .get("t")
+        .and_then(Value::as_i64)
+        .map_or_else(|| "-".to_string(), rfc3339_utc);
+    let detail = super::one_line(s("detail"), 200);
+    let head = format!(
+        "{ts} {} tab={} session={} {} -> {}",
+        s("step"),
+        s("tab"),
+        s("session"),
+        s("from"),
+        s("to")
+    );
+    if detail.is_empty() {
+        head
+    } else {
+        format!("{head} — {detail}")
+    }
+}
+
 /// `aterm harness ledger`.
 fn run_ledger(
     env: &Env,
@@ -1571,6 +1654,9 @@ fn run_ledger(
             (true, _) | (false, LedgerFile::Disk) => {
                 let _ = writeln!(out, "{row}");
             }
+            (false, LedgerFile::Upgrade) => {
+                let _ = writeln!(out, "{}", upgrade_ledger_line(row));
+            }
             (false, LedgerFile::Approvals(_)) => {
                 let _ = writeln!(out, "{}", approval_line(row));
             }
@@ -1590,80 +1676,262 @@ fn run_ledger(
 // upgrade
 // ---------------------------------------------------------------------------
 
-/// The floor under `upgrade --every`: a sweep reads every session's screen
-/// and the whole process table, and the notice it types is re-asked on a
-/// 30-minute clock, so nothing is gained below this.
-pub const UPGRADE_MIN_EVERY_S: u64 = 10;
-
 /// The step a hand-run `upgrade` answers while `[harness] enabled` reads off
 /// ([`upgrade_pass`]): the verdict word the deleted `switch` and `watch` verbs
 /// answered under the same switch, kept so a script that keyed on it still
 /// reads it.
 pub const UPGRADE_BYPASSED: &str = "refused:bypassed";
 
-/// `aterm harness upgrade` — sweep every live Claude Code session once (or
-/// every `--every` seconds) and move each one step toward the newer build
-/// ([`super::upgrade_drive::sweep`]). A session that is waiting is a line,
-/// not a failure; a sweep that did not RUN is a line AND, for a one-shot run,
-/// an exit code ([`upgrade_pass`] says which). `--every` never exits on one:
-/// it prints the line and sweeps again at the next tick.
-fn run_upgrade(
+/// `aterm harness upgrade models [set <list>]` — the live upgrade's model
+/// priority list ([`super::upgrade_models`]).
+fn run_upgrade_models(
     env: &Env,
-    sid: &str,
-    dry_run: bool,
-    every: Option<u64>,
-    json: bool,
+    set: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     let Some(home) = env.home.clone() else {
         let _ = writeln!(
             err,
-            "aterm harness: upgrade needs the home directory (Claude's sessions live under it)"
+            "aterm harness: upgrade models needs the home directory"
         );
         return ExitCode::from(2);
     };
     let opts = super::upgrade_drive::Opts {
         home,
         state: env.state.clone(),
+        sock: None,
+        only_sid: None,
+        dry_run: set.is_none(),
+        // Reads the list, or writes it: no tab is looked at or typed into.
+        human_grace_s: 0,
+        hand_back: false,
+        background: false,
+    };
+    match set {
+        Some(list) => match super::upgrade_drive::set_models(&opts, list) {
+            Ok(ids) => {
+                let _ = writeln!(out, "models (best first): {}", ids.join(", "));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                let _ = writeln!(err, "aterm harness: {e}");
+                ExitCode::from(2)
+            }
+        },
+        None => {
+            let _ = write!(out, "{}", super::upgrade_drive::models_report(&opts));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `aterm harness upgrade` — sweep every live Claude Code session once and
+/// move each one step toward the newer build
+/// ([`super::upgrade_drive::sweep`]). A session that is waiting is a line,
+/// not a failure; a sweep that did not RUN is a line AND an exit code
+/// ([`upgrade_pass`] says which). There is no loop: the window's host takes
+/// the same steps at each session's idle points, on atpkg's activation
+/// notice, so a script that wants them repeated runs this again.
+fn run_upgrade(
+    env: &Env,
+    sid: &str,
+    dry_run: bool,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let (policy, notes) = SupervisorConfig::from_path(env.config.as_deref());
+    let opts = match upgrade_opts(env, sid, &policy) {
+        Ok(opts) => super::upgrade_drive::Opts { dry_run, ..opts },
+        Err(e) => {
+            let _ = writeln!(err, "aterm harness: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let code = upgrade_pass(env, &opts, (&policy, &notes), json, out, err);
+    let _ = out.flush();
+    code
+}
+
+/// A hand-run pass's options for `env`, scoped to `sid` when it names one,
+/// under `policy`'s `[harness] human_grace_s`. No loop runs behind a hand-run
+/// pass, so it carries a relaunched agent on itself (`hand_back: false`).
+fn upgrade_opts(
+    env: &Env,
+    sid: &str,
+    policy: &SupervisorConfig,
+) -> Result<super::upgrade_drive::Opts, String> {
+    let home = env
+        .home
+        .clone()
+        .ok_or("upgrade needs the home directory (Claude's sessions live under it)")?;
+    Ok(super::upgrade_drive::Opts {
+        home,
+        state: env.state.clone(),
         sock: env.sock.clone(),
         only_sid: (!sid.is_empty()).then(|| sid.to_string()),
-        dry_run,
+        dry_run: false,
+        human_grace_s: policy.human_grace_s,
+        hand_back: false,
+        background: false,
+    })
+}
+
+/// `aterm harness upgrade [<sid>] --status` and `upgrade <sid>
+/// --now|--defer|--skip` ([`OwnerAsk`]): the recorded upgrades read, or the
+/// owner's word written ([`super::upgrade_drive::ask`]). Nothing is swept,
+/// typed or signalled. A word the busy lock kept out exits 75, like a step
+/// that could not run; any other refusal exits 1. With either switch the
+/// window's host reads off (the one `[harness]` reader,
+/// [`SupervisorConfig::from_path`]) the word is still written — it is the
+/// owner's — and stderr says what it waits on: `[harness] enabled` off,
+/// nothing moves until it is back on; `[harness] upgrade` off, the window
+/// takes no upgrade step, so the word takes effect at the next hand-run
+/// `aterm harness upgrade <sid>` or once the switch is back on (review of
+/// 2026-09-25: only `enabled` was read, and under `upgrade = false` the word
+/// printed `request=now`, exited 0 and said nothing, while nothing would ever
+/// read it).
+fn run_upgrade_owner(
+    env: &Env,
+    sid: &str,
+    ask: OwnerAsk,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
+    let opts = match upgrade_opts(env, sid, &policy) {
+        Ok(opts) => opts,
+        Err(e) => {
+            let _ = writeln!(err, "aterm harness: {e}");
+            return ExitCode::from(2);
+        }
     };
-    let mut was_off = false;
-    loop {
-        let code = upgrade_pass(env, &opts, json, &mut was_off, out, err);
-        let _ = out.flush();
-        let Some(s) = every else {
-            return code;
+    let now = u64::try_from(env.now).unwrap_or(0);
+    let print = |out: &mut dyn Write, row: &super::upgrade_drive::Row| {
+        let _ = if json {
+            writeln!(
+                out,
+                "{}",
+                aterm_json::to_string(&row.to_json(now)).unwrap_or_default()
+            )
+        } else {
+            writeln!(out, "{}", row.line(now))
         };
-        std::thread::sleep(std::time::Duration::from_secs(s));
+    };
+    let word = match ask {
+        OwnerAsk::Status => {
+            let (rows, vetted) = super::upgrade_drive::status_rows(&opts);
+            let rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| r.phase != super::upgrade::Phase::Done)
+                .collect();
+            for row in &rows {
+                print(out, row);
+            }
+            if !vetted {
+                let _ = writeln!(
+                    err,
+                    "aterm harness: Claude's session files could not be read whole, so stale \
+                     upgrades may be listed"
+                );
+            }
+            if rows.is_empty() && !json {
+                let _ = writeln!(
+                    out,
+                    "no upgrade is recorded{}",
+                    if sid.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" for tab {sid}")
+                    }
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
+        OwnerAsk::Now => super::upgrade_drive::Ask::Now,
+        OwnerAsk::Defer(secs) => super::upgrade_drive::Ask::Defer(secs),
+        OwnerAsk::Skip => super::upgrade_drive::Ask::Skip,
+    };
+    match super::upgrade_drive::ask(&opts, sid, word) {
+        Ok(row) => {
+            print(out, &row);
+            // `--now` is read only after the terminal check, so an agent in a
+            // pane is not moved by it: say so, with what does move it.
+            if ask == OwnerAsk::Now
+                && row.remedy(now) == Some(super::upgrade_drive::Remedy::InItsPane)
+            {
+                let _ = writeln!(
+                    err,
+                    "aterm harness: upgrade {sid}: recorded, but its agent runs under {}, which \
+                     typing into the tab does not reach — quit it there and resume it in the tab",
+                    super::upgrade_drive::runs_under(
+                        row.wait.strip_prefix("terminal:").unwrap_or(&row.wait)
+                    )
+                );
+            }
+            if let Some(path) = env
+                .config
+                .as_deref()
+                .filter(|_| !(policy.enabled && policy.upgrade))
+            {
+                let _ = if policy.enabled {
+                    writeln!(
+                        err,
+                        "aterm harness: the word is recorded, but `[harness] upgrade` reads off \
+                         in {}, so it takes effect at the next `aterm harness upgrade {sid}`",
+                        path.display()
+                    )
+                } else {
+                    writeln!(
+                        err,
+                        "aterm harness: the word is recorded, but `[harness] enabled` reads off \
+                         in {} (Settings ▸ Harness): nothing moves until it is back on",
+                        path.display()
+                    )
+                };
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.starts_with("busy:") => {
+            let _ = writeln!(
+                err,
+                "aterm harness: upgrade {sid}: a sweep holds the lock ({e}); nothing was written, \
+                 try again"
+            );
+            ExitCode::from(atpkg::lock::CONTENDED_EXIT)
+        }
+        Err(e) => {
+            let _ = writeln!(err, "aterm harness: upgrade {sid}: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
 /// ONE pass of `upgrade`: the master switch, then the sweep, every report
-/// printed — and the exit code a one-shot run owes for it.
+/// printed — and the exit code it owes for it.
 ///
-/// THE MASTER SWITCH GATES A HAND-RUN SWEEP, re-read before every pass. With
-/// aterm.toml's `[harness] enabled` reading off ([`harness_switch`], the
-/// reading the window's own parse gives) the pass answers one
+/// THE MASTER SWITCH GATES A HAND-RUN SWEEP. With aterm.toml's
+/// `[harness] enabled` reading off
+/// ([`crate::supervise::SupervisorConfig::from_path`], the reader the window's
+/// host reads the same table with) the pass answers one
 /// [`UPGRADE_BYPASSED`] line, takes no lock, types and signals nothing, and
 /// exits 1; the window's host stands down on the same switch. Until
 /// 2026-09-24 a hand-run sweep did not read the switch at all: with the
 /// harness switched off it still typed its notices, sent SIGTERM and
-/// relaunched, and a `--every` loop started earlier kept doing so after the
-/// owner turned the harness off. `[harness] upgrade` does NOT gate it —
-/// naming the verb is that consent; it is the window's sweep's own switch. A
+/// relaunched. `[harness] upgrade` does NOT gate it — naming the verb is that
+/// consent; it is the window's own switch. A
 /// `--dry-run` acts on nothing, so it still sweeps and prints — after the
 /// refusal line, with a sentence on stderr saying a real run would act on
 /// none of it — and exits 0. The stderr sentence also names every restart an
 /// earlier sweep left in flight ([`stranded`]), because standing down
-/// strands it, and a `false` filed under another table
-/// ([`Env::misplaced_switch`]).
+/// strands it, and every note the reader has about the file (a `false` filed
+/// under another table, a value it could not take).
 ///
 /// A SWEEP THAT DID NOT RUN is not a success: it decided nothing about any
-/// session. `busy:another-sweep` — another sweeper holds the lock, which is
-/// the window's own host every minute by default — exits 75, atpkg's
+/// session. `busy:another-sweep` — another actor holds the lock, most often
+/// the window's own host at a session's step — exits 75, atpkg's
 /// "try again later" code for the same thing, a single-writer lock held by a
 /// sibling ([`atpkg::lock::CONTENDED_EXIT`]), so a script retries by CODE
 /// rather than reading the line. `busy:state-unwritable` and
@@ -1672,15 +1940,12 @@ fn run_upgrade(
 fn upgrade_pass(
     env: &Env,
     opts: &super::upgrade_drive::Opts,
+    (policy, notes): (&SupervisorConfig, &[String]),
     json: bool,
-    was_off: &mut bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let off = env
-        .config
-        .as_deref()
-        .filter(|path| !harness_switch(Some(*path), "enabled"));
+    let off = env.config.as_deref().filter(|_| !policy.enabled);
     if let Some(path) = off {
         upgrade_line(
             out,
@@ -1694,34 +1959,37 @@ fn upgrade_pass(
                 step: UPGRADE_BYPASSED.to_string(),
             },
         );
-        // Said once per turn of the switch, not every `--every` tick.
-        if !*was_off {
-            let _ = writeln!(
-                err,
-                "aterm harness: upgrade refused — `[harness] enabled` reads off in {} (Settings \
-                 ▸ Harness), so a sweep types and signals nothing{}{}",
-                path.display(),
-                stranded(&super::upgrade_drive::in_flight(opts)),
-                if opts.dry_run {
-                    "; the lines below are what it would do with the switch on"
-                } else {
-                    ""
-                }
-            );
-            if let Some(note) = env.misplaced_switch() {
-                let _ = writeln!(err, "{note}");
+        let _ = writeln!(
+            err,
+            "aterm harness: upgrade refused: `[harness] enabled` reads off in {} (Settings ▸ \
+             Harness){}{}",
+            path.display(),
+            stranded(&super::upgrade_drive::in_flight(opts)),
+            if opts.dry_run {
+                "; the lines below are what it would do with the switch on"
+            } else {
+                ""
             }
+        );
+        for note in notes {
+            let _ = writeln!(err, "aterm harness: {note}");
         }
-        *was_off = true;
         if !opts.dry_run {
             return ExitCode::from(1);
         }
-    } else {
-        *was_off = false;
     }
     let mut code = ExitCode::SUCCESS;
+    // A dry run says how long each session has been behind and waiting, as
+    // the last real sweep recorded it (a dry run records nothing itself).
+    let recorded = if opts.dry_run {
+        super::upgrade_drive::rows(opts)
+    } else {
+        Vec::new()
+    };
+    let now = u64::try_from(env.now).unwrap_or(0);
     for r in super::upgrade_drive::sweep(opts) {
-        upgrade_line(out, json, &r);
+        let row = recorded.iter().find(|row| row.session == r.session);
+        upgrade_line_with(out, json, &r, row.map(|row| (row, now)));
         match r.step.strip_prefix("busy:") {
             Some("another-sweep") => code = ExitCode::from(atpkg::lock::CONTENDED_EXIT),
             Some(_) => code = ExitCode::from(1),
@@ -1740,13 +2008,12 @@ fn stranded(sessions: &[String]) -> String {
     match sessions {
         [] => String::new(),
         [one] => format!(
-            "; the restart of session {one} an earlier sweep began stays where it stopped — its \
-             agent signalled, not yet relaunched or told to carry on — until the switch is back on"
+            "; the restart of session {one} an earlier sweep began stays stopped until the \
+             switch is back on"
         ),
         many => format!(
-            "; the {} restarts an earlier sweep began (sessions {}) stay where they stopped — \
-             their agents signalled, not yet relaunched or told to carry on — until the switch \
-             is back on",
+            "; the {} restarts an earlier sweep began (sessions {}) stay stopped until the \
+             switch is back on",
             many.len(),
             many.join(", ")
         ),
@@ -1755,28 +2022,61 @@ fn stranded(sessions: &[String]) -> String {
 
 /// One `upgrade` report, in the text or the JSON form.
 fn upgrade_line(out: &mut dyn Write, json: bool, r: &super::upgrade_drive::Report) {
-    if json {
-        let mut o = Map::new();
-        o.insert("schema".to_owned(), Value::from(1u64));
-        o.insert("kind".to_owned(), Value::from("upgrade".to_owned()));
-        o.insert("pid".to_owned(), Value::from(r.pid));
-        for (k, v) in [
-            ("tab", &r.tab),
-            ("session", &r.session),
-            ("from", &r.from),
-            ("to", &r.to),
-            ("step", &r.step),
-        ] {
-            o.insert(k.to_owned(), Value::from(v.clone()));
-        }
-        let _ = writeln!(
-            out,
-            "{}",
-            aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
-        );
-    } else {
-        let _ = writeln!(out, "{}", r.line());
+    upgrade_line_with(out, json, r, None);
+}
+
+/// [`upgrade_line`], with a dry run's `pending_for=`/`wait_for=` from the
+/// session's recorded upgrade when there is one (`-` for no recorded wait).
+fn upgrade_line_with(
+    out: &mut dyn Write,
+    json: bool,
+    r: &super::upgrade_drive::Report,
+    recorded: Option<(&super::upgrade_drive::Row, u64)>,
+) {
+    let ages = recorded.map(|(row, now)| {
+        (
+            now.saturating_sub(row.behind_since),
+            (!row.wait.is_empty()).then(|| now.saturating_sub(row.wait_since)),
+        )
+    });
+    if !json {
+        let _ = match ages {
+            Some((behind, wait)) => writeln!(
+                out,
+                "{} pending_for={} wait_for={}",
+                r.line(),
+                super::upgrade::span(behind),
+                wait.map_or_else(|| "-".to_string(), super::upgrade::span)
+            ),
+            None => writeln!(out, "{}", r.line()),
+        };
+        return;
     }
+    let mut o = Map::new();
+    o.insert("schema".to_owned(), Value::from(1u64));
+    o.insert("kind".to_owned(), Value::from("upgrade".to_owned()));
+    o.insert("pid".to_owned(), Value::from(r.pid));
+    for (k, v) in [
+        ("tab", &r.tab),
+        ("session", &r.session),
+        ("from", &r.from),
+        ("to", &r.to),
+        ("step", &r.step),
+    ] {
+        o.insert(k.to_owned(), Value::from(v.clone()));
+    }
+    if let Some((behind, wait)) = ages {
+        o.insert("pending_for_s".to_owned(), Value::from(behind));
+        o.insert(
+            "wait_for_s".to_owned(),
+            wait.map_or(Value::Null, Value::from),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{}",
+        aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,12 +2095,7 @@ fn answer_retired(
 ) -> ExitCode {
     if is_tombstone(verb) {
         if stdin_is_tty {
-            let _ = writeln!(
-                err,
-                "aterm harness {verb}: retired (decision \"B\": aterm installs nothing into \
-                 an agent); it does nothing and exits 0 so a bridge an older aterm installed \
-                 cannot block a session"
-            );
+            let _ = writeln!(err, "aterm harness {verb}: retired; it does nothing");
         } else {
             let _ = io::copy(stdin, &mut io::sink());
         }
@@ -1814,7 +2109,7 @@ fn run_retired(verb: &str, err: &mut dyn Write) -> ExitCode {
     if is_tombstone(verb) {
         return ExitCode::SUCCESS;
     }
-    let _ = writeln!(err, "aterm harness {verb}: retired — {RETIRED}");
+    let _ = writeln!(err, "aterm harness {verb}: retired: {RETIRED}");
     ExitCode::from(2)
 }
 
@@ -1844,12 +2139,9 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
             json,
         } => run_disk(env, targets, *apply, *json, out, err),
         Cmd::Ledger { file, count, json } => run_ledger(env, file, *count, *json, out, err),
-        Cmd::Upgrade {
-            sid,
-            dry_run,
-            every,
-            json,
-        } => run_upgrade(env, sid, *dry_run, *every, *json, out, err),
+        Cmd::Upgrade { sid, dry_run, json } => run_upgrade(env, sid, *dry_run, *json, out, err),
+        Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),
+        Cmd::UpgradeModels { set } => run_upgrade_models(env, set.as_deref(), out, err),
     }
 }
 
@@ -1876,7 +2168,7 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let (cmd, over) = match parse(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("aterm harness: {e}\n\nRun `aterm harness --help` for usage.");
+            eprintln!("aterm harness: {e}; run `aterm harness --help`");
             return ExitCode::from(2);
         }
     };

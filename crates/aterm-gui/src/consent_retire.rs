@@ -28,6 +28,12 @@ use aterm_containment::consent::{self, Claimants, Retired};
 /// The trash tool macOS 15 and later ship.
 pub(crate) const TRASH_TOOL: &str = "/usr/bin/trash";
 
+/// Whether [`TRASH_TOOL`] is on this Mac, read once: it ships with the OS.
+pub(crate) fn trash_tool_present() -> bool {
+    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRESENT.get_or_init(|| Path::new(TRASH_TOOL).is_file())
+}
+
 /// How long one move may take. Within a volume it is a rename; across
 /// volumes it is a copy.
 const TRASH_CEILING: Duration = Duration::from_secs(120);
@@ -176,9 +182,29 @@ impl RetireState {
         self.retire_slot().report.clone()
     }
 
+    /// Put a finished press's report in the slot, for the host's status tests.
+    #[cfg(test)]
+    pub(crate) fn set_report_for_test(&self, report: RetireReport) {
+        self.retire_slot().report = Some(report);
+    }
+
     /// Whether a report arrived since the last call.
     pub(crate) fn take_arrival(&self) -> bool {
         std::mem::take(&mut self.retire_slot().arrived)
+    }
+}
+
+/// The block's status line once a press's moves are done; the per-copy lines in
+/// the block say what happened to each.
+pub(crate) fn summary(moved: usize, of: usize) -> String {
+    let copies = if of == 1 { "copy" } else { "copies" };
+    match moved {
+        0 => "Nothing was moved.".to_string(),
+        m if m == of => format!("Moved {m} {copies} to the Trash."),
+        m if of - m == 1 => {
+            format!("Moved {m} of {of} copies to the Trash; the other stayed where it was.")
+        }
+        m => format!("Moved {m} of {of} copies to the Trash; the others stayed where they were."),
     }
 }
 
@@ -345,6 +371,55 @@ mod tests {
         let _ = wait_for_report(&state);
     }
 
+    /// A windowed instance's arms ARE the checks the design names: a fresh
+    /// census, the per-copy identity re-read, the process-table walk and the
+    /// trash tool — so no test double can stand in for them in production. A
+    /// headless one gets the inert arms, which move nothing.
+    #[test]
+    fn the_live_arms_are_the_real_checks() {
+        fn same(a: &RetireArms, b: &RetireArms) -> bool {
+            std::ptr::fn_addr_eq(a.census, b.census)
+                && std::ptr::fn_addr_eq(a.unchanged, b.unchanged)
+                && std::ptr::fn_addr_eq(a.in_use, b.in_use)
+                && std::ptr::fn_addr_eq(a.trash, b.trash)
+        }
+        assert!(same(&RetireState::new(false).arms, &RetireArms::live()));
+        assert!(same(&RetireState::new(true).arms, &RetireArms::inert()));
+        assert!(!same(&RetireArms::live(), &RetireArms::inert()));
+        let live = RetireArms::live();
+        assert!(std::ptr::fn_addr_eq(
+            live.census,
+            consent::claimants_for as fn(&str) -> Claimants
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            live.unchanged,
+            consent::still_claims as fn(&consent::Claimant, &str) -> bool
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            live.in_use,
+            atpkg::gc::runs_from as fn(&Path) -> Option<bool>
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            live.trash,
+            trash_with_tool as fn(&Path) -> Result<(), String>
+        ));
+    }
+
+    #[test]
+    fn the_summary_counts_what_moved() {
+        assert_eq!(summary(1, 1), "Moved 1 copy to the Trash.");
+        assert_eq!(summary(2, 2), "Moved 2 copies to the Trash.");
+        assert_eq!(
+            summary(1, 3),
+            "Moved 1 of 3 copies to the Trash; the others stayed where they were."
+        );
+        assert_eq!(
+            summary(1, 2),
+            "Moved 1 of 2 copies to the Trash; the other stayed where it was."
+        );
+        assert_eq!(summary(0, 1), "Nothing was moved.");
+    }
+
     #[test]
     fn the_refusal_is_the_systems_own_words() {
         let stderr = "2026-09-23 22:29:30.491 trash[79297:53920104] # Error attempting to move \
@@ -363,10 +438,16 @@ mod tests {
     /// `app_control`'s tests; this pins the vocabulary.
     #[test]
     fn no_control_module_names_the_retire_entry_points() {
+        // What STARTS a move, including the App's worker field itself
+        // (`self.claimant_retire.start(…)` would skip `begin_claimant_retire`'s
+        // gates). Reading whether the trash tool exists (`trash_tool_present`,
+        // used by the `privacy` verb's note) is not one.
         const ENTRY_POINTS: &[&str] = &[
             "begin_claimant_retire",
-            "consent_retire",
             "retire_claimants",
+            "RetireState",
+            "RetireArms",
+            ".claimant_retire",
         ];
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut scanned = 0usize;
@@ -394,8 +475,10 @@ mod tests {
             scanned >= 3,
             "scanned {scanned} control modules: the fence matched nothing"
         );
+        let lib = include_str!("lib.rs");
         assert!(
-            include_str!("lib.rs").contains("fn begin_claimant_retire"),
+            lib.contains("fn begin_claimant_retire")
+                && lib.contains("claimant_retire: consent_retire::RetireState,"),
             "the entry point moved; update ENTRY_POINTS"
         );
     }

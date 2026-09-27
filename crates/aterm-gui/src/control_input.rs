@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
 use aterm_core::terminal::{RowMatch, RowRange, Terminal, first_matching_row};
-use aterm_session::Op;
+use aterm_session::sink::SinkWriter;
 use winit::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
@@ -51,7 +51,7 @@ pub(crate) fn cmd_scroll(
     // Reply-bearing: the reply is sent AFTER the seam applied the scroll on the
     // main thread, so the position read below is NOT racy with the apply.
     // `scroll` is read-side view control (display_offset only) — audit class ReadScreen.
-    match post_input_reply(proxy, Op::ReadScreen, vec![InputEvent::ScrollView(intent)]) {
+    match post_input_reply(proxy, vec![InputEvent::ScrollView(intent)]) {
         Ok(_) => {}
         Err(e) => return e,
     }
@@ -453,7 +453,7 @@ pub(crate) fn key_arms_own_license(rest: &str) -> bool {
 /// grammar — the two leading options and the key names — is stated in exactly
 /// one place (the plain, the guarded and both cross-session arms answer it).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
-                                    [if-gen=<epoch>.<seq>] [if-fp=<hex16>] \
+                                    [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [unread=ok] \
                                     <name> — enter tab esc space backspace delete up down \
                                     left right home end pageup pagedown f1..f12 (opt +mods, \
                                     e.g. ctrl+c)\n";
@@ -466,7 +466,7 @@ pub(crate) fn cmd_key(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         // Reply-bearing: OK means the seam APPLIED the event (bytes written),
         // not merely that it was enqueued. With no frontmost window the seam
         // drops the reply sender, so the caller gets ERR rather than a false OK.
-        Some(ev) => input_reply_to_str(post_input_reply(proxy, Op::WriteInput, vec![ev])),
+        Some(ev) => input_reply_to_str(post_input_reply(proxy, vec![ev])),
         None => KEY_USAGE.to_string(),
     }
 }
@@ -501,6 +501,10 @@ pub(crate) struct LeadingInputOptions {
     /// The `if-fp=<hex16>` fence: the visible screen's FNV-1a-64 the caller last
     /// read (`status hash=`, `turn hash=`). See [`InputFence`].
     pub if_fp: Option<u64>,
+    /// `unread=ok`: write even though the program has left earlier input
+    /// unread — the one override of the unread-input gate
+    /// (`crate::input_stall::refusal`), for a driver that means to queue.
+    pub unread_ok: bool,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
     /// dispatch answers it AFTER the halt gate: a halted session must say
@@ -531,6 +535,11 @@ pub(crate) struct LeadingInputOptions {
 /// across an alternate-screen re-entry (see [`crate::control::ScreenGen`]); a
 /// caller still spelling it gets `ERR usage` naming `if-gen=`, never a press on
 /// an unsound fence and never the option typed as `send` text.
+///
+/// `unread=ok` rides the same two verbs and composes the same way: it lifts the
+/// unread-input gate (`crate::input_stall::refusal`) for this one write, so a
+/// driver that means to queue behind input the program has not read can. `ok`
+/// is its only value; any other, or a second `unread=`, is a carried refusal.
 ///
 /// The regex is ONE wire token: the control line is split on whitespace and
 /// nothing quotes, so a pattern with a space in it must be written with `.` in
@@ -604,6 +613,19 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
                  alternate-screen re-entry; fence on if-gen=<status gen=>\n"
                     .to_string(),
             );
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        // `unread=ok` (2026-09-24): queue behind input the program has not
+        // read. `ok` is the only value, so a typo is refused rather than typed
+        // into the program as text.
+        if guarded && let Some(value) = head.strip_prefix("unread=") {
+            if value != "ok" {
+                opts.refusal = Some("ERR usage: unread=ok is the only value\n".to_string());
+            } else if std::mem::replace(&mut opts.unread_ok, true) {
+                opts.refusal = Some("ERR usage: unread= given twice\n".to_string());
+            }
             cur = tail;
             consumed = true;
             continue;
@@ -861,7 +883,7 @@ pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
 /// grammar, delivered by [`input_if_fenced`] instead of the seam. A
 /// malformed name is the usage line BEFORE any lock is taken. The guard-only
 /// spelling of [`cmd_key_fenced`], which is what the dispatch calls.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn cmd_key_guarded(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -897,7 +919,7 @@ pub(crate) fn cmd_key_fenced(
 /// `send if=<re> <text>`: the guarded `send` — the same [`send_bytes`] body
 /// (the literal `\n` submit form included), delivered by
 /// [`input_if_fenced`]. The guard-only spelling of [`cmd_send_fenced`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn cmd_send_guarded(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -1004,7 +1026,7 @@ pub(crate) fn parse_ctrl(rest: &str) -> Option<InputEvent> {
 /// nowhere — the same honesty the byte-identical `key ctrl+c` already had.
 pub(crate) fn cmd_ctrl(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     match parse_ctrl(rest) {
-        Some(ev) => input_reply_to_str(post_input_reply(proxy, Op::WriteInput, vec![ev])),
+        Some(ev) => input_reply_to_str(post_input_reply(proxy, vec![ev])),
         None => "ERR usage: ctrl <single-letter>\n".to_string(),
     }
 }
@@ -1033,35 +1055,104 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
-/// `signal <name>` -> deliver a job-control signal to the PTY's CURRENT
-/// foreground process group (via `tcgetpgrp` on the master + `killpg`).
-/// `name` is one of `int`/`c`, `quit`, `tstp`/`z`, `hup`, `term`, `kill`.
-/// This makes Ctrl-C/Ctrl-\\/Ctrl-Z effects deliverable and testable regardless
-/// of the line discipline / launch context (which may not generate them).
+/// `signal <name> [pid=<n>]` -> deliver a job-control signal to the PTY's
+/// CURRENT foreground process group (via `tcgetpgrp` on the master +
+/// `killpg`). `name` is one of `int`/`c`, `quit`, `tstp`/`z`, `hup`, `term`,
+/// `kill`, `cont`. This makes Ctrl-C/Ctrl-\\/Ctrl-Z effects deliverable and
+/// testable regardless of the line discipline / launch context (which may not
+/// generate them).
+///
+/// `pid=<n>` narrows it to ONE process: the signal goes to exactly `n`
+/// (`kill`, not `killpg`), and only while `n` leads the terminal's foreground
+/// process group — otherwise `ERR pid <n> is not the foreground process group`
+/// and nothing is sent. Like every form of the verb it is refused under a
+/// `hold` by the dispatcher, so a caller gets "this exact process, and no
+/// hold" as one server-side decision (the harness's live upgrade concludes a
+/// Claude Code this way; an older server answers the `pid=` form with
+/// `ERR unknown signal`, having sent nothing).
+///
+/// `term`, `kill`, `hup` and `quit`, in either form, first DISCARD the input
+/// a raw-mode (or stopped) program left unread and say so (`discarded=<n>`):
+/// the shell that takes the tty back would otherwise run it
+/// ([`crate::input_stall::discard_before_signal`], 2026-09-25). A `pid=` the
+/// verb refuses discards nothing. The reply does not wait to see the program
+/// end: a published stall whose program lives through the signal stays
+/// published, and names `signal kill` once it has for five seconds
+/// ([`crate::input_stall::Restart`]).
+///
 /// POSIX-only: on Windows (no process groups / killpg for a ConPTY) the verb
 /// stays in the table but honestly replies
 /// `ERR signal unsupported on this platform`.
 #[cfg(unix)]
-pub(crate) fn cmd_signal(master: i32, rest: &str) -> String {
-    let sig = match rest.trim() {
+pub(crate) fn cmd_signal(master: i32, rest: &str, sink: &SinkWriter) -> String {
+    let (sig, pid) = match parse_signal(rest) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let pgrp = unsafe { libc::tcgetpgrp(master) };
+    if pgrp <= 0 {
+        return "ERR no foreground process group\n".to_string();
+    }
+    if let Some(pid) = pid
+        && pid != pgrp
+    {
+        return format!("ERR pid {pid} is not the foreground process group ({pgrp})\n");
+    }
+    // A signal that ENDS the program first drops the input it left unread,
+    // so the shell that inherits the tty never runs it
+    // (`input_stall::discard_before_signal`, 2026-09-25).
+    let discarded = crate::input_stall::discard_before_signal(master, sink, sig);
+    let tail = discarded.map_or_else(String::new, |n| format!(" discarded={n}"));
+    let reply = if let Some(pid) = pid {
+        // SAFETY: `kill` on a pid this terminal's own foreground group is led
+        // by, re-read just above.
+        let rc = unsafe { libc::kill(pid, sig) };
+        if rc == 0 {
+            format!("OK signalled pid {pid}{tail}\n")
+        } else {
+            format!("ERR kill failed{tail}\n")
+        }
+    } else {
+        // SAFETY: `killpg` on the terminal's own foreground group, read from
+        // the master just above; it takes no pointers.
+        let rc = unsafe { libc::killpg(pgrp, sig) };
+        if rc == 0 {
+            format!("OK signalled pgrp {pgrp}{tail}\n")
+        } else {
+            format!("ERR killpg failed{tail}\n")
+        }
+    };
+    // A program that lives through it keeps its stall (2026-09-25, third
+    // round): the watch looks now (`input_stall::after_signal`).
+    crate::input_stall::after_signal(sink, sig);
+    reply
+}
+
+/// PURE parser for `signal <name> [pid=<n>]` → (signal number, exact pid).
+#[cfg(unix)]
+pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>), String> {
+    let mut words = rest.split_whitespace();
+    let name = words.next().unwrap_or("");
+    let sig = match name {
         "int" | "c" | "sigint" => libc::SIGINT,
         "quit" | "sigquit" => libc::SIGQUIT,
         "tstp" | "z" | "sigtstp" => libc::SIGTSTP,
         "hup" | "sighup" => libc::SIGHUP,
         "term" | "sigterm" => libc::SIGTERM,
         "kill" | "sigkill" => libc::SIGKILL,
-        other => return format!("ERR unknown signal: {other}\n"),
+        // The remedy the unread-input gate names for `input=stopped`: a job
+        // stopped with input queued reads nothing until it is continued.
+        "cont" | "sigcont" => libc::SIGCONT,
+        _ => return Err(format!("ERR unknown signal: {}\n", rest.trim())),
     };
-    let pgrp = unsafe { libc::tcgetpgrp(master) };
-    if pgrp <= 0 {
-        return "ERR no foreground process group\n".to_string();
+    let mut pid = None;
+    for w in words {
+        match w.strip_prefix("pid=").map(str::parse::<i32>) {
+            Some(Ok(n)) if n > 1 && pid.is_none() => pid = Some(n),
+            _ => return Err(format!("ERR bad signal argument: {w}\n")),
+        }
     }
-    let rc = unsafe { libc::killpg(pgrp, sig) };
-    if rc == 0 {
-        format!("OK signalled pgrp {pgrp}\n")
-    } else {
-        "ERR killpg failed\n".to_string()
-    }
+    Ok((sig, pid))
 }
 
 /// Windows arm of the `signal` verb: kept in the verb table so the surface is
@@ -1069,8 +1160,8 @@ pub(crate) fn cmd_signal(master: i32, rest: &str) -> String {
 /// honest error (callers wanting Ctrl-C semantics can `feed 03`, which the
 /// ConPTY host cooks into a console Ctrl-C for the foreground app).
 #[cfg(windows)]
-pub(crate) fn cmd_signal(master: i32, rest: &str) -> String {
-    let _ = (master, rest);
+pub(crate) fn cmd_signal(master: i32, rest: &str, sink: &SinkWriter) -> String {
+    let _ = (master, rest, sink);
     "ERR signal unsupported on this platform\n".to_string()
 }
 
@@ -1312,7 +1403,7 @@ pub(crate) fn cmd_mouse(proxy: &EventLoopProxy<Wake>, scope: super::Scope, rest:
         // NOT gate `seam_egress` / violate `bytes_human_eq_controller`.
         Ok(ev) => {
             let ev = apply_copy_on_select_policy(scope, ev);
-            input_reply_to_str(post_input_reply(proxy, Op::WriteInput, vec![ev]))
+            input_reply_to_str(post_input_reply(proxy, vec![ev]))
         }
         Err(e) => e,
     }
@@ -1382,7 +1473,6 @@ pub(crate) fn cmd_paste(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // means the paste reached the PTY (no window ⇒ ERR, not a false OK).
     input_reply_to_str(post_input_reply(
         proxy,
-        Op::WriteInput,
         vec![InputEvent::Paste(
             paste_text(rest),
             crate::input::PasteFraming::AtDrain,
@@ -1409,11 +1499,9 @@ pub(crate) fn paste_text(rest: &str) -> String {
 /// reports a false `OK` for focus that went nowhere.
 pub(crate) fn cmd_focus(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     match parse_focus(rest) {
-        Some(focused) => input_reply_to_str(post_input_reply(
-            proxy,
-            Op::WriteInput,
-            vec![InputEvent::Focus(focused)],
-        )),
+        Some(focused) => {
+            input_reply_to_str(post_input_reply(proxy, vec![InputEvent::Focus(focused)]))
+        }
         None => "ERR usage: focus <in|out>\n".to_string(),
     }
 }
@@ -1785,7 +1873,7 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     if let Some(event) = parse_resize_px(rest) {
         return match event {
             Err(usage) => usage,
-            Ok(event) => match post_input_reply(proxy, Op::WriteInput, vec![event]) {
+            Ok(event) => match post_input_reply(proxy, vec![event]) {
                 Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
                 Ok(_) => "OK\n".to_string(),
                 Err(e) => e,
@@ -1802,7 +1890,6 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     };
     match post_input_reply(
         proxy,
-        Op::WriteInput,
         vec![InputEvent::Resize {
             rows: r,
             cols: c,
@@ -1840,6 +1927,35 @@ pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_parses_the_bare_form_and_the_exact_pid_form() {
+        assert_eq!(parse_signal("int"), Ok((libc::SIGINT, None)));
+        assert_eq!(parse_signal(" term "), Ok((libc::SIGTERM, None)));
+        assert_eq!(
+            parse_signal("int pid=52489"),
+            Ok((libc::SIGINT, Some(52489)))
+        );
+        // What an OLDER server answers for the pid= form, having sent
+        // nothing — the harness's fallback detector — stays the answer for
+        // an unknown name.
+        assert_eq!(
+            parse_signal("nope pid=5"),
+            Err("ERR unknown signal: nope pid=5\n".to_string())
+        );
+        for bad in [
+            "int pid=",
+            "int pid=x",
+            "int pid=1",
+            "int pid=0",
+            "int pid=-3",
+            "int 5",
+            "int pid=5 pid=6",
+        ] {
+            assert!(parse_signal(bad).is_err(), "{bad}");
+        }
+    }
 
     /// GATE (lane-license, deliverable 2): the control fence exempts exactly
     /// the `key` bodies that arm their own license class at the input seam —
@@ -1963,6 +2079,331 @@ mod tests {
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: id= given twice\n"));
         // The guarded set is exactly the two keystroke-shaped writes.
         assert_eq!(GUARDED_VERBS, ["send", "key"]);
+    }
+
+    /// `signal cont` (2026-09-24) is a known signal — the remedy the
+    /// unread-input gate names for a stopped job — so it reaches the
+    /// process-group lookup rather than `ERR unknown signal`.
+    #[test]
+    #[cfg(unix)]
+    fn signal_cont_is_a_known_signal() {
+        for name in ["cont", "sigcont"] {
+            assert_eq!(
+                cmd_signal(-1, name, &SinkWriter::new(-1)),
+                "ERR no foreground process group\n",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            cmd_signal(-1, "continue", &SinkWriter::new(-1)),
+            "ERR unknown signal: continue\n"
+        );
+    }
+
+    /// THE RESTART TYPEAHEAD HAZARD, end to end (whole-branch review,
+    /// 2026-09-25). A real interactive shell (`zsh -f -i`, its own session,
+    /// the pty its controlling tty) runs a job that puts the tty in raw mode
+    /// and never reads it — the frozen program. A line is typed into it and
+    /// sits unread. The published remedy, `signal term`, ends the job, and the
+    /// shell takes the terminal back: the line must NOT run. The negative
+    /// control sends the bare `killpg` today's remedy was, and the line runs
+    /// — the typed command prints `TYPE''AHEAD` as it was typed and
+    /// `TYPEAHEAD` only when the shell executes it. A marker typed after the
+    /// signal runs in both, so a pass is never a dead shell.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn signal_term_drops_a_frozen_programs_keys_before_the_shell_can_run_them() {
+        let (ran, reply) = typeahead_after_restart(Remedy::BareKillpg, Typed::Direct);
+        assert!(
+            ran,
+            "the control: a bare killpg lets the shell run the line"
+        );
+        assert_eq!(reply, None);
+        let (ran, reply) = typeahead_after_restart(Remedy::Verb, Typed::Direct);
+        assert!(!ran, "signal term dropped the line before the shell got it");
+        let reply = reply.expect("the verb's reply");
+        assert!(
+            reply.starts_with("OK signalled pgrp ") && reply.ends_with(" discarded=17\n"),
+            "{reply}"
+        );
+        // The exact-pid form (origin/main's `signal term pid=<n>`, the
+        // harness's live upgrade ending a Claude Code) ends the program just
+        // the same, so it drops the same keys (merged 2026-09-25).
+        let (ran, reply) = typeahead_after_restart(Remedy::VerbPid, Typed::Direct);
+        assert!(!ran, "signal term pid= dropped the line too");
+        let reply = reply.expect("the verb's reply");
+        assert!(
+            reply.starts_with("OK signalled pid ") && reply.ends_with(" discarded=17\n"),
+            "{reply}"
+        );
+    }
+
+    /// THE SPILL BEHIND A FULL QUEUE, through the same remedy (whole-branch
+    /// review, second round, 2026-09-25). A paste into a frozen raw program
+    /// fills its input queue (1022 bytes on Darwin) and the sink SPILLS the
+    /// rest; the spill's drainer parks in `poll(POLLOUT)` holding the fd lock.
+    /// The first cut of the remedy flushed the kernel queue and left the
+    /// spill: a flush does not wake a parked `poll` on Darwin, the emptied
+    /// queue gives the shell nothing to read, so the drainer slept for good
+    /// and every later key — the resume command included — queued behind it.
+    /// The session was deaf, and `signal term` had made it so. Measured on
+    /// that cut: `discarded=1022 left=96`, then the marker below never
+    /// reached the shell (this test timed out waiting for it). Now the
+    /// remedy drops the spill with the queue — the reply counts both, 1118 —
+    /// the line inside the spill never runs, and the marker, written through
+    /// the SAME sink, does. The bare-killpg control shows the spilled line is
+    /// a live command once the shell has the tty.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn signal_term_drops_a_spill_behind_a_full_queue_and_the_session_still_hears() {
+        let (ran, reply) = typeahead_after_restart(Remedy::BareKillpg, Typed::ThroughASpill);
+        assert!(ran, "the control: the spilled line runs in the shell");
+        assert_eq!(reply, None);
+        let (ran, reply) = typeahead_after_restart(Remedy::Verb, Typed::ThroughASpill);
+        assert!(!ran, "signal term dropped the spilled line too");
+        let reply = reply.expect("the verb's reply");
+        assert!(
+            reply.starts_with("OK signalled pgrp ") && reply.ends_with(" discarded=1118\n"),
+            "{reply}"
+        );
+    }
+
+    /// How the frozen program is ended.
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Remedy {
+        /// A bare `killpg(SIGTERM)`: the remedy as it was, the control.
+        BareKillpg,
+        /// `signal term`, through the verb.
+        Verb,
+        /// `signal term pid=<the job's leader>`, through the verb.
+        VerbPid,
+    }
+
+    /// How the typed-ahead line reaches the frozen program.
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Typed {
+        /// 17 bytes written to the master directly: all in the kernel queue.
+        Direct,
+        /// 1118 bytes through the SINK: 1022 fill the raw queue, and the tail
+        /// — the line — spills behind it with a drainer parked on the queue.
+        ThroughASpill,
+    }
+
+    /// One run of the hazard: returns whether the typed line RAN in the
+    /// shell, and the verb's reply for a [`Remedy`] that goes through it. The marker that proves the shell is
+    /// back is written through the sink, as a later key from the window or a
+    /// driver would be.
+    #[cfg(target_os = "macos")]
+    fn typeahead_after_restart(remedy: Remedy, typed: Typed) -> (bool, Option<String>) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        // The two hazard tests run on parallel threads, and `openpty` from
+        // parallel threads fails now and then (measured in aterm-session's
+        // input_backlog_pty.rs, 2026-09-25): one at a time.
+        static OPENPTY: Mutex<()> = Mutex::new(());
+        let one = OPENPTY.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut master, mut slave) = (-1i32, -1i32);
+        // SAFETY: `openpty` fills the two out-params; the optional pointers
+        // are null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        drop(one);
+        assert_eq!(rc, 0, "openpty");
+        // SAFETY: `slave` is a fresh fd this function alone owns.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
+        let mut shell = std::process::Command::new("/bin/zsh");
+        shell
+            .args(["-f", "-i"])
+            .env("TERM", "xterm")
+            .stdin(stdio())
+            .stdout(stdio())
+            .stderr(stdio());
+        // SAFETY: runs in the forked child before exec, after stdio is in
+        // place: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and
+        // touch nothing of the parent's.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        /// Reaps the shell however the run ends, so a failed assertion leaves
+        /// no interactive shell behind (the job's own `sleep` ends by itself).
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let shell = Reap(shell.spawn().expect("spawn zsh"));
+        drop(slave);
+        aterm_pty::set_nonblocking(master, true).expect("nonblocking master");
+        // The terminal's side: everything the shell and its jobs draw, read
+        // as it comes — a pty's output queue is small, and a shell that
+        // cannot draw its prompt reads nothing either.
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drawer = {
+            let (seen, stop) = (seen.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut buf = [0u8; 4096];
+                    // SAFETY: a bounded read into a live stack buffer from the
+                    // master, which outlives this thread (joined before close).
+                    let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                    match usize::try_from(n) {
+                        Ok(n) if n > 0 => seen.lock().expect("seen").extend_from_slice(&buf[..n]),
+                        _ => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+        let drawn = |needle: &str| {
+            let seen = seen.lock().expect("seen");
+            seen.windows(needle.len()).any(|w| w == needle.as_bytes())
+        };
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: {:?}",
+                    String::from_utf8_lossy(&seen.lock().expect("seen"))
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let type_in = |bytes: &[u8]| {
+            // SAFETY: a bounded write of a live slice to the live master.
+            let n = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(usize::try_from(n).ok(), Some(bytes.len()), "write(master)");
+        };
+
+        // The frozen program: raw mode, never reading. Typed once the shell
+        // is at its prompt (bracketed paste on is its line editor starting).
+        wait_for("the prompt", &|| drawn("\x1b[?2004h"));
+        type_in(b"(stty raw -echo; exec sleep 30)\r");
+        // The JOB's raw mode, not the line editor's: ISIG off (the editor
+        // keeps it on), and the job in the foreground, not the shell.
+        let shell_pgrp = libc::pid_t::try_from(shell.0.id()).expect("pid");
+        wait_for("the job's raw mode", &|| {
+            // SAFETY: `tcgetpgrp` only reads the live master's foreground group.
+            let fg = unsafe { libc::tcgetpgrp(master) };
+            fg > 0
+                && fg != shell_pgrp
+                && aterm_pty::tty_echo(master)
+                    .is_some_and(|e| !e.canonical && !e.echo && e.signals.is_none())
+        });
+        let sink = SinkWriter::new(master);
+        sink.note_master_nonblocking(true);
+        match typed {
+            Typed::Direct => {
+                // The line typed into it, unread (17 bytes).
+                type_in(b"echo TYPE''AHEAD\r");
+                assert_eq!(aterm_pty::input_queue_len(master), Some(17));
+            }
+            Typed::ThroughASpill => {
+                // A paste of a long comment line, then the line: 1118 bytes.
+                let mut paste = vec![b'#'; 1100];
+                paste.extend_from_slice(b"\recho TYPE''AHEAD\r");
+                assert_eq!(paste.len(), 1118);
+                assert_eq!(sink.write_frame_nonparking(&paste).expect("paste"), 1118);
+                // The drainer takes the spill's mutex as it starts, and a
+                // reading that meets it busy leaves the spill uncounted.
+                wait_for("the paste parked", &|| {
+                    sink.input_backlog()
+                        .is_some_and(|b| b.spilled.is_some() && b.unread() == 1118)
+                });
+                let parked = sink.input_backlog().expect("a pty is measured");
+                assert_eq!(parked.queued, 1022, "the raw queue is full: {parked:?}");
+            }
+        }
+
+        // SAFETY: `tcgetpgrp` only reads the live master's foreground group.
+        let pgrp = unsafe { libc::tcgetpgrp(master) };
+        assert!(pgrp > 0, "a foreground job");
+        let reply = match remedy {
+            Remedy::Verb => Some(cmd_signal(master, "term", &sink)),
+            Remedy::VerbPid => Some(cmd_signal(master, &format!("term pid={pgrp}"), &sink)),
+            Remedy::BareKillpg => {
+                // SAFETY: `pgrp` is this test's own job.
+                assert_eq!(unsafe { libc::killpg(pgrp, libc::SIGTERM) }, 0);
+                None
+            }
+        };
+        // A marker typed after the remedy, through the sink: the shell is
+        // back and reading, and the sink still reaches it.
+        sink.write_frame_nonparking(b"echo MARK''ALIVE\r")
+            .expect("the marker");
+        wait_for("the shell's marker", &|| drawn("MARKALIVE"));
+        let ran = drawn("TYPEAHEAD");
+
+        drop(shell);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        drawer.join().expect("the drawer");
+        aterm_pty::close_fd(master);
+        (ran, reply)
+    }
+
+    /// `unread=ok` (2026-09-24) is the one override of the unread-input gate:
+    /// taken off `send`/`key` only, in any order beside the other options; `ok`
+    /// is its only value; a bad value or a second one is a CARRIED refusal (the
+    /// halt gate still speaks first); and `send -- unread=ok` types the text.
+    #[test]
+    fn take_leading_options_takes_unread_ok_on_send_and_key_only() {
+        let (o, tail) = take_leading_options("key", "unread=ok down");
+        assert!(o.unread_ok);
+        assert_eq!(o.refusal, None);
+        assert_eq!(tail, "down");
+        let (o, tail) = take_leading_options("send", "id=a:b:c unread=ok if=x hi");
+        assert!(o.unread_ok);
+        assert_eq!(o.idem.as_deref(), Some("a:b:c"));
+        assert_eq!(o.guard.as_deref(), Some("x"));
+        assert_eq!(tail, "hi");
+        // Given twice, or with any value but `ok`: refused, never typed.
+        let (o, tail) = take_leading_options("key", "unread=ok unread=ok down");
+        assert_eq!(
+            o.refusal.as_deref(),
+            Some("ERR usage: unread= given twice\n")
+        );
+        assert_eq!(tail, "down");
+        for bad in ["yes", "", "OK", "ok1"] {
+            let (o, _) = take_leading_options("key", &format!("unread={bad} down"));
+            assert_eq!(
+                o.refusal.as_deref(),
+                Some("ERR usage: unread=ok is the only value\n"),
+                "unread={bad:?}"
+            );
+            assert!(!o.unread_ok, "unread={bad:?} must not lift the gate");
+        }
+        // `--` ends options: the text is sent literally and the gate stands.
+        let (o, tail) = take_leading_options("send", "-- unread=ok");
+        assert!(!o.unread_ok);
+        assert_eq!(tail, "unread=ok");
+        // A body token is body.
+        let (o, tail) = take_leading_options("send", "hello unread=ok");
+        assert!(!o.unread_ok);
+        assert_eq!(tail, "hello unread=ok");
+        // `turn`, `paste`, `feed` take no override: their tail is untouched.
+        for verb in ["turn", "paste", "feed", "ctrl"] {
+            let (o, tail) = take_leading_options(verb, "unread=ok x");
+            assert!(!o.unread_ok, "{verb}");
+            assert_eq!(tail, "unread=ok x", "{verb}");
+        }
     }
 
     /// `if-gen=<epoch>.<seq>` parses to the screen generation `status gen=`

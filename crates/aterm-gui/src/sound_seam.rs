@@ -155,6 +155,7 @@ pub(crate) enum SeamReason {
     SeriousMode,
     Unfocused,
     HostInert,
+    #[cfg(any(target_os = "macos", test))]
     HostWedged,
     ResizeQuiet,
     /// The engine refuses for a reason the config gates do not explain.
@@ -196,6 +197,7 @@ impl SeamReason {
             Self::SeriousMode => "serious-mode",
             Self::Unfocused => "unfocused",
             Self::HostInert => "host-inert",
+            #[cfg(any(target_os = "macos", test))]
             Self::HostWedged => "host-wedged",
             Self::ResizeQuiet => "resize-quiet",
             Self::EngineSilent => "engine-silent",
@@ -226,6 +228,7 @@ pub(crate) fn sound_seam(i: &SeamInputs) -> Option<SeamReason> {
     if matches!(i.host, HostState::Inert) {
         return Some(SeamReason::HostInert);
     }
+    #[cfg(any(target_os = "macos", test))]
     if matches!(i.host, HostState::Wedged) {
         return Some(SeamReason::HostWedged);
     }

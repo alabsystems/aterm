@@ -209,9 +209,6 @@ pub enum Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
     pub upstream: &'static str,
-    /// Which world the upstream name belongs to ("Rust", "TLA+", "SMT") — the
-    /// signpost's first clause.
-    pub family: &'static str,
     pub policy: Policy,
 }
 
@@ -249,7 +246,6 @@ pub const CARGO_VERB_REROUTES: &[(&str, &str)] = &[("clippy", "targo tippy"), ("
 pub const TABLE: &[Row] = &[
     Row {
         upstream: "clippy",
-        family: "Rust",
         policy: Policy::Direct {
             branded: "tippy",
             source_verb: None,
@@ -257,7 +253,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "rustfmt",
-        family: "Rust",
         policy: Policy::Direct {
             branded: "trustfmt",
             source_verb: None,
@@ -265,7 +260,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "rustdoc",
-        family: "Rust",
         policy: Policy::Direct {
             branded: "trustdoc",
             source_verb: None,
@@ -273,7 +267,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "lean",
-        family: "Lean",
         policy: Policy::Direct {
             branded: "clean",
             source_verb: Some(SourceVerb {
@@ -284,7 +277,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "tlc",
-        family: "TLA+",
         policy: Policy::Signpost {
             branded: "ty",
             lanes: &[],
@@ -292,7 +284,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "rustc",
-        family: "Rust",
         policy: Policy::Signpost {
             branded: "trustc",
             lanes: RUSTC_LANES,
@@ -300,7 +291,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "cargo",
-        family: "Rust",
         policy: Policy::Signpost {
             branded: "targo",
             lanes: CARGO_LANES,
@@ -308,7 +298,6 @@ pub const TABLE: &[Row] = &[
     },
     Row {
         upstream: "z3",
-        family: "SMT",
         policy: Policy::Oracle { branded: "ay" },
     },
 ];
@@ -372,25 +361,26 @@ fn escape_clause(upstream: &str) -> String {
 /// The setting that silences a SIGNPOST row's announcement, as the line spells it.
 pub const ANNOUNCE_SETTING: &str = "[reroute] announce = false";
 
-/// The last lines of a SIGNPOST message: what is about to happen — upstream runs, and
-/// what it produces carries no proof claim — and the setting that silences the line,
-/// because a line printed on every build must say how to stop printing it.
-fn signpost_closing(upstream: &str) -> String {
+/// The last lines of a SIGNPOST message: the page that answers which toolchain this
+/// directory gets, and the setting that silences the line, because a line printed on
+/// every build must say how to stop printing it. What is about to happen (upstream
+/// runs) is the message's FIRST line, in each arm.
+fn signpost_closing() -> String {
     // The measuring page is named on every signpost (owner, 2026-09-08: the
     // Trust default is to be "very strongly encouraged by the aterm system
     // itself"): a reader who is about to run stock cargo anyway is told, in
     // the same breath, the one command that answers which toolchain this
-    // directory actually gets — instead of guessing from the two lines above.
+    // directory actually gets — instead of guessing from the lines above.
     format!(
-        "       Running upstream '{upstream}' now — nothing it produces carries a proof claim.\n       `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
+        "       `aterm help rust` shows which toolchain this directory gets; the default here is Trust.\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
     )
 }
 
-/// The DIRECT row's one line.
+/// The DIRECT row's one line: what runs first, then the escape.
 #[must_use]
-pub fn direct_announcement(upstream: &str, family: &str, branded: &str) -> String {
+pub fn direct_announcement(upstream: &str, branded: &str) -> String {
     format!(
-        "aterm: '{upstream}' is the {family} name; on Trust the tool is '{branded}' — running {branded}. {}",
+        "aterm: running {branded}, Trust's '{upstream}'. {}",
         escape_clause(upstream)
     )
 }
@@ -398,12 +388,10 @@ pub fn direct_announcement(upstream: &str, family: &str, branded: &str) -> Strin
 /// The SIGNPOST announcement, the caller's arguments filled into every lane:
 ///
 /// ```text
-/// aterm: 'cargo' is the Rust name; on Trust the tool is 'targo'. Trust will not
-///        pick a verification lane for you:
+/// aterm: running upstream 'cargo' (no proof claim); on Trust the tool is 'targo':
 ///          targo trust build --release          VERIFIED   — emits a proof claim
 ///          targo --unverified build --release   UNVERIFIED — no proof claim
-///        Running upstream 'cargo' now — nothing it produces carries a proof claim.
-///        `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.
+///        `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
 ///        ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
 /// ```
 #[must_use]
@@ -420,28 +408,24 @@ pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
     {
         let tail = args[1..].join(" ");
         out.push_str(&format!(
-            "aterm: '{upstream} {verb}' is the {} name; on Trust the tool is '{reroute}':\n",
-            row.family
+            "aterm: running upstream '{upstream} {verb}'; on Trust the tool is '{reroute}':\n"
         ));
         out.push_str(&format!("         {}\n", join_command(reroute, &tail)));
-        out.push_str(&signpost_closing(upstream));
+        out.push_str(&signpost_closing());
         return out;
     }
     if lanes.is_empty() {
         out.push_str(&format!(
-            "aterm: '{upstream}' is the {} name; on this toolchain the tool is '{branded}', and\n",
-            row.family
+            "aterm: running upstream '{upstream}' (no proof claim); on this toolchain the tool is '{branded}'\n"
         ));
-        out.push_str("       drop-in equivalence is not yet proven, so nothing is substituted:\n");
+        out.push_str("       (drop-in equivalence is not yet proven):\n");
         out.push_str(&format!("         {}\n", join_command(branded, &rest)));
-        out.push_str(&signpost_closing(upstream));
+        out.push_str(&signpost_closing());
         return out;
     }
     out.push_str(&format!(
-        "aterm: '{upstream}' is the {} name; on Trust the tool is '{branded}'. Trust will not\n",
-        row.family
+        "aterm: running upstream '{upstream}' (no proof claim); on Trust the tool is '{branded}':\n"
     ));
-    out.push_str("       pick a verification lane for you:\n");
     let commands: Vec<String> = lanes
         .iter()
         .map(|lane| join_command(lane.command, &rest))
@@ -454,21 +438,26 @@ pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
             lane.label, lane.note
         ));
     }
-    out.push_str(&signpost_closing(upstream));
+    out.push_str(&signpost_closing());
     out
 }
 
 /// The ORACLE refusal, naming the upstream copy's own path when there is one: a path
-/// never meets a stub, so it is the consent to run the real tool.
+/// never meets a stub, so it is the consent to run the real tool. Why the name is
+/// refused (the branded tool is measured against it) is `aterm pkg which`'s answer
+/// ([`policy_summary`]), not this line's.
 #[must_use]
-pub fn oracle_message(upstream: &str, branded: &str, upstream_path: Option<&Path>) -> String {
+pub fn oracle_message(upstream: &str, upstream_path: Option<&Path>) -> String {
+    // The escape is named only where it reaches something: with no upstream copy on
+    // PATH, an `aterm --no-reroute` session has none either.
     let reach = match upstream_path {
-        Some(path) => format!("run {} to reach the real {upstream}", path.display()),
+        Some(path) => format!(
+            "run {} to reach the real {upstream} (`aterm --no-reroute` lifts this)",
+            path.display()
+        ),
         None => format!("no upstream '{upstream}' is on PATH"),
     };
-    format!(
-        "aterm: '{upstream}' is the oracle '{branded}' is measured against, so a session never runs it by name: {reach} (`aterm --no-reroute` starts a session with every upstream tool)."
-    )
+    format!("aterm: '{upstream}' does not run by name in an aterm session — {reach}.")
 }
 
 /// `cargo trust <verb>` / `cargo --unverified <verb>`: the user named the lane
@@ -481,7 +470,7 @@ pub const EXPLICIT_LANE_VERBS: &[&str] = &["trust", "--unverified"];
 #[must_use]
 pub fn explicit_lane_note(upstream: &str, branded: &str, lane: &str) -> String {
     format!(
-        "aterm: '{upstream} {lane}' names the lane in the Rust spelling; on Trust the tool is '{branded}' — running {branded} {lane}. {}",
+        "aterm: running {branded} {lane} for '{upstream} {lane}'. {}",
         escape_clause(upstream)
     )
 }
@@ -490,7 +479,7 @@ pub fn explicit_lane_note(upstream: &str, branded: &str, lane: &str) -> String {
 #[must_use]
 pub fn passthrough_note(upstream: &str, toolchain: &str) -> String {
     format!(
-        "aterm: '{upstream} +{toolchain}' names an upstream toolchain explicitly — running upstream '{upstream}'; nothing it produces is verified. (The Trust lane is 'targo trust <verb>'; a session started with `aterm --no-reroute` prints no note.)"
+        "aterm: running upstream '{upstream} +{toolchain}' (no proof claim; an `aterm --no-reroute` session prints no note)"
     )
 }
 
@@ -590,6 +579,9 @@ fn sh_skip_a_stub(indent: &str) -> String {
 ///   name — the escape works with no atpkg at all;
 /// * with atpkg unreachable it fails closed with the escape named (exit 2),
 ///   never quietly running upstream.
+///
+/// `atpkg` is the one [`crate::stub::Embedder`] settled on; the EMPTY path names none
+/// (`ATPKG=''`, which the `[ -x ]` refuses), and the stub goes straight to `command -v atpkg`.
 #[must_use]
 pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String {
     let name = crate::stub::sh_single_quote(upstream);
@@ -936,13 +928,26 @@ pub fn stub_state(layout: &Layout, name: &str) -> StubState {
 
 /// Every stub [`lay`] wants in `dir(layout)` now, `(name, body)`: each [`TABLE`] row's, then
 /// each agent program's with a twin ([`agents_routes`]).
-fn wanted_stubs(layout: &Layout) -> Vec<(&'static str, String)> {
+///
+/// A row's stub names the atpkg `embedder` settles on over the one the stub standing there
+/// names now ([`crate::stub::Embedder::embed`]): never an atpkg that is not there, and never
+/// one that lasts less than the live atpkg the stub already names — a dev build or a scratch
+/// copy of aterm runs this lay too, at its every launch and session spawn.
+fn wanted_stubs(layout: &Layout, embedder: &crate::stub::Embedder) -> Vec<(&'static str, String)> {
     let dir = dir(layout);
-    let atpkg = crate::stub::embedded_atpkg_path();
     let agents = layout.agents_dir();
     TABLE
         .iter()
-        .map(|row| (row.upstream, stub_body_sh(row.upstream, &atpkg, &dir)))
+        .map(|row| {
+            let path = dir.join(row.upstream);
+            let standing = is_reroute_stub(&path)
+                .then(|| crate::metadata_io::read_bounded_regular_utf8(&path, MAX_STUB_BYTES).ok())
+                .flatten()
+                .and_then(|body| crate::stub::sh_named_atpkg(&body, "ATPKG"));
+            let atpkg = embedder.embed(standing.as_deref());
+            let body = stub_body_sh(row.upstream, crate::stub::named(atpkg.as_deref()), &dir);
+            (row.upstream, body)
+        })
         .chain(
             agents_routes(layout)
                 .into_iter()
@@ -966,7 +971,19 @@ fn wanted_stubs(layout: &Layout) -> Vec<(&'static str, String)> {
 /// A FILE IS WRITTEN ONLY WHEN ITS BYTES DIFFER (Phase 3, 2026-09-22): a pass or a spawn
 /// changes only what is wrong in content. A macOS tag is cleared in place by the store heal
 /// every door ends with ([`crate::provenance::heal_store`]), never by re-laying bytes.
+///
+/// THE ATPKG A STUB NAMES IS NOT SIMPLY THIS PROCESS'S (2026-09-25, the end-to-end run's
+/// D1): a copy of aterm started from a scratch directory re-laid all eight stubs naming
+/// `<scratch>/bin/atpkg`, a file that was never there, over stubs naming the installed
+/// app's. [`crate::stub::Embedder`] decides, for the stubs, the pending stubs and the
+/// `agents/` twins alike.
 pub fn lay(layout: &Layout) -> io::Result<()> {
+    lay_with(layout, &crate::stub::Embedder::this_process())
+}
+
+/// [`lay`], with the atpkg on offer and the temporary directories `embedder`'s — a test
+/// stands the laying process anywhere.
+pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> io::Result<()> {
     if cfg!(windows) {
         return Ok(());
     }
@@ -987,13 +1004,13 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     }
     // Every stub whose bytes differ.
     let mut files = Vec::new();
-    let wanted = wanted_stubs(layout);
+    let wanted = wanted_stubs(layout, embedder);
     for (name, body) in &wanted {
         let path = dir.join(name);
         match std::fs::symlink_metadata(&path) {
             Err(_) => {} // absent: ours to claim
             // Ours already, and byte-identical: nothing to lay. A body that differs — the
-            // embedded atpkg path moved with a relocation or a self-update — is rewritten.
+            // atpkg it names moved with a relocation or a self-update — is rewritten.
             Ok(_) if is_reroute_stub(&path) => {
                 if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes()) {
                     continue;
@@ -1080,7 +1097,7 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             branded,
             source_verb,
         } => {
-            eprintln!("{}", direct_announcement(upstream, row.family, branded));
+            eprintln!("{}", direct_announcement(upstream, branded));
             exec_branded(layout, upstream, branded, &direct_args(source_verb, args))
         }
         Policy::Signpost { branded, lanes } => {
@@ -1114,13 +1131,10 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             }
             exec_upstream(layout, upstream, args)
         }
-        Policy::Oracle { branded } => {
+        Policy::Oracle { .. } => {
             let path_var = std::env::var_os("PATH");
             let upstream_path = upstream_on_path(layout, upstream, path_var.as_deref());
-            eprintln!(
-                "{}",
-                oracle_message(upstream, branded, upstream_path.as_deref())
-            );
+            eprintln!("{}", oracle_message(upstream, upstream_path.as_deref()));
             ExitCode::from(REFUSAL_EXIT)
         }
     }
@@ -1323,7 +1337,11 @@ mod tests {
     }
 
     /// Replace whatever is at `at` with `bytes`, or with a symlink to `target`, by rename,
-    /// so a concurrent run exec'ing `at` sees the old entry or the new one, never neither.
+    /// so the directory entry is the old one or the new one, never neither. That is NOT
+    /// safe under a concurrent run when the entry replaced is a SYMLINK: a call that reads
+    /// it while it is renamed over — `readlink`, or a path walk following it — fails
+    /// EINVAL ([`managed_target`] has the measurement), so a shared symlink is laid only
+    /// when it is wrong.
     #[cfg(unix)]
     fn lay_by_rename(at: &Path, bytes: Option<&str>, target: Option<&Path>) {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1341,6 +1359,7 @@ mod tests {
     /// The ONE fake program: it prints the label on the first line of the `.who` file
     /// beside the name it was run by, then its arguments, and exits with the code on that
     /// file's second line (0 when there is none).
+    #[cfg(unix)]
     const FAKE: &str = "#!/bin/sh\n{ IFS= read -r who; IFS= read -r code; } < \"$0.who\"\n\
                         echo \"$who: $*\"\nexit \"${code:-0}\"\n";
 
@@ -1476,7 +1495,9 @@ mod tests {
         };
         let text = signpost_message(row, lanes, &args(&["build", "--release"]));
         assert!(
-            text.starts_with("aterm: 'cargo' is the Rust name; on Trust the tool is 'targo'."),
+            text.starts_with(
+                "aterm: running upstream 'cargo' (no proof claim); on Trust the tool is 'targo':\n"
+            ),
             "{text}"
         );
         assert!(text.contains("targo trust build --release"), "{text}");
@@ -1488,19 +1509,15 @@ mod tests {
         // Every announce-and-run signpost names the page that MEASURES the
         // answer, and says the default (owner, 2026-09-08).
         assert!(
-            text.contains("`aterm help rust` measures which toolchain THIS directory gets"),
+            text.contains("`aterm help rust` shows which toolchain this directory gets"),
             "{text}"
         );
         assert!(text.contains("the default here is Trust"), "{text}");
         assert!(text.contains("UNVERIFIED — no proof claim"), "{text}");
-        // ANNOUNCE, NOT REFUSE: the default says upstream is about to run and
-        // names the one setting that silences it — never an environment variable.
-        assert!(
-            text.contains(
-                "Running upstream 'cargo' now — nothing it produces carries a proof claim."
-            ),
-            "{text}"
-        );
+        // ANNOUNCE, NOT REFUSE: the default says upstream is about to run (the
+        // first line) and names the one setting that silences it — never an
+        // environment variable.
+        assert_eq!(text.lines().count(), 5, "{text}");
         assert!(
             text.ends_with(
                 "([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)"
@@ -1563,7 +1580,9 @@ mod tests {
             &args(&["clippy", "--workspace", "--", "-D", "warnings"]),
         );
         assert!(
-            text.contains("'cargo clippy' is the Rust name; on Trust the tool is 'targo tippy'"),
+            text.starts_with(
+                "aterm: running upstream 'cargo clippy'; on Trust the tool is 'targo tippy':\n"
+            ),
             "{text}"
         );
         assert!(
@@ -1590,6 +1609,12 @@ mod tests {
         };
         let text = signpost_message(tlc, lanes, &args(&["Spec.tla"]));
         assert!(
+            text.starts_with(
+                "aterm: running upstream 'tlc' (no proof claim); on this toolchain the tool is 'ty'\n"
+            ),
+            "{text}"
+        );
+        assert!(
             text.contains("drop-in equivalence is not yet proven"),
             "{text}"
         );
@@ -1598,26 +1623,38 @@ mod tests {
 
     #[test]
     fn direct_oracle_and_passthrough_are_one_line_each_and_name_the_escape() {
+        let no_copy = oracle_message("z3", None);
         for text in [
-            direct_announcement("rustfmt", "Rust", "trustfmt"),
-            oracle_message("z3", "ay", Some(Path::new("/opt/homebrew/bin/z3"))),
-            oracle_message("z3", "ay", None),
+            direct_announcement("rustfmt", "trustfmt"),
+            oracle_message("z3", Some(Path::new("/opt/homebrew/bin/z3"))),
+            no_copy.clone(),
             passthrough_note("cargo", "stable"),
             unreachable_message("cargo"),
         ] {
             assert_eq!(text.lines().count(), 1, "{text}");
             assert!(text.starts_with("aterm: "), "{text}");
-            assert!(text.contains("aterm --no-reroute"), "{text}");
+            assert!(
+                text == no_copy || text.contains("aterm --no-reroute"),
+                "{text}"
+            );
             assert!(
                 !text.contains("ATERM_"),
                 "no environment knob is taught: {text}"
             );
         }
         assert!(
-            oracle_message("z3", "ay", Some(Path::new("/opt/homebrew/bin/z3")))
+            direct_announcement("rustfmt", "trustfmt").starts_with("aterm: running trustfmt, "),
+            "a DIRECT line leads with what runs"
+        );
+        assert!(
+            oracle_message("z3", Some(Path::new("/opt/homebrew/bin/z3")))
                 .contains("run /opt/homebrew/bin/z3 to reach the real z3"),
             "the ORACLE refusal names the path that is the consent"
         );
+        // With no upstream copy on PATH, an `aterm --no-reroute` session has none
+        // either: the escape is not offered as the fix.
+        assert!(!no_copy.contains("aterm --no-reroute"), "{no_copy}");
+        assert!(no_copy.contains("no upstream 'z3' is on PATH"), "{no_copy}");
     }
 
     /// A second `lay` may be in flight: its `.<name>.stub-<pid>` temp and the
@@ -1770,11 +1807,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Run `cmd`, killing it after `secs` — an exec loop must fail this test,
-    /// not hang it.
-    #[cfg(unix)]
     /// The CPU time a pid has consumed, as `ps` spells it, or `None` when `ps`
     /// cannot answer. Read ONLY to describe a timeout — never to decide one.
+    #[cfg(unix)]
     fn child_cpu_time(pid: u32) -> Option<String> {
         let out = std::process::Command::new("/bin/ps")
             .args(["-o", "time=", "-p", &pid.to_string()])
@@ -1784,6 +1819,9 @@ mod tests {
         (!t.is_empty()).then_some(t)
     }
 
+    /// Run `cmd`, killing it after `secs` — an exec loop must fail this test,
+    /// not hang it.
+    #[cfg(unix)]
     fn output_within(mut cmd: std::process::Command, secs: u64) -> std::process::Output {
         use std::io::Read as _;
         let mut child = cmd
@@ -2180,6 +2218,113 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).is_empty(),
             "stdout must stay clean"
         );
+        // NAMING NO ATPKG (the empty path, `crate::stub::named(None)`): `ATPKG=''`, which the
+        // `[ -x ]` refuses — `command -v atpkg` answers, and with none on PATH the same
+        // fail-closed exit 2 as a dangling path.
+        let none = stub_body_sh("cargo", crate::stub::named(None), &d);
+        assert!(none.contains("\nATPKG=''\n"), "{none}");
+        let out = run(&none, None);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not reachable"),
+            "{out:?}"
+        );
+        let path_atpkg = l.prefix.join("path-bin");
+        place_fake(&path_atpkg.join("atpkg"), "path atpkg\n3");
+        let stub = d.join("cargo");
+        std::fs::write(&stub, &none).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = sh(&stub)
+            .args(["build"])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:{}",
+                    d.display(),
+                    path_atpkg.display(),
+                    upstream_dir.display()
+                ),
+            )
+            .env_remove(PASSTHROUGH_ENV)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "path atpkg: __reroute cargo build\n",
+            "no atpkg named: the one on PATH answers"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// WHICH ATPKG A LAY NAMES, through the real [`lay_with`] (D1, 2026-09-25): a
+    /// `target/` build with a live `atpkg` beside it never takes the stubs from the installed
+    /// app, nor does a copy with none beside it; the installed app takes them from the
+    /// `target/` build, and a moved app from its own gone path — the negative control that
+    /// keeps this from passing for a lay that re-points nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_build_never_takes_the_stubs_from_the_installed_app() {
+        let l = layout("which-atpkg");
+        // Canonical, as a lay spells an atpkg path.
+        let root = std::fs::canonicalize(&l.prefix).unwrap();
+        let live = |path: PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let installed = live(root.join("Applications/aterm.app/Contents/MacOS/atpkg"));
+        let checkout = root.join("checkout/target");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+        let target_build = live(checkout.join("debug/atpkg"));
+        // The fixture lives under the temp dir, which is itself transient: this test's
+        // "machine" has no temp dir, so each class is only what its own path says.
+        let as_process = |offered: &Path| crate::stub::Embedder::offering(offered, &[]);
+        let named = |l: &Layout| -> Vec<Option<PathBuf>> {
+            TABLE
+                .iter()
+                .map(|row| {
+                    let body = std::fs::read_to_string(dir(l).join(row.upstream)).unwrap();
+                    crate::stub::sh_named_atpkg(&body, "ATPKG")
+                })
+                .collect()
+        };
+        let all = |p: &Path| vec![Some(p.to_path_buf()); TABLE.len()];
+        // The installed app laid them.
+        lay_with(&l, &as_process(&installed)).unwrap();
+        assert_eq!(named(&l), all(&installed));
+        // A target/ build, its atpkg live: nothing re-pointed.
+        lay_with(&l, &as_process(&target_build)).unwrap();
+        assert_eq!(named(&l), all(&installed), "a target/ build took the stubs");
+        // A copy with no atpkg beside it (D1): nothing re-pointed.
+        lay_with(&l, &as_process(&root.join("scratch/bin/atpkg"))).unwrap();
+        assert_eq!(named(&l), all(&installed), "a missing atpkg was named");
+        // NEGATIVE CONTROLS. With the stubs on the target/ build, the installed app takes
+        // them back; and once the app has moved (the old path gone), the new path takes them.
+        let fresh = Layout {
+            prefix: l.prefix.join("fresh"),
+        };
+        lay_with(&fresh, &as_process(&target_build)).unwrap();
+        assert_eq!(named(&fresh), all(&target_build), "a vacancy is anyone's");
+        lay_with(&fresh, &as_process(&installed)).unwrap();
+        assert_eq!(
+            named(&fresh),
+            all(&installed),
+            "the installed app takes them back"
+        );
+        let moved = live(root.join("Moved/aterm.app/Contents/MacOS/atpkg"));
+        std::fs::remove_file(&installed).unwrap();
+        lay_with(&l, &as_process(&moved)).unwrap();
+        assert_eq!(named(&l), all(&moved), "the moved app re-lays every stub");
+        // Nothing live on either side: the stubs name none, never the missing path.
+        std::fs::remove_file(&moved).unwrap();
+        lay_with(&l, &as_process(&root.join("scratch/bin/atpkg"))).unwrap();
+        assert_eq!(named(&l), vec![None; TABLE.len()]);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -2194,14 +2339,7 @@ mod tests {
     /// absolute path. One twin program per agent, shared by every test ([`assessed`]).
     #[cfg(unix)]
     fn fake_twin(l: &Layout, name: &str) -> PathBuf {
-        // Its managed target: a symlink to FAKE, labelled, beside the programs.
-        let target = programs_dir().join(format!("managed-{name}"));
-        lay_by_rename(
-            Path::new(&format!("{}.who", target.display())),
-            Some(&format!("managed {name}\n")),
-            None,
-        );
-        lay_by_rename(&target, None, Some(&assessed("fake", FAKE)));
+        let target = managed_target(name);
         let twin = assessed(
             &format!("twin-{name}"),
             &format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display()),
@@ -2211,6 +2349,37 @@ mod tests {
         let _ = std::fs::remove_file(&at);
         std::os::unix::fs::symlink(twin, &at).unwrap();
         at
+    }
+
+    /// The managed target a [`fake_twin`] execs: `managed-<name>` beside the programs, a
+    /// symlink to [`FAKE`] labelled `managed <name>`. ONE path, shared by every test that
+    /// makes a twin for `name` — so it is laid only when it is not already exactly that,
+    /// under one lock: once in a fresh target dir, and never while a test runs through it.
+    ///
+    /// Every `fake_twin` call used to re-lay it by rename, and on Darwin a call that READS a
+    /// symlink while `rename(2)` replaces it fails with EINVAL — `readlink`, and `open`,
+    /// `stat` and `execve` following it — while `lstat` of it, a follow of a symlink whose
+    /// REGULAR-file target is renamed over, and a renamed-over regular file never fail
+    /// (measured 2026-09-25, Darwin 25.6 / APFS: 1–2% of calls under a tight rename loop).
+    /// So a parallel test laying its twin failed this one's `/bin/sh`, started by the
+    /// kernel for the `#!/bin/sh` behind the link, as `/bin/sh: …/managed-claude: Invalid
+    /// argument` (exit 126) — or the twin's own `exec`, as `bad interpreter: Invalid
+    /// argument`. A rename is atomic for the directory entry, not for a walk through it.
+    #[cfg(unix)]
+    fn managed_target(name: &str) -> PathBuf {
+        static LAYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let target = programs_dir().join(format!("managed-{name}"));
+        let who = PathBuf::from(format!("{}.who", target.display()));
+        let label = format!("managed {name}\n");
+        let fake = assessed("fake", FAKE);
+        let _laying = LAYING.lock().unwrap_or_else(|e| e.into_inner());
+        if std::fs::read(&who).ok().as_deref() != Some(label.as_bytes()) {
+            lay_by_rename(&who, Some(&label), None);
+        }
+        if std::fs::read_link(&target).ok().as_deref() != Some(fake.as_path()) {
+            lay_by_rename(&target, None, Some(&fake));
+        }
+        target
     }
 
     /// `name` run through `stub` on `path`, with every marker and the escape CLEARED from
@@ -2290,7 +2459,7 @@ mod tests {
             for path in [&stale, &leaked] {
                 assert_eq!(stdout(&run_stub(&stub, path, &[])), own, "{name} outside");
             }
-            // TERM_PROGRAM is not a marker (ATERM_TERM_PROGRAM makes it user-settable).
+            // TERM_PROGRAM is not a marker (a shell rc can reset it).
             let out = run_stub(&stub, &stale, &[("TERM_PROGRAM", "aterm")]);
             assert_eq!(stdout(&out), own, "{name}: TERM_PROGRAM decides nothing");
             // The --no-reroute marker does not apply to these stubs (manager's ruling,

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Publication of a complete capability by `tools/fabric-enable.sh`.
+//! Publication of a complete capability by `aterm fabric on`.
 
 use super::Model;
 
 /// A rejected mint cannot publish a replacement or reach broker supervision.
 /// Three grants bound the exhaustive model; Tier-1 runs the same counter with
-/// eight grants against subprocess-effect traces from the real enable script.
-/// Existing capability bytes and temporary-file cleanup are checked separately
-/// by that shell fixture at every mint and on each failure exit.
+/// eight grants against the effect trace of the REAL command, in
+/// `crates/aterm-link/tests/fabric_on.rs`
+/// (`a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model`) —
+/// that is the crate whose integration tests can run the binary. Existing
+/// capability bytes and temporary-file cleanup are checked there too, at every
+/// mint and on each failure exit. Until round 13 both were a shell fixture
+/// around `tools/fabric-enable.sh`; that script is a wrapper over the command
+/// now and the transaction it modelled is Rust.
 /// `Buggy=1` restores continuing after rejection and premature publication.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

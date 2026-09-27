@@ -59,19 +59,22 @@ and `aterm fabric` shows ROLE, DETAIL and PHASE per session — so before you `p
 task, that is where to look: a `busy` worker gets the mail only, a `prompt` or `question`
 one is waiting on somebody. `[fabric] presence = "minimal"` turns the meaning fields off.
 
-**A Claude Code session in an aterm window is supervised by default, and that needs no
-fabric.** The window's own host (`status supervisor=aterm-harness@<pid>`) answers only the
-boxes it proves safe, continues a turn that ended after real work, and escalates the rest
-to the session's `attention` (`owner=supervisor`: one menu-bar row and one native
-notification). It posts no mail — the menu bar is its channel, fabric or not; a
-manager's own `aterm drive watch --mail` posts one `kind=ask` per point, only while
-`fabric=connected`. `[harness] enabled = false` in aterm.toml (Settings ▸ Harness) turns
-it off; `aterm help harness` has the rest.
+**A Claude Code or Codex session aterm hosts is supervised, fully automatically, by
+default — and that needs no fabric.** The window's own host (`status
+supervisor=aterm-harness@<pid>`) answers what would otherwise wait on a person — every
+permission box its one-shot `Yes` — keeps its hands off a session a person is typing into
+(`status human_ms=`) or another driver holds (`status hand=`), and escalates only what
+`[harness]` in aterm.toml limited, or what nobody can automate, to the session's `attention`
+(`owner=supervisor`: one menu-bar row and one native notification). It posts no mail — the
+menu bar is its channel, fabric or not; a manager's own `aterm drive watch --mail` posts one
+`kind=ask` per point, only while `fabric=connected`. Every `[harness]` key can only take
+power away (`enabled = false`, the Harness row in Settings, turns it off; `approve = "safe"`
+answers only the boxes it proves safe); `aterm help harness` has them.
 
 ## Reading mail
 
 ```sh
-aterm ctl @self inbox                    # rows, and MOVES the listed watermark
+aterm ctl @self inbox                    # rows, and marks each one LISTED
 aterm ctl @self inbox --peek --meta      # moves nothing; omits the bodies
 aterm ctl @self inbox get <id>           # one full body, by row id
 aterm ctl @self inbox get @<off>         # one body by BROKER OFFSET — even after the ring dropped it
@@ -94,9 +97,12 @@ post 7 to=@s-9a01…@n-b2f0… kind=ask off=- len=17
   endpoint never received the rest: `inbox get @<off>` fetches the whole body from the bus.
 - A `post` row is **your own** outbound message that has not landed yet.
 
-Two watermarks, not one. A bare `inbox` advances only the *listed* mark (what the ring may
-evict and what releases a sender's quota). `seen=` moves only on `inbox seen`. An agent
-that only ever `--peek`s should still `inbox seen` its mail, or the sender's quota fills.
+One watermark, and a per-row flag. `seen=` is the only watermark and moves only on
+`inbox seen`. Listing is per row and `--peek` does not do it: an UNLISTED row is what a
+sender's quota counts, so an agent that only ever `--peek`s fills its senders' quotas.
+There is deliberately no *listed* watermark — one existed, and a bounded or
+`since=`-filtered reply advanced it past the rows it had skipped, so `pending=` read 0
+over unread mail.
 
 **Nothing lost: `inbox get @<off>`.** The ring is bounded, so a burst can push a row out
 (`dropped=` counts it), and a long body can arrive cut (`truncated=1`) — but the record is

@@ -84,7 +84,6 @@ pub(crate) fn badge_tray(g: &SettingsGeom, theme: Theme) -> TrayInput {
             h: pill_h,
             radius,
             fill: rgba(r.elevated, 0xC8),
-            blur: false,
         },
         DrawPrim::Stroke {
             x,

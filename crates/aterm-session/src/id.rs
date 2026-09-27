@@ -61,12 +61,6 @@ impl LaunchNonce {
         Self(b)
     }
 
-    /// The raw nonce bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-
     /// Mint a fresh random per-launch nonce from the OS CSPRNG.
     #[must_use]
     pub fn generate() -> Self {

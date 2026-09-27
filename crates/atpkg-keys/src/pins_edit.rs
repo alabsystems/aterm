@@ -127,10 +127,10 @@ impl std::fmt::Debug for Anchor {
 }
 
 impl Anchor {
-    /// The head member — the current master, for [`MASTER_ANCHOR`]. `None` only for an
-    /// empty (unpinned, inert) anchor.
-    #[must_use]
-    pub fn head(&self) -> Option<&str> {
+    /// The head member — the current master. `None` only for an empty (unpinned,
+    /// inert) anchor. Test-only: the edits read `members` directly.
+    #[cfg(test)]
+    fn head(&self) -> Option<&str> {
         self.members.first().map(String::as_str)
     }
 }

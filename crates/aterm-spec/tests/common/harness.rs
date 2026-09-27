@@ -34,7 +34,8 @@ pub struct Instance {
 }
 
 /// THE TABLE — the introspection control-plane property suite. A new property:
-/// add its `derive::props` generator instance + one row here.
+/// add its `derive::props` generator instance (or, when no generator states it, a
+/// hand-written model, as reply fidelity is) + one row here.
 pub fn instances() -> Vec<Instance> {
     use aterm_spec::derive::{
         authorize_soundness_model, capability_secrecy_model, dispatch_complete_model,

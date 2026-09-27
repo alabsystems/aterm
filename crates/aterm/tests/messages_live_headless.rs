@@ -42,6 +42,9 @@ const MAX_SOCK_PATH: usize = 100;
 /// exit path (Drop runs on panic too).
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: PathBuf,
@@ -105,11 +108,12 @@ fn boot(tag: &str) -> Option<Instance> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", "120")
+        .args(launch_isolation::control_sock(&tmp))
+        .args(["--lines", "40", "--columns", "120"])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -121,6 +125,7 @@ fn boot(tag: &str) -> Option<Instance> {
     let sock = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock,
         tmp,
         log,
@@ -343,7 +348,7 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
             &inst,
             "notice post system sev=warn one two three four five six seven"
         ),
-        "ERR notice: a glass title over six words"
+        "ERR notice: title over 6 words; put the rest after --"
     );
     assert_eq!(
         status(&inst, "notice post update sev=warn Nope"),

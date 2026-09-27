@@ -913,6 +913,14 @@ struct LaunchWatch {
     slot: Arc<LaunchSlot>,
 }
 
+// Test-only: how many times [`LaunchWatch::wait`] parked on the condvar on this
+// thread, so a test can prove a zero budget is a poll by COUNTING the parks
+// instead of timing them (the load-sensitive test audit of 2026-09-27).
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static CONDVAR_PARKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(all(test, target_os = "macos"))]
 impl LaunchInFlight {
     /// A launch whose LaunchServices answer is scripted: `Some(pid)` is delivered
@@ -951,6 +959,8 @@ impl LaunchWatch {
             let Some(remaining) = remaining_budget(budget, started.elapsed()) else {
                 return Err(LaunchError::Timeout(budget));
             };
+            #[cfg(test)]
+            CONDVAR_PARKS.with(|parks| parks.set(parks.get() + 1));
             let (reacquired, _) = self
                 .slot
                 .answered
@@ -1214,8 +1224,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod macos {
         use super::super::{
-            LaunchError, LaunchWatch, LaunchedSuccessor, admit_launched_pid, remaining_budget,
+            CONDVAR_PARKS, LaunchError, LaunchWatch, LaunchedSuccessor, admit_launched_pid,
+            remaining_budget,
         };
+        use std::cell::Cell;
         use std::time::{Duration, Instant};
 
         #[test]
@@ -1254,15 +1266,28 @@ mod tests {
 
         /// A ZERO budget is a poll: it never sleeps, answers what is already
         /// delivered, and reports `Timeout` at once otherwise.
+        ///
+        /// "Never sleeps" is COUNTED, not timed (the load-sensitive test audit
+        /// of 2026-09-27). The old `< 50 ms` stopwatch around a microsecond
+        /// poll measured only whether the scheduler paused this thread, and it
+        /// passed a zero budget that parked on the condvar for anything under
+        /// 50 ms. The park count separates a poll from a park of any length;
+        /// the loose wall bound is kept only for a sleep of some other form.
         #[test]
         fn a_zero_budget_wait_is_a_poll_that_never_sleeps() {
+            let parks = CONDVAR_PARKS.with(Cell::get);
             let started = Instant::now();
             assert_eq!(
                 crate::app_launch_successor::LaunchInFlight::scripted(None).wait(Duration::ZERO),
                 Err(LaunchError::Timeout(Duration::ZERO))
             );
+            assert_eq!(
+                CONDVAR_PARKS.with(Cell::get),
+                parks,
+                "a zero budget parked on the condvar instead of polling"
+            );
             assert!(
-                started.elapsed() < Duration::from_millis(50),
+                started.elapsed() < Duration::from_secs(5),
                 "{:?}",
                 started.elapsed()
             );
@@ -1272,6 +1297,24 @@ mod tests {
                     .map(crate::app_launch_successor::LaunchedSuccessor::pid),
                 Ok(7)
             );
+            assert_eq!(
+                CONDVAR_PARKS.with(Cell::get),
+                parks,
+                "a delivered answer is read without parking"
+            );
+            // The count is live, so the zeros above are not vacuous: an
+            // unanswered budget parks. The budgets escalate because a thread
+            // descheduled past its whole budget before the first check is
+            // correctly told `Timeout` without a park.
+            let live = [1, 10, 100, 1_000].into_iter().any(|ms| {
+                let budget = Duration::from_millis(ms);
+                assert_eq!(
+                    crate::app_launch_successor::LaunchInFlight::scripted(None).wait(budget),
+                    Err(LaunchError::Timeout(budget))
+                );
+                CONDVAR_PARKS.with(Cell::get) > parks
+            });
+            assert!(live, "an unanswered budget never parked: the count is dead");
         }
 
         #[test]

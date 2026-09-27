@@ -117,14 +117,12 @@ impl Layout {
     /// a regular file at `agents/` is REFUSED and left alone (a pre-created link must never
     /// capture the twins) — judged by `lstat` BEFORE the `mkdir`, so the refusal is this
     /// function's one-path sentence and never the `update directory …` wording
-    /// `ensure_private_dir` would give the same fact. This is the window's mkdir/mode rule
-    /// (`aterm-gui::spawn::managed_agents_dir`, 2026-09-16) PLUS that refusal: the window
-    /// still hands a symlinked `agents/` after warning about it (`Path::is_dir` follows the
-    /// link); the front door hands nothing. One rule in two places until the window is
-    /// pointed here. `Ok` is the absolute directory, real and traversable; `Err` is the
-    /// sentence for the caller's one stderr line, always starting with the path — the
-    /// launch then omits the directory rather than putting a nonexistent entry first on
-    /// PATH.
+    /// `ensure_private_dir` would give the same fact. The window
+    /// (`aterm-gui::spawn::managed_agents_dir`) and the front door both come here, so a
+    /// symlinked `agents/` is handed by neither. `Ok` is the absolute directory, real and
+    /// traversable; `Err` is the sentence for the caller's one stderr line
+    /// ([`agents_dir_refusal_line`]), always starting with the path — the launch then
+    /// omits the directory rather than putting a nonexistent entry first on PATH.
     pub fn ensure_agents_dir(&self) -> Result<PathBuf, String> {
         let dir = self.agents_dir();
         match std::fs::symlink_metadata(&dir) {
@@ -581,6 +579,29 @@ impl Layout {
     pub fn link_marker(&self, program: &str) -> PathBuf {
         self.links_dir().join(program)
     }
+}
+
+/// The one stderr line for a refused `agents/` ([`Layout::ensure_agents_dir`]), shared by
+/// the front door and the window so the two never disagree. `reach` is who goes without
+/// the managed agents ("this session", "this window's sessions"). The remedy is the one
+/// that is TRUE for what is there: a symlink or a regular file at `agents/` must be
+/// removed first — `aterm pkg repair` reaches the directory through the same
+/// `ensure_dir` and refuses the same entry rather than replacing it
+/// (`activate::reconcile_agents`), so naming repair alone would send the person in a
+/// loop; anything else (the `mkdir` refused) is what `repair` re-lays — as root when
+/// `system` says the prefix is root-owned ([`Layout::is_system_prefix`]). `error`
+/// already starts with the path.
+#[must_use]
+pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &str) -> String {
+    let remedy = match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_symlink() => "remove that symlink, then run `aterm pkg repair`",
+        Ok(md) if !md.is_dir() => "remove that file, then run `aterm pkg repair`",
+        _ if system => "run `aterm pkg repair` as root",
+        _ => "run `aterm pkg repair`",
+    };
+    format!(
+        "aterm: managed agents dir not created ({error}); the managed `claude`/`codex` are NOT in front of PATH in {reach} — {remedy}"
+    )
 }
 
 /// The per-build completeness marker: a SIBLING file `store/<program>/<build>.ready`
@@ -2325,9 +2346,10 @@ pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
 }
 
 /// Compose the child `PATH` for running a managed tool: the inherited `PATH` with the
-/// managed `bin_dir` **appended** — never prepended, so a pinned tool that calls a sibling
-/// by bare name resolves the pinned sibling, while system commands (`sudo`/`ssh`/…) on the
-/// inherited `PATH` are never shadowed (§10). Idempotent: if `bin_dir` is already present
+/// managed `bin_dir` **appended** — never prepended, so a pinned tool's siblings are
+/// reachable by bare name while system commands (`sudo`/`ssh`/…) on the inherited `PATH`
+/// are never shadowed (§10). A same-named tool earlier on the inherited `PATH` wins, and
+/// `atpkg doctor` warns about that shadow. Idempotent: if `bin_dir` is already present
 /// the inherited value is returned unchanged. With no inherited `PATH`, returns just
 /// `bin_dir`. This is the single source of truth for the `atpkg run` / `aterm <tool>`
 /// child environment; keeping it pure makes the append-not-prepend policy unit-testable.
@@ -2367,8 +2389,7 @@ mod tests {
         h
     }
 
-    /// `Layout::ensure_agents_dir` — the front door's rule (2026-09-18; the window's
-    /// mkdir/mode rule plus a symlink refusal the window does not yet make):
+    /// `Layout::ensure_agents_dir` — the rule the front door and the window share:
     /// a fresh prefix gets `agents/` created (private, `0700`, the `$HOME` shape) and
     /// the absolute directory back; a second call is a no-op with the same answer; a
     /// symlink at `agents/` — even one that resolves to a real directory — is REFUSED

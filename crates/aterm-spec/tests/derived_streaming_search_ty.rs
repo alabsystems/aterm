@@ -13,9 +13,10 @@
 //! This file:
 //!   1. **Tier-0 prove-AND-catch** (tiered, VERIFY-1): the interpreter proves all
 //!      five invariants over the whole bounded reachable space at `Buggy = 0` and
-//!      finds the counterexample at `Buggy = 1` (the dropped invalidation clamp —
-//!      the pre-#7472/#7244 index-out-of-range class); `ty` additionally re-proves
-//!      the generated TLA+ wherever installed.
+//!      finds a counterexample at `Buggy = 1` (one slip per law, the dropped
+//!      invalidation clamp — the pre-#7472/#7244 index-out-of-range class — among
+//!      them; `streaming_search_each_law_has_its_own_slip` pins the others); `ty`
+//!      additionally re-proves the generated TLA+ wherever installed.
 //!   2. **Wrap = 0 variant**: the same proof with wraparound navigation disabled
 //!      (Next/Prev clamp at the boundary instead of cycling).
 //!   3. **Executable-twin spot-walks**: `m.fire` sequences reproducing the
@@ -25,8 +26,9 @@
 //!      model fails it; an added one has no resolving anchor in `operations.rs`
 //!      and fails aterm-gui's `spec_xref_closure`.
 //!
-//! Registry enrolment is not re-pinned here: `non_vacuity_ratchet.rs` names this
-//! model, so dropping it from `xref::model_registry()` fails there.
+//! Registry enrolment is pinned here directly: with every law caught, the
+//! non-vacuity ratchet no longer names this model in either table, so it cannot
+//! notice the model leaving `xref::model_registry()`.
 //!
 //! Tier-1 (lockstep against the REAL engine) lives in
 //! `aterm-search/tests/conformance_streaming.rs`; the compile-time gate in
@@ -38,10 +40,14 @@ use aterm_spec::{interp, verify};
 /// Tier-0: proven at the committed `Buggy = 0`, caught at `Buggy = 1`.
 #[test]
 fn derived_streaming_search_proves_and_catches_unclamped_index() {
-    verify::prove_and_catch_scalar(
-        &streaming_search_model(),
-        "derived StreamingSearch spec (invalidation clamp)",
+    let model = streaming_search_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name),
+        "StreamingSearch must stay enrolled in the model registry"
     );
+    verify::prove_and_catch_scalar(&model, "derived StreamingSearch spec (invalidation clamp)");
 }
 
 /// Tier-0 at `Wrap = 0`: with boundary-clamping navigation the invariants still
@@ -207,4 +213,35 @@ fn streaming_search_interpreter_walks_the_engine_lifecycle() {
     assert!(m0.fire("NextMatch", &mut st));
     assert!(m0.fire("NextMatch", &mut st));
     assert_eq!(st["cur"], 2, "Wrap=0 clamps at the end");
+}
+
+/// Each law is caught on its OWN slip, not only through the dropped clamp: the
+/// capacity test read as `>`, `complete_search` without its `-1` reset, and
+/// `content_added` storing a match it never counts.
+#[test]
+fn streaming_search_each_law_has_its_own_slip() {
+    let buggy = interp::with_buggy(&streaming_search_model(), 1);
+
+    let mut scanned = buggy.init_state();
+    for action in ["Start", "ScanHit", "ScanHit", "ScanHit"] {
+        assert!(buggy.fire(action, &mut scanned), "{action}: {scanned:?}");
+    }
+    assert_eq!(
+        scanned["stored"], 3,
+        "the capacity hit stored past the bound"
+    );
+    assert!(!buggy.check_invariant("MemoryBounded", &scanned));
+    assert_eq!(
+        (scanned["state"], scanned["scanp"]),
+        (2, 4),
+        "a finished search still reports its row count as progress"
+    );
+    assert!(!buggy.check_invariant("ScanProgressConsistent", &scanned));
+
+    let mut added = buggy.init_state();
+    for action in ["Start", "ScanMiss", "ScanMiss", "ScanMiss", "Add"] {
+        assert!(buggy.fire(action, &mut added), "{action}: {added:?}");
+    }
+    assert_eq!((added["stored"], added["total"]), (1, 0));
+    assert!(!buggy.check_invariant("TotalMatchesConsistent", &added));
 }

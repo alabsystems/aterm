@@ -32,9 +32,9 @@ use std::sync::Arc;
 
 use super::acquire_worker::{AcquireOutcome, AcquireWorker, result_is_current};
 use super::encoder::{CommandBuffer, RenderPassDesc, StoreAction};
-use super::ffi::{
-    self, ClearColor, LoadAction, MtlScissorRect, MtlViewport, Obj, PixelFormat, PrimitiveType,
-};
+#[cfg(test)]
+use super::ffi::PixelFormat;
+use super::ffi::{self, ClearColor, LoadAction, MtlScissorRect, MtlViewport, Obj, PrimitiveType};
 use super::loss::{CbOutcome, LossLatch};
 use super::resources::SealedTexture;
 use super::swapchain::{
@@ -120,6 +120,7 @@ impl MetalWindowSurface {
 
     /// Headless twin — the shape every test drives (a `CAMetalLayer` vends
     /// drawables without a window).
+    #[cfg(test)]
     pub(crate) fn standalone(
         device: &ffi::Device,
         config: SwapchainConfig,
@@ -234,12 +235,7 @@ impl MetalWindowSurface {
                 // together. Terminal outcomes book neither.
                 self.completed_queue_ns = Some(completed.queue_ns);
                 if result_is_current(completed.generation, self.generation, false) {
-                    self.ready = Some(output.drawable.ok_or_else(|| AcquireRefusal::AcquireNil {
-                        detail: format!(
-                            "nextDrawable returned nil after {:.3}ms on drawable worker",
-                            output.wait_ns as f64 / 1_000_000.0
-                        ),
-                    }));
+                    self.ready = Some(output.drawable.ok_or(AcquireRefusal::AcquireNil));
                 }
             }
             AcquireOutcome::Panicked | AcquireOutcome::Disconnected => {
@@ -249,6 +245,7 @@ impl MetalWindowSurface {
     }
 
     /// The config the swapchain currently holds.
+    #[cfg(not(wgpu_arm))]
     pub(crate) const fn config(&self) -> &SwapchainConfig {
         &self.config
     }
@@ -259,6 +256,7 @@ impl MetalWindowSurface {
     /// or the device-pixel drawable composites as points (v0.69.0's 2x
     /// oversize + resample). Never echoed from a cached field — the gate asks
     /// the layer.
+    #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         self.swapchain.contents_scale()
     }
@@ -280,6 +278,7 @@ impl MetalWindowSurface {
 
     /// M3: whether this is the EDR (`Rgba16Float` extended-linear) target —
     /// `GpuSurface::is_hdr`'s twin.
+    #[cfg(test)]
     pub(crate) fn is_hdr(&self) -> bool {
         self.config.format == PixelFormat::Rgba16Float
     }
@@ -342,11 +341,11 @@ impl MetalWindowSurface {
     /// loss latch and the bounded nil-acquire each get their own arm, and a
     /// drawable whose texture no longer matches the retained config (the
     /// layer was mutated behind the surface's back) is returned as
-    /// [`AcquireRefusal::Drift`] with both geometries named — the caller
+    /// [`AcquireRefusal::Drift`] — the caller
     /// reconfigures and skips the frame, exactly like wgpu's Outdated arm.
     pub(crate) fn acquire(&mut self) -> Result<Frame<'_>, AcquireRefusal> {
-        if let Some(reason) = self.swapchain.latch().reason() {
-            return Err(AcquireRefusal::LatchLost(reason.to_owned()));
+        if self.swapchain.latch().reason().is_some() {
+            return Err(AcquireRefusal::LatchLost);
         }
         // ONE acquire, geometry-checked on the vended frame itself. This was
         // a probe-then-reacquire two-phase (a scoped throwaway acquire for
@@ -365,7 +364,7 @@ impl MetalWindowSurface {
             if let Some(ready) = self.ready.take() {
                 self.swapchain
                     .frame_from_acquired(ready?)
-                    .map_err(AcquireRefusal::LatchLost)?
+                    .map_err(|_| AcquireRefusal::LatchLost)?
             } else {
                 if !worker.is_pending() {
                     worker
@@ -377,7 +376,7 @@ impl MetalWindowSurface {
         } else {
             self.swapchain
                 .acquire()
-                .map_err(|detail| AcquireRefusal::AcquireNil { detail })?
+                .map_err(|_| AcquireRefusal::AcquireNil)?
         };
         let (tw, th) = (
             ffi::texture_width(frame.texture()),
@@ -385,18 +384,9 @@ impl MetalWindowSurface {
         );
         if (tw, th) != (want_w, want_h) {
             // Dropping the frame returns the drawable to the pool unpresented.
-            return Err(AcquireRefusal::Drift {
-                got: (tw, th),
-                want: (want_w, want_h),
-            });
+            return Err(AcquireRefusal::Drift);
         }
         Ok(frame)
-    }
-
-    /// The loss latch this surface answers to — the `device_lost()` hook's
-    /// wiring point (see `GpuContext::wire_metal_loss_latch`).
-    pub(crate) fn latch(&self) -> Arc<LossLatch> {
-        Arc::clone(self.swapchain.latch())
     }
 }
 
@@ -408,12 +398,7 @@ fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
         code: None,
         name: "drawable acquisition worker stopped; backend unavailable",
     });
-    AcquireRefusal::LatchLost(
-        latch
-            .reason()
-            .unwrap_or("drawable worker stopped")
-            .to_owned(),
-    )
+    AcquireRefusal::LatchLost
 }
 
 /// W6a — the winit view's backing `CALayer`, from a raw-window-handle target:
@@ -456,6 +441,7 @@ pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W)
 /// not-yet-ordered-front `NSWindow` already answers `screen` (the screen its
 /// frame lands on), so the attach sees the real value. Main thread only, like
 /// [`parent_layer_of`] (AppKit property reads); both callers run there.
+#[cfg(not(wgpu_arm))]
 pub(crate) fn screen_edr_potential_of<W: raw_window_handle::HasWindowHandle>(
     target: &W,
 ) -> Option<f32> {
@@ -511,17 +497,14 @@ pub(crate) enum AcquireRefusal {
     /// A demand-driven acquisition is queued or running off the UI thread.
     Pending,
     /// The process device-loss latch is set (acquire refuses before FFI).
-    LatchLost(String),
+    LatchLost,
     /// The drawable's texture geometry no longer matches the retained config
     /// — the layer was resized/mutated externally.
-    Drift {
-        got: (usize, usize),
-        want: (usize, usize),
-    },
+    Drift,
     /// `nextDrawable` returned nil after the BOUNDED wait
     /// (`allowsNextDrawableTimeout=YES`): pool exhausted or the window
     /// server is throttling an invisible window.
-    AcquireNil { detail: String },
+    AcquireNil,
 }
 
 /// The `SurfacePresentFailure` mapping, one arm per measured signal:
@@ -544,10 +527,10 @@ pub(crate) fn surface_present_failure(
 ) -> SurfacePresentFailure {
     match refusal {
         AcquireRefusal::Pending => SurfacePresentFailure::AcquirePending,
-        AcquireRefusal::LatchLost(_) => SurfacePresentFailure::Validation,
-        AcquireRefusal::Drift { .. } => SurfacePresentFailure::Reconfigured,
-        AcquireRefusal::AcquireNil { .. } if occluded_hint => SurfacePresentFailure::Occluded,
-        AcquireRefusal::AcquireNil { .. } => SurfacePresentFailure::Timeout,
+        AcquireRefusal::LatchLost => SurfacePresentFailure::Validation,
+        AcquireRefusal::Drift => SurfacePresentFailure::Reconfigured,
+        AcquireRefusal::AcquireNil if occluded_hint => SurfacePresentFailure::Occluded,
+        AcquireRefusal::AcquireNil => SurfacePresentFailure::Timeout,
     }
 }
 
@@ -924,7 +907,7 @@ mod tests {
     use crate::pipeline_table::Pipeline;
 
     fn device() -> Option<ffi::Device> {
-        let d = ffi::Device::system_default();
+        let d = ffi::Device::preferred();
         if d.is_none() {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }
@@ -1060,7 +1043,7 @@ mod tests {
             latch.reason().is_some(),
             "a Validation-only mutant would park forever"
         );
-        assert!(matches!(refusal, AcquireRefusal::LatchLost(_)));
+        assert!(matches!(refusal, AcquireRefusal::LatchLost));
         assert_eq!(
             surface_present_failure(&refusal, false),
             SurfacePresentFailure::Validation
@@ -1107,14 +1090,8 @@ mod tests {
         surface.config.width = 24;
         let refusal = surface.acquire().expect_err("a drifted acquire refuses");
         assert!(
-            matches!(
-                refusal,
-                AcquireRefusal::Drift {
-                    got: (16, 16),
-                    want: (24, 16)
-                }
-            ),
-            "drift names both geometries: {refusal:?}"
+            matches!(refusal, AcquireRefusal::Drift),
+            "a drifted acquire refuses as Drift: {refusal:?}"
         );
         assert_eq!(
             surface_present_failure(&refusal, false),
@@ -1141,7 +1118,7 @@ mod tests {
             .expect_err("a deviceless layer must not vend");
         let waited = t0.elapsed();
         assert!(
-            matches!(nil, AcquireRefusal::AcquireNil { .. }),
+            matches!(nil, AcquireRefusal::AcquireNil),
             "the deviceless refusal is the nil arm, not drift/latch: {nil:?}"
         );
         assert!(
@@ -1178,7 +1155,7 @@ mod tests {
             name: "injected",
         });
         let refusal = surface.acquire().expect_err("a latched acquire refuses");
-        assert!(matches!(refusal, AcquireRefusal::LatchLost(_)));
+        assert!(matches!(refusal, AcquireRefusal::LatchLost));
         assert_eq!(
             surface_present_failure(&refusal, false),
             SurfacePresentFailure::Validation

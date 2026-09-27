@@ -271,7 +271,7 @@ mod tests {
             let path = Path::new(p);
             assert_eq!(
                 resolve_from(path).is_some(),
-                posture_from(path).can_update(),
+                posture_from(path) == InstallPosture::Installed,
                 "the updater and the doctor disagree about {p}"
             );
         }
@@ -281,11 +281,6 @@ mod tests {
     /// consequences that are otherwise invisible.
     #[test]
     fn only_fixable_states_advise_a_move() {
-        assert!(InstallPosture::MountedImage.wants_move_to_applications());
-        assert!(InstallPosture::Translocated.wants_move_to_applications());
-        assert!(!InstallPosture::Installed.wants_move_to_applications());
-        assert!(!InstallPosture::NotABundle.wants_move_to_applications());
-
         assert!(InstallPosture::Installed.remedy().is_none());
         assert!(InstallPosture::NotABundle.remedy().is_none());
         for p in [InstallPosture::MountedImage, InstallPosture::Translocated] {

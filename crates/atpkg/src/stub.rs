@@ -28,13 +28,35 @@
 //! stub that prints sh's own "not found" would violate the guarantee. So the script
 //! falls back, in order:
 //!
-//! 1. the embedded co-located `atpkg` path, if it exists and is executable;
+//! 1. the embedded atpkg path, if it exists and is executable;
 //! 2. `command -v atpkg` (the `~/.local/bin` alias / shell hook);
 //! 3. a static honest message — and exit 127.
 //!
 //! The per-launch seed-pass reconcile REWRITES stubs whose bytes changed, refreshing
 //! embedded paths as a matter of course; a byte-identical stub is left alone, so a
 //! steady-state pass lays nothing.
+//!
+//! # Which atpkg a laid file names ([`Embedder`])
+//!
+//! The same rule for every file this crate lays with an atpkg path in it — these stubs, the
+//! reroute stubs ([`crate::reroute::lay`]) and the `agents/` twins' self-update block
+//! ([`crate::activate::reconcile_agents`]). The process laying it offers the `atpkg` beside
+//! its own executable ([`co_located_atpkg_path`]); the file may already name one. Then:
+//!
+//! * **a path that is not there is never written.** A process whose co-located `atpkg` does
+//!   not exist offers nothing. With nothing live on either side the file names none (an
+//!   empty value, which fallback 1's `[ -x ]` refuses), and the next fallback answers.
+//! * **a live path is displaced only by one that lasts at least as long** ([`Durability`]):
+//!   an app bundle outranks a plain binary, which outranks a transient copy — one in a
+//!   temporary directory, a cargo target directory, Gatekeeper's translocated copy or a
+//!   mounted disk image. A path that is gone is displaced by anything live.
+//!
+//! Measured 2026-09-25, the end-to-end run's defect D1: a copy of aterm started from a
+//! scratch directory (no `atpkg` beside it) re-laid the machine's eight reroute stubs naming
+//! `<scratch>/bin/atpkg` — never there, and deleted with the scratch directory — over stubs
+//! naming the installed app's. The same lay runs at every launch, every session spawn and
+//! every pass, so every copy of aterm, wherever it ran, re-pointed the machine's files at
+//! the `atpkg` beside it — there or not.
 //!
 //! # Trust posture
 //!
@@ -53,12 +75,12 @@
 //! install there is nothing to disambiguate: the plain-name stub already answers
 //! (it bumps), and a second promising name on `PATH` would double
 //! every "not found" into two courtesy scripts for one program. So the reconcile
-//! never lays `alab-*`, and [`write_pending_stub`] is a no-op for an alias
+//! never lays `alab-*`, and `write_pending_stub` is a no-op for an alias
 //! name — the alias appears with the real shims, and only then.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::store::{Layout, ToolName};
 
@@ -165,8 +187,61 @@ pub(crate) fn sh_single_quote(s: &str) -> String {
     out
 }
 
-/// The stub script body for `tool`, embedding `atpkg` as the co-located fallback-1
-/// path. Pure, so the shape is pinned by tests.
+/// The inverse of [`sh_single_quote`] (and of the platform backend's twin, the same rule):
+/// the text a word made of `'…'` runs and `\'` escapes stands for, or `None` for any other
+/// spelling — a value this crate did not quote is never guessed at.
+fn sh_single_unquote(word: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = word;
+    while !rest.is_empty() {
+        if let Some(quoted) = rest.strip_prefix('\'') {
+            let end = quoted.find('\'')?;
+            out.push_str(&quoted[..end]);
+            rest = &quoted[end + 1..];
+        } else {
+            rest = rest.strip_prefix("\\'")?;
+            out.push('\'');
+        }
+    }
+    Some(out)
+}
+
+/// The atpkg a laid `/bin/sh` body names on its `<var>=` line — `ATPKG` for a pending or a
+/// reroute stub, `__atpkg` for an `agents/` twin's self-update block — or `None` when it
+/// names none (no such line, a value this crate did not quote, or the empty value).
+#[must_use]
+pub(crate) fn sh_named_atpkg(body: &str, var: &str) -> Option<PathBuf> {
+    body.lines()
+        .find_map(|line| {
+            let value = line.trim_start().strip_prefix(var)?.strip_prefix('=')?;
+            sh_single_unquote(value.trim_end())
+        })
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The atpkg a laid batch stub ([`stub_content_cmd`]) names on its `if exist "…" (` line, or
+/// `None` when it names none.
+#[must_use]
+fn cmd_named_atpkg(body: &str) -> Option<PathBuf> {
+    body.lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("if exist \"")?
+                .strip_suffix("\" (")
+                .map(str::to_owned)
+        })
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The atpkg the pending stub `body` names, in either spelling.
+fn stub_named_atpkg(body: &str) -> Option<PathBuf> {
+    sh_named_atpkg(body, "ATPKG").or_else(|| cmd_named_atpkg(body))
+}
+
+/// The stub script body for `tool`, naming `atpkg` as the fallback-1 path, or none
+/// ([`Embedder::embed`] decides which). Pure, so the shape is pinned by tests.
 ///
 /// NOTE the `exec "$ATPKG"` spelling: `platform::parse_sh_shim_target` recognizes
 /// real shims by a trimmed line starting `exec '`, so the stub deliberately execs
@@ -174,12 +249,21 @@ pub(crate) fn sh_single_quote(s: &str) -> String {
 /// `None`), or `active_builds`/`which`/the front door would mistake it for an
 /// installed tool.
 #[must_use]
-fn stub_content(tool: &ToolName, atpkg: &Path) -> String {
+fn stub_content(tool: &ToolName, atpkg: Option<&Path>) -> String {
+    let atpkg = named(atpkg);
     if cfg!(windows) {
         stub_content_cmd(tool, atpkg)
     } else {
         stub_content_sh(tool, atpkg)
     }
+}
+
+/// How a renderer is told to name no atpkg: the EMPTY path. The `/bin/sh` bodies render it
+/// `ATPKG=''` / `__atpkg=''`, a value every body's `[ -x ]` refuses, so the body goes
+/// straight to its next fallback; the batch body leaves its `if exist` block out.
+#[must_use]
+pub(crate) fn named(atpkg: Option<&Path>) -> &Path {
+    atpkg.unwrap_or_else(|| Path::new(""))
 }
 
 /// The POSIX `/bin/sh` stub body (macOS/Linux — the shim there is a plain
@@ -234,7 +318,9 @@ const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HE
 /// the moment it is re-laid resumes in the padding and returns silently, instead of
 /// inside the new body. [`is_pending_stub`] scans every line for the `rem` marker, so a
 /// framed stub is recognized, rewritten and removed exactly as before;
-/// [`CMD_STUB_FIRST_LINE`] is the first line AFTER `:main`. Unverified on a Windows host.
+/// [`CMD_STUB_FIRST_LINE`] is the first line AFTER `:main`. An EMPTY `atpkg` ([`named`])
+/// leaves the `if exist` block out: the stub names no atpkg and starts at `where atpkg`.
+/// Unverified on a Windows host.
 #[must_use]
 fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
     let name = tool.as_str();
@@ -244,9 +330,11 @@ fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
     s.push_str(STUB_MARKER);
     s.push_str("\r\n");
     s.push_str("rem Replaced by the real shim when the program installs.\r\n");
-    s.push_str(&format!(
-        "if exist \"{atpkg}\" (\r\n  \"{atpkg}\" __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
-    ));
+    if !atpkg.is_empty() {
+        s.push_str(&format!(
+            "if exist \"{atpkg}\" (\r\n  \"{atpkg}\" __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
+        ));
+    }
     s.push_str(&format!(
         "where atpkg >nul 2>nul\r\nif not errorlevel 1 (\r\n  atpkg __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
     ));
@@ -274,15 +362,17 @@ fn cmd_stub_name_safe(name: &str) -> bool {
     })
 }
 
-/// The co-located `atpkg` alias beside the running executable — fallback 1's
-/// embedded path. Canonicalized so an argv0 alias (`atpkg` → `aterm`) or a
-/// `~/.local/bin` symlink resolves to the real bundle before the sibling join.
+/// The co-located `atpkg` alias beside the running executable — what this process OFFERS
+/// as fallback 1's path ([`Embedder`] decides whether a laid file names it). Canonicalized
+/// so an argv0 alias (`atpkg` → `aterm`) or a `~/.local/bin` symlink resolves to the real
+/// bundle before the sibling join. NOT checked for existence here: a copy of aterm with no
+/// `atpkg` beside it answers a path that is not there ([`Embedder::this_process`] drops it).
 ///
 /// On Windows `canonicalize` answers the VERBATIM spelling (`\\?\C:\…`), and this path
 /// is embedded in `.cmd` files — the pending stub's — where `cmd.exe`'s `if exist` and
 /// its command launch do not reliably accept it; the prefix is taken off there ([`crate::platform::strip_verbatim_prefix`],
 /// review finding 2026-09-17; no Windows box has rendered a real one).
-pub(crate) fn embedded_atpkg_path() -> std::path::PathBuf {
+pub(crate) fn co_located_atpkg_path() -> PathBuf {
     // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): a bare `atpkg` join
     // embedded a path that exists on no Windows install — the same probe bug
     // the GUI's co-located resolver fixed — so fallback 1 always missed there
@@ -292,11 +382,190 @@ pub(crate) fn embedded_atpkg_path() -> std::path::PathBuf {
         .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join(&atpkg)))
-        .unwrap_or_else(|| std::path::PathBuf::from(atpkg));
+        .unwrap_or_else(|| PathBuf::from(atpkg));
     if cfg!(windows) {
         crate::platform::strip_verbatim_prefix(&path)
     } else {
         path
+    }
+}
+
+/// Whether `path` is an atpkg a laid file can hand over to: an executable regular file,
+/// a link to one counting (a bundle's `atpkg` is a symlink to `aterm`) — the `[ -x ]` every
+/// laid body asks before its hand-over.
+#[must_use]
+pub(crate) fn is_live_atpkg(path: &Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !md.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        md.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// How long an atpkg path can be expected to keep standing — what [`Embedder::embed`]
+/// compares when the atpkg a process offers differs from the live one a file already
+/// names. A later variant outranks an earlier one.
+///
+/// The classes are the ones the code already tells apart: the app-bundle shape
+/// `…/<X>.app/Contents/MacOS/<exe>` and the translocated and mounted-image launches
+/// (`aterm_update::bundle::posture_from`, which this crate does not depend on — the same
+/// three tests, restated), the `target/` build every "not a bundle" comment names, and the
+/// scratch directory of D1 (module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Durability {
+    /// Goes away on its own: under a temporary directory, inside a cargo target directory
+    /// (any directory above it carries a `CACHEDIR.TAG`, which cargo writes at every
+    /// target root), Gatekeeper's translocated copy (`/AppTranslocation/`), or a mounted
+    /// disk image (`/Volumes/…`).
+    Transient,
+    /// A plain binary anywhere else: `tools/install.sh`'s `~/.local/lib/aterm/bin` store
+    /// (the Linux install and the source-build lane), a copy someone put somewhere on
+    /// purpose.
+    Plain,
+    /// Inside an app bundle (`…/<X>.app/Contents/MacOS/`) anywhere not transient: the
+    /// installed `aterm.app`, or a dev bundle `tools/dev-app.sh` assembled — installed, or
+    /// left in `dist/` by `--no-install`. No bundle is ranked above another, so the laid
+    /// files name whichever bundle last ran.
+    Bundle,
+}
+
+/// The first bytes of every `CACHEDIR.TAG` (the Cache Directory Tagging Specification), the
+/// file cargo writes at the root of every target directory. A directory carrying one says
+/// its contents may be deleted and rebuilt at any time.
+const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `dir` carries a cache-directory tag.
+fn is_cache_dir(dir: &Path) -> bool {
+    crate::metadata_io::read_bounded_regular_utf8(&dir.join("CACHEDIR.TAG"), 4096)
+        .is_ok_and(|text| text.starts_with(CACHEDIR_TAG_SIGNATURE))
+}
+
+/// Whether `path` sits exactly at `…/<X>.app/Contents/MacOS/<file>`.
+fn in_app_bundle(path: &Path) -> bool {
+    let Some(macos) = path.parent() else {
+        return false;
+    };
+    let Some(contents) = macos.parent() else {
+        return false;
+    };
+    macos.file_name().is_some_and(|n| n == "MacOS")
+        && contents.file_name().is_some_and(|n| n == "Contents")
+        && contents
+            .parent()
+            .and_then(Path::extension)
+            .is_some_and(|ext| ext == "app")
+}
+
+/// The [`Durability`] of the atpkg at `atpkg`, with `temp_roots` the machine's temporary
+/// directories ([`temp_roots`]).
+#[must_use]
+pub(crate) fn durability(atpkg: &Path, temp_roots: &[PathBuf]) -> Durability {
+    let s = atpkg.to_string_lossy();
+    if s.contains("/AppTranslocation/")
+        || s.starts_with("/Volumes/")
+        || temp_roots.iter().any(|root| atpkg.starts_with(root))
+        || atpkg.ancestors().skip(1).any(is_cache_dir)
+    {
+        return Durability::Transient;
+    }
+    if in_app_bundle(atpkg) {
+        Durability::Bundle
+    } else {
+        Durability::Plain
+    }
+}
+
+/// This machine's temporary directories, each as spelled and as it resolves (`/tmp` is
+/// `/private/tmp` on macOS, and `$TMPDIR` sits under `/private/var/folders`): the system
+/// temp dir, `/tmp` and `/var/tmp`. A root that is the filesystem root itself (a `TMPDIR=/`)
+/// is dropped — it would make every path transient.
+fn temp_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root in [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ] {
+        if let Ok(real) = std::fs::canonicalize(&root) {
+            roots.push(real);
+        }
+        roots.push(root);
+    }
+    roots.retain(|root| root.is_absolute() && root.parent().is_some());
+    roots.dedup();
+    roots
+}
+
+/// Which atpkg a file laid NOW names (module doc, "Which atpkg a laid file names"): the one
+/// rule every writer of an atpkg path goes through — the pending stubs, the reroute stubs
+/// and the `agents/` twins.
+#[derive(Debug, Clone)]
+pub(crate) struct Embedder {
+    /// The atpkg this process offers ([`co_located_atpkg_path`]); [`Self::embed`] takes it
+    /// only when it is live.
+    offered: PathBuf,
+    /// The machine's temporary directories ([`temp_roots`]).
+    temp_roots: Vec<PathBuf>,
+}
+
+impl Embedder {
+    /// The embedder of THIS process: its co-located atpkg, this machine's temp dirs.
+    #[must_use]
+    pub(crate) fn this_process() -> Self {
+        Self {
+            offered: co_located_atpkg_path(),
+            temp_roots: temp_roots(),
+        }
+    }
+
+    /// An embedder offering `offered`, with `temp_roots` as the temporary directories — a
+    /// process stood anywhere, for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn offering(offered: &Path, temp_roots: &[PathBuf]) -> Self {
+        Self {
+            offered: offered.to_path_buf(),
+            temp_roots: temp_roots.to_vec(),
+        }
+    }
+
+    /// The atpkg a file names once laid, given the one it names now (`standing`: `None` for
+    /// a file not there yet, or one that names none), or `None` to name none:
+    ///
+    /// * a path that is not a live atpkg ([`is_live_atpkg`]), or is not absolute, is never
+    ///   the answer — on either side;
+    /// * a live `standing` path stays unless the offered one is live and lasts at least as
+    ///   long ([`Durability`]): a scratch copy never takes a file from the installed app,
+    ///   while the installed app — moved, reinstalled, or a dev bundle installed on
+    ///   purpose — takes it from anything.
+    #[must_use]
+    pub(crate) fn embed(&self, standing: Option<&Path>) -> Option<PathBuf> {
+        let live = |path: &Path| path.is_absolute() && is_live_atpkg(path);
+        let offered = Some(self.offered.as_path()).filter(|p| live(p));
+        let standing = standing.filter(|p| live(p));
+        match (offered, standing) {
+            (None, None) => None,
+            (Some(offered), None) => Some(offered.to_path_buf()),
+            (None, Some(standing)) => Some(standing.to_path_buf()),
+            (Some(offered), Some(standing)) => {
+                // Equal paths first: the steady state (the installed app re-laying its own
+                // files) never walks the ancestors for a cache tag.
+                let keep = offered != standing
+                    && durability(offered, &self.temp_roots)
+                        < durability(standing, &self.temp_roots);
+                Some(if keep { standing } else { offered }.to_path_buf())
+            }
+        }
     }
 }
 
@@ -335,14 +604,15 @@ pub fn pending_stub_exists(layout: &Layout, tool: &str) -> bool {
 /// the tombstone writer's shape). NEVER over anything that is not already a pending
 /// stub: a resolvable shim, a tombstone, or any unrecognized file wins and the write is
 /// a clean no-op — the stub is the lowest-precedence occupant of the name.
-pub fn write_pending_stub(layout: &Layout, tool: &ToolName) -> io::Result<()> {
+#[cfg(test)]
+pub(crate) fn write_pending_stub(layout: &Layout, tool: &ToolName) -> io::Result<()> {
     match pending_stub_executable(layout, tool)? {
         Some(file) => crate::lay::write_in_process(&file),
         None => Ok(()),
     }
 }
 
-/// The pending stub [`write_pending_stub`] would lay, RENDERED but not written —
+/// The pending stub `write_pending_stub` would lay, RENDERED but not written —
 /// `Ok(None)` when there is nothing to lay (an alias, a name Windows cannot embed
 /// inertly, a name something else occupies), so the two roster loops render a whole pass
 /// before they lay it. The precedence rule lives here, once: NEVER over anything that is
@@ -369,26 +639,33 @@ pub(crate) fn pending_stub_executable(
 /// machine with a brew cask, and R6's "typing the name prints the install state" did
 /// not hold for the two names it matters most for (audit 2026-09-14). Same precedence
 /// rule: never over anything that is not already a pending stub.
+///
+/// The atpkg the stub names is [`Embedder::embed`]'s answer over the one the stub standing
+/// there names now: a copy of aterm with no `atpkg` beside it, or one that lasts less than
+/// the atpkg already named, re-points nothing (module doc).
 pub(crate) fn pending_stub_executable_at(
     layout: &Layout,
     tool: &ToolName,
-    shim: std::path::PathBuf,
+    shim: PathBuf,
 ) -> io::Result<Option<crate::lay::Executable>> {
-    let body = stub_content(tool, &embedded_atpkg_path());
-    match std::fs::symlink_metadata(&shim) {
-        Err(_) => {} // absent: ours to claim
-        Ok(_) if is_pending_stub(&shim) => {
-            // Ours already, and byte-identical: nothing to lay — the reroute stubs' rule
-            // (`reroute::lay`). Every seed runs the adoption lay and every install pass
-            // reconciles twice, so a name that stays wanted-and-absent re-laid identical
-            // bytes each time. A body that differs — the embedded atpkg path changed, or an
-            // older client's retired extra/requires line — is rewritten. A macOS tag is not a
-            // difference: the store heal clears it in place ([`crate::provenance::heal_store`]).
-            if stub_is_current(&shim, &body) {
-                return Ok(None);
-            }
-        }
+    let standing = match std::fs::symlink_metadata(&shim) {
+        Err(_) => None, // absent: ours to claim
+        Ok(_) if is_pending_stub(&shim) => Some(
+            crate::metadata_io::read_bounded_regular_utf8(&shim, 64 * 1024).unwrap_or_default(),
+        ),
         Ok(_) => return Ok(None), // someone else's file (shim/tombstone/hand-made): never touch
+    };
+    let atpkg =
+        Embedder::this_process().embed(standing.as_deref().and_then(stub_named_atpkg).as_deref());
+    let body = stub_content(tool, atpkg.as_deref());
+    // Ours already, and byte-identical: nothing to lay — the reroute stubs' rule
+    // (`reroute::lay`). Every seed runs the adoption lay and every install pass reconciles
+    // twice, so a name that stays wanted-and-absent re-laid identical bytes each time. A body
+    // that differs — the atpkg it names changed, or an older client's retired extra/requires
+    // line — is rewritten. A macOS tag is not a difference: the store heal clears it in place
+    // ([`crate::provenance::heal_store`]).
+    if standing.is_some() && stub_is_current(&shim, &body) {
+        return Ok(None);
     }
     if let Some(dir) = shim.parent() {
         layout.ensure_dir(dir)?;
@@ -958,7 +1235,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let l = layout("identical-skip");
         let t = tool("trust");
-        let body = stub_content(&t, &embedded_atpkg_path());
+        let body = stub_content(&t, Embedder::this_process().embed(None).as_deref());
         let fresh = pending_stub_executable(&l, &t).unwrap();
         assert!(fresh.is_some(), "an absent name is ours to claim");
         write_pending_stub(&l, &t).unwrap();
@@ -1071,7 +1348,7 @@ mod tests {
                 .unwrap()
         };
         // 1: embedded path exists and is executable.
-        let out = run(&stub_content(&t, &fake), "/nonexistent");
+        let out = run(&stub_content(&t, Some(&fake)), "/nonexistent");
         assert_eq!(out.status.code(), Some(127));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -1091,7 +1368,7 @@ mod tests {
         )
         .unwrap();
         let out = run(
-            &stub_content(&t, Path::new("/gone/after/relocation/atpkg")),
+            &stub_content(&t, Some(Path::new("/gone/after/relocation/atpkg"))),
             path_dir.to_str().unwrap(),
         );
         assert_eq!(out.status.code(), Some(127));
@@ -1099,8 +1376,17 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "path: __pending trust\n"
         );
+        // 2, naming no atpkg at all (nothing live when it was laid): the same PATH answer.
+        let out = run(&stub_content(&t, None), path_dir.to_str().unwrap());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "path: __pending trust\n"
+        );
         // 3: nothing reachable — the static honest message, exit 127.
-        let out = run(&stub_content(&t, Path::new("/gone/atpkg")), "/nonexistent");
+        let out = run(
+            &stub_content(&t, Some(Path::new("/gone/atpkg"))),
+            "/nonexistent",
+        );
         assert_eq!(out.status.code(), Some(127));
         assert!(String::from_utf8_lossy(&out.stderr).contains(STUB_UNREACHABLE_MSG));
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1127,5 +1413,470 @@ mod tests {
         // The line is descriptive of the vendor, never an ALab mark.
         assert!(describe("codex").unwrap().starts_with("OpenAI "));
         assert!(describe("claude").unwrap().starts_with("Anthropic "));
+    }
+
+    // ── which atpkg a laid file names ───────────────────────────────────────────────
+
+    /// The classes the rule ranks, each from its own path: an app bundle, a plain binary, and
+    /// the four transient shapes — a temp dir, a cargo target dir, a translocated copy, a
+    /// mounted image.
+    #[cfg(unix)]
+    #[test]
+    fn durability_ranks_a_bundle_over_a_plain_binary_over_a_transient_copy() {
+        let l = layout("durability");
+        let root = std::fs::canonicalize(&l.prefix).unwrap();
+        let target = root.join("checkout/target.noindex");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            format!("{CACHEDIR_TAG_SIGNATURE}\n# This file is a cache directory tag.\n"),
+        )
+        .unwrap();
+        // A file of that name WITHOUT the signature tags nothing.
+        let untagged = root.join("untagged");
+        std::fs::create_dir_all(&untagged).unwrap();
+        std::fs::write(untagged.join("CACHEDIR.TAG"), "not a tag\n").unwrap();
+        let scratch = root.join("tmp");
+        let scratch_roots = [scratch.clone()];
+        for (path, want) in [
+            (
+                root.join("Applications/aterm.app/Contents/MacOS/atpkg"),
+                Durability::Bundle,
+            ),
+            (
+                root.join("Applications/aterm (dev).app/Contents/MacOS/atpkg"),
+                Durability::Bundle,
+            ),
+            (root.join(".local/lib/aterm/bin/atpkg"), Durability::Plain),
+            (untagged.join("debug/atpkg"), Durability::Plain),
+            // Not the exact bundle shape: a plain binary.
+            (root.join("aterm.app/MacOS/atpkg"), Durability::Plain),
+            (target.join("debug/atpkg"), Durability::Transient),
+            (
+                target.join("release/bundle/aterm.app/Contents/MacOS/atpkg"),
+                Durability::Transient,
+            ),
+            (scratch.join("run/bin/atpkg"), Durability::Transient),
+            (
+                PathBuf::from(
+                    "/private/var/folders/x/AppTranslocation/Y/d/aterm.app/Contents/MacOS/atpkg",
+                ),
+                Durability::Transient,
+            ),
+            (
+                PathBuf::from("/Volumes/aterm/aterm.app/Contents/MacOS/atpkg"),
+                Durability::Transient,
+            ),
+        ] {
+            assert_eq!(
+                durability(&path, &scratch_roots),
+                want,
+                "{}",
+                path.display()
+            );
+        }
+        // The machine's own temp dirs are transient, and the filesystem root is not a temp
+        // dir whatever `TMPDIR` says.
+        let roots = temp_roots();
+        assert!(roots.iter().all(|r| r.parent().is_some()), "{roots:?}");
+        assert_eq!(
+            durability(&std::env::temp_dir().join("x/bin/atpkg"), &roots),
+            Durability::Transient
+        );
+        assert_eq!(
+            durability(
+                Path::new("/Applications/aterm.app/Contents/MacOS/atpkg"),
+                &roots
+            ),
+            Durability::Bundle
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// [`Embedder::embed`], case by case: a missing atpkg is never named on either side; a
+    /// live one stays unless the offered one lasts at least as long; a gone one yields to
+    /// anything live.
+    #[cfg(unix)]
+    #[test]
+    fn the_embedder_names_no_missing_atpkg_and_never_trades_down() {
+        let l = layout("embedder");
+        let root = std::fs::canonicalize(&l.prefix).unwrap();
+        let live = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let installed = live("Applications/aterm.app/Contents/MacOS/atpkg");
+        let dev = live("Applications/aterm (dev).app/Contents/MacOS/atpkg");
+        let store = live("home/.local/lib/aterm/bin/atpkg");
+        let scratch = live("tmp/run/bin/atpkg");
+        let target = root.join("checkout/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            format!("{CACHEDIR_TAG_SIGNATURE}\n"),
+        )
+        .unwrap();
+        let target_build = live("checkout/target/debug/atpkg");
+        let gone = root.join("gone/aterm.app/Contents/MacOS/atpkg");
+        let not_executable = root.join("plain-file/atpkg");
+        std::fs::create_dir_all(not_executable.parent().unwrap()).unwrap();
+        std::fs::write(&not_executable, "not a program").unwrap();
+        let scratch_roots = [root.join("tmp")];
+        let embed = |offered: &Path, standing: Option<&Path>| {
+            Embedder::offering(offered, &scratch_roots).embed(standing)
+        };
+        // D1: the offered atpkg is not there — the standing live one stays, or none is named.
+        assert_eq!(embed(&gone, Some(&installed)), Some(installed.clone()));
+        assert_eq!(embed(&gone, None), None);
+        assert_eq!(embed(&gone, Some(&gone)), None);
+        assert_eq!(embed(&not_executable, None), None);
+        assert_eq!(
+            embed(Path::new("atpkg"), None),
+            None,
+            "a relative path is never named"
+        );
+        // Never trade down from a live atpkg.
+        assert_eq!(
+            embed(&target_build, Some(&installed)),
+            Some(installed.clone())
+        );
+        assert_eq!(embed(&scratch, Some(&installed)), Some(installed.clone()));
+        assert_eq!(embed(&store, Some(&installed)), Some(installed.clone()));
+        assert_eq!(embed(&scratch, Some(&store)), Some(store.clone()));
+        assert_eq!(embed(&target_build, Some(&store)), Some(store.clone()));
+        // Up, or level: the offered one takes it — the installed app from a target/ build,
+        // a launched dev bundle from the release, the store from a scratch copy.
+        assert_eq!(
+            embed(&installed, Some(&target_build)),
+            Some(installed.clone())
+        );
+        assert_eq!(embed(&dev, Some(&installed)), Some(dev.clone()));
+        assert_eq!(embed(&installed, Some(&dev)), Some(installed.clone()));
+        assert_eq!(embed(&store, Some(&scratch)), Some(store.clone()));
+        assert_eq!(embed(&installed, Some(&installed)), Some(installed.clone()));
+        // A gone or unnamed standing path yields to anything live — the app moved, a fresh
+        // prefix, a file an older client laid naming none.
+        assert_eq!(embed(&installed, Some(&gone)), Some(installed.clone()));
+        assert_eq!(
+            embed(&target_build, Some(&gone)),
+            Some(target_build.clone())
+        );
+        assert_eq!(embed(&installed, None), Some(installed.clone()));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// What a laid file names is read back exactly as it was written — every quoting the
+    /// renderers produce, the empty value as "none", and nothing from a line this crate did
+    /// not quote; the batch stub leaves its `if exist` block out when it names none.
+    #[test]
+    fn the_named_atpkg_reads_back_as_written() {
+        let t = tool("trust");
+        for path in [
+            "/Applications/aterm.app/Contents/MacOS/atpkg",
+            "/Users//o'brien/Application Support/aterm/bin/atpkg",
+            "/it's/''/x",
+        ] {
+            let body = stub_content_sh(&t, Path::new(path));
+            assert_eq!(
+                sh_named_atpkg(&body, "ATPKG"),
+                Some(PathBuf::from(path)),
+                "{body}"
+            );
+            assert_eq!(stub_named_atpkg(&body), Some(PathBuf::from(path)));
+            let twin = crate::platform::sh_selfupdate_prelude(
+                "claude",
+                Path::new("/p"),
+                Path::new(path),
+                &["update"],
+            );
+            assert_eq!(
+                sh_named_atpkg(&twin, "__atpkg"),
+                Some(PathBuf::from(path)),
+                "{twin}"
+            );
+            let reroute = crate::reroute::stub_body_sh("cargo", Path::new(path), Path::new("/r"));
+            assert_eq!(sh_named_atpkg(&reroute, "ATPKG"), Some(PathBuf::from(path)));
+        }
+        let cmd = stub_content_cmd(&t, Path::new(r"C:\Program Files\aterm\atpkg.exe"));
+        assert_eq!(
+            stub_named_atpkg(&cmd),
+            Some(PathBuf::from(r"C:\Program Files\aterm\atpkg.exe"))
+        );
+        // Naming none.
+        let none = stub_content_sh(&t, named(None));
+        assert!(none.contains("\nATPKG=''\n"), "{none}");
+        assert_eq!(stub_named_atpkg(&none), None);
+        let cmd_none = stub_content_cmd(&t, named(None));
+        assert!(!cmd_none.contains("if exist"), "{cmd_none}");
+        assert!(cmd_none.contains("where atpkg"), "{cmd_none}");
+        assert_eq!(stub_named_atpkg(&cmd_none), None);
+        // Not our quoting: not guessed at.
+        assert_eq!(sh_named_atpkg("ATPKG=/unquoted/atpkg\n", "ATPKG"), None);
+        assert_eq!(sh_named_atpkg("ATPKG='/open\n", "ATPKG"), None);
+        assert_eq!(sh_named_atpkg("MY_ATPKG='/x'\n", "ATPKG"), None);
+    }
+
+    // ── which atpkg a laid file names, at the real process edge ─────────────────────
+
+    /// The env that turns [`probe_lays_every_file_as_this_copy`] on: the prefix it lays over.
+    #[cfg(unix)]
+    const LAY_AS_COPY_ENV: &str = "ATPKG_STUB_LAY_AS_COPY_PREFIX";
+    /// That probe's name, as `--exact` wants it.
+    #[cfg(unix)]
+    const LAY_AS_COPY_PROBE: &str = "stub::tests::probe_lays_every_file_as_this_copy";
+
+    /// The copy's whole job: the three lays that run at every launch, session spawn and pass
+    /// — the reroute stubs, the pending stubs, the `agents/` twins — over the prefix it is
+    /// handed, as the binary it IS (its own `current_exe`, its own neighbours). Outside a
+    /// copy (the env unset) it does nothing.
+    #[cfg(unix)]
+    #[test]
+    fn probe_lays_every_file_as_this_copy() {
+        let Some(prefix) = std::env::var_os(LAY_AS_COPY_ENV) else {
+            return;
+        };
+        let l = Layout {
+            prefix: std::path::PathBuf::from(prefix),
+        };
+        crate::reroute::lay(&l).expect("the reroute lay");
+        lay_adoption_stubs(&l);
+        crate::activate::reconcile_agents(&l);
+    }
+
+    /// Place a copy of THIS test binary at `exe` — with the `atpkg` alias beside it when
+    /// `alias`, the shape every bundle and install.sh's store carry — and run
+    /// [`probe_lays_every_file_as_this_copy`] from there over `l`.
+    ///
+    /// A copy already at `exe` is REMOVED first, never written over. macOS keeps a
+    /// binary's code-signature state with the file it ran from, and a file written over
+    /// after it has run can be SIGKILLed by the kernel at its next exec, before the probe
+    /// runs (`unix_wait_status(9)`) — the fixture failing, not the lay. Measured 2026-09-25, every kill at the second copy to one path: copied
+    /// over, 5 of 200 runs of the test below were killed (and a shell `cp` over a copy that
+    /// had already run, 38 of 40); removed first, which gives the copy a new file, 0 of 200
+    /// run one at a time and 0 of 200 run four at a time. The same kernel class is recorded
+    /// in `caller_shell`'s outliving-program test.
+    #[cfg(unix)]
+    fn lay_as_copy_at(exe: &Path, alias: bool, l: &Layout) {
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        match std::fs::remove_file(exe) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("remove the previous copy at {}: {e}", exe.display()),
+        }
+        std::fs::copy(std::env::current_exe().unwrap(), exe).expect("copy this test binary");
+        std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if alias {
+            let _ = std::fs::remove_file(exe.with_file_name("atpkg"));
+            std::os::unix::fs::symlink(exe.file_name().unwrap(), exe.with_file_name("atpkg"))
+                .unwrap();
+        }
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--nocapture", LAY_AS_COPY_PROBE])
+            .env(LAY_AS_COPY_ENV, &l.prefix)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the copy");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the copy at {} did not run the probe: {out:?}",
+            exe.display()
+        );
+    }
+
+    /// Every `(file, atpkg it names)` under `prefix`'s three laid directories: the value of
+    /// each file's `ATPKG=` line (a reroute or pending stub) or `__atpkg=` line (an agents
+    /// twin), as written.
+    #[cfg(unix)]
+    fn atpkg_named_under(prefix: &Path) -> Vec<(std::path::PathBuf, String)> {
+        let l = Layout {
+            prefix: prefix.to_path_buf(),
+        };
+        let mut named = Vec::new();
+        for dir in [crate::reroute::dir(&l), l.bin_dir(), l.agents_dir()] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                for line in text.lines() {
+                    let line = line.trim_start();
+                    if let Some(value) = line
+                        .strip_prefix("ATPKG=")
+                        .or_else(|| line.strip_prefix("__atpkg="))
+                    {
+                        named.push((entry.path(), value.to_string()));
+                    }
+                }
+            }
+        }
+        named.sort();
+        named
+    }
+
+    /// Rewrite every atpkg a laid file under `prefix` names to `atpkg` — the state a launch of
+    /// the installed app leaves behind.
+    #[cfg(unix)]
+    fn name_atpkg_everywhere(prefix: &Path, atpkg: &Path) {
+        let quoted = sh_single_quote(&atpkg.to_string_lossy());
+        for (file, _) in atpkg_named_under(prefix) {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mut out = String::new();
+            for line in text.split_inclusive('\n') {
+                let body = line.trim_start();
+                let indent = &line[..line.len() - body.len()];
+                let var = ["ATPKG=", "__atpkg="]
+                    .into_iter()
+                    .find(|var| body.starts_with(var));
+                match var {
+                    Some(var) => {
+                        out.push_str(indent);
+                        out.push_str(var);
+                        out.push_str(&quoted);
+                        out.push('\n');
+                    }
+                    None => out.push_str(line),
+                }
+            }
+            std::fs::write(&file, out).unwrap();
+        }
+    }
+
+    /// D1 of the 2026-09-25 end-to-end run: a private copy of aterm started from a scratch
+    /// directory re-laid the machine's eight reroute stubs with
+    /// `ATPKG='<scratch>/bin/atpkg'` — a file that was never there, in a directory that was
+    /// deleted after the run — over stubs naming the installed app's live atpkg. Every launch
+    /// and session spawn runs that lay, and so does every pass for the pending stubs and the
+    /// `agents/` twins, all from `<current_exe dir>/atpkg`, never asking whether it exists.
+    ///
+    /// Reproduced as it happened: a copy of this test binary in a scratch `bin/` with no
+    /// `atpkg` beside it runs the three real lays over a prefix whose every file names a
+    /// live, installed atpkg. Nothing may be re-pointed at the scratch directory, and every
+    /// file still names the installed atpkg afterwards.
+    ///
+    /// NEGATIVE CONTROL, the legitimate re-lay: the installed app MOVES (its old atpkg gone,
+    /// the app at a new path with the `atpkg` alias beside it) and every file is re-laid
+    /// naming the new path; and a FRESH prefix is laid naming it too. Without this half the
+    /// first half would pass for a lay that re-points nothing ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_run_from_a_scratch_dir_never_re_points_a_laid_file_at_a_missing_atpkg() {
+        if std::env::var_os(LAY_AS_COPY_ENV).is_some() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("atpkg-lay-as-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Removed however the test ends — a failed run leaves no copies of this binary
+        // (tens of MB each) behind in the temp dir.
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(root.clone());
+        // Canonical, as the lay spells an atpkg path: `current_exe` resolved.
+        let root = std::fs::canonicalize(&root).unwrap();
+        let l = Layout {
+            prefix: root.join("prefix"),
+        };
+        // The installed app's atpkg: live.
+        let installed = root.join("Applications/aterm.app/Contents/MacOS/atpkg");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A managed claude, so the agents twin and its reroute stub are laid too.
+        let build = l.build_dir("claude", 2026092501);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin/claude"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            build.join("bin/claude"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::activate::install_shims(
+            &l,
+            &build,
+            &["claude".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        crate::store::mark_build_ready(&build).unwrap();
+        // Every file laid once, then named at the installed app — its launch's state.
+        crate::reroute::lay(&l).unwrap();
+        lay_adoption_stubs(&l);
+        crate::activate::reconcile_agents(&l);
+        name_atpkg_everywhere(&l.prefix, &installed);
+        let before = atpkg_named_under(&l.prefix);
+        let quoted = sh_single_quote(&installed.to_string_lossy());
+        assert!(
+            before.iter().all(|(_, v)| *v == quoted),
+            "the fixture names the installed atpkg everywhere: {before:#?}"
+        );
+        // Non-vacuous: all three kinds are there.
+        let reroute_dir = crate::reroute::dir(&l);
+        for (what, file) in [
+            ("a reroute stub", reroute_dir.join("cargo")),
+            ("a pending stub", l.shim(&tool("ty"))),
+            ("the agents twin", l.agent_shim(&tool("claude"))),
+        ] {
+            assert!(
+                before.iter().any(|(f, _)| *f == file),
+                "{what} names an atpkg: {before:#?}"
+            );
+        }
+
+        // THE SCRATCH COPY: `<scratch>/bin/aterm`, nothing beside it.
+        let scratch = root.join("scratch/bin/aterm");
+        lay_as_copy_at(&scratch, false, &l);
+        let after = atpkg_named_under(&l.prefix);
+        let scratch_dir = scratch.parent().unwrap().to_string_lossy().into_owned();
+        let leaked: Vec<_> = after
+            .iter()
+            .filter(|(_, v)| v.contains(&scratch_dir))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a copy run from a scratch dir re-pointed laid files at an atpkg that is not \
+             there: {leaked:#?}"
+        );
+        assert_eq!(
+            after, before,
+            "every laid file still names the installed atpkg"
+        );
+
+        // NEGATIVE CONTROL: the installed app moved. Its old atpkg is gone; the app runs
+        // from its new path, alias beside it, and every file follows it.
+        std::fs::remove_file(&installed).unwrap();
+        let moved = root.join("Moved/aterm.app/Contents/MacOS/aterm");
+        lay_as_copy_at(&moved, true, &l);
+        let moved_atpkg = sh_single_quote(&moved.with_file_name("atpkg").to_string_lossy());
+        let relaid = atpkg_named_under(&l.prefix);
+        assert_eq!(relaid.len(), before.len(), "{relaid:#?}");
+        assert!(
+            relaid.iter().all(|(_, v)| *v == moved_atpkg),
+            "the moved app re-lays every file naming its own atpkg: {relaid:#?}"
+        );
+        // And a fresh prefix is laid naming it from the first lay.
+        let fresh = Layout {
+            prefix: root.join("fresh"),
+        };
+        lay_as_copy_at(&moved, true, &fresh);
+        let laid = atpkg_named_under(&fresh.prefix);
+        assert!(
+            laid.iter()
+                .any(|(f, _)| *f == crate::reroute::dir(&fresh).join("cargo")),
+            "{laid:#?}"
+        );
+        assert!(
+            laid.iter().all(|(_, v)| *v == moved_atpkg),
+            "a fresh install names its own atpkg: {laid:#?}"
+        );
     }
 }

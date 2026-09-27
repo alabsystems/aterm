@@ -258,7 +258,7 @@ impl ConnCardState {
 
     /// Focus `row` and cycle its value by `delta` — the a11y Click's cycle
     /// (a screen reader clicks the chooser row it hears; the row advances).
-    #[cfg_attr(not(a11y_tree), allow(dead_code))]
+    #[cfg(a11y_tree)]
     pub(crate) fn cycle_row(&mut self, row: CardRow, delta: isize) {
         self.focus = row;
         self.cycle_value(delta);
@@ -586,7 +586,6 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
             h: card_h + 6.0,
             radius: radius + 3.0,
             fill: rgba([0, 0, 0], 0x2A),
-            blur: false,
         },
         DrawPrim::Panel {
             x: card_x - 1.0,
@@ -595,7 +594,6 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
             h: card_h + 3.0,
             radius: radius + 1.0,
             fill: rgba([0, 0, 0], 0x30),
-            blur: false,
         },
         // Opaque like the palette: the tray rasterizer has no backdrop blur.
         DrawPrim::Panel {
@@ -605,7 +603,6 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
             h: card_h,
             radius,
             fill: rgba(r.surface, 0xFF),
-            blur: false,
         },
         DrawPrim::Stroke {
             x: card_x,
@@ -696,7 +693,6 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
                 h,
                 radius: ch * 0.3,
                 fill: rgba(r.accent, 0x22),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x,

@@ -450,9 +450,9 @@ impl WarmTier {
 
     /// Replace the oldest warm block's compressed data with garbage.
     ///
-    /// This is a cross-crate behavioral-test seam used to force warm-tier
-    /// decompression failure during eviction paths.
-    #[cfg(any(test, feature = "testing"))]
+    /// Test seam used to force warm-tier decompression failure during eviction
+    /// paths.
+    #[cfg(test)]
     pub(crate) fn corrupt_oldest_block(&mut self) {
         if let Some(block) = self.blocks.front_mut() {
             let old_bytes = block.compressed.len();

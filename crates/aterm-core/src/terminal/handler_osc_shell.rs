@@ -10,8 +10,7 @@
 
 use super::handler::TerminalHandler;
 use super::shell::{
-    BlockState, COMMAND_MARKS_MAX, CommandMark, OUTPUT_BLOCKS_MAX, OutputBlock, ShellEvent,
-    ShellState,
+    BlockState, COMMAND_MARKS_MAX, CommandMark, OUTPUT_BLOCKS_MAX, OutputBlock, ShellState,
 };
 use super::{MAX_COMMANDLINE_BYTES, MAX_CWD_PATH_BYTES};
 
@@ -23,20 +22,6 @@ impl TerminalHandler<'_> {
         let cursor = self.grid.cursor();
         let row = self.grid.visible_to_absolute(cursor.row);
         Some((cmd, row, cursor.col))
-    }
-
-    /// Send a shell callback event if one is registered.
-    fn emit_shell_event(&mut self, event: ShellEvent) {
-        if let Some(ref mut cb) = self.shell.callback {
-            cb(event);
-        }
-    }
-
-    /// Notify shell callback consumers that the working directory changed.
-    pub(super) fn shell_directory_changed(&mut self, path: Option<&str>) {
-        self.emit_shell_event(ShellEvent::DirectoryChanged {
-            path: path.map(Into::into),
-        });
     }
 
     /// Shell mark A: Prompt starting — create mark, finalize previous block, start new block.
@@ -65,8 +50,6 @@ impl TerminalHandler<'_> {
             block.working_directory = Some(cwd.as_str().into());
         }
         self.shell.current_block = Some(block);
-
-        self.emit_shell_event(ShellEvent::PromptStart { row, col });
     }
 
     /// Shell mark B: Command input starting (prompt finished).
@@ -84,8 +67,6 @@ impl TerminalHandler<'_> {
             block.state = BlockState::EnteringCommand;
             block.command_input_start_time_ms = self.transient.process_wall_ms;
         }
-
-        self.emit_shell_event(ShellEvent::CommandStart { row, col });
     }
 
     /// Shell mark C: Command execution starting.
@@ -101,8 +82,6 @@ impl TerminalHandler<'_> {
             block.state = BlockState::Executing;
             block.command_exec_start_time_ms = self.transient.process_wall_ms;
         }
-
-        self.emit_shell_event(ShellEvent::OutputStart { row });
     }
 
     /// Shell mark D: Command finished — complete mark, update block state.
@@ -125,8 +104,6 @@ impl TerminalHandler<'_> {
             block.state = BlockState::Complete;
             block.command_end_time_ms = self.transient.process_wall_ms;
         }
-
-        self.emit_shell_event(ShellEvent::CommandFinished { exit_code });
     }
 
     /// Parse exit code from OSC params (used by both 133 D and 633 D).
@@ -281,33 +258,12 @@ impl TerminalHandler<'_> {
                 if let Some(ref mut mark) = self.shell.current_mark {
                     mark.commandline = Some(commandline.clone().into_boxed_str());
                 }
-                let semantic_text = commandline.clone().into_boxed_str();
                 if let Some(ref mut block) = self.shell.current_block {
                     block.commandline = Some(commandline.into_boxed_str());
                 }
-                self.emit_shell_event(ShellEvent::SemanticText {
-                    text: semantic_text,
-                });
             }
-            'F' | 'G' | 'H' => {
-                let payload = params
-                    .get(2)
-                    .and_then(|p| std::str::from_utf8(p).ok())
-                    // Bound the payload before unescaping (same cap as `E`); these
-                    // are transient (emitted, not retained) but still shouldn't
-                    // unescape a multi-MiB blob on every progress update.
-                    .filter(|p| p.len() <= MAX_COMMANDLINE_BYTES)
-                    .map(Self::unescape_vscode_string)
-                    .filter(|payload| !payload.is_empty())
-                    .map(String::into_boxed_str);
-                let event = match cmd {
-                    'F' => ShellEvent::ProgressStart { payload },
-                    'G' => ShellEvent::ProgressUpdate { payload },
-                    'H' => ShellEvent::ProgressEnd { payload },
-                    _ => return,
-                };
-                self.emit_shell_event(event);
-            }
+            // 'F'/'G'/'H' (progress) retain nothing and no host consumes them:
+            // they fall through to the ignored arm below.
             'P' => {
                 // Property setting (VS Code extension)
                 let Some(prop) = params.get(2).and_then(|p| std::str::from_utf8(p).ok()) else {
@@ -318,6 +274,10 @@ impl TerminalHandler<'_> {
                 };
                 let key = &prop[..pos];
                 let value = &prop[pos + 1..];
+                if key == crate::shell_integration::INTEGRATION_REV_KEY {
+                    self.record_integration_rev(value);
+                    return;
+                }
                 if key != "Cwd" || value.is_empty() {
                     return;
                 }
@@ -335,13 +295,31 @@ impl TerminalHandler<'_> {
                 if let Some(ref mut block) = self.shell.current_block {
                     block.working_directory = Some(value.into());
                 }
-                // Store + notify last (`DirectoryChanged` keeps firing after the
-                // mark/block fields are current, as before), bumping the shared
-                // tab-label epoch on a real change like the OSC 7 path.
+                // Store last, bumping the shared tab-label epoch on a real
+                // change like the OSC 7 path.
                 self.store_reported_cwd(Some(value));
             }
             _ => {}
         }
+    }
+
+    /// OSC 633 `P;AtermIntegration=<rev>` — which integration BODY the shell
+    /// runs (the LOADER / BODY split, 2026-09-26; `status integration_rev=`).
+    ///
+    /// Recorded ONLY when the nonce gate is on: the mark reached here signed
+    /// with the shell's authorized key, so it is the shell's word and not a
+    /// program's output (with the gate off every mark passes, and a revision
+    /// anyone can print is worth nothing). The value must be a script folder's
+    /// address — exactly 16 lowercase hex digits — or it is ignored.
+    fn record_integration_rev(&mut self, value: &str) {
+        if !self.modes.require_shell_integration_nonce
+            || !crate::shell_integration::is_integration_rev(value)
+        {
+            return;
+        }
+        let mut rev = [0u8; 16];
+        rev.copy_from_slice(value.as_bytes());
+        self.shell.integration_rev = Some(rev);
     }
 
     /// Unescape VS Code's command line escape format.

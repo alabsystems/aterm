@@ -14,11 +14,10 @@
 //! produces a verdict here. A quiet stream produces NOTHING.
 //!
 //! **The attention path** is the half that ships regardless of the observer:
-//! when aterm's OWN file work takes `EPERM(1)` under a protected root, or when
-//! the Full Disk Access probe flips granted → denied, one tab attention mark is
-//! raised, ONE native notification is posted through `notify.rs`'s existing
-//! bounded queue, and the menu-bar glance is re-rendered. Rate-limited to one
-//! notification per posture transition, never one per `EPERM`.
+//! when aterm's OWN file work takes `EPERM(1)` under a protected root, one tab
+//! attention mark is raised, ONE native notification is posted through
+//! `notify.rs`'s existing bounded queue, and the menu-bar glance is
+//! re-rendered. Rate-limited to one notification, never one per `EPERM`.
 //!
 //! # `unavailable` is a third value, and it is not `false`
 //!
@@ -93,13 +92,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use aterm_containment::consent::FdaState;
-
 /// The observer's binary, named ABSOLUTELY.
 ///
 /// A bare `log` is a zsh builtin that shadows this and exits 0 with empty
 /// output — the single trap that produced a false "tccd is invisible" spike
 /// result. Never spell it any other way.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const LOG_TOOL: &str = "/usr/bin/log";
 
 /// The directory whose readability decides whether this account can see the
@@ -108,10 +106,12 @@ pub(crate) const LOG_TOOL: &str = "/usr/bin/log";
 ///
 /// Ordinary Unix permissions, no TCC service, so probing it cannot raise a
 /// dialog.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const DIAGNOSTICS_DIR: &str = "/var/db/diagnostics";
 
 /// The stream predicate. `tccd` is the only process whose `AUTHREQ_*` lines
 /// this module understands.
+#[cfg(target_os = "macos")]
 pub(crate) const STREAM_PREDICATE: &str = "process == \"tccd\"";
 
 /// Bound on the observer's event queue.
@@ -129,6 +129,7 @@ const EVENT_QUEUE_CAP: usize = 256;
 /// The table is fed by a stream nothing in this process controls, so it is a
 /// ring: the oldest entry is evicted rather than growing without bound. An
 /// evicted entry produces no verdict.
+#[cfg(any(target_os = "macos", test))]
 const PENDING_CAP: usize = 512;
 
 /// How long an uncorrelated entry may sit before it is discarded.
@@ -168,12 +169,12 @@ pub(crate) enum UnavailableReason {
     /// This instance holds the inert arm: headless, a unit test, or a build
     /// with no live observer.
     Inert,
-    /// Not macOS; there is no `tccd` and no unified log to stream. Constructed
-    /// only by the non-macOS arm, hence unreachable — not dead — on macOS.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// Not macOS; there is no `tccd` and no unified log to stream.
+    #[cfg(any(not(target_os = "macos"), test))]
     UnsupportedPlatform,
     /// [`DIAGNOSTICS_DIR`] is not readable by this account — the admin-group
     /// constraint. THIS IS NOT A NEGATIVE VERDICT.
+    #[cfg(any(target_os = "macos", test))]
     NoLogAccess,
     /// [`LOG_TOOL`] is missing or would not start.
     LogToolUnavailable,
@@ -188,9 +189,7 @@ impl UnavailableReason {
     /// The report spelling, reported BESIDE `unavailable` so a reader can tell
     /// "no admin group" from "format changed".
     ///
-    /// PENDING CONSUMER: `control_privacy`'s `observer log=` row, which renders
-    /// a literal `unavailable` while the observer ships off.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Inert => "inert",
@@ -213,17 +212,29 @@ pub(crate) enum ObserverAvailability {
     /// `[privacy] observer` is false — the shipping default.
     #[default]
     Off,
-    /// A stream is live and its lines are understood.
+    /// A stream is live and its lines are understood. Only the macOS log
+    /// stream ever starts one.
+    #[cfg(any(target_os = "macos", test))]
     Ok,
     /// Asked for, and could not look.
     Unavailable(UnavailableReason),
 }
 
 impl ObserverAvailability {
+    /// Whether a stream is live right now — never, where none can start.
+    const fn is_live(self) -> bool {
+        #[cfg(any(target_os = "macos", test))]
+        {
+            matches!(self, Self::Ok)
+        }
+        #[cfg(not(any(target_os = "macos", test)))]
+        {
+            false
+        }
+    }
+
     /// The `observer log=` token.
-    ///
-    /// PENDING CONSUMER: `control_privacy`'s `observer` row (§5.1).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -235,9 +246,7 @@ impl ObserverAvailability {
     /// The reason, when there is one. Reported BESIDE `unavailable` so a reader
     /// can tell "no admin group" from "format changed"; never folded into the
     /// token itself, which stays on the closed three-value vocabulary.
-    ///
-    /// PENDING CONSUMER: `control_privacy`'s `observer` row.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn reason(self) -> Option<UnavailableReason> {
         match self {
             Self::Unavailable(reason) => Some(reason),
@@ -256,6 +265,7 @@ impl ObserverAvailability {
 /// it is a correlation key, nothing computes with it, and an unparsed shape
 /// would throw away a key that still correlates perfectly well as a string.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) enum TccEvent {
     /// `AUTHREQ_CTX` — a request opened, naming the service.
     Ctx {
@@ -301,6 +311,7 @@ pub(crate) enum TccEvent {
 /// format is undocumented, so the parser claims to understand only the exact
 /// shapes recorded in the tests and reports everything else as
 /// [`TccEvent::Unparsed`].
+#[cfg(any(target_os = "macos", test))]
 fn field_after<'a>(haystack: &'a str, key: &str) -> Option<&'a str> {
     let start = haystack.find(key)? + key.len();
     let rest = haystack.get(start..)?;
@@ -316,6 +327,7 @@ fn field_after<'a>(haystack: &'a str, key: &str) -> Option<&'a str> {
 /// [`TccEvent::Unparsed`] is reserved for a line that IS an `AUTHREQ_*` message
 /// and did not yield its fields, which is exactly the signal a format change
 /// produces.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
     let marker = line.find("AUTHREQ_")?;
     let body = line.get(marker..)?;
@@ -371,6 +383,7 @@ pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
 /// Anchored on the block name because the blocks are concatenated on one line
 /// and the leading one is `responsible=` — the terminal application, which is
 /// the same pid for every session and must never be correlated on.
+#[cfg(any(target_os = "macos", test))]
 fn pid_in_block(body: &str, block: &str) -> Option<i32> {
     let at = body.find(block)?;
     let rest = body.get(at..)?;
@@ -378,6 +391,7 @@ fn pid_in_block(body: &str, block: &str) -> Option<i32> {
 }
 
 /// `yes`/`true`/`1` are true; anything else is false. Case-insensitive.
+#[cfg(any(target_os = "macos", test))]
 fn parse_yes_no(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -470,6 +484,7 @@ impl PendingTable {
     }
 
     /// Fold one event.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn note(&mut self, event: TccEvent, now: Instant) {
         if matches!(event, TccEvent::Unparsed) {
             self.unparsed_run = self.unparsed_run.saturating_add(1);
@@ -513,6 +528,7 @@ impl PendingTable {
     /// ring is full: an unbounded table fed by a stream nothing in this process
     /// controls is a memory hazard, and an evicted entry simply never produces
     /// a verdict.
+    #[cfg(any(target_os = "macos", test))]
     fn slot(&mut self, msg_id: &str, now: Instant) -> &mut PendingEntry {
         if let Some(index) = self.entries.iter().position(|e| e.msg_id == msg_id) {
             return &mut self.entries[index];
@@ -583,7 +599,7 @@ impl PendingTable {
 
     /// Whether nothing is in flight. The `len` twin, so a reader never has to
     /// compare a count against zero.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -626,12 +642,15 @@ pub(crate) fn owning_session(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ObserverEvent {
     /// The child started and lines are on the way.
+    #[cfg(any(target_os = "macos", test))]
     Started,
     /// The observer could not look. Terminal for this pass.
     Unavailable(UnavailableReason),
     /// One recognized (or explicitly unrecognized) `tccd` message.
+    #[cfg(any(target_os = "macos", test))]
     Line(TccEvent),
     /// The stream ended and the child was reaped.
+    #[cfg(any(target_os = "macos", test))]
     Ended,
 }
 
@@ -643,9 +662,11 @@ pub(crate) struct StreamSink {
     /// The child's pid while it lives, `0` otherwise. Written by the worker,
     /// read by [`ObserverState::stop`] so a stop can SIGNAL the child without
     /// ever holding its handle — the event loop must never own something it
-    /// could be tempted to `wait()` on.
+    /// could be tempted to `wait()` on. Only the macOS stream has a child.
+    #[cfg(target_os = "macos")]
     child_pid: Arc<AtomicI32>,
     /// Set by [`ObserverState::stop`]; the worker checks it between lines.
+    #[cfg(target_os = "macos")]
     stop: Arc<AtomicBool>,
 }
 
@@ -708,10 +729,7 @@ impl ObserverProbe {
     }
 
     /// Whether this instance's arm can reach the OS at all.
-    ///
-    /// PENDING CONSUMER: the Security panel's observer row, which reports "this
-    /// instance is not looking" rather than "nothing is pending".
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn is_live(self) -> bool {
         self.live
     }
@@ -853,30 +871,25 @@ impl ObserverState {
     }
 
     /// Whether this instance's arm can reach the OS.
-    ///
-    /// PENDING CONSUMER: the Security panel, like `WarmupState::probe_is_live`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn probe_is_live(&self) -> bool {
         self.probe.is_live()
     }
 
     /// The `observer log=` value right now.
+    #[cfg(test)]
     pub(crate) const fn availability(&self) -> ObserverAvailability {
         self.availability
     }
 
     /// Whether a stream is running.
-    ///
-    /// PENDING CONSUMER: the Security panel's observer row.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn is_live(&self) -> bool {
         self.rx.is_some()
     }
 
-    /// In-flight correlations, for the panel and the tests.
-    ///
-    /// PENDING CONSUMER: the Security panel's observer row.
-    #[allow(dead_code)]
+    /// In-flight correlations.
+    #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.table.len()
     }
@@ -904,7 +917,9 @@ impl ObserverState {
         let sink = StreamSink {
             tx,
             poke: Box::new(poke),
+            #[cfg(target_os = "macos")]
             child_pid: Arc::clone(&self.child_pid),
+            #[cfg(target_os = "macos")]
             stop: Arc::clone(&self.stop),
         };
         let run = self.probe.run;
@@ -937,7 +952,7 @@ impl ObserverState {
         self.stop.store(true, Ordering::Release);
         signal_child(self.child_pid.load(Ordering::Acquire));
         self.rx = None;
-        if matches!(self.availability, ObserverAvailability::Ok) {
+        if self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
         }
     }
@@ -974,7 +989,7 @@ impl ObserverState {
         for event in queued {
             self.apply(event, now);
         }
-        if disconnected && matches!(self.availability, ObserverAvailability::Ok) {
+        if disconnected && self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
         }
         self.table.expire(now, PENDING_MAX_AGE);
@@ -988,14 +1003,20 @@ impl ObserverState {
 
     /// Fold ONE message.
     fn apply(&mut self, event: ObserverEvent, now: Instant) {
+        // Only a macOS stream line is timed; elsewhere nothing reads the clock.
+        #[cfg(not(any(target_os = "macos", test)))]
+        let _ = now;
         match event {
+            #[cfg(any(target_os = "macos", test))]
             ObserverEvent::Started => self.availability = ObserverAvailability::Ok,
             ObserverEvent::Unavailable(reason) => {
                 self.availability = ObserverAvailability::Unavailable(reason);
             }
+            #[cfg(any(target_os = "macos", test))]
             ObserverEvent::Line(line) => self.table.note(line, now),
+            #[cfg(any(target_os = "macos", test))]
             ObserverEvent::Ended => {
-                if matches!(self.availability, ObserverAvailability::Ok) {
+                if self.availability.is_live() {
                     self.availability =
                         ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
                 }
@@ -1013,14 +1034,16 @@ impl ObserverState {
     /// EMPTY IS THE COMMON ANSWER, and it means "nothing observed", never "not
     /// blocked". Read [`Self::availability`] alongside it: a quiet stream and an
     /// unavailable observer produce the same empty vector and mean very
-    /// different things.
+    /// different things. The tests' non-consuming read of what
+    /// [`Self::take_new_verdicts`] announces.
+    #[cfg(test)]
     pub(crate) fn verdicts(
         &self,
         now: Instant,
         sessions: &[(u64, i32)],
         pgid_of: impl Fn(i32) -> Option<i32>,
     ) -> Vec<(u64, String)> {
-        if !matches!(self.availability, ObserverAvailability::Ok) {
+        if !self.availability.is_live() {
             return Vec::new();
         }
         let mut out: Vec<(u64, String)> = Vec::new();
@@ -1048,7 +1071,7 @@ impl ObserverState {
         sessions: &[(u64, i32)],
         pgid_of: impl Fn(i32) -> Option<i32>,
     ) -> Vec<ObservedPrompt> {
-        if !matches!(self.availability, ObserverAvailability::Ok) {
+        if !self.availability.is_live() {
             return Vec::new();
         }
         let mut fresh: Vec<ObservedPrompt> = Vec::new();
@@ -1184,9 +1207,6 @@ pub(crate) enum AttentionEvent {
     /// root. `session` names the tab to mark when there is one; the warm-up is
     /// instance-level work and carries `None`.
     ProtectedEperm { session: Option<u64> },
-    /// The Full Disk Access probe reported this state. Only a granted → denied
-    /// flip announces; every other move just re-arms and re-renders.
-    FdaPosture(FdaState),
 }
 
 /// The one native notification an [`AttentionEvent`] may produce.
@@ -1218,44 +1238,24 @@ pub(crate) struct AttentionOutcome {
 /// The notification title. One string, so a reader recognizes the class.
 const ATTENTION_TITLE: &str = "aterm · file access";
 
-/// THE RATE LIMIT (§3.6): one notification per POSTURE TRANSITION, never one
-/// per `EPERM`.
+/// THE RATE LIMIT (§3.6): one notification, never one per `EPERM`.
 ///
-/// A denial storm is one notification. A posture that moves — the probe
-/// changing state — re-arms it, so the next real denial is announced again.
-/// Instance-owned like everything else here: a fresh `App` starts with the gate
-/// armed and no memory of the previous process's posture.
+/// A denial storm is one notification. Instance-owned like everything else
+/// here: a fresh `App` starts with the gate armed.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct AttentionGate {
-    /// The last posture seen, or `None` before the first probe.
-    last_fda: Option<FdaState>,
-    /// Whether this posture epoch has already spent its one notification.
+    /// Whether the one notification has been spent.
     spent: bool,
 }
 
 impl AttentionGate {
     /// A fresh, armed gate.
     pub(crate) const fn new() -> Self {
-        Self {
-            last_fda: None,
-            spent: false,
-        }
+        Self { spent: false }
     }
 
-    /// The last posture this gate was told about. Reported, never inferred.
-    ///
-    /// PENDING CONSUMER: the Security panel, which states which posture the
-    /// current rate-limit epoch belongs to.
-    #[allow(dead_code)]
-    pub(crate) const fn last_posture(&self) -> Option<FdaState> {
-        self.last_fda
-    }
-
-    /// Whether the current posture epoch has spent its notification.
-    ///
-    /// PENDING CONSUMER: the Security panel, so a human can see that a denial
-    /// storm was collapsed rather than missed.
-    #[allow(dead_code)]
+    /// Whether the notification has been spent.
+    #[cfg(all(test, unix))]
     pub(crate) const fn is_spent(&self) -> bool {
         self.spent
     }
@@ -1263,49 +1263,12 @@ impl AttentionGate {
     /// THE FOLD. One event to one outcome.
     pub(crate) fn note(&mut self, event: AttentionEvent) -> AttentionOutcome {
         match event {
-            AttentionEvent::FdaPosture(state) => self.note_posture(state),
             AttentionEvent::ProtectedEperm { session } => self.note_eperm(session),
         }
     }
 
-    /// A probe result. Unchanged posture is a no-op — a poll that keeps
-    /// answering `denied` must not re-announce anything.
-    fn note_posture(&mut self, state: FdaState) -> AttentionOutcome {
-        let previous = self.last_fda.replace(state);
-        if previous == Some(state) {
-            return AttentionOutcome::default();
-        }
-        // THE TRANSITION RE-ARMS. Whatever moved, the next denial is news
-        // again.
-        self.spent = false;
-        // The one posture move that is itself worth telling a human about:
-        // access aterm HAD is gone. Every other move (unknown → anything,
-        // denied → granted) is either good news or not a measurement.
-        if previous == Some(FdaState::Granted) && state == FdaState::Denied {
-            self.spent = true;
-            return AttentionOutcome {
-                raise_tab: None,
-                notice: Some(AttentionNotice {
-                    session: 0,
-                    title: ATTENTION_TITLE,
-                    body: "aterm no longer has full disk access. Programs here can be \
-                           interrupted by macOS consent dialogs until it is granted again in \
-                           System Settings ▸ Privacy & Security."
-                        .to_owned(),
-                }),
-                refresh_status_item: true,
-            };
-        }
-        AttentionOutcome {
-            raise_tab: None,
-            notice: None,
-            refresh_status_item: true,
-        }
-    }
-
     /// An observed `EPERM` under a protected root. The tab mark is raised every
-    /// time (it is per-tab and idempotent); the notification is spent once per
-    /// posture epoch.
+    /// time (it is per-tab and idempotent); the notification is spent once.
     fn note_eperm(&mut self, session: Option<u64>) -> AttentionOutcome {
         if self.spent {
             return AttentionOutcome {
@@ -1354,13 +1317,14 @@ mod tests {
 
     use super::*;
 
-    /// The module's SHIPPING source: everything before the first `#[cfg(test)]`
-    /// attribute, which is the test-seam block's. Mirrors `tools/grep_guard.sh`'s
-    /// `np_strip`, and it is what lets the scans below name the very patterns
-    /// they are forbidding.
+    /// The module's SHIPPING source: everything before the first TOP-LEVEL
+    /// `#[cfg(test)]` attribute, which is the test-seam block's (an indented one
+    /// gates a single test-only method and ends nothing). Mirrors
+    /// `tools/grep_guard.sh`'s `np_strip`, and it is what lets the scans below
+    /// name the very patterns they are forbidding.
     fn shipping_source() -> &'static str {
         const SOURCE: &str = include_str!("consent_observer.rs");
-        let marker = "#[cfg(test)]";
+        let marker = "\n#[cfg(test)]\n";
         let shipping = SOURCE
             .split(marker)
             .next()
@@ -2100,71 +2064,6 @@ mod tests {
         }
     }
 
-    /// A granted → denied flip is itself worth telling a human about, and it is
-    /// the only posture move that announces.
-    #[test]
-    fn only_a_granted_to_denied_flip_announces_a_posture_move() {
-        let cases: &[(FdaState, FdaState, bool)] = &[
-            (FdaState::Granted, FdaState::Denied, true),
-            (FdaState::Denied, FdaState::Granted, false),
-            (FdaState::Unknown, FdaState::Denied, false),
-            (FdaState::Granted, FdaState::Unknown, false),
-            (FdaState::Unknown, FdaState::Granted, false),
-        ];
-        for (from, to, announces) in cases {
-            let mut gate = AttentionGate::new();
-            let _ = gate.note(AttentionEvent::FdaPosture(*from));
-            let outcome = gate.note(AttentionEvent::FdaPosture(*to));
-            assert_eq!(
-                outcome.notice.is_some(),
-                *announces,
-                "{from:?} -> {to:?} announces={announces}"
-            );
-            assert!(
-                outcome.refresh_status_item,
-                "a posture move always re-renders"
-            );
-            assert_eq!(outcome.raise_tab, None, "a posture is not a tab fact");
-        }
-    }
-
-    /// An UNCHANGED posture is a no-op. The probe polls; a poll that keeps
-    /// answering `denied` must not re-announce anything.
-    #[test]
-    fn an_unchanged_posture_changes_nothing() {
-        let mut gate = AttentionGate::new();
-        let _ = gate.note(AttentionEvent::FdaPosture(FdaState::Denied));
-        let repeat = gate.note(AttentionEvent::FdaPosture(FdaState::Denied));
-        assert_eq!(repeat, AttentionOutcome::default());
-        assert_eq!(gate.last_posture(), Some(FdaState::Denied));
-    }
-
-    /// A posture TRANSITION re-arms the gate: the storm's notification is spent,
-    /// but the next real change is news again.
-    #[test]
-    fn a_posture_transition_rearms_the_spent_gate() {
-        let mut gate = AttentionGate::new();
-        assert!(
-            gate.note(AttentionEvent::ProtectedEperm { session: None })
-                .notice
-                .is_some()
-        );
-        assert!(gate.is_spent());
-        assert!(
-            gate.note(AttentionEvent::ProtectedEperm { session: None })
-                .notice
-                .is_none()
-        );
-        let _ = gate.note(AttentionEvent::FdaPosture(FdaState::Granted));
-        assert!(!gate.is_spent(), "the move re-armed it");
-        assert!(
-            gate.note(AttentionEvent::ProtectedEperm { session: None })
-                .notice
-                .is_some(),
-            "and the next denial is news again"
-        );
-    }
-
     /// An instance-level denial (the warm-up) marks no tab — there is no session
     /// it belongs to — but it still notifies once.
     #[test]
@@ -2186,13 +2085,7 @@ mod tests {
             .note(AttentionEvent::ProtectedEperm { session: Some(1) })
             .notice
             .expect("a first denial notifies");
-        let mut flip = AttentionGate::new();
-        let _ = flip.note(AttentionEvent::FdaPosture(FdaState::Granted));
-        let posture = flip
-            .note(AttentionEvent::FdaPosture(FdaState::Denied))
-            .notice
-            .expect("a granted -> denied flip notifies");
-        for notice in [eperm, posture] {
+        for notice in [eperm] {
             let lower = notice.body.to_ascii_lowercase();
             for banned in ["restart", "relaunch", "reopen", "reboot", "next launch"] {
                 assert!(
@@ -2217,6 +2110,10 @@ mod tests {
     /// `log` is a ZSH BUILTIN that shadows `/usr/bin/log`, exits 0 and prints
     /// nothing — the artifact that produced a false "tccd is invisible"
     /// finding. The tool is named absolutely, here and nowhere else.
+    ///
+    /// Unix-only: `/usr/bin/log` is macOS's, and on Windows `Path::is_absolute`
+    /// wants a drive letter, so the absoluteness half cannot be asked there.
+    #[cfg(unix)]
     #[test]
     fn the_log_tool_is_named_absolutely() {
         assert_eq!(LOG_TOOL, "/usr/bin/log");

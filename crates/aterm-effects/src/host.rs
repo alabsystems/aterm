@@ -14,22 +14,16 @@
 //! Linux/Windows arms and the JS hosts (`aterm-wasm`, `aterm-gpu-web`).
 //!
 //! Two seams are deliberately NOT traits called from inside the frame: the
-//! durable Kitty Log (the favourite is an INPUT, sightings are EMITTED as
-//! [`FrameEvent::Sighting`] and the host records them) and entropy (the seed
-//! is a VALUE the host mints — `aterm_uds::rand` natively,
+//! durable Kitty Log (the favourite is an INPUT; sightings go back to the
+//! host, which records them) and entropy (the seed is a VALUE the host mints — `aterm_uds::rand` natively,
 //! `crypto.getRandomValues` on the page). The engine REQUESTS, the frontend
 //! PERFORMS.
 //!
-//! Phase 1 carries the resident pet. The Robi geometry on [`ChromeGeom`], the
-//! event roster and [`Provenance`] are declared now so Phase 5 grows the
-//! contract without renaming it.
+//! Phase 1 carries the resident pet.
 
 pub use aterm_time::Instant;
 
 use aterm_core::terminal::{BlockState, ShellState, Terminal};
-
-use crate::companion::CompanionRung;
-use crate::kitty_registry::KittyLook;
 
 /// The host's tri-state presentability — the pipeline's `set_effects_visibility`
 /// as a type: `Focused` (full profile), `VisibleUnfocused` (calm cap + drain),
@@ -40,17 +34,6 @@ pub enum Visibility {
     Focused,
     VisibleUnfocused,
     Hidden,
-}
-
-/// THE PROVENANCE LAW: only a TYPED witness may arm typing-reactive effects;
-/// `send`/paste are inert (`docs/INTROSPECTION.md`; the native app's law,
-/// restated at the web binding as *"movement without one is program output
-/// and stays dark"*). Declared here so Phase 5's `note_typed_edit` cannot be
-/// added without naming which side of the law a call sits on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Provenance {
-    Typed,
-    Injected,
 }
 
 /// `Present` ticks the live brain; `StaticCapture` selects
@@ -77,22 +60,6 @@ pub struct FrameGeom {
     pub origin_px: (i32, i32),
 }
 
-/// Chrome the effects need: `pad`/`head` (the pipeline's `set_chrome` law —
-/// `[head][pad][grid][pad]`), and — Phase 5 — the Robi geometry
-/// ([`crate::robi::RobiSense`]'s bar line, handholds and window clamp). Zero
-/// handholds = Robi off, which is what every web host passes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ChromeGeom {
-    pub pad: u16,
-    pub head: u16,
-    pub strip_px: u16,
-    pub win_top: i32,
-    pub win_bot: i32,
-    pub bar_y: i32,
-    pub handholds: [i32; crate::robi::MAX_HANDHOLDS],
-    pub handhold_count: u8,
-}
-
 /// Everything a host tells the engine for ONE frame.
 #[derive(Clone, Copy, Debug)]
 pub struct HostFrameInput {
@@ -108,7 +75,6 @@ pub struct HostFrameInput {
     /// The adaptive load-shed envelope `0..=1`. It attenuates trails and
     /// flying heads; the full resident retains its alpha and becomes static.
     pub shed_envelope: f32,
-    pub chrome: ChromeGeom,
     /// The pointer in FRAME px; `None` = it left the surface — or, for a host
     /// that pushes pointer events BETWEEN frames instead, "not fed with the
     /// frame". THE PRECEDENCE (`CompanionOwner::sense`): a `Some` here wins
@@ -118,8 +84,6 @@ pub struct HostFrameInput {
     /// setter from `note_pointer_px` and leaves this `None`.
     pub pointer_px: Option<(f32, f32)>,
     pub capture: CaptureMode,
-    /// The host has a live sink AND its focus/master policy allows sound.
-    pub sound_allowed: bool,
     pub geometry: FrameGeom,
 }
 
@@ -235,63 +199,15 @@ pub enum PressOutcome {
     RobiBubble = 3,
 }
 
-/// This frame's clickable bodies in FRAME px, `(x0, x1, y0, y1)` right/bottom
-/// exclusive — the pet's from its live drawn body offset by the frame origin.
-/// `None` = nothing drawn, which is what clears a stale hit target.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HitRects {
-    pub pet: Option<(i32, i32, i32, i32)>,
-    pub robi: Option<(i32, i32, i32, i32)>,
-    pub robi_bubble: Option<(i32, i32, i32, i32)>,
-}
-
-/// One scheduling verdict for the winit deadline fold and the wasm WF-1 gate.
-/// `Frames` == `is_active()` (a frame-cadence lane); `At` == `next_deadline_ms()`
-/// (an exact engine wake); `Idle` == 0% idle.
+/// One scheduling verdict: `Frames` == `is_active()` (a frame-cadence lane);
+/// `At` == `next_deadline_ms()` (an exact engine wake); `Idle` == 0% idle.
+/// The pipeline tests read the two predicates through it.
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 pub enum Wake {
     Frames,
     At(Instant),
     Idle,
-}
-
-/// Where a kitty sighting came from — the Kitty Log's two provenances. Typed
-/// sightings may present a discovery; ambient ones (grid-scanned OUTPUT
-/// text — `cat` in a man page) count and collect only.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SightingSource {
-    Typed,
-    Ambient,
-}
-
-/// What the engine EMITS for the host's ledgers and chrome. The engine only
-/// emits; the host records (Kitty Log), draws (the Robi tip bubble is chrome)
-/// or persists (a Robi dismissal is a settings write).
-#[derive(Clone, Copy, Debug)]
-pub enum FrameEvent {
-    CompanionArrived {
-        look: KittyLook,
-        rung: CompanionRung,
-    },
-    PetPetted,
-    DogSummoned,
-    RobiTip {
-        index: u16,
-    },
-    RobiDismissed,
-    Sighting {
-        look: KittyLook,
-        source: SightingSource,
-    },
-}
-
-/// What one frame hands back: the overlay fingerprint the host folds into
-/// its repaint key, the scheduling verdict, and the clickable bodies.
-#[derive(Clone, Copy, Debug)]
-pub struct HostFrameOutput {
-    pub fp: u64,
-    pub wake: Wake,
-    pub hit: HitRects,
 }
 
 #[cfg(test)]
@@ -366,8 +282,5 @@ mod tests {
         assert_eq!(PressOutcome::Pet as u8, 1);
         assert_eq!(PressOutcome::Robi as u8, 2);
         assert_eq!(PressOutcome::RobiBubble as u8, 3);
-        let chrome = ChromeGeom::default();
-        assert_eq!(chrome.handhold_count, 0, "zero handholds = Robi off");
-        assert!(HitRects::default().pet.is_none());
     }
 }

@@ -63,16 +63,6 @@ fn mode_ordering_matches_tla_encoding() {
         (mode_a >= mode_b) == (a >= b),
         "mode ordering must match TLA+ numeric encoding",
     );
-    // at_least() must agree
-    kani::assert(
-        mode_a.at_least(mode_b) == (a >= b),
-        "at_least must match numeric comparison",
-    );
-    // below() must agree
-    kani::assert(
-        mode_a.below(mode_b) == (a < b),
-        "below must match numeric comparison",
-    );
 }
 
 // -----------------------------------------------------------------------

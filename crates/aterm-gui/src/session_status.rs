@@ -70,6 +70,24 @@ pub(crate) fn screen_agent_frame(t: &Terminal, tail_rows: usize) -> (u64, Vec<St
 /// change that keeps the group — an `exec` in place (`cd ~/ay && exec
 /// claude` replaces the shell without a new process group).
 pub(crate) const PROGRAM_RECHECK: Duration = Duration::from_secs(5);
+/// One short confirmation after a newly named non-agent foreground program:
+/// an interpreter can still be in the same-PGID exec window before Claude.
+const PROGRAM_NAME_CONFIRM: Duration = Duration::from_millis(500);
+/// After the first confirmation, a later screen move owns a single delayed
+/// recheck. Four seconds from the last request keeps the total first-group
+/// bound below five seconds without polling a stable named screen.
+const PROGRAM_NAMED_RECHECK_FLOOR: Duration = Duration::from_secs(4);
+
+/// A failed first process-table read must not leave a still Claude screen
+/// unnamed forever. Retry promptly once, then back off to the ordinary
+/// five-second cadence when process inspection stays unavailable.
+fn unresolved_program_recheck(attempts: u8) -> Duration {
+    match attempts {
+        0 | 1 => Duration::from_millis(250),
+        2 => Duration::from_secs(1),
+        _ => PROGRAM_RECHECK,
+    }
+}
 
 /// FNV-1a 64 over the classified rows, `\n`-joined: the live-zone hash the
 /// agent verdict is re-derived on (a changed content seq over an unchanged
@@ -109,10 +127,20 @@ struct AgentWatch {
     pgid: i32,
     /// When a program resolution was last requested for this session.
     resolved_at: Option<Instant>,
-    /// The foreground group in which Claude's composer frame identified the
-    /// session: it stays an agent until that group leaves the foreground (an
-    /// approval box hides the frame, and must not un-identify it).
-    frame_pgid: Option<i32>,
+    /// Requests in this foreground group, capped at three. The cap makes the
+    /// unresolved retry cadence 250 ms, then 1 s, then 5 s indefinitely.
+    resolve_attempts: u8,
+    /// Deadline owned by a newly seen non-agent name or a later screen move.
+    /// A transient `sh` can become Claude without another screen change.
+    deferred_name_recheck_at: Option<Instant>,
+    /// The initial short confirmation ran; later screen moves use the slower
+    /// named-program floor instead of rearming a 500 ms probe per frame.
+    name_confirmed: bool,
+    /// The foreground group in which the agent's own screen identified the
+    /// session, and the agent it identified (Claude Code by its frame, Codex
+    /// by its composer): it stays that agent until the group leaves the
+    /// foreground (a box hides the composer, and must not un-identify it).
+    frame: Option<(i32, aterm_phase::Program)>,
     /// The published reading (`None` = not an identified agent).
     reading: Option<crate::presence::AgentReading>,
     /// [`StatusObserver::agent_seq`] when `reading` last changed.
@@ -861,6 +889,32 @@ const KEYWORD_OPENERS: [&str; 6] = ["for", "while", "if", "until", "case", "{"];
 /// (`'claude'`, `(for`, `claude)`): trimmed before any word is read.
 const WORD_TRIM: [char; 8] = ['\'', '"', '`', ';', '(', ')', '&', '|'];
 
+/// `env`'s split-string flag — `-S`, a short cluster holding it after env's
+/// value-less letters (`-vS`, `-iS`), `--split-string` — hands env ONE string
+/// that env splits into the program and ITS arguments (`env -S 'claude
+/// --resume /secret/tok'` runs `claude`). The program is that string's first
+/// word, never the string's basename, which is whatever follows its last `/`:
+/// an argument's (the skeptic's third review of the D3 fix read `tok` there).
+/// `Some(Some(s))`: the string is attached to the flag (`-Snode …`,
+/// `--split-string=…`); `Some(None)`: it is the next word; `None`: not the
+/// flag.
+fn env_split_string(flag: &str) -> Option<Option<&str>> {
+    if let Some(rest) = flag.strip_prefix("--split-string") {
+        return match rest.strip_prefix('=') {
+            Some(attached) => Some(Some(attached)),
+            None => rest.is_empty().then_some(None),
+        };
+    }
+    let cluster = flag.strip_prefix('-').filter(|c| !c.starts_with('-'))?;
+    let at = cluster.find('S')?;
+    // Letters before `S` must take no value of their own (`-uS` unsets `S`).
+    if !cluster[..at].chars().all(|c| matches!(c, 'i' | 'v' | '0')) {
+        return None;
+    }
+    let attached = &cluster[at + 1..];
+    Some((!attached.is_empty()).then_some(attached))
+}
+
 /// `FOO=1` in front of a program: environment, not the program.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
@@ -875,8 +929,7 @@ fn is_assignment(word: &str) -> bool {
 /// [`command_detail`] reads the program from; here it says whether a segment
 /// opens a compound command.
 fn leading_word(segment: &str) -> Option<&str> {
-    let mut words = segment
-        .split_whitespace()
+    let mut words = shell_words(segment)
         .map(|w| w.trim_matches(WORD_TRIM))
         .filter(|w| !is_assignment(w) && (*w == "{" || w.chars().any(char::is_alphanumeric)))
         .peekable();
@@ -898,6 +951,85 @@ fn leading_word(segment: &str) -> Option<&str> {
     words.next()
 }
 
+/// `segment` cut into its WORDS where the shell cuts them: at whitespace
+/// outside quotes. A single- or double-quoted stretch, and a character behind a
+/// backslash, belong to the word they sit in — so a program at a path with a
+/// space is ONE word:
+/// `'/Users//me/Library/Application Support/aterm/pkg/agents/claude' --resume x`,
+/// the shape of the line the harness's live upgrade relaunches Claude Code
+/// with, is that path and two arguments, never `/Users//me/Library/Application`
+/// followed by `Support/…/claude'` (the live E2E of 2026-09-26 read
+/// `detail=Application` for every session the upgrade moved onto the managed
+/// store). Each word is a borrowed slice of `segment` with its quotes and
+/// backslashes still in it — nothing is copied: [`command_detail`]'s `clean`
+/// trims the quotes off a word's ends, and its `basename` takes the program's
+/// name from after the last `/`, past any quoted or escaped space in a
+/// directory.
+///
+/// A quote that joins words is also the way ARGUMENTS reach the program's
+/// word when the line is not quoted the way this reads it, and whatever
+/// follows the last `/` of that word is what `detail=` would publish — so a
+/// word ends at the FIRST place either of two readings ends it ([`word_end`]):
+/// the POSIX one (a backslash inside single quotes is literal: `'\''`), and
+/// fish's (and bash's `$'…'`), where `\'` inside single quotes is a quote
+/// character that does not close them —
+/// the harness's own fish relaunch line quotes `/Users//o'neil/…/claude` as
+/// `'/Users//o\'neil/…/claude'`, which the POSIX reading runs on into the
+/// session id. A reading that ends with a quote still open (`don't --token
+/// x`, a scrape cut mid-word, or `don't '/secret/tok'`, where the argument's
+/// opening quote closes the program's apostrophe and the word runs through the
+/// argument) ends the word at its FIRST whitespace, quoted or not — the one
+/// end that no pairing of the quotes can move into an argument.
+/// Backticks and `$(…)` are not tracked, as before.
+fn shell_words(segment: &str) -> impl Iterator<Item = &str> {
+    let mut rest = 0;
+    std::iter::from_fn(move || {
+        let start = rest + segment[rest..].find(|c: char| !c.is_whitespace())?;
+        let end = word_end(segment, start, false).min(word_end(segment, start, true));
+        rest = end;
+        Some(&segment[start..end])
+    })
+}
+
+/// Where the word that opens at byte `start` of `segment` ends, read by ONE
+/// quoting dialect: `escape_in_single` is fish's (and `$'…'`'s) reading, in
+/// which a backslash inside single quotes escapes the next character, and
+/// POSIX's when false. The end is the first whitespace outside quotes, or the
+/// segment's end — unless a quote is still open there, when the word ends at
+/// the first whitespace after `start`, quoted or escaped or not (the segment's
+/// end if there is none). Not the first whitespace after the quote that is
+/// open at the end: that quote may be an argument's, with the program's
+/// apostrophe closed by the argument's opening quote (`don't '/secret/tok'`),
+/// so the stretch before it is already argument text. [`shell_words`] takes
+/// the nearer end of the two readings.
+fn word_end(segment: &str, start: usize, escape_in_single: bool) -> usize {
+    let mut quote: Option<char> = None;
+    let mut chars = segment[start..].char_indices();
+    while let Some((offset, c)) = chars.next() {
+        let at = start + offset;
+        match quote {
+            None if c.is_whitespace() => return at,
+            None if c == '\'' || c == '"' => quote = Some(c),
+            Some(q) if c == q => quote = None,
+            _ => {}
+        }
+        if c == '\\' && (escape_in_single || quote != Some('\'')) {
+            chars.next();
+        }
+    }
+    if quote.is_none() {
+        return segment.len();
+    }
+    // A quote is still open, so this reading paired the line's quotes wrongly
+    // somewhere — and the pair it got wrong may be the program's apostrophe
+    // with the ARGUMENT's opening quote (`don't '/secret/tok'`), which runs
+    // the word through that argument. The word's first whitespace is the one
+    // end no mispairing can move past the program's own text.
+    segment[start..]
+        .find(char::is_whitespace)
+        .map_or(segment.len(), |offset| start + offset)
+}
+
 /// The most a `detail=` may say about a command line: the program's basename,
 /// plus its first subcommand when that word is in the program's CLOSED
 /// vocabulary ([`SUBCOMMANDS`]) — never an argument. This is the RFC §4 privacy
@@ -916,7 +1048,20 @@ fn leading_word(segment: &str) -> Option<&str> {
 /// are skipped and one wrapper (`sudo`/`env`/`time`/`nice`/`exec`/…, matched by
 /// its basename, so `/usr/bin/env` is `env`) is unwrapped, so `FOO=1 sudo -u me
 /// targo --unverified test -p x` still reads `targo test` and `exec claude
-/// --resume` reads `claude`. Empty or whitespace input is `None`.
+/// --resume` reads `claude`. Empty or whitespace input is `None`. A WORD is the
+/// shell's ([`shell_words`]): a quoted or backslash-escaped space is part of
+/// it, so a program at a path with a space reads its own name —
+/// `'/Users//me/Library/Application Support/aterm/pkg/agents/claude' --resume x`
+/// is `claude`, never `Application`. The published name never holds
+/// whitespace: it ends at the first one (`"/opt/My App/My App"` is `My`), and
+/// a word ends wherever a POSIX or a fish reading of the quotes ends it, and
+/// at its own first whitespace when a reading leaves a quote open — so a line
+/// quoted in a way this does not read (`don't --token x`, `don't
+/// '/secret/tok'`, fish's `'/Users//o\'neil/bin/claude' '--resume' 'id'`)
+/// still reads a name from the program's word, never text from an argument.
+/// `env -S '<program> <args>'` (and `--split-string`) hands env one string it
+/// splits itself, so the program — and a subcommand from the closed list — is
+/// read from that string's words ([`env_split_string`]).
 ///
 /// A COMPOUND command line names the program of the segment that is RUNNING,
 /// not the word the line happens to open with — measured: `cd ~/ay && claude`
@@ -988,8 +1133,7 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
         .map(|(_, text)| *text)
         .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&w)))
         .unwrap_or_else(|| running_segment(cmdline, &segments));
-    let mut words = segment
-        .split_whitespace()
+    let mut words = shell_words(segment)
         .map(clean)
         .filter(|w| !w.is_empty())
         .peekable();
@@ -1006,18 +1150,47 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     // Every word in the program slot is reduced to its BASENAME before it is
     // looked at, the wrapper included: a shell that reports `/usr/bin/env
     // FOO=1 codex` names the same wrapper as `env FOO=1 codex`, and comparing
-    // the full path would leave the `env` in place as the "program".
+    // the full path would leave the `env` in place as the "program". The
+    // basename is what follows the last `/` (or `\`, save one that escapes a
+    // space: `my\ tool`), and only up to its first whitespace: a word may hold
+    // a quoted or escaped space, and a program's name is never published with
+    // one — `"/opt/My App/My App"` is `My`, and no reading of a line that
+    // [`shell_words`] got wrong can carry an argument out behind the name.
     fn basename(word: &str) -> Option<&str> {
-        word.rsplit(['/', '\\'])
+        let mut from = 0;
+        let mut chars = word.char_indices().peekable();
+        while let Some((at, c)) = chars.next() {
+            let escapes_space = c == '\\' && chars.peek().is_some_and(|(_, n)| n.is_whitespace());
+            if c == '/' || (c == '\\' && !escapes_space) {
+                from = at + c.len_utf8();
+            }
+        }
+        word[from..]
+            .split_whitespace()
             .next()
-            .filter(|base| !base.is_empty())
+            .map(|name| name.trim_end_matches('\\').trim_matches(WORD_TRIM))
+            .filter(|name| !name.is_empty())
     }
     let mut program_word = words.next()?;
+    // `env -S '<program> <args>'`: the one string env splits ([`env_split_string`]).
+    let mut split: Option<String> = None;
     if WRAPPERS.contains(&basename(&program_word)?) {
+        let env = basename(&program_word) == Some("env");
         // Unwrap one level: skip the wrapper's own flags (and the value a
         // value-taking flag consumes), then any assignments `env` carries.
         while let Some(next) = words.peek() {
-            if WRAPPER_FLAGS_WITH_VALUE.contains(&next.as_ref()) {
+            let split_flag = env
+                .then(|| env_split_string(next))
+                .flatten()
+                .map(|attached| attached.map(str::to_string));
+            if let Some(attached) = split_flag {
+                words.next();
+                split = match attached {
+                    Some(attached) => Some(attached),
+                    None => Some(words.next()?.into_owned()),
+                };
+                break;
+            } else if WRAPPER_FLAGS_WITH_VALUE.contains(&next.as_ref()) {
                 words.next();
                 words.next();
             } else if next.starts_with('-') || is_assignment(next) {
@@ -1026,10 +1199,24 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
                 break;
             }
         }
-        program_word = words.next()?;
+        if split.is_none() {
+            program_word = words.next()?;
+        }
     }
-
-    let program = basename(&program_word)?;
+    // The split string's words past its program stand where the line's
+    // would for the subcommand below; env's own options and assignments may
+    // open the string (`-S '-i FOO=1 node x'`).
+    let split_words = split.as_deref().map(|string| {
+        string
+            .split_whitespace()
+            .map(|w| w.trim_matches(WORD_TRIM))
+            .filter(|w| !w.is_empty() && !w.starts_with('-') && !is_assignment(w))
+            .collect::<Vec<_>>()
+    });
+    let program = match &split_words {
+        Some(split_words) => basename(split_words.first()?)?,
+        None => basename(&program_word)?,
+    };
     // Bound before allocating too: truncating an owned long token would keep
     // its entire command-sized capacity in the published status record.
     let program_end = program
@@ -1048,7 +1235,10 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
         // that spells a list word taken as the subcommand). Wrong either way,
         // never an argument: nothing outside the closed list can follow the
         // program on the wire.
-        let sub = words.find(|w| !w.starts_with('-'));
+        let sub = match &split_words {
+            Some(split_words) => split_words.get(1).map(|w| std::borrow::Cow::Borrowed(*w)),
+            None => words.find(|w| !w.starts_with('-')),
+        };
         if let Some(sub) = sub.filter(|s| vocabulary.contains(&s.as_ref())) {
             detail.push(' ');
             detail.push_str(&sub);
@@ -1515,6 +1705,16 @@ pub(crate) struct StatusObserver {
     agent_cleared_at: u64,
     /// Names a foreground group's program off the event loop.
     programs: program::ProgramResolver,
+    /// THE INPUT WATCH (2026-09-24): which sessions have input their program
+    /// has not read, and the stall published for each
+    /// ([`crate::input_stall::InputWatches`]). Not part of the `tab_status`
+    /// subsystem — [`Self::clear`] leaves it alone, because a published stall
+    /// is also a server attention entry that only its own probe may clear.
+    pub(crate) inputs: crate::input_stall::InputWatches,
+    /// When each Claude Code session's footer facts were last asked for, so a
+    /// sweep at the classification rate asks at most every
+    /// [`crate::claude_footer::RECHECK`].
+    footer_asked: std::collections::HashMap<u64, Instant>,
 }
 
 #[derive(Debug)]
@@ -1549,7 +1749,57 @@ impl StatusObserver {
             agent_seq: 0,
             agent_cleared_at: 0,
             programs: program::ProgramResolver::default(),
+            inputs: crate::input_stall::InputWatches::default(),
+            footer_asked: std::collections::HashMap::new(),
         }
+    }
+
+    /// Ask for `session`'s footer facts when Claude Code is the program in
+    /// front and the last ask is at least [`crate::claude_footer::RECHECK`]
+    /// old. The answer arrives on the resolver thread; a change wakes the loop.
+    pub(crate) fn request_footer_if_due(
+        &mut self,
+        session: u64,
+        timeline: &std::sync::Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
+        program: Option<&str>,
+        pgid: i32,
+        now: Instant,
+    ) {
+        if program != Some("claude") || pgid <= 0 {
+            return;
+        }
+        let due = self.footer_asked.get(&session).is_none_or(|asked| {
+            now.saturating_duration_since(*asked) >= crate::claude_footer::RECHECK
+        });
+        if due {
+            self.footer_asked.insert(session, now);
+            crate::claude_footer::request(session, timeline, pgid);
+        }
+    }
+
+    /// Session `session`'s published input stall, if any.
+    pub(crate) fn input_stall(&self, session: u64) -> Option<&crate::input_stall::InputStallFact> {
+        self.inputs.published(session)
+    }
+
+    /// Whether session `session`'s input is being watched — its output wakes
+    /// then probe it (at most every `input_stall::PROBE_MIN_GAP`).
+    pub(crate) fn input_armed(&self, session: u64) -> bool {
+        self.inputs.armed(session)
+    }
+
+    /// Stop watching `session`'s input; returns the stall it had published.
+    pub(crate) fn forget_input(
+        &mut self,
+        session: u64,
+    ) -> Option<crate::input_stall::InputStallFact> {
+        self.inputs.forget(session)
+    }
+
+    /// The input watch's earliest deadline (`DeadlineOwner::InputWatch`);
+    /// `None` on a machine with no unread input, which arms nothing.
+    pub(crate) fn next_input_wake(&self) -> Option<Instant> {
+        self.inputs.next_wake()
     }
 
     /// Could ANY known session be past its deadline right now? The O(1) half of
@@ -1634,6 +1884,9 @@ impl StatusObserver {
         };
         let due = now + self.min_interval;
         slot.next_due = due;
+        // What the refused look would have read is owed at the next due
+        // instant — the PTY reader holding the lock is output arriving.
+        self.note_output(session);
         // Same LOWER-bound fold as `observe`; `note_swept` restores exactness.
         self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
     }
@@ -1719,11 +1972,32 @@ impl StatusObserver {
         // is looked at once more at its next due instant, so the frame an
         // agent drew last (an approval box, then silence) is read within one
         // interval. It re-arms only while the content keeps moving.
-        let followup = self
+        let agent_wake = self
             .agents
             .iter()
-            .filter(|(_, w)| w.followup)
-            .filter_map(|(id, _)| self.sessions.get(id).map(|slot| slot.next_due))
+            .filter_map(|(id, w)| {
+                let slot = self.sessions.get(id)?;
+                let followup = w.followup.then_some(slot.next_due);
+                // A missing argv[0] can be transient (a group just exec'd).
+                // An unchanged screen cannot cause another request itself,
+                // so this deadline is the only route to a retry. The slot's
+                // observation floor prevents a past deadline from spinning.
+                let unresolved = if w.pgid > 0 && w.program_seen == Some(None) {
+                    w.resolved_at.map(|at| {
+                        (at + unresolved_program_recheck(w.resolve_attempts)).max(slot.next_due)
+                    })
+                } else {
+                    None
+                };
+                let confirmation = w
+                    .deferred_name_recheck_at
+                    .filter(|_| w.pgid > 0)
+                    .map(|at| at.max(slot.next_due));
+                [followup, unresolved, confirmation]
+                    .into_iter()
+                    .flatten()
+                    .min()
+            })
             .min();
         let owed = self
             .sessions
@@ -1741,9 +2015,22 @@ impl StatusObserver {
                 slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
             })
             .min();
-        match (owed, followup) {
+        match (owed, agent_wake) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
+        }
+    }
+
+    /// The resolver finished after this session's ordinary one-interval
+    /// follow-up. Arm one more observation at the slot's existing floor; the
+    /// worker never takes the terminal lock and posts only when the timeline's
+    /// current foreground program actually changed. A retired session is a
+    /// no-op. This is a level, so a burst of completions still owns one wake.
+    pub(crate) fn note_program_answered(&mut self, session: u64) {
+        if self.sessions.contains_key(&session)
+            && let Some(watch) = self.agents.get_mut(&session)
+        {
+            watch.followup = true;
         }
     }
 
@@ -1762,6 +2049,22 @@ impl StatusObserver {
         match self.agents.get(&session) {
             Some(w) if w.reading_seq > 0 => (w.reading_seq, w.reading.clone()),
             _ => (self.agent_cleared_at, None),
+        }
+    }
+
+    /// OUTPUT ARRIVED for `session` (the output wake, before its sweep): its
+    /// agent verdict owes a look at the next due instant. A sweep that looks
+    /// now answers for itself (its look sets the follow-up from what it
+    /// read); one that cannot — the session not due yet, the whole sweep
+    /// gated, the terminal contended — leaves this armed, so the FINAL frame
+    /// of a burst that landed between looks is read within one interval,
+    /// never at whatever unrelated deadline comes next (a box answered and a
+    /// static busy screen drawn read `agent=prompt` for seconds; an exited
+    /// agent's shell prompt left `program=claude` standing). No poll: one
+    /// deadline, armed by the output itself.
+    pub(crate) fn note_output(&mut self, session: u64) {
+        if let Some(w) = self.agents.get_mut(&session) {
+            w.followup = true;
         }
     }
 
@@ -1819,40 +2122,109 @@ impl StatusObserver {
             pgid: -1,
             ..AgentWatch::default()
         });
-        if w.pgid != pgid {
+        let group_moved = w.pgid != pgid;
+        // THE GROUP MOVED since the last look (from one this watch saw): the
+        // `program` — read from the timeline under the terminal guard, before
+        // this sweep's `note_foreground_group` forgot it — names the group
+        // that LEFT. The zone is judged under no name (a group still being
+        // named identifies nothing), never under the departed agent's: its
+        // last frame, read by Claude Code's reader, published the departed
+        // agent's reader again, and the in-GUI host went on seeing an agent
+        // that had exited until a later look (the relaunch missed exits that
+        // way). A first look (`-1`: no group seen yet) takes the name as read.
+        let program = if w.pgid > 0 && group_moved {
+            None
+        } else {
+            program
+        };
+        if group_moved {
             w.pgid = pgid;
-            if w.frame_pgid != Some(pgid) {
-                w.frame_pgid = None;
+            w.deferred_name_recheck_at = None;
+            w.name_confirmed = false;
+            if w.frame.is_some_and(|(g, _)| g != pgid) {
+                w.frame = None;
             }
         }
         let program_moved = w.program_seen.as_ref() != Some(&program);
+        let screen_moved = w.seq_seen != Some(generation);
+        if let Some(name) = program.as_deref() {
+            // A later exec in this SAME group can make the next lookup miss.
+            // Once this name is known, that is a fresh retry episode.
+            w.resolve_attempts = 0;
+            // App can carry the OLD group's program on the group-change
+            // sweep. Only a later observation of this group can arm a name
+            // confirmation. After one confirmation, a NEW screen movement
+            // arms one later recheck even if this frame then stays forever.
+            // A moving screen cannot cause process-table polling faster than
+            // the four-second floor once the first confirmation has run.
+            let recognized_agent = aterm_phase::program_of(name).is_some();
+            if pgid > 0
+                && !group_moved
+                && !resolving
+                && w.deferred_name_recheck_at.is_none()
+                && !recognized_agent
+                && (!w.name_confirmed || screen_moved || program_moved)
+            {
+                let floor = if w.name_confirmed {
+                    PROGRAM_NAMED_RECHECK_FLOOR
+                } else {
+                    PROGRAM_NAME_CONFIRM
+                };
+                let since_request = w.resolved_at.map_or(now, |at| at + floor);
+                w.deferred_name_recheck_at = Some((now + PROGRAM_NAME_CONFIRM).max(since_request));
+            }
+            if recognized_agent {
+                // Once the name itself identifies Claude/Codex, a remaining
+                // non-agent confirmation would only waste a process lookup.
+                w.deferred_name_recheck_at = None;
+                if !group_moved && !resolving {
+                    w.name_confirmed = true;
+                }
+            }
+        } else {
+            // A named group's confirmation is irrelevant once the resolver
+            // has lost its name. The bounded unknown-name retry owns it now.
+            w.deferred_name_recheck_at = None;
+            w.name_confirmed = false;
+        }
         let Some(rows) = rows else {
             // Not read this time (unchanged, or deferred by the floor): look
             // again next interval if anything is still owed — a moved seq or
             // program, or a resolution in flight whose answer is not yet read.
-            w.followup = resolving || program_moved || w.seq_seen != Some(generation);
+            w.followup = resolving || program_moved || screen_moved;
             return AgentStep::default();
         };
-        let moved = w.seq_seen != Some(generation);
+        let moved = screen_moved;
         w.seq_seen = Some(generation);
         w.followup = moved || resolving;
-        let hash = zone_hash(&rows);
+        // The zone the verdict reads ([`crate::presence::live_zone`]): a box
+        // drawn above the last rows of a mostly blank pane moves it.
+        let hash = zone_hash(crate::presence::live_zone(&rows));
         if w.zone_hash == Some(hash) && !program_moved {
             return AgentStep::default();
         }
         w.zone_hash = Some(hash);
         w.program_seen = Some(program.clone());
         w.classified_at = Some(now);
-        let known = w.frame_pgid == Some(pgid);
+        let known = w.frame.filter(|(g, _)| *g == pgid).map(|(_, p)| p);
         // A foreground group with no name yet: the resolver is naming it.
         let pending = program.is_none() && pgid > 0;
-        let verdict =
-            crate::presence::agent_verdict(program.as_deref(), pending, known, &rows, now);
-        if matches!(
-            verdict,
-            crate::presence::AgentVerdict::Agent { by_frame: true, .. }
-        ) {
-            w.frame_pgid = Some(pgid);
+        // Behind the reader's panic fence: this runs on the window's thread.
+        let verdict = crate::presence::agent_verdict_guarded(
+            session,
+            program.as_deref(),
+            pending,
+            known,
+            &rows,
+            now,
+        );
+        if let crate::presence::AgentVerdict::Agent {
+            by_frame: true,
+            program,
+            ..
+        } = &verdict
+        {
+            w.frame = Some((pgid, *program));
         }
         let reading = verdict.reading().cloned();
         let reading_changed = reading != w.reading;
@@ -1871,13 +2243,16 @@ impl StatusObserver {
     }
 
     /// Whether `session`'s foreground program should be (re-)named now: its
-    /// group just changed (`group_changed`), or the screen moved and the last
-    /// naming is older than [`PROGRAM_RECHECK`] (an `exec` in place). Call
-    /// before [`Self::agent_observe`], which records the generation.
+    /// group just changed (`group_changed`), an unknown name has reached its
+    /// bounded retry deadline, a one-shot known-name confirmation is due, or
+    /// the screen moved and the last naming is older than [`PROGRAM_RECHECK`]
+    /// (an `exec` in place). Call before
+    /// [`Self::agent_observe`], which records the generation.
     pub(crate) fn program_due(
         &self,
         session: u64,
         group_changed: bool,
+        program: Option<&str>,
         generation: crate::control::ScreenGen,
         now: Instant,
     ) -> bool {
@@ -1885,24 +2260,55 @@ impl StatusObserver {
             return true;
         }
         self.agents.get(&session).is_some_and(|w| {
-            w.seq_seen != Some(generation)
-                && w.resolved_at
-                    .is_some_and(|at| now.saturating_duration_since(at) >= PROGRAM_RECHECK)
+            let confirmation_due = program.is_some_and(|p| aterm_phase::program_of(p).is_none())
+                && w.pgid > 0
+                && w.deferred_name_recheck_at.is_some_and(|at| now >= at);
+            confirmation_due
+                || w.resolved_at.is_some_and(|at| {
+                    let age = now.saturating_duration_since(at);
+                    (program.is_none()
+                        && w.pgid > 0
+                        && age >= unresolved_program_recheck(w.resolve_attempts))
+                        || (w.seq_seen != Some(generation) && age >= PROGRAM_RECHECK)
+                })
         })
     }
 
+    /// Charge one resolver request and advance its bounded retry episode. The
+    /// App path has already created an `AgentWatch` via `agent_zone_wanted`;
+    /// `entry` also makes this helper safe for a caller that has not done so.
+    fn note_program_request(&mut self, session: u64, pgid: i32, now: Instant) {
+        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
+            pgid: -1,
+            ..AgentWatch::default()
+        });
+        if w.pgid != pgid {
+            w.resolve_attempts = 0;
+            w.deferred_name_recheck_at = None;
+            w.name_confirmed = false;
+        } else if w.deferred_name_recheck_at.take().is_some() {
+            // A confirmation was requested. Its next screen movement may
+            // schedule another, but only at the named-program floor.
+            w.name_confirmed = true;
+        }
+        w.resolved_at = Some(now);
+        w.resolve_attempts = w.resolve_attempts.saturating_add(1).min(3);
+    }
+
     /// Ask the resolver to name `pgid`'s leader into `timeline`, off-thread.
+    /// `shell` is the session's shell pid: a leader that is its direct child
+    /// also measures the shell's PATH (`program::leader_facts`).
     pub(crate) fn request_program(
         &mut self,
         session: u64,
         timeline: &std::sync::Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
         pgid: i32,
+        shell: i32,
         now: Instant,
+        proxy: Option<&winit::event_loop::EventLoopProxy<crate::Wake>>,
     ) {
-        if let Some(w) = self.agents.get_mut(&session) {
-            w.resolved_at = Some(now);
-        }
-        self.programs.request(timeline, pgid);
+        self.note_program_request(session, pgid, now);
+        self.programs.request(session, timeline, pgid, shell, proxy);
     }
 
     pub(crate) fn revision(&self, session: u64) -> u64 {
@@ -1932,6 +2338,9 @@ impl StatusObserver {
     /// process lifetime as tabs open and close.
     pub(crate) fn retire(&mut self, session: u64) {
         self.agents.remove(&session);
+        let _ = self.inputs.forget(session);
+        self.programs.retire(session);
+        self.footer_asked.remove(&session);
         if self.sessions.remove(&session).is_some() {
             // The removed slot may have BEEN the minimum, and a stale-early
             // bound would only cost a scan — but the exact value is one cheap
@@ -1981,6 +2390,7 @@ impl StatusObserver {
     pub(crate) fn clear(&mut self) -> bool {
         let had = !self.sessions.is_empty();
         self.sessions.clear();
+        self.programs.clear_pending();
         // The agent readings describe the same stopped subsystem: retire them
         // (presence folds the post-clear sequence as "no reading").
         self.agents.clear();
@@ -2100,7 +2510,11 @@ impl crate::App {
                 .session_status
                 .agent_zone_wanted(id, generation, &program, now)
                 .then(|| {
-                    let (fp, zone) = screen_agent_frame(&guard, crate::presence::CLASSIFY_ROWS);
+                    // The whole screen: the verdict reads its live zone (the
+                    // last CLASSIFY_ROWS of the content, `presence::live_zone`),
+                    // and the whole for a box the zone cuts
+                    // (`presence::agent_verdict`).
+                    let (fp, zone) = screen_agent_frame(&guard, usize::MAX);
                     let stamp = crate::session_timeline::AgentStamp { generation, fp };
                     (zone, stamp)
                 });
@@ -2195,13 +2609,53 @@ impl crate::App {
                     .unwrap_or_else(|p| p.into_inner())
                     .note_foreground_group(pgid);
             let resolve = pgid > 0
-                && self
-                    .session_status
-                    .program_due(id, group_changed, generation, now);
+                && self.session_status.program_due(
+                    id,
+                    group_changed,
+                    program.as_deref(),
+                    generation,
+                    now,
+                );
             if resolve {
-                self.session_status
-                    .request_program(id, &session.ctx.timeline, pgid, now);
+                self.session_status.request_program(
+                    id,
+                    &session.ctx.timeline,
+                    pgid,
+                    pid,
+                    now,
+                    self.proxy.as_ref(),
+                );
             }
+            // A LIVE PATH MEASUREMENT the registry's mark does not reflect yet
+            // (gap audit 2026-09-24): the mark is LOWERED, so `path=`, the
+            // handoff's carry and the managed-current count all read the
+            // measured fact — a healed shell stops reading frozen. Never
+            // RAISED by a measurement (review of 2026-09-25): the evidence is
+            // one job's exec environment, a `PATH=` override reads frozen, and
+            // the mark means "adopted from before this update". Owed once per
+            // live reading; a leaf lock, then the registry's write lock.
+            let lowered = session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take_path_lowered();
+            if lowered {
+                self.store
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clear_frozen_path(id);
+            }
+            // THE CLAUDE CODE FOOTER: the facts aterm paints over its
+            // permission-mode row, re-read at most every RECHECK while it is
+            // the program in front (`crate::claude_footer`).
+            self.session_status.request_footer_if_due(
+                id,
+                &session.ctx.timeline,
+                program.as_deref(),
+                pgid,
+                now,
+            );
             let step = self
                 .session_status
                 .agent_observe(id, generation, zone, program, pgid, resolve, now);
@@ -2332,7 +2786,20 @@ impl crate::App {
                 now,
             )
         } else {
-            self.session_status.clear()
+            // The Claude Code footer rides this sweep (its facts are keyed by
+            // the foreground group the sweep keeps current): with the sweep
+            // off, forget them, or the next Claude in a tab would be painted
+            // with the last one's model and branch (`crate::claude_footer`).
+            let mut footers = false;
+            for session in self.pool.iter() {
+                footers |= session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clear_claude_footer();
+            }
+            self.session_status.clear() || footers
         };
         // The badge switch changes no POLICY — it only decides whether a record
         // reaches chrome — so `reconfigure` cannot see it move. Track it here or
@@ -2543,7 +3010,7 @@ impl crate::App {
             return Err(format!("no such session {session}"));
         };
         let enabled = self.config.tab_status_or_default();
-        // FABRIC, additive (§11.2). `hold=` is this session's standing fleet halt
+        // FABRIC, additive (§11.2). `hold=` is this session's standing halt, local or fleet
         // — a driver polling `status` learns why its `send` will answer `ERR
         // halted` without a second round trip — and `fabric=` is the INSTANCE's
         // bridge state, which is the other half of the same question: a
@@ -2638,12 +3105,23 @@ impl crate::App {
         );
         // `integration=<on|off|degraded>`, from the same guard: whether this
         // session's OSC 133/633 marks can reach the engine. `degraded` = a
-        // nonce is required and none is authorized (an adopted shell whose
-        // handoff did not carry it), so `detail=` and blocks are dark — and
-        // `program=` below is how its program is still named.
+        // nonce is required and none is in use (an adopted shell whose handoff
+        // did not carry it, or one whose re-key waits for its next prompt —
+        // `shell_rekey`), so `detail=` and blocks are dark — and `program=`
+        // below is how its program is still named.
         let integration = term
             .as_deref()
             .map_or("-", |t| t.shell_integration_posture().as_str());
+        // …and which integration BODY the shell signs that it runs (2026-09-26,
+        // `shell_body`), from the same guard: the revision and the posture the
+        // `integration_rev=` word below is read from, with the registry's frozen
+        // mark.
+        let body = term.as_deref().map(|t| {
+            (
+                t.shell_integration_rev().map(str::to_owned),
+                t.shell_integration_posture(),
+            )
+        });
         drop(term);
         // `supervisor=<holder|->`: the live supervisor claim (`meta set
         // supervisor`), so a poll shows that something is answering this
@@ -2655,6 +3133,16 @@ impl crate::App {
             .unwrap_or_else(|p| p.into_inner())
             .live_supervisor(crate::metrics::now_us())
             .map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
+        // `input= input_bytes= input_wait_ms= fg_rss_mb=` (2026-09-24), after
+        // `integration=`: whether the program is READING its input, probed
+        // live — the fact a frozen program's unmoving screen cannot show
+        // ([`crate::input_stall::status_input`]). `-` off macOS or off a tty.
+        // Unread input with no watch looking wakes one.
+        let input = crate::input_stall::status_input(
+            &pooled.ctx.sink,
+            self.session_status.input_stall(session),
+            self.session_status.input_armed(session),
+        );
         // THE PROGRAM AND THE AGENT VERDICT (`program= agent= agent_detail=
         // agent_rev= agent_since_ms=`): the sweep's publication, read from the
         // session timeline — the same store the `sessions` row, `await agent`
@@ -2666,6 +3154,13 @@ impl crate::App {
             .unwrap_or_else(|p| p.into_inner())
             .agent()
             .wire_fields();
+        // `human_ms=<ms|->`, just after `supervisor=`: how long ago a PERSON
+        // last had a hand on this session through a window
+        // ([`crate::human_input`]; control verbs never stamp it), `-` for
+        // never — what a supervisor keeps its hands off for `[harness]
+        // human_grace_s`, and waits on before it keys a dialog a person may
+        // be navigating. One atomic load.
+        let human_ms = pooled.ctx.human_input.wire(crate::metrics::now_us());
         // THE TWO ADDITIVE FIELDS (design §5.2). Additive: `schema=1` does not
         // move. Computed after the terminal guard is released, from the cwd
         // that guard already produced.
@@ -2688,16 +3183,43 @@ impl crate::App {
         // sourced there. An UPPER BOUND — sourcing the hook is not reported back
         // — the same one the managed-current row's tab count is. One registry
         // read, no lock the poll did not already take elsewhere.
-        let path = if self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .has_frozen_path(session)
-        {
-            "frozen"
-        } else {
-            "live"
+        //
+        // `history_lost=<n>` (2026-09-26), from the same registry read, after
+        // the owner columns and before the `gen=`/`seq=`/`hash=` stamp: the
+        // history lines this session's update handoffs could not carry, over
+        // every handoff it crossed (`crate::handoff_history`) — `0` when every
+        // line crossed or it never crossed one. The one place the per-tab count
+        // is answerable; the band says the update's total once.
+        //
+        // `integration_rev=<current|stale:<rev>|frozen|->` (2026-09-26), from the
+        // same registry read and the terminal guard above, after `history_lost=`
+        // and before the stamp: which integration body the shell runs against
+        // the one this build ships (`shell_body::status_word`) — `frozen` for a
+        // shell adopted with an integration from before loaders, which no body
+        // pointer reaches.
+        let (mark, history_lost, integration_frozen) = {
+            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+            (
+                store.has_frozen_path(session),
+                store.history_lost(session),
+                store.is_integration_frozen(session),
+            )
         };
+        let integration_rev = crate::shell_body::status_word(
+            body.as_ref()
+                .map(|(rev, posture)| (rev.as_deref(), *posture)),
+            integration_frozen,
+        );
+        // `path=` MEASURED where it can be (2026-09-24): a reading of the
+        // shell's exported PATH from its child's environment wins over the
+        // carried mark, and `path_evidence=` says which it is; `copy=` and
+        // `upgrade=` ride after `supervisor=` ([`SessionTimeline::owner_columns`]).
+        let (path, owner) = pooled
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner_columns(mark, crate::upgrade_host::now_s());
         let Some(status) = self.session_status.status(session) else {
             // Never classified. Distinct from `phase=unknown`, which IS a
             // classification ("evidence was looked for and none was usable").
@@ -2710,7 +3232,8 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
                  identity={identity} {presence} path={path} {agent} integration={integration} \
-                 supervisor={supervisor} gen={generation} seq={seq} hash={hash}",
+                 {input} supervisor={supervisor} human_ms={human_ms} {owner} \
+                 history_lost={history_lost} integration_rev={integration_rev} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -2749,7 +3272,8 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
              identity={identity} {presence} path={path} {agent} integration={integration} \
-             supervisor={supervisor} gen={generation} seq={seq} hash={hash}",
+             {input} supervisor={supervisor} human_ms={human_ms} {owner} \
+             history_lost={history_lost} integration_rev={integration_rev} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3691,6 +4215,35 @@ mod tests {
         );
     }
 
+    /// THE INPUT FIELDS (2026-09-24): `input= input_bytes= input_wait_ms=
+    /// fg_rss_mb=` ride BOTH arms of the record, right after `integration=` and
+    /// right before `supervisor=`, and the stamp still rides last. A session
+    /// with no tty (every headless stub) has no reading: all four are `-`.
+    #[test]
+    fn the_status_record_carries_the_input_fields_before_supervisor() {
+        let mut app = crate::App::headless_for_test();
+        let fields = " input=- input_bytes=- input_wait_ms=- fg_rss_mb=- supervisor=";
+        let unobserved = app.session_status_record(0).expect("live session");
+        assert!(unobserved.contains(" observed=false "), "{unobserved}");
+        let observed = {
+            let mut ev = evidence(blank(1));
+            ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+            settle_observer(&mut app.session_status, 0, &ev, Instant::now());
+            app.session_status_record(0).expect("live session")
+        };
+        assert!(observed.contains(" observed=true "), "{observed}");
+        for record in [unobserved, observed] {
+            assert!(record.contains(fields), "{record}");
+            let integration = record.find(" integration=").expect("integration=");
+            let input = record.find(" input=").expect("input=");
+            assert!(
+                !record[integration + 1..input].contains(' '),
+                "input= follows integration=: {record}"
+            );
+            assert_stamp_rides_last(&record);
+        }
+    }
+
     /// The two ADDITIVE fabric fields (§11.2). They answer the question a driver
     /// asks right after `ERR halted`: is this session held, and is there a bridge
     /// alive to lift it? Both arrive on BOTH arms of the record — the unobserved
@@ -3718,6 +4271,17 @@ mod tests {
         // additive way, so the tail is no longer the end of the record.
         assert!(
             record.contains(" hand=- level=quiet story=0 why=- path=live program="),
+            "{record}"
+        );
+        // The person's stamp (2026-09-25): no person has keyed session 0,
+        // and the field rides after `supervisor=`; the owner's columns
+        // follow it, then the history this session's handoffs lost (none:
+        // it never crossed one, 2026-09-26), the integration its shell runs
+        // (none signed: `-`, 2026-09-26), then the screen's stamp.
+        assert!(
+            record.contains(
+                " supervisor=- human_ms=- path_evidence=- copy=- upgrade=- history_lost=0 integration_rev=- gen="
+            ),
             "{record}"
         );
         assert_stamp_rides_last(&record);
@@ -4525,6 +5089,13 @@ mod tests {
             ("targo --unverified test -p x", Some("targo test")),
             ("cargo build --release", Some("cargo build")),
             ("git status", Some("git status")),
+            // `env -S`'s one string: the subcommand is read from its words,
+            // from the closed list, and never an argument of it.
+            (
+                "env -S 'git status --porcelain /secret/repo'",
+                Some("git status"),
+            ),
+            ("env -S 'git /secret/tok'", Some("git")),
             // A flag's VALUE is never a subcommand: the program stands alone.
             // The value may look exactly like a subcommand (a bare identifier);
             // only vocabulary membership tells them apart, and a directory, a
@@ -4659,6 +5230,218 @@ mod tests {
         assert_eq!(command_detail(&wide), Some("終".repeat(48)));
         // A program name is never reported with a subcommand it does not own.
         assert_eq!(command_detail("claude commit").as_deref(), Some("claude"));
+    }
+
+    /// The live E2E's D3 (2026-09-26): once the harness's live upgrade had
+    /// relaunched Claude Code from the managed store — the line it types quotes
+    /// every word, `'…/Library/Application Support/aterm/pkg/agents/claude'
+    /// '--resume' …` — the tab's `status` read `detail=Application`. Words were
+    /// cut at EVERY space, quoted or not, so the program slot held the first
+    /// half of the path. A quoted or backslash-escaped space is part of its
+    /// word, as the shell reads it, so the detail is the program's name.
+    /// CONTROL: the same program at a path with no space reads as it always
+    /// did, and a quoted argument with spaces is still never the detail.
+    #[test]
+    fn a_program_at_a_path_with_spaces_reads_its_name() {
+        let store = "/Users//me/Library/Application Support/aterm/pkg/agents";
+        let relaunch = format!(
+            ". '/Users//me/.aterm/shell.d/00-atpkg.zsh'; rehash; '{store}/claude' \
+             '--dangerously-skip-permissions' '--resume' 'b87ea568-277e-4ba7-bbd2-f0ab8bd14d1c'"
+        );
+        let cases: &[(String, &str)] = &[
+            // The upgrade's relaunch line, verbatim in shape.
+            (relaunch, "claude"),
+            (format!("'{store}/claude' --resume x"), "claude"),
+            (format!("\"{store}/claude\" --resume x"), "claude"),
+            (
+                format!("{} --resume x", store.replace(' ', "\\ ") + "/claude"),
+                "claude",
+            ),
+            (format!("exec '{store}/claude'"), "claude"),
+            // A quoted assignment with a space is ONE assignment, skipped.
+            (format!("env 'FOO=a b' '{store}/codex' resume"), "codex"),
+            // CONTROL: no space anywhere in the path.
+            (
+                "/Users//me/.local/share/claude/versions/2.1.281 --resume x".to_string(),
+                "2.1.281",
+            ),
+            (
+                "'/Users//me/.local/bin/claude' --resume x".to_string(),
+                "claude",
+            ),
+            // CONTROL: an argument with spaces is an argument.
+            (
+                "claude -p 'fix the bug in Application Support'".to_string(),
+                "claude",
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(command_detail(cmd).as_deref(), Some(*want), "{cmd:?}");
+        }
+        // Through the one producer the `status` record reads, by both roads: a
+        // screen scrape of the typed line, and OSC 633;E's explicit line.
+        let line = format!("'{store}/claude' '--resume' 'x'");
+        let mut term = aterm_core::terminal::Terminal::new(24, 200);
+        term.process(format!("\x1b]133;A\x07$ \x1b]133;B\x07{line}\n\x1b]133;C\x07").as_bytes());
+        assert_eq!(
+            executing_detail(&term).as_deref(),
+            Some("claude"),
+            "scraped"
+        );
+        term.process(b"\x1b]133;D;0\x07");
+        term.process(
+            format!("\x1b]133;A\x07$ \x1b]633;E;{line}\x07\x1b]133;B\x07{line}\n\x1b]133;C\x07")
+                .as_bytes(),
+        );
+        assert_eq!(
+            executing_detail(&term).as_deref(),
+            Some("claude"),
+            "explicit"
+        );
+    }
+
+    /// The quote that lets a spaced path be ONE word (D3, above) must never
+    /// carry an ARGUMENT into `detail=` — "never an argument" is the privacy
+    /// rule, and splitting at every space kept it by construction. A line the
+    /// POSIX reading gets wrong ran its program's word on to the end of the
+    /// line, and `detail=` published whatever followed the word's last `/`:
+    /// measured on the first D3 fix, `$'/usr/local/bin/don\'t' --token
+    /// SECRET` read `'t' --token SECRET`, the harness's own fish quoting read
+    /// `claude' '--resume' 'b87ea568-…` (the session id), and `don't --token
+    /// SECRET` read the whole line. And ending a word at the first whitespace
+    /// after the LAST quote that opened still leaked when the argument's
+    /// opening quote closed the program's apostrophe: `don't '/secret/tok'`
+    /// read `tok`, `/Users//o'neil/bin/claude --resume '/secret/tok'` read
+    /// `tok`, `it's-a-script.sh --password 'x/hunter2'` read `hunter2`. So a
+    /// word ends where EITHER reading (POSIX, fish) ends it, a reading that
+    /// leaves a quote open ends the word at the word's own first whitespace,
+    /// and the published name ends at its first whitespace. CONTROL: the
+    /// managed copy's `Application Support` path, quoted every way a shell
+    /// quotes it, still reads `claude`, and `don't "/secret/tok"` — whose
+    /// double quotes sit inside the apostrophe's open quote, so the quote left
+    /// open is the program's own — read `don't` under both rules.
+    #[test]
+    fn a_misquoted_line_never_publishes_an_argument() {
+        let store = "Library/Application Support/aterm/pkg/agents/claude";
+        let cases: &[(String, &str)] = &[
+            // bash/zsh `$'…'`, where `\'` is a quote: POSIX reads the quote
+            // after `t` as opening one that never closes. What is read is a
+            // piece of the program's name (`don't`), never the argument.
+            (r"$'/usr/local/bin/don\'t' --token SECRET".into(), "t"),
+            // The harness's own fish quoting (`upgrade::quote`) of a home with
+            // an apostrophe: POSIX runs the program's word into the session id.
+            (
+                r"'/Users//o\'neil/bin/claude' '--resume' 'b87ea568-277e-4ba7-bbd2-f0ab8bd14d1c'"
+                    .into(),
+                "claude",
+            ),
+            // …and a line POSIX misreads with every quote closed, whose last
+            // `/` sits in an argument: no open quote to notice, only fish's
+            // nearer end.
+            (
+                r"'/Users//o\'neil/bin/claude' '--resume' '/secret/tok en'".into(),
+                "claude",
+            ),
+            // An apostrophe in a bare word opens a quote that never closes —
+            // and the rest of the line may hold a `/` of its own.
+            ("don't --token SECRET".into(), "don't"),
+            ("don't /secret/tok".into(), "don't"),
+            (
+                "it's-a-script.sh --password hunter2".into(),
+                "it's-a-script.sh",
+            ),
+            // …and the ARGUMENT's opening quote may close the program's
+            // apostrophe, running the word through the argument, with the
+            // line's last quote left open behind it. The word still ends at
+            // its first whitespace, so nothing past the program is read.
+            ("don't '/secret/tok'".into(), "don't"),
+            (
+                "it's-a-script.sh --password 'x/hunter2'".into(),
+                "it's-a-script.sh",
+            ),
+            ("don't --token '/secret/tok'".into(), "don't"),
+            (
+                "don't '--resume' '/Users//me/secret-session'".into(),
+                "don't",
+            ),
+            ("sudo don't '/secret/tok'".into(), "don't"),
+            ("o'neil-tool --token '/secret/tok'".into(), "o'neil-tool"),
+            (
+                "/Users//o'neil/bin/claude --resume '/secret/tok'".into(),
+                "claude",
+            ),
+            ("can't 'x' '/secret/tok'".into(), "can't"),
+            ("it's 'a' b '/secret/tok'".into(), "it's"),
+            // CONTROL: double quotes inside the apostrophe's open quote pair
+            // nothing, so the quote left open is the program's own.
+            ("don't \"/secret/tok\"".into(), "don't"),
+            // `env -S` hands env ONE string that env splits into the program
+            // and its arguments: the program is that string's first word,
+            // never its basename (the third review read `server.js`, `tok`,
+            // `notes.py`, `app.ts`).
+            (
+                "env -S \"node --inspect /Users//me/secret-project/server.js\"".into(),
+                "node",
+            ),
+            ("env -S 'claude --resume /secret/tok'".into(), "claude"),
+            (
+                "/usr/bin/env -S \"python3 /Users//me/private/notes.py --token x\"".into(),
+                "python3",
+            ),
+            (
+                "env --split-string 'deno run --allow-read /Users//me/secret/app.ts'".into(),
+                "deno",
+            ),
+            (
+                "env --split-string='deno run --allow-read /Users//me/secret/app.ts'".into(),
+                "deno",
+            ),
+            ("env -vS 'node /srv/secret/server.js'".into(), "node"),
+            ("env -S'node /srv/secret/server.js'".into(), "node"),
+            ("env -S '-i FOO=1 /usr/bin/node /srv/x.js'".into(), "node"),
+            // CONTROL: `-u` takes a value, so `-uS` unsets `S` and is no split.
+            ("env -uS /usr/bin/node /srv/x.js".into(), "node"),
+            // A space in the program's OWN name is never published.
+            (r"/Users//me/my\ tool --token SECRET".into(), "my"),
+            ("\"/opt/my tools/run me\" --token SECRET".into(), "run"),
+            // fish's quoting of the spaced store path under an apostrophe
+            // home: the readings disagree, the nearer end wins. A directory's
+            // name, never an argument (the cost of not knowing the dialect).
+            (
+                format!(r"'/Users//o\'neil/{store}' '--resume' 'SECRET'"),
+                "Application",
+            ),
+            // CONTROL: the managed copy's path, as POSIX, fish (no apostrophe:
+            // the same line), double quotes and backslashes write it.
+            (format!("'/Users//me/{store}' '--resume' 'SECRET'"), "claude"),
+            (
+                format!(r"'/Users//o'\''neil/{store}' '--resume' 'SECRET'"),
+                "claude",
+            ),
+            (format!("\"/Users//me/{store}\" --resume SECRET"), "claude"),
+            (
+                format!("/Users//me/{} --resume SECRET", store.replace(' ', r"\ ")),
+                "claude",
+            ),
+        ];
+        const ARGUMENTS: [&str; 7] = [
+            "SECRET", "token", "hunter2", "b87ea568", "resume", "secret", "tok",
+        ];
+        for (cmd, want) in cases {
+            let got = command_detail(cmd);
+            assert_eq!(got.as_deref(), Some(*want), "{cmd:?}");
+            let got = got.unwrap_or_default();
+            assert!(
+                !got.contains(char::is_whitespace),
+                "{cmd:?}: a program's name is published without whitespace: {got:?}"
+            );
+            for argument in ARGUMENTS {
+                assert!(
+                    !got.contains(argument),
+                    "{cmd:?}: {got:?} carries the argument {argument:?}"
+                );
+            }
+        }
     }
 
     /// The allocation-free selection must keep the old group/pop semantics,
@@ -4889,7 +5672,72 @@ mod tests {
 mod agent_verdict_tests {
     use std::time::{Duration, Instant};
 
+    use super::{
+        PROGRAM_NAME_CONFIRM, PROGRAM_NAMED_RECHECK_FLOOR, PROGRAM_RECHECK, SessionSlot, StatusFsm,
+        StatusObserver, StatusPolicy,
+    };
     use crate::{App, WindowId};
+
+    /// The background resolver can answer after the usual one-interval
+    /// follow-up has already gone quiet. Its completion wake restores one
+    /// status read at the observation floor, including on a static screen.
+    #[test]
+    fn a_late_program_answer_owns_one_observation_wake() {
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(250);
+        let id = 7;
+        let pgid = 42;
+        let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
+        let policy = StatusPolicy::default();
+        let mut observer = StatusObserver::new(policy, floor);
+        observer.sessions.insert(
+            id,
+            SessionSlot {
+                fsm: StatusFsm::new(policy, t0),
+                next_due: t0 + floor,
+                revision: 1,
+                lifecycle: None,
+            },
+        );
+        observer.agent_observe(
+            id,
+            generation,
+            Some(vec!["Claude Code composer".into()]),
+            Some("claude".into()),
+            pgid,
+            false,
+            t0,
+        );
+        observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
+        observer.agent_observe(
+            id,
+            generation,
+            None,
+            Some("claude".into()),
+            pgid,
+            false,
+            t0 + floor,
+        );
+        assert_eq!(observer.next_wake(), None, "the ordinary follow-up retired");
+
+        observer.note_program_answered(id);
+        observer.note_program_answered(id);
+        assert_eq!(observer.next_wake(), Some(t0 + floor * 2));
+        assert!(observer.agent_zone_wanted(id, generation, &Some("codex".into()), t0 + floor * 2,));
+        observer.agent_observe(
+            id,
+            generation,
+            Some(vec!["Codex prompt".into()]),
+            Some("codex".into()),
+            pgid,
+            false,
+            t0 + floor * 2,
+        );
+        assert_eq!(observer.next_wake(), None);
+        observer.retire(id);
+        observer.note_program_answered(id);
+        assert_eq!(observer.next_wake(), None);
+    }
 
     /// Claude Code 2.1.280's rm circuit-breaker box, measured 2026-09-23 in a
     /// private headless aterm (120 columns; rows 1-24 of the capture).
@@ -5179,6 +6027,677 @@ mod agent_verdict_tests {
         );
     }
 
+    /// THE FINAL FRAME OF A BURST THAT LANDED BETWEEN LOOKS (2026-09-24,
+    /// live: a box answered and a static busy screen drawn still read
+    /// `agent=prompt` after the host had cleared its badge; an exited agent's
+    /// prompt left `program=claude` standing). A look that saw nothing move
+    /// arms no follow-up, and output inside the interval runs no look: the
+    /// output wake's [`super::StatusObserver::note_output`] owes the session a look
+    /// at its next due instant — and so does a look the terminal lock
+    /// refused ([`super::StatusObserver::note_skipped`]). NEGATIVE CONTROL: before
+    /// the burst nothing is owed that soon.
+    #[test]
+    fn output_between_looks_is_owed_a_look_at_the_next_due_instant() {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let interval = Duration::from_millis(250);
+        let mut obs = super::StatusObserver::new(super::StatusPolicy::default(), interval);
+        let ev = super::Evidence {
+            pin: None,
+            shell: None,
+            lifecycle: None,
+            foreground_job: None,
+            activity: super::ActivitySample {
+                alt_screen: false,
+                content_seq: 1,
+                last_input: None,
+                last_output: None,
+            },
+        };
+        let rows = vec!["$ ls".to_string()];
+        let t0 = Instant::now();
+        let _ = obs.observe(1, &ev, t0);
+        assert!(obs.agent_zone_wanted(1, g(1), &None, t0));
+        let _ = obs.agent_observe(1, g(1), Some(rows), None, -1, false, t0);
+        // A look at the same screen: nothing moved, nothing owed by it.
+        let t1 = t0 + interval;
+        let _ = obs.observe(1, &ev, t1);
+        assert!(!obs.agent_zone_wanted(1, g(1), &None, t1));
+        let _ = obs.agent_observe(1, g(1), None, None, -1, false, t1);
+        let due = obs.sessions[&1].next_due;
+        assert!(
+            obs.next_wake().is_none_or(|w| w > due),
+            "NEGATIVE CONTROL: nothing owes a look at {due:?} yet"
+        );
+        // A burst lands 10 ms later: not due, so no look — but one is owed.
+        obs.note_output(1);
+        assert_eq!(obs.next_wake(), Some(due), "a look at the next due instant");
+        // That look reads the new frame, and owes nothing more once it holds.
+        let t2 = due;
+        let _ = obs.observe(1, &ev, t2);
+        assert!(obs.agent_zone_wanted(1, g(2), &None, t2));
+        let _ = obs.agent_observe(
+            1,
+            g(2),
+            Some(vec!["$ ls".into(), "x".into()]),
+            None,
+            -1,
+            false,
+            t2,
+        );
+        let t3 = t2 + interval;
+        let _ = obs.observe(1, &ev, t3);
+        let _ = obs.agent_observe(1, g(2), None, None, -1, false, t3);
+        let due = obs.sessions[&1].next_due;
+        assert!(obs.next_wake().is_none_or(|w| w > due), "settled again");
+        // A look the lock refused owes the next one as well.
+        obs.note_skipped(1, t3);
+        assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
+    }
+
+    /// THE DEPARTED AGENT'S LAST FRAME (2026-09-24): the look that first sees
+    /// a new foreground group read `program=` from the timeline before this
+    /// sweep's `note_foreground_group` forgot it — the name of the group that
+    /// LEFT. Judged under it, an exited Claude Code's last frame published
+    /// Claude's reader again, and the in-GUI host went on seeing the agent
+    /// (the relaunch on exit missed exits that way). The zone of a moved
+    /// group is judged under no name: `agent=-`, no reader. NEGATIVE CONTROL:
+    /// the same rows in the SAME group are the agent's.
+    #[test]
+    fn a_group_that_left_is_never_judged_under_its_name() {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let frame = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_OFFER);
+        let mut exited = frame.clone();
+        exited.push("$ ".to_string());
+        let claude = Some("claude".to_string());
+        let reader = |step: &super::AgentStep| step.publish.as_ref().map(|p| (p.0, p.3));
+        for group_after in [200, 100] {
+            let mut obs = super::StatusObserver::new(
+                super::StatusPolicy::default(),
+                Duration::from_millis(50),
+            );
+            let t0 = Instant::now();
+            assert!(obs.agent_zone_wanted(1, g(1), &claude, t0));
+            let step =
+                obs.agent_observe(1, g(1), Some(frame.clone()), claude.clone(), 100, true, t0);
+            assert_eq!(
+                reader(&step).and_then(|(_, r)| r),
+                Some(aterm_phase::Program::Claude),
+                "the agent, named"
+            );
+            let t1 = t0 + super::AGENT_MIN_INTERVAL;
+            assert!(obs.agent_zone_wanted(1, g(2), &claude, t1));
+            let step = obs.agent_observe(
+                1,
+                g(2),
+                Some(exited.clone()),
+                claude.clone(),
+                group_after,
+                true,
+                t1,
+            );
+            let got = reader(&step);
+            if group_after == 100 {
+                assert_eq!(
+                    got.and_then(|(_, r)| r),
+                    Some(aterm_phase::Program::Claude),
+                    "NEGATIVE CONTROL: the same group is still the agent"
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    Some(("-", None)),
+                    "the departed group's frame is no agent's"
+                );
+            }
+        }
+    }
+
+    /// THE GATE HASHES THE ZONE THE VERDICT READS (the live run of
+    /// 2026-09-26: Claude Code 2.1.283 in a fresh 149x62 pane). The pane
+    /// idle at its top, then the folder-trust dialog drawn there: the last
+    /// 40 rows of the SCREEN are blank on both, so a gate that hashed them
+    /// passed over the dialog, and `agent=idle` stood while the hosted loop
+    /// slept on it. The gate hashes [`crate::presence::live_zone`], the rows
+    /// the verdict reads: the dialog is classified and published a trust
+    /// prompt. NEGATIVE CONTROL: the dialog read again, nothing in the zone
+    /// moved, is not classified again.
+    #[test]
+    fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
+        use aterm_phase::prompt::fixtures::{TRUST_FRESH_PANE, composer, rows, screen};
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let claude = Some("claude".to_string());
+        let word = |step: &super::AgentStep| step.publish.as_ref().map(|p| (p.0, p.1.clone()));
+        let mut idle = rows(&["\u{23fa} Done.", ""]);
+        idle.extend(composer("  ? for shortcuts"));
+        idle.resize(62, String::new());
+        let trust = screen(TRUST_FRESH_PANE);
+        assert_eq!(trust.len(), 62);
+        assert_eq!(idle[22..], trust[22..], "the same blank foot");
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let t0 = Instant::now();
+        let step = obs.agent_observe(1, g(1), Some(idle), claude.clone(), 100, false, t0);
+        assert_eq!(word(&step), Some(("idle", None)));
+        let t1 = t0 + super::AGENT_MIN_INTERVAL;
+        let step = obs.agent_observe(1, g(2), Some(trust.clone()), claude.clone(), 100, false, t1);
+        assert!(step.reading_changed, "{:?}", word(&step));
+        assert_eq!(word(&step), Some(("prompt", Some("trust".to_string()))));
+        let t2 = t1 + super::AGENT_MIN_INTERVAL;
+        let step = obs.agent_observe(1, g(3), Some(trust), claude, 100, false, t2);
+        assert_eq!(word(&step), None, "the zone did not move");
+    }
+
+    /// `history_lost=` (2026-09-26): the history lines this session's update
+    /// handoffs could not carry, summed — what its adoption brought on its
+    /// record plus every import that failed here — and `0` for a session that
+    /// lost none. The update's total rides one band row as well
+    /// (`App::settle_handoff_history`), never the log alone. NEGATIVE CONTROL:
+    /// an update that carried every line posts no row.
+    #[cfg(unix)] // App::settle_handoff_history is the unix handoff's
+    #[test]
+    fn the_status_record_counts_the_history_an_update_could_not_carry() {
+        use crate::handoff_history::{ImportReport, record_reports};
+        let (mut app, sid) = app_with_stub();
+        let record = app.session_status_record(sid).expect("live");
+        assert!(
+            record.contains(" history_lost=0 integration_rev=- gen="),
+            "{record}"
+        );
+        let whole = [ImportReport {
+            session: sid,
+            imported: 5000,
+            dropped: 0,
+            failed_lines: 0,
+            failed: None,
+            cleared: false,
+        }];
+        record_reports(&app.store, &whole);
+        app.settle_handoff_history(&whole);
+        assert!(
+            !app.has_live_message("Couldn't carry all scrollback"),
+            "nothing was lost: no row"
+        );
+        // The adoption's carried count, then an import that failed here.
+        app.store.write().unwrap().add_history_lost(sid, 1200);
+        let failed = [ImportReport {
+            session: sid,
+            imported: 0,
+            dropped: 1200,
+            failed_lines: 34,
+            failed: Some("the sidecar arrived with a sha other than its stamp".into()),
+            cleared: false,
+        }];
+        record_reports(&app.store, &failed);
+        app.settle_handoff_history(&failed);
+        let record = app.session_status_record(sid).expect("live");
+        assert!(
+            record.contains(" history_lost=1234 integration_rev=- gen="),
+            "{record}"
+        );
+        assert!(app.has_live_message("Couldn't carry all scrollback"));
+    }
+
+    /// THE REGISTRY'S FROZEN MARK IS LOWERED BY A MEASUREMENT, NEVER RAISED
+    /// (gap audit 2026-09-24: a tab healed by the live upgrade's relaunch line
+    /// read `path=frozen` through seven handoffs, because nothing ever lowered
+    /// the mark; review of 2026-09-25: a one-off `PATH=` override then RAISED
+    /// it, and the band counted that tab "from before this update"). A live
+    /// reading lowers it — so the handoff's carry and the managed record's
+    /// count lose the tab. A frozen reading from one job, and then from a
+    /// second, leaves an unmarked tab unmarked: one reads `unconfirmed`, two
+    /// read `frozen` as measured. NEGATIVE CONTROL: with no reading, the
+    /// carried mark stands through a sweep.
+    #[test]
+    fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
+        use crate::session_status::program::PathVerdict;
+        let (mut app, sid) = app_with_stub();
+        app.store.write().unwrap().mark_frozen_path(sid);
+        let t0 = Instant::now();
+        let _ = app.observe_session_statuses(t0);
+        assert!(
+            app.store.read().unwrap().has_frozen_path(sid),
+            "no reading: the mark stands"
+        );
+        let record = app.session_status_record(sid).expect("live");
+        assert!(record.contains(" path=frozen "), "{record}");
+        assert!(record.contains(" path_evidence=carried "), "{record}");
+        let measure = |app: &App, verdict: PathVerdict| {
+            let pooled = app.pool.get(sid).unwrap();
+            let mut tl = pooled.ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(4242);
+            tl.set_program(4242, Some("claude".into()));
+            tl.set_leader(4242, Some("foreign"), Some(verdict));
+        };
+        measure(&app, PathVerdict::Live);
+        let _ = app.observe_session_statuses(t0 + Duration::from_millis(300));
+        assert!(
+            !app.store.read().unwrap().has_frozen_path(sid),
+            "a live reading lowers the mark"
+        );
+        let record = app.session_status_record(sid).expect("live");
+        assert!(record.contains(" path=live program=claude "), "{record}");
+        assert!(record.contains(" path_evidence=measured:"), "{record}");
+        assert!(record.contains(" copy=foreign upgrade=- "), "{record}");
+        // One job's frozen reading (a `PATH=/usr/bin:/bin tool` override
+        // reads exactly so) is not the shell's: not raised, and `path=` stays.
+        measure(&app, PathVerdict::Frozen);
+        let _ = app.observe_session_statuses(t0 + Duration::from_millis(600));
+        assert!(
+            !app.store.read().unwrap().has_frozen_path(sid),
+            "one job's frozen reading raises nothing"
+        );
+        let record = app.session_status_record(sid).expect("live");
+        assert!(record.contains(" path=live program=claude "), "{record}");
+        assert!(record.contains(" path_evidence=unconfirmed:"), "{record}");
+        // A SECOND job agreeing settles it as the shell's: `path=frozen`,
+        // measured — and still no mark (it is not "from before this update").
+        {
+            let pooled = app.pool.get(sid).unwrap();
+            let mut tl = pooled.ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(4343);
+            tl.set_program(4343, Some("claude".into()));
+            tl.set_leader(4343, Some("foreign"), Some(PathVerdict::Frozen));
+        }
+        let _ = app.observe_session_statuses(t0 + Duration::from_millis(900));
+        assert!(!app.store.read().unwrap().has_frozen_path(sid));
+        let record = app.session_status_record(sid).expect("live");
+        assert!(record.contains(" path=frozen program=claude "), "{record}");
+        assert!(record.contains(" path_evidence=measured:"), "{record}");
+    }
+
+    /// Tier-1 for `ProgramResolutionRetry`: a failed process-table lookup on a
+    /// motionless Claude screen still owns a wake and another resolution.
+    /// This drives the shipping observer's request bookkeeping, timer and
+    /// guard; the model's old-code mutant is the negative control.
+    #[test]
+    fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
+        let model = aterm_spec::derive::program_resolution_retry_model();
+        let mut modeled = model.init_state();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mut old = buggy.init_state();
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(100);
+        let id = 7;
+        let pgid = 42;
+        let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
+        let policy = StatusPolicy::default();
+        let mut observer = StatusObserver::new(policy, floor);
+        observer.sessions.insert(
+            id,
+            SessionSlot {
+                fsm: StatusFsm::new(policy, t0),
+                next_due: t0 + floor,
+                revision: 1,
+                lifecycle: None,
+            },
+        );
+
+        // Record the first group request before the zone read to exercise
+        // the request helper independently. Production creates the watch
+        // earlier via `agent_zone_wanted`; either order retains its deadline.
+        assert!(observer.program_due(id, true, None, generation, t0));
+        observer.note_program_request(id, pgid, t0);
+        assert!(model.fire("Start", &mut modeled));
+        assert!(buggy.fire("Start", &mut old));
+        assert_eq!(observer.agents[&id].resolved_at, Some(t0));
+        assert_eq!(
+            i64::from(observer.agents[&id].resolve_attempts),
+            modeled["attempts"]
+        );
+        assert!(!buggy.check_invariant("UnnamedGroupOwnsRetry", &old));
+        observer.agent_observe(
+            id,
+            generation,
+            Some(vec!["Claude Code approval box".into()]),
+            None,
+            pgid,
+            true,
+            t0,
+        );
+        assert_eq!(observer.next_wake(), Some(t0 + floor));
+
+        // The one follow-up read sees the same frame. Its flag clears, but
+        // the unresolved name keeps an independently bounded deadline.
+        observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
+        observer.agent_observe(id, generation, None, None, pgid, false, t0 + floor);
+        assert_eq!(observer.next_wake(), Some(t0 + Duration::from_millis(250)));
+        assert!(!observer.program_due(
+            id,
+            false,
+            None,
+            generation,
+            t0 + Duration::from_millis(249)
+        ));
+        let first_retry = t0 + Duration::from_millis(250);
+        assert!(model.fire("Elapse", &mut modeled));
+        assert!(model.fire("Decide", &mut modeled));
+        assert!(buggy.fire("Elapse", &mut old));
+        assert!(buggy.fire("Decide", &mut old));
+        assert_eq!(modeled["retry_due"], 1);
+        assert_eq!(old["retry_due"], 0, "old same-generation guard strands it");
+        assert_eq!(
+            observer.program_due(id, false, None, generation, first_retry),
+            modeled["retry_due"] == 1
+        );
+        observer.note_program_request(id, pgid, first_retry);
+        assert!(model.fire("Retry", &mut modeled));
+        assert_eq!(
+            i64::from(observer.agents[&id].resolve_attempts),
+            modeled["attempts"]
+        );
+
+        // The second miss waits one second, then the third and every later
+        // miss waits five seconds. Each resolution's single follow-up is
+        // charged to the ordinary observation floor.
+        observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor;
+        observer.agent_observe(id, generation, None, None, pgid, true, first_retry);
+        assert_eq!(observer.next_wake(), Some(first_retry + floor));
+        observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor * 2;
+        observer.agent_observe(id, generation, None, None, pgid, false, first_retry + floor);
+        let second_retry = first_retry + Duration::from_secs(1);
+        assert_eq!(observer.next_wake(), Some(second_retry));
+        assert!(!observer.program_due(
+            id,
+            false,
+            None,
+            generation,
+            second_retry - Duration::from_millis(1)
+        ));
+        assert!(model.fire("Elapse", &mut modeled));
+        assert!(model.fire("Decide", &mut modeled));
+        assert_eq!(
+            observer.program_due(id, false, None, generation, second_retry),
+            modeled["retry_due"] == 1
+        );
+        observer.note_program_request(id, pgid, second_retry);
+        assert!(model.fire("Retry", &mut modeled));
+        assert_eq!(observer.agents[&id].resolve_attempts, 3);
+        observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor;
+        observer.agent_observe(id, generation, None, None, pgid, true, second_retry);
+        observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor * 2;
+        observer.agent_observe(
+            id,
+            generation,
+            None,
+            None,
+            pgid,
+            false,
+            second_retry + floor,
+        );
+        assert_eq!(observer.next_wake(), Some(second_retry + PROGRAM_RECHECK));
+
+        // A contended terminal can skip a deadline. The same past timer is
+        // clamped to the charged next observation, never rearmed immediately.
+        let late = second_retry + PROGRAM_RECHECK + Duration::from_secs(1);
+        observer.note_skipped(id, late);
+        assert_eq!(observer.next_wake(), Some(late + floor));
+
+        // A later successful name on the same static frame identifies Claude
+        // and disarms every unresolved retry.
+        let named_at = late + floor;
+        let named = observer.agent_observe(
+            id,
+            generation,
+            Some(vec!["Claude Code approval box".into()]),
+            Some("claude".into()),
+            pgid,
+            false,
+            named_at,
+        );
+        assert_eq!(
+            named.publish.and_then(|(_, _, _, reader)| reader),
+            Some(aterm_phase::Program::Claude)
+        );
+        assert!(model.fire("Resolve", &mut modeled));
+        assert_eq!(
+            i64::from(observer.agents[&id].resolve_attempts),
+            modeled["attempts"]
+        );
+        assert_eq!(observer.next_wake(), None);
+        assert!(!observer.program_due(
+            id,
+            false,
+            Some("claude"),
+            generation,
+            named_at + PROGRAM_RECHECK * 2
+        ));
+
+        // The same group can exec again. Once a name was known, its next
+        // transient miss starts at the fast 250 ms retry instead of inheriting
+        // the old five-second backoff. A departed or retired group owns none.
+        let newer = crate::control::ScreenGen { epoch: 0, seq: 2 };
+        let exec_at = named_at + PROGRAM_RECHECK * 2;
+        assert!(observer.program_due(id, false, Some("claude"), newer, exec_at));
+        observer.note_program_request(id, pgid, exec_at);
+        observer.agent_observe(
+            id,
+            newer,
+            Some(vec!["still named".into()]),
+            Some("claude".into()),
+            pgid,
+            true,
+            exec_at,
+        );
+        observer.agent_observe(
+            id,
+            newer,
+            Some(vec!["unnamed".into()]),
+            None,
+            pgid,
+            false,
+            exec_at,
+        );
+        observer.sessions.get_mut(&id).unwrap().next_due = exec_at + floor;
+        assert_eq!(
+            observer.next_wake(),
+            Some(exec_at + Duration::from_millis(250))
+        );
+        observer.agent_observe(id, newer, None, None, -1, false, exec_at + floor);
+        assert_eq!(observer.next_wake(), None);
+        observer.retire(id);
+        assert_eq!(observer.next_wake(), None);
+    }
+
+    /// Tier-1 for the named-shell side of `ProgramResolutionRetry`. A first
+    /// lookup can catch `sh` before its same-PGID exec into Claude. One short
+    /// confirmation may still see `sh`; a later single Claude frame must arm
+    /// another bounded lookup even though that frame then stays still.
+    #[test]
+    fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
+        let model = aterm_spec::derive::program_resolution_retry_model();
+        let mut modeled = model.init_state();
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(100);
+        let id = 8;
+        let pgid = 43;
+        let first = crate::control::ScreenGen { epoch: 0, seq: 1 };
+        let later = crate::control::ScreenGen { epoch: 0, seq: 2 };
+        let policy = StatusPolicy::default();
+        let mut observer = StatusObserver::new(policy, floor);
+        observer.sessions.insert(
+            id,
+            SessionSlot {
+                fsm: StatusFsm::new(policy, t0),
+                next_due: t0 + floor,
+                revision: 1,
+                lifecycle: None,
+            },
+        );
+
+        observer.note_program_request(id, pgid, t0);
+        assert!(model.fire("Start", &mut modeled));
+        observer.agent_observe(
+            id,
+            first,
+            Some(vec!["launching".into()]),
+            Some("claude".into()),
+            pgid,
+            true,
+            t0,
+        );
+        assert!(
+            !observer.agents[&id].name_confirmed,
+            "the group-change sweep's old Claude name is not this group's answer"
+        );
+        // The first later sweep sees the transient shell name, not the stale
+        // name sampled before `note_foreground_group` on the launch sweep.
+        let shell_at = t0 + floor;
+        observer.agent_observe(
+            id,
+            first,
+            Some(vec!["sh launching Claude".into()]),
+            Some("sh".into()),
+            pgid,
+            false,
+            shell_at,
+        );
+        assert!(model.fire("ResolveShell", &mut modeled));
+        let first_confirm = shell_at + PROGRAM_NAME_CONFIRM;
+        assert_eq!(modeled["confirm_armed"], 1);
+        assert_eq!(observer.next_wake(), Some(first_confirm));
+        assert!(!observer.program_due(
+            id,
+            false,
+            Some("sh"),
+            first,
+            first_confirm - Duration::from_millis(1)
+        ));
+        assert!(model.fire("Elapse", &mut modeled));
+        assert_eq!(
+            observer.program_due(id, false, Some("sh"), first, first_confirm),
+            model.action_enabled("ConfirmShell", &modeled)
+        );
+        observer.note_program_request(id, pgid, first_confirm);
+        assert!(model.fire("ConfirmShell", &mut modeled));
+        observer.agent_observe(
+            id,
+            first,
+            None,
+            Some("sh".into()),
+            pgid,
+            true,
+            first_confirm,
+        );
+        observer.sessions.get_mut(&id).unwrap().next_due = first_confirm + floor;
+        observer.agent_observe(
+            id,
+            first,
+            None,
+            Some("sh".into()),
+            pgid,
+            false,
+            first_confirm + floor,
+        );
+        assert_eq!(modeled["confirm_armed"], 0);
+        assert_eq!(observer.next_wake(), None, "stable sh stops polling");
+
+        // Claude execs at t=3 s and draws once. At this point the 5 s
+        // screen-moved guard is still closed; the deferred deadline is the
+        // only way to name the now-static new program.
+        let moved_at = t0 + Duration::from_secs(3);
+        assert!(!observer.program_due(id, false, Some("sh"), later, moved_at));
+        observer.agent_observe(
+            id,
+            later,
+            Some(vec!["Claude Code approval box".into()]),
+            Some("sh".into()),
+            pgid,
+            false,
+            moved_at,
+        );
+        let before_move = modeled.clone();
+        assert!(model.fire("MoveNamed", &mut modeled));
+        let old_move = aterm_spec::interp::with_buggy(&model, 1)
+            .successors("MoveNamed", &before_move)[0]
+            .clone();
+        assert_eq!(old_move["confirm_armed"], 0, "old guard loses this frame");
+        observer.sessions.get_mut(&id).unwrap().next_due = moved_at + floor;
+        assert_eq!(observer.next_wake(), Some(moved_at + floor));
+        observer.sessions.get_mut(&id).unwrap().next_due = moved_at + floor * 2;
+        observer.agent_observe(
+            id,
+            later,
+            None,
+            Some("sh".into()),
+            pgid,
+            false,
+            moved_at + floor,
+        );
+        let later_confirm = first_confirm + PROGRAM_NAMED_RECHECK_FLOOR;
+        assert_eq!(later_confirm, t0 + Duration::from_millis(4_600));
+        assert_eq!(observer.next_wake(), Some(later_confirm));
+        assert_eq!(modeled["confirm_armed"], 1);
+        assert!(!observer.program_due(
+            id,
+            false,
+            Some("sh"),
+            later,
+            later_confirm - Duration::from_millis(1)
+        ));
+        assert!(model.fire("Elapse", &mut modeled));
+        assert_eq!(
+            observer.program_due(id, false, Some("sh"), later, later_confirm),
+            model.action_enabled("ConfirmShell", &modeled)
+        );
+        observer.note_program_request(id, pgid, later_confirm);
+        assert!(model.fire("ConfirmShell", &mut modeled));
+        observer.agent_observe(
+            id,
+            later,
+            None,
+            Some("sh".into()),
+            pgid,
+            true,
+            later_confirm,
+        );
+        observer.sessions.get_mut(&id).unwrap().next_due = later_confirm + floor;
+        assert_eq!(observer.next_wake(), Some(later_confirm + floor));
+        let named = observer.agent_observe(
+            id,
+            later,
+            Some(vec!["Claude Code approval box".into()]),
+            Some("claude".into()),
+            pgid,
+            false,
+            later_confirm + floor,
+        );
+        assert_eq!(
+            named.publish.and_then(|(_, _, _, reader)| reader),
+            Some(aterm_phase::Program::Claude)
+        );
+        assert!(model.fire("NameBecomesClaude", &mut modeled));
+        assert_eq!(modeled["confirm_armed"], 0);
+        assert_eq!(observer.next_wake(), None);
+
+        // A later non-agent name can arm another deadline, but leaving the
+        // foreground group cancels it even if the retired screen stays put.
+        let third = crate::control::ScreenGen { epoch: 0, seq: 3 };
+        observer.agent_observe(
+            id,
+            third,
+            Some(vec!["sh again".into()]),
+            Some("sh".into()),
+            pgid,
+            false,
+            later_confirm + PROGRAM_RECHECK,
+        );
+        assert!(model.fire("AgentLeaves", &mut modeled));
+        assert!(observer.agents[&id].deferred_name_recheck_at.is_some());
+        assert_eq!(modeled["confirm_armed"], 1);
+        observer.agent_observe(
+            id,
+            third,
+            Some(vec!["prompt".into()]),
+            None,
+            -1,
+            false,
+            later_confirm + PROGRAM_RECHECK + floor,
+        );
+        assert!(model.fire("GroupLeaves", &mut modeled));
+        assert_eq!(observer.agents[&id].deferred_name_recheck_at, None);
+        assert_eq!(modeled["confirm_armed"], 0);
+        assert_eq!(observer.next_wake(), None);
+    }
     /// INT-4: a shell whose last line ends in `?` is not an agent — `agent=-`
     /// and no attention — while the SAME screen under `program=claude` is read
     /// as the question it is. Identity, not screen text, decides.
@@ -5293,6 +6812,60 @@ mod agent_verdict_tests {
         let mut set = app.notify_suppress.lock().unwrap();
         set.clear();
         set.extend(sessions.iter().copied());
+    }
+
+    /// THE E2E PROBE OF 2026-09-25 (W1): a trust dialog drawn at the top of
+    /// a 45-row pane had its title above the live zone's 40 rows, so the
+    /// server published `agent_detail=other` and the menu bar said "other
+    /// approval" — and it said so from the raw verdict before the window's
+    /// supervisor had taken the session's claim, then again from the
+    /// supervisor's own escalation: two notifications for one box. The zone
+    /// that cuts a box is read again whole (the verdict names `trust`), and a
+    /// session the host supervises raises no verdict row, claim or not — its
+    /// box is the host's to answer or escalate. NEGATIVE CONTROL: with no host
+    /// supervising, the verdict's row is there.
+    #[test]
+    fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
+        let (mut app, sid) = app_with_stub();
+        app.headless = false;
+        let fixture = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::TRUST);
+        let dialog = &fixture[8..=23];
+        assert!(dialog[1].contains("Accessing workspace"), "{dialog:?}");
+        {
+            let pooled = app.pool.get(sid).expect("pooled");
+            let mut t = crate::term_lock(&pooled.term);
+            t.resize(45, 120);
+            let mut bytes = String::from("\x1b[H\x1b[2J");
+            for (i, row) in dialog.iter().enumerate() {
+                bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+            }
+            t.process(bytes.as_bytes());
+        }
+        let _ = take_posts();
+        looking_at(&app, &[]);
+        sweep(&mut app, Instant::now());
+        let agent = published(&app, sid);
+        assert_eq!(agent.word, "prompt", "{agent:?}");
+        assert!(
+            agent
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("trust")),
+            "{agent:?}"
+        );
+        let (hosted, bare) = {
+            let store = app.store.read().unwrap();
+            let handle = store.by_local(sid).expect("the session");
+            (
+                App::status_session_row(handle, true),
+                App::status_session_row(handle, false),
+            )
+        };
+        assert!(hosted.supervised, "{hosted:?}");
+        assert_eq!(crate::status_item::escalation(&hosted), None);
+        // NEGATIVE CONTROL: no host supervising — the verdict's row.
+        assert!(!bare.supervised);
+        assert!(crate::status_item::escalation(&bare).is_some());
     }
 
     /// ONE PLACE FOR ANDREW, end to end on the measured rm box: the sweep
@@ -5415,7 +6988,12 @@ mod agent_verdict_tests {
         let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
         let _ = take_posts();
         looking_at(&app, &[]);
-        let ttl = Duration::from_millis(120);
+        // Long enough that the negative controls below — a presence refresh,
+        // two debug-build paints and sweeps — finish inside it on a loaded
+        // gate: at 120 ms they could outlast the claim and read a correct lapse
+        // as a notice posted while supervised (the load-sensitive test audit
+        // of 2026-09-27). The lapse is then waited for, not slept for.
+        let ttl = Duration::from_secs(2);
         let now_us = crate::metrics::now_us();
         assert_eq!(
             crate::session_timeline::claim_supervisor(
@@ -5443,9 +7021,19 @@ mod agent_verdict_tests {
         let _ = app.presence_tick(Instant::now());
         assert!(take_posts().is_empty(), "NEGATIVE CONTROL: not lapsed yet");
 
-        std::thread::sleep(ttl + Duration::from_millis(10));
-        let _ = app.presence_tick(Instant::now());
-        let posts = take_posts();
+        let lapsed_by = Instant::now() + ttl + Duration::from_secs(10);
+        let posts = loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = app.presence_tick(Instant::now());
+            let posts = take_posts();
+            if !posts.is_empty() {
+                break posts;
+            }
+            assert!(
+                Instant::now() < lapsed_by,
+                "the lapsed claim never handed its box to the human"
+            );
+        };
         assert_eq!(posts.len(), 1, "exactly one notice: {posts:?}");
         assert_eq!(posts[0].session, sid);
         let meta_events: Vec<String> = ctx

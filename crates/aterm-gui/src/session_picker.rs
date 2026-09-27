@@ -231,7 +231,7 @@ impl SessionPickerState {
     }
 
     /// Move the cursor to FILTERED index `idx` (a11y Focus/Click land here).
-    #[cfg_attr(not(a11y_tree), allow(dead_code))]
+    #[cfg(a11y_tree)]
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -477,7 +477,6 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
             h: card_h + 6.0,
             radius: radius + 3.0,
             fill: rgba([0, 0, 0], 0x2A),
-            blur: false,
         },
         DrawPrim::Panel {
             x: card_x - 1.0,
@@ -486,7 +485,6 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
             h: card_h + 3.0,
             radius: radius + 1.0,
             fill: rgba([0, 0, 0], 0x30),
-            blur: false,
         },
         DrawPrim::Panel {
             x: card_x,
@@ -495,7 +493,6 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
             h: card_h,
             radius,
             fill: rgba(r.surface, 0xFF),
-            blur: false,
         },
         DrawPrim::Stroke {
             x: card_x,
@@ -610,7 +607,6 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
                 h,
                 radius: ch * 0.3,
                 fill: rgba(r.accent, 0x22),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x,

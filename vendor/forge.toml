@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# vendor/forge.toml — THE FORK LEDGER. One [[fork]] block per [patch.crates-io] entry in the
-# workspace root manifest: what aterm vendored, at which upstream version, under which
-# license, and how the lock-order census classifies it.
+# vendor/forge.toml — THE FORK LEDGER. One [[fork]] block per VENDORED [patch.crates-io]
+# entry in the workspace root manifest: what aterm vendored, at which upstream version,
+# under which license, and how the lock-order census classifies it.
 #
 # THE COMMENTS ARE THE RECORD. A fork's reason to exist is not a key here — it is the
-# comment block above it. forge round-trips this file with aterm-toml precisely so that
-# no future write can eat one. Unknown KEYS are refused by name (fail-closed, the way
-# aterm-census's vendored-crate registry is); unknown COMMENTS are kept verbatim.
+# comment block above it. Nothing in forge writes this file; it is edited by hand. Unknown
+# KEYS are refused by name (fail-closed, the way aterm-census's vendored-crate registry is).
 #
-# Every version below is cross-checked against Cargo.lock: a vendored version that drifts
-# from the requirement the graph asks for silently un-uses the patch, and the only trace is
-# one line in the lock.
-#
-# Regenerate this skeleton with aterm_forge::policy::seed_from_vendor and DIFF it against
-# the checked-in file. Never overwrite: the diff is the review.
+# `cargo forge check` holds this file to the tree ([OB-17]): the [forge] cells must be the
+# matrix forge measures, and every [[fork]] block must match its vendored manifest's path,
+# version and license — no block missing, none stale — with apache_notice as attest's
+# [OB-7] reads that license and census.* as aterm-census's REVIEWED_VENDORED_CRATES
+# classifies the fork. Patch LIVENESS (a vendored version that drifts from the
+# requirement the graph asks for silently un-uses the patch) is [OB-12]'s.
 
 [forge]
 # The methods every number in a forge report was produced by, recorded so a report can be

@@ -219,7 +219,7 @@ pub fn run() -> i32 {
     }
 }
 
-/// Pure parser (unit-tested in tests/resume.rs).
+/// Pure parser (unit-tested in tests/it/resume.rs).
 pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
     let mut it = args.iter().map(String::as_str);
     let Some(cmd) = it.next() else {

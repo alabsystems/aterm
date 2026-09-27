@@ -1,0 +1,18 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-25 (no live capture): rows synthesized from the 2.1.282 render code He() (a scrolled window draws `↓`/`↑` in the pointer column) and zgt() (min(n, floor((rows-8)/2)) items: 4 of 5 in a 17-row pane) on the S1-01 geometry, 80 columns · a four-option question whose list is scrolled: `Type something.` below the window
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Pick
+
+Which parser should the demo use?
+
+❯ 1. Alpha (Recommended)
+     The first parser.
+  2. Beta
+     The second parser.
+  3. Gamma
+     The third parser.
+↓ 4. Delta
+     The fourth parser.
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

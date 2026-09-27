@@ -89,30 +89,6 @@ impl CellFlags {
     // These alternative names remain available only for consumers that opt into
     // the compatibility surface explicitly.
 
-    /// Alias for [`WIDE`](Self::WIDE) (Alacritty compatibility).
-    #[cfg(feature = "alacritty-compat")]
-    pub const WIDE_CHAR: Self = Self::WIDE;
-    /// Alias for [`WIDE_CONTINUATION`](Self::WIDE_CONTINUATION) (Alacritty compatibility).
-    /// This is the spacer cell after a wide character.
-    #[cfg(feature = "alacritty-compat")]
-    pub const WIDE_CHAR_SPACER: Self = Self::WIDE_CONTINUATION;
-    /// Alias for [`STRIKETHROUGH`](Self::STRIKETHROUGH) (Alacritty compatibility).
-    #[cfg(feature = "alacritty-compat")]
-    pub const STRIKEOUT: Self = Self::STRIKETHROUGH;
-    /// Alias for [`CURLY_UNDERLINE`](Self::CURLY_UNDERLINE) (Alacritty compatibility).
-    #[cfg(feature = "alacritty-compat")]
-    pub const UNDERCURL: Self = Self::CURLY_UNDERLINE;
-    /// Combined DIM and BOLD flags (Alacritty compatibility).
-    /// Some renderers handle dim+bold specially.
-    #[cfg(feature = "alacritty-compat")]
-    pub const DIM_BOLD: Self = Self((1 << 0) | (1 << 1)); // BOLD | DIM
-    /// Combined BOLD and ITALIC flags (Alacritty compatibility).
-    #[cfg(feature = "alacritty-compat")]
-    pub const BOLD_ITALIC: Self = Self((1 << 0) | (1 << 2)); // BOLD | ITALIC
-    /// Leading wide char spacer (Alacritty compatibility).
-    /// Alias for WIDE_CONTINUATION — placed at end-of-line before a wrapped wide char.
-    #[cfg(feature = "alacritty-compat")]
-    pub const LEADING_WIDE_CHAR_SPACER: Self = Self::WIDE_CONTINUATION;
     /// All underline style flags combined (Alacritty compatibility).
     #[cfg(feature = "alacritty-compat")]
     pub const ALL_UNDERLINES: Self = Self(
@@ -211,6 +187,7 @@ impl CellFlags {
     /// Get only the core flags (excluding COMPLEX).
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn core_flags(&self) -> Self {
         Self(self.0 & Self::VISUAL_FLAGS_MASK)
     }

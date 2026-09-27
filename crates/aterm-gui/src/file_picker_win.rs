@@ -84,7 +84,6 @@ const IID_IFILE_OPEN_DIALOG: Guid = Guid {
 /// pointer can be viewed through it for `Release` without caring which concrete
 /// interface it is.
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct IUnknownVtbl {
     query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
@@ -111,7 +110,6 @@ struct FilterSpec {
 /// single-select picker has no use for) are never indexed, so leaving them off
 /// is sound. Everything BEFORE `get_result` must stay, in this order.
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct IFileOpenDialogVtbl {
     query_interface:
         unsafe extern "system" fn(*mut IFileOpenDialog, *const Guid, *mut *mut c_void) -> i32,
@@ -147,7 +145,6 @@ struct IFileOpenDialog {
 /// `IShellItem` (shobjidl_core.h). Only `GetDisplayName` is called; the three
 /// slots before it keep the documented method order so it lands on slot 5.
 #[repr(C)]
-#[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct IShellItemVtbl {
     query_interface:
         unsafe extern "system" fn(*mut IShellItem, *const Guid, *mut *mut c_void) -> i32,

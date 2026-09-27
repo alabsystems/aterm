@@ -62,12 +62,14 @@ impl Color {
     /// 216-color cube range (indices 16-231).
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn from_ansi_256(index: u8) -> Self {
         ANSI_256_TABLE[index as usize]
     }
 
     /// Compute an ANSI 256-color value (const fn, used to build the static table).
     #[doc(hidden)]
+    #[cfg(test)]
     pub const fn compute_ansi_256(index: u8) -> Self {
         // Standard ANSI colors (xterm defaults)
         const ANSI_16: [(u8, u8, u8); 16] = [
@@ -129,6 +131,7 @@ impl Color {
 ///
 /// Eliminates per-call division/modulo arithmetic for the 216-color cube
 /// (indices 16-231). Array index == palette index for O(1) lookup.
+#[cfg(test)]
 static ANSI_256_TABLE: [Color; 256] = {
     let mut table = [Color::new(0, 0, 0); 256];
     let mut i: u16 = 0;

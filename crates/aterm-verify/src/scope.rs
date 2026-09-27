@@ -68,15 +68,6 @@ impl Scope {
         name.map_or(Self::Workspace, Self::Crate)
     }
 
-    /// `Some(crate)` when narrowed to exactly one crate by `--scope`.
-    #[must_use]
-    pub fn crate_name(&self) -> Option<&str> {
-        match self {
-            Self::Crate(c) => Some(c),
-            _ => None,
-        }
-    }
-
     /// The ONLY shape that can discharge the merge contract. The verdict reads
     /// this; see [`crate::verdict::discharges_merge_contract`].
     #[must_use]
@@ -226,7 +217,6 @@ mod tests {
         let s = Scope::workspace();
         assert_eq!(s.label(), "--workspace");
         assert_eq!(s.args(), ["--workspace"]);
-        assert_eq!(s.crate_name(), None);
         assert_eq!(s.desc(), "workspace");
         assert!(s.is_workspace());
         assert!(!s.selects_nothing());
@@ -237,7 +227,6 @@ mod tests {
         let s = Scope::crate_only("aterm-grid");
         assert_eq!(s.label(), "-p aterm-grid");
         assert_eq!(s.args(), ["-p", "aterm-grid"]);
-        assert_eq!(s.crate_name(), Some("aterm-grid"));
         assert_eq!(s.desc(), "aterm-grid");
         assert!(!s.is_workspace());
     }
@@ -248,7 +237,6 @@ mod tests {
         assert_eq!(s.label(), "-p aterm-grid -p aterm-gui");
         assert_eq!(s.args(), ["-p", "aterm-grid", "-p", "aterm-gui"]);
         assert_eq!(s.desc(), "changed:2");
-        assert_eq!(s.crate_name(), None, "it is not ONE crate");
         assert!(!s.is_workspace());
         assert!(!s.selects_nothing());
     }

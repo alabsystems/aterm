@@ -534,10 +534,17 @@ pub fn sparkle_persist_capacity_model() -> Model {
 /// walks`: a 12-step budget would strand the third arm at `steps = 12,
 /// phase = 0` and fail this very invariant at `Buggy = 0`).
 ///
-/// Tier-1 binding: aterm-gui's nova battery drives the real host tick through
-/// a full window (`nova_one_flash_per_episode_across_occlusion` — Dip emits
-/// nothing, Flash crowns, Ring quads, Settled emits nothing and re-arms only
-/// on true episode death) against `nova::phase`, the pure phase function.
+/// Tier-1, two binds. aterm-effects' `word_decorations::nova_host_conformance`
+/// drives the real `WordDecorations` engine over a real terminal through three
+/// arms and what lies between them — the flash limiter's grant, the spent mark,
+/// a grace re-hit and an identity rebirth that must not re-ignite, a suspend
+/// frozen mid-crown and thawed, and two `hard_reset` re-arms — projecting
+/// `phase` from the host's own grant and `flashes` from the light its nova
+/// stream actually carries. Every window boundary is validated as `Step`, every
+/// re-arm as `Rearm`, and the `Buggy = 1` re-flash, built from the real settled
+/// state, is the step it rejects. aterm-effects' `tests/nova_phase_conformance.rs`
+/// walks the shipping `nova::phase` and crown emitter at 1 ms for every genome
+/// duration against `Step`.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
@@ -1172,8 +1179,14 @@ pub fn cursor_cat_fold_model() -> Model {
 /// hidden companion ignores the cue rather than being summoned by it.
 ///
 /// `Buggy=1` reproduces the predictive-prefix defect by treating `fuc` as a
-/// complete curse. Tier-1 drives the real `CursorCat::on_curse` seam and
-/// projects its public reaction plus the accepted/rejected decision.
+/// complete curse, and drops `on_curse`'s `!self.is_active()` refusal so a
+/// hidden cat ACCEPTS a complete curse: `on_curse` answers true (the host
+/// requests a spurious follow-up draw) and the wince and its `Wince` reaction
+/// hold leak into a companion that is not on glass. The cat is not made visible
+/// — that is `state`'s, which `on_curse` never writes — and the next hidden
+/// frame's `reset_spine` clears the wince clock, though not the reaction hold.
+/// Tier-1 drives the real `CursorCat::on_curse` seam and projects its public
+/// reaction plus the accepted/rejected decision.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_curse_wince_model() -> Model {
@@ -1208,6 +1221,9 @@ pub fn cursor_cat_curse_wince_model() -> Model {
             }
             action HiddenComplete when (active == 0 && completions == 0) {
                 completions = 1;
+                winces = if Buggy == 1 { winces + 1 } else { winces };
+                chain = if Buggy == 1 { chain + 1 } else { chain };
+                reaction = if Buggy == 1 { 1 } else { reaction };
             }
             action Done when (completions == MaxChain || active == 0) {
                 active = active;
@@ -1234,10 +1250,28 @@ pub fn cursor_cat_curse_wince_model() -> Model {
 /// partial count; releasing an armed run enters one bounded wind-down phase,
 /// which then settles to the byte-identical idle state.
 ///
-/// `Buggy=1` restores the original eight-press arm threshold. The
-/// `ArmedRequiresCurrentThreshold` invariant therefore supplies a concrete
-/// counterexample at the eighth press while the committed model proves that
-/// every armed state has accumulated all sixteen presses.
+/// `Buggy=1` restores the original eight-press arm threshold, at full drive as
+/// it shipped. The `ArmedRequiresCurrentThreshold` invariant therefore supplies
+/// a concrete counterexample at the eighth press while the committed model
+/// proves that every armed state has accumulated all sixteen presses.
+///
+/// `ArmedRunIsAtFullDrive` is the one drive law with content: an armed run
+/// drives the celebration at 1.0 from the arming press. Its slip is an
+/// ALTERNATIVE arm, not a variant of the eight-press one, so `Buggy=1` picks it
+/// per run (`PickRampedArm` sets `ramp_fault`, which `Buggy=0` pins to zero):
+/// the run arms on the sixteenth press but ramps its drive IN from zero —
+/// `drive()` easing 0 → 1 from `armed_at`, a mirror of the wind-down's
+/// smoothstep — so the arming instant reads armed with no drive and the host's
+/// 0.33 face gate keeps the ordinary cursor kitty where the singer belongs.
+/// That slip is hypothetical: the shipping `drive` returns 1.0 whenever the run
+/// is armed and unreleased.
+///
+/// No law says an idle run has no drive or that a released one still has some.
+/// Every writer of phase 0 writes `drive_live = 0` and `Release` writes it 1,
+/// and the Tier-1 projection DERIVES phases 0 and 2 from the drive (unarmed
+/// with / without a tail), so both halves would restate the writes here and
+/// the projection's definition there. The release crossfade is pinned directly
+/// by the Tier-1 (`drive > 0` at the release instant).
 ///
 /// Tier-0 lives in `derived_ring_ty.rs`; Tier-1 drives the genuine
 /// `aterm_effects::kitty_sing::KittySing` press, release, and settle methods in
@@ -1253,18 +1287,30 @@ pub fn kitty_sing_detector_model() -> Model {
             var phase = 0;      // 0 idle/accumulating, 1 armed, 2 winding down
             var count = 0;      // same-character presses in the current run
             var drive_live = 0; // full drive or its bounded release tail exists
+            // Which arm a `Buggy=1` run carries: 0 the eight-press one, 1 the
+            // sixteen-press one that ramps its drive in. Always 0 at `Buggy=0`.
+            var ramp_fault = 0;
 
+            // A stutter at `Buggy=0`, so no action is dead at the committed
+            // config (the strict-vacuity rule for negative controls).
+            action PickRampedArm when (ramp_fault == 0 && phase == 0 && count == 0) {
+                ramp_fault = Buggy;
+            }
             action Repeat when (phase == 0 && count <= ArmRepeats - 1) {
                 count = count + 1;
-                phase = if Buggy == 1 {
+                phase = if Buggy == 1 && ramp_fault == 0 {
                     if count + 1 > OldArmRepeats - 1 { 1 } else { 0 }
                 } else {
                     if count + 1 > ArmRepeats - 1 { 1 } else { 0 }
                 };
-                drive_live = if Buggy == 1 {
-                    if count + 1 > OldArmRepeats - 1 { 1 } else { 0 }
+                drive_live = if ramp_fault == 1 {
+                    0
                 } else {
-                    if count + 1 > ArmRepeats - 1 { 1 } else { 0 }
+                    if Buggy == 1 {
+                        if count + 1 > OldArmRepeats - 1 { 1 } else { 0 }
+                    } else {
+                        if count + 1 > ArmRepeats - 1 { 1 } else { 0 }
+                    }
                 };
             }
             action Break when (phase == 0 && count > 0) {
@@ -1282,8 +1328,8 @@ pub fn kitty_sing_detector_model() -> Model {
 
             invariant ArmedRequiresCurrentThreshold:
                 if phase == 1 { count == ArmRepeats } else { count <= ArmRepeats - 1 };
-            invariant DriveMatchesLifecycle:
-                if phase == 0 { drive_live == 0 } else { drive_live == 1 };
+            invariant ArmedRunIsAtFullDrive:
+                if phase == 1 { drive_live == 1 } else { 1 == 1 };
             invariant CountBounded: count <= ArmRepeats;
             invariant PhaseBounded: phase <= 2;
         }
@@ -1328,10 +1374,11 @@ pub fn cursor_cat_earn_floor_model() -> Model {
                 };
             }
 
+            // No separate "active requires singing" law: `Qualify` is this
+            // machine's only summons and its guard already reads `singing`, and
+            // outside the bypass the shipping cat earns lawfully by band+dwell.
             invariant NoCatBeforeSixteen:
                 if active == 1 { run == MinRun } else { run <= MinRun - 1 };
-            invariant ActiveRequiresSinging:
-                if active == 1 { singing == 1 } else { active == 0 };
             invariant RunBounded: run <= MinRun;
             invariant FlagsBounded: singing <= 1 && active <= 1;
         }
@@ -1528,9 +1575,11 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
             invariant NoComposedRouteStrand: stranded == 0;
             invariant RouteSwitchCannotReplay: stale_replay == 0;
             invariant NoPulseFromAnUnlicensedMove: cold_pulse == 0;
-            invariant DeliveryIsClassifiedAndAtMostOnce:
-                consumes <= classified && deliveries <= classified
-                    && deliveries == consumes;
+            // No separate at-most-once / classified-provenance law. The first
+            // law pins `consumes == deliveries` (1 after an attempt, 0 before),
+            // and `consumes <= classified` holds by the guards, not by that
+            // law: every consuming render needs `pending`, which only
+            // `ClassifyPulse` sets, together with `classified`.
             invariant StateBounded:
                 licensed <= 1 && classified <= 1 && pending <= 1 && route <= 2
                     && attempted_route <= 2 && consumes <= 1 && deliveries <= 1
@@ -2477,12 +2526,16 @@ pub fn echo_ledger_bridge_model() -> Model {
             invariant OnePressOneCell:
                 older + younger + stale + spent + forfeited + expired == banked;
             invariant ExpiredPressesBuyNothing: stale_gone == expired + stale;
+            // The space, one variable per bound. The tallies' relations to
+            // `banked` are the conservation laws above (`OnePressOneCell`,
+            // `ExpiredPressesBuyNothing`, `NoBridgeOutsideALicensedMove`), and
+            // the ledger's live total is the press actions' guard.
             invariant StateBounded:
                 older <= Depth && younger <= Depth && stale <= Depth
-                    && older + younger + stale <= Depth && hole <= Depth
-                    && banked <= BankCap && spent <= banked + banked
-                    && forfeited <= banked && expired <= banked
-                    && stale_gone <= banked && bridged <= spent + banked + banked
+                    && hole <= Depth && banked <= BankCap
+                    && spent <= BankCap + BankCap && forfeited <= BankCap
+                    && expired <= BankCap && stale_gone <= BankCap
+                    && bridged <= BankCap + BankCap + BankCap + BankCap
                     && laid_hole <= Depth && last_older <= Depth
                     && bridged_delta <= Depth && just_refused <= 1;
         }
@@ -2499,7 +2552,11 @@ pub fn echo_ledger_bridge_model() -> Model {
 /// `Buggy=1` reproduces the former `cur=None` implementation: resident trail
 /// geometry and cursor companions remain projected over unrelated history,
 /// while the hidden pet lifecycle receives no progress and can strand its
-/// frame cadence.
+/// frame cadence. "No progress" is modelled literally: the hidden brain gets no
+/// tick on entry (`HiddenPetLifecycleProgresses`), and a brain that is never
+/// ticked never settles, so `SettleHistoryBrain` does not fire at `Buggy=1` and
+/// the stuck scheduler is written where the tick was withheld
+/// (`HiddenSchedulerNeverSticks`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_viewport_lifecycle_model() -> Model {
@@ -2532,7 +2589,11 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
                 cursor_body_visible = if Buggy == 1 { cursor_body_visible } else { 0 };
                 pet_visible = if Buggy == 1 { pet_visible } else { 0 };
                 base_cursor_visible = if Buggy == 1 { base_cursor_visible } else { 0 };
-                pet_brain_ticked = if pet_brain_pending == 1 { 1 } else { 0 };
+                pet_brain_ticked = if Buggy == 1 {
+                    0
+                } else {
+                    if pet_brain_pending == 1 { 1 } else { 0 }
+                };
                 scheduler_stuck = if Buggy == 1 { pet_brain_pending } else { 0 };
             }
             action RetainHistory when (
@@ -2550,7 +2611,7 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
                     && pet_brain_ticked == 1
             ) {
                 pet_brain_pending = 0;
-                scheduler_stuck = if Buggy == 1 { 1 } else { 0 };
+                scheduler_stuck = 0;
             }
             action LeaveHistory when (
                 live_viewport == 0 && pet_brain_pending == 0
@@ -2599,12 +2660,23 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
 ///
 /// `Buggy = 1` reproduces the retained-coordinate defect: retiring boundaries
 /// keep the old body and hit target, allowing them to jump into a replacement
-/// pane/tab or remain interactable after presentation has stopped. The pinned
-/// focus-loss actions are independent negative controls and remain visible in
-/// both laws, so the repair cannot be "retire on every raw blur".
+/// pane/tab or remain interactable after presentation has stopped.
 ///
 /// This model projects only the resident `PetBrain` body and the GUI's paired
-/// hit target. The ordinary flying cursor cat has a distinct earned/promise
+/// hit target. `Buggy = 1` also carries the over-repair on the pinned blurs, so
+/// the repair cannot be "retire on every raw blur": the typed-wake and recording
+/// focus losses retire too, by rebuilding the resident brain
+/// (`PetBrain::default()`) where `PetBrain::retire_coordinate_space` would carry
+/// the durable identity across. That hides a body the pin still presents
+/// (`PresentationPinsPreserveTheSighting`) and drops the identity
+/// (`DurableIdentitySurvives`). The drop is not all transient: the species is
+/// re-applied from config by `prepare_resident_pet_tick` on the next tick, but
+/// nothing re-applies the worn look, earned contentment, disposition and
+/// lifetime clocks the carry exists for. The Tier-1 projection reads the
+/// species at the blur itself, before any tick, and the negative control
+/// replays the rebuild on the real window.
+///
+/// The ordinary flying cursor cat has a distinct earned/promise
 /// lifecycle; its owner-switch retirement is a separately asserted host rule
 /// in the Tier-1 GUI regression, not one of these variables.
 #[must_use]
@@ -2642,9 +2714,15 @@ pub fn cursor_companion_owner_lifecycle_model() -> Model {
             }
             action TypedWakeFocusLoss when (phase == 1) {
                 phase = 5;
+                pet_visible = if Buggy == 1 { 0 } else { pet_visible };
+                hit_target = if Buggy == 1 { 0 } else { hit_target };
+                durable_identity = if Buggy == 1 { 0 } else { durable_identity };
             }
             action RecordingFocusLoss when (phase == 1) {
                 phase = 6;
+                pet_visible = if Buggy == 1 { 0 } else { pet_visible };
+                hit_target = if Buggy == 1 { 0 } else { hit_target };
+                durable_identity = if Buggy == 1 { 0 } else { durable_identity };
             }
             action ScreenBufferSwitch when (phase == 1) {
                 phase = 7;
@@ -2742,7 +2820,13 @@ pub fn composed_sync_hold_model() -> Model {
 /// `Buggy = 1` is the close/reopen race that treats the close sequence alone as
 /// a presentation license. It keeps presenting after the reopened episode has
 /// become dirty, exposing cells that belong to an incomplete synchronized
-/// update.
+/// update (`DirtyReopenHoldsUntilClose`). The opposite, older error is an
+/// ALTERNATIVE hold rule, not a second half of the same one, so `Buggy = 1`
+/// picks it per trace (`PickLevelHold` sets `level_fault`, which `Buggy = 0`
+/// pins to zero): the LEVEL-sampled hold `bc73adcdd` retired, which reads a
+/// close+reopen as one endless episode and holds the clean reopen and the dirty
+/// episode alike, so the completed boundary never presents and a flooding TUI
+/// pins presents to the sync timeout (`CleanReopenMayPresentCompletedBoundary`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn sync_reopen_visibility_model() -> Model {
@@ -2759,7 +2843,15 @@ pub fn sync_reopen_visibility_model() -> Model {
             var completed_generation = 0;
             var presented_generation = 0;
             var partial_visible = 0;
+            // Which hold rule a `Buggy = 1` trace carries: 0 the close-sequence
+            // license, 1 the level-sampled hold. Always 0 at `Buggy = 0`.
+            var level_fault = 0;
 
+            // A stutter at `Buggy = 0`, so no action is dead at the committed
+            // config (the strict-vacuity rule for negative controls).
+            action PickLevelHold when (phase == 0 && level_fault == 0) {
+                level_fault = Buggy;
+            }
             action CloseFirstEpisode when (phase == 0) {
                 phase = 1;
                 sync_active = 0;
@@ -2771,14 +2863,16 @@ pub fn sync_reopen_visibility_model() -> Model {
                 phase = 2;
                 sync_active = 1;
                 // The new episode has performed no presented mutation, so the
-                // completed close boundary remains a lawful frame.
-                presented_generation = 1;
+                // completed close boundary remains a lawful frame. The level
+                // hold holds on the sampled level instead, and presents nothing.
+                hold = if level_fault == 1 { 1 } else { hold };
+                presented_generation = if level_fault == 1 { presented_generation } else { 1 };
             }
             action DirtyReopenedEpisode when (phase == 2) {
                 phase = 3;
                 open_dirty = 1;
-                hold = if Buggy == 1 { 0 } else { 1 };
-                partial_visible = if Buggy == 1 { 1 } else { 0 };
+                hold = if Buggy == 1 && level_fault == 0 { 0 } else { 1 };
+                partial_visible = if Buggy == 1 && level_fault == 0 { 1 } else { 0 };
             }
             action CloseReopenedEpisode when (phase == 3) {
                 phase = 4;
@@ -2989,169 +3083,81 @@ pub fn cursor_scroll_signal_model() -> Model {
     }
 }
 
-/// Bounded FIFO/lifecycle for the rainbow kitty fast-jump landing starbursts. Every
-/// admitted fast jump retains the newest issued identity while evicting the
-/// oldest at capacity. A style switch moves (never copies or loses) the active
-/// ring into an outgoing fade owner; staggered expiry, fade completion, and
-/// reset maintain the exact brisk-frame wake predicate.
+/// THE LANDING POOL — the v2 rainbow kitty's bounded FIFO of landings
+/// (`rainbow_kitty::meteor::Meteors::landings`, `LANDING_POOL` = 3).
 ///
-/// `Buggy=1` drops the newest item at saturation and loses the payload during
-/// fade transfer. Either defect violates a committed invariant. Tier-1 drives
-/// the genuine landing helper, distinct landing identities, frame pruning,
-/// style-fade ownership, overlap, fade completion, cadence, and master-off.
+/// Every arrival is ADMITTED, from either of its two sites: a meteor's arrival
+/// edge in `Meteors::emit`, and a ringing bar of the sing-along party in
+/// `Meteors::party`. At capacity the OLDEST landing is evicted to make the room,
+/// so the pool always holds exactly the latest arrivals, contiguous in arrival
+/// order: the jump the user just made always lands. Every landing lives the same
+/// 600 ms (`Landing::end`: the spark life and the ring's ceiling are both
+/// `FLIGHT_OFF_GLASS_MS`), so expiry takes the oldest first and never a newer
+/// one; `Meteors::reset` empties the pool.
+///
+/// `Buggy=1` is the eviction regression the admission guards: a saturated pool
+/// DROPS the arrival (`if len < LANDING_POOL { push }`) instead of the oldest, so
+/// the newest jump lands with no impact while three stale ones finish.
+///
+/// Tier-1: `rainbow_kitty::meteor::tests::the_landing_pool_conforms_to_the_model`
+/// walks this model's whole reachable space on a real `Meteors` — real flights
+/// landing through `emit`, real ring bars through `party`, real expiry through
+/// `emit`'s retain at the oldest landing's own end, real `reset` — projecting the
+/// pool's length and the arrival ordinals of its first and last landings, and
+/// rejects the drop-the-arrival mutant at each admission site.
+///
+/// (The v1 model of the burst ring this replaces, `RainbowJumpBurstLifecycle`,
+/// also moved a style-fade payload into a ghost owner; v2 has no fade transfer,
+/// so that half is gone, and the retired model survives only as
+/// `ty_checker_canary.rs`'s fixture.)
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn rainbow_jump_burst_lifecycle_model() -> Model {
+pub fn rainbow_landing_pool_model() -> Model {
     crate::ty_model! {
-        RainbowJumpBurstLifecycle {
-            const BurstCap = 3;
-            const TotalCap = 6;
-            const MaxIssued = 6;
+        RainbowLandingPool {
+            const Cap = 3;
+            const MaxIssued = 5;
             const Buggy = 0;
+            // Landings in the pool.
             var resident = 0;
+            // Arrival ordinals (1-based) of the newest and the oldest resident,
+            // 0 while the pool is empty.
             var newest = 0;
-            var ghost = 0;
-            var ghost_newest = 0;
+            var oldest = 0;
+            // Arrivals so far.
             var issued = 0;
-            var wake = 0;
-            var lost = 0;
 
-            action FastJump when (issued <= MaxIssued - 1) {
-                resident = if resident + 1 > BurstCap { BurstCap } else { resident + 1 };
-                newest = if Buggy == 1 && resident + 1 > BurstCap {
-                    newest
-                } else {
+            action Land when (issued <= MaxIssued - 1) {
+                resident = if resident + 1 > Cap { Cap } else { resident + 1 };
+                newest = if Buggy == 1 && resident + 1 > Cap { newest } else { issued + 1 };
+                oldest = if resident == 0 {
                     issued + 1
+                } else {
+                    if resident + 1 > Cap && Buggy == 0 { oldest + 1 } else { oldest }
                 };
                 issued = issued + 1;
-                wake = 1;
             }
-            action SlowJump { resident = resident; }
             action ExpireOne when (resident > 0) {
                 resident = resident - 1;
                 newest = if resident > 1 { newest } else { 0 };
-                wake = if resident - 1 + ghost > 0 { 1 } else { 0 };
+                oldest = if resident > 1 { oldest + 1 } else { 0 };
             }
-            action BeginFade when (resident > 0) {
-                ghost = if Buggy == 1 { 0 } else { resident };
-                ghost_newest = if Buggy == 1 { 0 } else { newest };
+            action Reset when (resident > 0) {
                 resident = 0;
                 newest = 0;
-                wake = if Buggy == 1 { 0 } else { 1 };
-                lost = if Buggy == 1 { 1 } else { 0 };
-            }
-            action FinishFade when (ghost > 0) {
-                ghost = 0;
-                ghost_newest = 0;
-                wake = if resident > 0 { 1 } else { 0 };
-            }
-            action Reset when (resident + ghost > 0) {
-                resident = 0;
-                newest = 0;
-                ghost = 0;
-                ghost_newest = 0;
-                wake = 0;
+                oldest = 0;
             }
 
-            invariant ResidentBounded: resident <= BurstCap;
-            invariant GhostBounded: ghost <= BurstCap;
-            invariant TotalBounded: resident + ghost <= TotalCap;
-            invariant NewestRetained:
-                if resident > 0 { newest == issued } else { newest == 0 };
-            invariant GhostIdentityBounded: ghost_newest <= issued;
-            invariant NoLostFadePayload: lost == 0;
-            invariant WakeMatchesResidents:
-                wake == if resident + ghost > 0 { 1 } else { 0 };
-            invariant IssuedBounded: issued <= MaxIssued;
-            invariant WakeBounded: wake <= 1;
-        }
-    }
-}
-
-/// Bounded admission/gating model for the rainbow terminus twinkle pool. Jump
-/// scatter requires both a live ribbon and full motion; right-margin scatter
-/// requires full motion but is already evidence of a live typing ribbon.
-/// Both paths saturate at the shared particle cap, expire to idle, and reset
-/// without leaving the animation scheduler armed.
-///
-/// `Buggy=1` bypasses the cold/reduced-motion guard and the cap. The
-/// `NoFalseScatter` and `ParticlesBounded` invariants make both defect classes
-/// catchable; Tier-1 binds the exact landing and scatter helpers plus cadence,
-/// expiry, margin, and master-off behavior.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn rainbow_terminus_admission_model() -> Model {
-    crate::ty_model! {
-        RainbowTerminusAdmission {
-            const ParticleCap = 6;
-            const ScatterBurst = 2;
-            const Buggy = 0;
-            var particles = 0;
-            var warm = 0;
-            var reduced = 0;
-            var wake = 0;
-            var false_scatter = 0;
-
-            action Warm when (warm == 0) { warm = 1; }
-            action Cool when (warm == 1) { warm = 0; }
-            action Reduce when (reduced == 0) { reduced = 1; }
-            action Restore when (reduced == 1) { reduced = 0; }
-            action JumpTerminus {
-                particles = if warm == 1 && reduced == 0 {
-                    if particles + ScatterBurst > ParticleCap {
-                        if Buggy == 1 { particles + ScatterBurst } else { ParticleCap }
-                    } else {
-                        particles + ScatterBurst
-                    }
+            // The pool holds exactly the latest `resident` arrivals.
+            invariant HoldsTheLatestArrivals:
+                if resident > 0 {
+                    newest == issued && oldest + resident == issued + 1
                 } else {
-                    if Buggy == 1 { particles + ScatterBurst } else { particles }
+                    newest == 0 && oldest == 0
                 };
-                wake = if warm == 1 && reduced == 0 {
-                    1
-                } else {
-                    if Buggy == 1 { 1 } else { wake }
-                };
-                false_scatter = if warm == 1 && reduced == 0 {
-                    false_scatter
-                } else {
-                    if Buggy == 1 { 1 } else { false_scatter }
-                };
-            }
-            action MarginTerminus {
-                particles = if reduced == 0 {
-                    if particles + ScatterBurst > ParticleCap {
-                        if Buggy == 1 { particles + ScatterBurst } else { ParticleCap }
-                    } else {
-                        particles + ScatterBurst
-                    }
-                } else {
-                    if Buggy == 1 { particles + ScatterBurst } else { particles }
-                };
-                wake = if reduced == 0 {
-                    1
-                } else {
-                    if Buggy == 1 { 1 } else { wake }
-                };
-                false_scatter = if reduced == 0 {
-                    false_scatter
-                } else {
-                    if Buggy == 1 { 1 } else { false_scatter }
-                };
-            }
-            action Expire when (particles > 0) {
-                particles = 0;
-                wake = 0;
-            }
-            action Reset when (particles > 0) {
-                particles = 0;
-                wake = 0;
-            }
-
-            invariant ParticlesBounded: particles <= ParticleCap;
-            invariant NoFalseScatter: false_scatter == 0;
-            invariant WakeMatchesParticles:
-                wake == if particles > 0 { 1 } else { 0 };
-            invariant FlagsBounded: warm <= 1 && reduced <= 1 && wake <= 1;
+            // The space, not the design: `newest`/`oldest` need no bound of their
+            // own — `HoldsTheLatestArrivals` pins both to `issued`.
+            invariant StateBounds: resident <= Cap && issued <= MaxIssued;
         }
     }
 }
@@ -3174,6 +3180,17 @@ pub fn rainbow_terminus_admission_model() -> Model {
 /// `ty` proves it for the file channel and catches the env-channel disclosure —
 /// a genuinely new property CLASS: explicit information flow of a secret to an
 /// untrusted sink.
+///
+/// Tier-1 binding: aterm-gui's
+/// `spawn::capability_secrecy_conformance` drives the real provisioning
+/// (`spawn::provision_child_proxy`) with a private socket dir and with none,
+/// reads `published` off the env it produced against the secrets the proxy
+/// table registered, and validates the real `Provision` (the file channel exactly
+/// when there is a private dir). `SandboxedRead` follows from the channel by this
+/// model's own definition, so the channel is what is bound. Binding it found
+/// the code short of the model: with no private dir, or a file it could not
+/// write, it fell back to the env channel. That fallback is deleted; the
+/// provisioning now fails closed.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -3202,7 +3219,15 @@ pub fn capability_secrecy_model() -> Model {
 /// `bound` first (publish from inside `spawn` after `bind`).
 ///
 /// Invariant `PublishImpliesBound`: `published ⟹ bound`. `ty` proves the ordered
-/// discipline and catches the pre-bind publish.
+/// discipline and catches the pre-bind publish. The shipping order is structural:
+/// aterm-gui's `control::publish_discovery` consumes the `BoundControl` only the
+/// bind produces, names the socket it was bound at, and hands back the listener
+/// `control::spawn` serves on — so publishing first, naming another socket, or
+/// serving without publishing are compile errors there. Tier-1: aterm-gui's
+/// `publish_ordering_conformance` projects each real entry (on disk? does the
+/// socket it names answer a dial?) through the real bind, publication,
+/// register-seam publish and stale sweep; the pre-bind write is the step it
+/// rejects, and the real sweep deletes that entry.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -3220,33 +3245,36 @@ pub fn publish_ordering_model() -> Model {
 /// REPLY FIDELITY (the ERR-after-delivery defect). Once a forwarded verb has been
 /// DELIVERED to the child, a later relay-stage failure must NOT report `ERR` to
 /// the client (a false "didn't happen" for an op that did). `delivered` and
-/// `reported_err` are booleans; `Buggy = 1` reports the error after delivery (the
-/// original `connect_and_relay` returning the relay error), `Buggy = 0` swallows it
-/// (return Ok once delivered — the fix).
+/// `reported_err` are booleans. A failure BEFORE delivery — the dial or the
+/// handshake write — is reported (`DialFail`: the honest `ERR forward`), and
+/// nothing is delivered after it. `Buggy = 1` reports a relay failure after
+/// delivery (the original `connect_and_relay` returning the relay error),
+/// `Buggy = 0` swallows it (return Ok once delivered — the fix).
 ///
 /// Invariant `NoErrorAfterDelivery`: never both delivered AND error-reported.
+///
+/// Tier-1: aterm-gui's `reply_fidelity_conformance` drives the shipping
+/// `proxy::deliver_then_relay` against a real child socket — the real relay, a
+/// relay that fails after delivery, and a dial with no listener — projecting
+/// `delivered` from what the child actually read and `reported_err` from the
+/// result the caller turns into `ERR forward`.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn reply_fidelity_model() -> Model {
-    props::two_stage_leak(props::TwoStage {
-        name: "ReplyFidelity",
-        stage: "delivered",
-        stage_act: "Deliver",
-        stage_rhs: int(1),
-        leak: "reported_err",
-        leak_act: "RelayFail",
-        leak_guard: and_(
-            eq(var("delivered"), int(1)),
-            eq(var("reported_err"), int(0)),
-        ),
-        leak_rhs: if_(eq(cst("Buggy"), int(1)), int(1), int(0)),
-        inv: "NoErrorAfterDelivery",
-        inv_expr: or_(
-            eq(var("delivered"), int(0)),
-            eq(var("reported_err"), int(0)),
-        ),
-    })
+    crate::ty_model! {
+        ReplyFidelity {
+            const Buggy = 0;
+            var delivered = 0;
+            var reported_err = 0;
+            action Deliver when (delivered == 0 && reported_err == 0) { delivered = 1; }
+            action DialFail when (delivered == 0 && reported_err == 0) { reported_err = 1; }
+            action RelayFail when (delivered == 1 && reported_err == 0) {
+                reported_err = if Buggy == 1 { 1 } else { 0 };
+            }
+            invariant NoErrorAfterDelivery: delivered == 0 || reported_err == 0;
+        }
+    }
 }
 
 /// **A FLICKERING PROGRAM NEVER TAKES THE CURSOR** — the anti-flap law of the

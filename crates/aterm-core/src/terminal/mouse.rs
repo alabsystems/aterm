@@ -10,26 +10,6 @@ use super::Terminal;
 use super::types::{MouseEncoding, MouseMode};
 use aterm_types::mouse::encode_mouse;
 
-/// Focus transition state for terminal focus reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FocusState {
-    /// Terminal focus was gained.
-    Focused,
-    /// Terminal focus was lost.
-    Unfocused,
-}
-
-impl From<bool> for FocusState {
-    fn from(focused: bool) -> Self {
-        if focused {
-            Self::Focused
-        } else {
-            Self::Unfocused
-        }
-    }
-}
-
 impl Terminal {
     // =========================================================================
     // Mouse event encoding — delegates to aterm_types::mouse for byte encoding
@@ -139,21 +119,6 @@ impl Terminal {
 
         let cb = dir.code() | modifiers;
         Some(encode_mouse(cb, col, row, self.modes.mouse_encoding, false))
-    }
-
-    /// Encode a focus state transition.
-    ///
-    /// Returns the escape sequence to send to the application, or `None` if
-    /// focus reporting is disabled.
-    #[must_use]
-    pub fn encode_focus_state(&self, focus_state: FocusState) -> Option<Vec<u8>> {
-        if !self.modes.focus_reporting {
-            return None;
-        }
-        Some(match focus_state {
-            FocusState::Focused => vec![0x1b, b'[', b'I'],
-            FocusState::Unfocused => vec![0x1b, b'[', b'O'],
-        })
     }
 
     /// Check if mouse tracking is enabled.

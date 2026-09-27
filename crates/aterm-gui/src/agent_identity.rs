@@ -118,7 +118,7 @@ pub(crate) fn ensure(name: &str, create: bool) -> io::Result<PathBuf> {
     let root = aterm_types::dirs::identities_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "no state root resolves (HOME and ATERM_STATE_HOME both unset)",
+            "no state root resolves (HOME is unset)",
         )
     })?;
     ensure_in(&root, name, create)
@@ -246,8 +246,7 @@ pub(crate) fn cmd_identities(store: &crate::session_store::Store, rest: &str) ->
             .collect()
     };
     let Some(root) = aterm_types::dirs::identities_dir() else {
-        return "ERR identities: no state root resolves (HOME and ATERM_STATE_HOME both unset)\n"
-            .to_string();
+        return "ERR identities: no state root resolves (HOME is unset)\n".to_string();
     };
     identities_reply(&root, &live, rest)
 }
@@ -528,25 +527,23 @@ mod tests {
     fn env_points_every_table_var_into_the_identity_dir() {
         let dir = PathBuf::from("/state/identities/worker");
         let env = env(&dir);
+        // The subdir is joined by the host's own separator (`\` on Windows),
+        // so the expectation is spelled through the same join.
+        let under = |sub: &str| dir.join(sub).to_string_lossy().into_owned();
         assert_eq!(
             env,
             vec![
-                (
-                    "CLAUDE_CONFIG_DIR".to_string(),
-                    "/state/identities/worker/.claude".to_string()
-                ),
-                (
-                    "CODEX_HOME".to_string(),
-                    "/state/identities/worker/.codex".to_string()
-                ),
+                ("CLAUDE_CONFIG_DIR".to_string(), under(".claude")),
+                ("CODEX_HOME".to_string(), under(".codex")),
             ]
         );
         assert_eq!(env.len(), aterm_primer::agent_homes().count());
     }
 
-    /// The public `ensure` resolves through `ATERM_STATE_HOME`, the knob a
-    /// headless instance keeps its state under — the identities root is
-    /// `<state>/identities`, and a name is a directory right below it.
+    /// The public `ensure` resolves through the state root (here the
+    /// development build's `ATERM_STATE_HOME` seam, what a test isolates with) —
+    /// the identities root is `<state>/identities`, and a name is a directory
+    /// right below it.
     #[test]
     fn ensure_resolves_the_identities_root_through_the_state_home() {
         let state = scratch("state");
@@ -772,6 +769,8 @@ mod tests {
     /// re-injected `CLAUDE_CONFIG_DIR=<root>/link/.claude`, pointing outside
     /// the identities tree, under a name the verb could neither list nor
     /// forget. Now both read the same [`identity_dir`]: a real directory.
+    /// Unix only: the fixture is a symlink.
+    #[cfg(unix)]
     #[test]
     fn restore_and_the_verb_agree_on_what_an_identity_is() {
         let root = scratch("symlink").join("identities");
@@ -779,10 +778,7 @@ mod tests {
         let elsewhere = root.parent().unwrap().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join(".claude")).unwrap();
         std::fs::create_dir_all(elsewhere.join(".codex")).unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&elsewhere, root.join("link")).unwrap();
-        #[cfg(not(unix))]
-        return;
         assert_eq!(
             identities_reply(&root, &[], "link"),
             "ERR no such identity link\n",

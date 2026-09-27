@@ -36,6 +36,18 @@ Bundled fonts and font fixtures retain their own terms:
 - JetBrains Mono test fixture: SIL Open Font License 1.1 in
   `crates/aterm-render/tests/fixtures/OFL.txt`.
 
+The bundled TERMINAL FONT STACK (non-macOS builds; `crates/aterm-render/
+assets/bundled/`, each face beside its own notice, held to the same
+`build.rs` grant gate as the display faces):
+
+- JetBrains Mono 2.304 (Regular, Bold, Italic, Bold Italic), The JetBrains
+  Mono Project Authors: SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/bundled/JetBrainsMono-*.LICENSE.txt`.
+- Noto Sans Symbols 2 2.008, The Noto Project Authors: SIL Open Font License
+  1.1 in `crates/aterm-render/assets/bundled/NotoSansSymbols2-Regular.LICENSE.txt`.
+- Noto Sans Math 3.000, Google LLC: SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/bundled/NotoSansMath-Regular.LICENSE.txt`.
+
 The bundled DISPLAY FACES (`display_font` / the `display:` family scheme) live
 in `crates/aterm-render/assets/game/`, each beside its own notice. A face may
 only ship here under an OFL, Apache-2.0, or MIT grant — `crates/aterm-render/

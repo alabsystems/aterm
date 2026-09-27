@@ -36,9 +36,9 @@
 //!   about a fifth of the row long ([`COMET_PERMILLE`]) — a tail rising as
 //!   the square of its length into a hot head, and a soft leading edge — that
 //!   enters through the window's left edge and leaves through its right, one
-//!   breathing crossing per [`COMET_PERIOD`], the next entering as it leaves;
-//!   with it the braille [`SPINNER`] in the glyph cell every
-//!   [`SPIN_FRAMES`] frames. The bar for work with a fill: its edge at the
+//!   breathing crossing per [`COMET_PERIOD`], the next entering as it leaves
+//!   (the glyph cell keeps the row's own glyph: the comet already moves, so
+//!   the braille spinner went — ruling 251). The bar for work with a fill: its edge at the
 //!   data (sub-cell coverage), a data glide and a travelling glint (dimmed,
 //!   the glint parked, while the bytes are stalled). The echo's fill, glow
 //!   and fade on completion, over the whole row.
@@ -55,9 +55,10 @@
 use crate::center::{Echo, EchoKind};
 use crate::glass::Fnv;
 use crate::{
-    ANIM_FRAME, COMET_HEAD_LIFT, COMET_LEAD_PERMILLE, COMET_PERIOD, COMET_PERMILLE, Duration,
-    ECHO_FADE, ECHO_FAULT_FLASH, ECHO_FILL, ECHO_GLOW, FILL_GLIDE, GLINT_DELAY, GLINT_PEAK,
-    GLINT_PERIOD, GLINT_RADIUS_PERMILLE, GLINT_TRAVEL, Instant, SPIN_FRAMES, SPINNER,
+    COMET_HEAD_LIFT, COMET_LEAD_PERMILLE, COMET_PERIOD, COMET_PERMILLE, Duration, ECHO_DRAIN,
+    ECHO_FADE, ECHO_FAULT_CROSS, ECHO_FAULT_FLASH, ECHO_SWEEP, ECHO_SWEEP_PERMILLE, FILL_GLIDE,
+    FILL_GLIDE_MAX, FILL_GLIDE_PER_POINT, GLINT_DELAY, GLINT_MIN_HALF_CELLS, GLINT_PEAK,
+    GLINT_PERIOD, GLINT_RADIUS_PERMILLE, GLINT_TRAVEL, Instant,
 };
 
 /// The whole row as a fraction: Q16, `0` at the window's left edge and `ROW`
@@ -123,7 +124,7 @@ impl Tone {
         warn: 0,
     };
     /// A full cell.
-    pub const FULL: Tone = Tone {
+    pub(crate) const FULL: Tone = Tone {
         fill: 255,
         lift: 0,
         warn: 0,
@@ -144,12 +145,6 @@ impl Tone {
         lift: 0,
         warn: 0,
     };
-
-    /// Whether the tone lights anything.
-    #[must_use]
-    pub const fn lit(self) -> bool {
-        self.fill > 0 || self.lift > 0 || self.warn > 0
-    }
 }
 
 /// A [`Tone`] read to 1/256 of a step in each channel (`0..=255·256`) —
@@ -199,16 +194,35 @@ pub struct Surface {
     /// whole palette inks (High Contrast). Otherwise the MEAN over the span:
     /// sub-cell coverage.
     pub flat: bool,
+    /// Where a determinate fill ENDS (Q16 of the row), when it ends inside
+    /// the row: the one hard edge of the surface, which the host draws as a
+    /// crisp line through the letters — the fill's ink left of it, the
+    /// track's right of it (design ruling 242). `None` for a comet, an empty
+    /// track and a whole fill.
+    pub edge: Option<u32>,
+    /// The surface is a RAIL (design ruling 243): a measured LEVEL, drawn in
+    /// the row's lowest pixels only (below the descenders, in the warn hue)
+    /// from 0 to its level across the whole window, with the words on the
+    /// band's own ground above it. Never a fill the words ride.
+    pub rail: bool,
 }
 
 impl Surface {
     /// The whole row in one tone.
     #[must_use]
-    pub fn uniform(tone: Tone, flat: bool) -> Self {
+    pub(crate) fn uniform(tone: Tone, flat: bool) -> Self {
         Self {
             stops: vec![Stop { at: 0, tone }, Stop { at: ROW, tone }],
             flat,
+            ..Self::default()
         }
+    }
+
+    /// This surface as a RAIL ([`Surface::rail`]).
+    #[must_use]
+    pub fn as_rail(mut self) -> Self {
+        self.rail = true;
+        self
     }
 
     /// Whether the row has no meter and no track.
@@ -220,7 +234,7 @@ impl Surface {
     /// The tone at `at` (Q16 of the row); at a hard edge, the tone to its
     /// right. [`Tone::TRACK`] on an empty surface.
     #[must_use]
-    pub fn tone_at(&self, at: u32) -> Tone {
+    pub(crate) fn tone_at(&self, at: u32) -> Tone {
         let s = &self.stops;
         let Some(first) = s.first() else {
             return Tone::TRACK;
@@ -350,16 +364,39 @@ impl Surface {
         (0..w).map(|c| self.span(c, c + 1, w)).collect()
     }
 
-    /// Every lit stop's tone with its WARN mixed to `w` — the empty track
-    /// keeps its own tone (a warn-tinted track read as mud, review
-    /// 2026-09-23) unless `track_too` (a busy row's echo, whose whole row is
-    /// the only surface there is to flash).
+    /// The FAULT WASH at `u` (0–255, ruling 244): every stop's fill ink
+    /// hands its coverage over to the warn ink — `fill · (1 − u)` of the fill
+    /// and `fill · u` of warn — a premultiplied cross-fade, so every point
+    /// stays inside the linear-light hull of the track, the fill and warn and
+    /// never passes through another hue (the `OkLCh` turn of ruling 156 sent a
+    /// blue fill through magenta and ochre, and a green one through lime).
+    /// The empty track keeps its own tone.
     #[must_use]
-    fn warned(mut self, w: u8, track_too: bool) -> Self {
+    fn washed(mut self, u: u8) -> Self {
         for s in &mut self.stops {
-            if s.tone != Tone::TRACK || track_too {
-                s.tone.warn = w;
-            }
+            let f = u16::from(s.tone.fill);
+            let w = u8::try_from((f * u16::from(u) + 127) / 255).unwrap_or(255);
+            s.tone = Tone {
+                fill: s.tone.fill - w.min(s.tone.fill),
+                lift: 0,
+                warn: w,
+            };
+        }
+        self
+    }
+
+    /// Every stop drained toward the track by `keep` (0–255 of its tone
+    /// kept): a busy row's frozen comet at its Fault (ruling 244).
+    #[must_use]
+    fn drained(mut self, keep: u8) -> Self {
+        let k = u16::from(keep);
+        let sc = |v: u8| u8::try_from((u16::from(v) * k + 127) / 255).unwrap_or(255);
+        for s in &mut self.stops {
+            s.tone = Tone {
+                fill: sc(s.tone.fill),
+                lift: sc(s.tone.lift),
+                warn: sc(s.tone.warn),
+            };
         }
         self
     }
@@ -436,7 +473,11 @@ fn clipped(points: &[(i64, Tone)], flat: bool) -> Surface {
         }
     };
     stops.push(Stop { at: ROW, tone: end });
-    Surface { stops, flat }
+    Surface {
+        stops,
+        flat,
+        ..Surface::default()
+    }
 }
 
 /// What a row's motion is doing — the descriptor the tests read.
@@ -445,12 +486,10 @@ pub enum Anim {
     /// No motion, no indicator.
     #[default]
     None,
-    /// The comet and the spinner.
+    /// The comet.
     Comet {
         /// Milliseconds into the current comet's crossing.
         phase_ms: u32,
-        /// The spinner's frame, an index into [`SPINNER`].
-        spin: u8,
     },
     /// A determinate bar.
     Bar {
@@ -484,8 +523,8 @@ pub struct RowMotion {
     pub eta: Option<String>,
     /// An echo's fade: 0 opaque … 255 gone.
     pub fade: u8,
-    /// The glyph cell's paint when it is not the row's own glyph: the
-    /// spinner's frame on a moving busy row, ✓ / ⚠ on an echo.
+    /// The glyph cell's paint when it is not the row's own glyph: ✓ / ⚠ on
+    /// an echo.
     pub glyph: Option<char>,
     /// What the motion is.
     pub anim: Anim,
@@ -535,7 +574,7 @@ const ONE: u64 = 65_536;
 
 /// Smoothstep: `p²(3 − 2p)`.
 #[must_use]
-pub fn smooth(p: u32) -> u32 {
+pub(crate) fn smooth(p: u32) -> u32 {
     let p = u64::from(p).min(ONE);
     let p2 = (p * p) >> 16;
     u32::try_from((p2 * (3 * ONE - 2 * p)) >> 16).unwrap_or(u32::MAX)
@@ -546,7 +585,7 @@ pub fn smooth(p: u32) -> u32 {
 /// and never lingers, and its pace is the same at both ends, so one crossing
 /// hands over to the next without a jolt.
 #[must_use]
-pub fn breath(p: u32) -> u32 {
+pub(crate) fn breath(p: u32) -> u32 {
     let p = u64::from(p).min(ONE);
     let v = (47_186 * p + 18_350 * u64::from(smooth(u32::try_from(p).unwrap_or(0)))) >> 16;
     u32::try_from(v).unwrap_or(u32::MAX)
@@ -554,14 +593,25 @@ pub fn breath(p: u32) -> u32 {
 
 /// Ease-out cubic: `1 − (1 − u)³`.
 #[must_use]
-pub fn ease_out_cubic(u: u32) -> u32 {
+#[cfg(test)]
+pub(crate) fn ease_out_cubic(u: u32) -> u32 {
     let v = ONE - u64::from(u).min(ONE);
     u32::try_from(ONE - ((((v * v) >> 16) * v) >> 16)).unwrap_or(u32::MAX)
 }
 
+/// Ease-out quadratic: `1 − (1 − u)²` — a glide's curve (design ruling
+/// 245): its peak speed is twice its mean, at the start, and it lands with
+/// no overshoot.
+#[must_use]
+pub fn ease_out_quad(u: u32) -> u32 {
+    let v = ONE - u64::from(u).min(ONE);
+    u32::try_from(ONE - ((v * v) >> 16)).unwrap_or(u32::MAX)
+}
+
 /// The bell: `4u(1 − u)`, 0 at both ends and 1 in the middle.
 #[must_use]
-pub fn bell(u: u32) -> u32 {
+#[cfg(test)]
+pub(crate) fn bell(u: u32) -> u32 {
     let u = u64::from(u).min(ONE);
     u32::try_from((4 * u * (ONE - u)) >> 16).unwrap_or(u32::MAX)
 }
@@ -589,21 +639,42 @@ fn permille_q16(p: u32) -> i64 {
 
 // ---- the recipes --------------------------------------------------------------
 
-/// The shown fill of a data jump from `from` to `to`, `t` into its
-/// [`FILL_GLIDE`] — eased out, so the bar lands softly.
+/// How long a glide from `from` to `to` (permille) takes (design ruling
+/// 245): [`FILL_GLIDE`] plus [`FILL_GLIDE_PER_POINT`] for every percentage
+/// point it travels, at most [`FILL_GLIDE_MAX`] — so a big jump is not a
+/// staircase of four or five hops, and a small one still lands quickly.
 #[must_use]
-pub fn glide(from: u16, to: u16, t: Duration) -> u16 {
-    let u = u64::from(ease_out_cubic(frac(t, FILL_GLIDE)));
+pub fn glide_span(from: u16, to: u16) -> Duration {
+    let points_x10 = u64::from(from.abs_diff(to));
+    let per = u64::try_from(FILL_GLIDE_PER_POINT.as_micros()).unwrap_or(u64::MAX);
+    let extra = Duration::from_micros(per.saturating_mul(points_x10) / 10);
+    (FILL_GLIDE + extra).min(FILL_GLIDE_MAX)
+}
+
+/// The shown fill of a data jump from `from` to `to`, `t` into its
+/// [`glide_span`] — eased out (quadratic), so the bar lands softly and moves
+/// monotonically toward the data.
+#[must_use]
+pub(crate) fn glide(from: u16, to: u16, t: Duration) -> u16 {
+    let u = u64::from(ease_out_quad(frac_fine(t, glide_span(from, to))));
     let (from, to) = (i64::from(from), i64::from(to));
     let v = from + ((to - from) * i64::try_from(u).unwrap_or(0)) / 65_536;
     u16::try_from(v.clamp(0, 1000)).unwrap_or(1000)
+}
+
+/// [`frac`] to the microsecond: a glide is read on the display's own
+/// cadence, whose period is not a whole number of milliseconds.
+fn frac_fine(t: Duration, span: Duration) -> u32 {
+    let span = span.as_micros().max(1);
+    let t = t.as_micros().min(span);
+    u32::try_from(t * u128::from(ONE) / span).unwrap_or(u32::MAX)
 }
 
 /// The comet's head, Q16 of the row, `age` into its crossing: from one
 /// leading edge LEFT of the row (nothing lit) to one tail RIGHT of it
 /// (nothing lit), breathing, over [`COMET_PERIOD`].
 #[must_use]
-pub fn comet_head(age: Duration) -> i64 {
+pub(crate) fn comet_head(age: Duration) -> i64 {
     let lead = permille_q16(COMET_LEAD_PERMILLE);
     let tail = permille_q16(COMET_PERMILLE - COMET_LEAD_PERMILLE);
     let travel = i64::from(ROW) + lead + tail;
@@ -676,34 +747,68 @@ fn tail_tone(k: i64) -> Tone {
     }
 }
 
-/// The glint's lift at Q16 position `c` for a glint centred at `g`: a
-/// smooth bump `(1 − d²/r²)²` of radius [`GLINT_RADIUS_PERMILLE`].
-fn glint_lift(c: i64, g: i64) -> u8 {
-    let r = permille_q16(GLINT_RADIUS_PERMILLE).max(1);
-    let d = (c - g).abs();
-    if d >= r {
+/// The glint's radius, Q16 of the row, on a row `cols` columns wide:
+/// [`GLINT_RADIUS_PERMILLE`], but never under [`GLINT_MIN_HALF_CELLS`] half
+/// cells (`cols` 0: no floor).
+#[must_use]
+pub fn glint_radius(cols: usize) -> i64 {
+    let r = permille_q16(GLINT_RADIUS_PERMILLE);
+    let cols = i64::try_from(cols).unwrap_or(i64::MAX);
+    if cols == 0 {
+        return r.max(1);
+    }
+    let floor = i64::from(ROW) * i64::from(GLINT_MIN_HALF_CELLS) / (2 * cols);
+    r.max(floor).max(1)
+}
+
+/// A raised-cosine lift of radius `r` (Q16) at distance `d` from its centre,
+/// scaled to `peak` (0–255): `peak · ½(1 + cos(π·d/r))`, 0 from `r` out —
+/// a bump with no corner anywhere, so the lift reads as light moving along
+/// the bar, not as a smudge with edges (design ruling 242). Integer: the
+/// cosine is a quintic fit, exact at both ends and the middle.
+fn raised_cosine(d: i64, r: i64, peak: u8) -> u8 {
+    let d = d.abs();
+    if d >= r || r <= 0 {
         return 0;
     }
-    let q = 256 - d * d * 256 / (r * r);
-    u8::try_from((i64::from(GLINT_PEAK) * ((q * q) >> 8)) >> 8).unwrap_or(255)
+    // x = d/r in Q16; ½(1 + cos πx) = 1 − smootherstep-like fit: use the
+    // exact identity ½(1 + cos πx) = cos²(πx/2), with cos(πx/2) from its
+    // Taylor series to x⁶ (error < 4e-4 over [0, 1]).
+    let x = (d << 16) / r; // 0..65536
+    let y = (x * 102_944) >> 16; // πx/2 in Q16 (π/2 = 1.5708 → 102 944)
+    let y2 = (y * y) >> 16;
+    let y4 = (y2 * y2) >> 16;
+    let y6 = (y4 * y2) >> 16;
+    let c = 65_536 - y2 / 2 + y4 / 24 - y6 / 720;
+    let c = c.clamp(0, 65_536);
+    let c2 = (c * c) >> 16;
+    u8::try_from((i64::from(peak) * c2 + 32_768) >> 16).unwrap_or(peak)
 }
 
 /// Whether a bar at `shown` carries a glint: a fill of at least half the
 /// glint's radius (on a shorter fill its centre is never on it).
 #[must_use]
-pub fn bar_glints(shown: u16) -> bool {
+pub(crate) fn bar_glints(shown: u16) -> bool {
     u32::from(shown) * 2 >= GLINT_RADIUS_PERMILLE
 }
 
 /// A determinate bar at `shown` permille OF THE ROW (ruling 55: 0 % an empty
 /// track, 100 % the window edge to edge, 50 % its middle): the fill ink from
-/// the row's left edge to the data, a hard edge there — the cell under it
-/// takes its coverage through [`Surface::span`] — and the track beyond.
-/// `glint` is how far into its travel a glint is (graded bars only; it lifts
-/// the fill, never the track).
+/// the row's left edge to the data, a hard edge there — the host draws it as
+/// a crisp line through the letters ([`Surface::edge`], ruling 242) — and
+/// the track beyond. `glint` is how far into its travel a glint is (graded
+/// bars only; it lifts the fill, never the track).
 #[must_use]
 pub fn bar(shown: u16, glint: Option<Duration>, graded: bool) -> Surface {
-    bar_in(shown, glint, graded, Tone::FULL)
+    bar_at(permille_q16(u32::from(shown)), glint, graded, 0)
+}
+
+/// [`bar`] with its edge at `edge` (Q16 of the row — a glide is read finer
+/// than a permille, ruling 245) on a row `cols` columns wide (the glint's
+/// least width, [`glint_radius`]; 0 for none).
+#[must_use]
+pub fn bar_at(edge: i64, glint: Option<Duration>, graded: bool, cols: usize) -> Surface {
+    bar_in(edge, glint, graded, Tone::FULL, cols)
 }
 
 /// The bar of a download whose bytes have STALLED: the fill dimmed
@@ -712,35 +817,52 @@ pub fn bar(shown: u16, glint: Option<Duration>, graded: bool) -> Surface {
 /// full ink: High Contrast discards gradation, and its words carry the
 /// stall.
 #[must_use]
-pub fn stalled_bar(shown: u16, graded: bool) -> Surface {
+pub(crate) fn stalled_bar(shown: u16, graded: bool) -> Surface {
     let tone = if graded { Tone::STALLED } else { Tone::FULL };
-    bar_in(shown, None, graded, tone)
+    bar_in(permille_q16(u32::from(shown)), None, graded, tone, 0)
 }
 
-fn bar_in(shown: u16, glint: Option<Duration>, graded: bool, ink: Tone) -> Surface {
-    let e = permille_q16(u32::from(shown));
+/// A glint's lift profile over `[0, e)`: the bump at `g` of radius `r`,
+/// sampled finely enough that a cell sees the curve and not its chords.
+fn lift_points(g: i64, r: i64, e: i64, peak: u8, ink: Tone) -> Vec<(i64, Tone)> {
+    let mut points = Vec::with_capacity(LIFT_STOPS * 2 + 3);
+    let n = i64::try_from(LIFT_STOPS).unwrap_or(16);
+    for k in -n..=n {
+        let x = g + r * k / n;
+        if x > 0 && x < e {
+            points.push((
+                x,
+                Tone {
+                    lift: raised_cosine(x - g, r, peak),
+                    ..ink
+                },
+            ));
+        }
+    }
+    points
+}
+
+/// Chords per half of a glint's bump.
+const LIFT_STOPS: usize = 16;
+
+fn bar_in(e: i64, glint: Option<Duration>, graded: bool, ink: Tone, cols: usize) -> Surface {
     let row = i64::from(ROW);
-    let g = glint.filter(|_| graded && bar_glints(shown)).map(|t| {
-        let r = permille_q16(GLINT_RADIUS_PERMILLE);
-        let u = i64::from(smooth(frac(t, GLINT_TRAVEL)));
-        -r + ((u * (e + 2 * r)) >> 16)
-    });
-    let tone = |c: i64| match g {
-        Some(g) => Tone {
-            lift: glint_lift(c, g),
-            ..ink
-        },
-        None => ink,
+    let e = e.clamp(0, row);
+    let r = glint_radius(cols);
+    let g = glint
+        .filter(|_| graded && e * 2 >= r.min(permille_q16(GLINT_RADIUS_PERMILLE)))
+        .map(|t| {
+            let u = i64::from(smooth(frac(t, GLINT_TRAVEL)));
+            -r + ((u * (e + 2 * r)) >> 16)
+        });
+    let lift_at = |c: i64| g.map_or(0, |g| raised_cosine(c - g, r, GLINT_PEAK));
+    let tone = |c: i64| Tone {
+        lift: lift_at(c),
+        ..ink
     };
     let mut points: Vec<(i64, Tone)> = vec![(0, tone(0))];
     if let Some(g) = g {
-        let r = permille_q16(GLINT_RADIUS_PERMILLE);
-        for k in -8..=8i64 {
-            let x = g + r * k / 8;
-            if x > 0 && x < e {
-                points.push((x, tone(x)));
-            }
-        }
+        points.extend(lift_points(g, r, e, GLINT_PEAK, ink));
     }
     if e >= row {
         points.push((row, tone(row)));
@@ -759,47 +881,103 @@ fn bar_in(shown: u16, glint: Option<Duration>, graded: bool, ink: Tone) -> Surfa
             tone: t,
         })
         .collect();
-    Surface { stops, flat }
+    Surface {
+        stops,
+        flat,
+        edge: (e > 0 && e < row).then(|| u32::try_from(e).unwrap_or(0)),
+        rail: false,
+    }
+}
+
+/// A full bar with ONE conclusive sweep `t` into its [`ECHO_SWEEP`]: a glint
+/// about four cells wide at 80 columns ([`ECHO_SWEEP_PERMILLE`], never under
+/// a glint's least width) entering through the window's left edge and
+/// leaving through its right, eased like the glint (ruling 244).
+fn swept(t: Duration, cols: usize) -> Surface {
+    let row = i64::from(ROW);
+    let r = permille_q16(ECHO_SWEEP_PERMILLE).max(glint_radius(cols).min(permille_q16(60)));
+    let u = i64::from(smooth(frac_fine(t, ECHO_SWEEP)));
+    let g = -r + ((u * (row + 2 * r)) >> 16);
+    let mut points: Vec<(i64, Tone)> = vec![(
+        0,
+        Tone {
+            lift: raised_cosine(g, r, GLINT_PEAK),
+            ..Tone::FULL
+        },
+    )];
+    points.extend(lift_points(g, r, row, GLINT_PEAK, Tone::FULL));
+    points.push((
+        row,
+        Tone {
+            lift: raised_cosine(row - g, r, GLINT_PEAK),
+            ..Tone::FULL
+        },
+    ));
+    Surface {
+        stops: points
+            .into_iter()
+            .map(|(x, tone)| Stop {
+                at: u32::try_from(x.clamp(0, row)).unwrap_or(0),
+                tone,
+            })
+            .collect(),
+        ..Surface::default()
+    }
 }
 
 /// A busy row's still form: the unlit track (main's still busy row).
 #[must_use]
-pub fn track(graded: bool) -> Surface {
+pub(crate) fn track(graded: bool) -> Surface {
     Surface::uniform(Tone::TRACK, !graded)
 }
 
-/// The spinner's glyph at `q` for a motion epoch `epoch`: one step of
-/// [`SPINNER`] every [`SPIN_FRAMES`] frames of the grid (main's 125 ms
-/// cadence).
+/// A measured LEVEL's surface (design ruling 243): its RAIL at `level`
+/// (Q16 of the row) — the bar's geometry, drawn by the host in the row's
+/// lowest pixels in the warn hue, never as a fill the words ride, and never
+/// glinting.
 #[must_use]
-pub fn spin_at(q: Instant, epoch: Instant) -> u8 {
-    let frames = q.saturating_duration_since(epoch).as_millis() / ANIM_FRAME.as_millis().max(1);
-    let step = frames / u128::from(SPIN_FRAMES.max(1));
-    u8::try_from(step % SPINNER.len() as u128).unwrap_or(0)
+pub fn level_rail(level: i64, graded: bool) -> Surface {
+    bar_in(level, None, graded, Tone::FULL, 0).as_rail()
+}
+
+/// How long an echo holds its slot (ruling 244): a Complete's fill glide
+/// ([`glide_span`] from where the bar stood to the window's edge), its
+/// sweep and its fade; a Fault's wash and fade; a Vanish's fade.
+#[must_use]
+pub fn echo_span(kind: EchoKind, from_permille: u16, indeterminate: bool) -> Duration {
+    match kind {
+        EchoKind::Complete => {
+            let from = if indeterminate { 0 } else { from_permille };
+            glide_span(from, 1000) + ECHO_SWEEP + ECHO_FADE
+        }
+        EchoKind::Fault => ECHO_FAULT_FLASH + ECHO_FADE,
+        EchoKind::Vanish => ECHO_FADE,
+    }
 }
 
 /// A completion echo `t` into its span: the row's surface and the fade. The
 /// band's end of its own indicator — not a row, not pressable, not
-/// announced — over the WHOLE row (ruling 141).
+/// announced — over the WHOLE row (ruling 141, amended by ruling 244).
 ///
-/// * Complete, moving and graded: the fill wipes to the window's right edge
-///   ([`ECHO_FILL`]), blooms toward the glint ([`ECHO_GLOW`], a bell), then
-///   fades ([`ECHO_FADE`], ease-in).
-/// * Fault: the last bar's FILL (a busy row: the whole row) rises to the
-///   fault hue ([`ECHO_FAULT_FLASH`], ease-out) and holds it through the
-///   fade — a failure never ends on a success-coloured bar, and the empty
-///   track keeps its own tone.
-/// * Vanish: the last bar fades.
-/// * A busy row's "last bar" is its comet, running on from where the row
-///   retired ([`Echo::comet_since`]) under a moving graded look — the echo's
-///   first frame is the next live one, never a bare track (ruling 162) — and
-///   the unlit track otherwise.
-/// * Still: a full bar held (Complete), the fault tint held (Fault), blank
-///   (Vanish).
+/// * Complete, moving and graded: the fill glides to the window's right
+///   edge ([`glide_span`], the data glide's own curve), ONE conclusive sweep
+///   crosses the whole row ([`ECHO_SWEEP`]), then the row fades
+///   ([`ECHO_FADE`], ease-in).
+/// * Fault on a bar: the fill cross-fades to a warn WASH over what it
+///   covered ([`ECHO_FAULT_CROSS`], premultiplied — never through another
+///   hue), holds it to [`ECHO_FAULT_FLASH`], and fades; the empty track
+///   keeps its own tone.
+/// * Fault on a busy row: its comet FREEZES where the work failed and drains
+///   to the track ([`ECHO_DRAIN`]); no warn on the surface at all — the ⚠ and
+///   `failed` carry it, on a neutral row.
+/// * Vanish: the last bar fades; a busy row's comet runs on from where the
+///   row retired ([`Echo::comet_since`], ruling 162) while it fades.
+/// * Still: a full bar held (Complete), the wash held (a bar's Fault), the
+///   track (a busy Fault), blank (Vanish).
 /// * Flat: no lift, no tint and no fade; Complete wipes with a hard edge,
 ///   then holds.
 #[must_use]
-pub fn echo(e: &Echo, t: Duration, look: Look) -> (Surface, u8) {
+pub(crate) fn echo(e: &Echo, t: Duration, look: Look, cols: usize) -> (Surface, u8) {
     let from = if e.indeterminate { 0 } else { e.from_permille };
     let last = || {
         if e.indeterminate {
@@ -812,57 +990,65 @@ pub fn echo(e: &Echo, t: Duration, look: Look) -> (Surface, u8) {
         }
     };
     let fade_over = |t: Duration, start: Duration| -> u8 {
-        let u = u64::from(frac(t.saturating_sub(start), ECHO_FADE));
+        let u = u64::from(frac_fine(t.saturating_sub(start), ECHO_FADE));
         u8::try_from((255 * ((u * u) >> 16)) >> 16).unwrap_or(255)
     };
     let full = || bar(1000, None, look.graded);
+    let wipe_span = glide_span(from, 1000);
+    let wipe = |t: Duration| bar_at(glide_q16(from, 1000, t), None, look.graded, cols);
     match (e.kind, look.pace, look.graded) {
         (EchoKind::Complete, Pace::Moving, true) => {
-            if t < ECHO_FILL {
-                (bar(glide(from, 1000, t), None, true), 0)
-            } else if t < ECHO_FILL + ECHO_GLOW {
-                let u = frac(t.saturating_sub(ECHO_FILL), ECHO_GLOW);
-                let lift = u8::try_from((200 * u64::from(bell(u))) >> 16).unwrap_or(200);
-                let tone = Tone {
-                    fill: 255,
-                    lift,
-                    warn: 0,
-                };
-                (Surface::uniform(tone, false), 0)
+            if t < wipe_span {
+                (wipe(t), 0)
+            } else if t < wipe_span + ECHO_SWEEP {
+                (swept(t.saturating_sub(wipe_span), cols), 0)
             } else {
-                (full(), fade_over(t, ECHO_FILL + ECHO_GLOW))
+                (full(), fade_over(t, wipe_span + ECHO_SWEEP))
             }
         }
         (EchoKind::Complete, Pace::Moving, false) => {
-            if t < ECHO_FILL {
-                (bar(glide(from, 1000, t), None, false), 0)
+            if t < wipe_span {
+                (wipe(t), 0)
             } else {
                 (full(), 0)
             }
         }
         (EchoKind::Complete, Pace::Still, _) => (full(), 0),
         (EchoKind::Fault | EchoKind::Vanish, _, false) => (last(), 0),
-        (EchoKind::Fault, Pace::Still, true) => (last().warned(255, e.indeterminate), 0),
+        (EchoKind::Fault, Pace::Still, true) if e.indeterminate => (track(true), 0),
+        (EchoKind::Fault, Pace::Still, true) => (last().washed(255), 0),
+        (EchoKind::Fault, Pace::Moving, true) if e.indeterminate => {
+            // Frozen where it failed (never running on), drained to the
+            // track: the row goes neutral and the ⚠ and `failed` say it.
+            let frozen = match e.comet_since {
+                Some(since) => comet(since, true),
+                None => track(true),
+            };
+            let keep = 255 - scale(255, frac_fine(t, ECHO_DRAIN));
+            (frozen.drained(keep), fade_over(t, ECHO_FAULT_FLASH))
+        }
         (EchoKind::Fault, Pace::Moving, true) => {
-            if t < ECHO_FAULT_FLASH {
-                let w = scale(255, ease_out_cubic(frac(t, ECHO_FAULT_FLASH)));
-                (last().warned(w, e.indeterminate), 0)
-            } else {
-                (
-                    last().warned(255, e.indeterminate),
-                    fade_over(t, ECHO_FAULT_FLASH),
-                )
-            }
+            let u = scale(255, frac_fine(t, ECHO_FAULT_CROSS));
+            (last().washed(u), fade_over(t, ECHO_FAULT_FLASH))
         }
         (EchoKind::Vanish, Pace::Moving, true) => (last(), fade_over(t, Duration::ZERO)),
         (EchoKind::Vanish, Pace::Still, true) => (last(), 255),
     }
 }
 
+/// [`glide`] in Q16 of the row, unquantized: the edge a glide shows at `t`,
+/// monotone toward `to` (ruling 245).
+#[must_use]
+pub fn glide_q16(from: u16, to: u16, t: Duration) -> i64 {
+    let u = i64::from(ease_out_quad(frac_fine(t, glide_span(from, to))));
+    let (a, b) = (permille_q16(u32::from(from)), permille_q16(u32::from(to)));
+    a + (((b - a) * u) >> 16)
+}
+
 /// The current comet's phase at `q` for a motion epoch `epoch` (the
 /// descriptor's; [`comet`] reads the whole span since the epoch).
 #[must_use]
-pub fn comet_phase(q: Instant, epoch: Instant) -> Duration {
+pub(crate) fn comet_phase(q: Instant, epoch: Instant) -> Duration {
     let since = q.saturating_duration_since(epoch).as_millis();
     Duration::from_millis(u64::try_from(since % COMET_PERIOD.as_millis()).unwrap_or(0))
 }
@@ -870,7 +1056,7 @@ pub fn comet_phase(q: Instant, epoch: Instant) -> Duration {
 /// How far into its travel the glint is at `q`, or `None` while it rests
 /// (or before its first travel, [`GLINT_DELAY`] after the epoch).
 #[must_use]
-pub fn glint_at(q: Instant, epoch: Instant) -> Option<Duration> {
+pub(crate) fn glint_at(q: Instant, epoch: Instant) -> Option<Duration> {
     let since = q.saturating_duration_since(epoch);
     let after = since.checked_sub(GLINT_DELAY)?;
     let gph = Duration::from_millis(
@@ -894,7 +1080,7 @@ pub fn next_glint_start(q: Instant, epoch: Instant) -> Instant {
 
 /// `ms32` of a duration, for the descriptors.
 #[must_use]
-pub fn anim_ms(d: Duration) -> u32 {
+pub(crate) fn anim_ms(d: Duration) -> u32 {
     ms32(d)
 }
 
@@ -913,10 +1099,25 @@ mod tests {
         assert_eq!(bell(0), 0);
         assert_eq!(bell(65_536), 0);
         assert_eq!(bell(32_768), 65_536);
+        assert_eq!(ease_out_quad(0), 0);
+        assert_eq!(ease_out_quad(65_536), 65_536);
+        assert_eq!(ease_out_quad(32_768), 49_152, "three quarters at half time");
+        let span = glide_span(100, 900);
+        assert_eq!(span, FILL_GLIDE_MAX, "80 points: 180 + 560 ms, capped");
         assert_eq!(glide(100, 900, Duration::ZERO), 100);
-        assert_eq!(glide(100, 900, FILL_GLIDE), 900);
-        assert!(glide(100, 900, FILL_GLIDE / 2) > 500, "eased out");
-        assert_eq!(glide(900, 100, FILL_GLIDE), 100, "down too");
+        assert_eq!(glide(100, 900, span), 900);
+        assert!(glide(100, 900, span / 2) > 500, "eased out");
+        assert_eq!(glide(900, 100, span), 100, "down too");
+        // The span scales with the distance (ruling 245).
+        assert_eq!(glide_span(500, 500), FILL_GLIDE);
+        assert_eq!(glide_span(0, 100), Duration::from_millis(250));
+        assert_eq!(glide_span(0, 500), Duration::from_millis(530));
+        assert_eq!(
+            glide_span(600, 100),
+            Duration::from_millis(530),
+            "both ways"
+        );
+        assert_eq!(glide_span(0, 1000), FILL_GLIDE_MAX);
         // Breath's velocity: never zero, never more than 1.14 of the mean.
         let mut prev = 0u32;
         for p in (1024..=65_536).step_by(1024) {
@@ -1021,6 +1222,8 @@ mod tests {
     #[test]
     fn a_span_is_the_mean_of_the_profile_over_it() {
         let ramp = Surface {
+            edge: None,
+            rail: false,
             stops: vec![
                 Stop {
                     at: 0,
@@ -1052,14 +1255,18 @@ mod tests {
         let s = stalled_bar(620, true);
         assert!(s.stops.iter().any(|p| p.tone == Tone::STALLED));
         assert!(s.stops.iter().all(|p| p.tone.lift == 0));
-        assert_eq!(bar(620, None, true), bar_in(620, None, true, Tone::FULL));
+        assert_eq!(
+            bar(620, None, true),
+            bar_in(permille_q16(620), None, true, Tone::FULL, 0)
+        );
         assert!(!bar_glints(10) && bar_glints(15));
     }
 
     /// Every echo covers the whole row: a Complete echo's wipe ends at the
-    /// window's right edge (100 % is the window edge to edge), a busy row's
-    /// Fault flashes its whole row, and the track keeps its own tone on a
-    /// bar's Fault.
+    /// window's right edge (100 % is the window edge to edge); a bar's Fault
+    /// washes what the fill covered and the track keeps its own tone; a busy
+    /// row's Fault freezes its comet and drains it to the track, with no warn
+    /// on the surface at all (ruling 244).
     #[test]
     fn echoes_cover_the_whole_row() {
         let mut e = Echo {
@@ -1074,24 +1281,47 @@ mod tests {
             until: Instant::now(),
             slot: 0,
             load: None,
-            load_slot: false,
+            load_slot: crate::model::Loads::NONE,
         };
-        let (s, fade) = echo(&e, ECHO_FILL, Look::MOVING);
+        let (s, fade) = echo(&e, glide_span(300, 1000), Look::MOVING, 80);
         assert_eq!(fade, 0);
         assert!(s.cells(80).iter().all(|t| t.fill == 255), "{s:?}");
         e.kind = EchoKind::Fault;
-        let (s, _) = echo(&e, ECHO_FAULT_FLASH, Look::MOVING);
+        let (s, _) = echo(&e, ECHO_FAULT_FLASH, Look::MOVING, 80);
         let cells = s.cells(80);
-        assert!(cells[..20].iter().all(|t| t.warn == 255));
+        assert!(
+            cells[..20]
+                .iter()
+                .all(|t| t.warn == 255 && t.fill == 0 && t.lift == 0),
+            "the fill has handed its coverage to warn"
+        );
         assert!(
             cells[30..].iter().all(|t| *t == Tone::TRACK),
             "the track keeps its tone"
         );
+        // Premultiplied: the fill and warn shares never sum past the
+        // coverage, so every point is inside the track–fill–warn hull.
+        for k in 0..=12u64 {
+            let (s, _) = echo(&e, Duration::from_millis(k * 10), Look::MOVING, 80);
+            for p in &s.stops {
+                assert!(
+                    u16::from(p.tone.fill) + u16::from(p.tone.warn) <= 255,
+                    "{k}: {p:?}"
+                );
+            }
+        }
         e.indeterminate = true;
-        let (s, _) = echo(&e, ECHO_FAULT_FLASH, Look::MOVING);
+        e.comet_since = Some(Duration::from_millis(1500));
+        let (s, _) = echo(&e, Duration::ZERO, Look::MOVING, 80);
+        assert_eq!(
+            s,
+            comet(Duration::from_millis(1500), true),
+            "frozen where it failed"
+        );
+        let (s, _) = echo(&e, ECHO_DRAIN, Look::MOVING, 80);
         assert!(
-            s.cells(80).iter().all(|t| t.warn == 255),
-            "a busy row's whole row"
+            s.cells(80).iter().all(|t| *t == Tone::TRACK),
+            "drained to the track, no warn anywhere"
         );
     }
 }

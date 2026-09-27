@@ -46,25 +46,18 @@ aterm-ctl = { path = "../aterm-ctl" }
 # supplies O_NOFOLLOW/O_DIRECTORY for private state and WAL admission.
 aterm-digest = { workspace = true }
 libc = { workspace = true }
-# The ONE identity token the alignment tuple is keyed by: `APP_VERSION`, which
-# design §3.1 of the wrapper defines as what `aterm --version` prints after the
-# `aterm ` prefix. Not a new edge in the BUILD graph — `aterm-ctl` above already
-# pulls aterm-types — and the alternative was guessing the token or inventing an
-# environment variable to carry it, either of which would key a cached probe
-# verdict by a string nothing measured.
+# The control protocol's shared halves, so the supervisor speaks the wire the
+# server does instead of a copy of it: the verb table (`framing_of`, `spec`,
+# the artifact-ack rule, `META_ATTENTION_KEYED_MAX`) and the ONE reader of a
+# screen generation (`control_verbs::ScreenGen`), which decides whether a read's
+# `gen` may go back as the `if-gen=` fence on a typed act — the fence a `key`
+# or `send` carries. Plus the state/home directories and the RFC 3339 calendar.
+# Not a new edge in the BUILD graph: `aterm-ctl` above already pulls aterm-types.
 aterm-types = { workspace = true }
 # The harness core reads two JSON shapes Claude Code writes (the statusLine
 # input and the transcript's usage rows) through the workspace's own parser.
 # A leaf: its one dependency is `serde`, already in the shipped graph.
 aterm-json = { workspace = true }
-# THE launch-nonce reader. `turn id=<epoch>:<producer>:<seq>` is parsed
-# server-side by `LaunchNonce::from_hex(epoch)?`, and a harness that mints an
-# `<epoch>` the server cannot parse types nothing at all — so the fence on a
-# typed act asks the SAME reader rather than re-deriving "32 lowercase hex".
-# Already in this crate's dev graph and in the lock; a leaf pair
-# (aterm-pty + aterm-uds) with no third-party package behind it, and no cycle:
-# aterm-session does not depend on aterm-agent.
-aterm-session = { workspace = true }
 # The box escalation cuts the badge's line by terminal CELLS, not chars (a wide
 # character is two): the workspace's own width tables, `char_width`. Not a new
 # edge in the shipped graph — aterm-core already links it — and its one
@@ -83,9 +76,19 @@ atpkg = { workspace = true }
 # Not a new edge in the shipped graph — atpkg above already depends on it — and
 # its one dependency is `serde`.
 aterm-toml = { workspace = true }
+# The live upgrade's relaunch line re-keys a shell spawned before the re-key
+# channel (`upgrade::with_rekey`): the text that sets the globals a script signs
+# its marks with lives beside the scripts, which own those names. Not a new edge
+# in the shipped graph — aterm-core links it into both binaries — and its own
+# dependencies (aterm-digest, aterm-uds) are already this crate's.
+aterm-shell-integration = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# The E2E loopback-TLS remote-Turn test drives a real `dial_and_relay` bridge and a
+# The loopback-TLS remote-Turn test mints its capability's `EdgeToken`. Test-only:
+# the library names nothing from aterm-session. No cycle (aterm-session does not
+# depend on aterm-agent).
+aterm-session = { workspace = true }
+# The E2E loopback-TLS remote-Turn test drives a real `dial_and_relay_pinned` bridge and a
 # channel-bound capability. Transport-only test deps; no cycle (aterm-net ⊄ aterm-agent).
 aterm-net = { workspace = true }

@@ -10,7 +10,7 @@
 //! remote-drive authority) is kept OUT of the config file:
 //!
 //! * **macOS** — the system **Keychain** (generic password, service
-//!   [`KEYCHAIN_SERVICE`], account = the connection name). The best-experience
+//!   `aterm-net-drive`, account = the connection name). The best-experience
 //!   default; provisioned with [`store_token`], read with [`resolve_token`].
 //! * **Linux** — an explicit **0600 `token_file`**, or the conventional
 //!   `~/.config/aterm/net/<name>.token` written by [`store_token`].
@@ -35,8 +35,8 @@ mod keychain;
 
 /// Keychain generic-password service under which drive tokens are stored on macOS
 /// (account = the connection name). Referenced only by the macOS Keychain lookup in
-/// [`resolve_token`]; kept on every target so the module docs' intra-link resolves.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// [`resolve_token`].
+#[cfg(target_os = "macos")]
 pub(crate) const KEYCHAIN_SERVICE: &str = "aterm-net-drive";
 
 /// Look up a saved connection by name (re-reads `aterm.toml`, so edits need no

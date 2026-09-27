@@ -25,7 +25,7 @@
 //!      a `kani_test_support` path behind the `cfg(kani)` gate).
 //!
 //! For now, the proofs live in the `substantive / failed_needs_rerun` bucket
-//! (per `docs/kani-drift-hygiene.md`) — they classify as substantive and
+//! — they classify as substantive and
 //! define real behavioral invariants, but a separate issue (to be filed after
 //! #7998 lands) owns the discharge work.
 //!
@@ -333,12 +333,8 @@ fn serde_roundtrip_preserves_decisions() {
     let toml_src = pre
         .to_toml()
         .expect("Hardened profile MUST round-trip through TOML");
-    let (post, fell_back) = Policy::from_toml_or_hardened(&toml_src);
-
-    kani::assert(
-        !fell_back,
-        "Round-trip of a valid profile MUST NOT trigger the hardened fall-through",
-    );
+    let post: Policy = aterm_toml::from_str(&toml_src)
+        .expect("Hardened profile MUST parse back from its own TOML");
 
     let eng_pre = PolicyEngine::new(pre);
     let eng_post = PolicyEngine::new(post);

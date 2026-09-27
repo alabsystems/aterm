@@ -25,9 +25,7 @@
 //! ```
 //!
 //! The socket path is resolved as: `--sock PATH` if given, else `--pid PID`
-//! (a specific instance's `<dir>/aterm-<PID>.sock`), else the
-//! `$ATERM_CONTROL_SOCK` environment variable (whose `0`/`off` disable
-//! keywords are honoured as on the server), else — INSIDE an aterm session —
+//! (a specific instance's `<dir>/aterm-<PID>.sock`), else — INSIDE an aterm session —
 //! the caller's OWN instance, located through `$ATERM_PARENT_SESSION_ID`'s
 //! discovery graph entry (`<dir>/graph/<sid>`, which records the hosting
 //! instance's socket; so a flagless call from within aterm always reaches the
@@ -147,7 +145,11 @@
 //! * `ls`              — every session of every live instance, one line each:
 //!   `<pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
 //!   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
-//!   identity=<name|-> path=<frozen|live>[ *]` (the server's
+//!   identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|->
+//!   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
+//!   agent_fp=<hex16|-> supervisor=<holder|->
+//!   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
+//!   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>[ *]` (the server's
 //!   `sessions` line prefixed with the instance pid; `*` marks the calling
 //!   terminal's own session, from `$ATERM_PARENT_SESSION_ID`; the title is
 //!   pct-encoded and often mirrors the cwd via shell integration). The
@@ -164,8 +166,7 @@
 //!
 //!   `ls`/`instances`/`windows` are answered CLIENT-side, but they still honour
 //!   `--sock`/`--pid`, which SCOPE the listing to the addressed instance — and
-//!   ONLY those flags do: `$ATERM_CONTROL_SOCK` never narrows discovery. That
-//!   matters for isolation: an automated caller that launched its own instance
+//!   ONLY those flags do. That matters for isolation: an automated caller that launched its own instance
 //!   under a private socket passes `--sock` (or `--pid`) and gets back only that
 //!   instance, never the user's real terminals. A scoped listing that finds
 //!   nothing says so distinctly instead of degrading to "no live instances".
@@ -200,11 +201,13 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use aterm_types::control_socket::{self, SocketDirective};
+use aterm_types::control_socket;
 use aterm_uds::CtlStream;
 
+pub mod census;
 mod conn;
 pub use conn::conn_main_entry;
+mod redial;
 
 /// Usage synopsis — the one-line invocation shape, shared by `--help` and the
 /// "no verb given" usage error so they never drift apart.
@@ -233,6 +236,8 @@ OPTIONS:
                   On `subscribe` an EXPLICIT --timeout is instead a max-watch
                   WALL-CLOCK bound (frames so far are flushed, then exit 124);
                   the flagless default (and an explicit 0) watches forever.
+                  A server that goes away does not extend it: the wait for a
+                  successor (exit 75) spends what the deadline has left.
     -h, --help    print this help and exit.
     -V, --version print version information and exit.
 
@@ -255,6 +260,20 @@ EXIT CODES:
          await/ready/wait `OK timeout`); for `ls`/`instances`/`windows`,
          EVERY found socket timed out. Additive: still nonzero, so existing
          `nonzero == failure` scripts are unaffected.
+    75   the aterm instance went away mid-exchange and nothing replaced it
+         within 30 s, or within what an explicit --timeout had left (an
+         update that did not come back, a crash, a quit): a `subscribe`
+         stream or a blocking read (`await`, `wait`, `ready`, `text`,
+         `inbox`) could not be resumed. An aterm SELF-UPDATE is followed
+         instead: `subscribe` keeps relaying from the successor (a stderr
+         line says so; its new `sub` lines start a new stream, each target
+         sending its current state, and a target named by local number
+         `@<n>` is followed by the session id its `sub` line gave), and a
+         blocking read is asked once more — except `await seq <n>`, `await
+         inbox since=`, `inbox get <id>` and any request naming its session
+         `@<n>`, whose anchor names a position in the old process (a
+         successor numbers its sessions afresh): those exit 75 too. Never 0:
+         a pipeline must not read an update as \"session over\".
 
 STDIN PAYLOADS (multi-line, whitespace-preserving; each <= 256 KiB):
     feed-bin      read the raw binary payload from STDIN and feed it to the PTY
@@ -272,10 +291,8 @@ STDIN PAYLOADS (multi-line, whitespace-preserving; each <= 256 KiB):
 
 SOCKET RESOLUTION:
     The socket path is resolved as: --sock PATH if given, else --pid PID
-    (a specific instance's <dir>/aterm-<PID>.sock), else the
-    $ATERM_CONTROL_SOCK environment variable (whose 0/off disable keywords
-    are honoured as on the server), else — INSIDE an aterm session — the
-    instance hosting the calling terminal (located via
+    (a specific instance's <dir>/aterm-<PID>.sock), else — INSIDE an aterm
+    session — the instance hosting the calling terminal (located via
     $ATERM_PARENT_SESSION_ID's <dir>/graph/<sid> entry, so a flagless call
     always drives YOUR terminal's instance even when a newer instance owns
     the symlink), else the per-user default <dir>/aterm.sock where <dir> is
@@ -286,13 +303,13 @@ SOCKET RESOLUTION:
     flow falls back to the newest <dir>/aterm-<pid>.sock that does, so it
     reaches a live instance. When nothing serves the socket but aterm IS
     running, a FLAGLESS call's error names each live instance with the
-    --pid/--sock that reaches it; a socket PINNED by --sock, --pid or an
-    explicit $ATERM_CONTROL_SOCK is told only how many other instances are
-    live (`aterm ctl instances` lists them) — never handed a different
-    instance to drive.
+    --pid/--sock that reaches it; a socket PINNED by --sock or --pid is
+    told only how many other instances are live (`aterm ctl instances`
+    lists them) — never handed a different instance to drive. No
+    environment variable selects a socket: --sock is the one spelling.
 
     DISCOVERY (`ls`, `instances`, `windows`): the client enumerates <dir>/aterm-<pid>.sock
-    (plus the <dir>/graph entries of explicit-$ATERM_CONTROL_SOCK instances)
+    (plus the <dir>/graph entries of instances bound with --control-sock)
     and dials each one with a 2 s deadline. When $XDG_RUNTIME_DIR is set,
     ~/Library/Application Support/aterm is NOT consulted, so a missing
     $XDG_RUNTIME_DIR/aterm reports the environment, not an empty fleet. A
@@ -336,15 +353,24 @@ PUSH FRAMES (subscribe):
                                  stream adds `EVENT * session-created|session-exited|fabric-retire`.
                                  `subscribe --help` prints the full contract.
       BYTES <local> <len>        then <len> RAW PTY bytes + a trailing newline.
+      MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]   one per
+                                 row delivered to that session's inbox (`mail`
+                                 stream) — metadata only; `inbox get <id>` reads
+                                 the body.
+      T <local|*> <t_us>         a frame timestamp (the `timestamps`/`ts` modifier),
+                                 written before the frame it stamps; at most one
+                                 per channel per wake.
       GAP <local> ...            a discontinuity marker: `bytes-dropped=<n>`
                                  (queue overflow), `resync=<seq>` (engine reset —
                                  state was dropped; treat the next DELTA as a fresh
                                  snapshot / re-read with `screen`), or
                                  `events-resync=<floor>` (a `since-turn=` anchor
                                  older than the retained turn ledger; records
-                                 below <floor> are gone), or `events-dropped=<n>` (the
+                                 below <floor> are gone), `events-dropped=<n>` (the
                                  session's timeline evicted <n> records this watch
-                                 had not been shown).
+                                 had not been shown), or `mail-dropped=<n>` (the
+                                 inbox ring evicted <n> rows this watch had not
+                                 been shown).
 
 VERBS (generated from the protocol verb table — always current, cannot drift):
 ";
@@ -382,7 +408,11 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     ls            every session of every live instance, one per line:
                   <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
-                  identity=<name|-> path=<frozen|live>[ *]
+                  identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|->
+                  agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
+                  agent_fp=<hex16|-> supervisor=<holder|->
+                  path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
+                  copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>[ *]
                   (* = the calling terminal's own session; window= is the
                   hosting window — a headless instance reports its one logical
                   window 0; none = a session no window holds; - = the instance
@@ -395,12 +425,15 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   session was spawned under (`spawn identity=<name>`: its
                   agents' own login, kept apart from the human's), - for the
                   human's own agent config — `identities` lists them; path=
-                  whether that session's shell fronts aterm's managed agents/
-                  on PATH: frozen = a shell adopted from a build older than
-                  2026-09-16 that never sourced the atpkg hook, so `claude`
-                  and `codex` typed there run the FOREIGN copies until
-                  `. ~/.aterm/shell.d/00-atpkg.zsh` is typed in it — an upper
-                  bound, since sourcing the hook is not reported back).
+                  whether `claude` and `codex` typed at that session's prompt
+                  run aterm's managed builds: frozen = a foreign copy (a
+                  native install, a brew cask) wins its PATH. Measured from a
+                  program the shell itself started where one has run, else
+                  the mark the shell was adopted with; the row's closing
+                  path_evidence=, copy= and upgrade= columns say which, which
+                  build an agent in front runs, and its live upgrade — `help
+                  sessions` has them. A tab whose foreground is an agent is
+                  never the place to type a shell line: it is a prompt there).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
@@ -774,9 +807,10 @@ fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Stri
 
 /// The front door's `--completions <shell>` as a callable: print the `aterm`
 /// completion script to stdout, or a clear error to stderr (FAILURE) for a
-/// missing or unknown shell name — the same errors the sibling `aterm-ctl`
-/// flag reports. `verbs`/`flags` as in [`front_door_completion_script`]; the
-/// ONE `aterm` binary supplies them from its own routing tables.
+/// missing or unknown shell name — the sibling `aterm-ctl` flag's two cases,
+/// worded for a person rather than as a protocol `ERR` line. `verbs`/`flags` as
+/// in [`front_door_completion_script`]; the ONE `aterm` binary supplies them
+/// from its own routing tables.
 pub fn front_door_completions_entry(
     shell: Option<&str>,
     verbs: &[&str],
@@ -799,8 +833,9 @@ pub fn front_door_completions_entry(
 }
 
 /// [`front_door_completions_entry`]'s fallible core, mirroring
-/// [`emit_completions`]: a missing shell name and an unknown one are the same
-/// two clear errors the `aterm-ctl --completions` path raises.
+/// [`emit_completions`]: a missing shell name and an unknown one are the two
+/// errors the `aterm-ctl --completions` path raises, without its `ERR` token
+/// (the entry prefixes `aterm: `).
 fn front_door_completions_result(
     shell: Option<&str>,
     verbs: &[&str],
@@ -812,8 +847,12 @@ fn front_door_completions_result(
             "--completions requires a shell name (bash, zsh, or fish)",
         ));
     };
-    let script =
-        front_door_completion_script(shell, verbs, flags).ok_or_else(unknown_shell_error)?;
+    let script = front_door_completion_script(shell, verbs, flags).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--completions: unknown shell (bash, zsh, or fish)",
+        )
+    })?;
     let stdout = stdout_handle();
     let mut out = stdout.lock();
     out.write_all(script.as_bytes())?;
@@ -842,23 +881,15 @@ fn front_door_completions_result(
 /// or `None` when nothing is reachable.
 ///
 /// Resolution is the flagless `aterm-ctl` rule, unchanged and deterministic:
-/// `$ATERM_CONTROL_SOCK` when explicit (and `None` outright when it disables the
-/// socket), otherwise the instance HOSTING the calling terminal when the caller
-/// is inside an aterm session, otherwise the `latest` pointer at the newest
-/// instance — or, when that pointer is dead, the newest instance that is
-/// listening ([`flagless_target`]). Then a LIVENESS probe — a connect, not an
+/// the instance HOSTING the calling terminal when the caller is inside an aterm
+/// session, otherwise the `latest` pointer at the newest instance — or, when
+/// that pointer is dead, the newest instance that is listening
+/// ([`flagless_target`]). Then a LIVENESS probe — a connect, not an
 /// existence check, because a crashed instance leaves its socket file behind
 /// and `attach` must not route a tab into a corpse.
 #[must_use]
 pub fn front_door_instance() -> Option<String> {
-    let path = resolve_path(
-        None,
-        None,
-        env::var(SOCK_ENV).ok(),
-        env::var(NO_SOCK_ENV).ok(),
-        env::var(SELF_SID_ENV).ok(),
-    )
-    .ok()?;
+    let path = resolve_path(None, None, env::var(SELF_SID_ENV).ok()).ok()?;
     front_door_probe(&path)
 }
 
@@ -925,8 +956,8 @@ pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
 /// foreground; `AllowSetForegroundWindow(pid)` is the documented handoff, and the
 /// launching `aterm.exe` HAS that right (it was started by the foreground
 /// process — the shell the user typed in, or Explorer for the jump-list task).
-/// Best-effort in every direction: no pid (an explicit `$ATERM_CONTROL_SOCK`
-/// path names no instance), a stale alias, or a refusal all leave the receiver
+/// Best-effort in every direction: no pid (an explicit `--control-sock` path
+/// names no instance), a stale alias, or a refusal all leave the receiver
 /// to fall back to the taskbar flash, which is Windows' own answer for "a
 /// background app wants your attention".
 ///
@@ -957,20 +988,13 @@ fn allow_foreground_handoff(_path: &str) {}
 /// per-instance filename `aterm-<pid>.sock`, resolving the `latest` POINTER FILE
 /// first (on Windows the alias is a regular file naming the instance socket —
 /// see `aterm_uds::latest`). `None` when the path names no instance: an explicit
-/// `$ATERM_CONTROL_SOCK` override, or a dangling/foreign alias.
+/// `--control-sock` path, or a dangling/foreign alias.
 #[cfg(windows)]
 fn instance_pid_of(path: &str) -> Option<u32> {
     let resolved = aterm_uds::latest::resolve(path);
     let name = std::path::Path::new(&resolved).file_name()?.to_str()?;
     control_socket::instance_pid(name)
 }
-
-/// Environment variable consulted for the socket path when `--sock`/`--pid`
-/// are absent. `0`/`off` mean the server runs without a socket.
-const SOCK_ENV: &str = "ATERM_CONTROL_SOCK";
-
-/// Environment kill switch: set (truthy) means the server has no socket.
-const NO_SOCK_ENV: &str = "ATERM_NO_CONTROL_SOCK";
 
 /// Socket filename inside the per-user directory — the server-maintained
 /// `latest` symlink to the newest instance's socket.
@@ -998,7 +1022,7 @@ const SELF_SID_ENV: &str = "ATERM_PARENT_SESSION_ID";
 ///
 /// `<dir>` here is the DEFAULT rendezvous dir ([`socket_dir`]). This resolves
 /// the calling terminal's instance even when that instance was launched on an
-/// EXPLICIT `$ATERM_CONTROL_SOCK` whose socket lives in some OTHER directory:
+/// EXPLICIT `--control-sock` whose socket lives in some OTHER directory:
 /// the server publishes each session's graph entry into the default dir too
 /// (not only beside the explicit socket), and the entry carries the socket's
 /// ABSOLUTE path, so the returned socket points at the right instance wherever
@@ -1012,6 +1036,12 @@ const SELF_SID_ENV: &str = "ATERM_PARENT_SESSION_ID";
 /// FILE behind — a bare existence check would then error out on a dead socket
 /// instead of falling back).
 fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
+    self_instance_sock_in(&socket_dir()?, self_sid)
+}
+
+/// [`self_instance_sock`] in the rendezvous dir `dir` — also what a redial
+/// follows ([`redial::Follow::Flagless`]), against the dir the call resolved.
+fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
     let sid = self_sid?;
     // The sid shape is server-generated (`s-<hex>`); refuse anything else so a
     // weird env value can never path-traverse out of the graph dir.
@@ -1019,7 +1049,7 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let body = std::fs::read_to_string(socket_dir()?.join("graph").join(sid)).ok()?;
+    let body = std::fs::read_to_string(dir.join("graph").join(sid)).ok()?;
     let sock = control_socket::graph_entry_sock(&body)?;
     // Liveness probe, not existence: only a socket something ACCEPTS on counts.
     if CtlStream::connect(&sock).is_ok() {
@@ -1032,17 +1062,16 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 /// THE FLAGLESS RESOLUTION, AS A LIBRARY ENTRY — for the other clients in this
 /// one binary that must find aterm the way `aterm ctl` does.
 ///
-/// aterm-link's clients used to try `$ATERM_CONTROL_SOCK` and then
+/// aterm-link's clients used to try an environment-named socket and then
 /// `$XDG_RUNTIME_DIR/aterm/aterm.sock`, and nothing else. An aterm child on
 /// macOS has NEITHER: it has `$ATERM_PARENT_SESSION_ID`, and the instance that
 /// hosts it is found through that session's graph entry in the rendezvous
 /// directory — the step this client has always taken. One resolver, called by
 /// every client, so no two can disagree.
 ///
-/// The order is [`resolve_path`]'s: `$ATERM_CONTROL_SOCK` when it names a path
-/// (its `0`/`off` forms and `$ATERM_NO_CONTROL_SOCK` are a refusal, not a
-/// path), then the instance hosting `self_sid` (its `<dir>/graph/<sid>` entry,
-/// probed for a listener — [`self_instance_sock`]), then the `latest` alias
+/// The order is [`resolve_path`]'s: the instance hosting `self_sid` (its
+/// `<dir>/graph/<sid>` entry, probed for a listener — [`self_instance_sock`]),
+/// then the `latest` alias
 /// `<dir>/aterm.sock` — and, when that alias is dead, the newest instance
 /// socket in the same directory that accepts a connect ([`flagless_target`]),
 /// so a client inside a session whose own instance has gone is pointed at a
@@ -1052,16 +1081,10 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 ///
 /// # Errors
 ///
-/// The socket is disabled in this environment, or no rendezvous directory can
-/// be resolved (`$XDG_RUNTIME_DIR` and `$HOME` both unset).
+/// No rendezvous directory can be resolved (`$XDG_RUNTIME_DIR` and `$HOME`
+/// both unset).
 pub fn resolve_sock_for(self_sid: Option<&str>) -> io::Result<String> {
-    resolve_path(
-        None,
-        None,
-        env::var(SOCK_ENV).ok(),
-        env::var(NO_SOCK_ENV).ok(),
-        self_sid.map(str::to_string),
-    )
+    resolve_path(None, None, self_sid.map(str::to_string))
 }
 
 /// The instance token beside the socket at `sock` — the same file this
@@ -1092,8 +1115,8 @@ pub fn read_token_beside(sock: &str) -> io::Result<String> {
 // The rule this seam implements: inside a multiplexer, a call that names its
 // target only IMPLICITLY (flagless, `@.`, or the `@self` that literally claims
 // "this session") is REFUSED with the outer sid and the explicit form to use.
-// Everything that names a target — `@<sid>`, `--pid`, `--sock`, an explicit
-// `$ATERM_CONTROL_SOCK` — is unchanged, because none of those is silent.
+// Everything that names a target — `@<sid>`, `--pid`, `--sock` — is unchanged,
+// because none of those is silent.
 // ---------------------------------------------------------------------------
 
 /// Environment marker the shell integration exports when the shell it loaded
@@ -1334,16 +1357,11 @@ fn addresses_no_session(verb: &str) -> bool {
 ///   I am in", and inside a pane that claim is false however the socket was
 ///   chosen, so flags do not rescue it.
 /// * no selector, or `@.` — implicit only while nothing else names a target;
-///   both follow the instance's ACTIVE tab. `--sock`, `--pid` and an explicit
-///   `$ATERM_CONTROL_SOCK` each pin the instance deliberately, and a deliberate
-///   choice is not the silent mis-targeting this guards.
+///   both follow the instance's ACTIVE tab. `--sock` and `--pid` each pin the
+///   instance deliberately, and a deliberate choice is not the silent
+///   mis-targeting this guards.
 /// * a concrete `@<sid>` — never implicit.
-fn targets_own_session_implicitly(
-    parts: &[String],
-    sock: Option<&str>,
-    pid: Option<u32>,
-    env_sock: Option<&str>,
-) -> bool {
+fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Option<u32>) -> bool {
     let Some(first) = parts.first() else {
         return false;
     };
@@ -1354,15 +1372,8 @@ fn targets_own_session_implicitly(
     // optional leading `@<sel>` proxy token.
     let sel_idx = usize::from(first == "subscribe");
     let selector = parts.get(sel_idx).filter(|t| t.starts_with('@'));
-    // Only the flagless per-instance case leaves the target to the environment;
-    // Explicit/Disabled both mean the caller (or the environment) already
-    // decided, and `Disabled` has its own clearer error downstream.
-    let unpinned = sock.is_none()
-        && pid.is_none()
-        && matches!(
-            control_socket::socket_directive(env_sock, None),
-            SocketDirective::PerInstance
-        );
+    // Only the flagless case leaves the target to aterm.
+    let unpinned = sock.is_none() && pid.is_none();
     match selector {
         Some(sel) if sel.split(',').any(|e| e == "@self" || e == "@env") => true,
         Some(sel) if sel.split(',').all(|e| e == "@.") => unpinned,
@@ -1422,7 +1433,10 @@ const MUX_NOTICE_ENV: &str = "ATERM_MUX_NOTICE";
 fn mux_boundary_notice(kind: &str) -> String {
     let mut msg = String::from("inside ");
     msg.push_str(kind);
-    msg.push_str(" — command blocks, exit codes and cwd tracking do not cross the multiplexer,\n  so aterm records none of them for these panes. `aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences this.");
+    msg.push_str(
+        " — no command blocks, exit codes or cwd tracking in these panes (`aterm ctl mux` \
+         explains; ATERM_MUX_NOTICE=0 silences)",
+    );
     msg
 }
 
@@ -1631,11 +1645,9 @@ fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
 fn resolve_path(
     sock: Option<String>,
     pid: Option<u32>,
-    env_sock: Option<String>,
-    env_no_sock: Option<String>,
     self_sid: Option<String>,
 ) -> io::Result<String> {
-    resolve_target(sock, pid, env_sock, env_no_sock, self_sid).map(|(path, _)| path)
+    resolve_target(sock, pid, self_sid).map(|(path, _)| path)
 }
 
 /// How the socket a client dials was chosen — which decides what a connect
@@ -1648,9 +1660,8 @@ enum TargetOrigin {
     /// error may name each live instance with the flag that reaches it — the
     /// same fleet a flagless `ls`/`instances` lists.
     Flagless,
-    /// The caller PINNED the socket — `--sock`, `--pid`, an explicit
-    /// `$ATERM_CONTROL_SOCK` — or, for the front door, it is the instance the
-    /// probe just answered. A dead pin must never be answered with a DIFFERENT
+    /// The caller PINNED the socket — `--sock` or `--pid` — or, for the front
+    /// door, it is the instance the probe just answered. A dead pin must never be answered with a DIFFERENT
     /// instance to drive: an agent whose private socket dies mid-task would be
     /// handed the human's window as a copy-paste `--pid`, and its next `send`
     /// would land there. The precedent is discovery's scoping
@@ -1659,29 +1670,24 @@ enum TargetOrigin {
     Pinned,
 }
 
-/// Resolve the socket path from the flags and the environment values, and how
-/// it was chosen ([`TargetOrigin`]: every flag and an explicit
-/// `$ATERM_CONTROL_SOCK` pin it; the per-instance default is flagless). Flags
-/// win over the environment; `--pid` targets one instance's
-/// `<dir>/aterm-<pid>.sock` directly. The env interpretation (explicit path
-/// vs `0`/`off` disable keywords vs per-instance default) is the engine's
-/// [`control_socket::socket_directive`], identical to the server's — plus one
-/// client-side refinement: in the per-instance-default case, a caller INSIDE an
-/// aterm session (`self_sid` = `$ATERM_PARENT_SESSION_ID`) resolves to the
-/// instance hosting ITS OWN terminal via the discovery graph, not to whichever
-/// instance most recently claimed the `latest` symlink.
+/// Resolve the socket path from the flags, and how it was chosen
+/// ([`TargetOrigin`]: every flag pins it; no flag is flagless). `--sock` names
+/// the socket; `--pid` targets one instance's `<dir>/aterm-<pid>.sock` directly.
+/// No flag means the flagless rule: a caller INSIDE an aterm session
+/// (`self_sid` = `$ATERM_PARENT_SESSION_ID`, protocol the window hands its
+/// shells) resolves to the instance hosting ITS OWN terminal via the discovery
+/// graph, not to whichever instance most recently claimed the `latest` symlink.
+/// No environment variable selects a socket (2026-09-24): `--sock` is the one
+/// spelling.
 fn resolve_target(
     sock: Option<String>,
     pid: Option<u32>,
-    env_sock: Option<String>,
-    env_no_sock: Option<String>,
     self_sid: Option<String>,
 ) -> io::Result<(String, TargetOrigin)> {
     let no_dir = || {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "cannot resolve control socket: set --sock, $ATERM_CONTROL_SOCK, \
-             or $XDG_RUNTIME_DIR/$HOME",
+            "cannot resolve control socket: pass --sock, or set $XDG_RUNTIME_DIR/$HOME",
         )
     };
     if sock.is_some() && pid.is_some() {
@@ -1701,24 +1707,48 @@ fn resolve_target(
     if let Some(s) = sock {
         return Ok((s, TargetOrigin::Pinned));
     }
-    match control_socket::socket_directive(env_sock.as_deref(), env_no_sock.as_deref()) {
-        SocketDirective::Disabled => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the control socket is disabled in this environment \
-             ($ATERM_CONTROL_SOCK=0/off or $ATERM_NO_CONTROL_SOCK)",
-        )),
-        SocketDirective::Explicit(p) => Ok((p, TargetOrigin::Pinned)),
-        // Flagless: prefer the instance HOSTING this terminal (in-session
-        // self-location) over the newest-instance `latest` symlink — and when
-        // that symlink is DEAD, the newest instance that is actually listening.
-        SocketDirective::PerInstance => match self_instance_sock(self_sid.as_deref()) {
-            Some(own) => Ok((own, TargetOrigin::Flagless)),
-            None => {
-                let dir = socket_dir().ok_or_else(no_dir)?;
-                let latest = dir.join(SOCK_FILE).to_string_lossy().into_owned();
-                Ok((flagless_target(&dir, latest), TargetOrigin::Flagless))
-            }
-        },
+    // Flagless: prefer the instance HOSTING this terminal (in-session
+    // self-location) over the newest-instance `latest` symlink — and when that
+    // symlink is DEAD, the newest instance that is actually listening.
+    match self_instance_sock(self_sid.as_deref()) {
+        Some(own) => Ok((own, TargetOrigin::Flagless)),
+        None => {
+            let dir = socket_dir().ok_or_else(no_dir)?;
+            let latest = dir.join(SOCK_FILE).to_string_lossy().into_owned();
+            Ok((flagless_target(&dir, latest), TargetOrigin::Flagless))
+        }
+    }
+}
+
+/// Where a SUCCESSOR of the server this call reaches may answer ([`redial`]),
+/// from the same inputs [`resolve_target`] reads: a `--pid` pin follows nothing
+/// (it names one process), `--sock` follows its path (a successor rebinds it),
+/// and the flagless rule follows the calling session's graph entry and the
+/// `latest` alias — never [`flagless_target`]'s dead-alias fallback, which would
+/// hand the stream to whichever unrelated instance answers. No environment
+/// variable selects a socket, so none selects what a redial follows either.
+fn redial_follow(sock: Option<&str>, pid: Option<u32>, self_sid: Option<String>) -> redial::Follow {
+    redial_follow_in(socket_dir(), sock, pid, self_sid)
+}
+
+/// [`redial_follow`] against the rendezvous dir `dir` (`None`: there is none —
+/// no `$HOME`, no `$XDG_RUNTIME_DIR` — so a flagless call has nothing to
+/// follow).
+fn redial_follow_in(
+    dir: Option<PathBuf>,
+    sock: Option<&str>,
+    pid: Option<u32>,
+    self_sid: Option<String>,
+) -> redial::Follow {
+    if pid.is_some() {
+        return redial::Follow::Nothing;
+    }
+    if let Some(sock) = sock {
+        return redial::Follow::Path(sock.to_string());
+    }
+    match dir {
+        Some(dir) => redial::Follow::Flagless { dir, self_sid },
+        None => redial::Follow::Nothing,
     }
 }
 
@@ -1754,7 +1784,7 @@ fn resolve_target(
 /// dials the alias and the kernel resolves it); else the newest per-instance
 /// socket in `dir` that accepts a connect ([`newest_live_instance_in`]); else
 /// the alias itself, so the error the caller then raises names the path it was
-/// given. Same-directory instances only: an explicit-`$ATERM_CONTROL_SOCK`
+/// given. Same-directory instances only: an explicit-`--control-sock`
 /// instance never claims the alias and owns its path outright, and a private
 /// instance an agent booted must not silently receive a human's flagless
 /// `send` — it is still NAMED when the connect then fails
@@ -2282,7 +2312,7 @@ fn live_instances() -> Vec<(u32, String)> {
 /// 1. Per-instance sockets living directly in the default dir
 ///    (`<dir>/aterm-<pid>.sock`; the `latest` symlink and non-instance names are
 ///    skipped). This is the default-launch case.
-/// 2. EXPLICIT-`$ATERM_CONTROL_SOCK` instances, whose socket lives OUTSIDE the
+/// 2. EXPLICIT-`--control-sock` instances, whose socket lives OUTSIDE the
 ///    default dir and is therefore NOT in the readdir above: they register a
 ///    discovery graph entry in the default dir (`<dir>/graph/<sid>`), which carries
 ///    the absolute socket path + the hosting pid. Without this pass such an
@@ -2409,7 +2439,7 @@ fn same_socket_path(a: &str, b: &str) -> bool {
 fn discovery_targets(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<(u32, String)>, String> {
     if let Some(s) = sock {
         // Trust the caller's explicit socket: an instance may be perfectly live
-        // without a graph entry in the default dir (a custom `$ATERM_CONTROL_SOCK`
+        // without a graph entry in the default dir (a custom `--control-sock`
         // that has not registered a session yet), so do NOT require enumeration
         // to know about it. `run_discovery` skips it if it does not answer.
         let name = Path::new(s)
@@ -2572,13 +2602,6 @@ pub struct FleetSession {
 }
 
 impl FleetSession {
-    /// The instance-local channel number — the row's first column (`ls`'s
-    /// second). `None` for a row too short to carry one.
-    #[must_use]
-    pub fn local(&self) -> Option<&str> {
-        self.row.split_whitespace().next()
-    }
-
     /// The stable session id — the row's second column (`ls`'s third), and what
     /// `@<sid>` addresses. `None` for a row too short to carry one, which is the
     /// row a listing consumer skips (as the column parse always did).
@@ -2628,8 +2651,8 @@ impl std::fmt::Display for FleetListError {
 /// fleet, or the classified reason there is none.
 ///
 /// Identical in scope and content to a bare `aterm-ctl ls` — the whole fleet
-/// (discovery verbs are never narrowed by `$ATERM_CONTROL_SOCK`; only the
-/// `--sock`/`--pid` flags scope them, and this entry point takes neither) — with
+/// (only the `--sock`/`--pid` flags scope discovery, and this entry point takes
+/// neither) — with
 /// the ` *` self marker carried as [`FleetSession::is_self`] instead of a
 /// trailing token.
 ///
@@ -2984,7 +3007,12 @@ fn socket_label(sock: &str, in_dir: Option<&Path>) -> String {
 /// socket names (`0` = none). A refused connect is labelled by liveness, and a
 /// denied one by errno: `EPERM` (1) is what a seatbelt hands back, so it names
 /// the sandbox outright; anything else (`EACCES`, `ENOTCONN`) could as well be
-/// another user's socket mode, and says so.
+/// another user's socket mode, and says so. That `1` is a Unix errno: on
+/// Windows no code that decodes to `PermissionDenied` is 1 (raw 1 is
+/// `ERROR_INVALID_FUNCTION`, `Uncategorized`; the denials are
+/// `ERROR_ACCESS_DENIED` 5 and `WSAEACCES` 10013 — measured on stock 1.97.1),
+/// so every denial there takes the second, ambiguous wording, which is the
+/// honest one on a host with no seatbelt.
 fn probe_cause(pid: u32, probe: &Probe) -> String {
     match probe {
         Probe::Answered(lines) => {
@@ -3334,20 +3362,77 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     match real_main(argv) {
         Ok(code) => code,
         Err(e) => {
+            // `aterm ctl help --full | head`: the reader closed stdout, so the
+            // client has said everything it wanted. Nothing is wrong and there is
+            // nobody to tell — no line, status 0.
+            if is_stdout_closed(&e) {
+                return ExitCode::SUCCESS;
+            }
             // Manual form of `eprintln!("aterm-ctl: {e}")` (the strict Trust
             // gate cannot lower inline `format_args!`), byte-identical output.
             // A failure to write the diagnostic is ignored — the process is
             // already exiting FAILURE and has nowhere left to report to.
             let _ = stderr_line(&e.to_string());
-            // A client-side socket-deadline expiry exits 124 (distinct from a
-            // generic failure), matching the server-reported-timeout mapping in
-            // `exchange`.
-            if is_timeout_error(&e) {
-                ExitCode::from(EXIT_TIMEOUT)
-            } else {
-                ExitCode::FAILURE
-            }
+            exit_for(&e)
         }
+    }
+}
+
+/// The exit status of a run that failed: 124 for a client-side socket-deadline
+/// expiry (distinct from a generic failure, matching the server-reported-timeout
+/// mapping in `exchange`), 0 when the reader closed stdout, 1 otherwise.
+fn exit_for(e: &io::Error) -> ExitCode {
+    if is_stdout_closed(e) {
+        ExitCode::SUCCESS
+    } else if is_timeout_error(e) {
+        ExitCode::from(EXIT_TIMEOUT)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The reader closed STDOUT (`| head`): the client has said everything the reader
+/// wanted, so the run ends silently with status 0. Only stdout writes carry this
+/// mark; a broken pipe on the SOCKET is the server hanging up, which keeps its
+/// line and its non-zero exit.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout closed by its reader")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// Mark a stdout write's broken pipe as [`StdoutClosed`]. Every other failure —
+/// ENOSPC on a redirected stdout, a dead downstream mid-frame — is returned as
+/// it came and still fails the run.
+fn stdout_closed(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        io::Error::new(io::ErrorKind::BrokenPipe, StdoutClosed)
+    } else {
+        e
+    }
+}
+
+fn is_stdout_closed(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<StdoutClosed>())
+}
+
+/// A stdout writer whose broken pipe is [`StdoutClosed`]: every stdout path —
+/// the one-line and line-framed printers, the byte-body copy and the subscribe
+/// relay — writes through it, so `| head` ends each of them the same way.
+struct StdoutSink<W>(W);
+
+impl<W: Write> Write for StdoutSink<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf).map_err(stdout_closed)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush().map_err(stdout_closed)
     }
 }
 
@@ -3469,10 +3554,11 @@ fn client_help_reply(parts: &[String]) -> Option<String> {
 
 /// Print a line-framed reply (`OK <n>` + n rows) the way [`exchange`] prints a
 /// server's: the rows to stdout, the header consumed. One buffered write, flushed
-/// explicitly so a broken pipe surfaces as the error it is.
+/// explicitly so a write failure surfaces as the error it is (a reader that
+/// closed the pipe is [`StdoutClosed`]).
 fn print_framed_lines(reply: &str) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = StdoutSink(io::BufWriter::new(stdout.lock()));
     for line in reply.lines().skip(1) {
         out.write_all(line.as_bytes())?;
         out.write_all(b"\n")?;
@@ -3545,7 +3631,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
             // rather than through `print_stdout_line` (which appends one).
             let help = help_text();
             let stdout = stdout_handle();
-            let mut out = stdout.lock();
+            let mut out = StdoutSink(stdout.lock());
             out.write_all(help.as_bytes())?;
             // End the guard explicitly before any later branch-local helper can
             // acquire stdout. The branches are mutually exclusive at runtime;
@@ -3595,6 +3681,19 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         } else if let Some(v) = arg.strip_prefix("--timeout=") {
             deadline = parse_timeout(v)?;
             timeout_explicit = true;
+        } else if arg == "--" {
+            // End of the client's options: what follows is the verb and its
+            // arguments, whatever they start with.
+            request_parts.extend(args.by_ref());
+            break;
+        } else if arg.starts_with('-') {
+            // A dash-leading token before the verb is an option this client does
+            // not have. Say so here: forwarded, it became the VERB, and the server's
+            // `ERR unknown verb (try: help)` sent the reader to the wrong table.
+            let mut msg = String::from("unknown option ");
+            msg.push_str(&arg);
+            msg.push_str(" (aterm ctl --help lists them)");
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
         } else {
             // First positional is the verb; the remainder is its argument list.
             request_parts.push(arg);
@@ -3646,12 +3745,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     }
     if let Some(n) = nesting.as_ref()
         && n.outer_sid.is_some()
-        && targets_own_session_implicitly(
-            &request_parts,
-            sock.as_deref(),
-            pid,
-            env::var(SOCK_ENV).ok().as_deref(),
-        )
+        && targets_own_session_implicitly(&request_parts, sock.as_deref(), pid)
     {
         announce_mux_boundary(nesting.as_ref(), true);
         return Err(nested_self_drive_error(n));
@@ -3717,13 +3811,14 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (path, origin) = resolve_target(
-        sock,
+    // Where a successor may answer if an aterm self-update replaces the server
+    // mid-exchange: the same resolution inputs, minus the dead-alias fallback.
+    let redial = redial::Redial::new(redial_follow(
+        sock.as_deref(),
         pid,
-        env::var(SOCK_ENV).ok(),
-        env::var(NO_SOCK_ENV).ok(),
         env::var(SELF_SID_ENV).ok(),
-    )?;
+    ));
+    let (path, origin) = resolve_target(sock, pid, env::var(SELF_SID_ENV).ok())?;
 
     // STDIN PAYLOAD PATHS. `feed-bin` (no inline length), and the `send`/`paste`
     // `--stdin`/`-` forms, all deliver the RAW stdin bytes to the PTY through the
@@ -3822,6 +3917,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         &frame_request,
         deadline,
         timeout_explicit,
+        &redial,
     );
     // AFTER the reply, so the caveat lands under the (necessarily empty) result
     // it explains rather than ahead of it. A failure to write the note is
@@ -4410,7 +4506,7 @@ fn running_elsewhere_count(others: usize) -> String {
 /// flag that reaches it, so the line is the fix. `--pid <N> (<sock>)` when the
 /// socket IS the default dir's per-instance socket for `N`
 /// ([`reached_by_pid`]); `--sock <sock>` for every other — an
-/// explicit-`$ATERM_CONTROL_SOCK` instance, whose path only `--sock` dials —
+/// explicit-`--control-sock` instance, whose path only `--sock` dials —
 /// with ` (pid N)` appended when its graph entry carried the hosting pid, so
 /// the pid is still shown. The graph entry's pid is NOT the discriminator:
 /// `write_graph_entry` records the hosting pid in EVERY entry, so an explicit
@@ -4454,7 +4550,7 @@ fn running_elsewhere_flags(dir: Option<&Path>, live: &[(u32, String)]) -> String
 /// separator spelling — Windows' `dir.join` writes `\`, so a `/`-spelled path
 /// to the very same file is not a different socket — and then
 /// [`same_socket_path`], tolerant of a symlinked ancestor. A socket that
-/// merely LOOKS per-instance — `$ATERM_CONTROL_SOCK=/elsewhere/aterm-4242.sock`
+/// merely LOOKS per-instance — `--control-sock /elsewhere/aterm-4242.sock`
 /// — fails the second test and is named by `--sock`. No default dir, no
 /// `--pid`: `--sock` always dials the path it is given.
 fn reached_by_pid(dir: Option<&Path>, pid: u32, sock: &str) -> bool {
@@ -4700,8 +4796,9 @@ fn stderr_line(msg: &str) -> io::Result<()> {
 /// The stdout handle, with aterm-ctl's EXPLICIT process-signal policy:
 /// SIGPIPE stays at Rust's startup default (ignored), so a broken pipe never
 /// kills the process asynchronously — it surfaces as an [`io::Error`] from
-/// `write_all`, which every caller here propagates (the process then exits
-/// non-zero via `main`). `io::stdout` is PASSED AS A FUNCTION ITEM to a
+/// `write_all`, which every caller here propagates through [`StdoutSink`]: a
+/// reader that closed the pipe ends the run silently with status 0 (`| head`),
+/// every other write failure exits non-zero via `main`. `io::stdout` is PASSED AS A FUNCTION ITEM to a
 /// combinator (see `read_token_for`) so the strict gate keeps it a plain
 /// opaque cross-crate call instead of inlining std's startup-semantics
 /// internals it cannot prove.
@@ -4718,7 +4815,7 @@ fn stdout_handle() -> io::Stdout {
 /// the streaming-payload path, which always propagated them).
 fn print_stdout_line(line: &str) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = stdout.lock();
+    let mut out = StdoutSink(stdout.lock());
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")
 }
@@ -4760,9 +4857,10 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
     // turn. Batching is invisible here because the payload is a bounded one-shot
     // body: nothing reads our stdout mid-payload, and the explicit `flush()`
     // below (NOT BufWriter's Drop) keeps a broken-pipe/ENOSPC error propagating
-    // to the caller. Deliberately NOT applied to `subscribe_watch`, which
-    // flushes per frame for liveness by design.
-    let mut out = io::BufWriter::new(stdout.lock());
+    // to the caller. Deliberately NOT applied to the `subscribe` relay
+    // (`redial::relay_subscription`), which flushes per frame for liveness by
+    // design.
+    let mut out = StdoutSink(io::BufWriter::new(stdout.lock()));
     for _ in 0..count {
         let mut line = String::new();
         if read_bounded_line(reader, &mut line)? == 0 {
@@ -4893,9 +4991,16 @@ fn receive_guarded_artifact_reply(
 ///
 /// `timeout_explicit` distinguishes a user-supplied `--timeout` from the default:
 /// it matters only for `subscribe`, whose default watches FOREVER but whose
-/// explicit `--timeout` is a max-watch wall-clock bound (see [`subscribe_watch`]).
-/// `origin` is how `path` was chosen, which decides what a connect failure on
-/// it may offer instead ([`connect_error`]).
+/// explicit `--timeout` is a max-watch wall-clock bound
+/// ([`redial::relay_subscription`]). `origin` is how `path` was chosen, which
+/// decides what a connect failure on it may offer instead ([`connect_error`]).
+/// `redial` is where a successor of the server may answer when an aterm
+/// self-update replaces it mid-exchange (the [`redial`] module's rule).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request's framing inputs plus the two policies (deadline, redial) it runs under; \
+              a wrapper struct would relocate the list, not simplify it"
+)]
 fn exchange(
     path: &str,
     origin: TargetOrigin,
@@ -4904,12 +5009,16 @@ fn exchange(
     frame_request: &str,
     deadline: Option<std::time::Duration>,
     timeout_explicit: bool,
+    redial: &redial::Redial,
 ) -> io::Result<ExitCode> {
     // The `latest` alias is a symlink on Unix (identity here — the kernel
     // resolves it during connect) and a pointer FILE on Windows; resolve it
     // client-side so both platforms dial the live instance socket.
     let path = &aterm_uds::latest::resolve(path);
     let stream = connect_stream(path, origin)?;
+    // WHO answered: the server's pid, so a hang-up can later tell "it ended the
+    // exchange" (the same process still serves) from "it was replaced".
+    let server = redial::server_pid(&stream);
 
     // Bound every socket operation, as `probe_lines` already does for
     // discovery: a wedged server (or one that stalls mid-reply) must surface
@@ -4918,14 +5027,57 @@ fn exchange(
     // verbs' 600 s server-side clamp; `--timeout` overrides it (0 => `None`).
     stream.set_read_timeout(deadline)?;
     stream.set_write_timeout(deadline)?;
+    // When that deadline runs out, measured from the request: a server that goes
+    // away under a blocking read does not extend it (`redial`'s rule — the wait
+    // for a successor, and the one retry on it, spend what it has left).
+    let started = std::time::Instant::now();
 
     // `&CtlStream` implements both `Read` and `Write`, so the two borrows can
     // coexist: send the auth line + request, then buffer-read the response.
-    send_request(&stream, read_token_for(path).as_deref(), request)?;
+    let sent = send_request(&stream, read_token_for(path).as_deref(), request);
 
     let mut reader = BufReader::new(&stream);
     let mut status_line = String::new();
-    if read_bounded_line(&mut reader, &mut status_line)? == 0 {
+    let got = sent.and_then(|()| read_bounded_line(&mut reader, &mut status_line));
+    // A BLOCKING READ cut before its reply — the server went away under an
+    // `await`, a `wait`, a `text` — is the self-update case: follow the successor
+    // once, or say it could not be resumed. Anything else keeps its old error.
+    let request_parts: Vec<String> = request.split_whitespace().map(String::from).collect();
+    let hung_up = match &got {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => redial::is_hangup(e),
+    };
+    if hung_up && redial::is_blocking_read(&request_parts) {
+        return replaced_before_reply(
+            path,
+            server,
+            &request_parts,
+            redial,
+            deadline.map(|d| started + d),
+            |next| {
+                // The retry gets what the deadline has left, never a fresh one
+                // (a set timeout must be non-zero, hence the 1 ms floor: a
+                // spent deadline fires at once, as exit 124).
+                let left = deadline.map(|d| {
+                    d.saturating_sub(started.elapsed())
+                        .max(std::time::Duration::from_millis(1))
+                });
+                exchange(
+                    next,
+                    TargetOrigin::Pinned,
+                    request,
+                    verb,
+                    frame_request,
+                    left,
+                    timeout_explicit,
+                    &redial::Redial::none(),
+                )
+            },
+            got.err(),
+        );
+    }
+    if got? == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "server closed the connection without responding",
@@ -4955,24 +5107,32 @@ fn exchange(
     if verb == "subscribe" {
         // `OK subscribe <n>` acknowledged — the connection is PUSH-ONLY from here
         // (CLIENT-1: there was previously no client at all for the push face). The
-        // ack goes to STDERR so stdout carries the DELTA/EVENT/GAP/BYTES frames
+        // ack goes to STDERR so stdout carries the DELTA/EVENT/GAP/BYTES/MAIL/T frames
         // VERBATIM (byte-exact — `cells`/`bytes` frames embed byte bodies) for a
         // parser/pipe.
         stderr_line(status_line)?;
         // A subscription legitimately idles between frames, so the DEFAULT clears
-        // the read deadline and watches forever (session exit / app quit / user
-        // interrupt ends it). An EXPLICIT `--timeout` instead bounds the watch as
-        // a WALL-CLOCK max — flush frames so far, exit 124 — while an explicit 0
+        // the read deadline and watches forever (the sessions' exit or a user
+        // interrupt ends it; an aterm self-update does NOT — the relay follows
+        // the successor, and a server that went away with none exits 75). An
+        // EXPLICIT `--timeout` instead bounds the watch as a WALL-CLOCK max over
+        // the whole relay — flush frames so far, exit 124 — while an explicit 0
         // (`deadline == None`) still watches forever, like the default.
-        match deadline {
-            Some(watch) if timeout_explicit => return subscribe_watch(&stream, &mut reader, watch),
-            _ => {}
-        }
-        stream.set_read_timeout(None)?;
+        let watch = deadline.filter(|_| timeout_explicit);
         let stdout = stdout_handle();
-        let mut out = stdout.lock();
-        io::copy(&mut reader, &mut out)?;
-        return Ok(ExitCode::SUCCESS);
+        let mut out = StdoutSink(stdout.lock());
+        return redial::relay_subscription(
+            redial::FirstLeg {
+                stream: &stream,
+                reader: &mut reader,
+                dialed: path,
+                server,
+            },
+            request,
+            watch,
+            redial,
+            &mut out,
+        );
     }
 
     if bytes_payload(verb, frame_request) {
@@ -4997,7 +5157,7 @@ fn exchange(
             stderr_line(&msg)?;
         }
         let stdout = stdout_handle();
-        let mut out = stdout.lock();
+        let mut out = StdoutSink(stdout.lock());
         let copied = copy_body(&mut reader, &mut out, nbytes as u64)?;
         if copied < nbytes as u64 {
             // Header promised more than arrived: print what we have (already
@@ -5106,44 +5266,58 @@ fn exchange(
     }
 }
 
-/// Relay a `subscribe` push stream to stdout under an EXPLICIT `--timeout` treated
-/// as a max-watch WALL-CLOCK deadline: watch at most `watch`, then flush the frames
-/// received so far and exit [`EXIT_TIMEOUT`]. Unlike a socket read timeout (an
-/// INACTIVITY bound a chatty session would keep resetting forever), this bounds
-/// TOTAL watch time. The read timeout is set to a short POLL interval — not the
-/// remaining time — so a near-deadline tick never rounds to a zero (== infinite)
-/// SO_RCVTIMEO, and the wall clock is re-checked at least every poll; a `--timeout`
-/// is whole seconds, so the sub-poll overshoot is negligible. Server hang-up (EOF)
-/// exits SUCCESS with whatever was streamed.
-fn subscribe_watch(
-    stream: &CtlStream,
-    reader: &mut BufReader<&CtlStream>,
-    watch: std::time::Duration,
+/// A blocking read (`await`, `wait`, `ready`, `text`, `inbox`) whose server hung
+/// up before replying: an aterm self-update is the ordinary cause (the old
+/// process `_exit`s at its Commit). A successor answering where this call
+/// follows ([`redial::Redial::after_hangup`]) is asked ONCE more through `again`
+/// — unless the request carries an anchor that means nothing to another process
+/// ([`redial::retries_across_replacement`]), which ends with the same exit code
+/// and a note to re-issue it. No successor: [`redial::EXIT_REPLACED`]. The same
+/// server still serving, or a platform that cannot tell: the original error.
+/// `until` is when the call's deadline runs out: the successor wait ends there
+/// if that is sooner than the handoff bound.
+fn replaced_before_reply(
+    dialed: &str,
+    server: Option<u32>,
+    request_parts: &[String],
+    redial: &redial::Redial,
+    until: Option<std::time::Instant>,
+    again: impl FnOnce(&str) -> io::Result<ExitCode>,
+    error: Option<io::Error>,
 ) -> io::Result<ExitCode> {
-    let start = std::time::Instant::now();
-    let poll = std::time::Duration::from_millis(250);
-    stream.set_read_timeout(Some(poll))?;
-    let stdout = stdout_handle();
-    let mut out = stdout.lock();
-    let mut buf = [0u8; 8192];
-    loop {
-        if start.elapsed() >= watch {
-            out.flush()?;
-            return Ok(ExitCode::from(EXIT_TIMEOUT));
+    let original = || {
+        error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server closed the connection without responding",
+            )
+        })
+    };
+    match redial.after_hangup(dialed, server, until) {
+        redial::Hangup::StillServing | redial::Hangup::Unknown => Err(original()),
+        redial::Hangup::Gone {
+            waited,
+            by_deadline,
+        } => {
+            stderr_line(&redial::gone_note(server, waited, by_deadline))?;
+            Ok(ExitCode::from(redial::EXIT_REPLACED))
         }
-        match reader.read(&mut buf) {
-            Ok(0) => {
-                out.flush()?;
-                return Ok(ExitCode::SUCCESS); // server hung up
+        redial::Hangup::Successor { path, pid } => {
+            let old = server.unwrap_or(0);
+            if redial::retries_across_replacement(request_parts) {
+                stderr_line(&format!(
+                    "aterm was replaced (pid {old} -> {pid}, an update) before it answered; \
+                     asking its successor once"
+                ))?;
+                again(&path)
+            } else {
+                stderr_line(&format!(
+                    "aterm was replaced (pid {old} -> {pid}, an update) before it answered; this \
+                     request's anchor (`seq <n>`, `since=`, an inbox id, a local `@<n>`) names a \
+                     position in the old process — re-issue it"
+                ))?;
+                Ok(ExitCode::from(redial::EXIT_REPLACED))
             }
-            Ok(n) => {
-                out.write_all(&buf[..n])?;
-                out.flush()?; // push each frame promptly (the loop may block next)
-            }
-            // A poll-interval read timeout is not an error here: loop back and
-            // re-check the wall clock. Any OTHER io error ends the watch.
-            Err(ref e) if is_timeout_error(e) => {}
-            Err(e) => return Err(e),
         }
     }
 }
@@ -5496,6 +5670,7 @@ mod tests {
                 "text",
                 Some(std::time::Duration::from_secs(5)),
                 false,
+                &redial::Redial::none(),
             );
             let _ = tx.send(res.is_ok());
         });
@@ -5570,15 +5745,6 @@ mod tests {
         }
     }
 
-    /// `usage_error` composes its message by hand for the same reason; pin it
-    /// to the `format!("usage: {SYNOPSIS}")` it replaced.
-    #[test]
-    fn usage_error_matches_format() {
-        let e = usage_error();
-        assert_eq!(e.to_string(), format!("usage: {SYNOPSIS}"));
-        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-    }
-
     /// `connect_error` composes its message by hand for the same reason; pin
     /// the `connect {path}: {cause}` frame and check the original error kind
     /// is preserved. The two "no engine serves this socket" kinds additionally
@@ -5645,14 +5811,14 @@ mod tests {
 
     /// A dead socket beside a LIVE instance must not claim "aterm isn't
     /// running": that line sent the operator to launch a second window when
-    /// `--pid` named a corpse or `$ATERM_CONTROL_SOCK` a path nobody serves.
+    /// `--pid` named a corpse or `--sock` a path nobody serves.
     /// The launch remedy is gone in both forms, because it is false. What
     /// replaces it depends on how the socket was chosen:
     ///
     /// * FLAGLESS — the flag that REACHES each live instance: `--pid` only for
     ///   the default dir's own `aterm-<pid>.sock`, `--sock` for everything
     ///   else.
-    /// * PINNED (`--sock`, `--pid`, an explicit `$ATERM_CONTROL_SOCK`) — only
+    /// * PINNED (`--sock`, `--pid`) — only
     ///   the count and `aterm ctl instances`: no instance, no flag, no "target
     ///   one". Handing a pinned caller the fleet as flags gave an agent whose
     ///   private socket died the human's window as a copy-paste `--pid`.
@@ -6194,75 +6360,37 @@ mod tests {
 
     #[test]
     fn resolve_refuses_both_sock_and_pid() {
-        let err = resolve_path(Some("/tmp/a.sock".into()), Some(7), None, None, None).unwrap_err();
+        let err = resolve_path(Some("/tmp/a.sock".into()), Some(7), None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn resolve_pid_targets_that_instance_socket() {
-        let path = resolve_path(None, Some(42), None, None, None).expect("per-user dir");
+        let path = resolve_path(None, Some(42), None).expect("per-user dir");
         // Platform-native separator: '/' on Unix, '\' on Windows.
         let want = format!("{}aterm-42.sock", std::path::MAIN_SEPARATOR);
         assert!(path.ends_with(&want), "got {path}");
     }
 
     #[test]
-    fn resolve_flag_beats_environment() {
-        let path = resolve_path(
-            Some("/tmp/a.sock".into()),
-            None,
-            Some("/elsewhere.sock".into()),
-            None,
-            None,
-        )
-        .unwrap();
+    fn resolve_sock_flag_passes_straight_through() {
+        let path = resolve_path(Some("/tmp/a.sock".into()), None, None).unwrap();
         assert_eq!(path, "/tmp/a.sock");
     }
 
-    #[test]
-    fn resolve_honours_environment_disable_keywords() {
-        for (env_sock, env_kill) in [(Some("0"), None), (Some("off"), None), (None, Some("1"))] {
-            let err = resolve_path(
-                None,
-                None,
-                env_sock.map(String::from),
-                env_kill.map(String::from),
-                None,
-            )
-            .unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        }
-        // ...but an explicit path value passes straight through.
-        let path = resolve_path(None, None, Some("/tmp/x.sock".into()), None, None).unwrap();
-        assert_eq!(path, "/tmp/x.sock");
-    }
-
     /// The origin `connect_error` renders from is the resolving arm's own:
-    /// every flag and an explicit `$ATERM_CONTROL_SOCK` PIN the socket, so a
-    /// dead one is never answered with another instance to drive. (The
-    /// per-instance arm is `Flagless` by construction; exercising it here would
-    /// dial the developer's real `latest` alias.)
+    /// every flag PINS the socket, so a dead one is never answered with another
+    /// instance to drive. (The flagless arm is `Flagless` by construction;
+    /// exercising it here would dial the developer's real `latest` alias.)
     #[test]
     fn resolve_target_pins_every_named_socket() {
-        let (path, origin) =
-            resolve_target(None, Some(42), None, None, None).expect("per-user dir");
+        let (path, origin) = resolve_target(None, Some(42), None).expect("per-user dir");
         let want = format!("{}aterm-42.sock", std::path::MAIN_SEPARATOR);
         assert!(path.ends_with(&want), "got {path}");
         assert_eq!(origin, TargetOrigin::Pinned);
         assert_eq!(
-            resolve_target(
-                Some("/tmp/a.sock".into()),
-                None,
-                Some("/elsewhere.sock".into()),
-                None,
-                None,
-            )
-            .unwrap(),
+            resolve_target(Some("/tmp/a.sock".into()), None, None).unwrap(),
             ("/tmp/a.sock".to_string(), TargetOrigin::Pinned)
-        );
-        assert_eq!(
-            resolve_target(None, None, Some("/tmp/x.sock".into()), None, None).unwrap(),
-            ("/tmp/x.sock".to_string(), TargetOrigin::Pinned)
         );
     }
 
@@ -6314,7 +6442,10 @@ mod tests {
             "every generated catalog line must appear in --help"
         );
         // The hand-written prose sections survive.
-        assert!(help.contains("$ATERM_CONTROL_SOCK"));
+        assert!(
+            !help.contains("$ATERM_CONTROL_SOCK"),
+            "no environment selects a socket"
+        );
         assert!(help.contains("aterm-<pid>.sock"));
         // The new OPTIONS + EXIT CODES prose.
         assert!(help.contains("--timeout"));
@@ -6389,15 +6520,6 @@ mod tests {
         assert!(EXCHANGE_DEADLINE > std::time::Duration::from_millis(600_000));
         // update check's floor: 30 s + 600 s of curl, plus real margin for staging.
         assert!(EXCHANGE_DEADLINE >= std::time::Duration::from_secs(650 + 60));
-    }
-
-    #[test]
-    fn version_line_is_well_formed() {
-        // Mirror what the --version branch prints; guard against a blank or
-        // mis-prefixed version line.
-        let line = format!("aterm-ctl {}", aterm_types::version::APP_VERSION);
-        assert!(line.starts_with("aterm-ctl "));
-        assert!(!aterm_types::version::APP_VERSION.is_empty());
     }
 
     /// `--timeout` parses SECONDS into the per-op deadline: `0` disables it
@@ -6560,103 +6682,6 @@ mod tests {
         );
     }
 
-    /// The CLIENT-answered discovery verbs (`ls`, `instances`, `windows`) — intercepted
-    /// by aterm-ctl, so NOT in the generated protocol catalog — are documented in
-    /// `--help` with their output shapes, and the subscribe PUSH-FRAME grammar is
-    /// spelled out (an AI reading `--help` must not reverse-engineer either).
-    #[test]
-    fn help_text_documents_client_verbs_and_push_frames() {
-        let help = help_text();
-        assert!(help.contains("CLIENT VERBS"), "client-verb block present");
-        // `ls`/`instances` output shapes (the finding: both were undiscoverable).
-        assert!(help.contains("instances"), "the `instances` verb is named");
-        assert!(
-            help.contains("<pid> <local> <sid> <parent|-> <state> <title>"),
-            "ls output shape documented"
-        );
-        assert!(
-            help.contains("<pid> <session-count> <sock>"),
-            "instances output shape documented"
-        );
-        // The roster's window/detail columns and the per-window fold (F2/F5).
-        assert!(
-            help.contains("window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->"),
-            "ls trailing columns documented"
-        );
-        // `path=` (2026-09-22) is the LAST column and says which tab still runs
-        // the foreign `claude`/`codex` — the one fact the managed-current row's
-        // tab COUNT could not name.
-        assert!(
-            help.contains("identity=<name|-> path=<frozen|live>[ *]")
-                && help.contains("frozen = a shell adopted from a build older than"),
-            "ls documents path=frozen|live and what frozen means"
-        );
-        assert!(
-            help.contains("<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]"),
-            "windows output shape documented"
-        );
-        for (verb, sentence) in [
-            ("ls", "`ls 1` is `ERR usage: ls`"),
-            ("instances", "`instances 1` is `ERR usage: instances`"),
-            ("windows", "`windows 1` is `ERR usage:\n    windows`"),
-        ] {
-            assert!(
-                help.contains(sentence),
-                "{verb} documents that it takes no argument"
-            );
-        }
-        // A headless instance is NOT `window=none`: it owns logical window 0,
-        // and both listings say so, so a reader of `ls` on a headless peer is
-        // not sent looking for a detached session.
-        assert!(
-            help.contains(
-                "a headless instance reports its one logical
-                  window 0"
-            ) && help.contains("a headless instance folds under its one logical window 0"),
-            "ls and windows both document headless placement as window 0"
-        );
-        // What `focused=`/`wfocus=` mean — the question a driver asks first when
-        // two windows are open: aterm's most recently focused window, which a
-        // minimize or an app deactivation does not change (the OS key window is
-        // a different fact). Both listings say so.
-        assert!(
-            help.contains(
-                "wfocus= that window is aterm's most
-                  recently focused one (unchanged by a minimize or by the app
-                  deactivating)"
-            ),
-            "ls documents wfocus="
-        );
-        assert!(
-            help.contains(
-                "focused= aterm's most recently focused window — one per
-                  instance, unchanged by a minimize or by the app deactivating"
-            ),
-            "windows documents focused="
-        );
-        assert!(
-            help.contains("`help ls` / `help instances` / `help windows` / `help mux` print the"),
-            "the block says help <client verb> is answered from it"
-        );
-        assert!(
-            completion_verb_list()
-                .split_whitespace()
-                .any(|v| v == "windows"),
-            "windows completes like ls/instances"
-        );
-        // The push-frame wire grammar names every frame shape.
-        assert!(help.contains("PUSH FRAMES"), "push-frame section present");
-        for shape in [
-            "sub <local> <sid>",
-            "DELTA <local> seq=",
-            "EVENT <local>",
-            "BYTES <local> <len>",
-            "GAP <local>",
-        ] {
-            assert!(help.contains(shape), "push frame `{shape}` documented");
-        }
-    }
-
     /// The stdin-payload cap mirrors the server's 256 KiB `feed-bin` limit and is
     /// enforced CLIENT-SIDE (a clear error before any byte is pipelined into a
     /// frame the server would refuse and desync on).
@@ -6701,11 +6726,11 @@ mod tests {
                     spec.name
                 );
             }
-            // Both CLIENT-answered verbs (absent from the protocol table) are added,
+            // Every CLIENT-answered verb (absent from the protocol table) is added,
             // adjacently — proof `completion_verb_list` appended them.
             assert!(
-                script.contains("ls instances"),
-                "{shell} completes the client verbs `ls`/`instances`"
+                script.contains("ls instances windows mux"),
+                "{shell} completes the client verbs `ls`/`instances`/`windows`/`mux`"
             );
         }
         // An unrecognized shell name has no script and maps to a clear error.
@@ -6767,8 +6792,16 @@ mod tests {
         // CONTRACT (install.sh): the zsh script's FIRST line is `#compdef aterm`.
         let zsh = front_door_completion_script("zsh", &verbs, &flags).expect("zsh");
         assert_eq!(zsh.lines().next(), Some("#compdef aterm"));
-        // An unknown shell has no script, exactly like the sibling generator.
+        // An unknown shell has no script, exactly like the sibling generator —
+        // and the front door says so without the protocol's `ERR` token.
         assert!(front_door_completion_script("powershell", &verbs, &flags).is_none());
+        let e = front_door_completions_result(Some("tcsh"), &verbs, &flags)
+            .expect_err("an unknown shell is refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            e.to_string(),
+            "--completions: unknown shell (bash, zsh, or fish)"
+        );
     }
 
     /// `aterm-uds` keeps a std-only MIRROR of the token-filename rule so it can
@@ -6976,6 +7009,60 @@ mod tests {
         parts.iter().map(|p| (*p).to_string()).collect()
     }
 
+    /// An option this client does not have, typed before the verb, is refused by
+    /// the client — it used to be forwarded AS the verb, and the server's
+    /// `ERR unknown verb (try: help)` sent the reader to the wrong table.
+    #[test]
+    fn an_unknown_option_before_the_verb_is_refused_by_the_client() {
+        for argv in [&["--frob", "status"][..], &["-x", "status"][..]] {
+            let err = real_main(strings(argv).into_iter().map(Into::into).collect())
+                .expect_err("an unknown option is a usage error");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let want = format!("unknown option {} (aterm ctl --help lists them)", argv[0]);
+            assert_eq!(err.to_string(), want);
+        }
+    }
+
+    /// `aterm ctl help --full | head`: the reader closing stdout is not a failure of
+    /// ours — no line, status 0. Every other write failure, and a broken pipe on
+    /// the SOCKET, keep their line and their exit.
+    #[test]
+    fn a_reader_closing_stdout_ends_the_client_quietly_with_status_0() {
+        let closed = stdout_closed(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert!(is_stdout_closed(&closed));
+        assert_eq!(
+            format!("{:?}", exit_for(&closed)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        let full = stdout_closed(io::Error::from(io::ErrorKind::StorageFull));
+        assert!(!is_stdout_closed(&full));
+        assert_eq!(
+            format!("{:?}", exit_for(&full)),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+        // A socket-side broken pipe is never marked: the server hung up, which is news.
+        let socket = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(!is_stdout_closed(&socket));
+        // Through the sink, a broken pipe comes back marked; other errors come back as they were.
+        struct Fails(io::ErrorKind);
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = StdoutSink(Fails(io::ErrorKind::BrokenPipe))
+            .write_all(b"x")
+            .expect_err("the sink fails");
+        assert!(is_stdout_closed(&err));
+        let err = StdoutSink(Fails(io::ErrorKind::StorageFull))
+            .write_all(b"x")
+            .expect_err("the sink fails");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+    }
+
     /// `help <client verb>` is answered from the CLIENT VERBS block, framed like
     /// the server's own `help <verb>`: `OK <n>` then exactly the entry's rows —
     /// the verb line and its continuation lines, nothing from the neighbouring
@@ -7023,17 +7110,14 @@ mod tests {
         let ls = client_help_reply(&strings(&["help", "ls"])).unwrap();
         assert!(ls.contains("detail=<pct|->"), "{ls}");
         // The identity column (session identities) sits before `path=`
-        // (2026-09-22), which is the LAST one before the self mark; both
-        // meanings are spelled beside the others.
+        // (2026-09-22); the agent and owner columns follow, up to the self mark.
         assert!(
-            ls.contains("identity=<name|-> path=<frozen|live>[ *]"),
+            ls.contains("identity=<name|-> path=<frozen|live> program=<name|->")
+                && ls.contains("upgrade=<-|<state>/<to>/<why>/<age>>[ *]"),
             "{ls}"
         );
         assert!(ls.contains("`spawn identity=<name>`"), "{ls}");
-        assert!(
-            ls.contains("frozen = a shell adopted from a build older than"),
-            "{ls}"
-        );
+        assert!(ls.contains("frozen = a foreign copy (a"), "{ls}");
         assert!(!ls.contains("instances     one line per"), "{ls}");
     }
 
@@ -7132,26 +7216,52 @@ mod tests {
         assert_eq!(dominant_hint(&scoped), Some(hint));
     }
 
+    /// The host's own "denied" errors, built from the RAW code its `connect()`
+    /// and `open()` hand back, so each host's run exercises the real decode
+    /// (`from_raw_os_error` → `ErrorKind`) the classifier keys on rather than a
+    /// kind chosen by hand. On Unix: `EPERM` (1), the macOS seatbelt's answer,
+    /// and `EACCES` (13). Windows numbers its errors differently — raw 1 is
+    /// `ERROR_INVALID_FUNCTION` and 13 `ERROR_INVALID_DATA`, both
+    /// `Uncategorized` (measured on stock 1.97.1), which is what failed these
+    /// tests there — and its two `PermissionDenied` codes are
+    /// `ERROR_ACCESS_DENIED` (5), what a refused directory read or token open
+    /// reports, and `WSAEACCES` (10013), what winsock reports for a connect the
+    /// socket's ACL forbids. Every expectation that quotes the error's text
+    /// formats it from these, never from a literal, because the strerror
+    /// wording is the host's.
     fn eperm() -> io::Error {
-        io::Error::from_raw_os_error(1)
+        io::Error::from_raw_os_error(if cfg!(windows) { 5 } else { 1 })
     }
 
     fn eacces() -> io::Error {
-        io::Error::from_raw_os_error(13)
+        io::Error::from_raw_os_error(if cfg!(windows) { 10013 } else { 13 })
     }
 
+    /// The verdict `probe_cause` attaches to a `Denied` probe carrying
+    /// [`eperm`]: on Unix raw 1 IS the seatbelt's `EPERM` and the report names
+    /// the sandbox outright; on Windows no denial is raw 1, so the same probe
+    /// takes the wording that leaves another user's socket open.
+    const EPERM_VERDICT: &str = if cfg!(windows) {
+        "another user's socket, or a sandbox refusing AF_UNIX connect()"
+    } else {
+        "a sandbox is refusing AF_UNIX connect()"
+    };
+
     /// One row: what the directory and the probes were, what the report must
-    /// say, what it must NEVER say, and the exit code.
-    struct Row {
+    /// say, what it must NEVER say, and the exit code. `says` borrows so a row
+    /// can quote the host's own strerror text (`&*format!(..)` inside the rows
+    /// ARRAY: an array literal extends its temporaries to the enclosing block,
+    /// which `vec![]`, a function call, does not).
+    struct Row<'a> {
         name: &'static str,
         dir: DirOutcome,
         probes: Vec<(u32, String, Probe)>,
         code: u8,
-        says: &'static [&'static str],
-        never_says: &'static [&'static str],
+        says: &'a [&'a str],
+        never_says: &'a [&'a str],
     }
 
-    fn check_row(row: Row) {
+    fn check_row(row: Row<'_>) {
         let with_probes = !row.probes.is_empty();
         let (msg, code) = discovery_report(row.dir, &row.probes);
         assert_eq!(code, row.code, "[{}] exit code; report:\n{msg}", row.name);
@@ -7190,7 +7300,7 @@ mod tests {
     /// the claim itself survives only for a readable, empty directory.
     #[test]
     fn discovery_report_names_the_cause_for_every_row_of_the_f8_table() {
-        let rows = vec![
+        let rows = [
             Row {
                 name: "XDG_RUNTIME_DIR set, $XDG_RUNTIME_DIR/aterm does not exist",
                 dir: DirOutcome::Missing {
@@ -7250,7 +7360,10 @@ mod tests {
                 code: EXIT_UNREACHABLE,
                 says: &[
                     "found 2 control sockets in /Users//someone/Library/Application Support/aterm but could not reach any:",
-                    "\n  aterm-10718.sock  connect: Operation not permitted (os error 1) — a sandbox is refusing AF_UNIX connect()",
+                    &*format!(
+                        "\n  aterm-10718.sock  connect: {} — {EPERM_VERDICT}",
+                        eperm()
+                    ),
                     "\n  aterm-10274.sock  connect: Connection refused — stale, pid 10274 is not running",
                     "hint: the control socket is refused by this sandbox; aterm drives such a session from outside and it takes no part in messaging — nothing to configure",
                 ],
@@ -7278,7 +7391,10 @@ mod tests {
                 code: EXIT_UNREACHABLE,
                 says: &[
                     "found 1 control socket in",
-                    "\n  aterm-10718.sock  token /Users//someone/Library/Application Support/aterm/aterm-10718.token unreadable: Permission denied (os error 13)",
+                    &*format!(
+                        "\n  aterm-10718.sock  token {FLEET}/aterm-10718.token unreadable: {}",
+                        eacces()
+                    ),
                     "hint: the token beside a socket must be readable by THIS user",
                 ],
                 never_says: &[FLEET_CLAIM, "sockets in"],
@@ -7314,7 +7430,7 @@ mod tests {
     /// and an answered fleet reports nothing.
     #[test]
     fn discovery_report_covers_stale_running_auth_timeout_and_empty() {
-        let rows = vec![
+        let rows = [
             Row {
                 name: "readable, empty directory — the one honest fleet claim",
                 dir: DirOutcome::Empty(PathBuf::from(FLEET)),
@@ -7334,7 +7450,10 @@ mod tests {
                 probes: vec![],
                 code: EXIT_UNREACHABLE,
                 says: &[
-                    "control-socket directory /Users//someone/Library/Application Support/aterm exists but cannot be read: Operation not permitted (os error 1)",
+                    &*format!(
+                        "control-socket directory {FLEET} exists but cannot be read: {}",
+                        eperm()
+                    ),
                     "readdir()",
                 ],
                 never_says: &[FLEET_CLAIM],
@@ -7470,7 +7589,10 @@ mod tests {
                 ],
                 code: EXIT_UNREACHABLE,
                 says: &[
-                    "\n  /tmp/run/aterm-6.sock  connect: Permission denied (os error 13) — another user's socket, or a sandbox refusing AF_UNIX connect()",
+                    &*format!(
+                        "\n  /tmp/run/aterm-6.sock  connect: {} — another user's socket, or a sandbox refusing AF_UNIX connect()",
+                        eacces()
+                    ),
                     "hint: the control socket is refused by this sandbox;",
                 ],
                 never_says: &[FLEET_CLAIM, LAUNCH_REMEDY, "--allow-unix-socket"],
@@ -7583,50 +7705,92 @@ mod tests {
     /// stuck syscall and fail closed without spawning another attempt. Once
     /// released, the successful late stream is sent to a dropped reply channel,
     /// closed normally, and the one worker joins cleanly.
+    ///
+    /// STRUCTURE, not stopwatches (the load-sensitive test audit of 2026-09-27:
+    /// this test timed each caller against 200-500 ms, which a descheduled thread
+    /// could exceed). The injected connect is released only after every call, so a
+    /// caller that waited on it would wait forever: each call runs on its own
+    /// thread, and a 10 s bound turns that hang into a failure. What ended each
+    /// call is read off its own deadline: the first caller's budget has run out
+    /// when it returns, and a later caller's 10 s budget has NOT (it failed closed
+    /// rather than waiting behind the stuck worker). The bounds stay tighter than
+    /// any plausible wrong wait, with seconds of room for load: the first
+    /// caller overshoots its own budget by under 1 s (a connect honouring a
+    /// fixed `PROBE_DEADLINE`-class timeout instead of the caller's remainder
+    /// overshoots by ~2 s), and each later caller keeps at least 8.5 s of its 10 s
+    /// (a retry, back-off or capped wait of 1.5 s or more spends it). And after the release the
+    /// sole worker has drained anything queued, so the count still being one
+    /// once it is joined proves no later caller queued a second connect.
     #[test]
     fn connector_deadline_bounds_one_stuck_worker_and_late_success() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_calls = std::sync::Arc::clone(&calls);
         let (entered, worker_entered) = std::sync::mpsc::sync_channel::<()>(1);
-        let (release, blocked) = std::sync::mpsc::sync_channel::<()>(0);
-        let connector = ProbeConnector::spawn(move |_path| {
-            worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            entered.send(()).expect("announce stalled connector");
-            blocked.recv().expect("release stalled connector");
-            let (result, peer) = CtlStream::pair()?;
-            drop(peer);
-            Ok(result)
-        })
-        .expect("spawn injected connector");
-
-        let started = std::time::Instant::now();
-        let first = connector
-            .connect(
-                "forever-stalled",
-                ProbeDeadline::after(std::time::Duration::from_millis(40)),
-            )
-            .expect_err("the first caller must observe its deadline");
-        assert_eq!(first.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "the blocking connect escaped its caller's budget"
+        let (release_sender, blocked) = std::sync::mpsc::sync_channel::<()>(0);
+        let connector = std::sync::Arc::new(
+            ProbeConnector::spawn(move |_path| {
+                worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                entered.send(()).expect("announce stalled connector");
+                blocked.recv().expect("release stalled connector");
+                let (result, peer) = CtlStream::pair()?;
+                drop(peer);
+                Ok(result)
+            })
+            .expect("spawn injected connector"),
         );
+        // Bound AFTER the connector, so a failing assertion drops it FIRST: the
+        // stuck connect then errors out, rather than the connector's drop joining
+        // a worker nothing will ever release.
+        let release = release_sender;
+        // One connect on its own thread: its error, and whether its deadline
+        // still had time left the moment it returned.
+        let call = |path: &'static str, budget: std::time::Duration| {
+            let connector = std::sync::Arc::clone(&connector);
+            let (done, outcome) = std::sync::mpsc::sync_channel(1);
+            let caller = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let deadline = ProbeDeadline::after(budget);
+                let result = connector.connect(path, deadline).map(drop);
+                let ran = started.elapsed();
+                let _ = done.send((result, deadline.remaining().ok(), ran));
+            });
+            let (result, left, ran) = outcome
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("{path}: the caller blocked behind the stuck connect"));
+            caller.join().expect("caller thread");
+            let error = result.expect_err("a connect behind the stuck worker cannot succeed");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{path}: {error}");
+            (left, ran)
+        };
+
+        // The first caller claims the one worker. `busy` is the marker: the stuck
+        // connect keeps it set, so it is clear afterwards only if the budget ran
+        // out before the job was submitted (this thread descheduled between
+        // `ProbeDeadline::after` and `connect`'s first look), which is retried
+        // with a larger budget rather than read as a verdict.
+        let claimed = [40, 160, 640, 2560].into_iter().any(|budget_ms| {
+            let budget = std::time::Duration::from_millis(budget_ms);
+            let (left, ran) = call("forever-stalled", budget);
+            assert!(
+                left.is_none(),
+                "the first caller gave up with {left:?} of its own budget left"
+            );
+            assert!(
+                ran.saturating_sub(budget) < std::time::Duration::from_secs(1),
+                "the blocking connect escaped its caller's {budget:?} budget: it ran {ran:?}"
+            );
+            connector.busy.load(std::sync::atomic::Ordering::Acquire)
+        });
+        assert!(claimed, "no first caller ever reached the worker");
         worker_entered
-            .recv_timeout(std::time::Duration::from_millis(500))
+            .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the sole worker must enter the injected connect");
 
-        for budget_ms in [10, 20, 40] {
-            let later_started = std::time::Instant::now();
-            let later = connector
-                .connect(
-                    "must-not-queue",
-                    ProbeDeadline::after(std::time::Duration::from_millis(budget_ms)),
-                )
-                .expect_err("a later connect must fail behind the bounded worker");
-            assert_eq!(later.kind(), io::ErrorKind::TimedOut);
+        for _ in 0..3 {
+            let (left, _) = call("must-not-queue", std::time::Duration::from_secs(10));
             assert!(
-                later_started.elapsed() < std::time::Duration::from_millis(200),
-                "submission blocked behind the stuck connect"
+                left.is_some_and(|left| left >= std::time::Duration::from_millis(8_500)),
+                "a later caller waited behind the stuck connect: {left:?} of its 10 s left"
             );
         }
         assert_eq!(
@@ -7636,7 +7800,17 @@ mod tests {
         );
 
         release.send(()).expect("release worker");
-        drop(connector); // closes its request channel and joins the sole worker
+        // A queued connect would now run and fail on the closed release rather
+        // than hang the join below.
+        drop(release);
+        // Every caller thread is joined, so this is the last handle: dropping it
+        // closes the request channel and joins the sole worker.
+        drop(std::sync::Arc::into_inner(connector).expect("the callers have exited"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a later caller queued a connect the worker ran once released"
+        );
     }
 
     /// A token miss names the FILE it looked for (the per-instance mirror,
@@ -7888,10 +8062,23 @@ mod tests {
     /// Every delivered byte arrives sooner than the configured socket timeout,
     /// so the old per-read deadline would accept this response after many budget
     /// windows. The one monotonic probe deadline must cut it off mid-line.
+    ///
+    /// The status line is padded so that trickling it ALONE takes seconds
+    /// (the load-sensitive test audit of 2026-09-27). A deadline re-armed per
+    /// read answers, or times out only once the whole line is in; one checked
+    /// only between lines returns no sooner than that line either. So the
+    /// elapsed bound, half that line's trickle, separates the correct probe
+    /// (gone at its 140 ms budget) from both by seconds. The 11-byte reply it
+    /// replaced left 360 ms of headroom, and a per-line deadline passed it.
     #[cfg(unix)]
     #[test]
     fn probe_deadline_is_total_against_a_trickling_peer() {
         use std::io::{BufRead, Write};
+
+        const GAP: std::time::Duration = std::time::Duration::from_millis(60);
+        let status = format!("OK 1{}\n", " ".repeat(96));
+        let status_trickle = GAP * u32::try_from(status.len()).expect("short status line");
+        let reply = format!("{status}alpha\n");
 
         let _serial = PROBE_SOCKET_TEST_LOCK
             .lock()
@@ -7906,13 +8093,9 @@ mod tests {
             let mut reader = std::io::BufReader::new(conn.try_clone().expect("clone client"));
             let mut request = String::new();
             reader.read_line(&mut request).expect("read probe request");
-            for byte in b"OK 1\nalpha\n" {
-                std::thread::sleep(std::time::Duration::from_millis(60));
-                if conn
-                    .write_all(&[*byte])
-                    .and_then(|()| conn.flush())
-                    .is_err()
-                {
+            for byte in reply.bytes() {
+                std::thread::sleep(GAP);
+                if conn.write_all(&[byte]).and_then(|()| conn.flush()).is_err() {
                     break; // the total-deadline client closed as intended
                 }
             }
@@ -7927,56 +8110,18 @@ mod tests {
         );
         assert!(matches!(probe, Probe::Timeout), "got {probe:?}");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "the peer restarted the per-read timeout instead of sharing one budget"
+            started.elapsed() < status_trickle / 2,
+            "took {:?}: the deadline waited for the whole status line instead of \
+             sharing one budget across its reads",
+            started.elapsed()
         );
 
         server.join().expect("trickle server");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `--help` documents the discovery exit-code ladder (1 = truly empty,
-    /// 2 = could not look / could not reach, 124 = every socket timed out) and
-    /// the directory rule that makes a missing `$XDG_RUNTIME_DIR/aterm` an
-    /// environment fact rather than a fleet fact.
-    #[test]
-    fn help_documents_the_discovery_exit_codes_and_the_dir_rule() {
-        let help = help_text();
-        assert!(
-            help.contains("could not LOOK, or could not REACH"),
-            "exit 2 is explained"
-        );
-        assert!(
-            help.contains("`no live aterm instances found`"),
-            "exit 1's one meaning is named"
-        );
-        assert!(
-            help.contains("for `ls`/`instances`/`windows`,\n         EVERY found socket timed out"),
-            "124 for discovery, every discovery verb named"
-        );
-        // The ladder is three verbs tall on every rung, not two: `windows` shares
-        // `ls`/`instances`' codes and used to be missing from all four lines.
-        assert!(
-            help.contains("(`ls`, `instances`, `windows`): at least one instance answered"),
-            "exit 0 names windows"
-        );
-        assert!(
-            help.contains("`ls`/`instances`/`windows`: the control-socket directory was readable"),
-            "exit 1 names windows"
-        );
-        assert!(
-            help.contains("`ls`/`instances`/`windows` only — could not LOOK, or could not REACH"),
-            "exit 2 names windows"
-        );
-        assert!(
-            help.contains("DISCOVERY (`ls`, `instances`, `windows`)"),
-            "the resolution rule has a paragraph naming every discovery verb"
-        );
-        assert!(help.contains("is NOT consulted"), "the XDG rule is stated");
-    }
-
     /// The mirror must resolve in the socket's OWN directory — the concrete
-    /// regressions: an explicit `$ATERM_CONTROL_SOCK` path like `/tmp/c.sock`
+    /// regressions: an explicit `--control-sock` path like `/tmp/c.sock`
     /// pairs with `/tmp/c.sock.token`, NEVER the hand-rolled `/tmp/c.token`
     /// (which no server writes) and no longer the directory-wide
     /// `/tmp/aterm.token` (which the next explicit socket would overwrite).
@@ -8017,7 +8162,7 @@ mod tests {
             "the flagless alias resolves to the instance it points at"
         );
 
-        // An explicit `$ATERM_CONTROL_SOCK` override names no instance.
+        // An explicit `--control-sock` path names no instance.
         assert_eq!(
             instance_pid_of(dir.join("c.sock").to_str().expect("utf8")),
             None
@@ -8441,27 +8586,18 @@ mod tests {
         assert!(targets_own_session_implicitly(
             &parts(&["text"]),
             None,
-            None,
             None
         ));
         // Any explicit instance pin is a deliberate choice, not silence.
         assert!(!targets_own_session_implicitly(
             &parts(&["text"]),
             Some("/tmp/x.sock"),
-            None,
             None
         ));
         assert!(!targets_own_session_implicitly(
             &parts(&["text"]),
             None,
-            Some(42),
-            None
-        ));
-        assert!(!targets_own_session_implicitly(
-            &parts(&["text"]),
-            None,
-            None,
-            Some("/tmp/explicit.sock")
+            Some(42)
         ));
         // `@self`/`@env` CLAIM this session by name — false in a pane however
         // the socket was chosen, so a pin does not rescue them.
@@ -8469,14 +8605,12 @@ mod tests {
             assert!(targets_own_session_implicitly(
                 &parts(&[sel, "send", "hi"]),
                 Some("/tmp/x.sock"),
-                Some(42),
-                None
+                Some(42)
             ));
         }
         // …including inside `subscribe`'s selector-SECOND position and a list.
         assert!(targets_own_session_implicitly(
             &parts(&["subscribe", "@self,@1", "screen"]),
-            None,
             None,
             None
         ));
@@ -8485,26 +8619,23 @@ mod tests {
         assert!(targets_own_session_implicitly(
             &parts(&["@.", "text"]),
             None,
-            None,
             None
         ));
         assert!(!targets_own_session_implicitly(
             &parts(&["@.", "text"]),
             None,
-            Some(7),
-            None
+            Some(7)
         ));
         // A concrete sid names its target; nothing implicit is left.
         assert!(!targets_own_session_implicitly(
             &parts(&["@s-abc", "text"]),
-            None,
             None,
             None
         ));
         // The client-answered verbs address no session at all.
         for verb in MUX_EXEMPT_VERBS {
             assert!(
-                !targets_own_session_implicitly(&parts(&[verb]), None, None, None),
+                !targets_own_session_implicitly(&parts(&[verb]), None, None),
                 "{verb} addresses no session"
             );
         }
@@ -8529,7 +8660,7 @@ mod tests {
         }
         for verb in &meta {
             assert!(
-                !targets_own_session_implicitly(&parts(&[verb]), None, None, None),
+                !targets_own_session_implicitly(&parts(&[verb]), None, None),
                 "{verb} addresses no session and cannot be mis-targeted by a multiplexer"
             );
         }
@@ -8537,12 +8668,12 @@ mod tests {
         // is still refused, because those really can land in the wrong terminal.
         for verb in ["text", "send", "key", "blocks", "window", "tab", "spawn"] {
             assert!(
-                targets_own_session_implicitly(&parts(&[verb]), None, None, None),
+                targets_own_session_implicitly(&parts(&[verb]), None, None),
                 "{verb} names a real target and stays guarded"
             );
         }
         // Empty argv is the usage error's business, not this guard's.
-        assert!(!targets_own_session_implicitly(&[], None, None, None));
+        assert!(!targets_own_session_implicitly(&[], None, None));
     }
 
     /// The refusal has to be ACTIONABLE, not just correct: it names the session
@@ -8580,7 +8711,7 @@ mod tests {
         for spec in aterm_types::control_verbs::VERBS {
             if matches!(spec.target, aterm_types::control_verbs::Target::Meta) {
                 assert!(
-                    !targets_own_session_implicitly(&parts(&[spec.name]), None, None, None),
+                    !targets_own_session_implicitly(&parts(&[spec.name]), None, None),
                     "{} is session-less, so `@<sid> {}` must never be prescribed \
                      — the server rejects a selector there",
                     spec.name,
@@ -8717,7 +8848,7 @@ mod tests {
         let msg = mux_boundary_notice("screen");
         for needle in [
             "inside screen",
-            "command blocks, exit codes and cwd tracking do not cross the multiplexer",
+            "no command blocks, exit codes or cwd tracking in these panes",
             "aterm ctl mux",
             "ATERM_MUX_NOTICE=0",
         ] {
@@ -8830,7 +8961,6 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].pid, 4242);
         assert_eq!(listed[0].row, rows[0], "the server's row, byte for byte");
-        assert_eq!(listed[0].local(), Some("0"));
         assert_eq!(listed[0].sid(), Some("s-a"));
         assert!(!listed[0].is_self);
         // Exactly the row `ls` would mark ` *`: its sid is the calling terminal's.
@@ -8933,11 +9063,7 @@ mod tests {
 
         // Found but unreachable (the seatbelt case): NOT empty, and it says so
         // with the cause `Command::output()` used to swallow.
-        let denied = vec![(
-            4242,
-            sock.clone(),
-            Probe::Denied(io::Error::from_raw_os_error(1)),
-        )];
+        let denied = vec![(4242, sock.clone(), Probe::Denied(eperm()))];
         let blind = fleet_listing(
             Vec::new(),
             discovery_report(
@@ -8951,11 +9077,7 @@ mod tests {
         .expect_err("nothing answered");
         assert!(!blind.is_empty_fleet(), "sockets were found, not absent");
         assert_eq!(blind.code, EXIT_UNREACHABLE);
-        assert!(
-            blind
-                .reason
-                .contains("sandbox is refusing AF_UNIX connect()")
-        );
+        assert!(blind.reason.contains(EPERM_VERDICT), "{}", blind.reason);
         assert!(!blind.reason.contains(FLEET_CLAIM));
 
         // Wedged: every probe timed out, which is its own status (124).

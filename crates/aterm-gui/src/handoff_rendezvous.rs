@@ -2185,18 +2185,24 @@ mod tests {
         let (commit_rd, commit_wr) = pipe_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
-        let dialer = std::thread::spawn(move || {
-            dial_and_claim(
-                &path,
-                &claim,
-                TEST_NONCE,
-                ClaimDeadlines {
-                    // Spent long before the hold ends: the dial is over by then.
-                    dial: Instant::now() + Duration::from_millis(150),
-                    grant: Instant::now() + Duration::from_secs(10),
-                },
-            )
-        });
+        // THE HOLD WAITS OUT THE DIAL BUDGET IT WAS HANDED, NOT A GUESS AT IT (the
+        // load-sensitive test audit of 2026-09-27). The dial budget used to be
+        // 150 ms stamped inside the dialer against a fixed 400 ms hold, so a
+        // dialer kept off the CPU for 150 ms between its connect and its claim
+        // write failed `Deadline` on a correct tree. The budget is now fixed here,
+        // before the dialer exists, and generous for a connect, a getsockopt and
+        // a 70-byte write; the hold sleeps until that same instant has passed,
+        // plus `PAST_THE_DIAL` for a receive a regressed dialer bounded by it to
+        // expire. The grant therefore still arrives only after the dial budget is
+        // spent — which is the property — and only the grant budget can govern it.
+        const PAST_THE_DIAL: Duration = Duration::from_millis(250);
+        let dial = Instant::now() + Duration::from_secs(2);
+        let deadlines = ClaimDeadlines {
+            dial,
+            grant: dial + Duration::from_secs(30),
+        };
+        let dialer =
+            std::thread::spawn(move || dial_and_claim(&path, &claim, TEST_NONCE, deadlines));
         let peer = rendezvous
             .accept_claim(
                 Some(own_pid()),
@@ -2205,7 +2211,8 @@ mod tests {
             )
             .expect("claimed");
         assert!(!peer.poll_hangup(), "a held, idle dialer is not a hangup");
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(dial.saturating_duration_since(Instant::now()) + PAST_THE_DIAL);
+        assert!(Instant::now() > dial, "the hold outlasted the dial budget");
         assert!(
             !peer.poll_hangup(),
             "…nor after the hold outlasted its dial budget"
@@ -2279,14 +2286,24 @@ mod tests {
         };
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
+        // The dialer dies once the parent has SEEN it alive, never after a guess
+        // at how long an accept takes. Both steps before that need it connected:
+        // `gate_one` asks the kernel for the dialer's pid, and LOCAL_PEERPID
+        // answers ENOTCONN once the peer has closed (measured on Darwin 25.6,
+        // the 70 claim bytes still readable), so a close first is a refused
+        // claim; and the first `poll_hangup` below must read a live peer. A
+        // 200 ms hold lost both to a test thread kept off the CPU that long.
+        // The sender dropping (a panic before the send) releases the dialer too.
+        let (seen_alive, hold) = std::sync::mpsc::channel::<()>();
         let dialer = std::thread::spawn(move || {
             let stream = CtlStream::connect(&path).expect("connect");
             (&stream)
                 .write_all(&claim_frame(&claim))
                 .and_then(|()| (&stream).flush())
                 .expect("claim written");
-            // Hold the stream long enough for the parent to accept, then die.
-            std::thread::sleep(Duration::from_millis(200));
+            // Hold the stream until the parent has accepted it and seen it
+            // alive, then die.
+            let _ = hold.recv();
             drop(stream);
         });
         let peer = rendezvous
@@ -2297,6 +2314,7 @@ mod tests {
             )
             .expect("claimed");
         assert!(!peer.poll_hangup(), "alive while it holds the stream");
+        let _ = seen_alive.send(());
         dialer.join().expect("dialer thread");
         let mut saw_hangup = false;
         for _ in 0..50 {

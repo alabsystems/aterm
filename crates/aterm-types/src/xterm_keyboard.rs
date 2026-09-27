@@ -61,12 +61,6 @@ impl XtermKeyboardState {
         self.modify_other_keys
     }
 
-    /// Check if modifyOtherKeys is enabled (level > 0).
-    #[must_use]
-    pub const fn modify_other_keys_enabled(&self) -> bool {
-        matches!(self.modify_other_keys, Some(v) if v > 0)
-    }
-
     /// Get the formatOtherKeys value.
     #[must_use]
     pub const fn format_other_keys(&self) -> u8 {
@@ -154,7 +148,7 @@ mod tests {
     fn test_default_state() {
         let state = XtermKeyboardState::new();
         assert_eq!(state.modify_other_keys(), Some(0));
-        assert!(!state.modify_other_keys_enabled());
+        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
         assert_eq!(state.format_other_keys(), 0);
     }
 
@@ -164,7 +158,7 @@ mod tests {
 
         state.set_modify_other_keys(1);
         assert_eq!(state.modify_other_keys(), Some(1));
-        assert!(state.modify_other_keys_enabled());
+        assert!(matches!(state.modify_other_keys(), Some(v) if v > 0));
 
         state.set_modify_other_keys(2);
         assert_eq!(state.modify_other_keys(), Some(2));
@@ -175,7 +169,7 @@ mod tests {
 
         state.set_modify_other_keys(0);
         assert_eq!(state.modify_other_keys(), Some(0));
-        assert!(!state.modify_other_keys_enabled());
+        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
     }
 
     #[test]
@@ -185,7 +179,7 @@ mod tests {
 
         state.reset_modify_other_keys();
         assert_eq!(state.modify_other_keys(), Some(0));
-        assert!(!state.modify_other_keys_enabled());
+        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
     }
 
     #[test]
@@ -195,7 +189,7 @@ mod tests {
 
         state.disable_modify_other_keys();
         assert_eq!(state.modify_other_keys(), None);
-        assert!(!state.modify_other_keys_enabled());
+        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
     }
 
     #[test]

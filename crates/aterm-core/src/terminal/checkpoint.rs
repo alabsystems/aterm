@@ -20,11 +20,10 @@
 //
 // ===========================================================================
 // EXCLUDED (host bindings, re-bound here):
-//   - the five callbacks (bell, cursor_style, buffer_activation, window,
-//     text_sizing)
+//   - the two callbacks (bell, window)
 //   - policy (PolicyState: the installed PolicyEngine + its compiled gate table)
 //   - live auth nonces / capabilities (clipboard_auth, shell_integration_auth,
-//     hyperlink_auth, dcs_auth)
+//     hyperlink_auth)
 // These are HOST effects, not buffer state. They are re-bound by the host on
 // `from_checkpoint` via `HostBindings`. For this increment `HostBindings::none()`
 // installs the same defaults `Terminal::new` does; real callbacks/policy/auth
@@ -416,17 +415,27 @@ pub struct TerminalCheckpoint {
     /// adopting host authorizes it explicitly (auth is a host binding, see the
     /// EXCLUDED block).
     pub shell_integration_nonce: Option<ShellIntegrationNonce>,
+    /// The integration BODY the shell last signed that it runs
+    /// ([`Terminal::shell_integration_rev`], the LOADER / BODY split of
+    /// 2026-09-26) — set, like the nonce, ONLY by the seamless-handoff carry
+    /// projections, so the successor's `status integration_rev=` can name an
+    /// adopted shell's body before its next prompt re-signs it. A FACT about
+    /// the shell, not an authority: a restore installs it (a checkpoint without
+    /// one leaves the engine's alone).
+    pub shell_integration_rev: Option<String>,
 }
 
 impl Terminal {
     /// Whether OSC 133/633 marks can reach this terminal
     /// ([`ShellIntegrationPosture`]): required-and-authorized, required with no
-    /// nonce (every mark dropped), or not required.
+    /// nonce in use (every mark dropped so far), or not required. A re-key the
+    /// shell has not taken yet ([`Self::authorize_shell_integration_on_first_mark`])
+    /// is not in use: it reads `Degraded` until a mark signed with it arrives.
     #[must_use]
     pub fn shell_integration_posture(&self) -> ShellIntegrationPosture {
         match (
             self.modes.require_shell_integration_nonce,
-            self.shell_integration_auth.nonce().is_some(),
+            self.shell_integration_auth.nonce_in_use().is_some(),
         ) {
             (false, _) => ShellIntegrationPosture::Off,
             (true, true) => ShellIntegrationPosture::On,
@@ -477,6 +486,7 @@ impl Terminal {
         self.parser_is_ground().then(|| {
             let mut c = self.checkpoint_bounded(max_history, 0);
             c.shell_integration_nonce = self.carried_shell_integration_nonce();
+            c.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
             c
         })
     }
@@ -525,15 +535,18 @@ impl Terminal {
     ) -> (TerminalCheckpoint, Option<&'static str>) {
         let mut carry = self.project_bounded(max_history, 0, true);
         carry.shell_integration_nonce = self.carried_shell_integration_nonce();
+        carry.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
         (carry, self.partial_sequence_state())
     }
 
     /// The authorized shell-integration nonce as the two seamless-handoff
     /// projections carry it — [`Self::checkpoint_carry`] and
-    /// [`Self::checkpoint_carry_abandoning_partial`], and no other.
+    /// [`Self::checkpoint_carry_abandoning_partial`], and no other. Only a nonce
+    /// IN USE: a re-key the shell has not taken yet stays behind, and the
+    /// successor re-keys the shell afresh.
     fn carried_shell_integration_nonce(&self) -> Option<ShellIntegrationNonce> {
         self.shell_integration_auth
-            .nonce()
+            .nonce_in_use()
             .map(ShellIntegrationNonce)
     }
 
@@ -670,6 +683,7 @@ impl Terminal {
             current_working_directory: self.current_working_directory.clone(),
             parser_ground,
             shell_integration_nonce: None,
+            shell_integration_rev: None,
         }
     }
 
@@ -802,6 +816,18 @@ impl Terminal {
         self.secure_keyboard_entry = c.secure_keyboard_entry;
         self.current_working_directory
             .clone_from(&c.current_working_directory);
+        // The shell's integration body, when the carry named one — a fact about
+        // the adopted shell, which its next prompt re-signs anyway. Validated
+        // like a signed mark; an absent or malformed one leaves the engine's.
+        if let Some(rev) = c
+            .shell_integration_rev
+            .as_deref()
+            .filter(|rev| crate::shell_integration::is_integration_rev(rev))
+        {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(rev.as_bytes());
+            self.shell.integration_rev = Some(bytes);
+        }
         // Style: semantic value, then re-arm the REBUILT grid's BCE cursor
         // template from it (see `from_checkpoint`).
         self.style = c.style.into_style();
@@ -924,6 +950,13 @@ pub struct CheckpointMeta {
     /// `integration=degraded` rather than trusting a partial nonce).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_integration_nonce: Option<String>,
+    /// The integration body the shell last signed that it runs, 16 hex digits
+    /// ([`TerminalCheckpoint::shell_integration_rev`], 2026-09-26). ADDITIVE and
+    /// absent when there is none (a parent without the field, a shell whose
+    /// script predates loaders), so the wire is what it always was; a value that
+    /// is not a folder address reassembles as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_integration_rev: Option<String>,
 }
 
 #[cfg(feature = "serde")]
@@ -958,6 +991,7 @@ impl CheckpointMeta {
             // reassembly rather than trusted from the wire.
             parser_ground: _,
             shell_integration_nonce,
+            shell_integration_rev,
         } = c;
         Self {
             rows: *rows,
@@ -979,6 +1013,7 @@ impl CheckpointMeta {
             secure_keyboard_entry: *secure_keyboard_entry,
             current_working_directory: current_working_directory.clone(),
             shell_integration_nonce: shell_integration_nonce.map(|n| n.to_hex()),
+            shell_integration_rev: shell_integration_rev.clone(),
         }
     }
 
@@ -1021,6 +1056,9 @@ impl CheckpointMeta {
                 .shell_integration_nonce
                 .as_deref()
                 .and_then(ShellIntegrationNonce::from_hex),
+            shell_integration_rev: self
+                .shell_integration_rev
+                .filter(|rev| crate::shell_integration::is_integration_rev(rev)),
         }
     }
 }
@@ -1798,6 +1836,220 @@ mod tests {
             adopted.shell_integration_posture(),
             ShellIntegrationPosture::On
         );
+    }
+
+    /// THE BODY A SHELL RUNS (the LOADER / BODY split, 2026-09-26): only a SIGNED
+    /// `633;P;AtermIntegration=<rev>` records it — with the gate off, or with a
+    /// wrong id, the same bytes change nothing — and only a folder address is
+    /// taken; a RIS keeps it. Like the nonce, only the carry projections take it
+    /// across an update, the meta round-trips it and refuses a malformed one,
+    /// and the adopting engine's restore installs it, so the successor names the
+    /// shell's body before its next prompt re-signs it.
+    #[test]
+    fn a_signed_integration_rev_is_recorded_and_carried() {
+        let key = [0x5Au8; 32];
+        let id = format!(";id={}", ShellIntegrationNonce(key).to_hex());
+        let mark = |rev: &str, id: &str| format!("\x1b]633;P;AtermIntegration={rev}{id}\x07");
+        let (rev_a, rev_b) = ("0123456789abcdef", "fedcba9876543210");
+
+        // The gate off: a program's output claims nothing.
+        let mut t = Terminal::new(4, 20);
+        t.process(mark(rev_a, "").as_bytes());
+        assert_eq!(t.shell_integration_rev(), None, "unsigned: not recorded");
+
+        t.authorize_shell_integration(key);
+        t.set_require_shell_integration_nonce(true);
+        t.process(mark(rev_a, ";id=00").as_bytes());
+        assert_eq!(t.shell_integration_rev(), None, "a wrong id is dropped");
+        for bad in ["0123456789ABCDEF", "0123456789abcde", "../../etc", ""] {
+            t.process(mark(bad, &id).as_bytes());
+            assert_eq!(t.shell_integration_rev(), None, "{bad:?} is no address");
+        }
+        t.process(mark(rev_a, &id).as_bytes());
+        assert_eq!(t.shell_integration_rev(), Some(rev_a));
+        t.process(mark(rev_b, &id).as_bytes());
+        assert_eq!(t.shell_integration_rev(), Some(rev_b), "the latest wins");
+        t.process(b"\x1bc");
+        assert_eq!(t.shell_integration_rev(), Some(rev_b), "RIS keeps it");
+
+        assert_eq!(t.checkpoint().shell_integration_rev, None);
+        let carry = t.checkpoint_carry(0).expect("Ground");
+        assert_eq!(carry.shell_integration_rev.as_deref(), Some(rev_b));
+        assert_eq!(
+            t.checkpoint_carry_abandoning_partial(0)
+                .0
+                .shell_integration_rev
+                .as_deref(),
+            Some(rev_b)
+        );
+        #[cfg(feature = "serde")]
+        {
+            let meta = CheckpointMeta::from_checkpoint(&carry);
+            assert_eq!(meta.shell_integration_rev.as_deref(), Some(rev_b));
+            let back = meta.clone().into_checkpoint(carry.grid.clone(), None);
+            assert_eq!(back.shell_integration_rev.as_deref(), Some(rev_b));
+            let mut bad = meta;
+            bad.shell_integration_rev = Some("not-an-address".into());
+            assert_eq!(
+                bad.into_checkpoint(carry.grid.clone(), None)
+                    .shell_integration_rev,
+                None
+            );
+        }
+
+        let mut adopted = Terminal::new(4, 20);
+        assert_eq!(adopted.shell_integration_rev(), None);
+        adopted.restore_checkpoint(&carry);
+        assert_eq!(adopted.shell_integration_rev(), Some(rev_b), "installed");
+        // A carry that names none leaves the adopting engine's alone.
+        let mut plain = carry.clone();
+        plain.shell_integration_rev = None;
+        adopted.restore_checkpoint(&plain);
+        assert_eq!(adopted.shell_integration_rev(), Some(rev_b));
+    }
+
+    /// A RE-KEY the shell has not taken yet (2026-09-24): the key verifies marks
+    /// at once, but the posture stays `Degraded` and the handoff carry leaves it
+    /// behind until a mark signed with it arrives — a Claude tab whose shell
+    /// reaches its next prompt hours later must not read `integration=on` in the
+    /// meantime, nor carry a key it never saw into the next update. A mark with
+    /// the wrong id does not count. CONTROL: a nonce authorized the ordinary way
+    /// (spawn, or a carried one) is in use at once, exactly as before.
+    #[test]
+    fn a_rekey_is_in_use_only_from_the_first_mark_signed_with_it() {
+        let key = [0x3Cu8; 32];
+        let mut t = Terminal::new(4, 20);
+        t.set_require_shell_integration_nonce(true);
+        t.authorize_shell_integration_on_first_mark(key);
+        assert_eq!(
+            t.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded,
+            "handed over, not yet taken"
+        );
+        assert_eq!(
+            t.checkpoint_carry(0)
+                .expect("Ground")
+                .shell_integration_nonce,
+            None,
+            "an untaken key is not carried"
+        );
+        t.process(format!("\x1b]133;A;id={}\x07", "1".repeat(64)).as_bytes());
+        t.process(b"\x1b]133;A\x07");
+        assert_eq!(
+            t.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded,
+            "a wrong or missing id is not the shell taking the key"
+        );
+        t.process(format!("\x1b]133;A;id={}\x07", ShellIntegrationNonce(key).to_hex()).as_bytes());
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::On);
+        assert_eq!(
+            t.checkpoint_carry(0)
+                .expect("Ground")
+                .shell_integration_nonce,
+            Some(ShellIntegrationNonce(key)),
+            "in use now, so carried"
+        );
+
+        // Control: the spawn-time authorization is in use at once.
+        let mut spawned = Terminal::new(4, 20);
+        spawned.set_require_shell_integration_nonce(true);
+        spawned.authorize_shell_integration(key);
+        assert_eq!(
+            spawned.shell_integration_posture(),
+            ShellIntegrationPosture::On
+        );
+        // …and it replaces a pending one outright.
+        let mut both = Terminal::new(4, 20);
+        both.set_require_shell_integration_nonce(true);
+        both.authorize_shell_integration_on_first_mark(key);
+        both.authorize_shell_integration(key);
+        assert_eq!(
+            both.shell_integration_posture(),
+            ShellIntegrationPosture::On
+        );
+    }
+
+    /// A TYPED re-key (2026-09-26) — the heal of a shell spawned before the
+    /// re-key channel, whose key rides a one-use file a typed line reads — is
+    /// the channel's key plus a way back. Taken back (the line never ran), it
+    /// authorizes nothing and the authorization it replaced stands again: a
+    /// shell that had lost its nonce is back to no nonce at all, so a mark
+    /// signed with the withdrawn key is dropped. Settled (the file was read),
+    /// it stays pending until its first mark exactly as the channel's key does,
+    /// and can no longer be taken back. And once a mark carried it, neither
+    /// verb moves it: a key in use is never withdrawn.
+    #[test]
+    fn a_typed_rekey_is_taken_back_until_the_shell_reads_it() {
+        let key = [0x4Du8; 32];
+        let signed = |k: &[u8; 32]| {
+            format!("\x1b]133;A;id={}\x07", ShellIntegrationNonce(*k).to_hex()).into_bytes()
+        };
+        let lost = || {
+            let mut t = Terminal::new(4, 20);
+            t.set_require_shell_integration_nonce(true);
+            t
+        };
+
+        // Withdrawn: back to the lost nonce, and the key's marks are dropped.
+        let mut t = lost();
+        t.authorize_shell_integration_rekey(key);
+        assert_eq!(
+            t.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded
+        );
+        assert!(t.withdraw_shell_integration_rekey(&key));
+        assert!(!t.withdraw_shell_integration_rekey(&key), "once");
+        let dropped = t.shell_integration_dropped_count();
+        t.process(&signed(&key));
+        assert_eq!(t.shell_integration_dropped_count(), dropped + 1);
+        assert_eq!(
+            t.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded
+        );
+
+        // Settled: pending until its first mark, then on; no longer withdrawable.
+        let mut t = lost();
+        t.authorize_shell_integration_rekey(key);
+        assert!(
+            !t.settle_shell_integration_rekey(&[0x11; 32]),
+            "not that key"
+        );
+        assert!(t.settle_shell_integration_rekey(&key));
+        assert!(!t.withdraw_shell_integration_rekey(&key), "settled");
+        assert_eq!(
+            t.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded,
+            "the file was read, no mark yet"
+        );
+        t.process(&signed(&key));
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::On);
+
+        // Used before anyone settled it: in use, never withdrawn.
+        let mut t = lost();
+        t.authorize_shell_integration_rekey(key);
+        t.process(&signed(&key));
+        assert!(!t.withdraw_shell_integration_rekey(&key));
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::On);
+
+        // A second typed key over an unsettled first: withdrawing it restores
+        // the authorization from before EITHER — here the channel key the shell
+        // was already handed, still pending its first mark.
+        let channel = [0x5Eu8; 32];
+        let mut t = lost();
+        t.authorize_shell_integration_on_first_mark(channel);
+        t.authorize_shell_integration_rekey([0x6F; 32]);
+        t.authorize_shell_integration_rekey(key);
+        assert!(!t.withdraw_shell_integration_rekey(&[0x6F; 32]), "replaced");
+        assert!(t.withdraw_shell_integration_rekey(&key));
+        t.process(&signed(&channel));
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::On);
+
+        // An ordinary authorization ends the way back.
+        let mut t = lost();
+        t.authorize_shell_integration_rekey(key);
+        t.authorize_shell_integration(key);
+        assert!(!t.withdraw_shell_integration_rekey(&key));
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::On);
     }
 
     #[test]

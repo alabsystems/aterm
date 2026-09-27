@@ -56,6 +56,7 @@ impl Default for StyleResolveOpts {
 /// * `default_bg` - Default background color (from terminal settings)
 /// * `reverse_video` - Terminal-level DECSCNM mode (DECSET mode 5)
 #[must_use]
+#[cfg(test)]
 pub fn resolve_fg_color(
     cell: &Cell,
     extra: Option<&CellExtra>,
@@ -79,93 +80,13 @@ pub fn resolve_fg_color(
     fg
 }
 
-/// Resolve the background RGB color for a cell, applying all style attributes.
-///
-/// See [`resolve_fg_color`] for attribute application order.
-#[must_use]
-pub fn resolve_bg_color(
-    cell: &Cell,
-    extra: Option<&CellExtra>,
-    palette: &ColorPalette,
-    default_fg: Rgb,
-    default_bg: Rgb,
-    reverse_video: bool,
-) -> Rgb {
-    let fg_rgb = extra.and_then(CellExtra::fg_rgb);
-    let bg_rgb = extra.and_then(CellExtra::bg_rgb);
-    let (_, bg) = resolve_both(
-        *cell,
-        fg_rgb,
-        bg_rgb,
-        palette,
-        default_fg,
-        default_bg,
-        reverse_video,
-        StyleResolveOpts::default(),
-    );
-    bg
-}
-
-/// Resolve the foreground RGB color from pre-resolved RGB values.
-///
-/// Use this when RGB values are already retrieved from the unified grid lookup
-/// (ring buffer + HashMap) rather than from `CellExtra` alone.
-#[must_use]
-pub fn resolve_fg_color_raw(
-    cell: &Cell,
-    fg_rgb: Option<[u8; 3]>,
-    bg_rgb: Option<[u8; 3]>,
-    palette: &ColorPalette,
-    default_fg: Rgb,
-    default_bg: Rgb,
-    reverse_video: bool,
-) -> Rgb {
-    let (fg, _) = resolve_both(
-        *cell,
-        fg_rgb,
-        bg_rgb,
-        palette,
-        default_fg,
-        default_bg,
-        reverse_video,
-        StyleResolveOpts::default(),
-    );
-    fg
-}
-
-/// Resolve the background RGB color from pre-resolved RGB values.
-///
-/// See [`resolve_fg_color_raw`] for details.
-#[must_use]
-pub fn resolve_bg_color_raw(
-    cell: &Cell,
-    fg_rgb: Option<[u8; 3]>,
-    bg_rgb: Option<[u8; 3]>,
-    palette: &ColorPalette,
-    default_fg: Rgb,
-    default_bg: Rgb,
-    reverse_video: bool,
-) -> Rgb {
-    let (_, bg) = resolve_both(
-        *cell,
-        fg_rgb,
-        bg_rgb,
-        palette,
-        default_fg,
-        default_bg,
-        reverse_video,
-        StyleResolveOpts::default(),
-    );
-    bg
-}
-
 /// Resolve both foreground and background colors for a cell.
 ///
 /// Returns `(fg, bg)` with all style attributes applied.
 ///
 /// **Note:** This uses `CellExtra` for RGB lookup, which only checks the
-/// HashMap. Prefer [`resolve_colors_raw`] with pre-resolved RGB values from
-/// `grid.fg_rgb_at()` / `grid.bg_rgb_at()` to include ring buffer lookups.
+/// HashMap. Prefer [`resolve_colors_raw_opts`] with pre-resolved RGB values
+/// from `grid.fg_rgb_at()` / `grid.bg_rgb_at()` to include ring buffer lookups.
 #[must_use]
 pub fn resolve_colors(
     cell: &Cell,
@@ -189,37 +110,10 @@ pub fn resolve_colors(
     )
 }
 
-/// Resolve both foreground and background colors from pre-resolved RGB values.
-///
-/// Use this when RGB values are already retrieved from the unified grid lookup
-/// (ring buffer + HashMap) via `grid.fg_rgb_at()` / `grid.bg_rgb_at()`.
-#[must_use]
-pub fn resolve_colors_raw(
-    cell: &Cell,
-    fg_rgb: Option<[u8; 3]>,
-    bg_rgb: Option<[u8; 3]>,
-    palette: &ColorPalette,
-    default_fg: Rgb,
-    default_bg: Rgb,
-    reverse_video: bool,
-) -> (Rgb, Rgb) {
-    resolve_both(
-        *cell,
-        fg_rgb,
-        bg_rgb,
-        palette,
-        default_fg,
-        default_bg,
-        reverse_video,
-        StyleResolveOpts::default(),
-    )
-}
-
-/// Like [`resolve_colors_raw`], with an explicit host style policy
-/// ([`StyleResolveOpts`]: `bold_is_bright` + `faint_opacity`). The render
-/// extraction path ([`render_row`](super::Terminal::render_row)) passes the
-/// terminal's configured policy; the default-opts wrappers above stay
-/// byte-identical for callers that don't care.
+/// Resolve colors from pre-resolved RGB values under an explicit host style
+/// policy ([`StyleResolveOpts`]: `bold_is_bright` + `faint_opacity`). The
+/// render extraction path ([`render_row`](super::Terminal::render_row)) passes
+/// the terminal's configured policy.
 #[must_use]
 #[allow(
     clippy::too_many_arguments,

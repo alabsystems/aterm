@@ -272,12 +272,6 @@ impl ScrollbackStorage {
         dispatch!(self, memory_budget())
     }
 
-    /// Get the hot+warm memory usage (bytes).
-    #[must_use]
-    pub fn memory_used(&self) -> usize {
-        dispatch!(self, memory_used())
-    }
-
     /// Get reclaimable storage bytes used for budget enforcement.
     #[must_use]
     pub fn budgeted_memory_used(&self) -> usize {
@@ -300,6 +294,7 @@ impl ScrollbackStorage {
 
     /// Get cold tier memory usage (bytes).
     #[must_use]
+    #[cfg(test)]
     pub fn cold_memory_used(&self) -> usize {
         dispatch!(self, cold_memory_used())
     }
@@ -417,6 +412,7 @@ impl ScrollbackStorage {
     /// Use `checkpoint_snapshot()` when a full-fidelity snapshot is needed
     /// (e.g., offline migration or explicit user-triggered save).
     #[must_use]
+    #[cfg(test)]
     pub fn checkpoint_snapshot_fast(&self) -> Scrollback {
         dispatch!(self, checkpoint_snapshot_fast())
     }
@@ -477,6 +473,7 @@ impl ScrollbackStorage {
     ///
     /// Always `false` without the `disk-tier` feature.
     #[must_use]
+    #[cfg(test)]
     pub fn is_disk_backed(&self) -> bool {
         #[cfg(feature = "disk-tier")]
         {
@@ -493,6 +490,7 @@ impl ScrollbackStorage {
     /// Returns `None` for memory-only scrollback (always `None` without the
     /// `disk-tier` feature).
     #[must_use]
+    #[cfg(test)]
     pub fn cold_disk_used(&self) -> Option<usize> {
         match self {
             ScrollbackStorage::Memory(_) => None,

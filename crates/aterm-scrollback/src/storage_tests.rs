@@ -544,12 +544,15 @@ fn test_iteration_complete_after_quarantine() {
         "forward iteration should yield line_count() lines"
     );
 
-    // Collect all lines via reverse iterator.
-    let reverse: Vec<_> = sb.iter_rev().map(|l| l.to_string()).collect();
+    // Collect all lines newest-first through the reverse index.
+    let reverse: Vec<_> = (0..sb.line_count())
+        .filter_map(|rev| sb.get_line_rev(rev).ok().flatten())
+        .map(|l| l.to_string())
+        .collect();
     assert_eq!(
         reverse.len(),
         sb.line_count(),
-        "reverse iteration should yield line_count() lines"
+        "reverse reads should yield line_count() lines"
     );
 
     // Forward and reverse should contain the same lines (in opposite order).

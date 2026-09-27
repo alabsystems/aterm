@@ -26,9 +26,10 @@
 //!
 //! The cached roster is not trusted for being cached. It faces the same `roster_seq`
 //! ratchet (a generation older than the durable floor is refused forever) and the same
-//! `valid_until` window (a cache that outlives the roster's freshness stops working, by
-//! design — that window IS the bound on how long a suppressed roster can keep an old
-//! authorization alive). An entry written before this field existed decodes to EMPTY
+//! `valid_until` check. That check no longer bounds how long a suppressed roster can keep
+//! an old authorization alive: every roster is minted with 9999-12-31 by owner decision
+//! (`crates/atpkg-keys/src/roster_ops.rs`), so the floor and revocation are the defences.
+//! An entry written before this field existed decodes to EMPTY
 //! roster bytes, which fail admission — fail-closed, and the next successful fetch
 //! replaces it.
 //!
@@ -112,8 +113,9 @@ impl IndexCache {
     /// parent directory `0700`. The cache of an install prefix must be built with
     /// [`IndexCache::for_layout`] instead — that is the only constructor whose parent
     /// gets the mode the prefix shape calls for.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, layout: None }
     }
 

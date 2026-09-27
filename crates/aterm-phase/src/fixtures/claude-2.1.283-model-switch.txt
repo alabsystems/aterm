@@ -1,0 +1,40 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `aterm ctl text` of a private headless aterm (124x40, the model-switch probe: `claude --model claude-haiku-4-5`, one turn, then `/model sonnet`) · the cache-miss confirmation, three columns in under a `▔` rule where the composer was, no footer; the scratch path anonymised
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/work1
+
+  Updated to latest. Got 33 features, 240 bugfixes, and 103 other changes.
+  code.claude.com/docs/en/changelog for details
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ Reply with the single word: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 8:14 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Sonnet 5 means the full history gets re-read on your
+   next message.
+
+   ❯ 1. Yes, switch to Sonnet 5
+     2. No, go back

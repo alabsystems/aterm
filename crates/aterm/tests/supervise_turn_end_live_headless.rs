@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless check of the supervisor's TURN-END POLICY (aterm-agent
-//! `supervise::policy::turn_end`, carried out by `Session::run_hosted`) over
-//! a real headless instance and its real control socket, through the
-//! supervisor's own persistent connection (`RelayCtl`).
+//! Live-headless check of the supervisor FULLY AUTOMATIC (aterm-agent
+//! `supervise`: the approval and turn-end policies, carried out by
+//! `Session::run_hosted`) over a real headless instance and its real control
+//! socket, through the supervisor's own persistent connection (`RelayCtl`).
+//!
+//! * FULL POWER, the owner's default: a WRITE box (the measured `touch x`)
+//!   gets its one-shot allow (`1`, fenced and guarded); a request for a
+//!   decision is ANSWERED with `answer_text`; a worker whose every turn is
+//!   short is continued on a GROWING back-off (the timing injected, 1 s
+//!   doubled); a turn a person stopped with Esc is held for their grace and
+//!   then continued. Each with its negative control (`approve = "safe"`,
+//!   `answer_questions = false`, a turn of real work).
 //!
 //! * A FAKE WORKER (a POSIX `sh` script in raw mode, run as `claude` via
 //!   `exec -a`, which appends every byte it reads to a key log and every
@@ -48,7 +56,9 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::phase::composer_text;
 use aterm_agent::supervise::policy::turn_end::TurnEndTiming;
-use aterm_agent::supervise::prompt::fixtures::{END_529, GOAL_ACTIVE_SUGGESTION, composer, screen};
+use aterm_agent::supervise::prompt::fixtures::{
+    BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION, composer, screen,
+};
 use aterm_agent::supervise::{
     Ctl, Endpoint, Interrupter, Phase, RelayCtl, Session, SuperviseOpts, SupervisorConfig,
     is_placeholder, worker_phase,
@@ -66,6 +76,9 @@ const COLUMNS: &str = "170";
 
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: String,
@@ -134,11 +147,12 @@ fn boot_with(tag: &str, columns: &str) -> Option<Instance> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", columns)
+        .args(launch_isolation::control_sock(&tmp))
+        .args(["--lines", "40", "--columns", columns])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -150,6 +164,7 @@ fn boot_with(tag: &str, columns: &str) -> Option<Instance> {
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,
@@ -349,8 +364,22 @@ fn goal_end() -> Vec<String> {
     r
 }
 
-/// The decision the second turn ends on: escalated, never typed into.
+/// The decision the second turn ends on: answered under full power,
+/// escalated (never typed into) where the owner switched answers off.
 const STOP: &str = "I need your decision on the schema before I go on.";
+
+/// A turn a person stopped with Esc, as Claude Code 2.1.280 draws it.
+fn interrupted() -> Vec<String> {
+    let mut r: Vec<String> = [
+        "⏺ Running the schema migration against the staging database now.",
+        "  ⎿  Interrupted · What should Claude do instead?",
+        "",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    r
+}
 
 /// A plain end of turn after real work: continued.
 const DONE: &str = "Fixed the parser; the suite is green.";
@@ -359,7 +388,10 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// drawn whole, `<name>.row` its caret row, 1-based, `<name>.below` the rows
 /// under it), `$2` the key log, `$3` the submit log, `$4` the screen the
 /// first person's line ends on, `$5` the columns, `$6` `mangle` to show a
-/// composer text over 40 characters as a pasted-text placeholder. The
+/// composer text over 40 characters as a pasted-text placeholder, `$7`
+/// `loop` to end EVERY turn on `$4` (else the turns after the first end on
+/// the decision). On the `box` screen a digit answers the box — logged
+/// `PRESS:<digit>` — and the turn ends on `done`. The
 /// composer is redrawn once per READ of the terminal, as Claude Code renders
 /// a burst of input in one frame — in two frames, half the new text and then
 /// all of it: `❯ <text>` from the caret row (the terminal wraps it), the rows
@@ -377,7 +409,7 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// without settling: the settle itself is pinned by the scripted
 /// `await idle 500 timeout 1500` exchanges in `aterm-agent`'s supervise tests.
 const FAKE_WORKER: &str = r#"#!/bin/sh
-dir="$1"; keys="$2"; subs="$3"; after="$4"; cols="$5"; mangle="$6"
+dir="$1"; keys="$2"; subs="$3"; after="$4"; cols="$5"; mangle="$6"; mode="$7"
 stty raw -echo
 : > "$keys"; : > "$subs"
 exec 3<&0
@@ -389,6 +421,8 @@ cur=ready; buf=""
 # for longer than the supervisor's 500 ms settle.
 draw() {
   cur="$1"; printf '\033[H\033[2J'; cat "$dir/$1.scr"
+  # The box is answered by a key, never composed into: it has no composer.
+  [ -e "$dir/$1.row" ] || return 0
   IFS= read -r row < "$dir/$1.row"
   below=$(cat "$dir/$1.below"; printf .); below="${below%.}"
 }
@@ -418,13 +452,17 @@ while :; do
   typed=0
   while [ -n "$chunk" ]; do
     rest="${chunk#?}"; c="${chunk%"$rest"}"; chunk="$rest"
+    if [ "$cur" = box ]; then
+      case "$c" in [0-9]) printf 'PRESS:%s\n' "$c" >> "$subs"; draw busy; sleep 1; draw done ;; esac
+      continue
+    fi
     if [ "$c" = "$cr" ]; then
       printf 'SUBMIT:%s\n' "$buf" >> "$subs"
       buf=""; typed=0
       n=$(wc -l < "$subs" | tr -d ' ')
       draw busy
       sleep 2
-      if [ "$n" = 1 ]; then draw "$after"; else draw stop; fi
+      if [ "$n" = 1 ] || [ "$mode" = loop ]; then draw "$after"; else draw stop; fi
     elif [ "$c" = "$esc" ]; then
       while [ ${#chunk} -lt 2 ]; do fill; done
       rest="${chunk#??}"; csi="${chunk%"$rest"}"; chunk="$rest"
@@ -445,6 +483,11 @@ fn start_worker(inst: &Instance, sid: &str, after: &str) -> (PathBuf, PathBuf) {
     start_worker_with(inst, sid, after, COLUMNS, false)
 }
 
+/// [`start_worker`], every turn ending on `after`.
+fn start_looping_worker(inst: &Instance, sid: &str, after: &str) -> (PathBuf, PathBuf) {
+    start_worker_in(inst, sid, after, COLUMNS, false, true)
+}
+
 /// [`start_worker`] for an instance `columns` wide (every rule drawn that
 /// wide), the composer mangled past 40 characters when `mangle`.
 fn start_worker_with(
@@ -453,6 +496,17 @@ fn start_worker_with(
     after: &str,
     columns: &str,
     mangle: bool,
+) -> (PathBuf, PathBuf) {
+    start_worker_in(inst, sid, after, columns, mangle, false)
+}
+
+fn start_worker_in(
+    inst: &Instance,
+    sid: &str,
+    after: &str,
+    columns: &str,
+    mangle: bool,
+    looping: bool,
 ) -> (PathBuf, PathBuf) {
     let dir = inst.tmp.join("screens");
     std::fs::create_dir_all(&dir).expect("screens dir");
@@ -465,6 +519,8 @@ fn start_worker_with(
         ("e529", e529),
         ("done", ended(DONE)),
         ("stop", ended(STOP)),
+        ("interrupted", interrupted()),
+        ("box", screen(BOX_BASH_TOUCH)),
     ] {
         let rows: Vec<String> = rows
             .into_iter()
@@ -476,8 +532,20 @@ fn start_worker_with(
                 }
             })
             .collect();
+        if name == "box" {
+            // Answered by a key, never composed into.
+            std::fs::write(dir.join("box.scr"), render(&rows, (0, 0))).expect("scr");
+            continue;
+        }
         let c = caret(&rows);
-        std::fs::write(dir.join(format!("{name}.scr")), render(&rows, (c, 2))).expect("scr");
+        let mut drawn = rows.clone();
+        if name == "goal" {
+            // The suggestion DIM, as Claude Code draws it: the loop reads the
+            // `cell` at column 2 before it takes one row of text there for the
+            // placeholder, and a plain one is a person's draft, caret homed.
+            drawn[c] = drawn[c].replacen("❯ ", "❯ \x1b[2m", 1) + "\x1b[22m";
+        }
+        std::fs::write(dir.join(format!("{name}.scr")), render(&drawn, (c, 2))).expect("scr");
         std::fs::write(dir.join(format!("{name}.row")), (c + 1).to_string()).expect("row");
         std::fs::write(
             dir.join(format!("{name}.below")),
@@ -493,12 +561,13 @@ fn start_worker_with(
         inst,
         sid,
         &format!(
-            "/bin/bash -c 'exec -a claude /bin/sh {} {} {} {} {after} {columns} {}'",
+            "/bin/bash -c 'exec -a claude /bin/sh {} {} {} {} {after} {columns} {} {}'",
             script.display(),
             dir.display(),
             keys.display(),
             subs.display(),
-            if mangle { "mangle" } else { "-" }
+            if mangle { "mangle" } else { "-" },
+            if looping { "loop" } else { "once" }
         ),
     );
     await_match(inst, sid, "Ready.for.the.next.stage");
@@ -506,8 +575,8 @@ fn start_worker_with(
 }
 
 /// The hosted loop on its own thread, over its own persistent connection,
-/// under the owner's policy (every switch on) with `timing`; stopped by
-/// [`Supervisor::stop`], which returns what the loop printed.
+/// under a policy with `timing`; stopped by [`Supervisor::stop`], which
+/// returns what the loop printed.
 struct Supervisor {
     stop: Arc<AtomicBool>,
     cut: Option<Interrupter>,
@@ -515,22 +584,26 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    /// The owner's policy with the answers off: these scripts end on a
+    /// decision, which is then escalated (the answer is
+    /// [`a_decision_is_answered_with_the_answer_text`]'s).
     fn start(inst: &Instance, sid: &str, timing: TurnEndTiming) -> Self {
-        Self::start_with(inst, sid, timing, None)
+        Self::start_with(inst, sid, timing, no_answers())
     }
 
-    /// [`Self::start`] with the policy's `rules_file`.
+    /// [`Self::start`] under `policy`.
     fn start_with(
         inst: &Instance,
         sid: &str,
         timing: TurnEndTiming,
-        rules: Option<PathBuf>,
+        policy: SupervisorConfig,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let mut ctl = RelayCtl::new(Endpoint::Socket(inst.sock.clone()), None);
         ctl.connect().expect("the supervisor's connection");
         let cut = ctl.interrupter();
         let ledger = inst.tmp.join("state/drive.jsonl");
+        let journal = inst.tmp.join("state/journal.jsonl");
         let sid = format!("@{sid}");
         let flag = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
@@ -538,10 +611,10 @@ impl Supervisor {
             s.set_approval_ledger(Some(ledger));
             s.set_supervisor_name(Some("turn-end-live".to_string()));
             s.set_turn_end_timing(timing);
-            let opts = SuperviseOpts::hosted_with(&SupervisorConfig {
-                rules_file: rules,
-                ..SupervisorConfig::default()
-            });
+            let opts = SuperviseOpts {
+                journal: Some(journal),
+                ..SuperviseOpts::hosted_with(&policy)
+            };
             let mut out: Vec<u8> = Vec::new();
             let _ = s.run_hosted(&opts, flag, &mut out);
             String::from_utf8(out).unwrap_or_default()
@@ -556,6 +629,50 @@ impl Supervisor {
         }
         self.handle.join().expect("the supervisor thread")
     }
+}
+
+/// The owner's policy, every power on but the answers.
+fn no_answers() -> SupervisorConfig {
+    SupervisorConfig {
+        answer_questions: false,
+        ..SupervisorConfig::default()
+    }
+}
+
+/// The session's `meta` once it satisfies `ok`, or after 20 s as it is.
+fn meta_when(inst: &Instance, sid: &str, ok: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let m = ctl_ok(inst, &[&format!("@{sid}"), "meta"]);
+        if ok(&m) || Instant::now() >= deadline {
+            return m;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The loop's journal (the `WAITING` lines are there, not on its stdout).
+fn journal(inst: &Instance) -> String {
+    std::fs::read_to_string(inst.tmp.join("state/journal.jsonl")).unwrap_or_default()
+}
+
+/// When each of the first `n` lines of `path` appeared, by polling it (the
+/// worker's own log: nothing on the socket announces it), or as many as
+/// came within `within`.
+fn arrivals(path: &Path, n: usize, within: Duration) -> Vec<Instant> {
+    let deadline = Instant::now() + within;
+    let mut at = Vec::new();
+    while at.len() < n && Instant::now() < deadline {
+        let now = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        while at.len() < now.min(n) {
+            at.push(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    at
 }
 
 /// The screens the worker draws read as the policy needs them to: the goal
@@ -691,7 +808,15 @@ fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
         let rules = inst.tmp.join("rules.txt");
         std::fs::write(&rules, RULES).expect("the rules file");
         let (keys, subs) = start_worker_with(&inst, &sid, "done", "64", mangle);
-        let sup = Supervisor::start_with(&inst, &sid, TurnEndTiming::default(), Some(rules));
+        let sup = Supervisor::start_with(
+            &inst,
+            &sid,
+            TurnEndTiming::default(),
+            SupervisorConfig {
+                rules_file: Some(rules),
+                ..no_answers()
+            },
+        );
         type_line(&inst, &sid, "go");
         await_match(&inst, &sid, "Fixed.the.parser");
         if !mangle {
@@ -699,9 +824,10 @@ fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
                 let out = sup.stop();
                 panic!(
                     "the decision never reached the screen ({reply}); submitted {:?}; keys \
-                     {:?}; the loop said:\n{out}",
+                     {:?}; the loop said:\n{out}\njournal:\n{}",
                     std::fs::read_to_string(&subs).unwrap_or_default(),
                     std::fs::read_to_string(&keys).unwrap_or_default(),
+                    journal(&inst)
                 );
             }
             let out = sup.stop();
@@ -740,4 +866,272 @@ fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
         );
         assert!(!out.contains("CONTINUED"), "{out}");
     }
+}
+
+/// FULL POWER, a WRITE box (the measured 2.1.280 `touch x` box): its
+/// one-shot allow, `1`, reaches the worker once — fenced on the judged read
+/// and guarded on the command's row — and the loop says `APPROVED`.
+/// NEGATIVE CONTROL: under the owner's `approve = "safe"` the same box is
+/// escalated (the keyed attention) and nothing is pressed.
+#[test]
+fn a_write_box_gets_its_one_shot_allow_under_full_power() {
+    for approve in ["all", "safe"] {
+        let Some(inst) = boot(if approve == "all" { "w" } else { "v" }) else {
+            return;
+        };
+        let sid = boot_session(&inst);
+        let (_keys, subs) = start_worker(&inst, &sid, "box");
+        let mut policy = SupervisorConfig::default();
+        policy.set("approve", approve).expect("a level");
+        let sup = Supervisor::start_with(&inst, &sid, TurnEndTiming::default(), policy);
+        type_line(&inst, &sid, "go");
+        await_match(&inst, &sid, "Bash.command");
+        if approve == "all" {
+            let submitted = lines_when(&subs, 2, Duration::from_secs(20));
+            let out = sup.stop();
+            assert_eq!(
+                submitted[..2],
+                ["SUBMIT:go", "PRESS:1"],
+                "the loop said:\n{out}"
+            );
+            assert!(out.contains("APPROVED seq="), "{out}");
+            continue;
+        }
+        let meta = meta_when(&inst, &sid, |m| m.contains("attention_owner=supervisor"));
+        let out = sup.stop();
+        assert!(
+            meta.contains("attention_owner=supervisor"),
+            "escalated: {meta}\nthe loop said:\n{out}"
+        );
+        let submitted = lines_when(&subs, 2, Duration::from_millis(500));
+        assert_eq!(
+            submitted,
+            ["SUBMIT:go"],
+            "nothing pressed; the loop said:\n{out}"
+        );
+    }
+}
+
+/// FULL POWER, a request for a decision: ANSWERED — `answer_text` typed
+/// through the fenced write and submitted once — and nothing escalated.
+/// (The negative control, the answers off, is every test above: there the
+/// same decision is escalated and never typed into.)
+#[test]
+fn a_decision_is_answered_with_the_answer_text() {
+    let Some(inst) = boot("a") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs) = start_worker(&inst, &sid, "stop");
+    // The owner's text, short (the fake worker echoes one byte at a time).
+    let answer = "Decide yourself and keep going.".to_string();
+    let sup = Supervisor::start_with(
+        &inst,
+        &sid,
+        TurnEndTiming::default(),
+        SupervisorConfig {
+            answer_text: answer.clone(),
+            ..SupervisorConfig::default()
+        },
+    );
+    type_line(&inst, &sid, "go");
+    await_match(&inst, &sid, "I.need.your.decision");
+    let submitted = lines_when(&subs, 2, Duration::from_secs(20));
+    let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+    let out = sup.stop();
+    assert_eq!(
+        submitted[..2],
+        ["SUBMIT:go".to_string(), format!("SUBMIT:{answer}")],
+        "the loop said:\n{out}"
+    );
+    assert!(out.contains("rule=answer@v1"), "{out}");
+    assert!(
+        !meta.contains("attention_owner=supervisor"),
+        "{meta}\n{out}"
+    );
+}
+
+/// FULL POWER, a worker whose every turn is short (`min_work` an hour, the
+/// injected clock): continued for ever, never escalated as done, each
+/// continuation after a LONGER wait than the one before, up to the cap,
+/// where it holds. The loop starts on the worker's first turn, busy: the
+/// continuations after it wait 1 s, 2 s, 4 s (the cap) and 4 s again — the
+/// back-offs the loop journals, and no continuation earlier than its own.
+#[test]
+fn a_short_turn_loop_backs_off_growing_and_never_escalates() {
+    let Some(inst) = boot("b") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs) = start_looping_worker(&inst, &sid, "done");
+    let sec = Duration::from_secs(1);
+    type_line(&inst, &sid, "go");
+    await_match(&inst, &sid, "On.it");
+    let sup = Supervisor::start_with(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            min_work: 3600 * sec,
+            short_backoff: sec,
+            short_backoff_max: 4 * sec,
+            ..TurnEndTiming::default()
+        },
+        SupervisorConfig::default(),
+    );
+    let at = arrivals(&subs, 6, Duration::from_secs(90));
+    let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+    let out = format!("{}\njournal:\n{}", sup.stop(), journal(&inst));
+    assert_eq!(
+        at.len(),
+        6,
+        "`go` and five continuations; the loop said:\n{out}"
+    );
+    // The back-offs, as the loop waited them out: doubling, then held.
+    let waits: Vec<u64> = out
+        .lines()
+        .filter_map(|l| l.split(" short turn(s) in a row: ").nth(1))
+        .filter_map(|rest| rest.split(" s back-off").next()?.parse().ok())
+        .collect();
+    assert_eq!(waits[..5], [1, 2, 4, 4, 4], "{out}");
+    // No continuation came before its back-off: between two, the worker's
+    // 2 s turn and at least the wait.
+    let gaps: Vec<Duration> = at[1..].windows(2).map(|w| w[1] - w[0]).collect();
+    for (gap, wait) in gaps.iter().zip(&waits[1..]) {
+        assert!(
+            *gap >= Duration::from_secs(2 + wait) - Duration::from_millis(300),
+            "{gap:?} < 2 s + {wait} s: {gaps:?}\n{out}"
+        );
+    }
+    assert!(
+        !meta.contains("attention_owner=supervisor"),
+        "{meta}\n{out}"
+    );
+}
+
+/// A PERSON'S KEYSTROKE, live: a turn a person stopped with Esc (the
+/// vendor's `Interrupted · What should Claude do instead?`) is held for
+/// `human_grace_s` (3 s here) — nothing typed, nothing escalated — and then,
+/// nobody having come back, continued. (A keystroke through a window, the
+/// server's `human_ms=`, needs a window this headless instance does not
+/// have: the decider's and the loop's tests pin that one.)
+#[test]
+fn an_esc_interrupt_holds_the_loop_for_the_grace_then_continues() {
+    let Some(inst) = boot("i") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs) = start_worker(&inst, &sid, "interrupted");
+    let grace = Duration::from_secs(3);
+    // The worker's 2 s turn counts as real work here: the point is held for
+    // the person, not backed off as a short turn.
+    let sup = Supervisor::start_with(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            min_work: Duration::from_secs(1),
+            ..TurnEndTiming::default()
+        },
+        SupervisorConfig {
+            human_grace_s: 3,
+            ..SupervisorConfig::default()
+        },
+    );
+    type_line(&inst, &sid, "go");
+    await_match(&inst, &sid, "What.should.Claude.do.instead");
+    let stopped_at = Instant::now();
+    let early = lines_when(&subs, 2, grace - Duration::from_millis(700));
+    let submitted = lines_when(&subs, 2, Duration::from_secs(20));
+    let after = stopped_at.elapsed();
+    let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+    let out = sup.stop();
+    assert_eq!(
+        early,
+        ["SUBMIT:go"],
+        "held for the grace; the loop said:\n{out}"
+    );
+    assert_eq!(
+        submitted[..2],
+        ["SUBMIT:go", "SUBMIT:keep going"],
+        "the loop said:\n{out}"
+    );
+    assert!(
+        after >= grace - Duration::from_millis(200),
+        "{after:?}\n{out}"
+    );
+    let journal = journal(&inst);
+    assert!(
+        journal.contains("a person stopped the turn with Esc"),
+        "{journal}\n{out}"
+    );
+    assert!(
+        !meta.contains("attention_owner=supervisor"),
+        "{meta}\n{out}"
+    );
+}
+
+/// A DRAFT LEFT STANDING, live (lane P's review: text in the composer
+/// stopped a fully automatic session for ever, nobody told): text typed
+/// into the worker's composer without Enter, a character every 250 ms for
+/// longer than the grace (3 s here) — a person writing, as the loop sees
+/// it: this headless server says nothing of a person, so the draft's own
+/// changes are the clock — is never submitted or typed into while it
+/// changes; once nobody has touched it for the grace it is SENT as it
+/// stands, once, by a fenced Enter alone (`CONTINUED … rule=continue@v1
+/// <the draft>`), and nothing is escalated.
+#[test]
+fn a_draft_left_standing_is_sent_once_nobody_has_touched_it_for_the_grace() {
+    let Some(inst) = boot("d") else { return };
+    let sid = boot_session(&inst);
+    let (_keys, subs) = start_worker(&inst, &sid, "done");
+    let grace = Duration::from_secs(3);
+    let sup = Supervisor::start_with(
+        &inst,
+        &sid,
+        TurnEndTiming {
+            short_backoff: Duration::from_secs(1),
+            ..TurnEndTiming::default()
+        },
+        SupervisorConfig {
+            human_grace_s: 3,
+            ..SupervisorConfig::default()
+        },
+    );
+    let draft = "also check the lexer";
+    let typing = Instant::now();
+    let at = format!("@{sid}");
+    // Stamped BEFORE each key is sent, so the reference is never later than
+    // the draft's true last change. It was stamped after the last `aterm ctl`
+    // exited plus a 250 ms nap, a reference that lags the change the loop's
+    // grace counts from by that process's exit, and under load that lag ate
+    // the 300 ms tolerance below (the load-sensitive test audit of 2026-09-27).
+    let mut last_key = typing;
+    for c in draft.chars() {
+        last_key = Instant::now();
+        // A lone space is no `send` text (it is trimmed): its key instead.
+        if c == ' ' {
+            ctl_ok(&inst, &[&at, "key", "space"]);
+        } else {
+            ctl_ok(&inst, &[&at, "send", "--", &c.to_string()]);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let typed = typing.elapsed();
+    let during = lines_when(&subs, 1, Duration::ZERO);
+    let submitted = lines_when(&subs, 1, Duration::from_secs(20));
+    let after = last_key.elapsed();
+    let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+    let out = sup.stop();
+    assert!(typed > grace, "typed for {typed:?}");
+    assert!(
+        during.is_empty(),
+        "sent while it changed: {during:?}\n{out}"
+    );
+    assert_eq!(
+        submitted.first().map(String::as_str),
+        Some(format!("SUBMIT:{draft}").as_str()),
+        "the loop said:\n{out}"
+    );
+    assert!(
+        after >= grace - Duration::from_millis(300),
+        "sent {after:?} after the last key\n{out}"
+    );
+    assert!(out.contains(&format!("rule=continue@v1 {draft}")), "{out}");
+    assert!(
+        !meta.contains("attention_owner=supervisor"),
+        "{meta}\n{out}"
+    );
 }

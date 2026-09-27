@@ -6,9 +6,9 @@
 //! Contains all `set_*_callback` methods, `resize()`, and related state queries.
 //! Extracted from mod.rs to reduce file size.
 
-use super::{
-    ClipboardOperation, CopyToClipboardOperation, Terminal, WindowOperation, WindowResponse, types,
-};
+use super::{ClipboardOperation, Terminal, types};
+#[cfg(any(test, target_os = "linux"))]
+use super::{WindowOperation, WindowResponse};
 
 impl Terminal {
     /// Resize the terminal.
@@ -346,82 +346,6 @@ impl Terminal {
         self.kitty_file_resolver = Some(Box::new(resolver));
     }
 
-    /// Clear bell callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_bell_callback(&mut self) {
-        self.bell_callback = None;
-    }
-
-    /// Set cursor style change callback (DECSCUSR).
-    ///
-    /// The callback is invoked when a DECSCUSR sequence changes the cursor style.
-    /// The UI layer should use this to start/stop cursor blink timers and update
-    /// cursor rendering.
-    pub fn set_cursor_style_callback<F: FnMut(aterm_types::CursorStyle) + Send + 'static>(
-        &mut self,
-        callback: F,
-    ) {
-        self.cursor_style_callback = Some(Box::new(callback));
-    }
-
-    /// Set buffer activation callback.
-    ///
-    /// The callback is invoked when the terminal switches between the main and
-    /// alternate screen buffers. The boolean parameter is `true` when switching
-    /// to the alternate screen, `false` when switching back to the main screen.
-    ///
-    /// This is useful for SwiftTerm integration where `bufferActivated` callback
-    /// needs to be notified of buffer switches (e.g., when vim/less starts).
-    pub fn set_buffer_activation_callback<F: FnMut(bool) + Send + 'static>(&mut self, callback: F) {
-        self.buffer_activation_callback = Some(Box::new(callback));
-    }
-
-    /// Clear buffer activation callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_buffer_activation_callback(&mut self) {
-        self.buffer_activation_callback = None;
-    }
-
-    /// Set title change callback.
-    pub fn set_title_callback<F: FnMut(&str) + Send + 'static>(&mut self, callback: F) {
-        self.title.callback = Some(Box::new(callback));
-    }
-
-    /// Clear title change callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_title_callback(&mut self) {
-        self.title.callback = None;
-    }
-
-    /// Set title event callback with type discriminator (v3).
-    ///
-    /// The callback receives the title type (WindowAndIcon, IconOnly, WindowOnly)
-    /// and the title text for all OSC 0/1/2 title changes.
-    pub fn set_title_event_callback<F: FnMut(aterm_types::TitleType, &str) + Send + 'static>(
-        &mut self,
-        callback: F,
-    ) {
-        self.title.event_callback = Some(Box::new(callback));
-    }
-
-    /// Clear title event callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_title_event_callback(&mut self) {
-        self.title.event_callback = None;
-    }
-
     /// Set desktop notification callback (OSC 9).
     ///
     /// The callback is invoked when an application sends a notification escape
@@ -445,15 +369,6 @@ impl Terminal {
     /// - `ESC ] 9 ; message ST`  - ST terminator variant
     pub fn set_notification_callback<F: FnMut(&str) + Send + 'static>(&mut self, callback: F) {
         self.notifications.callback = Some(Box::new(callback));
-    }
-
-    /// Clear desktop notification callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_notification_callback(&mut self) {
-        self.notifications.callback = None;
     }
 
     /// Set a callback for dynamic color changes (OSC 10/11/12, OSC 110/111/112).
@@ -482,16 +397,12 @@ impl Terminal {
     ///     }
     /// });
     /// ```
+    #[cfg(test)]
     pub fn set_color_change_callback<F>(&mut self, callback: F)
     where
         F: FnMut(super::ColorTarget, aterm_types::Rgb, super::ColorChangeOp) + Send + 'static,
     {
         self.color.change_callback = Some(Box::new(callback));
-    }
-
-    /// Clear the color change callback.
-    pub fn clear_color_change_callback(&mut self) {
-        self.color.change_callback = None;
     }
 
     /// Set a callback for dynamic color queries (OSC 10/11/12 with `?`).
@@ -511,16 +422,12 @@ impl Terminal {
     /// - `Foreground` — OSC 10 `?`
     /// - `Background` — OSC 11 `?`
     /// - `Cursor` — OSC 12 `?`
+    #[cfg(test)]
     pub fn set_color_query_callback<F>(&mut self, callback: F)
     where
         F: FnMut(super::ColorTarget) -> Option<aterm_types::Rgb> + Send + 'static,
     {
         self.color.query_callback = Some(Box::new(callback));
-    }
-
-    /// Clear the color query callback.
-    pub fn clear_color_query_callback(&mut self) {
-        self.color.query_callback = None;
     }
 
     /// Set advanced desktop notification callback (OSC 99/777).
@@ -562,11 +469,6 @@ impl Terminal {
         self.notifications.advanced_callback = Some(Box::new(callback));
     }
 
-    /// Clear advanced notification callback (OSC 99/777).
-    pub fn clear_advanced_notification_callback(&mut self) {
-        self.notifications.advanced_callback = None;
-    }
-
     /// Set clipboard callback for OSC 52 operations.
     ///
     /// The callback is invoked when an application sends OSC 52 to set or clear
@@ -574,10 +476,8 @@ impl Terminal {
     ///
     /// Clipboard queries (Pd = "?") are ignored by default for security.
     ///
-    /// To enable queries:
-    /// - Rust API: set `TerminalConfig::allow_osc52_query = true` via
-    ///   [`apply_config`](Self::apply_config).
-    /// - Direct toggle: [`set_osc52_query_allowed`](Self::set_osc52_query_allowed).
+    /// To enable queries, set `TerminalConfig::allow_osc52_query = true` via
+    /// [`apply_config`](Self::apply_config).
     ///
     /// The callback receives a [`ClipboardOperation`] and should:
     /// - For `Set` operations: copy the content to the appropriate clipboard(s)
@@ -615,64 +515,6 @@ impl Terminal {
         self.clipboard.callback = Some(Box::new(callback));
     }
 
-    /// Set a callback for OSC 1337 named pasteboard operations.
-    ///
-    /// This callback handles Terminal-style clipboard operations:
-    /// - `CopyToClipboard=name` + `EndCopy`: Text capture to named pasteboard
-    /// - `Copy=base64`: Direct copy of base64-decoded data
-    ///
-    /// Named pasteboards (on macOS) include "general", "rule", "find", "font".
-    /// An empty pasteboard name typically means the general (system) clipboard.
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// use aterm_core::terminal::{Terminal, CopyToClipboardOperation};
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    /// term.set_copy_to_clipboard_callback(|op| {
-    ///     match op {
-    ///         CopyToClipboardOperation::CaptureComplete { pasteboard, content } => {
-    ///             println!("Copy to pasteboard '{}': {}", pasteboard, content);
-    ///         }
-    ///         CopyToClipboardOperation::DirectCopy { content } => {
-    ///             println!("Direct copy: {}", content);
-    ///         }
-    ///     }
-    /// });
-    /// ```
-    pub fn set_copy_to_clipboard_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(CopyToClipboardOperation) + Send + 'static,
-    {
-        self.clipboard.copy_callback = Some(Box::new(callback));
-    }
-
-    /// Check if a CopyToClipboard capture is currently active.
-    ///
-    /// Returns `true` if OSC 1337 CopyToClipboard was received but EndCopy has
-    /// not yet been processed.
-    #[must_use]
-    pub fn is_copy_to_clipboard_active(&self) -> bool {
-        self.clipboard.copy_state.is_some()
-    }
-
-    /// Set a callback for DCS payloads.
-    ///
-    /// The callback receives the raw DCS data bytes (payload only) and the final byte.
-    /// Payload data is capped to a fixed size to avoid unbounded buffering.
-    pub fn set_dcs_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(&[u8], u8) + Send + 'static,
-    {
-        self.dcs.callback = Some(Box::new(callback));
-    }
-
-    /// Clear the DCS callback.
-    pub fn clear_dcs_callback(&mut self) {
-        self.dcs.callback = None;
-    }
-
     /// Set a callback for window operations (CSI t - XTWINOPS).
     ///
     /// The callback is invoked when window manipulation or query sequences are received.
@@ -699,91 +541,12 @@ impl Terminal {
     ///     }
     /// });
     /// ```
+    #[cfg(any(test, target_os = "linux"))]
     pub fn set_window_callback<F>(&mut self, callback: F)
     where
         F: FnMut(WindowOperation) -> Option<WindowResponse> + Send + 'static,
     {
         self.window_callback = Some(Box::new(callback));
-    }
-
-    /// Clear window callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_window_callback(&mut self) {
-        self.window_callback = None;
-    }
-
-    /// Get the current remote host (OSC 1337 RemoteHost).
-    ///
-    /// Returns `Some(RemoteHost)` if in an SSH session (as reported by the shell
-    /// via OSC 1337 RemoteHost=user@host), or `None` if in a local session.
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// use aterm_core::terminal::Terminal;
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    /// term.process(b"\x1b]1337;RemoteHost=alice@server.example.com\x07");
-    /// if let Some(host) = term.remote_host() {
-    ///     println!("Connected to {}@{}", host.user, host.hostname);
-    /// }
-    /// ```
-    #[must_use]
-    pub fn remote_host(&self) -> Option<&types::RemoteHost> {
-        self.iterm2.remote_host.as_ref()
-    }
-
-    /// Set a callback for remote host change events.
-    ///
-    /// Called when OSC 1337 RemoteHost changes the current host (connect or
-    /// disconnect). The callback receives `None` when returning to local session.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use aterm_core::terminal::Terminal;
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    /// term.set_remote_host_callback(|host| {
-    ///     match host {
-    ///         Some(h) => println!("SSH to {}@{}", h.user, h.hostname),
-    ///         None => println!("Back to local session"),
-    ///     }
-    /// });
-    /// ```
-    #[cfg(test)]
-    pub fn set_remote_host_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(Option<&types::RemoteHost>) + Send + 'static,
-    {
-        self.iterm2.remote_host_callback = Some(Box::new(callback));
-    }
-
-    /// Set a callback for text sizing events (OSC 66 - Kitty protocol).
-    ///
-    /// Called when text sizing escape sequences are received. The operation
-    /// includes scale, width, alignment parameters, and the text content.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use aterm_core::terminal::Terminal;
-    /// use aterm_core::testing::set_text_sizing_callback;
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    /// set_text_sizing_callback(&mut term, |op| {
-    ///     println!("Text: {}, scale: {:?}", op.text, op.scale);
-    /// });
-    /// ```
-    #[cfg(test)]
-    pub(crate) fn set_text_sizing_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(types::TextSizingOperation) + Send + 'static,
-    {
-        self.text_sizing_callback = Some(Box::new(callback));
     }
 }
 

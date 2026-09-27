@@ -8,7 +8,7 @@
 //! [`open_pts_slave`]),
 //! `execve`, `read`, `write`, `ioctl(TIOCSWINSZ)` — moved VERBATIM from the
 //! pre-split `lib.rs` (zero semantic change). The shared, portable items
-//! ([`SpawnedShell`], [`crate::UTF8_LOCALE`], `build_child_env`) live in
+//! ([`SpawnedShell`], `build_child_env`) live in
 //! `lib.rs`; everything in this module is Unix-only by placement (no inline
 //! cfg), and `lib.rs` re-exports it so Unix callers compile untouched.
 
@@ -20,79 +20,20 @@ use std::ptr;
 use crate::{SpawnedShell, build_child_env};
 
 /// Fixed absolute path to the macOS Seatbelt wrapper used by the OS-sandbox wrap
-/// (see [`spawn_shell`]'s `sandbox_wrap`). Inlined here (rather than depending on
+/// (see [`spawn_shell_with_pid`]'s `sandbox_wrap`). Inlined here (rather than depending on
 /// the policy crate) to keep this minimal syscall seam dependency-light; it MUST
 /// equal `aterm_containment::SANDBOX_EXEC_PATH` — a test in this crate locks that.
 const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
-/// Spawn `$SHELL` in a fresh PTY of `rows`×`cols`, returning the master fd.
-///
-/// Honors `$ATERM_EXEC`: if set, the shell runs that command first (to paint a
-/// known screen) and then `exec`s an interactive shell so the result persists.
-/// Defaults to `/bin/sh` when `$SHELL` is unset.
-///
-/// `env_add` is a set of `(key, value)` environment entries injected into the
-/// child before exec (e.g. the OSC 133/633 shell-integration loader vars +
-/// nonce); `argv_override`, when `Some`, replaces the shell's argv (e.g. bash's
-/// `--rcfile`). Both are GENERIC — this seam knows nothing about shell
-/// integration; the frontend computes them. Pass `&[]` / `None` for a bare
-/// interactive shell.
-///
-/// `exec_command`, when `Some(&[prog, args…])`, runs that command DIRECTLY in the
-/// PTY instead of a shell (the `-e` convention: when it exits, the PTY closes and
-/// the window follows). `prog` is PATH-resolved HERE in the parent (the child must
-/// stay async-signal-safe, so no `execvp` PATH search there); `argv[0]` is `prog`
-/// as given. It takes precedence over `argv_override` and `$ATERM_EXEC` — there is
-/// no interactive shell to integrate with. An unresolved/again-failing `prog` ends
-/// the child with `_exit(127)`, closing the window, just like a failed shell exec.
-///
-/// `cwd`, when `Some`, is the working directory the child `chdir`s into before
-/// exec (the `--working-directory` flag); it overrides the default
-/// `/`→`$HOME` Finder-launch fallback. A failed `chdir` is non-fatal (the child
-/// starts in the inherited directory), matching the existing best-effort `chdir`.
-///
-/// ## OS sandbox wrap (`sandbox_wrap`, macOS Seatbelt — ATERM_DESIGN §5.6)
-///
-/// `sandbox_wrap`, when `Some(sbpl)`, wraps the WHOLE resolved program+argv in
-/// `/usr/bin/sandbox-exec -p <sbpl>` so the macOS kernel Seatbelt applies the SBPL
-/// profile (e.g. `(deny network*)` for `Containment` mode) before the target
-/// `exec`s. The wrap is BUILT IN THE PARENT: `sandbox-exec` becomes the exec
-/// target (a fixed absolute path — no PATH search, async-signal-safe in the child)
-/// and the original program+argv become its trailing arguments, so the login-shell
-/// argv[0], `--rcfile`, `$ATERM_EXEC`, and `-e` paths are all preserved verbatim
-/// as what sandbox-exec runs. This is **fail-closed**: if `sandbox-exec` is not
-/// present at its fixed path, `spawn_shell` returns an error and does NOT spawn —
-/// it never silently runs an UNSANDBOXED shell when the caller demanded the
-/// sandbox. `None` means no wrap: the spawn is byte-identical to before (used for
-/// every non-`Containment` mode, so the default User-mode spawn is unchanged).
-///
-/// Spawning a child process is a privileged effect (ATERM_DESIGN WS-G), so it
-/// requires a `Cap<Spawn>` of at least `Trusted` tier (`aterm-cap`): there is no
-/// way to spawn without one.
-///
-/// ## Fail-closed confinement (ATERM_DESIGN §5.6, exit-before-exec)
-///
-/// The child applies the resource sandbox BEFORE `execve`. If the sandbox
-/// `apply()` returns an error the child does NOT exec — it writes a one-byte
-/// failure indicator on the close-on-exec status pipe and `_exit(126)`s, so a
-/// confinement failure can never silently hand back a master fd for an
-/// UNCONFINED shell. The parent reads the status pipe: a clean EOF (the write
-/// end closed by `execve`'s O_CLOEXEC) means the child exec'd confined; any byte
-/// means the child failed before exec, and the parent returns an error instead
-/// of the master fd.
-///
-/// # Errors
-/// Returns `PermissionDenied` if the capability's tier is too low, the OS error
-/// if the PTY pair / `pipe` / `fork` fails, or `PermissionDenied`/`Other` if the child failed
-/// to confine itself (sandbox `apply` error) or to `execve` before exec. On any
-/// pre-exec child failure the master fd is closed and NO unconfined shell is
-/// returned.
+/// [`spawn_shell_with_pid`] minus the pid, with the historical hardened limits.
+/// Test-only: every frontend spawns through the `_with_pid` forms.
+#[cfg(test)]
 // The arg list is intentionally wide: this is the SINGLE spawn seam, and each
 // argument is an independent, security-relevant input (caps, env, argv, cwd, the
 // OS-sandbox wrap). Bundling them into a struct would hide that surface, not
 // shrink it.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_shell(
+pub(crate) fn spawn_shell(
     rows: u16,
     cols: u16,
     cap: &aterm_cap::Cap<aterm_cap::effects::Spawn>,
@@ -138,8 +79,7 @@ pub fn spawn_shell(
 /// unsafe: minimal Debian/Ubuntu, virtually all Docker base images, and musl/Alpine do
 /// NOT generate it, so glibc silently falls back to C/POSIX (ASCII — the exact mojibake
 /// this override exists to prevent) AND every locale-aware child (perl) then prints
-/// `Setting locale failed`. Kept separate from [`UTF8_LOCALE`], which is the macOS-only
-/// pbcopy/pbpaste pin; on macOS both resolve to the same value so they cannot drift.
+/// `Setting locale failed`.
 const SPAWN_UTF8_LOCALE: &str = if cfg!(target_os = "macos") {
     "en_US.UTF-8"
 } else {
@@ -1043,7 +983,14 @@ fn fifo_ends_are_one_private_object(rd: libc::c_int, wr: libc::c_int) -> bool {
 /// COST, measured on this machine: 274 us per channel against 1.2 us for
 /// `pipe`+2x`fcntl`. Absolutely that is 0.27 ms on a path whose median is 3.2 ms
 /// and which already does `fork(2)`, `execve(2)` of a shell and a full pty setup;
-/// it would only matter to something spawning in a tight loop.
+/// it would only matter to something spawning in a tight loop. That figure is a
+/// QUIET volume's: `mkfifo` and `unlink` are filesystem metadata operations and
+/// cost whatever the volume charges for one. MEASURED 2026-09-24 with dozens of
+/// compiler processes writing to the same volume: a channel took p50 ~33 ms
+/// (`mkfifo` ~24 ms, `unlink` ~8 ms), and `creat`/`mkdir` in the same directory
+/// cost the same, so it is the volume, not the fifo — a slower session open on
+/// a busy machine, never a wrong verdict, and still far inside
+/// [`EXEC_STATUS_BUDGET`].
 ///
 /// THE RESIDUAL, stated plainly: for the ~100 us (max 318 us measured) between
 /// `mkfifo` and `unlink` the fifo has a NAME. A same-uid process that opened that
@@ -1374,17 +1321,74 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
     read_exec_status_now(rd).unwrap_or(ExecStatus::NoVerdict)
 }
 
-/// Like [`spawn_shell`] but also returns the child pid (see [`SpawnedShell`]) —
-/// with NO cell metrics, so the child's winsize pixel fields start zero.
+/// Spawn `$SHELL` in a fresh PTY of `rows`×`cols`, returning the master fd and the
+/// child pid (see [`SpawnedShell`]).
+/// Defaults to `/bin/sh` when `$SHELL` is unset. (A command to run instead of
+/// the shell is `exec_command`, the `-e` flag; no environment variable injects
+/// one.)
 ///
-/// The metric-free shim over [`spawn_shell_with_pid_cell_px`], which is the one
-/// fork/exec body (this adds no behavior of its own). Kept as its own name and
-/// signature because it is the seam every frontend already calls; a caller that
-/// knows the host's cell size should call the `_cell_px` form so a tool reading
+/// `env_add` is a set of `(key, value)` environment entries injected into the
+/// child before exec (e.g. the OSC 133/633 shell-integration loader vars +
+/// nonce); `argv_override`, when `Some`, replaces the shell's argv (e.g. bash's
+/// `--rcfile`). Both are GENERIC — this seam knows nothing about shell
+/// integration; the frontend computes them. Pass `&[]` / `None` for a bare
+/// interactive shell.
+///
+/// `exec_command`, when `Some(&[prog, args…])`, runs that command DIRECTLY in the
+/// PTY instead of a shell (the `-e` convention: when it exits, the PTY closes and
+/// the window follows). `prog` is PATH-resolved HERE in the parent (the child must
+/// stay async-signal-safe, so no `execvp` PATH search there); `argv[0]` is `prog`
+/// as given. It takes precedence over `argv_override` — there is no interactive
+/// shell to integrate with. An unresolved/again-failing `prog` ends
+/// the child with `_exit(127)`, closing the window, just like a failed shell exec.
+///
+/// `cwd`, when `Some`, is the working directory the child `chdir`s into before
+/// exec (the `--working-directory` flag); it overrides the default
+/// `/`→`$HOME` Finder-launch fallback. A failed `chdir` is non-fatal (the child
+/// starts in the inherited directory), matching the existing best-effort `chdir`.
+///
+/// ## OS sandbox wrap (`sandbox_wrap`, macOS Seatbelt — ATERM_DESIGN §5.6)
+///
+/// `sandbox_wrap`, when `Some(sbpl)`, wraps the WHOLE resolved program+argv in
+/// `/usr/bin/sandbox-exec -p <sbpl>` so the macOS kernel Seatbelt applies the SBPL
+/// profile (e.g. `(deny network*)` for `Containment` mode) before the target
+/// `exec`s. The wrap is BUILT IN THE PARENT: `sandbox-exec` becomes the exec
+/// target (a fixed absolute path — no PATH search, async-signal-safe in the child)
+/// and the original program+argv become its trailing arguments, so the login-shell
+/// argv[0], `--rcfile`, and `-e` paths are all preserved verbatim
+/// as what sandbox-exec runs. This is **fail-closed**: if `sandbox-exec` is not
+/// present at its fixed path, `spawn_shell` returns an error and does NOT spawn —
+/// it never silently runs an UNSANDBOXED shell when the caller demanded the
+/// sandbox. `None` means no wrap: the spawn is byte-identical to before (used for
+/// every non-`Containment` mode, so the default User-mode spawn is unchanged).
+///
+/// Spawning a child process is a privileged effect (ATERM_DESIGN WS-G), so it
+/// requires a `Cap<Spawn>` of at least `Trusted` tier (`aterm-cap`): there is no
+/// way to spawn without one.
+///
+/// ## Fail-closed confinement (ATERM_DESIGN §5.6, exit-before-exec)
+///
+/// The child applies the resource sandbox BEFORE `execve`. If the sandbox
+/// `apply()` returns an error the child does NOT exec — it writes a one-byte
+/// failure indicator on the close-on-exec status pipe and `_exit(126)`s, so a
+/// confinement failure can never silently hand back a master fd for an
+/// UNCONFINED shell. The parent reads the status pipe: a clean EOF (the write
+/// end closed by `execve`'s O_CLOEXEC) means the child exec'd confined; any byte
+/// means the child failed before exec, and the parent returns an error instead
+/// of the master fd.
+///
+/// With NO cell metrics, so the child's winsize pixel fields start zero: the
+/// metric-free shim over [`spawn_shell_with_pid_cell_px`], which is the one
+/// fork/exec body (this adds no behavior of its own). A caller that knows the
+/// host's cell size should call the `_cell_px` form so a tool reading
 /// `ioctl(TIOCGWINSZ)` gets real pixel geometry instead of zeros.
 ///
 /// # Errors
-/// See [`spawn_shell_with_pid_cell_px`].
+/// Returns `PermissionDenied` if the capability's tier is too low, the OS error
+/// if the PTY pair / `pipe` / `fork` fails, or `PermissionDenied`/`Other` if the child failed
+/// to confine itself (sandbox `apply` error) or to `execve` before exec. On any
+/// pre-exec child failure the master fd is closed and NO unconfined shell is
+/// returned.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_shell_with_pid(
     rows: u16,
@@ -1417,9 +1421,8 @@ pub fn spawn_shell_with_pid(
     )
 }
 
-/// Like [`spawn_shell`] but also returns the child pid (see [`SpawnedShell`]),
-/// and fills the winsize PIXEL fields from the host's cell metrics.
-/// Identical spawn/sandbox/exec behavior — `spawn_shell` is this minus the pid.
+/// [`spawn_shell_with_pid`], filling the winsize PIXEL fields from the host's cell
+/// metrics. Identical spawn/sandbox/exec behavior.
 ///
 /// SPEC: the parent-prebuild + child branch of this fork/exec seam is the real
 /// implementation of the external `ForkExec.tla` model (TRUST_NATIVE_TLA Phase 2,
@@ -1612,8 +1615,8 @@ pub fn spawn_shell_with_pid_cell_px(
     // exec target + argv. `-e prog args…` (`exec_command`) runs the command
     // DIRECTLY and takes precedence over every shell path. Otherwise the program is
     // `$SHELL` and argv is: an explicit override (bash `--rcfile …`) wins; else
-    // `$ATERM_EXEC` runs a command then execs the shell; else a LOGIN interactive
-    // shell whose argv[0] is "-"+basename (the macOS convention → sources
+    // the config `shell_args`; else a LOGIN interactive shell whose argv[0] is
+    // "-"+basename (the macOS convention → sources
     // .zprofile / .bash_profile / path_helper). `argv_store` + `exec_target` own
     // the C strings the child's `execve` reads.
     let (exec_target, argv_store): (CString, Vec<CString>) =
@@ -1638,18 +1641,6 @@ pub fn spawn_shell_with_pid_cell_px(
                 .unwrap_or(shell.as_os_str());
             let mut argv = vec![CString::new(base.as_bytes()).unwrap_or_else(|_| cshell.clone())];
             argv.extend(args.iter().filter_map(|a| CString::new(a.as_bytes()).ok()));
-            (cshell.clone(), argv)
-        } else if let Some(cmd) = std::env::var_os("ATERM_EXEC") {
-            let script = format!(
-                "{}; exec {}",
-                cmd.to_string_lossy(),
-                shell.to_string_lossy()
-            );
-            let argv = vec![
-                cshell.clone(),
-                CString::new("-c").unwrap(),
-                CString::new(script).unwrap_or_else(|_| CString::new("true").unwrap()),
-            ];
             (cshell.clone(), argv)
         } else {
             let base = std::path::Path::new(&shell)
@@ -1977,7 +1968,7 @@ pub fn spawn_shell_with_pid_cell_px(
         ExecStatus::FailedBeforeExec(_) => Some((
             io::ErrorKind::Other,
             // NAME THE TARGET. This is overwhelmingly a config typo (`shell` in
-            // aterm.toml, `--shell`, `$ATERM_SHELL` — the exec target is used
+            // aterm.toml, `--shell` — the exec target is used
             // VERBATIM, no PATH search), and the anonymous version of this
             // message gave the user a fact with no handle on it. The child
             // cannot say more (async-signal-safe: one status byte), but the
@@ -1986,10 +1977,10 @@ pub fn spawn_shell_with_pid_cell_px(
             // program is not the shell at all.
             format!(
                 "child could not exec `{}` (_exit(127)) — usually a nonexistent or \
-                 non-executable path. If this is the shell, it came from `shell` in \
-                 aterm.toml, `--shell`, or $ATERM_SHELL (in that precedence). \
-                 `aterm doctor` reports whether $SHELL is executable; for the other \
-                 two sources, test the path above directly",
+                 non-executable path. If this is the shell, it came from `--shell`, \
+                 `shell` in aterm.toml, or $SHELL (in that precedence). `aterm doctor` \
+                 reports whether $SHELL is executable; for the other two sources, test \
+                 the path above directly",
                 exec_target.to_string_lossy()
             ),
         )),
@@ -2213,7 +2204,7 @@ pub fn reap(pid: i32) {
 /// (`prog`), because `sandbox-exec` execs its first positional and sets that path
 /// as the child's argv[0]. Every real argument after argv[0] is preserved; only a
 /// cosmetic login-dash argv[0] on a bare shell is dropped (documented on
-/// [`spawn_shell`]).
+/// [`spawn_shell_with_pid`]).
 ///
 /// # Errors
 /// `NotFound` if `wrapper_path` is missing/not executable (fail-closed — the
@@ -2426,48 +2417,6 @@ pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// Like [`write_some`], but reports ONLY the byte count the kernel accepted and
-/// NEVER yields an [`io::Error`]: every error collapses to `0`, `EINTR` is
-/// retried internally. Built for the sink drain loop (`aterm-session`): returning
-/// `usize` keeps any `io::Error` from crossing the call boundary into the loop,
-/// so the loop has no opaque error value to drop — eliminating the `io::Error`
-/// drop-glue gap that forced the loop's old skip'd `discard_write_error` helper.
-/// Mapping vs [`write_some`]: `Ok(n) -> n`, `Ok(0) -> 0`, `Err(_) -> 0` —
-/// behavior-identical for the drainer, which treats every non-positive result as
-/// session-dead.
-///
-/// INVARIANT (load-bearing for `drain_loop`'s panic-freedom proof): the ONLY
-/// `io::Error` this body may ever construct is `io::Error::last_os_error()` (the
-/// `Os(errno)` variant), and it is born AND dropped inside this body. That drop
-/// is trivially total — no boxed `Custom` payload, so no user `Drop` runs. Do NOT
-/// introduce `io::Error::new`/`io::Error::other`/a `?`-propagated error here: a
-/// `Custom` variant runs arbitrary user `Drop` (may panic) and would silently
-/// regress the drain loop from PROVED back to a coverage gap.
-// #[inline] so the MIR crosses the crate boundary (the `write_some`/`dup_fd`
-// precedent): aterm-session's drain loop bundles and VERIFIES this body rather
-// than assuming an absent callee.
-#[inline]
-pub fn write_some_count(master: i32, bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-    loop {
-        // SAFETY: `master` is a PTY master fd from `spawn_shell`; `bytes` is a valid
-        // slice of `bytes.len()` bytes (identical to `write_some`).
-        let r = unsafe { libc::write(master, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
-        if r < 0 {
-            // `last_os_error()` is the `Os(errno)` variant, constructed AND dropped
-            // right here — no boxed `Custom` payload, so the drop is total. Only
-            // `EINTR` retries; every other error collapses to `0` (session-dead).
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return 0;
-        }
-        return r as usize;
-    }
-}
-
 /// [`write_some`] with BLOCKING semantics restored on an `O_NONBLOCK` master: on
 /// `WouldBlock` it parks in `poll(POLLOUT)` and retries. The direct-read gather
 /// flips the master's file description non-blocking (`O_NONBLOCK` is
@@ -2496,18 +2445,21 @@ pub fn write_some_blocking(master: i32, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// [`write_some_count`] with BLOCKING semantics restored on an `O_NONBLOCK`
-/// master (the [`write_some_blocking`] twin for the sink's spill drain loop):
-/// `EAGAIN` parks in `poll(POLLOUT)` and retries instead of collapsing to `0` —
-/// without this the drainer would misread a full-but-alive tty input queue (the
-/// wedged foreground it EXISTS to absorb) as session-dead and drop the spill.
-/// All other errors still collapse to `0`; `EINTR` retries internally.
+/// The [`write_some_blocking`] twin for the sink's spill drain loop
+/// (`aterm-session`): reports ONLY the byte count the kernel accepted and NEVER
+/// yields an [`io::Error`], so no opaque error value crosses into the loop for it
+/// to drop. `EAGAIN` parks in `poll(POLLOUT)` and retries instead of collapsing to
+/// `0` — without this the drainer would misread a full-but-alive tty input queue
+/// (the wedged foreground it EXISTS to absorb) as session-dead and drop the spill.
+/// All other errors collapse to `0`; `EINTR` retries internally.
 ///
-/// INVARIANT (the `write_some_count` drop discipline): every `io::Error` touched
-/// here is the `Os(errno)` variant, born in this body or in [`poll_writable`],
-/// and dropped HERE — a trivially total drop with no boxed `Custom` payload.
-// #[inline] so the MIR crosses the crate boundary (the `write_some_count`
-// precedent): aterm-session's drain loop bundles and VERIFIES this body.
+/// INVARIANT (load-bearing for the drain loop's panic-freedom proof): every
+/// `io::Error` touched here is the `Os(errno)` variant, born in this body or in
+/// [`poll_writable`], and dropped HERE — a trivially total drop with no boxed
+/// `Custom` payload. Do NOT introduce `io::Error::new`/`io::Error::other`/a
+/// `?`-propagated error here.
+// #[inline] so the MIR crosses the crate boundary (the `write_some` precedent):
+// aterm-session's drain loop bundles and VERIFIES this body.
 #[inline]
 pub fn write_some_count_blocking(master: i32, bytes: &[u8]) -> usize {
     if bytes.is_empty() {
@@ -2541,7 +2493,7 @@ pub fn write_some_count_blocking(master: i32, bytes: &[u8]) -> usize {
 /// `last_os_error`, born inside [`write_some_nonparking`] and dropped THERE on the
 /// EINTR / would-block branches (trivially total — no boxed `Custom` payload), or moved
 /// into `Fatal` for the caller to RETURN. This keeps the caller's non-parking write loop
-/// free of any opaque `io::Error` drop (the `write_some_count` idiom, generalized to a
+/// free of any opaque `io::Error` drop (the [`write_some_count_blocking`] idiom, generalized to a
 /// path that must still surface `WouldBlock` and the real error).
 #[cfg(unix)]
 #[derive(Debug)]
@@ -2745,9 +2697,10 @@ pub fn fd_is_tty(fd: i32) -> bool {
     rc == 0
 }
 
-/// The slave's ECHO / ICANON bits, read THROUGH THE MASTER — what the line
-/// discipline will do with the next byte a keypress writes into this PTY
-/// ([`crate::TtyEcho`]). `None` when `fd` is not a tty (a pipe sink, the `-1`
+/// The slave's ECHO / ICANON bits, and its signal characters while ISIG is
+/// set, read THROUGH THE MASTER — what the line discipline will do with the
+/// next byte a keypress writes into this PTY ([`crate::TtyEcho`],
+/// [`crate::TtySignals`]). `None` when `fd` is not a tty (a pipe sink, the `-1`
 /// sentinel, a closed fd): the caller then knows nothing and must keep its
 /// default behaviour.
 ///
@@ -2779,10 +2732,214 @@ pub fn tty_echo(fd: i32) -> Option<crate::TtyEcho> {
     if rc != 0 {
         return None;
     }
+    // `_POSIX_VDISABLE`: the `c_cc` value that disables a special character.
+    // Not declared in `aterm-libc`; `<sys/termios.h>` spells it 0xff on the
+    // BSDs and `<bits/posix_vdisable.h>` '\0' on Linux.
+    #[cfg(target_os = "linux")]
+    const VDISABLE: libc::cc_t = 0;
+    #[cfg(not(target_os = "linux"))]
+    const VDISABLE: libc::cc_t = 0xff;
+    let special = |slot: usize| Some(t.c_cc[slot]).filter(|&c| c != VDISABLE);
     Some(crate::TtyEcho {
         echo: t.c_lflag & libc::ECHO != 0,
         canonical: t.c_lflag & libc::ICANON != 0,
+        signals: (t.c_lflag & libc::ISIG != 0).then(|| crate::TtySignals {
+            intr: special(libc::VINTR),
+            quit: special(libc::VQUIT),
+            susp: special(libc::VSUSP),
+        }),
     })
+}
+
+/// Whether the slave's line discipline hands EVERY byte written into this PTY
+/// to the program's input queue — so a queue that holds fewer bytes than were
+/// written can only mean the program READ some. `Some(true)` exactly when
+/// `ICANON`, `ISIG`, `IEXTEN`, `IXON` and `IGNCR` are all clear, which is
+/// `cfmakeraw` (Node's `setRawMode`, Python's `tty.setraw`, every agent TUI);
+/// `None` off a tty or when `tcgetattr` fails.
+///
+/// Each of those flags lets the driver CONSUME a written byte itself: `ISIG`
+/// turns `VINTR`/`VQUIT`/`VSUSP` into a signal and flushes the queue, `IXON`
+/// takes `VSTART`/`VSTOP` as flow control, `IEXTEN` takes `VLNEXT` and
+/// `VDISCARD`, and `IGNCR` drops every `\r`. Measured on Darwin 25.6
+/// (2026-09-25, review of the restart hold's read evidence): in cbreak mode
+/// (`ICANON` off, the rest on) `^C`, `^S`, `^O` and `^V` written through the
+/// master each left FIONREAD at 0 with nothing reading the slave — and the
+/// held gate lets a lone `^C` through by design, so counting that as a read
+/// released a program that was still frozen.
+#[must_use]
+pub fn tty_passes_every_byte(fd: i32) -> Option<bool> {
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `libc::termios` is a plain struct of integer fields and a `c_cc`
+    // byte array; an all-zeros bit pattern is a valid, fully-initialized value.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` may be any integer; `tcgetattr` fails cleanly (rc != 0,
+    // EBADF/ENOTTY) on a bad or non-tty fd and fills `t` on success.
+    let rc = unsafe { libc::tcgetattr(fd, &mut t) };
+    if rc != 0 {
+        return None;
+    }
+    Some(
+        t.c_lflag & (libc::ICANON | libc::ISIG | libc::IEXTEN) == 0
+            && t.c_iflag & (libc::IXON | libc::IGNCR) == 0,
+    )
+}
+
+/// `TIOCOUTQ` — `_IOR('t', 115, int)`, the output-queue depth of a tty. Not
+/// declared in `aterm-libc` (nothing else reads it), so it is spelled here
+/// the way aterm-gui's `session_program.rs` spells `KERN_PROCARGS2`; the test
+/// module pins the value against its `_IOR` derivation.
+#[cfg(target_os = "macos")]
+const TIOCOUTQ: libc::c_ulong = 0x4004_7473;
+
+/// How many bytes written INTO this PTY the program at the slave has not read
+/// yet — `ioctl(FIONREAD)` on the master, which the Darwin pty driver answers
+/// from the SLAVE's input queues. `None` when `fd` is not a tty (a pipe sink,
+/// the `-1` sentinel, a closed fd), when the ioctl fails, and on every
+/// platform but macOS.
+///
+/// WHY THIS EXISTS (2026-09-24): a Claude Code session froze — 140 GB
+/// resident, still spinning on the CPU, never reading its tty again — with the
+/// owner's Enter sitting unread in the slave's queue. The supervisor's next
+/// screen-fenced key passed every screen check (the screen had not changed,
+/// because the program had stopped drawing) and was queued BEHIND that Enter,
+/// so both were read together, hours later, against a screen nobody had
+/// looked at. Nothing in aterm could see the queue. This probe is the one
+/// reading that can: a raw-mode reader drains its queue within a turn, so a
+/// byte that stays unread says the program stopped reading, whatever the
+/// screen says.
+///
+/// What the count MEANS, measured on this Mac's ptys (Darwin 25.6,
+/// 2026-09-24), and pinned by the `queue_len_*` tests below:
+///
+/// * CANONICAL mode counts COMPLETE LINES only: `abc` typed at a cooked
+///   prompt reads 0 (the line discipline holds a partial line where
+///   `read(2)` cannot see it), and the `\n` that completes it makes the
+///   count 4. So a canonical 0 does not mean "nothing typed".
+/// * RAW mode counts EVERY byte: `\r` reads 1, and `\r` then `\x1b[B` reads
+///   4 — the shape of the incident, where ONE slave `read()` returned both.
+/// * RAW with `VMIN` > the queued count and `VTIME` = 0 reads 0: the driver
+///   reports what a `read(2)` would return right now, and that read would
+///   still be waiting for `VMIN` bytes.
+/// * Every error UNDERCOUNTS — `None`, never a guess — so a caller that acts
+///   on a count can only act on bytes the kernel reported.
+///
+/// macOS-only ON PURPOSE: on Linux a master's `FIONREAD` counts the OUTPUT
+/// the master has not read, not the slave's unread input, so the same call
+/// would answer a different question. The Linux reading needs the slave
+/// itself (a transient `TIOCGPTPEER` fd) and is not measured; until it is,
+/// Linux answers `None` rather than a number that means something else.
+///
+/// One `isatty`, one `ioctl`, no allocation, no blocking — and no lock: a
+/// caller may run it while a writer is parked on a full queue. The read is
+/// a snapshot; a racing write or read moves it at once.
+#[must_use]
+pub fn input_queue_len(fd: i32) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        queue_len(fd, libc::FIONREAD)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// How many bytes the program at the slave has WRITTEN that the master has not
+/// read yet — `ioctl(TIOCOUTQ)` on the master, the slave's output queue.
+/// `None` off a tty, on error, and on every platform but macOS, exactly as
+/// [`input_queue_len`].
+///
+/// Measured (Darwin 25.6, 2026-09-24): a raw slave writing 10 bytes reads 10,
+/// and 0 once the master has read them; at a canonical slave with ECHO on,
+/// the kernel's echo of typed bytes lands here too (`abc` typed reads 3).
+///
+/// Its use is as the fairness half of the stall reading: a program BLOCKED
+/// WRITING to an aterm that is not draining its output is not frozen, it is
+/// waiting for aterm. A non-zero count here says the lag may be aterm's, so
+/// a consumer must not blame the program for input it has not read while
+/// its own output sits unread. macOS-only for the same reason as
+/// [`input_queue_len`]: this is the reading the Darwin driver gives, and
+/// Linux is not measured.
+#[must_use]
+pub fn output_queue_len(fd: i32) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        queue_len(fd, TIOCOUTQ)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// DISCARD every byte written into this PTY that the program at the slave has
+/// not read — `tcflush(master, TCIFLUSH)` — and return how many there were
+/// ([`input_queue_len`], read just before). `None` off a tty, on error, and on
+/// every platform but macOS, where nothing is discarded.
+///
+/// WHY THIS EXISTS (2026-09-25): the remedy aterm publishes for a frozen
+/// program is `signal term`, and a frozen program leaves every key typed at
+/// it in the tty's input queue — the queue outlives the program. The shell
+/// that takes the terminal back reads those keys as its own input the moment
+/// it gets the tty, so a person who kept typing into a frozen Claude Code had
+/// their complete lines RUN AS SHELL COMMANDS when it died (reproduced on a
+/// pty with `zsh -f -i`, whole-branch review). No warning can stop that: the
+/// shell reads before anyone could look. The keys were typed for the dying
+/// program, never for the shell, so aterm drops them first.
+///
+/// Measured on this Mac's ptys (Darwin 25.6, 2026-09-25), raw and canonical
+/// alike: `tcflush(master, TCIFLUSH)` empties the SLAVE's input queue (the
+/// master's and the slave's FIONREAD both read 0 after it) and leaves the
+/// slave's OUTPUT queue (TIOCOUTQ) untouched; `TCOFLUSH` on the master does
+/// the reverse. In canonical mode the flush also drops the partial line
+/// FIONREAD cannot count, so a caller that means to keep a shell's
+/// type-ahead must not call this there. Pinned by
+/// `flush_input_queue_discards_the_unread_input_and_nothing_else`.
+#[must_use]
+pub fn flush_input_queue(fd: i32) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let unread = queue_len(fd, libc::FIONREAD)?;
+        // SAFETY: `fd` is a tty (checked by `queue_len` just above) and
+        // `tcflush` only discards queued data; a stale fd fails with rc < 0.
+        if unsafe { libc::tcflush(fd, libc::TCIFLUSH) } != 0 {
+            return None;
+        }
+        Some(unread)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// The shared body of the two queue probes: an int-valued tty ioctl, `None`
+/// unless `fd` is a tty and the call succeeds with a non-negative count.
+#[cfg(target_os = "macos")]
+fn queue_len(fd: i32, request: libc::c_ulong) -> Option<usize> {
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `isatty` takes any integer and only asks the kernel about it; a
+    // bad or closed fd answers 0, never undefined behaviour.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return None;
+    }
+    let mut n: libc::c_int = 0;
+    // SAFETY: `request` is FIONREAD or TIOCOUTQ, both `_IOR(.., int)`: the
+    // kernel writes exactly one `c_int` through the pointer, and `n` is a live
+    // `c_int` on this stack. A bad fd fails cleanly with rc < 0.
+    let rc = unsafe { libc::ioctl(fd, request, &mut n) };
+    if rc != 0 {
+        return None;
+    }
+    usize::try_from(n).ok()
 }
 
 /// Read up to `buf.len()` bytes from the PTY master into `buf`. Returns the number
@@ -3035,13 +3192,15 @@ const IDLE_POLL_DEFAULT_US: u32 = 50;
 /// batch rather than fragmenting it into ≤1 KiB slices.
 const HOT_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// Idle-cutoff hysteresis (`ATERM_PTY_IDLE_POLL_US=<µs>`): how long a dry,
-/// parser-idle gap may wait for a refill before delivering. An immediate
+/// Idle-cutoff hysteresis: how long a dry, parser-idle gap may wait for a refill
+/// before delivering. An immediate
 /// cutoff (0) protects the fps/request-response class (the ghostty bb0ac4c
 /// regression) but its small-batch churn costs ~33-43 MB/s of cat-flood
-/// throughput; [`IDLE_POLL_DEFAULT_US`] is the measured sweet spot. `0`
-/// restores the immediate cutoff. Read once; unparsable values mean the
-/// default. Clamped to [`IDLE_POLL_CLAMP_US`]: a wait beyond the batch
+/// throughput; [`IDLE_POLL_DEFAULT_US`] is the measured sweet spot and the
+/// shipped value. A development build may sweep it through the
+/// `ATERM_PTY_IDLE_POLL_US=<µs>` seam ([`aterm_types::dev_seam!`]; `0` restores
+/// the immediate cutoff). Read once; unparsable values mean the default.
+/// Clamped to [`IDLE_POLL_CLAMP_US`]: a wait beyond the batch
 /// budget is meaningless, and on the wake-pipe-less fallback path an
 /// unbounded select would stall teardown for the full value.
 fn idle_poll_us() -> u32 {
@@ -3049,9 +3208,8 @@ fn idle_poll_us() -> u32 {
     const IDLE_POLL_CLAMP_US: u32 = 5_000;
     static IDLE_POLL_US: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *IDLE_POLL_US.get_or_init(|| {
-        std::env::var("ATERM_PTY_IDLE_POLL_US")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
+        aterm_types::dev_seam!("ATERM_PTY_IDLE_POLL_US")
+            .and_then(|v| v.to_string_lossy().trim().parse().ok())
             .unwrap_or(IDLE_POLL_DEFAULT_US)
             .min(IDLE_POLL_CLAMP_US)
     })
@@ -3064,10 +3222,21 @@ enum BridgeWait {
     Deliver,
 }
 
+// The bridge polls THIS thread has taken — tests only, so a gather's park
+// primitive is read without a clock (the hot gather must take the µs idle wait,
+// never this 1 ms poll). Thread-local on purpose: other tests in this binary
+// take bridge polls concurrently, and a process-wide count would race them.
+#[cfg(test)]
+thread_local! {
+    static BRIDGE_POLLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Park for the writer's next refill: one bounded poll on `[master, wake_rd]`.
 /// A pending wake byte is deliberately NOT consumed — [`read_or_wake`] owns the
 /// wake protocol and must observe it after the batch is delivered.
 fn bridge_poll(master: i32, wake_rd: i32, timeout_ms: i32) -> BridgeWait {
+    #[cfg(test)]
+    BRIDGE_POLLS.with(|n| n.set(n.get() + 1));
     let mut fds = [
         libc::pollfd {
             fd: master,
@@ -3168,7 +3337,7 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
 /// (no parse stage attached) bridges unconditionally.
 ///
 /// The parser-idle cutoff carries a measured hysteresis ([`idle_poll_us`],
-/// `ATERM_PTY_IDLE_POLL_US`, default [`IDLE_POLL_DEFAULT_US`]): a dry idle
+/// [`IDLE_POLL_DEFAULT_US`]): a dry idle
 /// gap waits up to that many µs for a refill before delivering — the
 /// immediate cutoff's small-batch churn costs ~33-43 MB/s of flood
 /// throughput; `0` restores immediate delivery.
@@ -3182,6 +3351,16 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
 /// continuously streaming program is delivered on the human's schedule, not
 /// the batch's, while a TUI repaint burst (µs refill gaps) still coalesces.
 /// A plain `fn` pointer so this crate stays independent of the host's metrics.
+///
+/// `at_gap(filled)` is the host's FENCE, called at every dry gap immediately
+/// before the drain would park (the same point, and the same once-per-gap
+/// cadence the drain tests inject refills at), with the number of bytes
+/// gathered so far. Returning `true` delivers the batch NOW, without parking;
+/// any refill stays queued in the tty for the next read. aterm-gui samples the
+/// foreground process group here (2026-09-25, the foreground handback): the
+/// drain has just hit `EAGAIN`, so every byte read so far is in `buf`, and a
+/// group change seen at this point is cut exactly at `filled`. A host with no
+/// fence passes `&mut |_| false`.
 pub fn drain_more_nonblocking(
     master: i32,
     buf: &mut [u8],
@@ -3189,8 +3368,9 @@ pub fn drain_more_nonblocking(
     wake_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
     interactive_pending: fn() -> bool,
+    at_gap: &mut dyn FnMut(usize) -> bool,
 ) -> usize {
-    drain_more_nonblocking_with_idle_wait(
+    drain_more_nonblocking_with_idle_wait_after_gap(
         master,
         buf,
         filled,
@@ -3198,12 +3378,14 @@ pub fn drain_more_nonblocking(
         parse_in_flight,
         interactive_pending,
         idle_poll_us(),
+        at_gap,
     )
 }
 
 /// [`drain_more_nonblocking`] body with the idle-cutoff hysteresis as an
 /// explicit parameter: the [`idle_poll_us`] OnceLock caches the env once per
 /// process, so tests needing different knob values drive this directly.
+#[cfg(test)]
 fn drain_more_nonblocking_with_idle_wait(
     master: i32,
     buf: &mut [u8],
@@ -3221,18 +3403,19 @@ fn drain_more_nonblocking_with_idle_wait(
         parse_in_flight,
         interactive_pending,
         idle_wait_us,
-        || {},
+        |_| false,
     )
 }
 
-/// Shared gather body. `before_gap_park` is a deterministic test seam invoked
-/// after the immediate probes are exhausted and immediately before the drain
-/// PARKS on a dry gap — either the armed parser-idle wait (parser idle) or the
-/// `BRIDGE_POLL_MS` bridge poll (parser busy). Exactly one of those two parks
-/// runs per dry gap, so the seam fires exactly once per gap on whichever path is
-/// taken. That is what lets a test inject a refill that PROVABLY lands inside
-/// the park, instead of racing a sleep against it. The shipping wrapper supplies
-/// an inlined no-op.
+/// Shared gather body. `at_gap` is invoked after the immediate probes are
+/// exhausted and immediately before the drain PARKS on a dry gap — either the
+/// armed parser-idle wait (parser idle) or the `BRIDGE_POLL_MS` bridge poll
+/// (parser busy). Exactly one of those two parks runs per dry gap, so it fires
+/// exactly once per gap on whichever path is taken, with the bytes gathered so
+/// far. Returning `true` delivers the batch instead of parking (the shipping
+/// host's foreground fence — see [`drain_more_nonblocking`]). It is also the
+/// deterministic test seam that lets a test inject a refill that PROVABLY lands
+/// inside the park, instead of racing a sleep against it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the gather's knobs are threaded explicitly so tests can drive each one \
@@ -3246,7 +3429,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
     interactive_pending: fn() -> bool,
     idle_wait_us: u32,
-    mut before_gap_park: impl FnMut(),
+    mut at_gap: impl FnMut(usize) -> bool,
 ) -> usize {
     /// One kernel tty output queue's worth — at/above this the writer saturated it.
     const SATURATED: usize = 1024;
@@ -3305,7 +3488,9 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                     // Hysteresis: a µs-bounded wait for the refill instead of
                     // delivering a churn-sized batch (the budget still caps the
                     // whole gather — it is re-checked per dry gap).
-                    before_gap_park();
+                    if at_gap(filled) {
+                        break; // the host's fence: deliver this batch now
+                    }
                     match idle_refill_wait(master, wake_rd, idle_wait_us) {
                         BridgeWait::Refill => {
                             spins = 0;
@@ -3314,7 +3499,9 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                         BridgeWait::Deliver => break,
                     }
                 }
-                before_gap_park();
+                if at_gap(filled) {
+                    break; // the host's fence: deliver this batch now
+                }
                 match bridge_poll(master, wake_rd, BRIDGE_POLL_MS) {
                     BridgeWait::Refill => spins = 0,
                     BridgeWait::Deliver => break,
@@ -3564,7 +3751,7 @@ mod tests {
         let n = read(rd, &mut buf[..1]); // stand-in for the read_or_wake first chunk
         assert_eq!(n, 1);
         let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None, never_hot);
+        let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None, never_hot, &mut |_| false);
         assert_eq!(filled, 4, "must gather the whole burst");
         assert_eq!(&buf[..4], b"echo");
         assert!(
@@ -3629,7 +3816,7 @@ mod tests {
                 // hot gather that fired the seam therefore provably took the
                 // µs-wait branch and not the busy-parser bridge poll.
                 IDLE_POLL_DEFAULT_US,
-                || {
+                |_| {
                     parks += 1;
                     if parks == 1 {
                         // SAFETY: bounded write to this test's live pipe end.
@@ -3638,6 +3825,7 @@ mod tests {
                             chunk.len() as isize
                         );
                     }
+                    false
                 },
             );
             let held = t0.elapsed();
@@ -3657,7 +3845,15 @@ mod tests {
         // so nine samples buy the margin for nothing.
         let mut best_held = std::time::Duration::MAX;
         for _ in 0..9 {
+            let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
             let (filled, parks, held) = gather();
+            // THE PROPERTY, read without a clock: the dry gap was bridged by the
+            // µs idle wait, never by the 1 ms bridge poll.
+            assert_eq!(
+                super::BRIDGE_POLLS.with(std::cell::Cell::get),
+                polls_before,
+                "a hot gather took the 1 ms bridge poll"
+            );
             assert_eq!(
                 filled,
                 2 * CHUNK,
@@ -3669,13 +3865,11 @@ mod tests {
             );
             best_held = best_held.min(held);
         }
+        // The hold is printed, not asserted: the park counter above is the
+        // property, and a wall-clock reading of a ~100 µs gather is the load's
+        // (best of nine still read 943 µs against 1 ms once — the load-sensitive
+        // test audit of 2026-09-27 found the bound one quantum from red).
         eprintln!("P05 busy-parser hot gather: best of nine held {best_held:?}");
-        // The second (dry) park was the µs idle wait, not a 1 ms bridge poll:
-        // the whole gather stays well inside HOT_BATCH_BUDGET.
-        assert!(
-            best_held < HOT_BATCH_BUDGET,
-            "hot gather held {best_held:?} at best; a 1 ms bridge poll would have been taken"
-        );
     }
 
     /// P05 — the hold a CONTINUOUS stream (refills every ~100 µs for longer
@@ -3745,10 +3939,16 @@ mod tests {
         }
         // Scheduling noise under a parallel suite can stretch or cut either arm,
         // so each is judged from the direction that falsifies it: the hot arm by
-        // its SHORTEST of five holds (the old code's hot arm cannot beat ~3 ms
-        // however many times it is run), the cold control by its LONGEST (a
-        // writer descheduled past the bridge poll cuts one run short; it cannot
-        // make a run hold past the budget).
+        // its SHORTEST hold (the old code's hot arm cannot beat ~3 ms however
+        // many times it is run), the cold control by its LONGEST (a writer
+        // descheduled past the bridge poll cuts one run short; it cannot make a
+        // run hold past the budget).
+        //
+        // THE HOT ARM RUNS UNTIL IT CLEARS ITS CEILING, up to fifteen times and
+        // 10 ms apart. It took the shortest of five back-to-back runs, which all
+        // land in the same few milliseconds and so in the same bad scheduling
+        // window (the load-sensitive test audit of 2026-09-27); the old code's
+        // hot arm never clears the ceiling however often it runs.
         //
         // THE CONTROL RUNS UNTIL IT CLEARS ITS FLOOR, up to fifteen times. It
         // took the longest of three, and on 2026-09-23 two full gates sharing
@@ -3758,7 +3958,18 @@ mod tests {
         // the floor however often it runs, so stopping at the first run that
         // does keeps the falsifier and drops the flake.
         const COLD_FLOOR: std::time::Duration = std::time::Duration::from_micros(1500);
-        let shortest = |f: fn() -> bool| (0..5).map(|_| hold(f)).min().expect("five runs");
+        const HOT_CEILING: std::time::Duration = std::time::Duration::from_micros(2200);
+        let shortest_until_ceiling = |f: fn() -> bool| {
+            let mut shortest = std::time::Duration::MAX;
+            for _ in 0..15 {
+                shortest = shortest.min(hold(f));
+                if shortest < HOT_CEILING {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            shortest
+        };
         let longest_until_floor = |f: fn() -> bool| {
             let mut longest = std::time::Duration::ZERO;
             for _ in 0..15 {
@@ -3769,12 +3980,12 @@ mod tests {
             }
             longest
         };
-        let hot = shortest(always_hot);
+        let hot = shortest_until_ceiling(always_hot);
         let cold = longest_until_floor(never_hot);
         eprintln!("P05 continuous-stream gather hold: hot={hot:?} cold={cold:?}");
         assert!(
-            hot < std::time::Duration::from_micros(2200),
-            "hot gather must close near HOT_BATCH_BUDGET, held {hot:?}"
+            hot < HOT_CEILING,
+            "hot gather must close near HOT_BATCH_BUDGET, held {hot:?} at best of fifteen"
         );
         // The CONTROL: the flood-shaped gather still holds a continuous stream
         // well past the hot budget (its bridge poll continues the batch on every
@@ -3807,7 +4018,10 @@ mod tests {
         let mut buf = [0u8; 65_536];
         let n = read(rd, &mut buf[..1024]);
         assert!(n > 0);
-        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, None, never_hot);
+        let filled =
+            drain_more_nonblocking(rd, &mut buf, n as usize, -1, None, never_hot, &mut |_| {
+                false
+            });
         assert_eq!(
             filled,
             payload.len(),
@@ -3841,7 +4055,15 @@ mod tests {
         let mut buf = [0u8; 65_536];
         let n = read(rd, &mut buf[..1024]);
         assert!(n > 0);
-        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, wake_rd, None, never_hot);
+        let filled = drain_more_nonblocking(
+            rd,
+            &mut buf,
+            n as usize,
+            wake_rd,
+            None,
+            never_hot,
+            &mut |_| false,
+        );
         assert_eq!(filled, payload.len(), "keeps the drained burst");
         let mut b = [0u8; 4];
         // SAFETY: bounded read from this test's live wake pipe end.
@@ -3899,12 +4121,12 @@ mod tests {
             // `== 0` and this busy parser takes the idle branch, breaks at the
             // cutoff, and never fires the seam — caught by `injected` below.
             0,
-            || {
+            |_| {
                 // The drain has exhausted its probes and is about to park on a
                 // dry gap. Refill exactly here: a bridge that continues gathers
                 // it into THIS batch; a broken one has already delivered.
                 if injected {
-                    return;
+                    return false;
                 }
                 injected = true;
                 // SAFETY: bounded write to this test's live pipe end.
@@ -3912,6 +4134,7 @@ mod tests {
                     unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
                     chunk.len() as isize
                 );
+                false
             },
         );
         close_fd(wr);
@@ -3927,6 +4150,86 @@ mod tests {
             2 * chunk.len(),
             "a busy-parser bridge must continue the batch across a refill gap"
         );
+    }
+
+    /// The host FENCE (2026-09-25, the foreground handback): `at_gap` returning
+    /// `true` at a dry gap delivers the batch WITHOUT parking, and a refill that
+    /// arrived at that gap stays queued for the next read — it must not be
+    /// gathered into the batch the fence just cut, because aterm-gui cuts at the
+    /// foreground-process-group change and the refill belongs to the NEW group.
+    /// Negative control in the same test: the identical schedule with a fence
+    /// that always answers `false` bridges the refill into the batch, exactly
+    /// as the pre-fence no-op seam did.
+    #[test]
+    fn drain_more_nonblocking_fence_delivers_before_a_park() {
+        use std::sync::atomic::AtomicUsize;
+        let chunk = [0xC3u8; 2048];
+        // Returns (filled, gaps seen by the fence, bytes a follow-up read finds).
+        let run = |cut: bool| -> (usize, u32, isize) {
+            let mut m = [0i32; 2];
+            // SAFETY: valid 2-int out-array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+            let (rd, wr) = (m[0], m[1]);
+            set_nonblocking(rd, true).expect("nonblock read end");
+            // SAFETY: bounded write to this test's live pipe end.
+            assert_eq!(
+                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                chunk.len() as isize
+            );
+            let busy = AtomicUsize::new(1); // parser busy ⇒ the bridge-poll park
+            let mut buf = [0u8; 65_536];
+            let n = read(rd, &mut buf[..1024]);
+            assert!(n > 0);
+            let mut gaps = 0u32;
+            let mut seen_at = Vec::new();
+            let filled = drain_more_nonblocking_with_idle_wait_after_gap(
+                rd,
+                &mut buf,
+                n as usize,
+                -1,
+                Some(&busy),
+                never_hot,
+                0,
+                |f| {
+                    gaps += 1;
+                    seen_at.push(f);
+                    if gaps == 1 {
+                        // The new holder's first bytes, queued at the gap.
+                        // SAFETY: bounded write to this test's live pipe end.
+                        assert_eq!(
+                            unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                            chunk.len() as isize
+                        );
+                        return cut;
+                    }
+                    false
+                },
+            );
+            assert_eq!(
+                seen_at[0],
+                chunk.len(),
+                "the fence sees every byte read so far"
+            );
+            let mut rest = [0u8; 4096];
+            let after = read(rd, &mut rest);
+            close_fd(wr);
+            close_fd(rd);
+            (filled, gaps, after)
+        };
+
+        let (filled, gaps, after) = run(true);
+        assert_eq!(filled, chunk.len(), "the fence cut the batch at the gap");
+        assert_eq!(gaps, 1, "a fence that answered true is not asked again");
+        assert_eq!(after, chunk.len() as isize, "the refill is still unread");
+
+        let (filled, gaps, after) = run(false);
+        assert_eq!(
+            filled,
+            2 * chunk.len(),
+            "a false fence bridges the refill, as before"
+        );
+        assert!(gaps >= 1);
+        assert!(after < 0, "nothing left behind (EAGAIN)");
     }
 
     /// Parser-idle cutoff (the ghostty fps-fire class): with `in_flight == 0`
@@ -3991,7 +4294,15 @@ mod tests {
                         0,
                     )
                 } else {
-                    drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&idle), never_hot)
+                    drain_more_nonblocking(
+                        rd,
+                        &mut buf,
+                        n as usize,
+                        -1,
+                        Some(&idle),
+                        never_hot,
+                        &mut |_| false,
+                    )
                 };
                 let el = t0.elapsed();
                 close_fd(rd);
@@ -4067,7 +4378,7 @@ mod tests {
             Some(&idle),
             never_hot,
             IDLE_POLL_DEFAULT_US,
-            || {
+            |_| {
                 assert!(!injected, "the refill must be injected exactly once");
                 // SAFETY: bounded write to this test's live pipe end.
                 assert_eq!(
@@ -4075,6 +4386,7 @@ mod tests {
                     chunk.len() as isize
                 );
                 injected = true;
+                false
             },
         );
         close_fd(wr);
@@ -4092,55 +4404,107 @@ mod tests {
 
     /// Hysteresis knob (`ATERM_PTY_IDLE_POLL_US` > 0): an idle parser at a dry
     /// gap WAITS for the writer's refill instead of delivering, so the refill
-    /// lands in the SAME batch. 100 ms is deliberately huge so scheduling can
-    /// never expire the wait before the +2 ms refill; the writer's close (EOF)
-    /// ends the batch. Retry damps scheduling flakes: a knob-off cutoff NEVER
-    /// continues the batch, so any passing attempt proves the hysteresis.
+    /// lands in the SAME batch — a refill written from another thread WHILE
+    /// the gather is parked (its sibling above injects one synchronously, just
+    /// before the park; this one proves the park itself wakes on arrival).
+    ///
+    /// The writer is released by the gather's own `at_gap` seam, not by a
+    /// sleep raced against the gather's start (the load-sensitive test audit
+    /// of 2026-09-27): once `at_gap` runs the gather has passed its dry-gap
+    /// budget check and is about to park, and the writer then waits 20 ms —
+    /// twenty busy-parser 1 ms bridge polls — so a gap that parked on the
+    /// wrong path has expired before the refill lands. The idle wait is 10 s,
+    /// so only a writer starved for that long can expire a correct park, and
+    /// the buffer holds exactly two chunks, so capacity ends the batch
+    /// without depending on EOF (which a sibling test's fork can delay).
+    ///
+    /// The one wall-clock verdict left is the gather's own: its 3 ms
+    /// `BATCH_BUDGET` is checked at each dry gap from a clock started on
+    /// entry, so a reader descheduled that long before its first gap delivers
+    /// the first chunk without ever reaching `at_gap`. An attempt that never
+    /// reached `at_gap` is therefore judged only when the whole gather took
+    /// less than that budget — then nothing but a cutoff that no longer waits
+    /// can explain it, and it fails at once. Slower ones retry, spread 10 ms
+    /// apart like the idle-parser test's attempts above.
     #[test]
     fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
         use std::sync::atomic::AtomicUsize;
-        let mut ok = false;
-        for _ in 0..3 {
+        /// The gather's `BATCH_BUDGET` (a const local to its body).
+        const GATHER_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
+        const CHUNK_LEN: usize = 2048;
+        let mut starved = Vec::new();
+        for _ in 0..12 {
             let mut m = [0i32; 2];
             // SAFETY: valid 2-int out-array for pipe(2).
             assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
             let (rd, wr) = (m[0], m[1]);
             set_nonblocking(rd, true).expect("nonblock read end");
-            let chunk = [0xB4u8; 2048];
+            let chunk = [0xB4u8; CHUNK_LEN];
             // SAFETY: bounded write to this test's live pipe end.
             assert_eq!(
                 unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
                 chunk.len() as isize
             );
+            let (release, released) = std::sync::mpsc::channel::<()>();
             let writer = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                // SAFETY: bounded write to the pipe end this thread owns.
-                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) };
+                // A gather that never reached its park drops `release`
+                // unsent: nothing is written, and the pipe just closes.
+                if released.recv().is_ok() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    // SAFETY: bounded write to the pipe end this thread owns.
+                    unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) };
+                }
                 close_fd(wr);
             });
             let idle = AtomicUsize::new(0);
-            let mut buf = [0u8; 65_536];
+            let mut buf = [0u8; 2 * CHUNK_LEN];
             let n = read(rd, &mut buf[..1024]);
             assert!(n > 0);
-            let filled = drain_more_nonblocking_with_idle_wait(
+            let mut gaps = 0u32;
+            let t0 = std::time::Instant::now();
+            let filled = drain_more_nonblocking_with_idle_wait_after_gap(
                 rd,
                 &mut buf,
                 n as usize,
                 -1,
                 Some(&idle),
                 never_hot,
-                100_000,
+                10_000_000,
+                |_| {
+                    gaps += 1;
+                    assert_eq!(gaps, 1, "a two-chunk buffer ends the batch at capacity");
+                    release.send(()).expect("the writer waits for its release");
+                    false
+                },
             );
+            let took = t0.elapsed();
+            drop(release);
             writer.join().unwrap();
             close_fd(rd);
-            if filled == 2 * chunk.len() {
-                ok = true;
-                break;
+            if gaps == 1 {
+                assert_eq!(
+                    filled,
+                    2 * CHUNK_LEN,
+                    "an armed idle wait must gather the refill into the same batch"
+                );
+                return;
             }
+            assert_eq!(
+                filled, CHUNK_LEN,
+                "a gather that never parked keeps its chunk"
+            );
+            assert!(
+                took >= GATHER_BUDGET,
+                "an armed idle wait must reach its park: the gather delivered \
+                 {filled} bytes in {took:?}, inside its {GATHER_BUDGET:?} budget, \
+                 without ever parking for the refill"
+            );
+            starved.push(took);
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(
-            ok,
-            "an armed idle wait must gather the refill into the same batch"
+        panic!(
+            "every attempt spent the gather's {GATHER_BUDGET:?} budget before its \
+             first dry gap, so none reached the idle wait: {starved:?}"
         );
     }
 
@@ -4230,7 +4594,15 @@ mod tests {
         let n = read(rd, &mut buf[..1024]);
         assert!(n > 0);
         let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&busy), never_hot);
+        let filled = drain_more_nonblocking(
+            rd,
+            &mut buf,
+            n as usize,
+            -1,
+            Some(&busy),
+            never_hot,
+            &mut |_| false,
+        );
         // Sample BEFORE the join: the join waits on a thread that sleeps 300us, so
         // reading `elapsed` after it folded another thread's scheduling into the
         // number this assertion is about.
@@ -4570,9 +4942,7 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        // Run a deterministic command then exit, so the test does not hang on an
-        // interactive prompt: ATERM_EXEC makes the child run it, then exec $SHELL.
-        // Using a bare `echo` + immediate close is enough to prove a live master.
+        // A bare shell + immediate close is enough to prove a live master.
         let master = spawn_shell(
             24,
             80,
@@ -5702,8 +6072,13 @@ mod tests {
              close-on-exec window is open on this machine, and every other \
              assertion in this test would pass anyway"
         );
+        // Half the budget: the regression settles only on the fail-closed
+        // budget itself, so this still separates the two, while the interval
+        // also holds pty allocation, the sandbox setup and a fork/exec beside a
+        // fork-heavy gate — 1 s (a tenth) was 300x the p50 but still reachable
+        // under load (the load-sensitive test audit of 2026-09-27).
         assert!(
-            elapsed < EXEC_STATUS_BUDGET / 10,
+            elapsed < EXEC_STATUS_BUDGET / 2,
             "a successful spawn must settle far inside the fail-closed budget \
              (measured p50 ~3 ms against a {EXEC_STATUS_BUDGET:?} budget); took \
              {elapsed:?}"
@@ -5760,6 +6135,21 @@ mod tests {
     /// says why that obvious-looking call is forbidden; this test is the backstop
     /// for anyone who changes the carrier without reading it.
     ///
+    /// COUNT-BOUNDED, NOT TIME-BOUNDED. The fork loop runs until the race has
+    /// reached its density floor — at least `MIN_FORKS` forks, and more than
+    /// `BUILT_FLOOR` whole channels and `NAMED_FLOOR` path resolutions, all
+    /// counted after a start barrier and read INSIDE the loop, so every one of
+    /// them overlapped forking — and only a generous `RACE_DEADLINE` ends it
+    /// otherwise, failing loudly with the counts. It used to be exactly 300
+    /// forks, a window of ~150-300 ms, and that window's harvest was hostage to
+    /// the filesystem: a channel is `mkfifo` + `unlink`, two metadata operations,
+    /// and MEASURED 2026-09-24 with dozens of compiler processes writing to the
+    /// same volume those cost 15-24 ms and ~8 ms p50 (as did `creat`/`mkdir` in
+    /// the same directory — the volume, not the fifo), so the window built the
+    /// carrier 4-22 times and the floor failed 161 runs of 200. Nothing was wrong
+    /// with the race except its length. A slow build now just means more forks
+    /// land inside each one, which is denser, not sparser.
+    ///
     /// DARWIN ONLY, and for a structural reason rather than convenience: the
     /// hazard belongs to the PATHNAME-based carrier, and the naming path this
     /// churns ([`exec_status_fifo_path`]) exists only there. Linux's
@@ -5769,63 +6159,92 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn building_the_status_channel_never_kills_a_concurrent_forks_child() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        // THE DENSITY FLOOR. The fork loop does not stop until all three are
+        // met, so a slow volume costs time, never coverage. The floors are the
+        // ones the fixed 300-fork window used to be judged by.
+        const MIN_FORKS: u64 = 300;
+        const BUILT_FLOOR: u64 = 50; // whole channels: strictly more than this
+        const NAMED_FLOOR: u64 = 10_000; // path resolutions: strictly more than this
+        // What ends the loop if the floor is never met. It is not a tuning knob:
+        // on a quiet volume the floor is met in well under a second, and under a
+        // build storm on the same volume (2026-09-24, channel p90 ~95 ms) 160
+        // passing runs took p50 ~1.3 s and at most 5.5 s, process start included.
+        // Hitting it means the carrier has stalled, which the PRECONDITION below
+        // reports with every count.
+        const RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+        const CHURN_THREADS: usize = 6;
 
         let stop = Arc::new(AtomicBool::new(false));
         let built = Arc::new(AtomicU64::new(0));
         let named = Arc::new(AtomicU64::new(0));
         let racy = Arc::new(AtomicU64::new(0));
+        // Every churn thread is running before the first fork, so the counts
+        // below are all taken while forking was under way — none of them is a
+        // head start the forks never saw.
+        let start = Arc::new(Barrier::new(CHURN_THREADS + 1));
 
         // TWO kinds of churn, and the split is what makes the test sensitive.
         //
-        // Building a whole channel costs ~270 us (mkfifo + two opens + unlink), so
-        // threads doing only that touch the NAMING path a few thousand times a
-        // second — far too sparse to reliably catch a once-gate that is only held
-        // for the duration of one lookup. VERIFIED: with channel-building churn
-        // alone, restoring the `confstr` did NOT fail this test in 10 runs. So
-        // most threads hammer the naming path DIRECTLY, in a tight loop, which is
+        // Building a whole channel costs ~270 us on a quiet volume (mkfifo + two
+        // opens + unlink) and tens of ms on a busy one, so threads doing only
+        // that touch the NAMING path a few thousand times a second at best — far
+        // too sparse to reliably catch a once-gate that is only held for the
+        // duration of one lookup. VERIFIED: with channel-building churn alone,
+        // restoring the `confstr` did NOT fail this test in 10 runs. So most
+        // threads hammer the naming path DIRECTLY, in a tight loop, which is
         // what raises the probability of a fork landing inside the gate to
         // something a test can rely on.
-        let churn: Vec<_> = (0..6)
+        let churn: Vec<_> = (0..CHURN_THREADS)
             .map(|i| {
-                let (stop, built, named, racy) =
-                    (stop.clone(), built.clone(), named.clone(), racy.clone());
-                std::thread::spawn(move || {
+                let (stop, built, named, racy, start) = (
+                    stop.clone(),
+                    built.clone(),
+                    named.clone(),
+                    racy.clone(),
+                    start.clone(),
+                );
+                std::thread::spawn(move || -> Result<(), String> {
                     // Two threads exercise the FULL carrier (so mkfifo/open/unlink
                     // are in the race too); the rest hammer path resolution.
                     let full = i < 2;
+                    start.wait();
                     while !stop.load(Ordering::Relaxed) {
                         if full {
-                            match open_exec_status_channel() {
-                                Ok((rd, wr, carrier)) => {
-                                    if carrier == ExecStatusCarrier::RacyPipe {
-                                        racy.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    built.fetch_add(1, Ordering::Relaxed);
-                                    // SAFETY: the two ends this thread just opened.
-                                    unsafe {
-                                        libc::close(rd);
-                                        libc::close(wr);
-                                    }
-                                }
-                                Err(_) => break,
+                            let (rd, wr, carrier) = open_exec_status_channel()
+                                .map_err(|e| format!("thread {i}: building the channel: {e}"))?;
+                            if carrier == ExecStatusCarrier::RacyPipe {
+                                racy.fetch_add(1, Ordering::Relaxed);
                             }
-                        } else if exec_status_fifo_path().is_ok() {
-                            named.fetch_add(1, Ordering::Relaxed);
+                            built.fetch_add(1, Ordering::Relaxed);
+                            // SAFETY: the two ends this thread just opened.
+                            unsafe {
+                                libc::close(rd);
+                                libc::close(wr);
+                            }
                         } else {
-                            break;
+                            exec_status_fifo_path()
+                                .map_err(|e| format!("thread {i}: naming the fifo: {e}"))?;
+                            named.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    Ok(())
                 })
             })
             .collect();
 
-        // Meanwhile, fork. The child does nothing but `_exit(0)` — so ANY death
-        // by signal is the fork machinery itself dying, never our own code.
-        let mut forks = 0u32;
+        // Meanwhile, fork — until the race has been dense enough, not for a fixed
+        // count. The child does nothing but `_exit(0)` — so ANY death by signal is
+        // the fork machinery itself dying, never our own code.
+        start.wait();
+        let began = std::time::Instant::now();
+        let mut forks = 0u64;
         let mut signalled: Vec<(i32, i32)> = Vec::new();
-        for _ in 0..300 {
+        // Read INSIDE the loop, at the fork that met the floor: what the churn
+        // threads do after `stop` overlapped no fork and is not counted.
+        let (built_while_forking, named_while_forking) = loop {
             // SAFETY: `fork` takes no arguments; the child below reaches only
             // `_exit`, which is async-signal-safe.
             let pid = unsafe { libc::fork() };
@@ -5841,30 +6260,30 @@ mod tests {
             if !libc::WIFEXITED(wstatus) {
                 signalled.push((pid, libc::WTERMSIG(wstatus)));
             }
-        }
+            let seen = (built.load(Ordering::Relaxed), named.load(Ordering::Relaxed));
+            let dense = forks >= MIN_FORKS && seen.0 > BUILT_FLOOR && seen.1 > NAMED_FLOOR;
+            // A churn thread only finishes before `stop` by failing, and then it
+            // is no longer racing: stop now and let the join below say why.
+            let churn_quit = churn.iter().any(std::thread::JoinHandle::is_finished);
+            if dense || churn_quit || began.elapsed() >= RACE_DEADLINE {
+                break seen;
+            }
+        };
+        let raced_for = began.elapsed();
         stop.store(true, Ordering::Relaxed);
-        for t in churn {
-            let _ = t.join();
-        }
-        let built = built.load(Ordering::Relaxed);
-        let named = named.load(Ordering::Relaxed);
+        let quit: Vec<String> = churn
+            .into_iter()
+            .filter_map(|t| match t.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(why)) => Some(why),
+                Err(_) => Some("a churn thread panicked".to_owned()),
+            })
+            .collect();
         let racy = racy.load(Ordering::Relaxed);
 
-        // PRECONDITIONS: both sides of the race really ran.
-        assert_eq!(forks, 300, "the fork loop must have run");
-        assert!(
-            built > 50 && named > 10_000,
-            "PRECONDITION: the carrier must have been exercised HARD alongside \
-             the forks, else nothing was raced (and a sparse race is exactly what \
-             was measured to miss this defect); built {built}, named {named}"
-        );
-        assert_eq!(
-            racy, 0,
-            "PRECONDITION: the builder must have produced the ATOMIC carrier — \
-             the pipe fallback has no directory lookup, so racing it would not \
-             exercise the hazard this test exists for"
-        );
-        // THE PROPERTY.
+        // THE PROPERTY, first: a killed child is a finding however sparse the
+        // race around it was, so no precondition may mask it. The preconditions
+        // below exist only to keep a PASS from being vacuous.
         assert!(
             signalled.is_empty(),
             "a child that does nothing but _exit(0) was killed by a signal while \
@@ -5873,6 +6292,29 @@ mod tests {
              `fork` itself aborted in libSystem's atfork child handler, e.g. the \
              `confstr`/libsystem_notify `os_once` corruption this test records). \
              (pid, signal) pairs: {signalled:?}"
+        );
+        // PRECONDITIONS: both sides of the race really ran, together, densely.
+        assert!(
+            quit.is_empty(),
+            "PRECONDITION: every churn thread must race until told to stop; these \
+             quit early, so the race stopped being exercised: {quit:?}"
+        );
+        assert!(
+            forks >= MIN_FORKS
+                && built_while_forking > BUILT_FLOOR
+                && named_while_forking > NAMED_FLOOR,
+            "PRECONDITION: the carrier must have been exercised HARD alongside \
+             the forks, else nothing was raced (and a sparse race is exactly what \
+             was measured to miss this defect); in {raced_for:?} of forking \
+             (deadline {RACE_DEADLINE:?}) it was built {built_while_forking} times \
+             (need > {BUILT_FLOOR}) and named {named_while_forking} (need > \
+             {NAMED_FLOOR}) across {forks} forks (need >= {MIN_FORKS})"
+        );
+        assert_eq!(
+            racy, 0,
+            "PRECONDITION: the builder must have produced the ATOMIC carrier — \
+             the pipe fallback has no directory lookup, so racing it would not \
+             exercise the hazard this test exists for"
         );
     }
 
@@ -5977,7 +6419,7 @@ mod tests {
             unsafe { libc::close(dwr) };
         });
         let waited = std::time::Instant::now();
-        wait_readable_briefly(drd, std::time::Duration::from_secs(2));
+        wait_readable_briefly(drd, std::time::Duration::from_secs(20));
         let wait_readable_took = waited.elapsed();
         let after_wake = read_exec_status_now(drd);
         closer.join().expect("closer thread");
@@ -6022,15 +6464,17 @@ mod tests {
         );
         // The line that separates the two behaviours is the SLICE, not an idle
         // machine's latency: a primitive blind to fifo EOF sleeps out the whole
-        // 2 s slice, a correct one wakes at the ~100 ms close plus scheduling
-        // delay. 1.5 s sits between them with room on both sides. The old 900 ms
-        // bound measured the machine instead — the full merge contract on
-        // 2026-09-24, at load average 34 from an unrelated solver farm, woke
-        // correctly in 950 ms and failed.
+        // 20 s slice, a correct one wakes at the ~100 ms close plus scheduling
+        // delay. 10 s sits between them with room on both sides, and the slice
+        // costs a correct run nothing. Twice the bound measured the machine
+        // instead: 900 ms failed on the full merge contract on 2026-09-24 (load
+        // average 34 from an unrelated solver farm woke correctly in 950 ms),
+        // and 1.5 s against a 2 s slice kept only 1.6x that observed delay (the
+        // load-sensitive test audit of 2026-09-27).
         assert!(
-            wait_readable_took < std::time::Duration::from_millis(1500),
+            wait_readable_took < std::time::Duration::from_secs(10),
             "`wait_readable_briefly` must WAKE when a fifo's last writer closes \
-             (~100 ms here) rather than sleeping out its 2 s slice — it took \
+             (~100 ms here) rather than sleeping out its 20 s slice — it took \
              {wait_readable_took:?}, which is what a readiness primitive blind to \
              fifo EOF (poll, kqueue) does. Correctness is unaffected (the caller \
              re-reads), but every successful spawn on macOS pays this in latency"
@@ -6380,6 +6824,14 @@ mod tests {
         last
     }
 
+    /// The kernel's default signal characters — `^C`, `^\`, `^Z` — which a
+    /// fresh pty's slave carries (the spawn seam copies the kernel defaults).
+    const DEFAULT_SIGNALS: crate::TtySignals = crate::TtySignals {
+        intr: Some(0x03),
+        quit: Some(0x1c),
+        susp: Some(0x1a),
+    };
+
     /// THE MASTER REPORTS THE SLAVE'S ECHO/ICANON — the fact the rainbow's
     /// "a press the tty will not echo banks no credit" law rides on
     /// (2026-09-12, the `read -s` half of the swallowed-press residual).
@@ -6410,9 +6862,10 @@ mod tests {
             t,
             crate::TtyEcho {
                 echo: true,
-                canonical: true
+                canonical: true,
+                signals: Some(DEFAULT_SIGNALS),
             },
-            "sleep on a fresh pty is cooked: echo + canonical"
+            "sleep on a fresh pty is cooked: echo + canonical + ISIG"
         );
         assert!(!t.swallows_input(), "a cooked tty echoes: the press banks");
         // SAFETY: close the master (the child gets SIGHUP via slave close at exit).
@@ -6427,7 +6880,8 @@ mod tests {
             t,
             crate::TtyEcho {
                 echo: false,
-                canonical: true
+                canonical: true,
+                signals: Some(DEFAULT_SIGNALS),
             },
             "`stty -echo` on the SLAVE must be visible through the MASTER"
         );
@@ -6447,9 +6901,10 @@ mod tests {
             t,
             crate::TtyEcho {
                 echo: false,
-                canonical: false
+                canonical: false,
+                signals: None,
             },
-            "`stty raw -echo` on the SLAVE must be visible through the MASTER"
+            "`stty raw -echo` on the SLAVE must be visible through the MASTER (raw clears ISIG)"
         );
         assert!(
             !t.swallows_input(),
@@ -6479,6 +6934,407 @@ mod tests {
             libc::close(pipe[1]);
         }
         assert_eq!(tty_echo(pipe[1]), None, "a closed fd is not a tty");
+    }
+
+    /// A pty pair for the queue probes, with the SLAVE's termios set by the
+    /// test itself (no child, no race): canonical with ECHO off, or
+    /// `cfmakeraw` with `VMIN = vmin` and `VTIME = 0`. From the seam's own
+    /// close-on-exec opener, never `openpty`, for the reason
+    /// `cloexec_controls_master_survival_across_exec` gives.
+    #[cfg(target_os = "macos")]
+    fn queue_pair(raw: bool, vmin: u8) -> (i32, i32) {
+        let (master, slave) = open_pty_pair_cloexec(None, None).expect("pty pair");
+        // SAFETY: `libc::termios` is plain integer fields and a byte array; an
+        // all-zeros bit pattern is a valid value, overwritten by `tcgetattr`.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `slave` is this test's live pty slave; `t` is a valid out-param.
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);
+        if raw {
+            // SAFETY: `t` is a live, initialised termios on this stack.
+            unsafe { libc::cfmakeraw(&mut t) };
+            t.c_cc[libc::VMIN] = vmin;
+            t.c_cc[libc::VTIME] = 0;
+        } else {
+            t.c_lflag |= libc::ICANON;
+            t.c_lflag &= !libc::ECHO;
+        }
+        // SAFETY: `slave` is live; `t` is the termios just derived from its own.
+        assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) }, 0);
+        (master, slave)
+    }
+
+    /// Write `bytes` into the pty (the master end), all of it, as a key would.
+    #[cfg(target_os = "macos")]
+    fn type_into(master: i32, bytes: &[u8]) {
+        // SAFETY: a bounded write of a live slice to this test's live master.
+        let wrote = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(
+            wrote,
+            bytes.len() as isize,
+            "a short write into a near-empty pty"
+        );
+    }
+
+    /// Read exactly `n` bytes from `fd` (the program reading its input, or aterm
+    /// reading the program's output), returning them.
+    #[cfg(target_os = "macos")]
+    fn read_exactly(fd: i32, n: usize) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        let mut got = 0;
+        while got < n {
+            // SAFETY: a bounded read into the unfilled tail of `out`.
+            let r = unsafe { libc::read(fd, out[got..].as_mut_ptr().cast(), n - got) };
+            assert!(r > 0, "read({fd}) returned {r} with {got}/{n} bytes");
+            got += r as usize;
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close_pair(master: i32, slave: i32) {
+        // SAFETY: both fds are this test's and still open.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    /// CANONICAL MODE COUNTS COMPLETE LINES ONLY: `abc` typed at a cooked
+    /// slave reads 0 — the partial line is the line discipline's, where no
+    /// `read(2)` can see it — and the `\n` that completes it reads 4. The
+    /// consumer's word for this is `typeahead`, never a stall: a count here
+    /// is a whole line the program has not asked for yet, the shell's
+    /// ordinary type-ahead.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_canonical_counts_complete_lines_only() {
+        let (master, slave) = queue_pair(false, 1);
+        assert_eq!(
+            input_queue_len(master),
+            Some(0),
+            "an empty queue reads 0, not None"
+        );
+        type_into(master, b"abc");
+        assert_eq!(
+            input_queue_len(master),
+            Some(0),
+            "a partial canonical line is invisible"
+        );
+        type_into(master, b"\n");
+        assert_eq!(
+            input_queue_len(master),
+            Some(4),
+            "the completed line counts whole"
+        );
+        assert_eq!(read_exactly(slave, 4), b"abc\n");
+        assert_eq!(
+            input_queue_len(master),
+            Some(0),
+            "the program read its line"
+        );
+        close_pair(master, slave);
+    }
+
+    /// RAW MODE COUNTS EVERY BYTE, and the count falls as the program reads
+    /// — the incident's shape: the owner's `\r` sat unread, a driver's
+    /// `\x1b[B` queued behind it, and the probe reads 1 then 4. A program
+    /// that reads ONE byte leaves 3, so the reading is the unread tail, not a
+    /// high-water mark.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_raw_counts_every_byte_and_falls_as_the_slave_reads() {
+        let (master, slave) = queue_pair(true, 1);
+        type_into(master, b"\r");
+        assert_eq!(input_queue_len(master), Some(1), "one raw Enter, unread");
+        type_into(master, b"\x1b[B");
+        assert_eq!(
+            input_queue_len(master),
+            Some(4),
+            "the down arrow queued behind it"
+        );
+        assert_eq!(read_exactly(slave, 1), b"\r");
+        assert_eq!(
+            input_queue_len(master),
+            Some(3),
+            "the unread tail after a 1-byte read"
+        );
+        assert_eq!(read_exactly(slave, 3), b"\x1b[B");
+        assert_eq!(input_queue_len(master), Some(0));
+        close_pair(master, slave);
+    }
+
+    /// RAW WITH `VMIN` ABOVE THE QUEUED COUNT AND `VTIME = 0` READS 0: the
+    /// driver answers what a `read(2)` would return right now, and that read
+    /// would still be waiting for `VMIN` bytes. A named undercount — the
+    /// probe never reports bytes the program could not yet read — pinned so a
+    /// consumer never reads this 0 as "the program drained its input".
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_raw_below_vmin_reads_zero() {
+        let (master, slave) = queue_pair(true, 5);
+        type_into(master, b"abc");
+        assert_eq!(
+            input_queue_len(master),
+            Some(0),
+            "3 bytes under VMIN=5 read as 0"
+        );
+        type_into(master, b"de");
+        assert_eq!(
+            input_queue_len(master),
+            Some(5),
+            "VMIN met: the whole queue counts"
+        );
+        close_pair(master, slave);
+    }
+
+    /// `tcflush(TCIFLUSH)` EMPTIES THE QUEUE — the remedy for the restart
+    /// typeahead hazard (the queue outlives the frozen program, and the shell
+    /// that inherits the tty would read the stale keys): after a flush the
+    /// probe reads 0.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_reads_zero_after_tcflush() {
+        let (master, slave) = queue_pair(true, 1);
+        type_into(master, b"\r\x1b[B");
+        assert_eq!(input_queue_len(master), Some(4));
+        // SAFETY: `slave` is this test's live pty slave.
+        assert_eq!(unsafe { libc::tcflush(slave, libc::TCIFLUSH) }, 0);
+        assert_eq!(
+            input_queue_len(master),
+            Some(0),
+            "the flush discarded the unread input"
+        );
+        close_pair(master, slave);
+    }
+
+    /// THE FLUSH ON THE MASTER (2026-09-25): `flush_input_queue(master)`
+    /// discards exactly the slave's unread INPUT and reports its count — the
+    /// incident's `\r` and the `\x1b[B` behind it, 4 bytes — and leaves the
+    /// program's unread OUTPUT alone. An empty queue flushes to `Some(0)`;
+    /// off a tty it is `None`, and nothing is touched.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn flush_input_queue_discards_the_unread_input_and_nothing_else() {
+        use std::os::fd::AsRawFd;
+        let (master, slave) = queue_pair(true, 1);
+        type_into(master, b"\r\x1b[B");
+        type_into(slave, b"drawn");
+        assert_eq!(flush_input_queue(master), Some(4), "the discarded count");
+        assert_eq!(input_queue_len(master), Some(0), "the input is gone");
+        assert_eq!(output_queue_len(master), Some(5), "the output is not");
+        assert_eq!(read_exactly(master, 5), b"drawn");
+        assert_eq!(flush_input_queue(master), Some(0), "nothing left to drop");
+        type_into(master, b"x");
+        assert_eq!(read_exactly(slave, 1), b"x", "the queue still works");
+        close_pair(master, slave);
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        assert_eq!(flush_input_queue(a.as_raw_fd()), None);
+        assert_eq!(flush_input_queue(-1), None);
+        drop(b);
+    }
+
+    /// A SIGNAL CHARACTER IS NEVER QUEUED WHILE ISIG IS SET — the fact the
+    /// unread-input gate's exemption rides on (S4 review, 2026-09-24). With
+    /// ICANON off and ISIG on (cbreak: readline between keys, `watch`,
+    /// `htop`) a `q` the program has not read counts 1, and a `^C` written
+    /// behind it is turned into SIGINT as it is written and flushes the queue
+    /// to 0 — it can never be read after the `q`. In raw mode (ISIG off) the
+    /// same `^C` is a byte queued behind the `q`: 2. `tty_echo` reports the
+    /// characters the line discipline acts on — a remapped `VINTR` moves the
+    /// signal (`^C` then queues, `^G` flushes) and a disabled one
+    /// (`_POSIX_VDISABLE`) reads `None`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_never_counts_a_signal_character_while_isig_is_set() {
+        let set_lflag = |slave: i32, edit: &dyn Fn(&mut libc::termios)| {
+            // SAFETY: all-zeros is a valid termios, overwritten by `tcgetattr`.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `slave` is this test's live pty slave; `t` is an out-param.
+            assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);
+            edit(&mut t);
+            // SAFETY: `slave` is live; `t` is derived from its own termios.
+            assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) }, 0);
+        };
+
+        // Cbreak: raw plus ISIG.
+        let (master, slave) = queue_pair(true, 1);
+        set_lflag(slave, &|t| t.c_lflag |= libc::ISIG);
+        let echo = tty_echo(master).expect("tcgetattr(master)");
+        assert!(!echo.canonical);
+        assert_eq!(echo.signals, Some(DEFAULT_SIGNALS));
+        for signal in [0x03, 0x1c, 0x1a] {
+            assert!(DEFAULT_SIGNALS.signals(signal), "{signal:#04x}");
+            type_into(master, b"q");
+            assert_eq!(input_queue_len(master), Some(1), "one unread `q`");
+            type_into(master, &[signal]);
+            assert_eq!(
+                input_queue_len(master),
+                Some(0),
+                "{signal:#04x} was a signal, not a byte behind the `q`"
+            );
+        }
+        assert!(!DEFAULT_SIGNALS.signals(b'q'));
+        // A remapped VINTR and a disabled VQUIT.
+        set_lflag(slave, &|t| {
+            t.c_cc[libc::VINTR] = 0x07;
+            t.c_cc[libc::VQUIT] = 0xff;
+        });
+        let signals = tty_echo(master).and_then(|e| e.signals).expect("ISIG");
+        assert_eq!(signals.intr, Some(0x07));
+        assert_eq!(signals.quit, None, "_POSIX_VDISABLE signals nothing");
+        assert!(!signals.signals(0x03) && !signals.signals(0xff));
+        type_into(master, b"q\x03");
+        assert_eq!(input_queue_len(master), Some(2), "`^C` is a byte now");
+        type_into(master, b"\x07");
+        assert_eq!(input_queue_len(master), Some(0), "`^G` is the signal");
+        close_pair(master, slave);
+
+        // Raw: ISIG off, so `^C` queues behind the `q` like any byte.
+        let (master, slave) = queue_pair(true, 1);
+        assert_eq!(tty_echo(master).map(|e| e.signals), Some(None));
+        type_into(master, b"q\x03");
+        assert_eq!(input_queue_len(master), Some(2));
+        assert_eq!(read_exactly(slave, 2), b"q\x03");
+        close_pair(master, slave);
+    }
+
+    /// A BYTE THE LINE DISCIPLINE CONSUMES LOOKS LIKE A READ (review of the
+    /// restart hold's read evidence, 2026-09-25): only a slave with ICANON,
+    /// ISIG, IEXTEN, IXON and IGNCR all clear queues every byte written, so
+    /// only there can a shrinking queue mean the program read. Raw
+    /// (`cfmakeraw`) passes every byte; each flag alone makes the driver eat
+    /// some byte with nothing reading the slave — `^C` (ISIG), `^S` (IXON),
+    /// `^O` (IEXTEN), `\r` (IGNCR) — which is measured here, so the answer is
+    /// tied to the kernel's behaviour, not to a list. Off a tty: `None`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn tty_passes_every_byte_only_in_raw_mode() {
+        use std::os::fd::AsRawFd;
+        let (master, slave) = queue_pair(true, 1);
+        assert_eq!(tty_passes_every_byte(master), Some(true), "cfmakeraw");
+        type_into(master, b"\x03\x13\x0f\r");
+        assert_eq!(input_queue_len(master), Some(4), "raw queues all four");
+        close_pair(master, slave);
+        // (name, the c_lflag bits, the c_iflag bits, a byte that flag eats)
+        let flags: [(&str, libc::tcflag_t, libc::tcflag_t, u8); 4] = [
+            ("ISIG", libc::ISIG, 0, 0x03),
+            ("IXON", 0, libc::IXON, 0x13),
+            ("IEXTEN", libc::IEXTEN, 0, 0x0f),
+            ("IGNCR", 0, libc::IGNCR, b'\r'),
+        ];
+        for (name, lflag, iflag, eaten) in flags {
+            let (master, slave) = queue_pair(true, 1);
+            // SAFETY: all-zeros is a valid termios, overwritten by `tcgetattr`.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `slave` is this test's live pty slave; `t` is an out-param.
+            assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);
+            t.c_lflag |= lflag;
+            t.c_iflag |= iflag;
+            // SAFETY: `slave` is live; `t` is derived from its own termios.
+            assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) }, 0);
+            assert_eq!(tty_passes_every_byte(master), Some(false), "{name}");
+            type_into(master, &[eaten]);
+            assert_eq!(
+                input_queue_len(master),
+                Some(0),
+                "{name}: {eaten:#04x} left the queue with nothing reading it"
+            );
+            close_pair(master, slave);
+        }
+        let (master, slave) = queue_pair(false, 1);
+        assert_eq!(tty_passes_every_byte(master), Some(false), "canonical");
+        close_pair(master, slave);
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        assert_eq!(tty_passes_every_byte(a.as_raw_fd()), None);
+        assert_eq!(tty_passes_every_byte(-1), None);
+        drop(b);
+    }
+
+    /// THE OUTPUT QUEUE: a raw slave writing 10 bytes reads 10 at the master
+    /// until the master reads them, then 0. And the two probes are two
+    /// questions, not one: the program's unread OUTPUT never shows in
+    /// `input_queue_len`, which is the reason the probe is macOS-only (a
+    /// Linux master's `FIONREAD` is this output count).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_output_counts_what_the_master_has_not_read() {
+        let (master, slave) = queue_pair(true, 1);
+        assert_eq!(output_queue_len(master), Some(0));
+        // SAFETY: a bounded write of a live slice to this test's live slave.
+        let wrote = unsafe { libc::write(slave, b"0123456789".as_ptr().cast(), 10) };
+        assert_eq!(wrote, 10);
+        assert_eq!(
+            output_queue_len(master),
+            Some(10),
+            "the program's unread output"
+        );
+        assert_eq!(
+            input_queue_len(master),
+            Some(0),
+            "output is not unread input"
+        );
+        assert_eq!(read_exactly(master, 10), b"0123456789");
+        assert_eq!(output_queue_len(master), Some(0), "aterm read it");
+        close_pair(master, slave);
+    }
+
+    /// OFF A TTY BOTH PROBES ANSWER `None`, never a count: a pipe has a
+    /// perfectly good `FIONREAD`, which is exactly why the probe asks
+    /// `isatty` first — a pipe sink (every headless test) must read as "not
+    /// measured", or a consumer would gate on a pipe's buffer.
+    #[test]
+    fn queue_len_answers_none_off_a_tty() {
+        assert_eq!(input_queue_len(-1), None, "the sentinel fd");
+        assert_eq!(output_queue_len(-1), None, "the sentinel fd");
+        let mut pipe = [0i32; 2];
+        // SAFETY: `pipe` is a valid two-element out-array.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: a bounded write to this test's live pipe write end.
+        assert_eq!(
+            unsafe { libc::write(pipe[1], b"xyz".as_ptr().cast(), 3) },
+            3
+        );
+        assert_eq!(
+            input_queue_len(pipe[0]),
+            None,
+            "a pipe with 3 bytes in it is not a tty"
+        );
+        assert_eq!(output_queue_len(pipe[0]), None, "a pipe is not a tty");
+        assert_eq!(input_queue_len(pipe[1]), None, "the write end is not a tty");
+        // SAFETY: both ends are ours and open.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert_eq!(input_queue_len(pipe[0]), None, "a closed fd is not a tty");
+    }
+
+    /// `TIOCOUTQ` is spelled locally (aterm-libc does not declare it), so its
+    /// value is pinned against its `<sys/ttycom.h>` derivation:
+    /// `_IOR('t', 115, int)` = `IOC_OUT | sizeof(int) << 16 | 't' << 8 | 115`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn queue_len_tiocoutq_is_ior_t_115_int() {
+        let ior = 0x4000_0000 | (4 << 16) | ((b't' as libc::c_ulong) << 8) | 115;
+        assert_eq!(TIOCOUTQ, ior);
+    }
+
+    /// OFF macOS THE PROBES ANSWER `None` EVEN ON A REAL PTY MASTER: a
+    /// Linux master's `FIONREAD` counts unread OUTPUT, so a number here would
+    /// answer a different question than the one the consumer asks. "Not
+    /// measured" keeps every consumer's gate open on these platforms.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn queue_len_answers_none_off_macos() {
+        let (master, slave) = open_pty_pair_cloexec(None, None).expect("pty pair");
+        assert!(fd_is_tty(master), "the fixture is a real pty");
+        assert_eq!(input_queue_len(master), None);
+        assert_eq!(output_queue_len(master), None);
+        // SAFETY: both fds are this test's and still open.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
     }
 
     /// A DUPLICATE OF THE MASTER IS CLOSE-ON-EXEC TOO.

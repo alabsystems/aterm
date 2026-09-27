@@ -4,10 +4,12 @@
 //! Tier-1 conformance for fixed-path snapshot generations and handle-anchored
 //! artifacts.
 //!
-//! The tests drive the shipping generation fence and `PinnedDir` accessors,
-//! project their observable states onto the derived models, and validate every
-//! concrete transition. Deliberately stale/outside post-states are rejected as
-//! non-vacuous controls.
+//! The tests drive the shipping generation fence, `PinnedDir` accessors, and the
+//! video lease registry, project their observable states onto the derived
+//! models, and validate every concrete transition. Deliberately stale/outside
+//! post-states are rejected as non-vacuous controls. `ArtifactReplyPublication`
+//! is driven where its writer and ACK wait live, in `control`'s tests
+//! (`capture_reply_*`); its projection is here.
 
 #![cfg(test)]
 
@@ -19,8 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use aterm_render::Frame;
 use aterm_spec::derive::{
     Model, anchored_artifact_transaction_model, artifact_reader_lease_model,
-    artifact_reply_publication_model, snapshot_generation_commit_model,
-    video_batch_publication_durability_model,
+    snapshot_generation_commit_model, video_batch_publication_durability_model,
 };
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
@@ -32,12 +33,10 @@ use crate::pinned_dir::PinnedDir;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AnchoredObservation {
     phase: i64,
-    pinned: bool,
     swapped: bool,
     path_identity: i64,
     operation: i64,
     effect_target: i64,
-    validated: bool,
     reply: i64,
     certified_identity: i64,
 }
@@ -45,12 +44,10 @@ pub(crate) struct AnchoredObservation {
 pub(crate) fn project_anchored(model: &Model, observed: AnchoredObservation) -> State {
     let mut state = model.init_state();
     state.insert("phase", observed.phase);
-    state.insert("pinned", i64::from(observed.pinned));
     state.insert("swapped", i64::from(observed.swapped));
     state.insert("path_identity", observed.path_identity);
     state.insert("operation", observed.operation);
     state.insert("effect_target", observed.effect_target);
-    state.insert("validated", i64::from(observed.validated));
     state.insert("reply", observed.reply);
     state.insert("certified_identity", observed.certified_identity);
     state
@@ -73,20 +70,25 @@ pub(crate) fn project_snapshot(model: &Model, observed: SnapshotObservation) -> 
     state
 }
 
+/// Test-visible projection of one guarded artifact reply. As `control`'s
+/// `capture_reply_*` binds read the shipping capture reply: `artifact` is the
+/// advertised file, `guard` the name lease only the capture guard holds once
+/// the file is written, `committed`/`reply`/`challenge` the bytes the writer
+/// produced (the OK body; the complete body-then-trailer frame; any nonce
+/// trailer), and `ack`/`ack_failed`/`write_error` the writer's and ACK wait's
+/// verdicts. `phase` and `quarantine_age` are drive coordinates.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReplyObservation {
-    phase: i64,
-    artifact: bool,
-    guard: bool,
-    committed: bool,
-    reply: bool,
-    challenge: bool,
-    ack: bool,
-    ack_failed: bool,
-    write_error: bool,
-    quarantine: bool,
-    quarantine_age: i64,
-    expired: bool,
+    pub(crate) phase: i64,
+    pub(crate) artifact: bool,
+    pub(crate) guard: bool,
+    pub(crate) committed: bool,
+    pub(crate) reply: bool,
+    pub(crate) challenge: bool,
+    pub(crate) ack: bool,
+    pub(crate) ack_failed: bool,
+    pub(crate) write_error: bool,
+    pub(crate) quarantine_age: i64,
 }
 
 pub(crate) fn project_artifact_reply(model: &Model, observed: ArtifactReplyObservation) -> State {
@@ -100,9 +102,7 @@ pub(crate) fn project_artifact_reply(model: &Model, observed: ArtifactReplyObser
     state.insert("ack", i64::from(observed.ack));
     state.insert("ack_failed", i64::from(observed.ack_failed));
     state.insert("write_error", i64::from(observed.write_error));
-    state.insert("quarantine", i64::from(observed.quarantine));
     state.insert("quarantine_age", observed.quarantine_age);
-    state.insert("expired", i64::from(observed.expired));
     state
 }
 
@@ -154,18 +154,23 @@ pub(crate) fn project_video_batch_publication_durability(
 /// Test-visible projection of the refcounted recording-lease registry.
 ///
 /// Production anchors intentionally name this exact function. Their concrete
-/// observations are: registry `count` -> `leases`, requested callback ->
-/// `armed`, retained recording-identity disagreement -> `identity_mismatch`, the
-/// last-release handoff -> `pending`, callback execution -> `sweeping`, and
-/// completed callback -> `swept`. `replacement_joined` is a negative-control
-/// witness and is always false for shipping code.
+/// observations are: registry `count` -> `leases`, the entry's
+/// `video_sweep_requested` -> `armed`, an entry whose reserved `video_retention`
+/// admission is gone -> `admission_spent`, retained recording-identity
+/// disagreement -> `identity_mismatch`, the last-release handoff -> `pending`,
+/// and callback execution -> `sweeping`. `requested` is the caller's history —
+/// an arm the test made and no finished sweep has discharged — so a registry
+/// that lost an armed entry still reads as owing its sweep.
+/// `replacement_joined` is a negative-control witness and is always false for
+/// shipping code.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReaderObservation {
     leases: i64,
     armed: bool,
+    requested: bool,
     pending: bool,
     sweeping: bool,
-    swept: bool,
+    admission_spent: bool,
     identity_mismatch: bool,
     replacement_joined: bool,
 }
@@ -177,9 +182,10 @@ pub(crate) fn project_artifact_reader_lease(
     let mut state = model.init_state();
     state.insert("leases", observed.leases);
     state.insert("armed", i64::from(observed.armed));
+    state.insert("requested", i64::from(observed.requested));
     state.insert("pending", i64::from(observed.pending));
     state.insert("sweeping", i64::from(observed.sweeping));
-    state.insert("swept", i64::from(observed.swept));
+    state.insert("admission_spent", i64::from(observed.admission_spent));
     state.insert("identity_mismatch", i64::from(observed.identity_mismatch));
     state.insert("replacement_joined", i64::from(observed.replacement_joined));
     state
@@ -188,12 +194,10 @@ pub(crate) fn project_artifact_reader_lease(
 fn unconfined() -> AnchoredObservation {
     AnchoredObservation {
         phase: 0,
-        pinned: false,
         swapped: false,
         path_identity: 0,
         operation: 0,
         effect_target: 0,
-        validated: false,
         reply: 0,
         certified_identity: 0,
     }
@@ -202,7 +206,6 @@ fn unconfined() -> AnchoredObservation {
 fn pinned() -> AnchoredObservation {
     AnchoredObservation {
         phase: 1,
-        pinned: true,
         swapped: false,
         path_identity: 1,
         ..unconfined()
@@ -223,14 +226,19 @@ fn replied(operation: i64) -> AnchoredObservation {
         phase: 3,
         operation,
         effect_target: 1,
-        validated: true,
         reply: 1,
         certified_identity: 1,
         ..pinned()
     }
 }
 
-fn assert_transition(model: &Model, action: &str, before: &State, after: &State, label: &str) {
+pub(crate) fn assert_transition(
+    model: &Model,
+    action: &str,
+    before: &State,
+    after: &State,
+    label: &str,
+) {
     assert!(
         model.action_enabled(action, before),
         "{label}: {action} is disabled for {before:?}"
@@ -251,7 +259,13 @@ fn assert_transition(model: &Model, action: &str, before: &State, after: &State,
     }
 }
 
-fn reject_transition(model: &Model, action: &str, before: &State, after: &State, label: &str) {
+pub(crate) fn reject_transition(
+    model: &Model,
+    action: &str,
+    before: &State,
+    after: &State,
+    label: &str,
+) {
     assert!(
         !model.successors(action, before).contains(after),
         "{label}: mutant unexpectedly appears in {action} successors"
@@ -289,7 +303,6 @@ fn marker_generation(path: &Path) -> i64 {
         .expect("numeric generation")
 }
 
-#[allow(dead_code)]
 #[aterm_spec::spec_unmodeled(
     machine = "SnapshotGenerationCommit",
     action = "SelectCurrent",
@@ -357,6 +370,30 @@ fn marker_generation(path: &Path) -> i64 {
               through the additional 30-second central-quarantine expiry"
 )]
 #[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyChallengeBeforeBody",
+    reason = "Buggy=1 negative control only; the nonce trailer is written after the complete body \
+              in write_control_reply_with_timeout_arm, and the Tier-1 early trailer is rejected"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyOkBeforeRevalidation",
+    reason = "Buggy=1 negative control only; write_control_reply_with_timeout_arm revalidates the \
+              guard before any OK byte, and the Tier-1 OK-then-ERR wire is rejected"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyTrailerErrorIgnored",
+    reason = "Buggy=1 negative control only; a failed trailer write returns the error and \
+              quarantines the guard, and the Tier-1 partial frame read as written is rejected"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReplyPublication",
+    action = "BuggyAbortRetainsArtifact",
+    reason = "Buggy=1 negative control only; an uncommitted reply guard removes its exact file on \
+              drop, and the Tier-1 orphaned-file release is rejected"
+)]
+#[aterm_spec::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "BuggyOverbook",
     reason = "Buggy=1 negative control only; the real locked admission update refuses when the \
@@ -367,6 +404,18 @@ fn marker_generation(path: &Path) -> i64 {
     action = "BuggyReconcileOverbook",
     reason = "Buggy=1 negative control only; exact-path reconciliation uses the same locked \
               aggregate descriptor budget and leaves the provisional charge intact on refusal"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyRefuseLeaksSlot",
+    reason = "Buggy=1 negative control only; try_acquire_from decides admission before it charges \
+              either counter, so a refusal leaves the pool untouched"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyReleaseProvisionalCharge",
+    reason = "Buggy=1 negative control only; reconciliation records the permit's new charge, so \
+              its drop returns exactly the units it holds"
 )]
 #[aterm_spec::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
@@ -390,6 +439,13 @@ fn marker_generation(path: &Path) -> i64 {
               ConfinedVideoDir::publish completes the recording-directory batch barrier"
 )]
 #[aterm_spec::spec_unmodeled(
+    machine = "VideoBatchPublicationDurability",
+    action = "BuggySyncAhead",
+    reason = "Buggy=1 negative control only; every member write clears batch_synced before it \
+              lands, so a barrier never covers a later member \
+              (video_member_write_after_sync_invalidates_marker_guard)"
+)]
+#[aterm_spec::spec_unmodeled(
     machine = "ArtifactReaderLease",
     action = "BuggyStartSweepEarly",
     reason = "Buggy=1 negative control only; the concrete registry starts its capability-bound \
@@ -409,9 +465,32 @@ fn marker_generation(path: &Path) -> i64 {
 )]
 #[aterm_spec::spec_unmodeled(
     machine = "ArtifactReaderLease",
+    action = "BuggyArmedReleaseDropsEntry",
+    reason = "Buggy=1 negative control only; the last release of an armed entry marks it \
+              sweeping and hands its capability to the priority cleanup lane instead of \
+              removing it"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyReleaseSweepsUnarmed",
+    reason = "Buggy=1 negative control only; the last release starts a sweep only when \
+              video_sweep_requested is set, and otherwise removes the registry entry"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyFinishKeepsEntry",
+    reason = "Buggy=1 negative control only; finish_video_retention_sweep removes the finished \
+              entry, taking its arm and recorded identity with it"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReaderLease",
     action = "BuggyAcquireReplacedIdentity",
     reason = "Buggy=1 negative control only; a mismatched retained recording identity is rejected \
               without joining the existing lexical-path lease group"
+)]
+#[expect(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
 )]
 fn explicit_environment_and_mutant_scope() {}
 
@@ -508,12 +587,16 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
     assert_eq!(
         waivers,
         BTreeSet::from([
+            "BuggyAbortRetainsArtifact",
             "BuggyAcceptPreChallengeAck",
+            "BuggyChallengeBeforeBody",
             "BuggyDropBeforeWrite",
+            "BuggyOkBeforeRevalidation",
             "BuggyPruneLeased",
             "BuggyPublishAfterCancel",
             "BuggyReleaseQuarantineEarly",
             "BuggyReleaseWithoutAck",
+            "BuggyTrailerErrorIgnored",
         ])
     );
 
@@ -548,6 +631,8 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
         BTreeSet::from([
             "BuggyOverbook",
             "BuggyReconcileOverbook",
+            "BuggyRefuseLeaksSlot",
+            "BuggyReleaseProvisionalCharge",
             "SelectOne",
             "SelectThree",
             "SelectTwo",
@@ -573,7 +658,10 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
         .filter(|waiver| waiver.machine == "VideoBatchPublicationDurability")
         .map(|waiver| waiver.action)
         .collect();
-    assert_eq!(batch_waivers, BTreeSet::from(["BuggyPublishBeforeSync"]));
+    assert_eq!(
+        batch_waivers,
+        BTreeSet::from(["BuggyPublishBeforeSync", "BuggySyncAhead"])
+    );
 
     let reader_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
         .filter(|anchor| anchor.machine == "ArtifactReaderLease")
@@ -607,6 +695,9 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
         BTreeSet::from([
             "BuggyAcquireDuringSweep",
             "BuggyAcquireReplacedIdentity",
+            "BuggyArmedReleaseDropsEntry",
+            "BuggyFinishKeepsEntry",
+            "BuggyReleaseSweepsUnarmed",
             "BuggyStartSweepEarly",
             "ReplaceIdentity",
         ])
@@ -942,582 +1033,138 @@ fn published_video_batch_rejects_every_late_mutation() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn artifact_reply_projection_conforms_through_ack_quarantine_and_failure_release() {
-    let model = artifact_reply_publication_model();
-    let idle = project_artifact_reply(&model, ArtifactReplyObservation::default());
-    let authorized = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 2,
-            artifact: true,
-            guard: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let queued = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 3,
-            artifact: true,
-            guard: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let prepared = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 4,
-            artifact: true,
-            guard: true,
-            committed: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let written = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 5,
-            artifact: true,
-            guard: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let peer_acked = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 6,
-            artifact: true,
-            guard: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let released_after_ack = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 10,
-            artifact: true,
-            guard: false,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    for (action, before, after) in [
-        ("AuthorizeCommit", &idle, &authorized),
-        ("QueueGuard", &authorized, &queued),
-        ("PrepareWire", &queued, &prepared),
-        ("WriteWire", &prepared, &written),
-        ("AcknowledgePeer", &written, &peer_acked),
-        ("ReleaseGuard", &peer_acked, &released_after_ack),
-    ] {
-        assert_transition(
-            &model,
-            action,
-            before,
-            after,
-            "artifact reply queue-to-ack lifecycle",
-        );
-    }
-
-    assert_transition(
-        &model,
-        "RetentionSweep",
-        &queued,
-        &queued,
-        "a sibling retention sweep skips the queued artifact lease",
-    );
-    let pruned_while_queued = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 3,
-            guard: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    reject_transition(
-        &model,
-        "RetentionSweep",
-        &queued,
-        &pruned_while_queued,
-        "retention cannot prune a queued artifact lease",
-    );
-
-    let ack_failed = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 7,
-            artifact: true,
-            guard: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack_failed: true,
-            quarantine: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let quarantine_tick_one = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 7,
-            artifact: true,
-            guard: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack_failed: true,
-            quarantine: true,
-            quarantine_age: 1,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let quarantine_expired = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 8,
-            artifact: true,
-            guard: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack_failed: true,
-            quarantine_age: 1,
-            expired: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let released_after_ack_failure = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 11,
-            artifact: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack_failed: true,
-            quarantine_age: 1,
-            expired: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    assert_transition(
-        &model,
-        "AcknowledgeFailed",
-        &written,
-        &ack_failed,
-        "EOF, timeout, or malformed ACK transfers ownership to quarantine",
-    );
-    assert_transition(
-        &model,
-        "AdvanceQuarantine",
-        &ack_failed,
-        &quarantine_tick_one,
-        "central quarantine advances without blocking the connection worker",
-    );
-    assert_transition(
-        &model,
-        "ExpireQuarantine",
-        &quarantine_tick_one,
-        &quarantine_expired,
-        "the reaper removes only an entry whose 30-second deadline is due",
-    );
-    assert_transition(
-        &model,
-        "ReleaseGuard",
-        &quarantine_expired,
-        &released_after_ack_failure,
-        "failed ACK releases only after central-quarantine expiry",
-    );
-
-    let abort_pending = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 9,
-            artifact: true,
-            guard: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    for (action, before) in [
-        ("AbortAuthorized", &authorized),
-        ("AbortQueued", &queued),
-        ("PrepareFailed", &queued),
-    ] {
-        assert_transition(
-            &model,
-            action,
-            before,
-            &abort_pending,
-            "pre-wire abort keeps ownership until cleanup",
-        );
-    }
-    let released_abort = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 12,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    assert_transition(
-        &model,
-        "ReleaseGuard",
-        &abort_pending,
-        &released_abort,
-        "pre-wire abort removes the unpublished artifact",
-    );
-
-    let write_failed = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 7,
-            artifact: true,
-            guard: true,
-            committed: true,
-            write_error: true,
-            quarantine: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let write_quarantine_due = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 7,
-            artifact: true,
-            guard: true,
-            committed: true,
-            write_error: true,
-            quarantine: true,
-            quarantine_age: 1,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let write_quarantine_expired = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 8,
-            artifact: true,
-            guard: true,
-            committed: true,
-            write_error: true,
-            quarantine_age: 1,
-            expired: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    let released_write_failure = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 11,
-            artifact: true,
-            committed: true,
-            write_error: true,
-            quarantine_age: 1,
-            expired: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    assert_transition(
-        &model,
-        "WriteFailed",
-        &prepared,
-        &write_failed,
-        "a partial socket write enters quarantine because path bytes may be visible",
-    );
-    assert_transition(
-        &model,
-        "AdvanceQuarantine",
-        &write_failed,
-        &write_quarantine_due,
-        "the reaper observes the partial-write quarantine deadline",
-    );
-    assert_transition(
-        &model,
-        "ExpireQuarantine",
-        &write_quarantine_due,
-        &write_quarantine_expired,
-        "the due partial-write entry expires centrally",
-    );
-    assert_transition(
-        &model,
-        "ReleaseGuard",
-        &write_quarantine_expired,
-        &released_write_failure,
-        "partial write failure releases only after quarantine expiry",
-    );
-
-    let cancelled = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 1,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    assert_transition(
-        &model,
-        "Cancel",
-        &idle,
-        &cancelled,
-        "timeout wins before publication",
-    );
-
-    let published_after_cancel = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 1,
-            artifact: true,
-            committed: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    reject_transition(
-        &model,
-        "AuthorizeCommit",
-        &cancelled,
-        &published_after_cancel,
-        "cancelled publication cannot be revived",
-    );
-    let dropped_before_write = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 3,
-            artifact: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    reject_transition(
-        &model,
-        "QueueGuard",
-        &authorized,
-        &dropped_before_write,
-        "queue handoff cannot drop the exact artifact guard",
-    );
-    let ack_before_challenge = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 6,
-            artifact: true,
-            guard: true,
-            committed: true,
-            ack: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    reject_transition(
-        &model,
-        "AcknowledgePeer",
-        &prepared,
-        &ack_before_challenge,
-        "a pre-pipelined acknowledgement cannot precede the causal nonce challenge",
-    );
-    let silent_release = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 10,
-            artifact: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    reject_transition(
-        &model,
-        "ReleaseGuard",
-        &written,
-        &silent_release,
-        "a complete reply cannot release without the matching nonce ACK",
-    );
-    let early_quarantine_release = project_artifact_reply(
-        &model,
-        ArtifactReplyObservation {
-            phase: 11,
-            artifact: true,
-            committed: true,
-            reply: true,
-            challenge: true,
-            ack_failed: true,
-            ..ArtifactReplyObservation::default()
-        },
-    );
-    reject_transition(
-        &model,
-        "ReleaseGuard",
-        &ack_failed,
-        &early_quarantine_release,
-        "failed or half-closed clients retain the guard for the full quarantine",
-    );
+fn write_published_recording(root: &Path, name: &str) {
+    let recording = root.join(name);
+    std::fs::create_dir(&recording).unwrap();
+    std::fs::write(recording.join("index.json"), b"{\"frames\":[]}").unwrap();
+    std::fs::write(
+        recording.join(crate::control_auth::VIDEO_PUBLISHED_FILE),
+        b"published",
+    )
+    .unwrap();
 }
 
-#[test]
-fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
-    let model = artifact_reader_lease_model();
-    let idle = project_artifact_reader_lease(&model, ArtifactReaderObservation::default());
-    let reader_one = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            leases: 1,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let reader_two = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            leases: 2,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let replaced_one = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            leases: 1,
-            identity_mismatch: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let armed_two = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            leases: 2,
-            armed: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let armed_one = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            leases: 1,
-            armed: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let pending = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            armed: true,
-            pending: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let sweeping = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            armed: true,
-            sweeping: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let swept = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            swept: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
-    let reacquired = project_artifact_reader_lease(
-        &model,
-        ArtifactReaderObservation {
-            leases: 1,
-            swept: true,
-            ..ArtifactReaderObservation::default()
-        },
-    );
+fn published_recording_count(root: &Path) -> usize {
+    std::fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry.path().join("index.json").is_file()
+                && entry
+                    .path()
+                    .join(crate::control_auth::VIDEO_PUBLISHED_FILE)
+                    .is_file()
+        })
+        .count()
+}
 
-    for (action, before, after, label) in [
-        (
-            "Acquire",
-            &idle,
-            &reader_one,
-            "first producer-or-reader lease acquisition",
-        ),
-        (
-            "Acquire",
-            &reader_one,
-            &reader_two,
-            "shared producer-or-reader lease acquisition",
-        ),
-        (
-            "Arm",
-            &reader_two,
-            &armed_two,
-            "marker publication or final reader identity validation",
-        ),
-        (
-            "Release",
-            &armed_two,
-            &armed_one,
-            "non-final producer-or-reader lease release",
-        ),
-        (
-            "Release",
-            &armed_one,
-            &pending,
-            "final producer-or-reader lease schedules convergence",
-        ),
-        (
-            "StartSweep",
-            &pending,
-            &sweeping,
-            "last-release convergence begins",
-        ),
-        (
-            "FinishSweep",
-            &sweeping,
-            &swept,
-            "convergence completion reopens the registry",
-        ),
-        (
-            "Acquire",
-            &swept,
-            &reacquired,
-            "producer-or-reader lease acquisition after completed convergence",
-        ),
-    ] {
-        assert_transition(&model, action, before, after, label);
+/// A private recordings root holding `count` published recordings. Returns the
+/// fixture directory, the root, the newest recording's name, and the registry
+/// key `retain_video_artifact_path` files that recording under.
+fn reader_fixture(label: &str, count: usize) -> (PathBuf, PathBuf, std::ffi::OsString, PathBuf) {
+    let dir = unique_dir(label);
+    let _ = std::fs::remove_dir_all(&dir);
+    crate::control_auth::ensure_private_dir(&dir).unwrap();
+    let root = dir.join("recordings");
+    crate::control_auth::ensure_private_dir(&root).unwrap();
+    for sequence in 0..count {
+        write_published_recording(&root, &format!("rec-{sequence:020}-000"));
     }
+    let fresh = std::ffi::OsString::from(format!("rec-{:020}-000", count - 1));
+    let key = PinnedDir::open_resolved(&root).unwrap().path().join(&fresh);
+    (dir, root, fresh, key)
+}
+
+/// One shipping `video frames` reader lease on `fresh`, with the recording
+/// handle its arm validates against. `None` is the registry refusing a lease
+/// while a sweep owns the entry.
+fn reader_lease(
+    root: &Path,
+    fresh: &OsStr,
+) -> Option<(crate::control_auth::ArtifactPathLease, PinnedDir)> {
+    let pinned_root = PinnedDir::open_resolved(root).unwrap();
+    let recording = pinned_root.child(fresh).unwrap();
+    crate::control_auth::retain_video_artifact_path(pinned_root, fresh.to_os_string(), &recording)
+        .unwrap()
+        .map(|lease| (lease, recording))
+}
+
+/// Read the shipping lease registry. `leases`, `armed` and `sweeping` are the
+/// entry's `count`, `video_sweep_requested` and `sweeping`, and
+/// `admission_spent` is an entry without its `video_retention`; an absent entry
+/// is idle. `pending` is never observable — the last decrement and the sweep's
+/// start happen under one registry mutex — and `requested`/`identity_mismatch`
+/// are the history this test drove.
+fn observe_reader(model: &Model, key: &Path, requested: bool, identity_mismatch: bool) -> State {
+    let entry = crate::control_auth::artifact_lease_registry_for_test(key);
+    project_artifact_reader_lease(
+        model,
+        ArtifactReaderObservation {
+            leases: i64::try_from(entry.map_or(0, |entry| entry.count)).unwrap(),
+            armed: entry.is_some_and(|entry| entry.sweep_requested),
+            requested,
+            pending: false,
+            sweeping: entry.is_some_and(|entry| entry.sweeping),
+            admission_spent: entry.is_some_and(|entry| !entry.admission_held),
+            identity_mismatch,
+            replacement_joined: false,
+        },
+    )
+}
+
+/// TIER-1: the shipping lease registry — `retain_video_artifact_path`,
+/// `arm_video_retention_sweep`, a lease's drop, and the cleanup worker's
+/// sweep — read back after every step. Twelve published recordings over the
+/// keep-limit of eight make the sweep's work visible: a sweep that ran prunes.
+#[cfg(unix)]
+#[test]
+fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
+    let model = artifact_reader_lease_model();
+    let (dir, root, fresh, key) = reader_fixture("reader-sweep", 12);
+    let idle = observe_reader(&model, &key, false, false);
+    assert_eq!(idle, model.init_state());
+
+    let (first, first_recording) = reader_lease(&root, &fresh).expect("first reader lease");
+    let reader_one = observe_reader(&model, &key, false, false);
+    assert_transition(&model, "Acquire", &idle, &reader_one, "first reader lease");
+    let (second, second_recording) = reader_lease(&root, &fresh).expect("second reader lease");
+    let reader_two = observe_reader(&model, &key, false, false);
     assert_transition(
         &model,
-        "RejectAcquireWhileSweeping",
-        &pending,
-        &pending,
-        "acquisition fails closed across the last-release handoff",
-    );
-    assert_transition(
-        &model,
-        "RejectAcquireWhileSweeping",
-        &sweeping,
-        &sweeping,
-        "acquisition fails closed while the sweep owns the registry",
-    );
-    assert_transition(
-        &model,
-        "ReplaceIdentity",
+        "Acquire",
         &reader_one,
-        &replaced_one,
-        "an external same-name replacement changes only the candidate identity",
-    );
-    assert_transition(
-        &model,
-        "RejectReplacedIdentity",
-        &replaced_one,
-        &replaced_one,
-        "a replacement cannot join the live recording lease group",
+        &reader_two,
+        "shared reader lease",
     );
 
+    first.arm_video_retention_sweep(&first_recording).unwrap();
+    let armed_two = observe_reader(&model, &key, true, false);
+    assert_transition(
+        &model,
+        "Arm",
+        &reader_two,
+        &armed_two,
+        "final reader identity validation requests the sweep",
+    );
+    drop(first_recording);
+    drop(second_recording);
+
+    drop(first);
+    let armed_one = observe_reader(&model, &key, true, false);
+    assert_transition(
+        &model,
+        "Release",
+        &armed_two,
+        &armed_one,
+        "a non-final release keeps the lease group",
+    );
+    assert_eq!(published_recording_count(&root), 12, "nothing swept yet");
     let early_sweep = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
             leases: 1,
             armed: true,
+            requested: true,
             sweeping: true,
             ..ArtifactReaderObservation::default()
         },
@@ -1529,11 +1176,22 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
         &early_sweep,
         "a non-final release cannot start convergence",
     );
-    let acquired_during_pending = project_artifact_reader_lease(
+
+    // The final drop decrements and starts the sweep under one mutex, and the
+    // cleanup worker finishes it. Park the worker first, so the sweeping entry
+    // stays open and the refusal below is judged on every run, not only when
+    // this thread happens to beat the worker.
+    let pending = model.successors("Release", &armed_one)[0].clone();
+    let sweeping = model.successors("StartSweep", &pending)[0].clone();
+    // The seam between the last decrement and the sweep's start is crossed
+    // under that one mutex, so real code never shows it; the model must still
+    // refuse a lease entering it.
+    let entered_seam = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
             leases: 1,
             armed: true,
+            requested: true,
             pending: true,
             ..ArtifactReaderObservation::default()
         },
@@ -1542,10 +1200,172 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
         &model,
         "Acquire",
         &pending,
-        &acquired_during_pending,
+        &entered_seam,
         "no producer-or-reader lease may enter the last-release/sweep interval",
     );
-    let joined_replacement = project_artifact_reader_lease(
+    // The final release that removes the armed entry instead of sweeping it —
+    // the `video_sweep_requested` case folded into the plain removal, or the
+    // release-build `_ =>` arm. The registry then reads idle, but the arm this
+    // test made is still owed its sweep.
+    let dropped_entry = project_artifact_reader_lease(
+        &model,
+        ArtifactReaderObservation {
+            requested: true,
+            ..ArtifactReaderObservation::default()
+        },
+    );
+    reject_transition(
+        &model,
+        "Release",
+        &armed_one,
+        &dropped_entry,
+        "the last armed release schedules its sweep instead of forgetting it",
+    );
+    assert!(!model.check_invariant("RequestedRetentionRunsAtLastRelease", &dropped_entry));
+    let hold = crate::control_auth::hold_artifact_cleanup_for_test();
+    drop(second);
+    assert_eq!(
+        crate::control_auth::artifact_lease_registry_for_test(&key),
+        Some(crate::control_auth::ArtifactLeaseEntryForTest {
+            count: 0,
+            sweep_requested: true,
+            sweeping: true,
+            admission_held: false,
+        }),
+        "the final drop left the entry sweeping, its admission handed to the sweep"
+    );
+    assert_eq!(observe_reader(&model, &key, true, false), sweeping);
+    assert!(
+        reader_lease(&root, &fresh).is_none(),
+        "acquisition fails closed while the sweep owns the entry"
+    );
+    assert_transition(
+        &model,
+        "RejectAcquireWhileSweeping",
+        &sweeping,
+        &observe_reader(&model, &key, true, false),
+        "acquisition fails closed while the sweep owns the entry",
+    );
+    drop(hold);
+    // Waits until the entry is GONE: a finish that reset the entry's flags and
+    // kept it (with its recorded identity) times out here.
+    crate::control_auth::wait_for_artifact_cleanup_for_test(&key);
+    let swept = observe_reader(&model, &key, false, false);
+    assert_transition(
+        &model,
+        "FinishSweep",
+        &sweeping,
+        &swept,
+        "completion removes the entry and reopens acquisition",
+    );
+    // A finish that reset the entry's flags and kept it: the entry has spent
+    // its admission, so `join_video_artifact_state` would refuse every reader.
+    let kept_entry = project_artifact_reader_lease(
+        &model,
+        ArtifactReaderObservation {
+            admission_spent: true,
+            ..ArtifactReaderObservation::default()
+        },
+    );
+    reject_transition(
+        &model,
+        "FinishSweep",
+        &sweeping,
+        &kept_entry,
+        "a finished sweep removes its entry",
+    );
+    assert!(!model.check_invariant("IdleNameAdmitsReaders", &kept_entry));
+    let retained = published_recording_count(&root);
+    assert!(
+        retained < 12,
+        "the last armed release ran the retention sweep ({retained} recordings left)"
+    );
+
+    // Re-seed four recordings older than every survivor, so a sweep the next
+    // release had no business running would visibly prune them.
+    for sequence in 0..4 {
+        write_published_recording(&root, &format!("rec-{sequence:020}-000"));
+    }
+    let reseeded = published_recording_count(&root);
+    assert_eq!(reseeded, retained + 4);
+    let (again, again_recording) = reader_lease(&root, &fresh).expect("reopened lease");
+    let reacquired = observe_reader(&model, &key, false, false);
+    assert_transition(
+        &model,
+        "Acquire",
+        &swept,
+        &reacquired,
+        "acquisition after completed convergence",
+    );
+    drop(again_recording);
+    drop(again);
+    let released = observe_reader(&model, &key, false, false);
+    assert_transition(
+        &model,
+        "Release",
+        &reacquired,
+        &released,
+        "an unarmed final release removes the entry",
+    );
+    crate::control_auth::wait_for_artifact_cleanup_for_test(&key);
+    assert_eq!(
+        published_recording_count(&root),
+        reseeded,
+        "an unarmed final release sweeps nothing"
+    );
+    // The same release scheduling a sweep nothing armed: it could never start,
+    // and the path would refuse every later reader.
+    let mut stranded = released.clone();
+    stranded.insert("pending", 1);
+    reject_transition(
+        &model,
+        "Release",
+        &reacquired,
+        &stranded,
+        "an unarmed final release schedules no sweep",
+    );
+    assert!(!model.check_invariant("MaintenanceRequiresArm", &stranded));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// TIER-1: a same-name replacement cannot join a live recording's lease group.
+/// The replacement is the environment's move; the refusal is the registry's.
+#[cfg(unix)]
+#[test]
+fn real_video_reader_registry_refuses_a_replaced_recording() {
+    let model = artifact_reader_lease_model();
+    let (dir, root, fresh, key) = reader_fixture("reader-identity", 1);
+    let (first, first_recording) = reader_lease(&root, &fresh).expect("first reader lease");
+    drop(first_recording);
+    let reader_one = observe_reader(&model, &key, false, false);
+
+    std::fs::rename(root.join(&fresh), root.join("recording-original")).unwrap();
+    write_published_recording(&root, fresh.to_str().unwrap());
+    let replaced_one = observe_reader(&model, &key, false, true);
+    assert_transition(
+        &model,
+        "ReplaceIdentity",
+        &reader_one,
+        &replaced_one,
+        "a same-uid process replaces the recording at its name",
+    );
+
+    let pinned_root = PinnedDir::open_resolved(&root).unwrap();
+    let replacement = pinned_root.child(&fresh).unwrap();
+    let error =
+        crate::control_auth::retain_video_artifact_path(pinned_root, fresh.clone(), &replacement)
+            .expect_err("a replacement cannot join the live lease group");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    let refused = observe_reader(&model, &key, false, true);
+    assert_transition(
+        &model,
+        "RejectReplacedIdentity",
+        &replaced_one,
+        &refused,
+        "the registry refuses the replaced identity",
+    );
+    let joined = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
             leases: 2,
@@ -1558,9 +1378,13 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
         &model,
         "Acquire",
         &replaced_one,
-        &joined_replacement,
+        &joined,
         "ordinary acquisition cannot admit a replaced recording identity",
     );
+
+    drop(replacement);
+    drop(first);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -1772,6 +1596,31 @@ fn real_pinned_read_write_and_reply_validation_conform() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Where bytes a confined operation touched ended up, in the model's
+/// `effect_target` coding: the pinned original directory (`1`), the swapped-in
+/// replacement (`2`), or nowhere (`0`).
+#[cfg(unix)]
+fn landed(moved: &Path, outside: &Path, bytes: &[u8]) -> i64 {
+    let holds = |dir: &Path| {
+        std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && std::fs::read(entry.path()).is_ok_and(|content| content == bytes)
+        })
+    };
+    match (holds(moved), holds(outside)) {
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 0,
+        (true, true) => panic!("one write landed in both directories"),
+    }
+}
+
+/// TIER-1: the swap happens between pinning and the operation. Both shipping
+/// operations run through the handle retained before the swap, and where their
+/// bytes went is read back off the filesystem — the retained original
+/// (`effect_target = 1`) or the swapped-in outside directory (`2`). A path that
+/// is resolved again after the swap, the confinement before 6aeae4606, is
+/// replayed with the same reads and writes by path, and refused.
 #[cfg(unix)]
 #[test]
 fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
@@ -1781,12 +1630,169 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
     let outside = unique_dir("outside");
     std::fs::create_dir_all(root.join("images")).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    let target = ConfinedImage::for_test(&root.join("images"), "shot.png");
-    let file = target.write_private(b"inside").unwrap();
+    // `PinnedDir::open` walks the path without following symlinks, so the
+    // temp dir's `/var` spelling is resolved first.
+    let root = std::fs::canonicalize(root).unwrap();
+    let outside = std::fs::canonicalize(outside).unwrap();
+    std::fs::write(root.join("images").join("read.bin"), b"read-inside").unwrap();
+    std::fs::write(outside.join("read.bin"), b"read-outside").unwrap();
     let model = anchored_artifact_transaction_model();
-    let written = project_anchored(&model, operated(2));
+    let initial = project_anchored(&model, unconfined());
 
+    // Pin both transactions, then swap the ancestor under them.
+    let read_pin = PinnedDir::open(&root.join("images")).expect("pin read directory");
+    let write_pin = PinnedDir::open(&root.join("images")).expect("pin write directory");
+    let pinned_state = project_anchored(&model, pinned());
+    assert_transition(
+        &model,
+        "ConfinePin",
+        &initial,
+        &pinned_state,
+        "artifact confinement",
+    );
     let moved = root.join("images-moved");
+    std::fs::rename(root.join("images"), &moved).unwrap();
+    symlink(&outside, root.join("images")).unwrap();
+    let swapped_before_io = project_anchored(
+        &model,
+        AnchoredObservation {
+            swapped: true,
+            path_identity: 2,
+            ..pinned()
+        },
+    );
+    assert_transition(
+        &model,
+        "SwapAncestor",
+        &pinned_state,
+        &swapped_before_io,
+        "artifact ancestor replacement before I/O",
+    );
+    let after_swap = |operation: i64, effect_target: i64| {
+        project_anchored(
+            &model,
+            AnchoredObservation {
+                phase: 2,
+                swapped: true,
+                path_identity: 2,
+                operation,
+                effect_target,
+                ..pinned()
+            },
+        )
+    };
+    let replied_after_swap = |operation: i64, effect_target: i64| {
+        project_anchored(
+            &model,
+            AnchoredObservation {
+                phase: 3,
+                swapped: true,
+                path_identity: 2,
+                operation,
+                effect_target,
+                reply: 2,
+                ..pinned()
+            },
+        )
+    };
+
+    // READ: the operation half of `read_private` reads through the retained
+    // handle, and its reply half then fails closed; the composed call refuses.
+    let (bytes, read_guard) = read_pin
+        .read_private_at_retained(OsStr::new("read.bin"), 64)
+        .expect("the retained handle still reads the original");
+    let read_target = match bytes.as_slice() {
+        b"read-inside" => 1,
+        b"read-outside" => 2,
+        other => panic!("unexpected read {other:?}"),
+    };
+    let read_done = after_swap(1, read_target);
+    assert_transition(
+        &model,
+        "ReadPinned",
+        &swapped_before_io,
+        &read_done,
+        "artifact retained-handle read after the swap",
+    );
+    read_guard
+        .validate_path_identity()
+        .expect_err("a swapped ancestor cannot authorize the read's reply");
+    assert_transition(
+        &model,
+        "ValidateReply",
+        &read_done,
+        &replied_after_swap(1, read_target),
+        "artifact fail-closed read reply",
+    );
+    assert!(
+        read_pin.read_private(OsStr::new("read.bin"), 64).is_err(),
+        "the composed shipping read fails closed"
+    );
+    // Negative control: the same read by path lands on the replacement.
+    let resolved = std::fs::read(root.join("images").join("read.bin")).unwrap();
+    assert_eq!(resolved, b"read-outside");
+    let outside_read = after_swap(1, 2);
+    reject_transition(
+        &model,
+        "ReadPinned",
+        &swapped_before_io,
+        &outside_read,
+        "artifact re-resolved-read negative control",
+    );
+    assert!(!model.check_invariant("AnchoredAccessNeverOutside", &outside_read));
+
+    // WRITE: the shipping write stages its bytes through the retained handle;
+    // the authorizer runs once they are down, which is where they are measured.
+    // Its final path validation then fails closed and removes them.
+    let mut write_target = None;
+    write_pin
+        .write_private_authorized(OsStr::new("shot.png"), b"write-after-swap", || {
+            write_target = Some(landed(&moved, &outside, b"write-after-swap"));
+            true
+        })
+        .expect_err("a swapped ancestor cannot publish the write");
+    let write_target = write_target.expect("the write staged its bytes");
+    let write_done = after_swap(2, write_target);
+    assert_transition(
+        &model,
+        "WritePinned",
+        &swapped_before_io,
+        &write_done,
+        "artifact retained-handle write after the swap",
+    );
+    assert_transition(
+        &model,
+        "ValidateReply",
+        &write_done,
+        &replied_after_swap(2, write_target),
+        "artifact fail-closed write reply",
+    );
+    assert_eq!(
+        landed(&moved, &outside, b"write-after-swap"),
+        0,
+        "the refused write leaves its bytes nowhere"
+    );
+    // Negative control: the same write by path lands outside.
+    std::fs::write(root.join("images").join("shot.png"), b"write-by-path").unwrap();
+    let outside_write = after_swap(2, landed(&moved, &outside, b"write-by-path"));
+    assert_eq!(outside_write["effect_target"], 2);
+    reject_transition(
+        &model,
+        "WritePinned",
+        &swapped_before_io,
+        &outside_write,
+        "artifact re-resolved-write negative control",
+    );
+    assert!(!model.check_invariant("AnchoredAccessNeverOutside", &outside_write));
+    std::fs::remove_file(outside.join("shot.png")).unwrap();
+
+    // A swap in the operation-to-reply interval: the write is published inside,
+    // then the ancestor moves, and the reply fails closed.
+    std::fs::remove_file(root.join("images")).unwrap();
+    std::fs::rename(&moved, root.join("images")).unwrap();
+    let target = ConfinedImage::for_test(&root.join("images"), "late.png");
+    let file = target.write_private(b"late-inside").unwrap();
+    let written = project_anchored(&model, operated(2));
     std::fs::rename(root.join("images"), &moved).unwrap();
     symlink(&outside, root.join("images")).unwrap();
     let swapped = project_anchored(
@@ -1802,61 +1808,27 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         "SwapAncestor",
         &written,
         &swapped,
-        "artifact ancestor replacement",
+        "artifact ancestor replacement after the write",
     );
     target
         .validate_for_reply(&file)
         .expect_err("swapped ancestor cannot authorize reply");
-    let failed = project_anchored(
-        &model,
-        AnchoredObservation {
-            phase: 3,
-            swapped: true,
-            path_identity: 2,
-            operation: 2,
-            effect_target: 1,
-            validated: true,
-            reply: 2,
-            ..pinned()
-        },
-    );
     assert_transition(
         &model,
         "ValidateReply",
         &swapped,
-        &failed,
+        &replied_after_swap(2, 1),
         "artifact fail-closed reply validation",
     );
-    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
-    assert_eq!(std::fs::read(moved.join("shot.png")).unwrap(), b"inside");
-
-    let phase_one_swapped = project_anchored(
-        &model,
-        AnchoredObservation {
-            swapped: true,
-            path_identity: 2,
-            ..pinned()
-        },
+    assert!(
+        std::fs::read_dir(&outside)
+            .unwrap()
+            .all(|entry| { entry.unwrap().file_name() == "read.bin" })
     );
-    let outside_read = project_anchored(
-        &model,
-        AnchoredObservation {
-            phase: 2,
-            swapped: true,
-            path_identity: 2,
-            operation: 1,
-            effect_target: 2,
-            ..pinned()
-        },
+    assert_eq!(
+        std::fs::read(moved.join("late.png")).unwrap(),
+        b"late-inside"
     );
-    reject_transition(
-        &model,
-        "ReadPinned",
-        &phase_one_swapped,
-        &outside_read,
-        "artifact re-resolved-read negative control",
-    );
-    assert!(!model.check_invariant("AnchoredAccessNeverOutside", &outside_read));
 
     let false_success = project_anchored(
         &model,
@@ -1866,10 +1838,8 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
             path_identity: 2,
             operation: 2,
             effect_target: 1,
-            validated: true,
             reply: 1,
             certified_identity: 2,
-            ..pinned()
         },
     );
     reject_transition(
@@ -1879,10 +1849,12 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         &false_success,
         "artifact false-success reply negative control",
     );
-    assert!(!model.check_invariant("SwappedPathNeverCertified", &false_success));
+    assert!(!model.check_invariant("SuccessfulReplyCertifiesOriginal", &false_success));
 
     drop(file);
     drop(target);
+    drop(read_pin);
+    drop(write_pin);
     let _ = std::fs::remove_file(root.join("images"));
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(outside);

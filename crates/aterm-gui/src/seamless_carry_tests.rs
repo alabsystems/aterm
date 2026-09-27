@@ -13,7 +13,7 @@ use aterm_core::terminal::{AltArchiveImport, Terminal, TerminalCheckpoint};
 
 use super::tests::{
     ENV_LOCK, RestoreVar, StageCarry, StagedHandoff, child_proof_from, pipe_pair,
-    stage_carry_handoff,
+    stage_carry_handoff, stage_history_handoff,
 };
 use super::*;
 use crate::handoff_carry::{self, ControlCarry};
@@ -90,10 +90,18 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 icon: r.icon,
                 role: r.role,
                 attention: r.attention,
+                // That build had no question policy to carry.
+                questions: None,
                 control: None,
                 frozen_path: false,
                 identity: None,
                 topics: Vec::new(),
+                fg_holder: None,
+                rekey: false,
+                loader: false,
+                history: None,
+                history_dropped: 0,
+                history_lost: 0,
             })
             .collect(),
     })
@@ -233,6 +241,7 @@ fn outgoing(
         screens: vec![checkpoint],
         controls: handoff_carry::export(&[source]),
         next_turn_id,
+        fg_holders: Vec::new(),
     }
 }
 
@@ -574,11 +583,14 @@ fn the_proof_digests_do_not_see_the_sidecar() {
     let _restore = env_guard();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
-    let with = outgoing(&term, &turns, Some(7));
+    let mut with = outgoing(&term, &turns, Some(7));
+    // The foreground holder rides the record, and is in neither digest either.
+    with.fg_holders = vec![(0, 4242)];
     let without = StageCarry {
         screens: with.screens.clone(),
         controls: Vec::new(),
         next_turn_id: None,
+        fg_holders: Vec::new(),
     };
     let mut child = Vec::new();
     for (label, carry) in [
@@ -687,12 +699,23 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             icon: None,
             role: None,
             attention: None,
+            // Set on purpose: a worker's question policy stays with it across
+            // the update.
+            questions: Some("recommended".to_string()),
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
             identity: Some("worker".to_string()),
             // NON-EMPTY on purpose: the topic set is consent, and this is the
             // roundtrip that proves a seamless update does not drop it.
             topics: vec!["build.failed head".to_string(), "sat-comp @42".to_string()],
+            // The foreground handback's holder (2026-09-25): a scalar on the
+            // record, so it crosses at every rung, and an old reader skips it.
+            fg_holder: Some(4242),
+            rekey: false,
+            loader: false,
+            history: None,
+            history_dropped: 0,
+            history_lost: 0,
         }],
     };
     let wire = new.to_toml().unwrap();
@@ -708,6 +731,14 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         wire.contains("identity = \"worker\"") && !old_wire.contains("identity"),
         "the identity label rides this build's wire and an old reader drops it"
     );
+    assert!(
+        wire.contains("fg_holder = 4242") && !old_wire.contains("fg_holder"),
+        "the foreground holder rides this build's wire and an old reader drops it"
+    );
+    assert!(
+        wire.contains("questions = \"recommended\"") && !old_wire.contains("questions"),
+        "the question policy rides this build's wire and an old reader drops it"
+    );
     let read = SessionHandoff::from_toml(&old_wire).expect("this build reads an old manifest");
     assert_eq!(read.next_turn_id, None);
     assert_eq!(
@@ -720,6 +751,10 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         "dropped by the old build: the label is gone"
     );
     assert_eq!(read.sessions[0].control, None);
+    assert_eq!(
+        read.sessions[0].fg_holder, None,
+        "an old manifest names no holder: the reader probes afresh"
+    );
     assert_eq!(read.sessions[0].screen.as_ref(), Some(&screen));
     assert_eq!(
         pre_carry_parse(&wire).unwrap(),
@@ -1070,6 +1105,7 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
                 since_turn: Some(minted - 10),
                 ..Default::default()
             },
+            "",
             &mut sink,
             || true,
         );
@@ -1228,4 +1264,158 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
         n.len().saturating_sub(o.len())
     );
     assert!(o[0].contains(" lost=0 breaks=0 "), "{}", o[0]);
+}
+
+// ------------------------------------------------ the HISTORY carry, real wire
+
+/// A shell tab with a deep history — far past the screen carry's 256 lines.
+fn deep_shell(lines: usize) -> Arc<Mutex<Terminal>> {
+    let mut t = Terminal::new(ROWS, COLS);
+    for i in 0..lines {
+        t.process(format!("build step {i:05} ok\r\n").as_bytes());
+    }
+    Arc::new(Mutex::new(t))
+}
+
+fn shell_history(t: &Terminal) -> Vec<String> {
+    let grid = t.main_grid();
+    (0..grid.scrollback_lines())
+        .map(|i| {
+            grid.get_history_line(i)
+                .map(|l| l.to_string().trim_end().to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn hist_files(staged: &StagedHandoff) -> Vec<std::path::PathBuf> {
+    let dir = staged.manifest_path.parent().unwrap().to_path_buf();
+    std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".hist"))
+        .collect()
+}
+
+/// The park, for session 0: its screen carry and its history head.
+fn park_history(term: &Arc<Mutex<Terminal>>) -> (StageCarry, crate::handoff_history::HistoryHead) {
+    let guard = term.lock().unwrap();
+    let checkpoint = guard.checkpoint_carry(256).expect("parser is Ground");
+    let head = crate::handoff_history::capture_head(0, &guard);
+    (
+        StageCarry {
+            screens: vec![checkpoint],
+            controls: Vec::new(),
+            next_turn_id: None,
+            fg_holders: Vec::new(),
+        },
+        head,
+    )
+}
+
+/// The worker's history step, as `prepare_outgoing_artifacts` runs it on the
+/// fork lane: export the sessions now, then join and stamp.
+fn stamp_with(
+    term: &Arc<Mutex<Terminal>>,
+    carry: &StageCarry,
+    head: crate::handoff_history::HistoryHead,
+) -> impl Fn(&mut SessionHandoff, &std::path::Path, &str) {
+    let term = Arc::clone(term);
+    let screens = vec![(0, carry.screens[0].clone())];
+    move |manifest, dir, nonce| {
+        let results = crate::handoff_history::HistoryPlan::Deferred(vec![(0, Arc::clone(&term))])
+            .results(dir);
+        let verdicts = crate::handoff_history::stamp_manifest(
+            manifest,
+            &screens,
+            &[head],
+            results,
+            dir,
+            nonce,
+        );
+        assert_eq!(verdicts.len(), 1);
+    }
+}
+
+/// THE HISTORY CARRY OVER THE REAL WIRE: the worker names the sidecar on the
+/// manifest record, `take_incoming` opens (and unlinks) it before the proof,
+/// the proof is exactly the one the parent expects — the sidecar is in
+/// neither digest — and the import after Commit gives the adopted engine the
+/// parent's whole history, line for line.
+#[test]
+fn the_history_carry_crosses_the_real_wire_outside_the_proof() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = env_guard();
+    let term = deep_shell(4000);
+    let parent = shell_history(&term.lock().unwrap());
+    assert!(parent.len() > 3900);
+    let (carry, head) = park_history(&term);
+    let stamp = stamp_with(&term, &carry, head);
+    let staged = stage_history_handoff("history-wire", &carry, &stamp);
+    let published = std::fs::read_to_string(&staged.manifest_path).unwrap();
+    assert!(published.contains("history = \""), "{published}");
+    assert_eq!(hist_files(&staged).len(), 1, "one attempt-bound sidecar");
+    let ((proof, _ready, _), mut adopted) = as_successor(&staged, |_| {
+        child_proof_from(take_incoming()).expect("the successor adopts")
+    });
+    assert_eq!(
+        proof, staged.expected,
+        "the proof is the one the parent expects"
+    );
+    assert!(
+        hist_files(&staged).is_empty(),
+        "the successor unlinks the sidecar as it opens it, before its proof"
+    );
+    let history = std::mem::take(&mut adopted[0].history);
+    assert!(history.carry.is_some(), "the carry rides the adoption");
+    assert_eq!((history.dropped, history.lost), (0, 0));
+    // The adopt, then the import after Commit.
+    let mut history = history;
+    let successor = Arc::new(Mutex::new(Terminal::new(ROWS, COLS)));
+    crate::spawn::hydrate_adopted_engine(
+        &successor,
+        Some(adopted[0].checkpoint.as_ref().expect("the screen came")),
+        None,
+        None,
+        None,
+        0,
+        &mut history,
+    );
+    let report = crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
+        session: 0,
+        term: Arc::clone(&successor),
+        history,
+    }])
+    .remove(0);
+    assert_eq!(report.failed, None);
+    assert_eq!(report.lost(), 0);
+    assert_eq!(shell_history(&successor.lock().unwrap()), parent);
+    staged.teardown();
+}
+
+/// THE ROLLBACK LANE for the history carry: a receiver built before it
+/// adopts and proves exactly as before, never opens the `.hist` — and the
+/// sender retires the sidecar once the proof checks out.
+#[test]
+fn a_receiver_built_before_the_history_carry_skips_it_and_proves() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = env_guard();
+    let term = deep_shell(2000);
+    let (carry, head) = park_history(&term);
+    let stamp = stamp_with(&term, &carry, head);
+    let staged = stage_history_handoff("history-rollback", &carry, &stamp);
+    let ((proof, _ready, _), adopted) = as_successor(&staged, |_| {
+        child_proof_from(take_incoming_as(ReceiverShape::PreCarry))
+            .expect("the older receiver adopts")
+    });
+    assert_eq!(proof, staged.expected);
+    assert!(adopted[0].history.carry.is_none());
+    assert_eq!(hist_files(&staged).len(), 1, "left where it was");
+    retire_outgoing_controls(&staged.nonce);
+    assert!(
+        hist_files(&staged).is_empty(),
+        "the sender retires it after the proof"
+    );
+    staged.teardown();
 }

@@ -253,6 +253,12 @@ fn shell_command(shell: &str) -> Command {
         // tests set ATERM_CHILD=1 themselves.
         "ATERM_CHILD",
         "ATERM_SESSION_ID",
+        // The two host channels (2026-09-24, 2026-09-26): a shell spawned by a
+        // live session never exports them (its loader scrubs both), but a suite
+        // run under an embedder might — and a pointer inherited here would be a
+        // real session's.
+        "ATERM_REKEY_PATH",
+        "ATERM_INTEGRATION_POINTER",
     ] {
         cmd.env_remove(var);
     }
@@ -1314,11 +1320,13 @@ fn test_prepare_cached_skips_rewrite_and_self_heals() {
     let base = dir.path().join("si");
     let written = std::sync::Mutex::new(None);
 
-    // First call writes everything.
+    // First call writes everything, into this build's content folder.
     prepare_cached(ShellType::Zsh, base.clone(), &written)
         .unwrap()
         .unwrap();
-    let zsh = base.join("aterm_shell_integration.zsh");
+    let zsh = base
+        .join(script_set_address())
+        .join("aterm_shell_integration.zsh");
     assert_eq!(std::fs::read_to_string(&zsh).unwrap(), scripts::ZSH);
 
     // Second call with the same base must skip the writes: clobber the
@@ -1360,11 +1368,18 @@ fn test_prepare_cached_rewrites_on_base_change() {
     prepare_cached(ShellType::Bash, base_b.clone(), &written)
         .unwrap()
         .unwrap();
-    assert!(base_b.join("aterm_shell_integration.bash").exists());
+    assert!(
+        base_b
+            .join(script_set_address())
+            .join("aterm_shell_integration.bash")
+            .exists()
+    );
 
     // Returning to the first base must write again — the memo keys a
     // single base, never a set.
-    let a_zsh = base_a.join("aterm_shell_integration.zsh");
+    let a_zsh = base_a
+        .join(script_set_address())
+        .join("aterm_shell_integration.zsh");
     std::fs::write(&a_zsh, "sentinel").unwrap();
     prepare_cached(ShellType::Bash, base_a.clone(), &written)
         .unwrap()
@@ -1387,7 +1402,11 @@ fn test_prepare_cached_retries_after_write_error() {
     prepare_cached(ShellType::Zsh, base.clone(), &written)
         .unwrap()
         .unwrap();
-    assert!(base.join("aterm_shell_integration.zsh").exists());
+    assert!(
+        base.join(script_set_address())
+            .join("aterm_shell_integration.zsh")
+            .exists()
+    );
 }
 
 #[test]
@@ -2344,8 +2363,12 @@ fn test_zsh_script_unsets_shell_nonce_env_var() {
         "zsh script must `unset ATERM_SHELL_NONCE` after capturing to a \
          shell-local (#8015) so the nonce is not inherited by subprocesses"
     );
+    // The environment first; the value the shell already signs with only in an
+    // upgrade in place (the loader, 2026-09-26), where the environment holds none.
     assert!(
-        script.contains(r#"typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-}""#),
+        script.contains(
+            r#"typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-${__aterm_shell_nonce:-}}""#
+        ),
         "zsh script must capture ATERM_SHELL_NONCE into __aterm_shell_nonce \
          at source time using `typeset -g` (#8015)"
     );
@@ -3947,7 +3970,8 @@ fn test_bash_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
     ]);
     assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
     assert!(
-        err.contains("inside screen") && err.contains("do not cross the multiplexer"),
+        err.contains("inside screen")
+            && err.contains("no command blocks, exit codes or cwd tracking in these panes"),
         "the first pane of a multiplexer says so once: {err:?}"
     );
 
@@ -5263,14 +5287,16 @@ fn test_live_hot_path_functions_fork_nothing() {
 /// Every shell's per-prompt AND per-command hook calls the live re-assert — the
 /// per-command half is what cures a command typed at a prompt drawn before the
 /// dirs existed — and the re-assert is gated on the session, never on the reroute
-/// dir the adopted shell lacks.
+/// dir the adopted shell lacks. The per-prompt hook is the BODY's prompt handler,
+/// which the loader's trampoline calls right after its body check (2026-09-26).
 #[test]
 fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_the_session() {
-    for (label, script, precmd, preexec, fish) in [
+    for (label, script, trampoline, precmd, preexec, fish) in [
         (
             "zsh",
             scripts::ZSH,
             "__aterm_precmd",
+            "__aterm_body_precmd",
             "__aterm_preexec",
             false,
         ),
@@ -5278,17 +5304,29 @@ fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_t
             "bash",
             scripts::BASH,
             "__aterm_prompt_command",
+            "__aterm_body_prompt_command",
             "__aterm_preexec",
             false,
         ),
         (
             "fish",
             scripts::FISH,
-            "fish_prompt",
+            // Installed as `fish_prompt` by the loader (over a prompt of ours).
+            "__aterm_fish_prompt_trampoline",
+            "__aterm_body_prompt",
             "__aterm_fish_preexec",
             true,
         ),
     ] {
+        let hop = shell_function_body(script, trampoline, fish);
+        let (check, handler) = (
+            hop.find("__aterm_body_check").unwrap_or(usize::MAX),
+            hop.find(precmd).unwrap_or(usize::MAX),
+        );
+        assert!(
+            check < handler && handler < usize::MAX,
+            "{label}: {trampoline} checks for a body, then runs {precmd}:\n{hop}"
+        );
         for hook in [precmd, preexec] {
             let body = shell_function_body(script, hook, fish);
             assert!(
@@ -5394,5 +5432,641 @@ fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_t
     assert!(
         ps.contains("$Global:__aterm_managed_agents_on") && ps.contains("$__aterm_refront"),
         "pwsh: the hot path re-probes a dir that was absent"
+    );
+}
+
+// ─── The re-key channel (2026-09-24) ───
+
+#[cfg(unix)]
+const REKEY_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+#[cfg(unix)]
+const REKEY_NEW: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+/// The line that prints the globals a mark is signed with, then a marker whose
+/// number is computed (so the echoed command line never matches it).
+#[cfg(unix)]
+fn rekey_probe(label: &str, n: u32) -> (String, String) {
+    let marker = format!("RK{}", 100 + n);
+    let line = if label == "fish" {
+        format!(
+            "printf 'NONCE=%s\\n' \"$__aterm_shell_nonce\"; printf 'SUFFIX=%s\\n' \"$__aterm_id_suffix_str\"; printf 'ENV=%s\\n' \"$ATERM_REKEY_PATH\"; echo RK(math 100 + {n})"
+        )
+    } else {
+        format!(
+            "printf 'NONCE=%s\\n' \"$__aterm_shell_nonce\"; printf 'SUFFIX=%s\\n' \"$__aterm_id_suffix_str\"; printf 'ENV=%s\\n' \"${{ATERM_REKEY_PATH:-}}\"; echo RK$((100 + {n}))"
+        )
+    };
+    (line, marker)
+}
+
+/// Drive one live shell through the re-key hook: the nonce it was spawned with
+/// and the path scrubbed from its environment; a key written while it idles is
+/// taken at its NEXT prompt — the globals change, the file is gone, and the
+/// prompt marks after it carry `;id=<new>`; a malformed key is consumed and
+/// changes nothing. `hooked` = the shell was spawned with the path (a shell
+/// from before the channel was not): the negative control, where the same file
+/// is never read.
+#[cfg(unix)]
+fn live_rekey(label: &str, sh: &mut LiveShell, file: &Path, hooked: bool) {
+    let (line, marker) = rekey_probe(label, 1);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, 0);
+    assert_eq!(
+        sh.value_before("NONCE=", at),
+        REKEY_OLD,
+        "{label}: spawned nonce"
+    );
+    assert_eq!(
+        sh.value_before("ENV=", at),
+        "",
+        "{label}: the path is scrubbed from the environment"
+    );
+
+    // A malformed key: consumed, nothing changes.
+    std::fs::write(file, "NOT-A-KEY\n").unwrap();
+    sh.send("true");
+    let (line, marker) = rekey_probe(label, 2);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, at);
+    assert_eq!(
+        sh.value_before("NONCE=", at),
+        REKEY_OLD,
+        "{label}: a bad key changes nothing"
+    );
+    assert_eq!(
+        !file.exists(),
+        hooked,
+        "{label}: consumed only by a hooked shell"
+    );
+    let _ = std::fs::remove_file(file);
+
+    // The real key, written while the shell idles at a prompt.
+    std::fs::write(file, format!("{REKEY_NEW}\n")).unwrap();
+    sh.send("true");
+    let (line, marker) = rekey_probe(label, 3);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, at);
+    let (nonce, suffix) = (
+        sh.value_before("NONCE=", at),
+        sh.value_before("SUFFIX=", at),
+    );
+    if hooked {
+        assert_eq!(nonce, REKEY_NEW, "{label}: re-keyed at the next prompt");
+        assert_eq!(suffix, format!(";id={REKEY_NEW}"));
+        assert!(!file.exists(), "{label}: the key file is removed once read");
+        // The marks after it are signed with the new key.
+        let (line, marker) = rekey_probe(label, 4);
+        sh.send(&line);
+        let end = sh.wait_for_after(&marker, at);
+        let out = sh.stdout.lock().unwrap();
+        let tail = String::from_utf8_lossy(&out[at..end]).into_owned();
+        drop(out);
+        assert!(
+            tail.contains(&format!("133;A;id={REKEY_NEW}"))
+                || tail.contains(&format!("133;C;id={REKEY_NEW}")),
+            "{label}: marks carry the new key: {tail:?}"
+        );
+    } else {
+        assert_eq!(
+            nonce, REKEY_OLD,
+            "control: {label} without the channel never reads it"
+        );
+        assert!(file.exists(), "control: the file is left where it was");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_live_zsh_takes_a_rekey_at_its_next_prompt() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping");
+        return;
+    };
+    for hooked in [true, false] {
+        let fx = LiveFixture::new();
+        let file = fx.home.join("rekey-zsh");
+        let path = file.to_str().unwrap().to_string();
+        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
+        if hooked {
+            extra.push(("ATERM_REKEY_PATH", path.as_str()));
+        }
+        let mut sh = spawn_live_zsh(zsh, &fx, "", &extra);
+        live_rekey("zsh", &mut sh, &file, hooked);
+        sh.finish();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_live_bash_takes_a_rekey_at_its_next_prompt() {
+    for hooked in [true, false] {
+        let fx = LiveFixture::new();
+        let file = fx.home.join("rekey-bash");
+        let path = file.to_str().unwrap().to_string();
+        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
+        if hooked {
+            extra.push(("ATERM_REKEY_PATH", path.as_str()));
+        }
+        let mut sh = spawn_live_bash(&fx, "", &extra);
+        live_rekey("bash", &mut sh, &file, hooked);
+        sh.finish();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_live_fish_takes_a_rekey_at_its_next_prompt() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping");
+        return;
+    };
+    if !script_can_allocate_a_pty() {
+        eprintln!("no `script` to allocate a pty; skipping");
+        return;
+    }
+    for hooked in [true, false] {
+        let fx = LiveFixture::new();
+        let file = fx.home.join("rekey-fish");
+        let path = file.to_str().unwrap().to_string();
+        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
+        if hooked {
+            extra.push(("ATERM_REKEY_PATH", path.as_str()));
+        }
+        let mut sh = spawn_live_fish(fish, &fx, &extra);
+        live_rekey("fish", &mut sh, &file, hooked);
+        sh.finish();
+    }
+}
+
+// ─── The typed re-key (2026-09-26) ───
+
+/// What [`typed_rekey`] SETS is what every script's marks READ, and they read
+/// it when they run: both globals are assigned at the script's top level (so a
+/// line typed at the prompt reaches the same variable), and every hot emitter
+/// — 133;A/B/C/D and 633;E — interpolates `__aterm_id_suffix_str` inside its
+/// function, never a copy taken at source time. That was measured by hand in
+/// the 0.91 and 2026-09-10 scripts the owner's degraded tabs sourced; this pins
+/// it for this build's. The typed text sets exactly those two names, in each
+/// shell's own assignment form, and exists for no shell without such a script.
+#[test]
+fn the_typed_rekey_sets_the_globals_the_marks_read() {
+    let emits = |script: &str, mark: &str| {
+        script.lines().any(|l| {
+            l.starts_with("    ")
+                && l.contains("__aterm_osc")
+                && l.contains(mark)
+                && l.contains("__aterm_id_suffix_str")
+        })
+    };
+    for (shell, script, declares) in [
+        (
+            ShellType::Zsh,
+            scripts::ZSH,
+            [
+                "typeset -g __aterm_shell_nonce=",
+                "typeset -g __aterm_id_suffix_str=",
+            ],
+        ),
+        (
+            ShellType::Bash,
+            scripts::BASH,
+            ["__aterm_shell_nonce=", "__aterm_id_suffix_str="],
+        ),
+        (
+            ShellType::Fish,
+            scripts::FISH,
+            [
+                "set -g __aterm_shell_nonce ",
+                "set -g __aterm_id_suffix_str ",
+            ],
+        ),
+    ] {
+        // At the top level (fish's is inside a top-level `if`, and `-g` is
+        // global wherever it runs).
+        let nested = format!("    {}", declares[0]);
+        for decl in declares {
+            assert!(
+                script
+                    .lines()
+                    .any(|l| l.starts_with(decl)
+                        || (shell == ShellType::Fish && l.starts_with(&nested))),
+                "{shell:?}: `{decl}` at the top level"
+            );
+        }
+        for mark in ["133;A", "133;B", "133;C", "133;D;", "633;E;"] {
+            assert!(
+                emits(script, mark),
+                "{shell:?}: the {mark} emitter reads __aterm_id_suffix_str when it runs"
+            );
+        }
+        let typed = typed_rekey(shell, "'/k'").expect("a scripted shell");
+        let (nonce, suffix) = if shell == ShellType::Fish {
+            (
+                "read -g __aterm_shell_nonce <'/k'",
+                "set -g __aterm_id_suffix_str \";id=$__aterm_shell_nonce\";",
+            )
+        } else {
+            (
+                "read -r __aterm_shell_nonce <'/k'",
+                "__aterm_id_suffix_str=\";id=$__aterm_shell_nonce\";",
+            )
+        };
+        assert!(typed.contains(nonce), "{shell:?}: {typed}");
+        assert!(typed.ends_with(suffix), "{shell:?}: {typed}");
+        assert!(
+            typed.contains("command rm -f -- '/k';"),
+            "{shell:?}: the file goes: {typed}"
+        );
+    }
+    for other in [
+        ShellType::PowerShell,
+        ShellType::Cmd,
+        ShellType::Wsl,
+        ShellType::Unknown,
+    ] {
+        assert_eq!(typed_rekey(other, "'/k'"), None, "{other:?}");
+    }
+}
+
+/// POSIX single quotes, `'\''` for a quote: the quoting the harness's relaunch
+/// line uses.
+#[cfg(unix)]
+fn posix_quoted(path: &Path) -> String {
+    format!("'{}'", path.to_str().expect("UTF-8").replace('\'', r"'\''"))
+}
+
+/// A LIVE SHELL WITHOUT THE CHANNEL — spawned as every shell before 0.94 was,
+/// with its nonce and no `ATERM_REKEY_PATH` — takes a key from the typed line:
+/// the globals change at once, the file is gone, and the marks of the very next
+/// prompt carry the new id. The path has a space and a quote in it (the real
+/// control dir sits under "Application Support"). A second line naming a file
+/// that is not there — a key withdrawn before the line ran — changes nothing
+/// and prints no error, and the command after it still runs. NEGATIVE CONTROL:
+/// before the line, the same file is never read (`live_rekey`'s unhooked arm
+/// measures the same shell ignoring it at a prompt).
+#[cfg(unix)]
+fn live_typed_rekey(label: &str, shell: ShellType, sh: &mut LiveShell, dir: &Path) {
+    let file = dir.join("re key's");
+    std::fs::write(&file, format!("{REKEY_NEW}\n")).unwrap();
+    sh.send("true");
+    let (line, marker) = rekey_probe(label, 1);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, 0);
+    assert_eq!(sh.value_before("NONCE=", at), REKEY_OLD, "{label}: before");
+    assert!(
+        file.exists(),
+        "{label}: no prompt of its own reads the file"
+    );
+
+    let typed = typed_rekey(shell, &posix_quoted(&file)).expect("scripted");
+    sh.send(&format!("{typed} echo RAN$((200 + 1))"));
+    let at = sh.wait_for_after("RAN201", at);
+    let (line, marker) = rekey_probe(label, 2);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, at);
+    assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW, "{label}: taken");
+    assert_eq!(
+        sh.value_before("SUFFIX=", at),
+        format!(";id={REKEY_NEW}"),
+        "{label}"
+    );
+    assert!(!file.exists(), "{label}: the one-use file is gone");
+    let (line, marker) = rekey_probe(label, 3);
+    sh.send(&line);
+    let end = sh.wait_for_after(&marker, at);
+    let tail = {
+        let out = sh.stdout.lock().unwrap();
+        String::from_utf8_lossy(&out[at..end]).into_owned()
+    };
+    assert!(
+        tail.contains(&format!("133;A;id={REKEY_NEW}"))
+            && tail.contains(&format!("133;C;id={REKEY_NEW}")),
+        "{label}: the next prompt's marks carry the new key: {tail:?}"
+    );
+
+    let gone = dir.join("withdrawn");
+    let typed = typed_rekey(shell, &posix_quoted(&gone)).expect("scripted");
+    sh.send(&format!("{typed} echo RAN$((300 + 1))"));
+    let at = sh.wait_for_after("RAN301", end);
+    let (line, marker) = rekey_probe(label, 4);
+    sh.send(&line);
+    let at = sh.wait_for_after(&marker, at);
+    assert_eq!(
+        sh.value_before("NONCE=", at),
+        REKEY_NEW,
+        "{label}: a missing file changes nothing"
+    );
+    assert_eq!(sh.value_before("SUFFIX=", at), format!(";id={REKEY_NEW}"));
+    // (bash's line editor echoes the typed line to stderr, path and all; an
+    // error would name the missing file.)
+    let err = sh.stderr_text().to_lowercase();
+    assert!(!err.contains("no such file"), "{label}: quiet: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_live_bash_without_the_channel_takes_a_typed_rekey() {
+    let fx = LiveFixture::new();
+    let mut sh = spawn_live_bash(&fx, "", &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
+    live_typed_rekey("bash", ShellType::Bash, &mut sh, &fx.home);
+    sh.finish();
+}
+
+/// zsh ships with macOS (`/bin/zsh`), so there this is never skipped; elsewhere
+/// the zsh lane is not claimed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_live_zsh_without_the_channel_takes_a_typed_rekey() {
+    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let fx = LiveFixture::new();
+    let mut sh = spawn_live_zsh(zsh, &fx, "", &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
+    live_typed_rekey("zsh", ShellType::Zsh, &mut sh, &fx.home);
+    sh.finish();
+}
+
+// ─── The content-addressed script folder (2026-09-24) ───
+
+/// The flat, last-writer-wins scheme `prepare` used before the content address:
+/// write into `root` once per process, then trust whatever file is there. Kept
+/// here ONLY as the negative control the tests below run beside the real one.
+fn prepare_flat_as_before(
+    shell: ShellType,
+    root: &Path,
+    written: &Mutex<Option<PathBuf>>,
+) -> InjectionEnv {
+    let mut written = written.lock().unwrap();
+    if written.as_deref() != Some(root) || !root.join("aterm_shell_integration.zsh").exists() {
+        ensure_scripts(root).unwrap();
+        *written = Some(root.to_path_buf());
+    }
+    injection_for(shell, root).unwrap()
+}
+
+/// What a FOREIGN build does to the shared cache root: an older aterm (the 0.91
+/// dev bundle, a stale test binary) writes its own, different scripts — to the
+/// legacy flat files — and a build of this scheme writes ITS content folder.
+fn foreign_build_writes(root: &Path) {
+    std::fs::create_dir_all(root.join("zdotdir")).unwrap();
+    std::fs::write(
+        root.join("aterm_shell_integration.zsh"),
+        "__aterm_foreign() { :; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("zdotdir/.zshenv"),
+        "source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\"\n",
+    )
+    .unwrap();
+    let other = root.join("0123456789abcdef");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("aterm_shell_integration.zsh"),
+        "__aterm_other_build() { :; }\n",
+    )
+    .unwrap();
+}
+
+/// The directory an injection points a shell at.
+fn injected_dir(injection: &InjectionEnv) -> PathBuf {
+    PathBuf::from(
+        &injection
+            .env_add
+            .iter()
+            .find(|(k, _)| k == "ATERM_SHELL_INTEGRATION_DIR")
+            .expect("ATERM_SHELL_INTEGRATION_DIR")
+            .1,
+    )
+}
+
+#[test]
+fn the_script_set_has_one_stable_sixteen_hex_address() {
+    let address = script_set_address();
+    assert_eq!(address.len(), 16);
+    assert!(is_address(address), "{address}");
+    assert_eq!(address, script_set_address(), "computed once, stable");
+    for not in [
+        "0123456789ABCDEF",
+        "0123456789abcde",
+        "0123456789abcdefa",
+        ".tmp-x",
+    ] {
+        assert!(!is_address(not), "{not}");
+    }
+    // Every file the set writes is part of what a match checks.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    ensure_scripts(dir.path()).unwrap();
+    assert!(script_set_matches(dir.path()));
+    std::fs::write(dir.path().join("bash/rcfile"), "# edited\n").unwrap();
+    assert!(
+        !script_set_matches(dir.path()),
+        "a changed wrapper is a different set"
+    );
+}
+
+/// THE MEASURED DEFECT: a foreign start rewrote the shared folder and every new
+/// tab of the running window sourced its scripts. Now a new window (a fresh
+/// memo) and the running one (a warm memo) both keep pointing their shells at
+/// THIS build's folder, whose bytes are this build's, whatever a foreign build
+/// wrote. NEGATIVE CONTROL: the flat scheme, under the same foreign write,
+/// points its shells at the foreign bytes.
+#[test]
+fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().join("shell-integration");
+    let warm = Mutex::new(None);
+    let first = prepare_cached(ShellType::Zsh, root.clone(), &warm)
+        .unwrap()
+        .unwrap();
+    let ours = injected_dir(&first);
+    assert_eq!(ours, root.join(script_set_address()));
+
+    foreign_build_writes(&root);
+
+    for memo in [&warm, &Mutex::new(None)] {
+        let again = prepare_cached(ShellType::Zsh, root.clone(), memo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(injected_dir(&again), ours);
+        assert_eq!(
+            std::fs::read_to_string(ours.join("aterm_shell_integration.zsh")).unwrap(),
+            lf_only(scripts::ZSH)
+        );
+        assert!(script_set_matches(&ours));
+    }
+    // The legacy flat files are left for the older builds that read them.
+    assert_eq!(
+        std::fs::read_to_string(root.join("aterm_shell_integration.zsh")).unwrap(),
+        "__aterm_foreign() { :; }\n"
+    );
+
+    // Control: the flat scheme, same root shape, same foreign write.
+    let flat_root = tmp.path().join("flat");
+    let flat_memo = Mutex::new(None);
+    prepare_flat_as_before(ShellType::Zsh, &flat_root, &flat_memo);
+    foreign_build_writes(&flat_root);
+    let flat = prepare_flat_as_before(ShellType::Zsh, &flat_root, &flat_memo);
+    assert_eq!(
+        std::fs::read_to_string(injected_dir(&flat).join("aterm_shell_integration.zsh")).unwrap(),
+        "__aterm_foreign() { :; }\n",
+        "control: the flat folder serves the foreign bytes"
+    );
+}
+
+/// A content folder that exists but does not hold this set (edited by hand,
+/// half-written by a writer that died) is replaced on the first `prepare` of a
+/// process, never trusted; a matching one is reused as it is; racing writers of
+/// the same set all land on one folder.
+#[test]
+fn a_damaged_content_folder_is_replaced_and_a_matching_one_reused() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().join("si");
+    let dir = root.join(script_set_address());
+    std::fs::create_dir_all(dir.join("zdotdir")).unwrap();
+    std::fs::write(dir.join("aterm_shell_integration.zsh"), "# damaged\n").unwrap();
+    assert_eq!(install_script_set(&root).unwrap(), dir);
+    assert!(script_set_matches(&dir));
+    assert_eq!(install_script_set(&root).unwrap(), dir);
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no scratch folder survives: {leftovers:?}"
+    );
+    let raced = tmp.path().join("race");
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let raced = raced.clone();
+            std::thread::spawn(move || install_script_set(&raced).unwrap())
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.join().unwrap(), raced.join(script_set_address()));
+    }
+    assert!(script_set_matches(&raced.join(script_set_address())));
+}
+
+/// No two writers share a scratch folder: suffixes drawn at once by many
+/// threads of one process — the same clock tick, the same pid — are all
+/// distinct (the race the test above can only catch under load: two threads on
+/// one microsecond wrote into one scratch folder, and the first rename took it
+/// from under the second).
+#[test]
+fn scratch_suffixes_drawn_at_once_never_collide() {
+    let handles: Vec<_> = (0..8)
+        .map(|_| std::thread::spawn(|| (0..500).map(|_| scratch_suffix()).collect::<Vec<_>>()))
+        .collect();
+    let mut all = std::collections::BTreeSet::new();
+    let mut drawn = 0;
+    for h in handles {
+        for s in h.join().unwrap() {
+            drawn += 1;
+            all.insert(s);
+        }
+    }
+    assert_eq!(all.len(), drawn, "a scratch suffix was drawn twice");
+}
+
+/// Collection keeps this build's folder, the five newest others and everything
+/// younger than two weeks; it removes older folders beyond those and dead
+/// writers' scratch folders, and never touches the legacy flat files.
+#[test]
+fn old_script_folders_are_collected_and_young_or_newest_ones_kept() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().join("si");
+    install_script_set(&root).unwrap();
+    std::fs::write(root.join("aterm_shell_integration.zsh"), "legacy").unwrap();
+    let others: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let dir = root.join(format!("{i:016x}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Distinct mtimes, oldest first.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            dir
+        })
+        .collect();
+    let scratch = root.join(".tmp-0000000000000000-1-1");
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    // Now: everything is young, nothing goes.
+    collect_old_script_sets(&root, std::time::SystemTime::now());
+    assert!(others.iter().all(|d| d.exists()) && scratch.exists());
+
+    // A month on: the three oldest others and the scratch folder go.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30 * 24 * 3600);
+    collect_old_script_sets(&root, later);
+    for (i, dir) in others.iter().enumerate() {
+        assert_eq!(dir.exists(), i >= 3, "{}", dir.display());
+    }
+    assert!(!scratch.exists());
+    assert!(
+        root.join(script_set_address()).exists(),
+        "this build's own folder"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("aterm_shell_integration.zsh")).unwrap(),
+        "legacy"
+    );
+}
+
+/// A REAL zsh, started as a tab is (the injection's env over a clean
+/// environment and an empty `$HOME`), after a foreign build wrote the shared
+/// root: it loads THIS build's integration and none of the foreign code.
+/// NEGATIVE CONTROL: the same zsh from the flat scheme's injection runs the
+/// foreign file. Skipped where there is no zsh.
+#[cfg(unix)]
+#[test]
+fn a_real_zsh_sources_this_builds_scripts_after_a_foreign_write() {
+    let zsh = Path::new("/bin/zsh");
+    if !zsh.exists() {
+        eprintln!("SKIP: no /bin/zsh");
+        return;
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = |injection: &InjectionEnv| -> String {
+        let mut cmd = Command::new(zsh);
+        cmd.env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .args([
+                "-i",
+                "-c",
+                "whence -w __aterm_precmd __aterm_foreign 2>/dev/null; true",
+            ]);
+        for (k, v) in &injection.env_add {
+            cmd.env(k, v);
+        }
+        let out = cmd.stdin(std::process::Stdio::null()).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let root = tmp.path().join("si");
+    let memo = Mutex::new(None);
+    prepare_cached(ShellType::Zsh, root.clone(), &memo).unwrap();
+    foreign_build_writes(&root);
+    let ours = run(&prepare_cached(ShellType::Zsh, root, &memo)
+        .unwrap()
+        .unwrap());
+    assert!(ours.contains("__aterm_precmd: function"), "{ours}");
+    assert!(!ours.contains("__aterm_foreign: function"), "{ours}");
+
+    let flat_root = tmp.path().join("flat");
+    let flat_memo = Mutex::new(None);
+    prepare_flat_as_before(ShellType::Zsh, &flat_root, &flat_memo);
+    foreign_build_writes(&flat_root);
+    let flat = run(&prepare_flat_as_before(
+        ShellType::Zsh,
+        &flat_root,
+        &flat_memo,
+    ));
+    assert!(
+        flat.contains("__aterm_foreign: function") && !flat.contains("__aterm_precmd: function"),
+        "control: the flat scheme's tab runs the foreign file: {flat}"
     );
 }

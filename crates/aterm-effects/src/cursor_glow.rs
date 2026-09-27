@@ -38,6 +38,20 @@ use aterm_render::{
 
 use crate::rainbow_kitty::{self as rk, CaretSeam, CompanionImpulse};
 
+/// Host row slots for the content witness: the bands' eight rows
+/// ([`rk::witness::WITNESS_ROWS`]), a waiting key's source row and the rows
+/// one above and below it ([`rk::witness::ARMING_ROWS`]), and the caret's
+/// row when it is outside both sets. The latter two are only read when
+/// needed; the usual typing frame samples the band's rows and nothing more.
+/// [`CursorGlow::ribbon_rows`] never names more than [`RIBBON_LIST_ROWS`],
+/// so the caret's row, captured first, always leaves a slot for every row of
+/// the list.
+pub const CURSOR_WITNESS_ROWS: usize = RIBBON_LIST_ROWS + 1;
+
+/// The most rows [`CursorGlow::ribbon_rows`] names: the bands' and a waiting
+/// key's arming rows ([`rk::Engine::ribbon_rows_for`]).
+const RIBBON_LIST_ROWS: usize = rk::witness::WITNESS_ROWS + rk::witness::ARMING_ROWS;
+
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_STD, STAR_CORE, STAR_GLINT, STAR_GLINT_COV, STAR_STACK_ADD, dust_r,
     fire_ramp, lerp_rgb, push_fx_rect as push_rect, push_twinkle_star, star_accent, star_arm,
@@ -142,7 +156,7 @@ impl GlowStyle {
     /// They lose it on upgrade, and that is a deliberate, bounded trade:
     ///
     ///  * The flying head is NOT deleted and NOT unreachable. It has its own
-    ///    explicit spellings now ([`Self::style_names_flying_kitty`] —
+    ///    explicit spellings now (`Self::style_names_flying_kitty` —
     ///    `rainbow kitty flying` / `flying kitty` / `kitty flying`), it is a
     ///    first-class entry in the Settings picker (`prefs::CURSOR_TRAIL_STYLES`),
     ///    and the historical aliases `nyan rainbow` / `nyan` / `rainbow` still
@@ -191,7 +205,7 @@ impl GlowStyle {
     /// `"rainbow kitty underline"` and `cursor_trail_style_aliases_agree_with_
     /// engine_parse` requires an alias and its canonical to draw the same
     /// animal. The flying head keeps every spelling it was promised —
-    /// [`Self::style_names_flying_kitty`] plus the bare `nyan` / `rainbow` /
+    /// `Self::style_names_flying_kitty` plus the bare `nyan` / `rainbow` /
     /// `nyan rainbow` aliases, none of which name a geometry.
     #[must_use]
     pub fn style_names_kitty_pet(s: &str) -> bool {
@@ -242,6 +256,7 @@ impl GlowStyle {
     /// prove the two lists never overlap — an overlap would make one string mean both animals
     /// and the pet would silently win.
     #[must_use]
+    #[cfg(test)]
     pub fn style_names_flying_kitty(s: &str) -> bool {
         let s = s.trim();
         ["rainbow kitty flying", "flying kitty", "kitty flying"]
@@ -3522,6 +3537,8 @@ struct HeldPark {
     /// probe, or one for another row) reads as a glyph, so every
     /// direct-drive path is unchanged.
     landing_glyph: bool,
+    /// The content witness carried this exact park's source row away.
+    content_followed: bool,
 }
 
 impl HeldPark {
@@ -3948,7 +3965,10 @@ enum ParkRelease {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpawnCall {
     Live,
-    FlushedPark { landing_glyph: bool },
+    FlushedPark {
+        landing_glyph: bool,
+        content_followed: bool,
+    },
 }
 
 /// **THE ROW-BAND LAW** — where a grid row lands when the host reports that
@@ -4760,12 +4780,22 @@ pub struct CursorGlow {
     /// `rk::witness`): the live grid rows the
     /// resident ribbon occupies, captured by the host under its terminal
     /// lock before the tick and read by the engine's witness right after
-    /// it. At most [`rk::witness::WITNESS_ROWS`] slots, resident and reused;
+    /// it. At most [`CURSOR_WITNESS_ROWS`] slots, resident and reused;
     /// `witness_rows_n` is how many are filled THIS frame, taken to zero by
     /// every tick so a stale sample can never be read against a later
     /// frame's cells.
     witness_rows: Vec<WitnessRowBuf>,
     witness_rows_n: usize,
+    /// **THE ROWS THE HOST WAS ASKED FOR** this frame — exactly what
+    /// [`Self::ribbon_rows`] last handed out, and how many — so the follow
+    /// pass counts as WITHHELD only a row the host was asked for and did
+    /// not deliver ([`rk::Engine::follow_rows`]). Recomputing the list at
+    /// the tick would ask a different question: by then the waiting key
+    /// whose arming rows the list named ([`rk::Engine::ribbon_rows_for`])
+    /// may be spent, and a row asked for and not delivered would be
+    /// forgotten. Written by a `&self` query, hence the `Cell`; taken by
+    /// every tick, so it never outlives its frame.
+    witness_asked: std::cell::Cell<([u16; RIBBON_LIST_ROWS], usize)>,
     /// The caret seam v2 handed back on the last engaged tick (§7.1); the
     /// host reads it through [`Self::caret_flare_at`] / [`Self::caret_paint`]
     /// when it builds the caret's `RainbowConfig`.
@@ -5521,7 +5551,12 @@ impl TrailStatus<'_> {
     /// pass carried to another row WITH their text ([`rk::Status::followed`]
     /// — a bottom-anchored composer growing a row without a scroll), so
     /// "the band went with its text" reads apart from "its text moved out
-    /// from under it".
+    /// from under it". `ribbon_follow_missed=` (2026-09-23) rides last: the
+    /// cells whose text ARRIVED on a neighbouring row that the follow pass
+    /// still did not carry ([`rk::Status::follow_missed`]) — each one left
+    /// to the content witness where it stood instead of going with its
+    /// text, the owner's *"not simply abruptly vanish"*; `0` is the healthy
+    /// reading.
     #[must_use]
     pub fn line_v2(&self, v2: Option<rk::Status>) -> String {
         let mut line = self.line();
@@ -5531,8 +5566,15 @@ impl TrailStatus<'_> {
             // formality.
             let _ = write!(
                 line,
-                " v2_quads={} v2_halos={} v2_stars={} v2_meteors={} v2_bridged={} ribbon_retired={} ribbon_followed={}",
-                s.quads, s.halos, s.stars, s.meteors, s.bridged, s.retired, s.followed
+                " v2_quads={} v2_halos={} v2_stars={} v2_meteors={} v2_bridged={} ribbon_retired={} ribbon_followed={} ribbon_follow_missed={}",
+                s.quads,
+                s.halos,
+                s.stars,
+                s.meteors,
+                s.bridged,
+                s.retired,
+                s.followed,
+                s.follow_missed
             );
         }
         line
@@ -5569,6 +5611,7 @@ impl CursorCatMotionPulse {
     /// Whether this pulse is one of the forward advances that must be mirrored
     /// into [`crate::kitty_cursor::CursorCat`]'s canonical momentum instance.
     #[must_use]
+    #[cfg(test)]
     pub fn advances_momentum(self) -> bool {
         matches!(
             self.kind,
@@ -6666,6 +6709,9 @@ impl CursorGlow {
     pub fn note_navigation(&mut self, now: Instant) {
         self.recent_typed_run = None;
         self.flush_held_park();
+        if self.newline_hint.take().is_some() && self.v2.engaged() {
+            self.v2.on_event(rk::Event::CancelComposerNewline, now);
+        }
         self.unsettle();
         // A newer, stronger input class supersedes a swallowed Tab/paste. If
         // its own echo is swallowed too, the weaker hint must not survive to
@@ -7353,14 +7399,19 @@ impl CursorGlow {
     /// The host arms this on the SAME arm that arms the typed hint for that
     /// chord, and only there: a main-screen Shift+Enter is Enter morphology, a
     /// plain Enter takes [`Self::note_return`], and a modified chord
-    /// that is not a composer newline arms nothing. Never gates bytes; never
-    /// classifies as typing on its own — it only tells the ribbon's relocation
-    /// retirement that the row change it is about to see was AUTHORED, so the
-    /// line above still holds the text its trail decorates.
+    /// that is not a composer newline arms nothing. It never gates bytes or
+    /// classifies as typing on its own. The classifier uses it to license the
+    /// authored row change; v2 also receives the key-time `ComposerNewline`
+    /// event, so its fresh-line walk is dated at the chord rather than the
+    /// later repaint. The ribbon waits for the authored home move before a
+    /// new-line glyph may spend that gate.
     pub fn note_newline_break(&mut self, now: Instant) {
         self.recent_typed_run = None;
         self.unsettle();
         self.newline_hint = Some(now);
+        if self.v2.engaged() {
+            self.v2.on_event(rk::Event::ComposerNewline, now);
+        }
     }
 
     /// Record a grid-geometry classifier boundary. Reflow itself is dark: the
@@ -7885,6 +7936,9 @@ impl CursorGlow {
     pub fn note_kill(&mut self, now: Instant, moves_cursor: bool) {
         self.recent_typed_run = None;
         self.flush_held_park();
+        if self.newline_hint.take().is_some() && self.v2.engaged() {
+            self.v2.on_event(rk::Event::CancelComposerNewline, now);
+        }
         self.unsettle();
         // A kill is the line's content going (the in-flight law): whatever
         // presses were still in flight on it are forgotten
@@ -7971,6 +8025,7 @@ impl CursorGlow {
     /// cannot diverge — a key-only, non-echoing keystream (a password prompt,
     /// vim vertical navigation) pulses on neither.
     #[must_use]
+    #[cfg(test)]
     pub fn take_momentum_pulse(&mut self) -> Option<Instant> {
         self.momentum_pulse
             .take()
@@ -7979,7 +8034,7 @@ impl CursorGlow {
     }
 
     /// Read and CLEAR the lossless cursor-cat motion pulse for this tick.
-    /// Unlike [`Self::take_momentum_pulse`], this preserves the authenticated
+    /// Unlike `Self::take_momentum_pulse`, this preserves the authenticated
     /// forward/reverse fold shape so the placement layer never has to infer a
     /// wrap from an arbitrary large cursor relocation.
     #[must_use]
@@ -8044,22 +8099,11 @@ impl CursorGlow {
         self.v2.engaged() && self.v2.catch_star(star, at)
     }
 
-    /// **THE KITTY'S DELIGHT EDGE** (§5.8, §7.2): the host reports the
-    /// companion's Delight at the caret's `(row, col)`; v2 earns the heroes
-    /// [`rk::companion::heroes_earned`] says it earns and mints the
-    /// `Delight` impulse. Not a cursor event, so it is not an [`rk::Event`];
-    /// inert unless v2 is engaged.
-    pub fn note_kitty_delight(&mut self, now: Instant, row: u16, col: u16) {
-        if self.v2.engaged() {
-            self.v2.earn_hero(now, row, col);
-        }
-    }
-
     /// **THE VERDICT'S HOT RESUME** (THE VERDICT, sense 3): the host reports
     /// that a shell command came back GREEN after a long run, on the OSC
-    /// 133/633 `D` it already dedupes. Not a cursor event, so — like
-    /// [`Self::note_kitty_delight`] — it is not an [`rk::Event`]; inert
-    /// unless v2 is engaged, and inert on glass even when it is. It mints no
+    /// 133/633 `D` it already dedupes. Not a cursor event, so it is not an
+    /// [`rk::Event`]; inert unless v2 is engaged, and inert on glass even when
+    /// it is. It mints no
     /// light: it only prices the first key you type next
     /// ([`rk::spine::Spine::note_verdict`]).
     pub fn note_command_verdict(&mut self, now: Instant) {
@@ -8254,6 +8298,9 @@ impl CursorGlow {
         // Explicit edit/navigation/geometry boundaries retire the run where
         // they are classified, rather than every generic licence clear.
         self.flush_held_park();
+        if self.newline_hint.is_some() && self.v2.engaged() {
+            self.v2.on_event(rk::Event::CancelComposerNewline, now);
+        }
         self.type_hint.clear();
         self.clear_non_typed_hints(now);
     }
@@ -8739,10 +8786,10 @@ impl CursorGlow {
     /// epoch step → `reset()`: the measured Codex session read
     /// `ribbon_segments 16 → 0` on the FIRST streamed line and `1, 1, 1, 0,
     /// 0…` for the rest, with every banked key and the momentum thrown away
-    /// per line (docs/measured/codex-on-glass-2026-09-10.md). A band move is
-    /// a COORDINATE TRANSFORM and never a licence (T1): nothing is judged,
-    /// nothing spawns, and the next observed move classifies against where
-    /// the previous caret cell NOW sits.
+    /// per line (measured on glass 2026-09-10; that record was never
+    /// committed). A band move is a COORDINATE TRANSFORM and never a licence
+    /// (T1): nothing is judged, nothing spawns, and the next observed move
+    /// classifies against where the previous caret cell NOW sits.
     ///
     /// What is dropped here and what is kept follows the hint's meaning, not
     /// the scroll path blindly: the plain-Backspace poof classifier and its
@@ -8934,22 +8981,38 @@ impl CursorGlow {
     /// band; `rk::witness`): the distinct grid rows Rainbow Kitty's resident
     /// ribbon occupies — and, since 2026-09-21 (the band follows its text),
     /// the row above and below each, so the follow pass can see where a
-    /// run's text went when a bottom-anchored box grew a row
-    /// ([`rk::Engine::ribbon_rows`]) — written into `out` (at most
-    /// `out.len()` — size it [`rk::witness::WITNESS_ROWS`]); returns how
-    /// many. The host captures exactly these rows under its terminal lock,
-    /// beside the row probe, and hands each to [`Self::observe_ribbon_row`]
-    /// or [`Self::capture_ribbon_row`] before the tick; the caret's own row
-    /// rides the row probe the host already holds, so it costs no second grid
-    /// read. `0` for every style
-    /// but rainbow kitty — the other nine sample nothing and pay nothing.
+    /// run's text went when a bottom-anchored box grew a row — then a
+    /// WAITING KEY's source row and the rows one above and below it
+    /// ([`rk::Engine::ribbon_rows_for`]), written into `out` (at most
+    /// `out.len()` — size it [`CURSOR_WITNESS_ROWS`]); returns how many. The
+    /// host captures the caret's row first (it rides the row probe the host
+    /// already holds, so it costs no second grid read), then exactly these
+    /// rows under its terminal lock, beside the row probe, and hands each to
+    /// [`Self::observe_ribbon_row`] or [`Self::capture_ribbon_row`] before
+    /// the tick. The host's [`CURSOR_WITNESS_ROWS`] slots hold all of it:
+    /// the bands' [`rk::witness::WITNESS_ROWS`], the waiting key's
+    /// [`rk::witness::ARMING_ROWS`] and the caret's row, so no row of the
+    /// list is ever dropped for want of a slot. A caller with a shorter `out`
+    /// gets the bands' rows first — a waiting key never evicts a band's row.
+    /// `0` for every style but rainbow kitty — the other nine sample nothing
+    /// and pay nothing.
+    ///
+    /// The source is needed even after the key's previous ribbon has faded,
+    /// and its neighbours with it: the witness arms that key's record on
+    /// this frame's samples, and a copy of its glyph standing beside it
+    /// already is a twin only if that row is seen
+    /// (`tests/erased_under_its_twin.rs`). The list handed out is recorded
+    /// (`witness_asked`): the follow pass counts as withheld only a row of it
+    /// the host did not deliver.
     pub fn ribbon_rows(&self, out: &mut [u16]) -> usize {
-        let mut n = self.v2.ribbon_rows(out);
         if !self.v2.engaged() || out.is_empty() {
-            return n;
+            return 0;
         }
         // A waiting key needs its source even after its previous ribbon has
-        // faded. The same bounded row-sampling seam serves every host.
+        // faded. The same bounded row-sampling seam serves every host. A
+        // delivered insert waiting for its echo (a paste, a Tab completion)
+        // is a waiting key too: its whole width is armed on the frame it
+        // echoes, on the row the hand was on when it was delivered.
         let source = self
             .held_park
             .filter(|p| p.cross_row)
@@ -8960,14 +9023,13 @@ impl CursorGlow {
                 .then_some(self.last)
                 .flatten()
                 .map(|(row, _)| row)
-            });
-        if let Some(row) = source
-            && !out[..n].contains(&row)
-        {
-            let i = n.min(out.len() - 1);
-            out[i] = row;
-            n = (i + 1).max(n);
-        }
+            })
+            .or_else(|| self.insert.armed.and_then(|licence| licence.row));
+        let n = self.v2.ribbon_rows_for(source, out);
+        let mut asked = [0u16; RIBBON_LIST_ROWS];
+        let kept = n.min(asked.len());
+        asked[..kept].copy_from_slice(&out[..kept]);
+        self.witness_asked.set((asked, kept));
         n
     }
 
@@ -8978,7 +9040,7 @@ impl CursorGlow {
     /// AFTER the PTY batch was applied. Copied into a resident slot (a
     /// clear and an extend: zero steady-state allocation); a row given twice
     /// in one frame replaces its earlier sample; past
-    /// [`rk::witness::WITNESS_ROWS`] rows the sample is dropped. Read by
+    /// [`CURSOR_WITNESS_ROWS`] rows the sample is dropped. Read by
     /// the engine's witness right after this frame's [`Self::tick`] and
     /// never after: the tick takes the count to zero. Inert for every style
     /// but rainbow kitty.
@@ -9017,7 +9079,7 @@ impl CursorGlow {
         {
             Some(i) => i,
             None => {
-                if n >= rk::witness::WITNESS_ROWS {
+                if n >= CURSOR_WITNESS_ROWS {
                     return None;
                 }
                 if self.witness_rows.len() == n {
@@ -9934,8 +9996,10 @@ impl CursorGlow {
             _ => self.v2.set_engaged(false),
         }
         self.v2_stop = None;
-        // The witness's samples were rows of the space that just died.
+        // The witness's samples were rows of the space that just died, and
+        // so were the rows it asked for.
         self.witness_rows_n = 0;
+        self.witness_asked.take();
     }
 
     /// The seam's HOLDS EXPIRE at the tick, before this tick's move: a held
@@ -10445,6 +10509,7 @@ impl CursorGlow {
             }
         }
         let witness_n = std::mem::take(&mut self.witness_rows_n);
+        let (asked, asked_n) = self.witness_asked.take();
         // THE SEAM'S GATE (`RAINBOW-KITTY-V2.md` §17.2, §17.3 phase 7, D14):
         // v2 IS the rainbow kitty — it owns the frame whenever the resolved
         // style is rainbow kitty, and only on a tick that DRAWS (the master
@@ -11029,7 +11094,7 @@ impl CursorGlow {
                     let mut samples = [rk::witness::RowSample {
                         row: u16::MAX,
                         cols: &[],
-                    }; rk::witness::WITNESS_ROWS];
+                    }; CURSOR_WITNESS_ROWS];
                     let n = witness_n.min(samples.len()).min(self.witness_rows.len());
                     for (sample, slot) in samples.iter_mut().zip(&self.witness_rows[..n]) {
                         *sample = rk::witness::RowSample {
@@ -11037,7 +11102,14 @@ impl CursorGlow {
                             cols: &slot.cols,
                         };
                     }
-                    self.v2.follow_rows(&samples[..n], now);
+                    let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
+                    let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
+                    let (_, proved) =
+                        self.v2
+                            .follow_rows_with_park(&samples[..n], &asked[..asked_n], now, pair);
+                    if proved && let Some(p) = self.held_park.as_mut() {
+                        p.content_followed = true;
+                    }
                 }
                 let mut frame = rk::Frame {
                     under: &mut under,
@@ -11088,7 +11160,7 @@ impl CursorGlow {
                     let mut samples = [rk::witness::RowSample {
                         row: u16::MAX,
                         cols: &[],
-                    }; rk::witness::WITNESS_ROWS];
+                    }; CURSOR_WITNESS_ROWS];
                     let n = witness_n.min(samples.len()).min(self.witness_rows.len());
                     for (sample, slot) in samples.iter_mut().zip(&self.witness_rows[..n]) {
                         *sample = rk::witness::RowSample {
@@ -12153,7 +12225,7 @@ impl CursorGlow {
                         pr: p.row,
                         pc: p.origin,
                     })
-                } else if cc == p.origin {
+                } else if cc == p.origin && !p.content_followed {
                     self.held_park = None;
                     Some(ParkRelease::Cancelled)
                 } else {
@@ -12220,8 +12292,9 @@ impl CursorGlow {
     /// then; an in-flight park runs the refusal branch — refused and the
     /// pool forgotten, today's verdict), `classify_move` pops the park's own
     /// stamp (oldest-first — later stamps are in the future at `p.at`),
-    /// lays nothing forward, classifies exactly as today (a re-anchor for a
-    /// wide retreat, `typing` for one cell, a jump for two), hands v2 its
+    /// lays nothing forward, classifies a wide retreat or a content-proved
+    /// short wrap as a re-anchor (an unproved one-cell park as `typing`, a
+    /// two-cell one as a jump), hands v2 its
     /// `Move` dated `p.at`, writes today's ring row.
     fn flush_park(&mut self, p: HeldPark) {
         self.in_flight_tally.park_flushed += 1;
@@ -12251,22 +12324,25 @@ impl CursorGlow {
         // `Move` — are the park's own, ordered before the keys pressed
         // since (`rk::Engine::set_flush_clock`).
         // ONLY FOR A PARK THE RIBBON WILL READ AS A RE-ANCHOR (2026-09-22,
-        // the merge with main's `RE_ANCHOR_MIN_CELLS`). The ordering exists
+        // the merge with main's `RE_ANCHOR_MIN_CELLS`, plus a short park
+        // whose source row was proved to follow its text). The ordering exists
         // for the composer's box-growth wrap, where the park's own landing
         // sweep and `Move` must be replayed before the keys pressed since,
         // so the relaid word takes the walk it had. Under the ribbon's own
-        // floor the move is not a re-anchor at all — a one- or two-cell
-        // backward park flush is the mirror moving — and reordering there
+        // floor without that content proof the move is not a re-anchor at
+        // all — a one- or two-cell backward park flush is the mirror moving
+        // — and reordering there
         // HELD the key that followed it instead of laying its cell: the
         // witness then saw the row's last glyph blank under an armed cell,
         // released it, and `wrapped_composer_band`'s `c2_bs` carried 218
         // row-frames with interior dark runs (measured 2026-09-22; 0 with
         // this scope, and the same 0 main has).
-        let reanchor = p.landing_row == p.row
-            && p.origin > p.landing
-            && p.origin - p.landing >= rk::ribbon::RE_ANCHOR_MIN_CELLS;
+        let reanchor = p.content_followed
+            || (p.landing_row == p.row
+                && p.origin > p.landing
+                && p.origin - p.landing >= rk::ribbon::RE_ANCHOR_MIN_CELLS);
         self.v2.set_flush_clock(reanchor.then_some(p.at));
-        let _ = self.with_presses_banked_through(p.at, |glow| {
+        let licensed = self.with_presses_banked_through(p.at, |glow| {
             glow.spawn_judged(
                 p.row,
                 p.origin,
@@ -12278,9 +12354,14 @@ impl CursorGlow {
                 SpawnLane::Visible,
                 SpawnCall::FlushedPark {
                     landing_glyph: p.landing_glyph,
+                    content_followed: p.content_followed,
                 },
             )
         });
+        if licensed && p.content_followed {
+            self.v2
+                .prove_short_reanchor((p.row, p.origin), (p.landing_row, p.landing), p.at);
+        }
         self.v2.set_flush_clock(None);
         self.type_hint.merge(later_stamps);
     }
@@ -12323,6 +12404,7 @@ impl CursorGlow {
             cfg: *cfg,
             geom,
             landing_glyph: self.landing_glyph_at(cr, cc),
+            content_followed: false,
         });
     }
 
@@ -12751,7 +12833,8 @@ impl CursorGlow {
             && !matches!(
                 call,
                 SpawnCall::FlushedPark {
-                    landing_glyph: false
+                    landing_glyph: false,
+                    ..
                 }
             )
         {
@@ -13037,7 +13120,14 @@ impl CursorGlow {
         // know whether a press was unpaid when the move arrived, and a
         // coalesced echo's spend empties the pool on this very move.
         let unpaid_before = self.typed_credits_within(now) >= 1;
-        let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom);
+        let content_followed = matches!(
+            call,
+            SpawnCall::FlushedPark {
+                content_followed: true,
+                ..
+            }
+        );
+        let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, content_followed);
         // A FRESH stamp is a LICENSE (v0.43.0 law): the resize/Enter gesture
         // behind a move earns the ZOOM/starburst arm even from a cold momentum
         // spine (the `disp >= RAINBOW_JUMP_MIN_DISP || return_licensed ||
@@ -13283,6 +13373,7 @@ impl CursorGlow {
         now: Instant,
         cfg: &'a GlowConfig,
         geom: Geom,
+        content_followed: bool,
     ) -> MoveCtx<'a> {
         // A single-cell advance is TYPING; a multi-cell delta is a real cursor JUMP.
         // The jump distance drives BOTH the comet lifetime and the ring/particle burst.
@@ -13375,8 +13466,9 @@ impl CursorGlow {
         // scrollback moves on the alt screen, so the scroll translation cannot
         // catch it either). Multi-row typed-paired moves (vim gg/G/{/}) stay on
         // the owner-mandated meteor path;
-        // `raw_dist > 2.0` keeps every possible ConPTY hide-bridged move (chebyshev
-        // ≤ HIDE_BRIDGE_MAX_DIST = 2) byte-identical — the bridge law holds exactly.
+        // `raw_dist > 2.0` keeps every unproved ConPTY hide-bridged move
+        // (chebyshev ≤ HIDE_BRIDGE_MAX_DIST = 2) byte-identical. Only an
+        // exact held park whose row content followed may use the short arm.
         // The typed classifier is consumed once (one hint, one echo) — below,
         // after the spend. Peek the quench classifier because the deletion
         // arm below owns its consumption.
@@ -13482,7 +13574,7 @@ impl CursorGlow {
             && !newline_paired
             && !echo_run
             && dr_abs <= 1
-            && raw_dist > 2.0
+            && (raw_dist > 2.0 || (content_followed && cr == pr && pc > cc && pc - cc <= 2))
             && (!self.ctx_alt || blink_fresh);
         let wrap = shape_wrap || re_anchor;
         // THE TYPED KEY'S MOVE under Rainbow Kitty: a typed-paired move no
@@ -16582,9 +16674,8 @@ impl CursorGlow {
                 GlowStyle::Laser => {
                     // The razor FILAMENT + tight beam body: the INNER laser layers
                     // only (thickness×core ≤ 2.9, i.e. ≤ ~0.75 cell), drawn with
-                    // fine 1px strides so the needle stays crisp. Tuple shape
-                    // matches `aterm_render::LASER_LAYERS`: (thickness×, coverage×,
-                    // white-mix base, white-mix ×pos).
+                    // fine 1px strides so the needle stays crisp. Tuple shape:
+                    // (thickness×, coverage×, white-mix base, white-mix ×pos).
                     const LASER_CORE: [(f32, f32, f32, f32); 3] = [
                         (2.9, 0.60, 0.0, 0.0),   // inner glow (pure hue)
                         (1.5, 0.95, 0.10, 0.0),  // beam body
@@ -19308,6 +19399,118 @@ mod tests {
         let mut dark = CursorGlow::default();
         dark.capture_ribbon_row(3, |_| panic!("a dark engine must not read a row"));
         assert_eq!(dark.witness_rows_n, 0);
+    }
+
+    #[test]
+    fn full_ribbon_row_budget_keeps_pending_source_and_caret_samples() {
+        let now = Instant::now();
+        let glow_cfg = cfg_for_style_name("rainbow kitty", true);
+        let cfg = rk::Config::from_glow(&glow_cfg, false);
+        let geom = Geom {
+            rows: 24,
+            win_h: 24 * u16::try_from(retina_geom().ch).unwrap(),
+            ..retina_geom()
+        };
+        let mut glow = CursorGlow::default();
+        glow.v2.set_engaged(true);
+        let (mut under, mut out, mut halos, mut beams, mut cues) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut tick = |glow: &mut CursorGlow, at| {
+            let mut frame = rk::Frame {
+                under: &mut under,
+                out: &mut out,
+                halos: &mut halos,
+                beams: &mut beams,
+                cues: &mut cues,
+                caret: rk::CaretSeam::default(),
+                companion: None,
+                fp: 0,
+            };
+            glow.v2.tick(at, geom, &cfg, &mut frame);
+        };
+
+        // Three separated live runs request exactly eight distinct rows:
+        // the current run, its two follow destinations, two older run rows,
+        // and three of their follow destinations. None may be traded for a
+        // pending key's source when the fixed ribbon budget fills.
+        glow.v2.on_event(
+            rk::Event::Move {
+                from: (3, 0),
+                to: (3, 4),
+                licence: rk::Licence::Typed,
+                dir: rk::Dir::Right,
+            },
+            now,
+        );
+        tick(&mut glow, now);
+        for (i, row) in [3u16, 5, 10].into_iter().enumerate() {
+            let at = now + ms(i as u64 + 1);
+            if row != 3 {
+                glow.v2.observe_caret((row, 4));
+                tick(&mut glow, at);
+            }
+            glow.v2.on_event(
+                rk::Event::Sweep {
+                    row,
+                    col0: 2,
+                    col1: 4,
+                },
+                at,
+            );
+            tick(&mut glow, at);
+        }
+        let mut engine_rows = [0u16; rk::witness::WITNESS_ROWS];
+        assert_eq!(
+            glow.v2.ribbon_rows_for(None, &mut engine_rows),
+            rk::witness::WITNESS_ROWS,
+            "the ribbon really fills all eight content slots"
+        );
+
+        // A temporarily parked caret can be outside every ribbon row and
+        // the unspent press can originate on a third row. The host samples
+        // the caret first, then the engine's list: the bands' eight rows,
+        // then the source and the rows one above and below it (its arming
+        // rows). All twelve rows must reach the same-frame witness and the
+        // source-prefix classifier.
+        let caret_row = 18;
+        let source_row = 20;
+        glow.last = Some((source_row, 4));
+        glow.type_hint.stamp(now);
+        let mut short = [0u16; rk::witness::WITNESS_ROWS];
+        assert_eq!(glow.ribbon_rows(&mut short), rk::witness::WITNESS_ROWS);
+        assert_eq!(
+            short, engine_rows,
+            "a short caller must fail closed, never evict a content row"
+        );
+        let mut wanted = [0u16; CURSOR_WITNESS_ROWS];
+        let n = glow.ribbon_rows(&mut wanted);
+        assert_eq!(n, rk::witness::WITNESS_ROWS + rk::witness::ARMING_ROWS);
+        assert_eq!(&wanted[..engine_rows.len()], &engine_rows);
+        assert_eq!(
+            wanted[engine_rows.len()..n],
+            [source_row, source_row - 1, source_row + 1],
+            "the source leads its arming rows"
+        );
+
+        glow.observe_ribbon_row(caret_row, &['c']);
+        for &row in &wanted[..n] {
+            glow.observe_ribbon_row(row, &['s']);
+        }
+        assert_eq!(glow.witness_rows_n, CURSOR_WITNESS_ROWS);
+        assert!(
+            glow.witness_rows[..glow.witness_rows_n]
+                .iter()
+                .any(|sample| sample.row == source_row),
+            "the pending key's source must be present for the cross-row proof"
+        );
+        assert!(
+            engine_rows
+                .iter()
+                .all(|row| glow.witness_rows[..glow.witness_rows_n]
+                    .iter()
+                    .any(|sample| sample.row == *row)),
+            "sourcing a pending key must not discard any ribbon content row"
+        );
     }
 
     #[test]

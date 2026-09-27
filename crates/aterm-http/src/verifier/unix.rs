@@ -9,11 +9,11 @@
 //! [`WebPkiServerVerifier`], which is already in the graph (`rustls-webpki`,
 //! via `rustls`) and needs no new package.
 //!
-//! # This file is COMPILED, and TESTED, on macOS too
+//! # This file is TESTED on macOS too
 //!
-//! It is not the selected arm there — [`super::apple`] is — but it is compiled
-//! on every Unix so that a Mac-only `cargo build` still type-checks it, and
-//! [`tests`] drives it natively: macOS ships `/etc/ssl/cert.pem`, which is the
+//! It is not the selected arm there — [`super::apple`] is — so a shipped Apple
+//! build does not carry it, but an Apple TEST build compiles it and [`tests`]
+//! drives it natively: macOS ships `/etc/ssl/cert.pem`, which is the
 //! same shape of multi-hundred-certificate OpenSSL bundle a Linux box has, so
 //! discovery, the tolerant PEM path and the chain math all execute for real.
 //! What that still does NOT cover is the exact set of paths a given distro puts

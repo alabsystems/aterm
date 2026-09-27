@@ -99,8 +99,7 @@ pub mod genome;
 /// THE HOST CONTRACT (`docs/DESIGN-host-boundary-2026-08-30.md` §3): the plain
 /// data every host — the macOS app, the JS pages, a headless capture — hands
 /// the effects driver for one frame (`HostFrameInput`, `TerminalFacts`) and
-/// gets back (`HostFrameOutput`, `Wake`, `PressOutcome`, `FrameEvent`). No
-/// platform type, `aterm_time::Instant` only.
+/// gets back (`PressOutcome`). No platform type, `aterm_time::Instant` only.
 pub mod host;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
 /// trail style — its art, pose, and exit choreography.
@@ -175,7 +174,7 @@ pub mod supernova;
 pub mod tone;
 /// Trail Packs — user-generated cursor trails compiled from bounded, fail-closed
 /// TOML into the `Copy` [`trail_pack::TrailParams`] the cursor-glow engine's
-/// custom interpreter drives (`docs/trail-packs-design.md`). The strict
+/// custom interpreter drives (`docs/trail-packs.md`). The strict
 /// contribution twin of the sparkle [`spec`] Toy Pack lane.
 pub mod trail_pack;
 pub mod trail_sound;

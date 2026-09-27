@@ -74,7 +74,7 @@ pub enum Damage {
 
 impl Damage {
     /// Create a new damage tracker with partial tracking.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     pub fn new(rows: u16) -> Self {
         Damage::Partial(DamageTracker::new(rows))
@@ -225,7 +225,7 @@ impl Damage {
     ///
     /// This is useful for GPU rendering where batching adjacent rows
     /// into rectangles reduces draw calls.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     pub fn iter_merged(&self, rows: u16, cols: u16) -> MergedDamageIterator<'_> {
         MergedDamageIterator::new(self, rows, cols)
     }

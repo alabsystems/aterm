@@ -88,23 +88,14 @@ impl std::fmt::Debug for TerminalMirror {
 
 /// Which window layer currently owns keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "host and overlay focus states land as their event paths migrate to WindowFocus"
-)]
 pub(crate) enum WindowFocus {
     Host,
     Content(ViewId),
-    Overlay,
 }
 
 /// Explicit native-view lifecycle. Only adjacent, forward transitions are
 /// accepted; stale async work cannot remount a closing or closed view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "lifecycle contract is consumed incrementally by mixed-leaf mounting and restore"
-)]
 pub(crate) enum ViewLifecycle {
     #[default]
     Created,

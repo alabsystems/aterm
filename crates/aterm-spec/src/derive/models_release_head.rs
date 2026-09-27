@@ -31,7 +31,7 @@ use super::*;
 /// the lease is held is outside the protocol and outside this model: GitHub offers no
 /// conditional PATCH, so nothing could close that race.
 ///
-/// Tier-1: `crates/aterm-release/tests/channel_latest.rs` drives the real
+/// Tier-1: `crates/aterm-release/tests/it/channel_latest.rs` drives the real
 /// `mirror::publish_on_channel` and `publish::prove_channel_head_is_older` against a fake
 /// GitHub, projecting its state onto these variables after every call.
 ///

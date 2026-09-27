@@ -492,11 +492,6 @@ impl<R: Read> DeflateReader<R> {
         }
     }
 
-    /// Consume the wrapper and return the source.
-    pub fn into_inner(self) -> R {
-        self.source
-    }
-
     /// Pull one chunk from the source into the input buffer. `Ok(false)` means
     /// the source is exhausted.
     fn refill(&mut self) -> io::Result<bool> {
@@ -718,11 +713,6 @@ impl<R: Read> GzipReader<R> {
             member_len: 0,
             members: 0,
         }
-    }
-
-    /// Consume the wrapper and return the source.
-    pub fn into_inner(self) -> R {
-        self.source
     }
 
     fn read_source(&mut self, sink: &mut Vec<u8>) -> io::Result<bool> {

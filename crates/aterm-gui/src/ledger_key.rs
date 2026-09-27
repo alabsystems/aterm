@@ -15,9 +15,10 @@
 //! `◇ quiet` summary. It is a CHILD PROCESS on purpose: the ledger gathers
 //! through the control socket like any driver would (`history`, `timeline`,
 //! `inbox --peek`), and doing that in-process on the main thread would park the
-//! event loop on its own socket. The child is pointed at THIS instance through
-//! `ATERM_CONTROL_SOCK`, so a nested or hand-launched instance reads its own
-//! sessions and never another's; the reply file is created `0600` by the CLI
+//! event loop on its own socket. The child is pointed at THIS instance by
+//! `drive --socket <this instance's socket>` ([`with_socket`]), so a nested or
+//! hand-launched instance reads its own sessions and never another's; the reply
+//! file is created `0600` by the CLI
 //! (a ledger carries what the manager typed and what the worker said).
 //!
 //! A headless instance (no OS window) composes the plan and launches nothing:
@@ -89,6 +90,20 @@ pub(crate) fn aterm_cli() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// `argv` (a `drive …` command line) pointed at the instance whose socket is
+/// `sock`: `drive --socket <sock> …`. A flag, not the environment — no variable
+/// selects a socket (2026-09-24).
+pub(crate) fn with_socket(argv: &[String], sock: Option<&str>) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len() + 2);
+    out.extend(argv.first().cloned());
+    if let Some(sock) = sock {
+        out.push("--socket".to_string());
+        out.push(sock.to_string());
+    }
+    out.extend(argv.iter().skip(1).cloned());
+    out
+}
+
 /// Run `plan` on a thread of its own — the ledger gathers over the control
 /// socket and can take seconds — and open the file once the CLI wrote it.
 /// `sock` is this instance's control socket, so the child reads THESE
@@ -102,10 +117,7 @@ pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
             crate::qos::set_self(crate::qos::Role::Background);
             let cli = aterm_cli();
             let mut cmd = std::process::Command::new(&cli);
-            cmd.args(&plan.argv);
-            if let Some(sock) = sock {
-                cmd.env("ATERM_CONTROL_SOCK", sock);
-            }
+            cmd.args(with_socket(&plan.argv, sock.as_deref()));
             match cmd.output() {
                 Ok(out) if out.status.success() => {
                     aterm_log::info!("ledger key: wrote {} for {}", plan.out.display(), plan.sid);
@@ -193,6 +205,12 @@ mod tests {
         assert_eq!(plan.sid, "s-1");
         assert_eq!(plan.argv[2], "@s-1");
         assert_eq!(plan.argv[6], plan.out.to_string_lossy());
+        // This instance's socket rides the argv as a `drive` flag.
+        assert_eq!(
+            with_socket(&plan.argv, Some("/run/aterm/aterm-7.sock"))[..4],
+            ["drive", "--socket", "/run/aterm/aterm-7.sock", "ledger"]
+        );
+        assert_eq!(with_socket(&plan.argv, None), plan.argv);
         // The front door, never the GUI binary.
         assert!(!aterm_cli().to_string_lossy().contains("aterm-gui"));
     }

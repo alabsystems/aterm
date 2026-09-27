@@ -10,10 +10,11 @@
 //! command = "aterm-link serve --fleet lab --broker /tmp/f.sock --cap-file ~/.config/aterm/fabric.cap"
 //! ```
 //!
-//! DEFAULT OFF, exactly like the embedded operator (`ATERM_OPERATOR=1`,
-//! `operator_host.rs:66-67`), and the env var `ATERM_FABRIC_COMMAND` overrides
-//! the config key the way every other launch knob in this process does
-//! (`flag > env > config > default`).
+//! DEFAULT OFF, exactly like the embedded operator (`[operator] enabled`,
+//! `operator_host::enabled`). The config key is the one spelling in a shipped
+//! aterm: `ATERM_FABRIC_COMMAND`, which used to override it, is a DEVELOPMENT
+//! seam since 2026-09-24 ([`aterm_types::dev_seam!`]) — the aterm-link e2e
+//! harness launches its debug instances with it, and a release build reads none.
 //!
 //! ## What the child gets, and what it does not
 //!
@@ -30,14 +31,16 @@
 //! PTY spawn seam runs (`aterm-pty`'s `build_child_env`), applied HERE because
 //! that one is a different seam and protects a different child. So aterm's
 //! identity (`ATERM_SESSION_ID`, `ATERM_LAUNCH_NONCE`), its control-socket path,
-//! the `ATERM_EDGE_READ`/`WRITE`/`SIGNAL` bearer secrets and `ATERM_EDGE_TOKENS`
-//! path, and the fabric credentials of an OUTER instance — `ATERM_LINK_BROKER`,
+//! its `ATERM_EDGE_TOKENS` path (and the retired `ATERM_EDGE_READ`/`WRITE`/`SIGNAL`
+//! bearer secrets, should an older outer aterm have injected them), and the
+//! fabric credentials of an OUTER instance — `ATERM_LINK_BROKER`,
 //! `ATERM_LINK_CAP_FILE`, `ATERM_LINK_FLEET` and `ATERM_FABRIC_COMMAND`, the four
 //! names `ENV_DENY_VARS` lists — do not reach it. Those four NAMES, and NOT the
 //! whole-prefix glob this header used to claim: `ENV_DENY_PREFIXES` carries no
 //! `ATERM_LINK_` rule, and the two other variables under that prefix are
 //! inherited ON PURPOSE — `ATERM_LINK_FAULT` and `ATERM_LINK_NOTIFY_FAULT` are
-//! the e2e harness's crash switches, which
+//! the e2e harness's crash switches (development seams: only a debug build's
+//! bridge reads them), which
 //! `the_bridge_child_inherits_no_identity_no_socket_and_no_edge_secret` REQUIRES
 //! to survive the filter. A future variable under that prefix that is a
 //! CREDENTIAL rather than a fault switch needs its own deny-list entry of its
@@ -66,8 +69,9 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// The env override for `[fabric] command`. Precedence is env > config, the same
-/// order every other launch knob in this process follows.
+/// A development build's override for `[fabric] command` (the e2e harness's): read
+/// only through [`aterm_types::dev_seam!`], so a shipped aterm has the config key
+/// alone.
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 
 /// The back-off between relaunches, and its ceiling. A bridge that fails at
@@ -97,8 +101,8 @@ const RELAUNCH_HEALTHY: Duration = Duration::from_secs(5);
 /// config.
 #[must_use]
 pub(crate) fn configured_command(config: &crate::app_config::Config) -> Option<Vec<String>> {
-    let raw = std::env::var(FABRIC_COMMAND_ENV)
-        .ok()
+    let raw = aterm_types::dev_seam!(FABRIC_COMMAND_ENV)
+        .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
             config
@@ -129,8 +133,9 @@ pub(crate) fn configured_command(config: &crate::app_config::Config) -> Option<V
 /// checks and sets under ONE lock, and `fabric attach` on an armed instance is
 /// refused rather than stacked.
 ///
-/// `configured` is what the instance was LAUNCHED with — `[fabric] command` or
-/// `$ATERM_FABRIC_COMMAND` as [`spawn_supervisor`] read them at startup —
+/// `configured` is what the instance was LAUNCHED with — `[fabric] command` (or a
+/// development build's `$ATERM_FABRIC_COMMAND` seam) as [`spawn_supervisor`] read
+/// it at startup —
 /// recorded so a bare `fabric attach` and `fabric status` can name it without
 /// the control thread re-reading the config file (the process-wide config
 /// service owns that read; see the note on `control::spawn`'s `network_config`).
@@ -399,11 +404,13 @@ fn launch_once(argv: &[String]) -> std::io::Result<std::process::Child> {
         // THE ENVIRONMENT IS FILTERED, not inherited whole. `Command` inherits the
         // parent block by default, which handed the one process holding
         // `Scope::Bridge` aterm's own identity, its control-socket path, and — when
-        // this aterm is itself nested — the OUTER instance's `ATERM_EDGE_*` bearer
-        // secrets, the very values audit finding F1 moved out of env into a 0600
-        // file. `env_clear` + the deny list is the same rule the PTY spawn seam
-        // applies to a child shell (`aterm-pty`'s `build_child_env`), applied at
-        // this seam because that one does not cover it.
+        // this aterm is itself nested — the OUTER instance's `ATERM_EDGE_TOKENS`
+        // path, plus the `ATERM_EDGE_*` bearer secrets themselves when that outer
+        // aterm is an older one that still injected them (audit finding F1 moved
+        // them into a 0600 file). `env_clear` + the deny list is the same rule
+        // the PTY spawn seam applies to a child shell (`aterm-pty`'s
+        // `build_child_env`), applied at this seam because that one does not
+        // cover it.
         .env_clear()
         .envs(filter_child_env(std::env::vars_os()))
         // The child's stdin is NOTHING. Its two real channels are fds 3 and 4,
@@ -564,8 +571,9 @@ mod tests {
         });
     }
 
-    /// The env var OVERRIDES the config key — `env > config`, the precedence
-    /// every other launch knob in this process follows.
+    /// In a development build (every test) the seam OVERRIDES the config key, so
+    /// the e2e harness can point a scratch instance at its bridge; a shipped
+    /// build compiles the read out.
     #[test]
     fn the_env_var_wins_over_the_config_key() {
         let cfg = with_command(Some("from-config --flag"));
@@ -667,9 +675,10 @@ mod tests {
     /// `Command` inherits the parent block by default and this seam applied no
     /// filter, so the one process holding `Scope::Bridge` also held — in a
     /// `/proc`-readable environment block — aterm's own identity, its
-    /// control-socket path, and, when this aterm is itself nested, the OUTER
-    /// instance's `ATERM_EDGE_READ`/`WRITE`/`SIGNAL` bearer secrets: the values
-    /// audit finding F1 deliberately moved out of env into a 0600 file. The module
+    /// control-socket path, and, when this aterm is itself nested under an older
+    /// aterm, the OUTER instance's `ATERM_EDGE_READ`/`WRITE`/`SIGNAL` bearer
+    /// secrets: the values audit finding F1 moved out of env into a 0600 file,
+    /// which an aterm from before that move still injects. The module
     /// header claimed the child got "none of aterm's own environment beyond what
     /// it needs" while it got all of it.
     #[test]
@@ -684,10 +693,11 @@ mod tests {
             pair("ATERM_EDGE_WRITE", "2233"),
             pair("ATERM_EDGE_SIGNAL", "4455"),
             pair("ATERM_EDGE_TOKENS", "/run/aterm/edge.tok"),
-            pair("ATERM_CONTROL_SOCK", "/run/aterm/ctl.sock"),
             pair("ATERM_SESSION_ID", "s-0123456789abcdef0123"),
             pair("ATERM_LAUNCH_NONCE", "0".repeat(32).as_str()),
             pair("ATERM_LINK_CAP_FILE", "/etc/aterm/outer.cap"),
+            pair("ATERM_LINK_BROKER", "/run/aterm/outer.sock"),
+            pair("ATERM_LINK_FLEET", "outer"),
             pair("ATERM_FABRIC_COMMAND", "aterm-link serve --fleet outer"),
             pair("ANTHROPIC_API_KEY", "sk-x"),
         ];
@@ -699,10 +709,11 @@ mod tests {
             "ATERM_EDGE_WRITE",
             "ATERM_EDGE_SIGNAL",
             "ATERM_EDGE_TOKENS",
-            "ATERM_CONTROL_SOCK",
             "ATERM_SESSION_ID",
             "ATERM_LAUNCH_NONCE",
             "ATERM_LINK_CAP_FILE",
+            "ATERM_LINK_BROKER",
+            "ATERM_LINK_FLEET",
             "ATERM_FABRIC_COMMAND",
             "ANTHROPIC_API_KEY",
         ] {
@@ -736,51 +747,6 @@ mod tests {
         assert!(
             production.contains(".envs(filter_child_env(std::env::vars_os()))"),
             "the child's environment must come through the deny-listed filter"
-        );
-    }
-
-    /// THE HEADER NAMES THE VARIABLES THAT ARE ACTUALLY DENIED.
-    ///
-    /// It used to claim the glob `ATERM_LINK_*`, and there is no `ATERM_LINK_`
-    /// prefix rule: `ENV_DENY_PREFIXES` does not contain one and `ENV_DENY_VARS`
-    /// denies four EXACT names. The two other variables under that prefix —
-    /// `ATERM_LINK_FAULT` and `ATERM_LINK_NOTIFY_FAULT` — pass straight through,
-    /// and the sibling test above REQUIRES that they do. A reader who took the
-    /// glob at face value would add the next `ATERM_LINK_*` credential without a
-    /// deny-list entry, because the header said the prefix was already covered.
-    /// aterm ships no evidence manifest, so this header IS the claim.
-    #[test]
-    fn the_header_names_the_denied_variables_rather_than_a_glob_it_does_not_enforce() {
-        let src = include_str!("fabric_launch.rs");
-        let header = src
-            .split_once(
-                "
-use std::process::",
-            )
-            .map(|(h, _)| h)
-            .expect("fabric_launch.rs keeps its module header");
-        assert!(
-            !header.contains("ATERM_LINK_*"),
-            "the header must not claim a prefix rule the filter does not have"
-        );
-        for denied in [
-            "ATERM_LINK_BROKER",
-            "ATERM_LINK_CAP_FILE",
-            "ATERM_LINK_FLEET",
-            "ATERM_FABRIC_COMMAND",
-        ] {
-            assert!(header.contains(denied), "the header omits {denied}");
-            assert!(
-                aterm_types::domain::is_ai_env_var(denied),
-                "{denied} is named as denied but the filter lets it through"
-            );
-        }
-        // And the deliberate keeper is named as one, because a reader who does not
-        // know it is deliberate will "fix" it.
-        assert!(header.contains("ATERM_LINK_FAULT"));
-        assert!(
-            !aterm_types::domain::is_ai_env_var("ATERM_LINK_FAULT"),
-            "the e2e harness relies on the child inheriting this"
         );
     }
 

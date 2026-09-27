@@ -95,11 +95,6 @@ pub(crate) struct InitializedJournal {
     pub(crate) durable_text: Arc<str>,
     pub(crate) image_fingerprint: ContentFingerprint,
     pub(crate) notice: Option<RecoveryNotice>,
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "only recovery diagnostics inspect this path")
-    )]
-    pub(crate) preserved_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -171,6 +166,29 @@ struct JournalEntry {
     next_rewrite_generation: u64,
     rewrite_inflight: Option<InflightRewrite>,
     pending_checkpoint: Option<SavedBaseline>,
+    /// The first snapshot this store published — the file contents the draft
+    /// was made against (the file at open, or the last verified save) — as a
+    /// fingerprint and a sequence. A re-seat keeps it: the text itself is read
+    /// back from the image on disk, never held twice in memory.
+    baseline: ContentFingerprint,
+    baseline_seq: Seq,
+    /// The image on disk may no longer be this store's own. An update's
+    /// successor republishes the journal of every document it restores, under
+    /// ITS sequence numbers; when that update rolls back, this process owns the
+    /// document again and must re-establish the image before it appends.
+    reseat_owed: bool,
+    reseat_inflight: Option<JournalReseatPlan>,
+    /// The last re-seat failed. It is retried at every drive, but a draft
+    /// whose journal keeps refusing is said out loud, not waited on in silence
+    /// ([`DraftCarryRefusal::ReseatFailed`]).
+    reseat_failed: bool,
+    /// The last append failed, and nothing has made the head durable since.
+    /// The update retries it itself before it asks
+    /// (`App::drive_owed_document_journals`), so the retry is on the worker
+    /// whenever the update reads this draft: without this fact a journal that
+    /// keeps refusing reads as one that is merely busy, and the update waits
+    /// on it in silence for good ([`DraftCarryRefusal::AppendFailed`]).
+    append_failed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +202,81 @@ pub(crate) enum JournalEffect {
         path: PathBuf,
         plan: JournalRewritePlan,
     },
+    Reseat {
+        path: PathBuf,
+        plan: JournalReseatPlan,
+    },
+}
+
+/// Re-establish this process's journal after an update's successor wrote over
+/// it (see [`JournalEntry::reseat_owed`]). The image is composed on the worker,
+/// under the journal lock, from what is actually on disk: the baseline snapshot
+/// is taken from the image found there when it is still this store's baseline,
+/// and anything found there that this store never held is preserved aside first.
+#[derive(Clone, Debug)]
+pub(crate) struct JournalReseatPlan {
+    pub(crate) generation: JournalRewriteGeneration,
+    pub(crate) document: DocumentId,
+    pub(crate) key: JournalDocumentKey,
+    /// The image this store last published. Still on disk means nothing to do.
+    pub(crate) ours: ContentFingerprint,
+    pub(crate) baseline: ContentFingerprint,
+    pub(crate) baseline_seq: Seq,
+    /// What this store last proved durable, and what it holds now: an image
+    /// that recovers to either is one this store already had.
+    pub(crate) durable_text: Arc<str>,
+    pub(crate) target_seq: Seq,
+    pub(crate) target_text: Arc<str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JournalReseatResult {
+    /// The image on disk is still the one this store published.
+    Unchanged,
+    /// A fresh image recovering to the plan's target was published. `baseline`
+    /// is its first snapshot: the plan's own when the image found on disk still
+    /// carried it, else the target itself (the file's baseline was not there to
+    /// copy, so a later open reports a disk conflict rather than replaying the
+    /// draft over contents it was not made against). `preserved` says whether
+    /// the image found there was set aside first.
+    Republished {
+        image: ContentFingerprint,
+        baseline: ContentFingerprint,
+        baseline_seq: Seq,
+        preserved: bool,
+    },
+    Failed(String),
+}
+
+/// Why a document's unsaved draft cannot be carried through an update right
+/// now, read from this store's memory alone (the disk half is
+/// [`verify_carried_draft`]). `Writing` and `Reseating` clear by themselves;
+/// the other two need something to change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DraftCarryRefusal {
+    /// The document has no journal in this process.
+    Unjournaled,
+    /// An append, checkpoint or re-seat is on the worker now.
+    Writing,
+    /// A re-seat is owed and has not run yet.
+    Reseating,
+    /// The last re-seat failed (it is retried, but not in silence).
+    ReseatFailed,
+    /// The last append failed and no write has landed since (it is retried,
+    /// but not in silence).
+    AppendFailed,
+    /// The latest edit is not durable, nothing is writing it and no write of
+    /// it failed: it was never planned (the drive itself refused, or the queue
+    /// was full and the retry is waiting for a slot).
+    Behind,
+}
+
+/// What this store vouches for about one document's head, for
+/// [`verify_carried_draft`] to check against the image on disk.
+#[derive(Clone, Debug)]
+pub(crate) struct DraftCarryCandidate {
+    pub(crate) path: PathBuf,
+    pub(crate) key: JournalDocumentKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +298,8 @@ pub(crate) enum JournalCompletion {
 pub(crate) struct DocumentJournalStore {
     host: DraftJournalHost,
     entries: BTreeMap<DocumentId, JournalEntry>,
+    /// See [`Self::set_reseat_fenced`].
+    reseat_fenced: bool,
 }
 
 impl DocumentJournalStore {
@@ -212,6 +307,7 @@ impl DocumentJournalStore {
         Ok(Self {
             host: DraftJournalHost::system_default()?,
             entries: BTreeMap::new(),
+            reseat_fenced: false,
         })
     }
 
@@ -220,6 +316,7 @@ impl DocumentJournalStore {
         Ok(Self {
             host: DraftJournalHost::new(root)?,
             entries: BTreeMap::new(),
+            reseat_fenced: false,
         })
     }
 
@@ -255,9 +352,112 @@ impl DocumentJournalStore {
                 next_rewrite_generation: 1,
                 rewrite_inflight: None,
                 pending_checkpoint: None,
+                baseline: ContentFingerprint::of(disk.text.as_bytes()),
+                baseline_seq: disk.seq,
+                reseat_owed: false,
+                reseat_inflight: None,
+                reseat_failed: false,
+                append_failed: false,
             },
         );
         Ok(initialized)
+    }
+
+    /// Owe a re-seat on every journal this store writes (see
+    /// [`JournalEntry::reseat_owed`]) and name the documents, so the host can
+    /// drive each one. The worker finds most images untouched and does nothing.
+    pub(crate) fn owe_reseat_all(&mut self) -> Vec<DocumentId> {
+        self.entries
+            .iter_mut()
+            .map(|(document, entry)| {
+                entry.reseat_owed = true;
+                *document
+            })
+            .collect()
+    }
+
+    /// Whether any journal write — an append, a checkpoint, a re-seat — is on
+    /// the worker now. An update may not start or commit over one: landing
+    /// after the successor read the image it restores from, it would publish
+    /// over (or onto) that image, and landing after Commit it would change the
+    /// image under the successor's own journal store.
+    pub(crate) fn writes_in_flight(&self) -> bool {
+        self.entries.values().any(entry_busy)
+    }
+
+    pub(crate) fn reseat_owed(&self, document: DocumentId) -> bool {
+        self.entries
+            .get(&document)
+            .is_some_and(|entry| entry.reseat_owed || entry.reseat_inflight.is_some())
+    }
+
+    /// Whether `document`'s last append or re-seat failed and nothing has
+    /// landed since ([`JournalEntry::append_failed`],
+    /// [`JournalEntry::reseat_failed`]).
+    pub(crate) fn write_failed(&self, document: DocumentId) -> bool {
+        self.entries.get(&document).is_some_and(|entry| {
+            (entry.append_failed && entry.desired.seq > entry.reducer.durable_seq())
+                || (entry.reseat_failed && (entry.reseat_owed || entry.reseat_inflight.is_some()))
+        })
+    }
+
+    /// Documents whose journal owes work nothing is doing: a re-seat, or a
+    /// head the last (failed) append never made durable. The host drives each
+    /// before it asks whether a draft can be carried, so a transient failure
+    /// is retried instead of holding the update until the next keystroke.
+    pub(crate) fn owed_documents(&self) -> Vec<DocumentId> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry_busy(entry)
+                    && (entry.reseat_owed || entry.desired.seq > entry.reducer.durable_seq())
+            })
+            .map(|(document, _)| *document)
+            .collect()
+    }
+
+    /// The memory half of carrying `head` through an update: this store has
+    /// proved `head` durable — its latest append or checkpoint reduced at
+    /// exactly this sequence — and nothing is writing, owed or failed. The disk
+    /// half, what the image actually recovers to, is [`verify_carried_draft`].
+    pub(crate) fn carry_candidate(
+        &self,
+        head: &DocumentSnapshot,
+    ) -> Result<DraftCarryCandidate, DraftCarryRefusal> {
+        let entry = self
+            .entries
+            .get(&head.id)
+            .ok_or(DraftCarryRefusal::Unjournaled)?;
+        if entry.reseat_failed && (entry.reseat_owed || entry.reseat_inflight.is_some()) {
+            // Checked before "writing": the retry is usually on the worker when
+            // the update asks, and a journal that keeps refusing must not read
+            // as one that is merely busy.
+            return Err(DraftCarryRefusal::ReseatFailed);
+        }
+        if entry.append_failed && entry.desired.seq > entry.reducer.durable_seq() {
+            // Before "writing" for the same reason: the update drives the retry
+            // of a failed append the moment before it asks, so a journal that
+            // keeps refusing is always on the worker when asked.
+            return Err(DraftCarryRefusal::AppendFailed);
+        }
+        if entry_busy(entry) {
+            return Err(DraftCarryRefusal::Writing);
+        }
+        if entry.reseat_owed {
+            return Err(DraftCarryRefusal::Reseating);
+        }
+        if entry.pending_checkpoint.is_some() {
+            // A verified save is queued to prune the journal: the next drive
+            // writes it.
+            return Err(DraftCarryRefusal::Writing);
+        }
+        if entry.desired.seq != head.seq || entry.reducer.durable_seq() != head.seq {
+            return Err(DraftCarryRefusal::Behind);
+        }
+        Ok(DraftCarryCandidate {
+            path: entry.path.clone(),
+            key: entry.key,
+        })
     }
 
     pub(crate) fn observe_commit(&mut self, snapshot: &DocumentSnapshot) -> Result<(), String> {
@@ -299,15 +499,55 @@ impl DocumentJournalStore {
         Ok(())
     }
 
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Plan",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn next_effect(
         &mut self,
         document: DocumentId,
     ) -> Result<Option<JournalEffect>, String> {
+        let reseat_fenced = self.reseat_fenced;
         let Some(entry) = self.entries.get_mut(&document) else {
             return Err("document journal was not initialized".to_string());
         };
-        if entry.append_text.is_some() || entry.rewrite_inflight.is_some() {
+        if entry_busy(entry) {
             return Ok(None);
+        }
+        // FIRST, because every other effect is bound to an image this store
+        // published: an append or checkpoint planned over a successor's image
+        // can only fail its preflight. While the fence stands, nothing is
+        // planned at all — the owed re-seat runs first once it falls.
+        if entry.reseat_owed && reseat_fenced {
+            return Ok(None);
+        }
+        if entry.reseat_owed {
+            let generation = JournalRewriteGeneration(entry.next_rewrite_generation);
+            entry.next_rewrite_generation = entry
+                .next_rewrite_generation
+                .checked_add(1)
+                .ok_or_else(|| "journal re-seat generation exhausted".to_string())?;
+            let plan = JournalReseatPlan {
+                generation,
+                document,
+                key: entry.key,
+                ours: entry.durable_image,
+                baseline: entry.baseline,
+                baseline_seq: entry.baseline_seq,
+                durable_text: entry.durable_text.clone(),
+                target_seq: entry.desired.seq,
+                target_text: entry.desired.text.clone(),
+            };
+            entry.reseat_owed = false;
+            entry.reseat_inflight = Some(plan.clone());
+            return Ok(Some(JournalEffect::Reseat {
+                path: entry.path.clone(),
+                plan,
+            }));
         }
         if let Some(saved) = entry.pending_checkpoint.take() {
             let generation = JournalRewriteGeneration(entry.next_rewrite_generation);
@@ -365,6 +605,14 @@ impl DocumentJournalStore {
         }))
     }
 
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Refuse",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn complete_append(
         &mut self,
         document: DocumentId,
@@ -386,6 +634,7 @@ impl DocumentJournalStore {
                 if let Some(fingerprint) = published_image {
                     entry.durable_image = fingerprint;
                 }
+                entry.append_failed = false;
                 JournalCompletion::Durable {
                     document,
                     seq: checkpoint.seq,
@@ -393,6 +642,7 @@ impl DocumentJournalStore {
             }
             JournalReduction::Failed { stage, message } => {
                 entry.append_text = None;
+                entry.append_failed = true;
                 JournalCompletion::Failed {
                     document,
                     message: format!("journal append failed at {stage:?}: {message}"),
@@ -400,6 +650,7 @@ impl DocumentJournalStore {
             }
             JournalReduction::Cancelled => {
                 entry.append_text = None;
+                entry.append_failed = true;
                 JournalCompletion::Failed {
                     document,
                     message: "journal append was cancelled".to_string(),
@@ -483,11 +734,10 @@ impl DocumentJournalStore {
         if plan.plan.generation != generation {
             return JournalCompletion::Stale;
         }
-        let plan = entry
+        let InflightRewrite { plan, checkpoint } = entry
             .rewrite_inflight
             .take()
-            .expect("generation checked against live rewrite")
-            .plan;
+            .expect("generation checked against live rewrite");
         match result {
             JournalRewriteResult::Committed(proof) if plan.verifies(proof) => {
                 entry.reducer =
@@ -495,6 +745,10 @@ impl DocumentJournalStore {
                 entry.durable_text = plan.target_text;
                 entry.durable_image = plan.fingerprint;
                 entry.append_text = None;
+                entry.append_failed = false;
+                // The verified save is the image's first snapshot now.
+                entry.baseline = ContentFingerprint::of(checkpoint.text.as_bytes());
+                entry.baseline_seq = checkpoint.seq;
                 JournalCompletion::Durable {
                     document,
                     seq: plan.target_seq,
@@ -511,11 +765,263 @@ impl DocumentJournalStore {
         }
     }
 
+    /// Reduce a re-seat. `Unchanged` is no news (`Stale`: nothing new is
+    /// durable, and the caller drives on); `Republished` makes the fresh image
+    /// this store's own, under its own sequence numbers; a failure owes the
+    /// re-seat again, so the next drive retries it.
+    pub(crate) fn complete_reseat(
+        &mut self,
+        document: DocumentId,
+        generation: JournalRewriteGeneration,
+        result: JournalReseatResult,
+    ) -> JournalCompletion {
+        let Some(entry) = self.entries.get_mut(&document) else {
+            return JournalCompletion::Stale;
+        };
+        if entry
+            .reseat_inflight
+            .as_ref()
+            .is_none_or(|plan| plan.generation != generation)
+        {
+            return JournalCompletion::Stale;
+        }
+        let plan = entry
+            .reseat_inflight
+            .take()
+            .expect("generation checked against live re-seat");
+        entry.reseat_failed = matches!(result, JournalReseatResult::Failed(_));
+        match result {
+            JournalReseatResult::Unchanged => JournalCompletion::Stale,
+            JournalReseatResult::Republished {
+                image,
+                baseline,
+                baseline_seq,
+                preserved: _,
+            } => {
+                entry.reducer =
+                    DraftJournalReducer::new_with_key(document, entry.key, plan.target_seq);
+                entry.durable_text = plan.target_text;
+                entry.durable_image = image;
+                entry.baseline = baseline;
+                entry.baseline_seq = baseline_seq;
+                entry.append_failed = false;
+                JournalCompletion::Durable {
+                    document,
+                    seq: plan.target_seq,
+                }
+            }
+            JournalReseatResult::Failed(message) => {
+                entry.reseat_owed = true;
+                JournalCompletion::Failed {
+                    document,
+                    message: format!("journal re-seat failed: {message}"),
+                }
+            }
+        }
+    }
+
+    /// Put back a re-seat that never crossed the worker queue boundary.
+    pub(crate) fn defer_reseat(
+        &mut self,
+        document: DocumentId,
+        generation: JournalRewriteGeneration,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&document) else {
+            return false;
+        };
+        if entry
+            .reseat_inflight
+            .as_ref()
+            .is_none_or(|plan| plan.generation != generation)
+        {
+            return false;
+        }
+        entry.reseat_inflight = None;
+        entry.reseat_owed = true;
+        true
+    }
+
+    /// While an update's successor may be restoring documents from these
+    /// journals, no re-seat is planned: it would publish over the image the
+    /// successor restored from, and the outgoing process's Commit check reads
+    /// that image as the successor's copy. The host raises the fence for the
+    /// life of a handoff attempt and lowers it once the attempt is over.
+    pub(crate) fn set_reseat_fenced(&mut self, fenced: bool) {
+        self.reseat_fenced = fenced;
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_seq(&self, document: DocumentId) -> Option<Seq> {
         self.entries
             .get(&document)
             .map(|entry| entry.reducer.durable_seq())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn journal_path(&self, document: DocumentId) -> Option<PathBuf> {
+        self.entries.get(&document).map(|entry| entry.path.clone())
+    }
+
+    /// The image this store last published for `document`.
+    #[cfg(test)]
+    pub(crate) fn durable_image(&self, document: DocumentId) -> Option<ContentFingerprint> {
+        self.entries.get(&document).map(|entry| entry.durable_image)
+    }
+}
+
+/// Take the journal's advisory lock for as long as the returned handle lives —
+/// how a test makes a peer's (a successor's) journal publication refuse busy.
+#[cfg(test)]
+pub(crate) fn hold_journal_lock_for_test(path: &Path) -> File {
+    let lock = open_journal_lock(&journal_lock_path(path).expect("journal lock path"))
+        .expect("open journal lock");
+    lock.lock().expect("take journal lock");
+    lock
+}
+
+fn entry_busy(entry: &JournalEntry) -> bool {
+    entry.append_text.is_some()
+        || entry.rewrite_inflight.is_some()
+        || entry.reseat_inflight.is_some()
+}
+
+/// The disk half of carrying a draft through an update: read the journal image
+/// as the successor will (bounded, no-follow, regular file only), replay it
+/// (every record's checksum is checked on the way), and require that it
+/// recovers to EXACTLY `head` — byte for byte, which no digest improves on —
+/// against the file contents `disk` names, the same test the successor's open
+/// makes before it replays a draft ([`DraftJournalHost::inspect_open`]).
+///
+/// At an update's Commit this reads the successor's own work: a successor
+/// republishes the journal of every document it restores with the text it
+/// restored, so an image that still recovers to `head` is the proof the
+/// successor holds this buffer (or, when its restore failed, that the journal
+/// its Recovery tab reopens does).
+pub(crate) fn verify_carried_draft(
+    candidate: &DraftCarryCandidate,
+    head: &str,
+    disk: ContentFingerprint,
+) -> Result<(), String> {
+    let bytes = read_existing_journal(&candidate.path, "the draft journal")?;
+    let recovered = recover_journal_for(candidate.key, &bytes)
+        .map_err(|error| format!("the draft journal does not replay ({error:?})"))?;
+    if recovered.text.as_bytes() != head.as_bytes() {
+        return Err("the draft journal does not hold the editor's current text".to_string());
+    }
+    if recovered.base_content != disk {
+        return Err(
+            "the draft journal was made against different file contents than are on disk"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The first snapshot of a journal image for `key` — the file contents its
+/// draft was made against. `None` for an image that does not decode, belongs
+/// to another document, or does not open with a snapshot.
+fn journal_baseline_text(key: JournalDocumentKey, bytes: &[u8]) -> Option<String> {
+    let records = crate::native_document_io::decode_journal(bytes).ok()?;
+    let first = records.into_iter().next()?;
+    if !first.belongs_to_key(key) {
+        return None;
+    }
+    match first.payload {
+        crate::native_document_io::JournalPayload::Snapshot(text) => Some(text),
+        crate::native_document_io::JournalPayload::Delta(_) => None,
+    }
+}
+
+/// `patience` carries the caller's thread, exactly as in [`execute_journal_append`].
+///
+/// Under the journal lock: an image that is still this store's is left alone;
+/// anything else is replaced by `[baseline, target]` — the baseline copied from
+/// the image found there when it is still this store's baseline — after that
+/// image is preserved aside unless it holds nothing this store did not have
+/// (its text is the store's durable text, its target, or its own baseline).
+/// Nothing is deleted on any path.
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "NativeUpdateEditorCarry",
+        action = "Reseat",
+        project = "aterm_gui::editor_carry_conformance::Rig::project"
+    )
+)]
+pub(crate) fn execute_journal_reseat(
+    path: &Path,
+    plan: &JournalReseatPlan,
+    patience: JournalLockPatience,
+) -> JournalReseatResult {
+    let result = with_journal_lock(path, patience, || {
+        let existing = read_journal_image(path).map_err(|error| format!("preflight: {error}"))?;
+        let found = existing
+            .as_deref()
+            .map_or_else(JournalImageGeneration::missing, JournalImageGeneration::of);
+        if found.exists && found.fingerprint == plan.ours {
+            return Ok(None);
+        }
+        let found_baseline = existing
+            .as_deref()
+            .and_then(|bytes| journal_baseline_text(plan.key, bytes));
+        let recovered = existing
+            .as_deref()
+            .and_then(|bytes| recover_journal_for(plan.key, bytes).ok());
+        let holds_nothing_new = recovered.as_ref().is_some_and(|recovered| {
+            recovered.text == *plan.durable_text
+                || recovered.text == *plan.target_text
+                || found_baseline
+                    .as_deref()
+                    .is_some_and(|baseline| recovered.text == baseline)
+        });
+        let preserved = found.exists && !holds_nothing_new;
+        if preserved {
+            preserve_journal_locked(path, found)?;
+        }
+        let baseline =
+            found_baseline.filter(|text| ContentFingerprint::of(text.as_bytes()) == plan.baseline);
+        let target = synthetic_snapshot(plan.document, plan.target_seq, plan.target_text.clone());
+        let (records, baseline_fingerprint, baseline_seq) = match baseline {
+            Some(text) if text.as_str() != &*plan.target_text => {
+                let base = synthetic_snapshot(plan.document, plan.baseline_seq, Arc::from(text));
+                (
+                    vec![
+                        JournalRecord::snapshot_for(plan.key, &base),
+                        JournalRecord::snapshot_for(plan.key, &target),
+                    ],
+                    plan.baseline,
+                    plan.baseline_seq,
+                )
+            }
+            Some(_) => (
+                vec![JournalRecord::snapshot_for(plan.key, &target)],
+                plan.baseline,
+                plan.target_seq,
+            ),
+            None => (
+                vec![JournalRecord::snapshot_for(plan.key, &target)],
+                ContentFingerprint::of(plan.target_text.as_bytes()),
+                plan.target_seq,
+            ),
+        };
+        let bytes = encode_journal(&records).map_err(|error| format!("encode: {error:?}"))?;
+        atomic_replace_locked(path, &bytes, found).map_err(|error| error.to_string())?;
+        Ok(Some((
+            ContentFingerprint::of(&bytes),
+            baseline_fingerprint,
+            baseline_seq,
+            preserved,
+        )))
+    });
+    match result {
+        Ok(None) => JournalReseatResult::Unchanged,
+        Ok(Some((image, baseline, baseline_seq, preserved))) => JournalReseatResult::Republished {
+            image,
+            baseline,
+            baseline_seq,
+            preserved,
+        },
+        Err(message) => JournalReseatResult::Failed(message),
     }
 }
 
@@ -523,9 +1029,6 @@ fn synthetic_snapshot(document: DocumentId, seq: Seq, text: Arc<str>) -> Documen
     DocumentSnapshot {
         id: document,
         seq,
-        file_version: crate::document_store::FileVersion {
-            content_fingerprint: ContentFingerprint::of(text.as_bytes()).0,
-        },
         text,
     }
 }
@@ -711,28 +1214,21 @@ impl DraftJournalHost {
         }
         let bytes = encode_journal(&records).map_err(|error| format!("{error:?}"))?;
         let image_fingerprint = ContentFingerprint::of(&bytes);
-        let preserved_path = with_journal_lock(
-            &decision.path,
-            JournalLockPatience::EventLoop,
-            || {
-                let current = observe_journal_image(&decision.path)?;
-                if current != decision.expected_image {
-                    return Err(format!(
-                        "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
+        with_journal_lock(&decision.path, JournalLockPatience::EventLoop, || {
+            let current = observe_journal_image(&decision.path)?;
+            if current != decision.expected_image {
+                return Err(format!(
+                    "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
                      the document before initializing recovery",
-                        decision.expected_image, current
-                    ));
-                }
-                let preserved = if decision.preserve_existing && current.exists {
-                    Some(self.preserve_locked(&decision.path, current)?)
-                } else {
-                    None
-                };
-                atomic_replace_locked(&decision.path, &bytes, current)
-                    .map_err(|error| error.to_string())?;
-                Ok(preserved)
-            },
-        )?;
+                    decision.expected_image, current
+                ));
+            }
+            if decision.preserve_existing && current.exists {
+                self.preserve_locked(&decision.path, current)?;
+            }
+            atomic_replace_locked(&decision.path, &bytes, current)
+                .map_err(|error| error.to_string())
+        })?;
         Ok(InitializedJournal {
             key: decision.key,
             path: decision.path,
@@ -740,7 +1236,6 @@ impl DraftJournalHost {
             durable_text: current.text.clone(),
             image_fingerprint,
             notice: decision.notice,
-            preserved_path,
         })
     }
 
@@ -748,41 +1243,50 @@ impl DraftJournalHost {
         self.root.join(format!("{:016x}.atdj", key.0))
     }
 
-    fn preserve_locked(
-        &self,
-        path: &Path,
-        expected: JournalImageGeneration,
-    ) -> Result<PathBuf, String> {
-        let stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("draft");
-        for suffix in 1..=10_000_u32 {
-            let candidate = self.root.join(format!("{stem}.preserved-{suffix}.atdj"));
-            match fs::hard_link(path, &candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(format!("could not preserve recovery journal: {error}"));
-                }
-            }
-            let preserved = observe_journal_image(&candidate);
-            if !matches!(preserved, Ok(actual) if actual == expected) {
-                let _ = fs::remove_file(&candidate);
-                return Err(match preserved {
-                    Ok(actual) => format!(
-                        "journal changed while preserving it (expected {expected:?}, found \
-                         {actual:?})"
-                    ),
-                    Err(error) => format!("could not validate preserved recovery journal: {error}"),
-                });
-            }
-            sync_directory(&self.root)
-                .map_err(|error| format!("could not sync preserved recovery journal: {error}"))?;
-            return Ok(candidate);
-        }
-        Err("too many preserved recovery journals for this document".to_string())
+    /// Set the existing journal aside as `<stem>.preserved-<n>.atdj`, the first
+    /// free `n`, beside the live one.
+    fn preserve_locked(&self, path: &Path, expected: JournalImageGeneration) -> Result<(), String> {
+        debug_assert_eq!(path.parent(), Some(self.root.as_path()));
+        preserve_journal_locked(path, expected)
     }
+}
+
+/// [`DraftJournalHost::preserve_locked`] for a caller holding only the path —
+/// the worker's re-seat ([`execute_journal_reseat`]). The preserved copy is a
+/// hard link beside the live journal, verified to be `expected` before the
+/// directory is synced; the caller holds the journal lock.
+fn preserve_journal_locked(path: &Path, expected: JournalImageGeneration) -> Result<(), String> {
+    let root = path
+        .parent()
+        .ok_or_else(|| "journal has no parent directory".to_string())?;
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("draft");
+    for suffix in 1..=10_000_u32 {
+        let candidate = root.join(format!("{stem}.preserved-{suffix}.atdj"));
+        match fs::hard_link(path, &candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("could not preserve recovery journal: {error}"));
+            }
+        }
+        let preserved = observe_journal_image(&candidate);
+        if !matches!(preserved, Ok(actual) if actual == expected) {
+            let _ = fs::remove_file(&candidate);
+            return Err(match preserved {
+                Ok(actual) => format!(
+                    "journal changed while preserving it (expected {expected:?}, found \
+                     {actual:?})"
+                ),
+                Err(error) => format!("could not validate preserved recovery journal: {error}"),
+            });
+        }
+        return sync_directory(root)
+            .map_err(|error| format!("could not sync preserved recovery journal: {error}"));
+    }
+    Err("too many preserved recovery journals for this document".to_string())
 }
 
 /// `patience` is the CALLER's declaration of which thread it is on, because that
@@ -1006,32 +1510,12 @@ fn test_draft_owner_is_alive(pid: u32) -> bool {
     }
 }
 
+/// aterm's shared per-user state root — the ONE rule
+/// ([`aterm_types::dirs::state_dir`]), so the journal, the operator and the
+/// session identities never disagree about the directory.
 #[cfg(not(test))]
 fn default_state_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("ATERM_STATE_HOME") {
-        return Some(PathBuf::from(root));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join("Library/Application Support/aterm"))
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|root| root.join("aterm"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(root) = std::env::var_os("XDG_STATE_HOME") {
-            return Some(PathBuf::from(root).join("aterm"));
-        }
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".local/state/aterm"))
-    }
+    aterm_types::dirs::state_dir()
 }
 
 #[cfg(unix)]
@@ -2093,17 +2577,19 @@ mod tests {
         let (other_store, _, external) = snapshots("external");
         let preserved =
             settle_busy(|| host.initialize(conflict.clone(), &external, &external)).unwrap();
-        assert_eq!(
-            fs::read(preserved.preserved_path.unwrap()).unwrap(),
-            original
-        );
+        let preserved_copy = |n: u32| {
+            let stem = preserved.path.file_stem().unwrap().to_str().unwrap();
+            root.join(format!("{stem}.preserved-{n}.atdj"))
+        };
+        assert_eq!(fs::read(preserved_copy(1)).unwrap(), original);
         drop(other_store);
 
         fs::write(&preserved.path, b"torn").unwrap();
         let corrupt = host.inspect_open(canonical, b"external").unwrap();
         assert!(matches!(corrupt.notice, Some(RecoveryNotice::Corrupt(_))));
         let kept = settle_busy(|| host.initialize(corrupt.clone(), &external, &external)).unwrap();
-        assert_eq!(fs::read(kept.preserved_path.unwrap()).unwrap(), b"torn");
+        assert_eq!(fs::read(preserved_copy(2)).unwrap(), b"torn");
+        assert_eq!(kept.path, preserved.path);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2798,5 +3284,321 @@ mod tests {
                 "single_edit diverged on {before:?} -> {after:?}"
             );
         }
+    }
+
+    /// One outgoing store with one journaled edit ("disk" → "disk+"), ready to
+    /// meet whatever an update's successor left in its journal.
+    fn journaled_edit(
+        name: &str,
+    ) -> (
+        PathBuf,
+        DocumentJournalStore,
+        DocumentStore,
+        DocumentId,
+        DocumentSnapshot,
+        PathBuf,
+        JournalDocumentKey,
+    ) {
+        let root = test_root(name);
+        let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
+        let (mut store, id, disk) = snapshots("disk");
+        let decision = journals
+            .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
+            .unwrap();
+        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let _ = store.transact(
+            id,
+            disk.seq,
+            vec![TextEdit {
+                range: 4..4,
+                insert: "+".into(),
+            }],
+        );
+        journals
+            .observe_commit(&store.snapshot(id).unwrap())
+            .unwrap();
+        let JournalEffect::Append { path, key, plan } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("the edit is appended")
+        };
+        let result = execute_journal_append(&path, key, &plan, JournalLockPatience::Worker);
+        assert!(matches!(
+            journals.complete_append(id, plan.generation, result),
+            JournalCompletion::Durable { .. }
+        ));
+        (root, journals, store, id, disk, path, key)
+    }
+
+    fn run_reseat(
+        journals: &mut DocumentJournalStore,
+        id: DocumentId,
+    ) -> (JournalReseatResult, JournalCompletion) {
+        assert_eq!(journals.owe_reseat_all(), vec![id]);
+        let JournalEffect::Reseat { path, plan } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("an owed re-seat runs before anything else")
+        };
+        let result = execute_journal_reseat(&path, &plan, JournalLockPatience::Worker);
+        let completion = journals.complete_reseat(id, plan.generation, result.clone());
+        (result, completion)
+    }
+
+    fn preserved_images(root: &Path) -> Vec<Vec<u8>> {
+        let mut preserved = fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".preserved-"))
+            .map(|entry| fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        preserved.sort();
+        preserved
+    }
+
+    /// Its own image still on disk: the re-seat touches nothing.
+    #[test]
+    fn a_reseat_leaves_this_stores_own_image_alone() {
+        let (root, mut journals, _store, id, _disk, path, _key) = journaled_edit("reseat-own");
+        let before = fs::read(&path).unwrap();
+        let (result, completion) = run_reseat(&mut journals, id);
+        assert_eq!(result, JournalReseatResult::Unchanged);
+        assert_eq!(completion, JournalCompletion::Stale);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!journals.reseat_owed(id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A successor republished the image (its own sequence numbers, the same
+    /// draft): the re-seat puts back `[baseline, head]` under this store's
+    /// sequences, preserves nothing (it held nothing new), and the next append
+    /// lands where the successor's image made every append fail.
+    #[test]
+    fn a_reseat_takes_back_a_successors_republication() {
+        let (root, mut journals, mut store, id, disk, path, key) =
+            journaled_edit("reseat-successor");
+        let head = store.snapshot(id).unwrap();
+        // The successor's restore: a fresh store over the same file replays the
+        // draft and republishes it.
+        let mut successor = DocumentJournalStore::for_test(root.clone()).unwrap();
+        let (mut theirs, their_id, their_disk) = snapshots("disk");
+        let decision = successor
+            .inspect_open("file:///tmp/draft.md", their_disk.text.as_bytes())
+            .unwrap();
+        assert_eq!(decision.recovered_text.as_deref(), Some("disk+"));
+        let _ = theirs.transact(
+            their_id,
+            their_disk.seq,
+            vec![TextEdit {
+                range: 0..4,
+                insert: "disk+".into(),
+            }],
+        );
+        let their_current = theirs.snapshot(their_id).unwrap();
+        settle_busy(|| successor.initialize(decision.clone(), &their_disk, &their_current))
+            .unwrap();
+        let republished = fs::read(&path).unwrap();
+
+        // The outgoing store's next append now fails against that image…
+        let _ = store.transact(
+            id,
+            head.seq,
+            vec![TextEdit {
+                range: 5..5,
+                insert: "!".into(),
+            }],
+        );
+        journals
+            .observe_commit(&store.snapshot(id).unwrap())
+            .unwrap();
+        let JournalEffect::Append { plan, .. } = journals.next_effect(id).unwrap().unwrap() else {
+            panic!("an append")
+        };
+        let refused = execute_journal_append(&path, key, &plan, JournalLockPatience::Worker);
+        assert!(matches!(
+            journals.complete_append(id, plan.generation, refused),
+            JournalCompletion::Failed { .. }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), republished, "and changes nothing");
+
+        // …and the re-seat takes it back.
+        let (result, completion) = run_reseat(&mut journals, id);
+        let JournalReseatResult::Republished {
+            baseline,
+            preserved,
+            ..
+        } = result
+        else {
+            panic!("the successor's image is replaced: {result:?}")
+        };
+        assert!(!preserved, "the successor's image held nothing new");
+        assert_eq!(baseline, ContentFingerprint::of(disk.text.as_bytes()));
+        let latest = store.snapshot(id).unwrap();
+        assert_eq!(
+            completion,
+            JournalCompletion::Durable {
+                document: id,
+                seq: latest.seq
+            }
+        );
+        let recovered = recover_journal_for(key, &fs::read(&path).unwrap()).unwrap();
+        assert_eq!(recovered.text, "disk+!", "the latest edit is durable");
+        assert_eq!(
+            recovered.base_content,
+            ContentFingerprint::of(b"disk"),
+            "over the file it was made against"
+        );
+        assert!(preserved_images(&root).is_empty());
+
+        // The journal writes again.
+        let _ = store.transact(
+            id,
+            latest.seq,
+            vec![TextEdit {
+                range: 6..6,
+                insert: "?".into(),
+            }],
+        );
+        journals
+            .observe_commit(&store.snapshot(id).unwrap())
+            .unwrap();
+        let JournalEffect::Append { plan, .. } = journals.next_effect(id).unwrap().unwrap() else {
+            panic!("an append")
+        };
+        let landed = execute_journal_append(&path, key, &plan, JournalLockPatience::Worker);
+        assert!(matches!(
+            journals.complete_append(id, plan.generation, landed),
+            JournalCompletion::Durable { .. }
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An image holding a draft this store never had is preserved aside before
+    /// the re-seat replaces it; one whose baseline is not this store's leaves
+    /// the target as its own baseline. Nothing is deleted on either path.
+    #[test]
+    fn a_reseat_preserves_what_it_never_had() {
+        let (root, mut journals, store, id, _disk, path, key) = journaled_edit("reseat-foreign");
+        let head = store.snapshot(id).unwrap();
+        let foreign = encode_journal(&[
+            JournalRecord::snapshot_for(key, &synthetic_snapshot(id, Seq(1), Arc::from("disk"))),
+            JournalRecord::snapshot_for(
+                key,
+                &synthetic_snapshot(id, Seq(2), Arc::from("someone else's draft")),
+            ),
+        ])
+        .unwrap();
+        fs::write(&path, &foreign).unwrap();
+        let (result, _) = run_reseat(&mut journals, id);
+        assert!(
+            matches!(
+                result,
+                JournalReseatResult::Republished {
+                    preserved: true,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        assert_eq!(preserved_images(&root), vec![foreign]);
+        let recovered = recover_journal_for(key, &fs::read(&path).unwrap()).unwrap();
+        assert_eq!(recovered.text, *head.text);
+        assert_eq!(recovered.base_content, ContentFingerprint::of(b"disk"));
+
+        // A baseline that is not this store's: the target is the baseline now,
+        // and the image (which holds no draft of its own) is not preserved.
+        let other_base = encode_journal(&[JournalRecord::snapshot_for(
+            key,
+            &synthetic_snapshot(id, Seq(1), Arc::from("changed on disk")),
+        )])
+        .unwrap();
+        fs::write(&path, &other_base).unwrap();
+        let (result, _) = run_reseat(&mut journals, id);
+        let JournalReseatResult::Republished {
+            baseline,
+            preserved,
+            ..
+        } = result
+        else {
+            panic!("{result:?}")
+        };
+        assert!(!preserved);
+        assert_eq!(baseline, ContentFingerprint::of(head.text.as_bytes()));
+        assert_eq!(preserved_images(&root).len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// While the fence stands (an update attempt is in flight) an owed re-seat
+    /// is not planned, and neither is anything behind it.
+    #[test]
+    fn a_fenced_reseat_holds_every_effect() {
+        let (root, mut journals, mut store, id, _disk, _path, _key) =
+            journaled_edit("reseat-fenced");
+        let head = store.snapshot(id).unwrap();
+        journals.owe_reseat_all();
+        journals.set_reseat_fenced(true);
+        let _ = store.transact(
+            id,
+            head.seq,
+            vec![TextEdit {
+                range: 0..0,
+                insert: ">".into(),
+            }],
+        );
+        journals
+            .observe_commit(&store.snapshot(id).unwrap())
+            .unwrap();
+        assert!(journals.next_effect(id).unwrap().is_none());
+        assert_eq!(
+            journals
+                .carry_candidate(&store.snapshot(id).unwrap())
+                .unwrap_err(),
+            DraftCarryRefusal::Reseating
+        );
+        journals.set_reseat_fenced(false);
+        assert!(matches!(
+            journals.next_effect(id).unwrap(),
+            Some(JournalEffect::Reseat { .. })
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A re-seat that fails (here: the journal lock held by a peer past the
+    /// event loop's budget) is owed again and SAID — the draft is refused by
+    /// name, not waited on — until a retry lands.
+    #[test]
+    fn a_failed_reseat_is_refused_by_name_until_a_retry_lands() {
+        let (root, mut journals, store, id, _disk, path, _key) = journaled_edit("reseat-failed");
+        let head = store.snapshot(id).unwrap();
+        journals.owe_reseat_all();
+        let JournalEffect::Reseat { plan, .. } = journals.next_effect(id).unwrap().unwrap() else {
+            panic!("a re-seat")
+        };
+        let held = hold_journal_lock_for_test(&path);
+        let refused = execute_journal_reseat(&path, &plan, JournalLockPatience::EventLoop);
+        assert!(
+            matches!(refused, JournalReseatResult::Failed(_)),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            journals.complete_reseat(id, plan.generation, refused),
+            JournalCompletion::Failed { .. }
+        ));
+        assert_eq!(
+            journals.carry_candidate(&head).unwrap_err(),
+            DraftCarryRefusal::ReseatFailed
+        );
+        // The retry on the worker still reads as the failure it is retrying.
+        let JournalEffect::Reseat { plan, .. } = journals.next_effect(id).unwrap().unwrap() else {
+            panic!("the re-seat is owed again")
+        };
+        assert_eq!(
+            journals.carry_candidate(&head).unwrap_err(),
+            DraftCarryRefusal::ReseatFailed
+        );
+        drop(held);
+        let landed = execute_journal_reseat(&path, &plan, JournalLockPatience::Worker);
+        assert_eq!(landed, JournalReseatResult::Unchanged);
+        journals.complete_reseat(id, plan.generation, landed);
+        assert!(journals.carry_candidate(&head).is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 }

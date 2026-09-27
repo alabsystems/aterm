@@ -421,9 +421,9 @@ pub struct Artifact {
     /// Relocation policy for a `sysroot-bundle` (§10.1) — decides the install-time
     /// apply branch. `self-contained` (default): the payload was relocated at PACK
     /// time (machine-local deps vendored in), so install just extracts + activates,
-    /// needing NO rustup on the user side. `rustup-linked`: the bundle ships a
-    /// dangling `toolchain` link the installer re-points at the user's rustup
-    /// nightly ([`crate::sysroot::relocate_sysroot`]). Signed (inside the manifest
+    /// needing NO rustup on the user side. `rustup-linked` (retired: the installer
+    /// no longer re-points such a bundle's dangling `toolchain` link, and no
+    /// published manifest selects it). Signed (inside the manifest
     /// bytes), so the flag cannot be flipped by a repo-write adversary. Ignored for
     /// non-bundle kinds.
     #[serde(default = "default_reloc")]
@@ -1285,22 +1285,38 @@ provides = ["emacs"]
         // The bind is what refuses it; `sig`'s tests prove that direction end to end.
     }
 
-    // A malformed / incomplete index (missing a required field) fails closed.
+    /// Each of these fails closed as `Malformed`, never a silent default. One labelled row
+    /// per shape:
+    /// * a missing required field (`index_build`) is not a default-0 silent accept;
+    /// * a DUPLICATE key — the real TOML parser gives this for free (the Phase-1 line
+    ///   scanner had to hand-defend it) — matters for `machine_id`, where a last-wins
+    ///   parser would let a second copy re-attribute the index;
+    /// * a wrong-typed attribution: a string `roster_seq` cannot become "absent" and
+    ///   slide into the bind.
     #[test]
-    fn malformed_index_fails_closed() {
-        // Missing index_build (required) → Malformed, not a default-0 silent accept.
-        let body = "schema = 2\nvalid_until = \"2026-07-05T12:00:00Z\"\n";
-        assert_eq!(parse_index(&verified(body)).unwrap_err(), Reject::Malformed);
-    }
-
-    // A real TOML parser rejects a DUPLICATE key (the Phase-1 line-scanner had to
-    // hand-defend this; toml gives it for free) → fail closed. `machine_id` is the one
-    // that matters now: a last-wins parser would let a second copy re-attribute the index.
-    #[test]
-    fn duplicate_attribution_key_fails_closed() {
-        let body = "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-                    machine_id = \"m3\"\nmachine_id = \"m11\"\nroster_seq = 3\n";
-        assert_eq!(parse_index(&verified(body)).unwrap_err(), Reject::Malformed);
+    fn malformed_indexes_fail_closed() {
+        for (body, why) in [
+            (
+                "schema = 2\nvalid_until = \"2026-07-05T12:00:00Z\"\n",
+                "missing index_build",
+            ),
+            (
+                "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+                 machine_id = \"m3\"\nmachine_id = \"m11\"\nroster_seq = 3\n",
+                "duplicate machine_id",
+            ),
+            (
+                "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+                 machine_id = \"m3\"\nroster_seq = \"3\"\n",
+                "string roster_seq",
+            ),
+        ] {
+            assert_eq!(
+                parse_index(&verified(body)).unwrap_err(),
+                Reject::Malformed,
+                "{why}"
+            );
+        }
     }
 
     // Table scoping is intrinsic to the real parser: a `machine_id` in a SIBLING table
@@ -1313,15 +1329,6 @@ provides = ["emacs"]
         let idx = parse_index(&verified(body)).expect("parses; [meta] ignored");
         assert_eq!(idx.machine_id.as_deref(), Some("m3"));
         assert_eq!(idx.roster_seq, Some(3));
-    }
-
-    // A wrong-typed attribution is a hard parse failure, never a silent default: a
-    // `roster_seq` that is a string cannot become "absent" and slide into the bind.
-    #[test]
-    fn wrongly_typed_attribution_fails_closed() {
-        let body = "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-                    machine_id = \"m3\"\nroster_seq = \"3\"\n";
-        assert_eq!(parse_index(&verified(body)).unwrap_err(), Reject::Malformed);
     }
 
     // pkg-*.toml: per-triple artifact selection + reject-newer + clean missing-triple skip.

@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration tests for the self-contained surface of `aterm-spec-macros`:
-//! the `SpecState` / `SpecAction` derives and the `refines` / `spec_invariant`
-//! / `spec_unmodeled` attribute macros.
+//! the `refines` / `spec_invariant` / `spec_unmodeled` attribute macros.
 //!
 //! Since TRUST_NATIVE_TLA Phase 0 the attribute macros are ANCHOR EMITTERS: they
 //! leave the annotated item unchanged AND emit an `inventory` record referencing
@@ -12,114 +11,7 @@
 //! emits `::aterm_spec::derive::*` paths and is exercised from `aterm-spec`'s own
 //! `tests/`.
 
-use aterm_spec_macros::{SpecAction, SpecState, refines, spec_invariant, spec_unmodeled};
-
-// ── SpecState: the machine name and TLA+ file each derive spelling produces ──
-
-#[derive(SpecState)]
-#[spec_machine(name = "ring", tla_file = "Evict.tla")]
-struct RingState {
-    #[allow(dead_code)]
-    seq: u64,
-}
-
-#[derive(SpecState)]
-struct KernelModel;
-
-#[derive(SpecState)]
-struct Cursor;
-
-#[derive(SpecState)]
-#[spec_machine(tla_file = "Subscribe.tla")]
-struct PartialAttrModel;
-
-#[test]
-fn spec_state_derives_the_machine_name_and_tla_file() {
-    // (row, derived name, derived file, expected name, expected file)
-    let rows = [
-        // Both attribute keys given: taken verbatim.
-        (
-            "explicit name and file",
-            RingState::SPEC_MACHINE_NAME,
-            RingState::SPEC_TLA_FILE,
-            "ring",
-            "Evict.tla",
-        ),
-        // No attribute: "KernelModel" -> strip "Model" -> "Kernel" -> lowercase;
-        // tla_file defaults to the empty string.
-        (
-            "default name strips the Model suffix and lowercases",
-            KernelModel::SPEC_MACHINE_NAME,
-            KernelModel::SPEC_TLA_FILE,
-            "kernel",
-            "",
-        ),
-        // A name with no "Model" suffix just lowercases.
-        (
-            "default name without a Model suffix",
-            Cursor::SPEC_MACHINE_NAME,
-            Cursor::SPEC_TLA_FILE,
-            "cursor",
-            "",
-        ),
-        // Only one key supplied: the other falls back ("PartialAttrModel" ->
-        // "partialattr").
-        (
-            "partial attribute falls back for the missing key",
-            PartialAttrModel::SPEC_MACHINE_NAME,
-            PartialAttrModel::SPEC_TLA_FILE,
-            "partialattr",
-            "Subscribe.tla",
-        ),
-    ];
-    for (row, name, file, want_name, want_file) in rows {
-        assert_eq!((name, file), (want_name, want_file), "{row}");
-    }
-}
-
-// ── SpecAction: variant names collected into SPEC_ACTIONS, in order ──────────
-
-#[derive(SpecAction)]
-#[allow(dead_code)]
-enum RingAction {
-    Push,
-    Evict,
-    Reset,
-}
-
-#[derive(SpecAction)]
-#[allow(dead_code)]
-enum DataAction {
-    Grow(u32),
-    Deliver { cursor: u64 },
-    Idle,
-}
-
-#[derive(SpecAction)]
-enum NoAction {}
-
-#[test]
-fn spec_action_collects_variant_names_in_order() {
-    let _ = |x: NoAction| match x {};
-    let rows: [(&str, &[&str], &[&str]); 3] = [
-        (
-            "unit variants, in declaration order",
-            &RingAction::SPEC_ACTIONS,
-            &["Push", "Evict", "Reset"],
-        ),
-        // Variants carrying data contribute only their ident.
-        (
-            "payloads are ignored",
-            &DataAction::SPEC_ACTIONS,
-            &["Grow", "Deliver", "Idle"],
-        ),
-        // An empty enum yields a zero-length action array.
-        ("empty enum", &NoAction::SPEC_ACTIONS, &[]),
-    ];
-    for (row, got, want) in rows {
-        assert_eq!(got, want, "{row}");
-    }
-}
+use aterm_spec_macros::{refines, spec_invariant, spec_unmodeled};
 
 // ── Attribute macros are pass-throughs: the annotated item still works ────────
 // `refines` accepts `machine = "..", action = ".."`, `spec_invariant` accepts

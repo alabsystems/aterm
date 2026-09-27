@@ -37,9 +37,11 @@ pub enum ApplyStrategy {
     /// protocol activates identically; only the download lane differs, and
     /// [`crate::flow`] picks that lane from `protocol`, never from this variant).
     Shim,
-    /// A `trust`/`trust-mc` sysroot bundle: extract, relocate the (dangling) sysroot
-    /// toolchain link to its resolved toolchain, gated
-    /// on the four-component nightly being installed (§10.1). Its `exposes` still shim.
+    /// A `trust`/`trust-mc` sysroot bundle: extract, then the fail-loud resolve check
+    /// (`sysroot::resolve_check` — each exposed binary must run `--version` to completion)
+    /// before the install counts. The bundles are `self-contained`, so there is no
+    /// relocation or nightly gate any more (both went with the `rustup-linked` policy,
+    /// `88e57be72`). Its `exposes` still shim.
     SysrootBundle,
     /// The `aterm.app` DMG: NOT extracted as a tarball — applied **in-session by the app's
     /// own updater** (the seamless overlap handoff in aterm-gui; `renamex_np(RENAME_SWAP)`
@@ -62,9 +64,6 @@ pub enum ApplyStrategy {
     /// [`Shim`](ApplyStrategy::Shim)).
     Unknown,
 }
-
-/// The protocols a row may declare, in the spelling the schema signs.
-pub const PROTOCOLS: &[&str] = &["github-release", "https"];
 
 /// Map a row's `kind` and `protocol` to its [`ApplyStrategy`]. Fail-closed on anything
 /// unrecognized — including a known kind over a protocol that cannot carry it (a
@@ -147,7 +146,7 @@ mod tests {
     /// dispatch it would still fail closed, over every protocol.
     #[test]
     fn the_retired_vendor_fetch_kind_is_unknown_everywhere() {
-        for protocol in PROTOCOLS {
+        for protocol in ["github-release", "https"] {
             assert_eq!(
                 strategy_for("vendor-fetch", protocol),
                 ApplyStrategy::Unknown,

@@ -1,0 +1,12 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, Xme() (permission_browser, NO key-hint footer), on the measured 2.1.280/2.1.281 box geometry · a Claude in Chrome box, footerless: `Allow`, a session grant, `Deny (esc)`
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Claude in Chrome wants to click on github.com
+
+ https://github.com/x
+
+ ❯ 1. Allow
+   2. Allow all actions on github.com for this session
+   3. Deny (esc)

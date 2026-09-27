@@ -584,14 +584,14 @@ macro_rules! declare_class {
 
             /// This instance as a raw `id`, borrowed.
             #[inline]
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn as_id(&self) -> $crate::Id {
                 $crate::Id::from_ptr(::core::ptr::from_ref(self).cast_mut().cast())
             }
 
             /// The `objc_super` a `[super …]` send from THIS class needs.
             #[inline]
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn super_receiver(&self) -> $crate::ObjcSuper {
                 // SAFETY: `self` borrows a live instance and `Self::meta()`
                 // returns the registered class that declares this method, so
@@ -602,7 +602,7 @@ macro_rules! declare_class {
 
             /// This instance's Rust ivars.
             #[inline]
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn ivars(&self) -> &$ivars {
                 let __meta = Self::meta();
                 let __slot = ::core::ptr::with_exposed_provenance::<$crate::IvarSlot<$ivars>>(
@@ -655,7 +655,7 @@ macro_rules! declare_class {
             /// the floor are all the caller's to avoid — which is why
             /// [`Self::alloc_init`] exists and should be preferred whenever
             /// `-init` is the right initializer.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis unsafe fn alloc_ivars(
                 _mtm: $crate::MainThread,
                 ivars: $ivars,
@@ -688,7 +688,7 @@ macro_rules! declare_class {
             ///
             /// `mtm` is the [`crate::MainThread`] witness every instantiation
             /// owes; it is consumed for its type and nothing else.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn alloc_init(
                 mtm: $crate::MainThread,
                 ivars: $ivars,

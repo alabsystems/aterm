@@ -50,7 +50,7 @@
 //! be attempted at all.
 
 /// Dispatch-kind hint used by
-/// [`ResponseCapability::mint_for_dispatch_with_engine`] to select the
+/// `ResponseCapability::mint_for_dispatch_with_engine` to select the
 /// right [`aterm_policy::selector::DispatchedSequence`] probe shape
 /// (#7994).
 ///
@@ -58,16 +58,17 @@
 /// terminal module is the only producer and the policy crate should
 /// not depend on our dispatch taxonomy.
 #[derive(Debug, Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "#7994 scaffolding: ProbeKind is consumed by the engine-consulting mint variant reserved for Release N+1 per-site wiring."
-)]
 pub(super) enum ProbeKind {
-    /// CSI dispatch (ESC `[` ... `<final_byte>`).
+    /// CSI dispatch (ESC `[` ... `<final_byte>`). Production probes only the
+    /// response sink ([`Self::response_sink`]); the per-shape probes exist for
+    /// the reference-implementation cross-check in the tests.
+    #[cfg(test)]
     Csi { final_byte: char },
     /// ESC dispatch (ESC `<final_byte>`; no CSI).
+    #[cfg(test)]
     Esc { final_byte: char },
     /// OSC dispatch with parsed command number.
+    #[cfg(test)]
     Osc { command: u32 },
     /// DCS dispatch (ESC P ... `<final_byte>` ST).
     Dcs { final_byte: u8 },
@@ -180,11 +181,7 @@ impl ResponseCapability {
     /// fails a test instead of silently answering a gate from the wrong rule.
     #[inline]
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "reference implementation for the compiled gate table in policy_gates.rs; \
-                  the production dispatch path reads the compiled verdict instead"
-    )]
+    #[cfg(test)]
     pub(super) fn mint_for_dispatch_with_engine(
         engine: Option<&aterm_policy::engine::PolicyEngine>,
         origin: aterm_policy::OriginTag,
@@ -210,36 +207,13 @@ impl ResponseCapability {
             None
         }
     }
-
-    /// Provenance ceremony: lift this response capability into a
-    /// [`HostAuthorizationToken`] borrowed for the capability's lifetime.
-    ///
-    /// Part of the #8001 `authorize_*` wiring (design §6 migration table).
-    /// Holding a `ResponseCapability` proves that the caller is inside a
-    /// parser-originated dispatch that may legitimately produce a host-
-    /// directed response; the returned token lets downstream
-    /// `authorize_pty_to_host` consumers lift Pty-origin response bytes
-    /// into `Host`-origin so the rate-limited `send_response` pipeline can
-    /// treat them as policy-approved.
-    ///
-    /// The token is borrowed by reference against `&self`, so it cannot
-    /// outlive the dispatch frame.
-    #[allow(
-        dead_code,
-        reason = "audit-only provenance ceremony retained until production callers consume the host-authorization token directly"
-    )]
-    #[must_use]
-    pub(crate) fn as_host_auth_token(&self) -> aterm_provenance::HostAuthorizationToken<'_> {
-        let _ = self;
-        aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
-    }
 }
 
 /// Build the [`aterm_policy::selector::DispatchedSequence`] a [`ProbeKind`]
 /// stands for.
 ///
 /// This is the **single** definition of every dispatch probe.
-/// [`ResponseCapability::mint_for_dispatch_with_engine`] calls it on the
+/// `ResponseCapability::mint_for_dispatch_with_engine` calls it on the
 /// per-dispatch path, and [`super::policy_gates::PolicyGates`] calls it when it
 /// compiles a constant probe's verdict once per installed policy. Sharing one
 /// definition is what makes the compiled verdict provably the verdict the
@@ -248,6 +222,7 @@ impl ResponseCapability {
 #[must_use]
 pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSequence {
     match kind {
+        #[cfg(test)]
         ProbeKind::Csi { final_byte } | ProbeKind::Esc { final_byte } => {
             aterm_policy::selector::DispatchedSequence::csi(
                 None,
@@ -255,6 +230,7 @@ pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSe
                 std::iter::empty::<String>(),
             )
         }
+        #[cfg(test)]
         ProbeKind::Osc { command } => {
             aterm_policy::selector::DispatchedSequence::osc(command, std::iter::empty::<String>())
         }
@@ -289,22 +265,6 @@ mod tests {
     #[test]
     fn capability_is_zero_sized() {
         assert_eq!(std::mem::size_of::<ResponseCapability>(), 0);
-    }
-
-    /// #8001 ceremony: a `ResponseCapability` mints a
-    /// `HostAuthorizationToken` that lifts `Provenance<_, Pty>` to
-    /// `Provenance<_, Host>`.
-    #[test]
-    fn as_host_auth_token_lifts_pty_to_host() {
-        use aterm_provenance::{OriginTag, Provenance, authorize_pty_to_host};
-
-        let cap = ResponseCapability::mint_for_dispatch();
-        let tok = cap.as_host_auth_token();
-        let pty: Provenance<Vec<u8>, aterm_provenance::Pty> =
-            Provenance::from_pty(b"\x1b[?1;2c".to_vec());
-        let host = authorize_pty_to_host(pty, tok);
-        assert_eq!(host.tag(), OriginTag::Host);
-        assert_eq!(host.as_ref(), b"\x1b[?1;2c");
     }
 
     /// #7994 perf fast path: with no policy engine installed (the default),

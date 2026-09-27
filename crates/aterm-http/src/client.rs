@@ -462,12 +462,6 @@ impl Response {
     pub fn body(&self) -> &[u8] {
         &self.body
     }
-
-    /// Consume the response, yielding its body.
-    #[must_use]
-    pub fn into_body(self) -> Vec<u8> {
-        self.body
-    }
 }
 
 struct StatusLine {
@@ -654,17 +648,74 @@ mod tests {
         Uri::parse(text).unwrap()
     }
 
-    fn plain_stub(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+    /// TCP reads may stop anywhere in the head or body. Drain the declared
+    /// request before replying/closing, or an unread tail can reset the socket
+    /// while the client is still writing (including macOS EINVAL on timeouts).
+    fn read_plain_request(reader: &mut impl Read) -> Vec<u8> {
+        const LIMIT: usize = 1024;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(
+                head.len() < LIMIT,
+                "fixture request head exceeded its bound"
+            );
+            let mut byte = [0];
+            reader.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = std::str::from_utf8(&head).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("fixture request carries Content-Length");
+        assert!(length <= LIMIT, "fixture request body exceeded its bound");
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        body
+    }
+
+    fn plain_stub(response: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            use std::io::{Read as _, Write as _};
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let body = read_plain_request(&mut stream);
             stream.write_all(response).unwrap();
+            body
         });
         (endpoint, server)
+    }
+
+    #[test]
+    fn plain_stub_drains_fragmented_request_head_and_body() {
+        // A deterministic stream that exposes the head and body in pieces;
+        // no sleeps or scheduler timing can make the single-read control pass.
+        let fragments = || {
+            std::io::Cursor::new(b"POST /requ")
+                .chain(std::io::Cursor::new(
+                    b"est HTTP/1.1\r\nContent-Length: 2\r\n\r\n",
+                ))
+                .chain(std::io::Cursor::new(b"{"))
+                .chain(std::io::Cursor::new(b"}"))
+        };
+        let mut old_read = [0; 1024];
+        let first = fragments().read(&mut old_read).unwrap();
+        assert_eq!(&old_read[..first], b"POST /requ");
+        assert!(
+            !old_read[..first].ends_with(b"\r\n\r\n{}"),
+            "one successful read does not consume the request"
+        );
+        assert_eq!(read_plain_request(&mut fragments()), b"{}");
     }
 
     #[test]
@@ -742,7 +793,7 @@ mod tests {
             Duration::from_secs(2),
         );
         let response = client.post(&endpoint).send(b"{}").unwrap();
-        server.join().unwrap();
+        assert_eq!(server.join().unwrap(), b"{}");
         assert_eq!(response.body(), b"ok");
         assert_eq!(client.tls_config.builds(), 0);
     }

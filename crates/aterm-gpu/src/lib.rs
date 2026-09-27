@@ -21,15 +21,7 @@
 // target activates `wgpu-oracle` — compiles BOTH arms and keeps all four
 // lints sharp; the suppression below applies to the production configuration
 // alone, so the shared spellings need no fork.
-#![cfg_attr(
-    not(wgpu_arm),
-    allow(
-        dead_code,
-        unused_variables,
-        unreachable_patterns,
-        irrefutable_let_patterns
-    )
-)]
+#![cfg_attr(not(wgpu_arm), allow(unreachable_patterns, irrefutable_let_patterns))]
 
 /// `eprintln!` that CANNOT panic — for every stderr line this crate writes at
 /// runtime (the Metal arm's degrade notes, the swapchain diagnostics).
@@ -50,6 +42,21 @@ macro_rules! stderr_line {
 }
 pub(crate) use stderr_line;
 
+/// The window's `--verbose` flag, handed down by the host at launch: the surface
+/// notes (present mode, EDR swapchain, the scRGB fallbacks) print only under it.
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the host's `--verbose` flag (a launch flag, never an environment read).
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host asked for `--verbose` (read by the wgpu arm's surface notes).
+#[cfg(wgpu_arm)]
+pub(crate) fn verbose() -> bool {
+    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 use aterm_render::Frame;
 
 #[cfg(all(target_os = "macos", feature = "acquire-conformance"))]
@@ -66,7 +73,7 @@ mod pipeline_table;
 // The one-future park/unpark executor the native init path drives wgpu's async
 // adapter/device acquisition on (retired `pollster`). Native-only: blocking the
 // browser main thread is forbidden, so the wasm path awaits instead.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
 mod block_on;
 
 // M3 phase B: the EDR present gate's pure decision functions, re-exported so the
@@ -163,7 +170,7 @@ static DX12_VISUAL_SWAPCHAIN_WITHDRAWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// What [`GpuContext::new`] actually BUILT (requested AND the DX12 backend won
 /// adapter selection), distinct from the request so introspection never reports
-/// an engaged visual path on a `ATERM_GPU_BACKEND=vulkan` escape-hatch run.
+/// an engaged visual path on a run where DX12 did not win the adapter.
 #[cfg(windows)]
 static DX12_VISUAL_SWAPCHAIN_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -378,20 +385,6 @@ pub(crate) fn frame_from_padded_rgba(bytes: &[u8], w: usize, h: usize, padded: u
     }
 }
 
-/// Map an `ATERM_GPU_BACKEND` value to a wgpu backend mask.
-/// `None` = unrecognized (caller warns and keeps the default).
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(wgpu_arm)]
-fn parse_gpu_backend(v: &str) -> Option<wgpu::Backends> {
-    match v.to_ascii_lowercase().as_str() {
-        "dx12" => Some(wgpu::Backends::DX12),
-        "vulkan" => Some(wgpu::Backends::VULKAN),
-        "gl" => Some(wgpu::Backends::GL),
-        "metal" => Some(wgpu::Backends::METAL),
-        _ => None,
-    }
-}
-
 /// Map an `ATERM_GPU_POWER` value to a power preference.
 /// `None` = unrecognized (caller warns and keeps the `LowPower` default).
 #[cfg(wgpu_arm)]
@@ -403,13 +396,9 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
     }
 }
 
-/// GPU selection environment overrides (each parsed by the helper right below):
+/// GPU selection DEVELOPMENT seams ([`aterm_types::dev_seam!`] — a shipped binary
+/// reads none of them and takes the defaults below):
 ///
-/// * `ATERM_GPU_BACKEND=dx12|vulkan|gl|metal` — restrict the wgpu instance to one
-///   backend (default: DX12 on Windows — the native API + HDR/scRGB present path;
-///   `Backends::PRIMARY` elsewhere). Native only; the wasm build's instance is
-///   created by its own init path. Escape hatch for a broken driver path (e.g.
-///   `ATERM_GPU_BACKEND=vulkan` if a DX12 driver misbehaves) without a rebuild.
 /// * `ATERM_GPU_ADAPTER=<substring>` — pick the adapter whose reported name
 ///   contains this string, case-insensitive (e.g. `intel`, `nvidia`). Falls back
 ///   to default selection (with a stderr warning) when nothing matches.
@@ -421,36 +410,28 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
 ///   suballocator's block-size floor; `<N>` is the DEVICE floor in MiB (the host
 ///   floor is half of it). Defaults to 16 MiB. See [`terminal_memory_hints`] for
 ///   what the wgpu `Performance` default costs and why this exists.
+///
+/// The backend itself is not selectable: each platform compiles exactly one wgpu
+/// backend (DX12 on Windows — the native API and the only HDR/scRGB present path
+/// — and Vulkan elsewhere; see this crate's manifest), so there is nothing to
+/// choose between. A driver that cannot render falls to the CPU present path, and
+/// `gpu = false` in aterm.toml chooses it outright.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(wgpu_arm)]
-fn backends_from_env() -> wgpu::Backends {
-    // Default backend: DX12 on Windows, `PRIMARY` elsewhere. DX12 is the native
-    // Windows GPU API + the ONLY backend wired for the HDR/scRGB EDR present
-    // (`WindowGpu::tag_swapchain_scrgb` reaches the DX12 `IDXGISwapChain3`; on the
-    // Vulkan backend the cursor aurora silently falls back to an SDR swapchain).
-    // DX12 is a Windows 10+ baseline so restricting is safe; `ATERM_GPU_BACKEND=vulkan`
-    // reverts for a broken-driver escape hatch.
+fn default_backends() -> wgpu::Backends {
     #[cfg(windows)]
-    let default = wgpu::Backends::DX12;
+    let backends = wgpu::Backends::DX12;
     #[cfg(not(windows))]
-    let default = wgpu::Backends::PRIMARY;
-    match std::env::var("ATERM_GPU_BACKEND") {
-        Ok(v) if !v.is_empty() => parse_gpu_backend(&v).unwrap_or_else(|| {
-            crate::stderr_line!(
-                "aterm-gpu: unknown ATERM_GPU_BACKEND {v:?} (want dx12|vulkan|gl|metal); using default"
-            );
-            default
-        }),
-        _ => default,
-    }
+    let backends = wgpu::Backends::PRIMARY;
+    backends
 }
 
 /// THE FLIP (map §5 W6, delivered): the first-party Metal renderer is the
 /// macOS backend — unconditionally. `ATERM_METAL` was the W6a dark-launch
-/// switch; it is RETIRED, not inverted, and there is deliberately NO
-/// `ATERM_WGPU=1` escape hatch. Why removal outright rather than one
-/// release of hatch (the Close report's confidence, recorded here so the
-/// decision is auditable):
+/// switch; it is DELETED (2026-09-24: nothing reads it, not even to warn),
+/// and there is deliberately NO `ATERM_WGPU=1` escape hatch. Why removal
+/// outright rather than one release of hatch (the Close report's confidence,
+/// recorded here so the decision is auditable):
 ///
 /// - The same release removes wgpu from the macOS normal dependency graph
 ///   (`aterm-gpu` was the cell's ONLY edge into it). A compiled-in wgpu
@@ -468,32 +449,18 @@ fn backends_from_env() -> wgpu::Backends {
 ///   which stays shipped. The hatch would duplicate an existing safety
 ///   arm, not add one.
 ///
-/// Setting `ATERM_METAL` still works for scripts that armed the dark
-/// launch (`=1` selects what is now the default); any OTHER value gets a
-/// one-time note that the switch is retired, then the default proceeds.
-/// The variable is read once and latched, like every `ATERM_GPU_*` knob.
+/// Kept as a `const fn` so every armed-path site reads as the decision it is.
 #[cfg(target_os = "macos")]
-pub fn metal_backend_selected() -> bool {
-    static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SELECTED.get_or_init(|| {
-        if let Ok(v) = std::env::var("ATERM_METAL")
-            && v != "1"
-        {
-            crate::stderr_line!(
-                "aterm-gpu: ATERM_METAL={v:?} ignored — the dark-launch switch is \
-                 retired and Metal is the macOS renderer (the wgpu arm left the \
-                 macOS build; on init failure the CPU present path is the floor)"
-            );
-        }
-        true
-    })
+#[must_use]
+pub const fn metal_backend_selected() -> bool {
+    true
 }
 
-/// `ATERM_GPU_POWER` (see [`backends_from_env`] for the env-var table).
+/// The `ATERM_GPU_POWER` seam, parsed (see [`default_backends`] for the table).
 #[cfg(wgpu_arm)]
 fn power_preference_from_env() -> wgpu::PowerPreference {
-    match std::env::var("ATERM_GPU_POWER") {
-        Ok(v) if !v.is_empty() => parse_gpu_power(&v).unwrap_or_else(|| {
+    match aterm_types::dev_seam!("ATERM_GPU_POWER").map(|v| v.to_string_lossy().into_owned()) {
+        Some(v) if !v.is_empty() => parse_gpu_power(&v).unwrap_or_else(|| {
             crate::stderr_line!(
                 "aterm-gpu: unknown ATERM_GPU_POWER {v:?} (want low|high); using low"
             );
@@ -517,12 +484,14 @@ fn power_preference_from_env() -> wgpu::PowerPreference {
 /// offscreen (33.7 MB at 4180×2016), and it is dedicated either way. The pool is
 /// only ever holding the small stuff: the glyph atlas, the uniform buffers, the
 /// per-frame instance streams.
+#[cfg(wgpu_arm)]
 const MEMBLOCK_FLOOR_MIB: u64 = 16;
 
 /// The block-size CEILING, in MiB. gpu-allocator doubles the block size per
 /// additional live block of a memory type (`min << active_blocks`), capped here,
 /// so a workload that genuinely needs pooled memory still converges on big blocks
 /// after a few — it just does not START there.
+#[cfg(wgpu_arm)]
 const MEMBLOCK_CEILING_MIB: u64 = 128;
 
 /// Parse `ATERM_GPU_MEMBLOCK` (see [`terminal_memory_hints`]).
@@ -597,16 +566,15 @@ fn terminal_memory_hints_default() -> wgpu::MemoryHints {
 /// 8 MiB buy only 4 MB more working set while costing ~2 ms on the first frame
 /// (more `CreateHeap` calls), and 32 MiB gives 48 MB back.
 ///
-/// Overridable via `ATERM_GPU_MEMBLOCK=performance|small|default|<MiB>` (the
-/// `<MiB>` arm sets the device-block FLOOR, clamped to gpu-allocator's own
-/// 4..=256 MiB range) for a workload that turns out to want bigger pools, in the
-/// same spirit as `ATERM_GPU_BACKEND` — see [`backends_from_env`] for the env-var
-/// table.
+/// A development build can override it with the `ATERM_GPU_MEMBLOCK=performance|
+/// small|default|<MiB>` seam (the `<MiB>` arm sets the device-block FLOOR, clamped
+/// to gpu-allocator's own 4..=256 MiB range) to measure a workload that might
+/// want bigger pools — see [`default_backends`] for the seam table.
 #[must_use]
 #[cfg(wgpu_arm)]
 pub fn terminal_memory_hints() -> wgpu::MemoryHints {
-    match std::env::var("ATERM_GPU_MEMBLOCK") {
-        Ok(v) if !v.is_empty() => parse_memblock(&v).unwrap_or_else(|| {
+    match aterm_types::dev_seam!("ATERM_GPU_MEMBLOCK").map(|v| v.to_string_lossy().into_owned()) {
+        Some(v) if !v.is_empty() => parse_memblock(&v).unwrap_or_else(|| {
             crate::stderr_line!(
                 "aterm-gpu: unknown ATERM_GPU_MEMBLOCK {v:?} \
                  (want performance|small|default|<4..=256 MiB>); using default"
@@ -617,13 +585,13 @@ pub fn terminal_memory_hints() -> wgpu::MemoryHints {
     }
 }
 
-/// `ATERM_GPU_ADAPTER` (see [`backends_from_env`] for the env-var table).
+/// The `ATERM_GPU_ADAPTER` seam (see [`default_backends`] for the table).
 /// Adapter enumeration is a native-only wgpu API; the wasm build has exactly one
 /// adapter anyway, so the override is a no-op there.
 #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
 async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
-    let want = std::env::var("ATERM_GPU_ADAPTER")
-        .ok()
+    let want = aterm_types::dev_seam!("ATERM_GPU_ADAPTER")
+        .map(|v| v.to_string_lossy().into_owned())
         .filter(|v| !v.is_empty())?;
     let want_lc = want.to_ascii_lowercase();
     let found = instance
@@ -674,8 +642,8 @@ impl GpuContext {
     }
 
     /// Acquire a GPU. Works headless (no window/surface needed) — picks the
-    /// default low-power adapter (Metal on macOS), subject to the
-    /// `ATERM_GPU_*` env overrides (see [`backends_from_env`]).
+    /// default low-power adapter (Metal on macOS), subject to a development
+    /// build's `ATERM_GPU_*` seams (see [`default_backends`]).
     ///
     /// NATIVE ONLY: this uses the crate's own `block_on` (`src/block_on.rs`) —
     /// a private module, so this is deliberately not an intra-doc link;
@@ -693,46 +661,46 @@ impl GpuContext {
         // surface-capable on Metal — the platform doesn't use the display handle
         // (it's only required for GLES/Wayland presentation), so the headless
         // adapter request below can keep `compatible_surface: None`.
-        #[cfg_attr(not(windows), allow(unused_mut))] // only the DX12 latch below mutates
-        let mut desc = wgpu::InstanceDescriptor {
-            backends: backends_from_env(),
+        let desc = wgpu::InstanceDescriptor {
+            backends: default_backends(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         };
         // H1 (Windows Mica/Acrylic): honour the visual-swapchain latch via the
         // EXPLICIT descriptor field (not wgpu's `WGPU_DX12_PRESENTATION_SYSTEM`
         // env knob — see the latch comment at the top of this file). Ignored by
-        // every non-DX12 backend, so the `ATERM_GPU_BACKEND=vulkan` escape hatch
-        // still works; `visual_swapchain` below records the ground truth.
+        // every non-DX12 backend; `visual_swapchain` below records the ground
+        // truth.
         #[cfg(windows)]
-        if dx12_visual_swapchain_requested() {
-            desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
-        }
+        let desc = {
+            let mut desc = desc;
+            if dx12_visual_swapchain_requested() {
+                desc.backend_options.dx12.presentation_system =
+                    wgpu::Dx12SwapchainKind::DxgiFromVisual;
+            }
+            desc
+        };
         // The first timed leg of the cold build: backend enumeration + driver
         // load. Everything from here to `from_parts` returning is inside the
         // frontend's single `backend_finalize` number.
         let instance = startup_probe::timed(startup_probe::Leg::GpuInstance, || {
             wgpu::Instance::new(desc)
         });
-        #[allow(
-            unused_mut,
-            reason = "mutated only on the Windows visual-swapchain arm"
-        )]
-        let mut ctx = crate::block_on::block_on(Self::from_instance(instance))?;
+        let ctx = crate::block_on::block_on(Self::from_instance(instance))?;
         // The visual path is ACTIVE only if the DX12 backend actually won adapter
         // selection (the descriptor option is inert elsewhere). Recorded on the
         // context (renderer decisions) AND the process-global (introspection).
         #[cfg(windows)]
-        {
+        let ctx = {
+            let mut ctx = ctx;
             ctx.visual_swapchain = dx12_visual_swapchain_requested() && ctx.backend == "Dx12";
             DX12_VISUAL_SWAPCHAIN_ACTIVE
                 .store(ctx.visual_swapchain, std::sync::atomic::Ordering::Relaxed);
-        }
-        // W6a — the ARMED path's init (map W5 addendum, "the loss hook"): when
-        // the dark-launch switch selects the Metal arm, mint the process loss
-        // domain NOW and wire it into `device_lost()`, so the frontend's
+            ctx
+        };
+        // W6a — the ARMED path's init (map W5 addendum, "the loss hook"): the
+        // Metal arm is selected (unconditionally, post-flip), so mint the process
+        // loss domain NOW and wire it into `device_lost()`, so the frontend's
         // existing poll consumes Metal loss from the very first armed frame.
-        // With the switch off this is byte-for-byte the pre-W6a constructor
-        // (the OnceLock stays empty and `device_lost()` short-circuits).
         #[cfg(target_os = "macos")]
         if metal_backend_selected() {
             let wired =
@@ -899,9 +867,9 @@ impl GpuContext {
         self.metal_loss.set(latch).is_ok()
     }
 
-    /// W6a — the ARMED renderer's loss domain: the latch wired at construct
-    /// (the `ATERM_METAL=1` init), wiring a fresh one first when the cell is
-    /// still empty (the test-armed path, which bypasses the env switch).
+    /// W6a — the ARMED renderer's loss domain: the latch wired at construct,
+    /// wiring a fresh one first when the cell is still empty (the test-armed
+    /// path, which bypasses that constructor).
     /// Either way the returned latch IS the one `device_lost()` polls.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_loss_latch_or_wire(&self) -> std::sync::Arc<metal::loss::LossLatch> {
@@ -1179,16 +1147,6 @@ impl GpuContext {
 #[cfg(test)]
 mod env_override_tests {
     use super::*;
-
-    #[test]
-    fn backend_parses_known_names_case_insensitive() {
-        assert_eq!(parse_gpu_backend("DX12"), Some(wgpu::Backends::DX12));
-        assert_eq!(parse_gpu_backend("vulkan"), Some(wgpu::Backends::VULKAN));
-        assert_eq!(parse_gpu_backend("gl"), Some(wgpu::Backends::GL));
-        assert_eq!(parse_gpu_backend("Metal"), Some(wgpu::Backends::METAL));
-        assert_eq!(parse_gpu_backend("opengl"), None);
-        assert_eq!(parse_gpu_backend(""), None);
-    }
 
     #[test]
     fn power_parses_low_and_high_only() {

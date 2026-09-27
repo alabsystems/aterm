@@ -46,14 +46,16 @@
 //!
 //! The W3 header recorded ONE production resource outside that greppable
 //! list: the scroll-shift scratch in `renderer.rs::shift_offscreen_band_px`.
-//! W4 item 3 ROUTED it — the scratch is a [`LayerTexture`] and its two staged
+//! W4 item 3 ROUTED it — the scratch is a `LayerTexture` and its two staged
 //! copies run through [`FrameEncoder::copy_texture_rect`] — so the greppable
 //! crossing list is once again the COMPLETE W6 flip todo.
 
 #[cfg(target_os = "macos")]
 use crate::metal::ffi as mtl;
+#[cfg(all(target_os = "macos", test))]
+use crate::metal::resources::SharedBuffer;
 #[cfg(target_os = "macos")]
-use crate::metal::resources::{MetalResourceDevice, SealedTexture, SharedBuffer};
+use crate::metal::resources::{MetalResourceDevice, SealedTexture};
 
 /// The texel formats the map's §3 inventory uses — exactly the six the Metal
 /// foundation models (`metal::ffi::PixelFormat`), spelled backend-neutrally.
@@ -61,23 +63,25 @@ use crate::metal::resources::{MetalResourceDevice, SealedTexture, SharedBuffer};
 pub(crate) enum TexelFormat {
     R8Unorm,
     Rgba8Unorm,
+    /// The sRGB alias of `Rgba8Unorm` (wgpu views and the oracle only).
+    #[cfg(wgpu_arm)]
     Rgba8UnormSrgb,
     Bgra8Unorm,
+    /// The sRGB alias of `Bgra8Unorm` (wgpu views and the oracle only).
+    #[cfg(wgpu_arm)]
     Bgra8UnormSrgb,
     Rgba16Float,
 }
 
 impl TexelFormat {
     /// Bytes one texel occupies in a linear (buffer/upload) layout.
-    #[allow(
-        dead_code,
-        reason = "consumed by the W3/W4 differential-ladder tests and by the W6 flip; \
-                  the plain lib target has no caller until its wave routes it"
-    )]
+    #[cfg(target_os = "macos")]
     pub(crate) const fn bytes_per_texel(self) -> u32 {
         match self {
             Self::R8Unorm => 1,
-            Self::Rgba8Unorm | Self::Rgba8UnormSrgb | Self::Bgra8Unorm | Self::Bgra8UnormSrgb => 4,
+            Self::Rgba8Unorm | Self::Bgra8Unorm => 4,
+            #[cfg(wgpu_arm)]
+            Self::Rgba8UnormSrgb | Self::Bgra8UnormSrgb => 4,
             Self::Rgba16Float => 8,
         }
     }
@@ -118,8 +122,10 @@ impl TexelFormat {
         match self {
             Self::R8Unorm => mtl::PixelFormat::R8Unorm,
             Self::Rgba8Unorm => mtl::PixelFormat::Rgba8Unorm,
+            #[cfg(wgpu_arm)]
             Self::Rgba8UnormSrgb => mtl::PixelFormat::Rgba8UnormSrgb,
             Self::Bgra8Unorm => mtl::PixelFormat::Bgra8Unorm,
+            #[cfg(wgpu_arm)]
             Self::Bgra8UnormSrgb => mtl::PixelFormat::Bgra8UnormSrgb,
             Self::Rgba16Float => mtl::PixelFormat::Rgba16Float,
         }
@@ -135,6 +141,7 @@ impl TexelFormat {
 /// NOT permit — CPU reads go through a blit into a Shared buffer, never a
 /// `getBytes:`).
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(wgpu_arm)]
 pub(crate) struct TexUsage {
     /// wgpu `TEXTURE_BINDING` / Metal `ShaderRead`.
     pub(crate) sampled: bool,
@@ -146,6 +153,7 @@ pub(crate) struct TexUsage {
     pub(crate) copy_dst: bool,
 }
 
+#[cfg(wgpu_arm)]
 impl TexUsage {
     /// The upload-then-sample shape every atlas/sprite/overlay texture uses
     /// (`TEXTURE_BINDING | COPY_DST`).
@@ -184,7 +192,7 @@ impl TexUsage {
         u
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     const fn metal(self) -> usize {
         let mut u = 0;
         if self.sampled {
@@ -204,6 +212,7 @@ impl TexUsage {
 /// textures); the Metal arm is the matching `SamplerDesc` preset, already
 /// GPU-verified equivalent by the W1 foundation tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(wgpu_arm)]
 pub(crate) enum SamplerKind {
     /// Exact-texel reads (glyph/deco/sprite atlases, the blit).
     NearestClamp,
@@ -216,24 +225,21 @@ pub(crate) enum SamplerKind {
 /// ([`crate::GpuContext::device_layer`]); the Metal arm exists for the
 /// differential ladder and becomes the live one at W6.
 #[derive(Clone, Copy)]
+#[cfg(wgpu_arm)]
 pub(crate) enum DeviceHandle<'a> {
     #[cfg(wgpu_arm)]
     Wgpu {
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
     },
-    #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W3/W4 differential-ladder tests and by the W6 \
-                  flip; the plain lib target has no Metal caller until then"
-    )]
+    #[cfg(all(target_os = "macos", test))]
     Metal(&'a MetalResourceDevice),
 }
 
+#[cfg(wgpu_arm)]
 impl DeviceHandle<'_> {
     /// Create a 2-D texture. `alias` declares a format the texture may later
-    /// be viewed as ([`LayerTexture::alias_view`]): the wgpu arm lists it in
+    /// be viewed as (the Unorm/sRGB FORMAT LAW alias): the wgpu arm lists it in
     /// `view_formats` (required there), the Metal arm needs no declaration for
     /// the one alias pair in use — Unorm<->sRGB is Metal's documented
     /// sRGB-variant exemption (measured in `metal::ffi::texture_view`).
@@ -268,7 +274,7 @@ impl DeviceHandle<'_> {
                     view_formats,
                 }))
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(mint) => LayerTexture::Metal(
                 mint.texture_2d(
                     format.metal(),
@@ -333,7 +339,7 @@ impl DeviceHandle<'_> {
                     },
                 );
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => {
                 let region = mtl::MtlRegion {
                     origin: mtl::MtlOrigin {
@@ -378,7 +384,7 @@ impl DeviceHandle<'_> {
                     mapped_at_creation: false,
                 }))
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(mint) => LayerBuffer::Metal(SharedBuffer::new(
                 mint.buffer(usize::try_from(size).unwrap_or(usize::MAX).max(1))
                     .unwrap_or_else(|e| panic!("device layer: {label}: {e}")),
@@ -399,7 +405,7 @@ impl DeviceHandle<'_> {
                     mapped_at_creation: false,
                 }))
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(mint) => LayerBuffer::Metal(SharedBuffer::new(
                 mint.buffer(usize::try_from(size).unwrap_or(usize::MAX).max(1))
                     .unwrap_or_else(|e| panic!("device layer: {label}: {e}")),
@@ -421,7 +427,7 @@ impl DeviceHandle<'_> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu { queue, .. } => queue.write_buffer(buf.wgpu(), 0, bytes),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => {
                 assert!(
                     bytes.len() <= mtl::buffer_length(buf.metal()),
@@ -455,7 +461,7 @@ impl DeviceHandle<'_> {
                     ..Default::default()
                 }))
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(mint) => {
                 let desc = match kind {
                     SamplerKind::NearestClamp => mtl::SamplerDesc::NEAREST_CLAMP,
@@ -478,7 +484,7 @@ impl DeviceHandle<'_> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => device,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL handle reached a wgpu-only construction                  seam (bind-group layout / pipeline / shader module) — that                  seam's wave has not routed it yet"
             ),
@@ -490,7 +496,7 @@ impl DeviceHandle<'_> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => device.limits().max_buffer_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(mint) => mint.device().max_buffer_length() as u64,
         }
     }
@@ -500,7 +506,7 @@ impl DeviceHandle<'_> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => device.limits().max_texture_dimension_2d,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => {
                 // Every Apple-silicon family (Apple4+) supports 16384; the
                 // foundation targets nothing older. Metal exposes no direct
@@ -513,13 +519,15 @@ impl DeviceHandle<'_> {
 
 /// A texture on whichever backend created it.
 #[derive(Debug)]
+#[cfg(wgpu_arm)]
 pub(crate) enum LayerTexture {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::Texture),
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     Metal(SealedTexture),
 }
 
+#[cfg(wgpu_arm)]
 impl LayerTexture {
     /// The live wgpu texture — the crossing into seams that stay wgpu-typed
     /// until their own wave (bind groups, encode, present). Panics by name on
@@ -530,7 +538,7 @@ impl LayerTexture {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL texture reached a wgpu-only seam \
                  (bind group / encode / present) — that seam's wave has not \
@@ -545,7 +553,7 @@ impl LayerTexture {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL texture reached a wgpu-only seam \
                  (bind group / encode / present) — that seam's wave has not \
@@ -555,7 +563,7 @@ impl LayerTexture {
     }
 
     /// The sealed Metal texture. Panics by name on the wgpu variant.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     pub(crate) fn metal(&self) -> &SealedTexture {
         match self {
             #[cfg(wgpu_arm)]
@@ -573,7 +581,7 @@ impl LayerTexture {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t.width(),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(t) => t.width() as u32,
         }
     }
@@ -583,95 +591,23 @@ impl LayerTexture {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t.height(),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(t) => t.height() as u32,
-        }
-    }
-
-    /// A view of this texture as `format` — the Unorm/sRGB alias (the FORMAT
-    /// LAW). On wgpu the format must have been declared at creation
-    /// (`alias`); on Metal the sRGB pair vends exempt from declaration and
-    /// the view INHERITS the texture's loss-domain stamp.
-    #[allow(
-        dead_code,
-        reason = "consumed by the W3/W4 differential-ladder tests and by the W6 flip; \
-                  the plain lib target has no caller until its wave routes it"
-    )]
-    pub(crate) fn alias_view(&self, format: TexelFormat) -> LayerTextureView {
-        match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(t) => LayerTextureView::Wgpu(t.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(format.wgpu()),
-                ..Default::default()
-            })),
-            #[cfg(target_os = "macos")]
-            Self::Metal(t) => LayerTextureView::Metal(
-                t.alias_view(format.metal())
-                    .expect("newTextureViewWithPixelFormat: of the declared alias pair"),
-            ),
-        }
-    }
-}
-
-/// A texture VIEW on whichever backend made it. On Metal a view IS a sealed
-/// texture (same object kind, inherited stamp), which is exactly how the
-/// encoder consumes it.
-#[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "consumed by the W3/W4 differential-ladder tests and by the W6 flip; \
-                  the plain lib target has no caller until its wave routes it"
-)]
-pub(crate) enum LayerTextureView {
-    #[cfg(wgpu_arm)]
-    Wgpu(wgpu::TextureView),
-    #[cfg(target_os = "macos")]
-    Metal(SealedTexture),
-}
-
-#[allow(
-    dead_code,
-    reason = "consumed by the W3/W4 differential-ladder tests and by the W6 flip; \
-                  the plain lib target has no caller until its wave routes it"
-)]
-impl LayerTextureView {
-    /// The live wgpu view — same crossing contract as [`LayerTexture::wgpu`].
-    #[cfg(wgpu_arm)]
-    pub(crate) fn wgpu(&self) -> &wgpu::TextureView {
-        match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(v) => v,
-            #[cfg(target_os = "macos")]
-            Self::Metal(_) => panic!(
-                "device layer: a METAL texture view reached a wgpu-only seam \
-                 — that seam's wave has not routed it yet"
-            ),
-        }
-    }
-
-    /// The sealed Metal view. Panics by name on the wgpu variant.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn metal(&self) -> &SealedTexture {
-        match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(_) => panic!(
-                "device layer: a WGPU texture view reached a Metal-only seam \
-                 — the caller mixed handles across backends"
-            ),
-            Self::Metal(v) => v,
         }
     }
 }
 
 /// A buffer on whichever backend created it.
 #[derive(Debug)]
+#[cfg(wgpu_arm)]
 pub(crate) enum LayerBuffer {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::Buffer),
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     Metal(SharedBuffer),
 }
 
+#[cfg(wgpu_arm)]
 impl LayerBuffer {
     /// The live wgpu buffer — same crossing contract as
     /// [`LayerTexture::wgpu`].
@@ -680,7 +616,7 @@ impl LayerBuffer {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(b) => b,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL buffer reached a wgpu-only seam \
                  (bind group / encode / present) — that seam's wave has not \
@@ -695,7 +631,7 @@ impl LayerBuffer {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(b) => b,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL buffer reached a wgpu-only seam \
                  (bind group / encode / present) — that seam's wave has not \
@@ -716,7 +652,7 @@ impl LayerBuffer {
     }
 
     /// The Metal buffer object. Panics by name on the wgpu variant.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     pub(crate) fn metal(&self) -> &mtl::Obj {
         match self {
             #[cfg(wgpu_arm)]
@@ -731,27 +667,30 @@ impl LayerBuffer {
 
 /// A sampler on whichever backend created it.
 #[derive(Debug)]
+#[cfg(wgpu_arm)]
 pub(crate) enum LayerSampler {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::Sampler),
-    #[cfg(target_os = "macos")]
-    Metal(mtl::Obj),
+    #[cfg(all(target_os = "macos", test))]
+    Metal(
+        #[expect(
+            dead_code,
+            reason = "owns the MTLSamplerState (released on drop); the test ladder mints it, nothing reads it back"
+        )]
+        mtl::Obj,
+    ),
 }
 
-#[allow(
-    dead_code,
-    reason = "consumed by the W3/W4 differential-ladder tests and by the W6 flip; \
-                  the plain lib target has no caller until its wave routes it"
-)]
+#[cfg(wgpu_arm)]
 impl LayerSampler {
     /// The live wgpu sampler — same crossing contract as
     /// [`LayerTexture::wgpu`].
-    #[cfg(wgpu_arm)]
+    #[cfg(all(wgpu_arm, test, target_os = "macos"))]
     pub(crate) fn wgpu(&self) -> &wgpu::Sampler {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(s) => s,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL sampler reached a wgpu-only seam — \
                  that seam's wave has not routed it yet"
@@ -765,24 +704,11 @@ impl LayerSampler {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(s) => s,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL sampler reached a wgpu-only seam — \
                  that seam's wave has not routed it yet"
             ),
-        }
-    }
-
-    /// The Metal sampler state. Panics by name on the wgpu variant.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn metal(&self) -> &mtl::Obj {
-        match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(_) => panic!(
-                "device layer: a WGPU sampler reached a Metal-only seam — \
-                 the caller mixed handles across backends"
-            ),
-            Self::Metal(s) => s,
         }
     }
 }
@@ -831,30 +757,12 @@ pub(crate) struct ClearColor4 {
 }
 
 impl ClearColor4 {
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the frame-plan tests spell their loads with these; the \
-                      production planner derives every clear from theme_color_alpha"
-        )
-    )]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) const BLACK: Self = Self {
         r: 0.0,
         g: 0.0,
         b: 0.0,
         a: 1.0,
-    };
-    #[allow(
-        dead_code,
-        reason = "kept beside BLACK as the two canonical clears; the frame-plan \
-                  spellings reach for whichever a case needs"
-    )]
-    pub(crate) const TRANSPARENT: Self = Self {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 0.0,
     };
 
     /// The wgpu spelling (bit-identical: four f64 fields either way).
@@ -892,11 +800,6 @@ pub(crate) enum FrameView<'a> {
     #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::TextureView),
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     Metal(&'a SealedTexture),
 }
 
@@ -906,11 +809,6 @@ pub(crate) enum FramePipeline<'a> {
     #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::RenderPipeline),
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     Metal(&'a mtl::Obj),
 }
 
@@ -923,11 +821,6 @@ pub(crate) enum FrameAtlas<'a> {
     #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::BindGroup),
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     Metal {
         tex: &'a mtl::Obj,
         sampler: &'a mtl::Obj,
@@ -946,11 +839,6 @@ pub(crate) enum FrameStream<'a> {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::BufferSlice<'a>),
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     Metal(&'a mtl::Obj),
 }
 
@@ -963,11 +851,6 @@ pub(crate) enum FrameUniforms<'a> {
     #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::BindGroup),
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     Metal {
         buf: &'a mtl::Obj,
         /// The vertex-stage `[[buffer(n)]]` slot (`BindSpec::vertex_uniform`).
@@ -987,11 +870,6 @@ pub(crate) enum FrameCopyTexture<'a> {
     #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::Texture),
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     Metal(&'a SealedTexture),
 }
 
@@ -1005,11 +883,6 @@ pub(crate) enum SubmittedFrame {
     /// The W1 `Submitted`: wait on it, or poll `try_outcome` (the map's
     /// completion-handler substitute).
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "waited on by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target only ever commits the Wgpu arm"
-    )]
     Metal(MtlSubmitted),
 }
 
@@ -1039,11 +912,6 @@ impl<'s> FrameEncoder<'s> {
 
     /// The Metal arm: one W1 command buffer on the session's ONE queue.
     #[cfg(target_os = "macos")]
-    #[allow(
-        dead_code,
-        reason = "constructed by the W4 full-frame differential and by the W6 flip; \
-                  the plain lib target has no Metal caller until then"
-    )]
     pub(crate) fn metal(session: &'s EncodeSession) -> Result<Self, String> {
         Ok(Self::Metal(session.begin()?))
     }
@@ -1111,6 +979,7 @@ impl<'s> FrameEncoder<'s> {
             }
             #[cfg(target_os = "macos")]
             Self::Metal(cb) => {
+                let _ = label; // Metal render encoders carry no pass label.
                 let FrameView::Metal(target) = view else {
                     panic!(
                         "device layer: a WGPU pass target reached the METAL frame \
@@ -1374,11 +1243,6 @@ impl FramePass<'_, '_> {
 /// extent, the format-derived minimum stride, and the destination length off
 /// the LIVE objects, and refuses a foreign loss domain.
 #[cfg(target_os = "macos")]
-#[allow(
-    dead_code,
-    reason = "called by the W4 full-frame differential (test cfg) and by the W6 \
-              flip's render_input; the plain lib target keeps the wgpu arm live"
-)]
 pub(crate) fn metal_try_read_back(
     session: &EncodeSession,
     mint: &MetalResourceDevice,
@@ -1469,7 +1333,7 @@ mod tests {
         };
         use crate::metal::swapchain::{Swapchain, SwapchainConfig};
 
-        let Some(dev) = Device::system_default() else {
+        let Some(dev) = Device::preferred() else {
             crate::stderr_line!("SKIP: no Metal device");
             return;
         };
@@ -1596,7 +1460,7 @@ mod tests {
     }
 
     fn mint() -> Option<MetalResourceDevice> {
-        let dev = Device::system_default()?;
+        let dev = Device::preferred()?;
         Some(MetalResourceDevice::new(&dev, Arc::new(LossLatch::new())))
     }
 
@@ -1620,9 +1484,12 @@ mod tests {
             Some(TexelFormat::Rgba8UnormSrgb),
         );
         assert!(Arc::ptr_eq(tex.metal().latch(), mint.latch()));
-        let view = tex.alias_view(TexelFormat::Rgba8UnormSrgb);
+        let view = tex
+            .metal()
+            .alias_view(TexelFormat::Rgba8UnormSrgb.metal())
+            .expect("newTextureViewWithPixelFormat: of the declared alias pair");
         assert!(
-            Arc::ptr_eq(view.metal().latch(), mint.latch()),
+            Arc::ptr_eq(view.latch(), mint.latch()),
             "the sRGB alias view must inherit its texture's loss-domain stamp"
         );
         assert_eq!(
@@ -1758,7 +1625,7 @@ mod tests {
             crate::stderr_line!("SKIP: no wgpu context");
             return;
         };
-        let Some(dev) = Device::system_default() else {
+        let Some(dev) = Device::preferred() else {
             crate::stderr_line!("SKIP: no Metal device");
             return;
         };
@@ -1863,7 +1730,7 @@ mod tests {
             crate::stderr_line!("SKIP: no wgpu context");
             return;
         };
-        let Some(dev) = Device::system_default() else {
+        let Some(dev) = Device::preferred() else {
             crate::stderr_line!("SKIP: no Metal device");
             return;
         };

@@ -51,7 +51,7 @@
 //! | [`loc`] | LOC, unsafe TOKENS, build scripts, proc-macro flags, SPDX |
 //! | [`survey`] | the inventory report, emitted (never transcribed) |
 //! | [`blame`] | which first-party manifest line forces a given package/feature |
-//! | [`policy`] | `vendor/forge.toml` — forks, decisions, comment-preserving |
+//! | [`policy`] | `vendor/forge.toml` — the fork ledger, hand-edited, held to the tree by `check` |
 //! | [`budget`] | `tools/forge-budget.tsv` — the lower-only ratchet |
 //! | [`attest`] | provenance, license and `[patch]`-liveness obligations |
 //! | [`mirror`] | Lane 1 generator: `Cargo.lock` → enforced `local-registry` |

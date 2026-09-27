@@ -368,24 +368,12 @@ impl WatcherSet {
         !self.watchers.is_empty()
     }
 
-    /// `true` iff at least one armed watcher has latched.
-    #[must_use]
-    pub fn any_latched(&self) -> bool {
-        self.watchers.iter().any(|w| w.latched.is_some())
-    }
-
-    /// The last `content_seq` the kernel saw advance — the dirty-row gate reads
-    /// this to skip the row-text scan on quiescent frames.
-    #[must_use]
-    pub fn seen_seq(&self) -> u64 {
-        self.clock.last_seq
-    }
-
     /// Which screen GENERATION [`seen_seq`](Self::seen_seq) was read in
     /// ([`ActivityClock::epoch`]). The dirty-row gate compares it too, so a
     /// leave-and-re-enter that lands on the same seq and the same grid flag
     /// still counts as activity.
     #[must_use]
+    #[cfg(test)]
     pub fn seen_epoch(&self) -> u64 {
         self.clock.epoch
     }
@@ -521,6 +509,7 @@ impl WatcherSet {
     /// a batch the caller collected rows for, so an empty `rows` can never be
     /// mistaken for a clear surface.
     /// Returns `true` if anything latched.
+    #[cfg(test)]
     pub fn observe(
         &mut self,
         content_seq: u64,
@@ -528,32 +517,19 @@ impl WatcherSet {
         now: Instant,
         rows: &[Option<String>],
     ) -> bool {
-        self.observe_in(content_seq, false, newest_block_complete, now, rows)
-    }
-
-    /// [`observe`](Self::observe) with the ACTIVE-GRID identity supplied (the
-    /// engine calls [`observe_screen`](Self::observe_screen), which adds the
-    /// generation; this form is the tests'). A change of `alt` means the counter came from a
-    /// different grid, so it is a **resync**, never a comparison: activity is
-    /// stamped and the baseline is SET (not monotonically raised, which is what
-    /// would otherwise pin it at the main grid's high-water mark for the whole
-    /// alt-screen lifetime and starve every predicate).
-    pub fn observe_in(
-        &mut self,
-        content_seq: u64,
-        alt: bool,
-        newest_block_complete: bool,
-        now: Instant,
-        rows: &[Option<String>],
-    ) -> bool {
         let epoch = self.clock.epoch;
-        self.observe_screen(content_seq, alt, epoch, newest_block_complete, now, rows)
+        self.observe_screen(content_seq, false, epoch, newest_block_complete, now, rows)
     }
 
-    /// [`observe_in`](Self::observe_in) with the screen GENERATION supplied —
-    /// the form the engine calls. A new generation is a resync exactly as a new
-    /// grid is ([`ActivityClock::epoch`]): the counter may repeat across it, so
-    /// the step itself is the change.
+    /// [`observe`](Self::observe) with the ACTIVE-GRID identity and the screen
+    /// GENERATION supplied — the form the engine calls. A change of `alt` means
+    /// the counter came from a different grid, so it is a **resync**, never a
+    /// comparison: activity is stamped and the baseline is SET (not
+    /// monotonically raised, which is what would otherwise pin it at the main
+    /// grid's high-water mark for the whole alt-screen lifetime and starve
+    /// every predicate). A new generation is a resync exactly as a new grid is
+    /// ([`ActivityClock::epoch`]): the counter may repeat across it, so the
+    /// step itself is the change.
     pub fn observe_screen(
         &mut self,
         content_seq: u64,

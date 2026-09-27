@@ -7,11 +7,6 @@
 //! [`crate::tab_model`].  This module owns app instances and the presentation state
 //! keyed by those view ids; it never owns tabs, windows, PTYs, or renderer handles.
 
-#![allow(
-    dead_code,
-    reason = "native tab-app migration foundation; host wiring lands in stages"
-)]
-
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -29,16 +24,13 @@ impl ServiceId {
     pub(crate) const UPDATER: Self = Self(1);
     pub(crate) const CONFIG: Self = Self(2);
     pub(crate) const PACKAGES: Self = Self(3);
-
-    pub(crate) const fn get(self) -> u64 {
-        self.0
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OperationId(u64);
 
 impl OperationId {
+    #[cfg(test)]
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
@@ -212,6 +204,9 @@ pub(crate) struct EditorViewState {
     /// chord/minibuffer state, and the store-issued `DocumentViewId`.
     pub(crate) buffer: Option<crate::native_editor::EditorBufferView>,
     pub(crate) preedit: String,
+    /// Platform marked-text caret in UTF-8 bytes, after native-field validation.
+    /// Absent keeps the field convention of placing the caret at the text end.
+    pub(crate) preedit_caret: Option<usize>,
     pub(crate) status: Option<String>,
     /// Persistent host-watcher warning for the canonical config/theme inputs.
     /// Kept separate from command feedback and diagnostics so either can change
@@ -927,9 +922,7 @@ impl NativeAppModel for RecoveryApp {
                 view.pending = None;
                 view.notice = Some(match outcome {
                     ClipboardOutcome::Copied => "Diagnostics copied".to_string(),
-                    ClipboardOutcome::Denied { message } | ClipboardOutcome::Failed { message } => {
-                        message
-                    }
+                    ClipboardOutcome::Failed { message } => message,
                 });
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
@@ -1436,8 +1429,6 @@ mod recovery_tests {
                     &RecoveryViewState::default(),
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 0,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 13.0,
@@ -1708,6 +1699,8 @@ mod recovery_tests {
 pub(crate) enum AppEvent {
     Action(ActionInvocation),
     FocusChanged(Option<UiKey>),
+    /// Text an assistive technology inserts (only the accessibility tree does).
+    #[cfg(any(a11y_tree, test))]
     InsertText(String),
     TextInput(TextInputEvent),
     EditorChord(crate::native_editor::KeyChord),
@@ -1728,6 +1721,7 @@ pub(crate) enum AppEvent {
     },
     /// Accessibility-owned source-byte selection for the editable text viewport.
     /// The document workspace validates UTF-8 boundaries before installing it.
+    #[cfg(any(a11y_tree, test))]
     EditorSetSelection {
         anchor: usize,
         head: usize,
@@ -1738,6 +1732,11 @@ pub(crate) enum AppEvent {
         visible_lines: usize,
     },
     ScrollLines(i32),
+    /// Page Up (`-1`) / Page Down (`1`) in Settings: the reducer moves by the
+    /// page its last render showed (design ruling 267) — a fixed line count
+    /// skipped rows of a six-row list. Only Settings is sent this; every
+    /// other view keeps `ScrollLines(±8)`.
+    ScrollPage(i32),
     /// Markdown scrolling needs the exact semantic viewport measure so a tall
     /// block advances by rows rather than collapsing to one block step.
     MarkdownScroll {
@@ -1820,7 +1819,12 @@ pub(crate) enum AppEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TextInputEvent {
-    Preedit(String),
+    Preedit {
+        text: String,
+        /// Platform caret/selection within `text`, in UTF-8 bytes (winit's
+        /// convention). The receiving field validates and grapheme-clamps it.
+        selection: Option<std::ops::Range<usize>>,
+    },
     Commit(String),
     Backspace,
     Delete,
@@ -1910,7 +1914,6 @@ pub(crate) struct CloseRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloseReadiness {
     Ready,
-    Pending { operation: OperationId },
     Blocked { recovery: Vec<Command> },
 }
 
@@ -1977,7 +1980,6 @@ pub(crate) struct ExternalOpenRequest {
 pub(crate) enum ExternalOpenOutcome {
     Opened,
     Denied { message: String },
-    Failed { message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2000,12 +2002,12 @@ pub(crate) enum UpdateRequest {
     Check,
     InstallAndRelaunch,
     Retry,
-    InstallWhenSafe,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UpdateOutcome {
     Accepted,
+    #[cfg(any(unix, test))]
     InstalledNeedsRelaunch {
         build: u64,
         message: String,
@@ -2027,6 +2029,7 @@ pub(crate) enum UpdateOutcome {
     /// but the automatic lane keeps its intent and retries once the desk
     /// changes. Neither `Failed`, which the automatic reducer answers with a
     /// latch, nor `Deferred`, which is the machine being busy.
+    #[cfg(any(unix, test))]
     CaptureRefused {
         message: String,
     },
@@ -2106,7 +2109,6 @@ pub(crate) enum ClipboardRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClipboardOutcome {
     Copied,
-    Denied { message: String },
     Failed { message: String },
 }
 
@@ -2115,14 +2117,6 @@ pub(crate) enum WorkOwner {
     View {
         instance: AppInstanceId,
         view: ViewId,
-        generation: u64,
-    },
-    Instance {
-        instance: AppInstanceId,
-        generation: u64,
-    },
-    Document {
-        document: DocumentId,
         generation: u64,
     },
     Service {
@@ -2136,14 +2130,6 @@ pub(crate) enum CompletionSink {
     View {
         instance: AppInstanceId,
         view: ViewId,
-        generation: u64,
-    },
-    Instance {
-        instance: AppInstanceId,
-        generation: u64,
-    },
-    DocumentReducer {
-        document: DocumentId,
         generation: u64,
     },
     ServiceReducer {
@@ -2225,7 +2211,6 @@ pub(crate) enum AppEffect {
     /// resolves the directory itself and opens it through NSWorkspace: no shell, no
     /// Terminal, no path from the view.
     OpenLogFolder,
-    RequestCloseSelf,
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
 }
@@ -2262,8 +2247,6 @@ impl Default for ViewMotionCx {
 
 pub(crate) struct ViewCx<'a> {
     pub(crate) viewport: LogicalRect,
-    pub(crate) config_revision: u64,
-    pub(crate) update_revision: u64,
     /// Monotonic, host-injected phase for bounded semantic demonstrations.
     /// App models remain clockless and deterministic for an equal context.
     pub(crate) animation_phase_ms: u64,
@@ -2289,7 +2272,6 @@ pub(crate) struct ViewCx<'a> {
 pub(crate) struct UpdateCx<'a> {
     instance: AppInstanceId,
     view: ViewId,
-    instance_generation: u64,
     view_generation: u64,
     next_operation: &'a mut u64,
     service_generations: &'a mut BTreeMap<ServiceId, u64>,
@@ -2390,10 +2372,6 @@ impl UpdateCx<'_> {
         operation
     }
 
-    pub(crate) fn open_config_editor(&mut self) -> OperationId {
-        self.open_config_editor_at(None)
-    }
-
     pub(crate) fn open_config_editor_at(
         &mut self,
         target: Option<ConfigEditorTarget>,
@@ -2436,10 +2414,6 @@ impl UpdateCx<'_> {
         operation
     }
 
-    pub(crate) fn request_close_self(&mut self) {
-        self.effects.push(AppEffect::RequestCloseSelf);
-    }
-
     pub(crate) fn invalidate_presentation(&mut self) {
         self.effects.push(AppEffect::InvalidateOwnPresentation);
     }
@@ -2463,7 +2437,6 @@ pub(crate) enum RuntimeError {
     DuplicateView(ViewId),
     UnknownView(ViewId),
     KindMismatch { app: AppKind, view: AppKind },
-    StaleCompletion(OperationId),
 }
 
 /// Process-wide native-app instance and view-state store. Stable ids are never
@@ -2476,7 +2449,6 @@ pub(crate) struct NativeRuntime {
     views: BTreeMap<ViewId, AppViewState>,
     view_generations: BTreeMap<ViewId, u64>,
     view_lifecycles: BTreeMap<ViewId, crate::front_content::ViewLifecycle>,
-    document_generations: BTreeMap<DocumentId, u64>,
     service_generations: BTreeMap<ServiceId, u64>,
     /// Process-global failure/recovery projection for the config and theme
     /// watcher. New Settings/Manual views inherit this state at attach time.
@@ -2493,7 +2465,6 @@ impl Default for NativeRuntime {
             views: BTreeMap::new(),
             view_generations: BTreeMap::new(),
             view_lifecycles: BTreeMap::new(),
-            document_generations: BTreeMap::new(),
             service_generations: BTreeMap::new(),
             config_watch_status: crate::config_watcher::WatchStatusState::default(),
             next_operation: 1,
@@ -2953,6 +2924,7 @@ impl NativeRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_config_completion_count(
         &self,
         instance: AppInstanceId,
@@ -2969,6 +2941,7 @@ impl NativeRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_config_assist_present(
         &self,
         instance: AppInstanceId,
@@ -3040,6 +3013,7 @@ impl NativeRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn document_identities(&self) -> Vec<(AppInstanceId, AppKind, String, String)> {
         self.instances
             .iter()
@@ -3127,24 +3101,6 @@ impl NativeRuntime {
         changed
     }
 
-    pub(crate) fn set_document_display_title(
-        &mut self,
-        instance: AppInstanceId,
-        title: String,
-    ) -> bool {
-        match self.instances.get_mut(&instance) {
-            Some(NativeApp::Markdown(app)) => {
-                app.title = title;
-                true
-            }
-            Some(NativeApp::Editor(app)) => {
-                app.title = title;
-                true
-            }
-            _ => false,
-        }
-    }
-
     pub(crate) fn set_document_recovery_status(
         &mut self,
         document: DocumentId,
@@ -3177,6 +3133,7 @@ impl NativeRuntime {
         self.view_generations.get(&view).copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn view_lifecycle(
         &self,
         view: ViewId,
@@ -3225,8 +3182,7 @@ impl NativeRuntime {
         view: ViewId,
         event: AppEvent,
     ) -> Result<DispatchOutcome, RuntimeError> {
-        let instance_generation = *self
-            .instance_generations
+        self.instance_generations
             .get(&instance)
             .ok_or(RuntimeError::UnknownInstance(instance))?;
         let view_generation = *self
@@ -3244,7 +3200,6 @@ impl NativeRuntime {
         let mut cx = UpdateCx {
             instance,
             view,
-            instance_generation,
             view_generation,
             next_operation: &mut self.next_operation,
             service_generations: &mut self.service_generations,
@@ -3323,8 +3278,7 @@ impl NativeRuntime {
         view: ViewId,
         request: CloseRequest,
     ) -> Result<(CloseReadiness, Vec<AppEffect>), RuntimeError> {
-        let instance_generation = *self
-            .instance_generations
+        self.instance_generations
             .get(&instance)
             .ok_or(RuntimeError::UnknownInstance(instance))?;
         let view_generation = *self
@@ -3338,7 +3292,6 @@ impl NativeRuntime {
         let mut cx = UpdateCx {
             instance,
             view,
-            instance_generation,
             view_generation,
             next_operation: &mut self.next_operation,
             service_generations: &mut self.service_generations,
@@ -3346,17 +3299,6 @@ impl NativeRuntime {
         };
         let readiness = app.prepare_close(request, &mut cx);
         Ok((readiness, cx.effects))
-    }
-
-    pub(crate) fn bump_service_generation(&mut self, service: ServiceId) -> u64 {
-        let generation = self.service_generations.entry(service).or_insert(1);
-        *generation = generation.saturating_add(1);
-        *generation
-    }
-
-    pub(crate) fn set_document_generation(&mut self, document: DocumentId, generation: u64) {
-        self.document_generations
-            .insert(document, generation.max(1));
     }
 
     pub(crate) fn completion_is_current<T>(&self, reply: &ReplyToken<T>) -> bool {
@@ -3388,26 +3330,6 @@ impl NativeRuntime {
                     && owner_generation == sink_generation
             }
             (
-                WorkOwner::Instance {
-                    instance: owner_instance,
-                    generation: owner_generation,
-                },
-                CompletionSink::Instance {
-                    instance: sink_instance,
-                    generation: sink_generation,
-                },
-            ) => owner_instance == sink_instance && owner_generation == sink_generation,
-            (
-                WorkOwner::Document {
-                    document: owner_document,
-                    generation: owner_generation,
-                },
-                CompletionSink::DocumentReducer {
-                    document: sink_document,
-                    generation: sink_generation,
-                },
-            ) => owner_document == sink_document && owner_generation == sink_generation,
-            (
                 WorkOwner::Service {
                     service: owner_service,
                     generation: owner_generation,
@@ -3432,14 +3354,6 @@ impl NativeRuntime {
                     && self.views.contains_key(&view)
                     && self.view_generations.get(&view) == Some(&generation)
             }
-            WorkOwner::Instance {
-                instance,
-                generation,
-            } => self.instance_generations.get(&instance) == Some(&generation),
-            WorkOwner::Document {
-                document,
-                generation,
-            } => self.document_generations.get(&document) == Some(&generation),
             WorkOwner::Service {
                 service,
                 generation,
@@ -3458,14 +3372,6 @@ impl NativeRuntime {
                     && self.views.contains_key(&view)
                     && self.view_generations.get(&view) == Some(&generation)
             }
-            CompletionSink::Instance {
-                instance,
-                generation,
-            } => self.instance_generations.get(&instance) == Some(&generation),
-            CompletionSink::DocumentReducer {
-                document,
-                generation,
-            } => self.document_generations.get(&document) == Some(&generation),
             CompletionSink::ServiceReducer {
                 service,
                 generation,
@@ -3594,6 +3500,7 @@ pub(crate) struct MarkdownApp {
 }
 
 impl MarkdownApp {
+    #[cfg(test)]
     pub(crate) fn new(document: DocumentId, title: String, source: &str) -> Self {
         Self::new_with_uri(
             document,
@@ -4033,9 +3940,7 @@ impl NativeAppModel for MarkdownApp {
             AppEvent::ClipboardFinished { outcome, .. } => {
                 view.notice = Some(match outcome {
                     ClipboardOutcome::Copied => "Copied source selection".to_string(),
-                    ClipboardOutcome::Denied { message } | ClipboardOutcome::Failed { message } => {
-                        bounded_markdown_text(&message, 160)
-                    }
+                    ClipboardOutcome::Failed { message } => bounded_markdown_text(&message, 160),
                 });
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
@@ -4044,10 +3949,7 @@ impl NativeAppModel for MarkdownApp {
             AppEvent::ExternalOpenFinished { outcome, .. } => {
                 view.notice = Some(match outcome {
                     ExternalOpenOutcome::Opened => "Opened link in the default browser".to_string(),
-                    ExternalOpenOutcome::Denied { message }
-                    | ExternalOpenOutcome::Failed { message } => {
-                        bounded_markdown_text(&message, 160)
-                    }
+                    ExternalOpenOutcome::Denied { message } => bounded_markdown_text(&message, 160),
                 });
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
@@ -5399,8 +5301,8 @@ fn config_visual_help(help: &str) -> String {
         "translucency ≥4.5:1 contrast",
     )
     .replace(
-        "the last --cpu/--gpu flag wins; inherited $ATERM_CPU otherwise wins over $ATERM_GPU; both override this value",
-        "last --cpu/--gpu > $ATERM_CPU > $ATERM_GPU > config",
+        "a launch --cpu or --gpu overrides this value (the last one given wins)",
+        "last --cpu/--gpu > config",
     )
 }
 
@@ -5450,6 +5352,7 @@ pub(crate) struct EditorApp {
 type LineIndexMemo = Option<(u64, u64, Option<std::sync::Arc<[usize]>>)>;
 
 impl EditorApp {
+    #[cfg(test)]
     pub(crate) fn new(document: DocumentId, title: String) -> Self {
         Self::new_with_uri(
             document,
@@ -5753,21 +5656,22 @@ impl NativeAppModel for EditorApp {
         // gutter — the slot `paint_text_viewport` reports as
         // `footer-available`.
         //
-        // TWO FACES SHARE THAT SLOT, and only one of them may be budgeted in
-        // CHARACTERS. `footer_chars` is the monospace minibuffer's: 7.0 px is
-        // the Mono caption advance (the cursor label beside it charges 6.6),
-        // so the count is exact-to-conservative for that face. The status is
-        // the proportional Ui face and is fitted BY MEASURE below, against the
-        // same slot. Charging its glyphs the monospace advance is what cut
-        // every config diagnostic about a third early — and because the status
-        // is composed prefix-first, what a tail elide always sacrificed was
-        // the remedy.
+        // Both faces use their actual advances. The minibuffer's character
+        // cap bounds projection work; it cannot determine pixel fit because
+        // Dynamic Type and fallback fonts change the Mono caption advances.
+        // Reserve the input caret's pixel as well as the right gutter.
         let footer_width = (editor_rect.width - 88.0).max(112.0);
         let footer_chars = ((footer_width / 7.0).floor() as usize).clamp(16, 256);
-        let minibuffer = view
-            .buffer
-            .as_ref()
-            .and_then(|buffer| editor_minibuffer_label(buffer, &view.preedit, footer_chars));
+        let minibuffer_width = (editor_rect.width - 88.0 - 1.0).max(0.0);
+        let (minibuffer, minibuffer_caret) = view.buffer.as_ref().map_or((None, None), |buffer| {
+            editor_minibuffer_projection(
+                buffer,
+                &view.preedit,
+                view.preedit_caret,
+                footer_chars,
+                minibuffer_width,
+            )
+        });
         let semantic_status = editor_status_message(
             self,
             view,
@@ -6387,9 +6291,11 @@ impl NativeAppModel for EditorApp {
                     selectable: true,
                     projection,
                     preedit: document_preedit,
+                    preedit_caret: view.preedit_caret,
                     status,
                     semantic_status,
                     minibuffer,
+                    minibuffer_caret,
                     cursor_label,
                     dirty: self.dirty,
                     saving: self.checkpoint_pending,
@@ -6534,54 +6440,102 @@ impl NativeAppModel for EditorApp {
     }
 }
 
-fn editor_minibuffer_label(
+fn editor_minibuffer_projection(
     view: &crate::native_editor::EditorBufferView,
     preedit: &str,
+    preedit_caret: Option<usize>,
     max_chars: usize,
-) -> Option<String> {
+    max_width: f32,
+) -> (Option<String>, Option<usize>) {
     use crate::native_editor::Minibuffer;
 
     if let Some(prefix) = view.prefix_hud.as_ref() {
-        return Some(bounded_markdown_label(prefix, max_chars));
+        return (Some(bounded_markdown_label(prefix, max_chars)), None);
     }
-    match &view.minibuffer {
-        Minibuffer::Inactive => None,
-        Minibuffer::Command { query, .. } => {
-            Some(editor_prompt_label("M-x ", query, preedit, max_chars))
-        }
-        Minibuffer::Search { query, .. } => {
-            Some(editor_prompt_label("I-search: ", query, preedit, max_chars))
-        }
-        Minibuffer::Buffer { query } => Some(editor_prompt_label(
-            "Switch buffer: ",
-            query,
-            preedit,
-            max_chars,
-        )),
-        Minibuffer::GotoLine { query, .. } => Some(editor_prompt_label(
-            "Goto line: ",
-            query,
-            preedit,
-            max_chars,
-        )),
-        Minibuffer::Message(message) => Some(bounded_markdown_label(message, max_chars)),
-    }
+    let (prefix, query) = match &view.minibuffer {
+        Minibuffer::Inactive => return (None, None),
+        Minibuffer::Command { query, .. } => ("M-x ", query),
+        Minibuffer::Search { query, .. } => ("I-search: ", query),
+        Minibuffer::Buffer { query } => ("Switch buffer: ", query),
+        Minibuffer::GotoLine { query, .. } => ("Goto line: ", query),
+    };
+    let (label, caret) =
+        editor_prompt_projection(prefix, query, preedit, preedit_caret, max_chars, max_width);
+    (Some(label), Some(caret))
 }
 
-fn editor_prompt_label(prefix: &str, query: &str, preedit: &str, max_chars: usize) -> String {
+fn editor_prompt_projection(
+    prefix: &str,
+    query: &str,
+    preedit: &str,
+    preedit_caret: Option<usize>,
+    max_chars: usize,
+    max_width: f32,
+) -> (String, usize) {
+    // Minibuffer editing is append-only (`insert_minibuffer_text` /
+    // `minibuffer_backspace`), so its committed caret is query.len(). Map
+    // marked-text movement from there through the SAME sanitizing/elision as
+    // the painted label. Replacing CR/LF by one space preserves byte offsets.
     let body = format!("{query}{preedit}").replace(['\r', '\n'], " ");
     let prefix_chars = prefix.graphemes().count();
-    let body_graphemes = body.graphemes().collect::<Vec<_>>();
+    let body_graphemes = body.grapheme_indices().collect::<Vec<_>>();
     let body_chars = body_graphemes.len();
-    if prefix_chars.saturating_add(body_chars) <= max_chars {
-        return format!("{prefix}{body}");
+    let requested = query.len() + preedit_caret.unwrap_or(preedit.len()).min(preedit.len());
+    let caret = if requested == body.len() {
+        requested
+    } else {
+        body_graphemes
+            .iter()
+            .take_while(|(offset, _)| *offset <= requested)
+            .last()
+            .map_or(0, |(offset, _)| *offset)
+    };
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Caption).get();
+    let width =
+        |text: &str| crate::tray_raster::measure_text(text, px, crate::widget::TextWeight::Regular);
+    let prefix_width = width(prefix);
+    if prefix_chars.saturating_add(body_chars) <= max_chars
+        && prefix_width + width(&body) <= max_width
+    {
+        return (format!("{prefix}{body}"), prefix.len() + caret);
     }
+    let ellipsis_width = width("…");
+    if max_chars == 0 || ellipsis_width > max_width {
+        return (String::new(), 0);
+    }
+    // At extremely narrow widths the prompt itself cannot fit. Keep the live
+    // query tail and its input caret instead of painting a clipped prompt.
+    let (prefix, prefix_chars, prefix_width) = if prefix_chars.saturating_add(1) <= max_chars
+        && prefix_width + ellipsis_width <= max_width
+    {
+        (prefix, prefix_chars, prefix_width)
+    } else {
+        ("", 0, 0.0)
+    };
     let tail_chars = max_chars.saturating_sub(prefix_chars.saturating_add(1));
-    if tail_chars == 0 {
-        return bounded_markdown_label(prefix, max_chars);
+    let fixed_width = prefix_width + ellipsis_width;
+    // At most the existing character cap is measured, even for a long query.
+    // Mono advances are nonnegative, so the first fitting suffix is found in
+    // logarithmically many bounded measurements, only when rebuilding the view.
+    let mut lo = body_chars.saturating_sub(tail_chars);
+    let mut hi = body_chars;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let start = body_graphemes[mid].0;
+        if fixed_width + width(&body[start..]) <= max_width {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
     }
-    let tail = body_graphemes[body_chars - tail_chars..].concat();
-    format!("{prefix}…{tail}")
+    let tail_start = body_graphemes
+        .get(lo)
+        .map_or(body.len(), |(offset, _)| *offset);
+    let tail = &body[tail_start..];
+    (
+        format!("{prefix}…{tail}"),
+        prefix.len() + '…'.len_utf8() + caret.saturating_sub(tail_start),
+    )
 }
 
 fn editor_status_message(
@@ -7156,8 +7110,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 0,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7227,8 +7179,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport: LogicalRect::new(0.0, 0.0, 1_000.0, 1_400.0),
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7314,8 +7264,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7428,7 +7376,6 @@ mod markdown_reader_tests {
         let snapshot = crate::document_store::DocumentSnapshot {
             id: document,
             seq: aterm_buffer::Seq(1),
-            file_version: crate::document_store::FileVersion::default(),
             text: std::sync::Arc::from(source),
         };
         let viewport = LogicalRect::new(0.0, 0.0, 900.0, 640.0);
@@ -7456,8 +7403,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7509,8 +7454,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7664,8 +7607,6 @@ mod markdown_reader_tests {
                     view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -7714,8 +7655,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7749,8 +7688,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7801,8 +7738,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7862,8 +7797,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7891,8 +7824,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -7955,8 +7886,6 @@ mod markdown_reader_tests {
                     view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -8073,6 +8002,30 @@ mod markdown_reader_tests {
         )
     }
 
+    fn editor_input_focus(app: &mut EditorApp, view: &mut EditorViewState, focused: bool) {
+        // The host marks keyboard focus visible; the real reducer chooses its
+        // target. A painted but unfocused editor must never own IME geometry.
+        view.common.focus_visible = true;
+        let mut next_operation = 1;
+        let mut service_generations = BTreeMap::new();
+        let mut cx = UpdateCx {
+            instance: AppInstanceId::from_stored(1),
+            view: ViewId::from_stored(1),
+            view_generation: 1,
+            next_operation: &mut next_operation,
+            service_generations: &mut service_generations,
+            effects: Vec::new(),
+        };
+        assert_eq!(
+            app.update(
+                view,
+                AppEvent::FocusChanged(focused.then(|| UiKey::new("editor/buffer"))),
+                &mut cx,
+            ),
+            EventResult::Handled
+        );
+    }
+
     fn editor_spec(compiled: &crate::native_ui::CompiledUi) -> &TextViewportSpec {
         compiled
             .paint
@@ -8126,8 +8079,6 @@ mod markdown_reader_tests {
                     &view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -8188,8 +8139,6 @@ mod markdown_reader_tests {
                     &view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -8282,8 +8231,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8360,8 +8307,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8427,8 +8372,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8457,12 +8400,10 @@ mod markdown_reader_tests {
             })
             .expect("visible completion help");
 
-        assert!(semantic.label.contains("inherited $ATERM_CPU"));
+        assert!(semantic.label.contains("a launch --cpu or --gpu"));
         for expected in [
             "GPU rendering",
-            "last --cpu/--gpu",
-            "$ATERM_CPU",
-            "$ATERM_GPU",
+            "last --cpu/--gpu > config",
             "Ctrl-Space",
             "↑↓ select",
             "Enter/Tab insert",
@@ -8486,9 +8427,63 @@ mod markdown_reader_tests {
             assert_eq!(bounded_markdown_label(source, 2), expected);
         }
 
-        let prompt = editor_prompt_label("I-search: ", "discarded👩‍💻🇺🇳", "e\u{301}", 14);
+        let prompt = editor_prompt_projection(
+            "I-search: ",
+            "discarded👩‍💻🇺🇳",
+            "e\u{301}",
+            None,
+            14,
+            f32::INFINITY,
+        )
+        .0;
         assert_eq!(prompt, "I-search: …👩‍💻🇺🇳e\u{301}");
         assert_eq!(prompt.graphemes().count(), 14);
+    }
+
+    #[test]
+    fn editor_ime_minibuffer_projection_maps_sanitized_and_elided_carets() {
+        let (_, mut view, _) = editor_fixture("", "ime.md");
+        let buffer = view.buffer.as_mut().unwrap();
+        buffer.minibuffer = crate::native_editor::Minibuffer::Command {
+            query: "λ\n".to_string(),
+            selected: 0,
+        };
+        let (label, caret) =
+            editor_minibuffer_projection(buffer, "e\u{301}日本", Some(3), 40, f32::INFINITY);
+        assert_eq!(label.as_deref(), Some("M-x λ e\u{301}日本"));
+        assert_eq!(caret, Some("M-x λ e\u{301}".len()));
+        let (label, caret) =
+            editor_minibuffer_projection(buffer, "e\u{301}日本", None, 40, f32::INFINITY);
+        assert_eq!(caret, label.as_ref().map(String::len));
+        buffer.prefix_hud = Some("C-x …".to_string());
+        assert_eq!(
+            editor_minibuffer_projection(buffer, "候補", Some(0), 40, f32::INFINITY),
+            (Some("C-x …".to_string()), None)
+        );
+        buffer.prefix_hud = None;
+        buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+        assert_eq!(
+            editor_minibuffer_projection(buffer, "候補", Some(0), 40, f32::INFINITY),
+            (None, None)
+        );
+        let (label, caret) = editor_prompt_projection(
+            "M-x ",
+            "discarded👩‍💻",
+            "e\u{301}日本",
+            Some(3),
+            9,
+            f32::INFINITY,
+        );
+        assert_eq!(label, "M-x …👩‍💻e\u{301}日本");
+        assert_eq!(caret, "M-x …👩‍💻e\u{301}".len());
+        let (label, caret) =
+            editor_prompt_projection("M-x ", "", "abcdef日本", Some(0), 8, f32::INFINITY);
+        assert_eq!(label, "M-x …f日本");
+        assert_eq!(
+            caret,
+            "M-x …".len(),
+            "a hidden prefix caret clamps to the visible tail"
+        );
     }
 
     #[test]
@@ -8542,8 +8537,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8579,8 +8572,6 @@ mod markdown_reader_tests {
                     &view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -8653,8 +8644,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8719,8 +8708,6 @@ mod markdown_reader_tests {
                     &view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -8776,8 +8763,6 @@ mod markdown_reader_tests {
                 view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8864,8 +8849,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8895,8 +8878,6 @@ mod markdown_reader_tests {
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8941,13 +8922,12 @@ mod markdown_reader_tests {
             selected: 0,
         };
         view.preedit = "終".to_string();
+        editor_input_focus(&mut app, &mut view, true);
         let recovered = app
             .view(
                 &view,
                 &ViewCx {
                     viewport,
-                    config_revision: 1,
-                    update_revision: 1,
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
@@ -8966,12 +8946,165 @@ mod markdown_reader_tests {
         let minibuffer = spec.minibuffer.as_deref().unwrap();
         assert!(minibuffer.starts_with("M-x …"));
         assert!(minibuffer.ends_with("TAIL終"));
+        assert_eq!(spec.minibuffer_caret, Some(minibuffer.len()));
+        let caret = recovered
+            .ime_caret_rect()
+            .expect("typed minibuffer has a visible caret");
+        let viewport = recovered
+            .paint
+            .iter()
+            .find(|node| matches!(node.content, UiContent::TextViewport(_)))
+            .unwrap();
+        let geometry = crate::native_ui::text_viewport_geometry(viewport.rect);
+        assert!(caret.y >= geometry.body_y + geometry.body_h);
         assert!(minibuffer.chars().count() <= 52);
         assert!(
             spec.preedit.is_empty(),
             "IME preedit belongs only to minibuffer"
         );
         recovered.validate_parity().unwrap();
+
+        editor_input_focus(&mut app, &mut view, false);
+        let unfocused = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport: LogicalRect::new(0.0, 0.0, 474.0, 468.0),
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_theme: aterm_render::Theme::default(),
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 474.0, 468.0))
+            .unwrap();
+        assert!(
+            unfocused.ime_caret_rect().is_none(),
+            "the real focus-loss event releases candidate geometry"
+        );
+    }
+
+    #[test]
+    fn editor_ime_minibuffer_tail_and_marked_caret_fit_real_mono_metrics() {
+        use crate::native_appearance::{
+            AppearancePreferences, current_preferences, install_preferences,
+        };
+        // Native appearance and chrome fonts already use the existing per-test
+        // thread-local host seam. Restore it even if an assertion fails.
+        struct RestoreAppearance(AppearancePreferences);
+        impl Drop for RestoreAppearance {
+            fn drop(&mut self) {
+                install_preferences(self.0);
+            }
+        }
+        let _restore = RestoreAppearance(current_preferences());
+        let mut historical_overflow = false;
+        for scale in [0.85, 1.0, 1.35, 2.0] {
+            install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for width in [280.0, 360.0, 474.0, 760.0] {
+                let (mut app, mut view, snapshot) = editor_fixture("", "ime-fit.md");
+                editor_input_focus(&mut app, &mut view, true);
+                let query = format!("{}TAIL", "λ".repeat(200));
+                view.buffer.as_mut().unwrap().minibuffer =
+                    crate::native_editor::Minibuffer::Command {
+                        query: query.clone(),
+                        selected: 0,
+                    };
+                view.preedit = "e\u{301}Z".to_string();
+                view.preedit_caret = Some("e\u{301}".len());
+                let viewport = LogicalRect::new(0.0, 0.0, width, 640.0);
+                let compiled = app
+                    .view(
+                        &view,
+                        &ViewCx {
+                            viewport,
+                            animation_phase_ms: 720,
+                            motion: ViewMotionCx::default(),
+                            terminal_font_px: 12.0,
+                            terminal_theme: aterm_render::Theme::default(),
+                            semantic_font: None,
+                            document: Some(&snapshot),
+                        },
+                    )
+                    .compile(viewport)
+                    .unwrap();
+                let spec = editor_spec(&compiled);
+                let node = compiled
+                    .paint
+                    .iter()
+                    .find(|node| matches!(node.content, UiContent::TextViewport(_)))
+                    .unwrap();
+                let label = spec.minibuffer.as_deref().unwrap();
+                assert!(
+                    label.starts_with("M-x …") && label.ends_with("TAILe\u{301}Z"),
+                    "scale={scale}, width={width}, label={label:?}"
+                );
+                assert_eq!(
+                    spec.minibuffer_caret,
+                    Some(label.len() - 1),
+                    "the platform middle caret stays before Z"
+                );
+                let caret = compiled
+                    .ime_caret_rect()
+                    .expect("focused marked caret fits");
+                assert!(
+                    caret.x >= node.rect.x + 72.0 && caret.right() <= node.rect.right(),
+                    "scale={scale}, width={width}, caret={caret:?}"
+                );
+                let px =
+                    crate::native_ui::native_type_px(crate::type_scale::TypeStep::Caption).get();
+                let measured =
+                    crate::tray_raster::measure_text(label, px, crate::widget::TextWeight::Regular);
+                assert!(
+                    measured + 1.0 <= node.rect.width - 88.0,
+                    "text and end caret retain the right gutter: scale={scale}, width={width}"
+                );
+                let historical_chars =
+                    (((node.rect.width - 88.0).max(112.0) / 7.0).floor() as usize).clamp(16, 256);
+                let (historical, _) = editor_prompt_projection(
+                    "M-x ",
+                    &query,
+                    &view.preedit,
+                    view.preedit_caret,
+                    historical_chars,
+                    f32::INFINITY,
+                );
+                historical_overflow |= crate::tray_raster::measure_text(
+                    &historical,
+                    px,
+                    crate::widget::TextWeight::Regular,
+                ) + 1.0
+                    > node.rect.width - 72.0;
+                // None means the end of marked text; its visible Z advance is a
+                // negative control for accidentally discarding the middle byte.
+                view.preedit_caret = None;
+                let at_end = app
+                    .view(
+                        &view,
+                        &ViewCx {
+                            viewport,
+                            animation_phase_ms: 720,
+                            motion: ViewMotionCx::default(),
+                            terminal_font_px: 12.0,
+                            terminal_theme: aterm_render::Theme::default(),
+                            semantic_font: None,
+                            document: Some(&snapshot),
+                        },
+                    )
+                    .compile(viewport)
+                    .unwrap();
+                assert!(at_end.ime_caret_rect().expect("end caret fits").x > caret.x);
+            }
+        }
+        assert!(
+            historical_overflow,
+            "the previous fixed 7px budget must actually clip a focused caret in this sweep"
+        );
     }
 
     #[test]
@@ -9034,8 +9167,6 @@ mod markdown_reader_tests {
                     &view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
@@ -9080,8 +9211,6 @@ mod markdown_reader_tests {
                     &view,
                     &ViewCx {
                         viewport,
-                        config_revision: 1,
-                        update_revision: 1,
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,

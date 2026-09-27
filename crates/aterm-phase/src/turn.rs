@@ -10,6 +10,30 @@ use crate::phase::{
     composer_frame, composer_text, is_against_right_edge, is_done_row, is_placeholder,
     is_tool_call, last_said_index, leading_spaces, status_block, status_row, transcript_end,
 };
+
+/// No turn yet: Claude Code's launch card (`Claude Code v<version>`, anchor
+/// `launch.banner`) above the composer and, between it and the composer's
+/// frame, no user message (`❯`) and nothing said (`⏺`, `●`) — the screen
+/// `claude` draws before anyone typed. A session resumed on a conversation
+/// shows its messages under the card, and one past its first screen has
+/// scrolled the card away: neither is fresh. The live E2E of 2026-09-25: the
+/// supervisor read a brand-new session's first idle point as a worker that
+/// stopped short and typed `keep going` into it two minutes later, and the
+/// first real question then waited twice as long, its streak begun by a
+/// turn nobody took.
+#[must_use]
+pub fn fresh(rows: &[String]) -> bool {
+    let Some(frame) = composer_frame(rows) else {
+        return false;
+    };
+    let banner = crate::anchor("launch.banner");
+    let Some(card) = rows[..frame.top].iter().rposition(|r| r.contains(banner)) else {
+        return false;
+    };
+    !rows[card + 1..frame.top]
+        .iter()
+        .any(|r| r.starts_with(['❯', '⏺', '●']))
+}
 use crate::prompt::parse_prompt;
 
 /// Claude Code's own suggestion for the next message: the DIM placeholder
@@ -111,6 +135,14 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
 /// next message is theirs (the safety review of 2026-09-24 measured a
 /// `keep going` typed into exactly this screen). Negative: the same words
 /// in a message, or an interrupt a new user message has answered.
+///
+/// A question dialog a person declined — Esc on it, or `2. Cancel` on its
+/// review tab — is the same stop: the last block is `⏺ User declined to
+/// answer questions` (anchor `question.declined`; measured 2026-09-25, S7
+/// and S8), no `Interrupted ·` row under it, and the tool result tells the
+/// model to STOP and wait for the person (the critique of 2026-09-25, R12:
+/// read as no interrupt, a turn-end policy would type `keep going` over
+/// the person's refusal). Negative: the words inside a longer message row.
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
     let end = transcript_end(rows).min(rows.len());
@@ -120,6 +152,12 @@ pub fn interrupted(rows: &[String]) -> bool {
     else {
         return false;
     };
+    let said = rows[block].trim_start_matches(['⏺', '●']).trim();
+    if rows[block].starts_with(['⏺', '●'])
+        && said == crate::anchors::anchor_text("question.declined")
+    {
+        return true;
+    }
     let text = crate::anchors::anchor_text("turn.interrupted");
     rows[block..end].iter().any(|r| {
         r.trim_start()
@@ -377,6 +415,44 @@ mod tests {
         assert!(!interrupted(&answered));
     }
 
+    /// R12 (the critique of 2026-09-25): a question dialog a person declined
+    /// — `2. Cancel` on its review tab (S7-03), Esc on it (S8-02), both
+    /// MEASURED — ends the turn on `⏺ User declined to answer questions`
+    /// with no `Interrupted ·` row, and reads as a person's stop. Negative
+    /// controls: the words inside a longer message row, and a decline a new
+    /// user message has answered.
+    #[test]
+    fn a_declined_question_is_a_persons_stop() {
+        use crate::prompt::fixtures::{QUESTION_DECLINED_CANCEL, QUESTION_DECLINED_ESC, screen};
+        for text in [QUESTION_DECLINED_CANCEL, QUESTION_DECLINED_ESC] {
+            let r = screen(text);
+            assert!(interrupted(&r), "{r:?}");
+            assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Idle);
+        }
+        let foot = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let quoted = framed(
+            &[
+                "⏺ If you press Esc, Claude Code prints User declined to answer questions.",
+                "",
+            ],
+            foot,
+        );
+        assert!(!interrupted(&quoted));
+        let answered = framed(
+            &[
+                "⏺ User declined to answer questions",
+                "  ⎿  · Which shell should the demo target? (zsh (Recommended) / bash)",
+                "",
+                "❯ use zsh",
+                "",
+                "⏺ Using zsh.",
+                "",
+            ],
+            foot,
+        );
+        assert!(!interrupted(&answered));
+    }
+
     #[test]
     fn a_stall_is_time_moving_with_the_count_flat() {
         let at = |timing: &str| {
@@ -407,5 +483,26 @@ mod tests {
         assert_eq!(status_row_progress(&done), None);
         assert_eq!(duration_secs("2h 3m"), Some(7380));
         assert_eq!(duration_secs("thinking"), None);
+    }
+
+    /// A brand-new session is FRESH: the launch card over the composer, no
+    /// message and nothing said (the E2E probe of 2026-09-25: it was
+    /// continued). NEGATIVE CONTROLS: the same launch after a first message
+    /// (in its first turn), after an answer, and a screen with no card (the
+    /// card scrolled away) are not.
+    #[test]
+    fn a_launch_with_no_turn_is_fresh() {
+        use crate::prompt::fixtures::{first_turn_under_a_table, launch_under_a_table};
+        let launch = launch_under_a_table("❯ Try \"refactor <filepath>\"", "  ? for shortcuts");
+        assert!(fresh(&launch), "{launch:#?}");
+        assert!(!fresh(&first_turn_under_a_table(&["❯ then add tests"])));
+        let mut answered = launch_under_a_table("❯", "  ? for shortcuts");
+        let top = answered.len() - 3;
+        for (k, r) in ["❯ fix the parser", "", "⏺ Fixed.", ""].iter().enumerate() {
+            answered.insert(top + k, (*r).to_string());
+        }
+        assert!(!fresh(&answered), "{answered:#?}");
+        assert!(!fresh(&framed(&["⏺ Done.", ""], "  ? for shortcuts")));
+        assert!(!fresh(&screen(END_OFFER)));
     }
 }

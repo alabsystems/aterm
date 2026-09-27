@@ -246,12 +246,11 @@ fn capability_list() -> Vec<(&'static str, bool)> {
     ]
 }
 
-/// The GPU renderer's backend name for the diagnostics label, per platform: wgpu
-/// negotiates Metal on macOS, DX12 on Windows and Vulkan elsewhere (Vulkan on
-/// Linux/NVIDIA) — the same per-platform default `aterm_gpu::backends_from_env`
-/// asks for. The live `metrics` verb still reports the actually-negotiated
-/// backend at runtime, which is also where an `$ATERM_GPU_BACKEND` override shows
-/// up; this label is the compile-time default, not a probe.
+/// The GPU renderer's backend name for the diagnostics label, per platform: Metal
+/// on macOS, DX12 on Windows and Vulkan elsewhere (Vulkan on Linux/NVIDIA) — the
+/// one backend each platform compiles (`aterm_gpu::default_backends`). The live
+/// `metrics` verb still reports the actually-negotiated backend at runtime; this
+/// label is the compile-time default, not a probe.
 #[cfg(target_os = "macos")]
 const GPU_BACKEND_LABEL: &str = "gpu (metal)";
 /// See the macOS variant above. Windows restricts wgpu to DX12 — the native
@@ -267,7 +266,7 @@ const GPU_BACKEND_LABEL: &str = "gpu (vulkan)";
 /// The renderer label for the reports: the platform GPU backend name when GPU is
 /// the resolved default, else the CPU renderer. `gpu` must come from
 /// [`crate::app_config::resolve_want_gpu`] so the label tracks the actual backend
-/// selection (env + config `gpu` + GPU-on default), not env alone.
+/// selection (`--cpu`/`--gpu` + config `gpu` + GPU-on default), not a flag alone.
 fn renderer_label(gpu: bool) -> &'static str {
     if gpu { GPU_BACKEND_LABEL } else { "cpu" }
 }
@@ -329,9 +328,15 @@ fn agent_primer_line(config: &crate::app_config::Config) -> String {
 /// which has already decided it is running from inside the bundle, ever passes
 /// `Some`. The same shape as `lock_modifiers` / `user_input_recent`.
 ///
-/// `unknown` here means aterm did not look. It is never a claim of denial, and
-/// a `granted` state is never a claim that no prompt can appear: `fda_scope`
-/// stays `unknown` by construction until that coverage is actually measured.
+/// `unknown` here means aterm did not look, and it is never a claim of denial.
+/// A `granted` state is still never a claim that no prompt can appear: what a
+/// completed grant establishes is the OBSERVING HOST's scope and Apple's
+/// documented app-data class, nothing about a folder or an adopted session.
+/// That rule has one home — [`crate::control_privacy::observed_fda_scope`],
+/// which the `privacy` control verb renders from — and this line calls it
+/// rather than restating it, so the two surfaces cannot disagree about the
+/// same machine (they did: this line pinned `unknown` for a granted probe the
+/// verb already reported as `this_process`).
 pub(crate) fn privacy_line(
     config: &crate::app_config::Config,
     probe: Option<aterm_containment::FdaProbe>,
@@ -359,10 +364,14 @@ pub(crate) fn privacy_line(
          folders={folders} hold_ms={hold} probe_interval_ms={interval} protected_roots={roots} \
          notice={notice} report_attribution={attribution}",
         fda = fda.as_str(),
-        // Pinned to `unknown`: which services a grant actually covers has not
-        // been measured, and per-folder state is unknown by construction —
-        // testing a folder to find out is what raises the dialog.
-        scope = aterm_containment::FdaScope::Unknown.as_str(),
+        // The one rule, not a second copy of it. Nothing here MEASURES a scope,
+        // so the measured half is `Unknown` — exactly what the verb passes under
+        // `SpikeEvidence::UNMEASURED` — and a granted probe resolves to
+        // `this_process` on both surfaces. Per-folder state stays unknown by
+        // construction either way: testing a folder is what raises the dialog.
+        scope =
+            crate::control_privacy::observed_fda_scope(fda, aterm_containment::FdaScope::Unknown,)
+                .as_str(),
         warmup = config.privacy_warmup().as_str(),
         hold = config.privacy_warmup_hold_ms(),
         interval = config.privacy_probe_interval_ms(),
@@ -375,10 +384,10 @@ pub(crate) fn privacy_line(
 /// Collect diagnostics from the live build + environment.
 pub(crate) fn collect() -> DiagInfo {
     let config = crate::app_config::load_config();
-    // Renderer default resolved through the shared funnel (env > config `gpu` >
-    // GPU-on default) so the report matches what `main` would actually launch. wgpu
-    // negotiates Metal on macOS, Vulkan elsewhere; the live `metrics` verb reports
-    // the actually-negotiated backend.
+    // Renderer default resolved through the shared funnel (`--cpu`/`--gpu` > config
+    // `gpu` > GPU-on default) so the report matches what `main` would actually
+    // launch. Metal on macOS, wgpu's one backend elsewhere; the live `metrics` verb
+    // reports the actually-negotiated backend.
     let gpu = crate::app_config::resolve_want_gpu(&config);
     let renderer_default = renderer_label(gpu);
 
@@ -1148,27 +1157,14 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
     // off-thread lane. Only authored keys receive diagnostics: an absent key
     // has no misleading TOML token to underline, while Settings still exposes
     // the active value in its ordinary row projection.
-    for key in [
-        "columns",
-        "lines",
-        "font_px",
-        "font_family",
-        "gpu",
-        "tab_strip_rows",
-        "stem_gamma",
-        "window_theme",
-        "shell",
-        "net.listen",
-        "net.cert",
-        "net.key",
-    ] {
+    for key in ["columns", "lines", "font_px", "font_family", "gpu", "shell"] {
         if config_key_is_authored(config, key)
             && let Some(active) = crate::app_config::active_environment_override(key)
         {
             warnings.push(ConfigSemanticWarning {
                 key,
                 message: format!(
-                    "{key}: ${} overrides the saved value; effective value is {}",
+                    "{key}: {} overrides the saved value; effective value is {}",
                     active.variable, active.effective
                 ),
             });
@@ -1179,8 +1175,8 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
     // product — every new session dies at spawn, and before the launch-alert
     // work the app just bounced and vanished. Validate the authored value so
     // `--validate-config` (and Manual) says so BEFORE a session has to fail.
-    // `$ATERM_SHELL` precedence is already surfaced by the env-override warning
-    // above; this checks the saved key, which is what survives a restart.
+    // `--shell` precedence is already surfaced by the override warning above;
+    // this checks the saved key, which is what survives a restart.
     //
     // WHAT COUNTS AS BROKEN IS PER-PLATFORM, and this used to be a single POSIX
     // rule (`!shell.contains('/')`) applied to both. See the two
@@ -1726,7 +1722,6 @@ fn package_capability_warnings(
 /// Windows consumes `background_material` as Mica/Mica Alt/Acrylic without the
 /// macOS translucency precondition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // non-host variants drive the cross-platform test matrix
 pub(crate) enum ConfigCapabilityPlatform {
     MacOs,
     Windows,
@@ -1739,14 +1734,18 @@ pub(crate) enum ConfigCapabilityPlatform {
 }
 
 impl ConfigCapabilityPlatform {
-    #[cfg(target_os = "macos")]
-    const CURRENT: Self = Self::MacOs;
-    #[cfg(windows)]
-    const CURRENT: Self = Self::Windows;
-    #[cfg(target_os = "linux")]
-    const CURRENT: Self = Self::Linux;
-    #[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "linux")))]
-    const CURRENT: Self = Self::Unsupported;
+    /// The build host's family. `cfg!` rather than four `#[cfg]` constants: every
+    /// variant stays a live value on every host, which is what lets the one
+    /// validator below be tested for all four families on any of them.
+    const CURRENT: Self = if cfg!(target_os = "macos") {
+        Self::MacOs
+    } else if cfg!(windows) {
+        Self::Windows
+    } else if cfg!(target_os = "linux") {
+        Self::Linux
+    } else {
+        Self::Unsupported
+    };
 
     /// Whether a native updater reads `[update]` here: macOS and Linux
     /// (`aterm_update::enabled`).
@@ -1914,6 +1913,11 @@ pub(crate) fn config_backend_capability_warnings(
             (
                 crate::prefs::EDIT_TRAIL_SOUND_RIFF,
                 config.trail_sound_riff.is_some(),
+            ),
+            // The supervisor's choice chime is a synth voice on the same output.
+            (
+                crate::prefs::EDIT_CHOICE_SOUND,
+                config.choice_sound.is_some(),
             ),
         ] {
             if authored {
@@ -2384,7 +2388,7 @@ fn show_config_font_px(value: f32, explicit: bool) -> String {
 }
 
 /// `--show-config`: the resolved launch config after applying the
-/// env > config > default precedence. Most values are final before a window
+/// launch flag / env > config > default precedence. Most values are final before a window
 /// exists. An unset font size is necessarily reported as its auto-scale base:
 /// the final physical size is selected only when the real window/display scale
 /// is known. The config FILE path + presence is shown so the reader knows
@@ -2419,8 +2423,8 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
         .unwrap_or_else(|| "Default".to_string());
     let themes = crate::app_config::ThemeCatalog::discover();
     let tc = config.applied_terminal_config_for_with_assets(aterm_types::Appearance::Dark, &themes);
-    // The same effective resolution the renderer uses (env > config > platform
-    // default), so `--show-config` reports the face that actually loads — on a
+    // The same effective resolution the renderer uses (`--font` > config >
+    // platform default), so `--show-config` reports the face that actually loads — on a
     // pristine config that is "(built-in candidates)", the library's
     // FONT_CANDIDATES lead (SF Mono on macOS); `--show-face` names the file.
     let font_family = crate::effective_font_family(config.font_family_request().as_deref())
@@ -2429,7 +2433,7 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     let lines = crate::app_config::resolve_initial_lines(&config);
 
     let mut s = String::new();
-    let _ = writeln!(s, "resolved launch config (env > config > default)");
+    let _ = writeln!(s, "resolved launch config (flag/env > config > default)");
     let _ = writeln!(s, "=========================================");
     s.push_str(&config_line(
         "config file: ",
@@ -2444,7 +2448,7 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     let _ = writeln!(s, "lines:          {lines}");
     let _ = writeln!(s, "tab_strip_rows: {tab_strip_rows}");
     let _ = writeln!(s, "theme:          {theme_name}");
-    // W2 typography knobs (all resolved with the same env > config precedence).
+    // W2 typography knobs (config > default; no environment alias).
     let _ = writeln!(
         s,
         "text_blending:  {}",
@@ -2493,7 +2497,7 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
 /// `--show-face`: the resolved font FACE for `family` — the file aterm would
 /// actually load plus its cell metrics + glyph count (from `aterm_render::face_info`,
 /// the same resolver the renderer uses). `family` empty falls back to the effective
-/// `font_family` (env > config > platform default). An unresolvable family yields a
+/// `font_family` (`--font` > config > platform default). An unresolvable family yields a
 /// clear message and a non-zero result so scripts can detect it.
 pub(crate) fn show_face(family: &str) -> (String, bool) {
     let family = family.trim();
@@ -2539,6 +2543,12 @@ mod tests {
     fn parsed(source: &str) -> crate::app_config::Config {
         aterm_toml::from_str(source).expect("test config")
     }
+
+    /// An absolute root for the `protected_roots` fixtures: `/tmp/…` is
+    /// absolute only on Unix (on Windows `Path::is_absolute` needs a drive, so
+    /// the resolver drops it as "neither absolute nor ~-prefixed" and every
+    /// count below is off by one). Same rationale as `app_config`'s twin.
+    const ABS_TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
 
     #[test]
     fn semantic_warnings_match_dependent_runtime_clamps() {
@@ -3034,9 +3044,9 @@ expect_nonce = "launch-pin"
     /// would leave the protected set with a hole in it and nothing said.
     #[test]
     fn privacy_flags_a_protected_root_it_cannot_resolve() {
-        let warnings = config_semantic_warnings(&parsed(
-            "[privacy]\nprotected_roots = [\"~/vault\", \"/tmp/vault\", \"vault\", \"\"]\n",
-        ));
+        let warnings = config_semantic_warnings(&parsed(&format!(
+            "[privacy]\nprotected_roots = [\"~/vault\", \"{ABS_TMP}/vault\", \"vault\", \"\"]\n"
+        )));
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings.iter().all(|w| w.key == "privacy.protected_roots"
@@ -3083,18 +3093,23 @@ expect_nonce = "launch-pin"
     /// nothing would notice.
     #[test]
     fn a_valid_privacy_section_emits_no_semantic_warning() {
-        let clean = parsed(concat!(
-            "[privacy]\n",
-            "enabled = true\n",
-            "check = true\n",
-            "notice = true\n",
-            "report_attribution = true\n",
-            "warmup = \"on-request\"\n",
-            "warmup_folders = [\"documents\", \"desktop\", \"downloads\", \"app-data\"]\n",
-            "warmup_hold_ms = 120000\n",
-            "probe_interval_ms = 5000\n",
-            "protected_roots = [\"~/vault\", \"/tmp/vault\"]\n",
-            "auto_accept = false\n",
+        // Positional `{}`: a format string expanded from `concat!` may not
+        // capture variables inline.
+        let clean = parsed(&format!(
+            concat!(
+                "[privacy]\n",
+                "enabled = true\n",
+                "check = true\n",
+                "notice = true\n",
+                "report_attribution = true\n",
+                "warmup = \"on-request\"\n",
+                "warmup_folders = [\"documents\", \"desktop\", \"downloads\", \"app-data\"]\n",
+                "warmup_hold_ms = 120000\n",
+                "probe_interval_ms = 5000\n",
+                "protected_roots = [\"~/vault\", \"{}/vault\"]\n",
+                "auto_accept = false\n",
+            ),
+            ABS_TMP
         ));
         let warnings = config_semantic_warnings(&clean);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -3234,27 +3249,29 @@ ink = "rainbow"
     }
 
     #[test]
-    fn host_validation_reports_only_authored_environment_masking() {
+    fn host_validation_reports_only_authored_launch_flag_masking() {
         const CHILD: &str = "ATERM_HOST_OVERRIDE_WARNING_CHILD";
         const EXACT: &str =
-            "diagnostics::tests::host_validation_reports_only_authored_environment_masking";
+            "diagnostics::tests::host_validation_reports_only_authored_launch_flag_masking";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", EXACT, "--nocapture"])
                 .env(CHILD, "1")
-                .env("ATERM_COLUMNS", "120")
                 .env("RUST_TEST_THREADS", "1")
                 .status()
-                .expect("launch isolated environment-precedence validation");
+                .expect("launch isolated launch-flag precedence validation");
             assert!(status.success());
             return;
         }
+        // The child process's own launch flags: `--columns 120` (process-wide, so
+        // only in this isolated child).
+        let _ = crate::cli::parse_cli(vec!["--columns".into(), "120".into()]);
 
         let authored: crate::app_config::Config = aterm_toml::from_str("columns = 80\n").unwrap();
         let warnings = config_host_semantic_warnings(&authored);
         assert!(warnings.iter().any(|warning| {
             warning.key == "columns"
-                && warning.message.contains("$ATERM_COLUMNS overrides")
+                && warning.message.contains("--columns overrides")
                 && warning.message.contains("effective value is 120")
         }));
 
@@ -3283,11 +3300,9 @@ ink = "rainbow"
 
     /// The `shell` VALIDITY warnings an authored TOML line produces.
     ///
-    /// The `$ATERM_SHELL` precedence notice is dropped. It also starts `shell:`,
-    /// but it is emitted for ANY authored `shell` whenever that variable happens
-    /// to be set in the harness's environment, and it says nothing about whether
-    /// the value can spawn — leaving it in would make every "validates clean"
-    /// assertion below depend on the environment the suite was launched from.
+    /// The `--shell` precedence notice is dropped. It also starts `shell:`, but it
+    /// is emitted for ANY authored `shell` whenever that flag is in force, and it
+    /// says nothing about whether the value can spawn.
     fn shell_warns(toml: &str) -> Vec<String> {
         validate_config_text(toml)
             .expect("parses")
@@ -3939,7 +3954,7 @@ ink = "rainbow"
             objc_protocols_absent: vec!["NSApplicationDelegate"],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
             config_presence: ConfigPresence::Absent,
-            env: vec![("ATERM_GPU".into(), "1".into())],
+            env: vec![("ATERM_CHILD".into(), "1".into())],
         }
     }
 
@@ -4038,7 +4053,7 @@ ink = "rainbow"
         assert!(r.contains("version:   0.3.0 (abc1234"), "version line");
         assert!(r.contains("[x] kitty_graphics"), "advertised cap checked");
         assert!(r.contains("[ ] soft_fonts"), "unadvertised cap unchecked");
-        assert!(r.contains("ATERM_GPU=1"), "env listed");
+        assert!(r.contains("ATERM_CHILD=1"), "env listed");
         assert!(
             r.contains(
                 "update-pin-sha256: \
@@ -4248,7 +4263,9 @@ ink = "rainbow"
     fn the_privacy_line_reports_unknown_from_the_inert_arm_and_never_probes() {
         use aterm_containment::{FdaProbe, FdaState, ProbeLabel};
 
-        let config = parsed("[privacy]\nprotected_roots = [\"/tmp/one\", \"/tmp/two\"]\n");
+        let config = parsed(&format!(
+            "[privacy]\nprotected_roots = [\"{ABS_TMP}/one\", \"{ABS_TMP}/two\"]\n"
+        ));
         let inert = privacy_line(&config, None);
         for token in [
             "full_disk_access=unknown",
@@ -4264,8 +4281,8 @@ ink = "rainbow"
             assert!(inert.contains(token), "{token} missing from {inert}");
         }
 
-        // The live arm renders what it was handed, and nothing more: a grant
-        // does not become a claim about coverage.
+        // The live arm renders what it was handed through the shared rule: a
+        // grant establishes the observing host's scope and nothing further.
         let granted = FdaProbe {
             state: FdaState::Granted,
             label: ProbeLabel::OpenOk,
@@ -4276,8 +4293,9 @@ ink = "rainbow"
             "{live}"
         );
         assert!(
-            live.contains("fda_scope=unknown"),
-            "granted or not, the scope of the grant stays unmeasured: {live}"
+            live.contains("fda_scope=this_process"),
+            "a completed grant establishes the observing host's scope, and this line \
+             renders the same rule the privacy verb does: {live}"
         );
 
         // `check = false` names the CONFIGURATION rather than implying denial,
@@ -4650,24 +4668,25 @@ ink = "rainbow"
     }
 
     /// The renderer label the reports print is derived from the SHARED backend
-    /// resolver (`resolve_want_gpu`), not from `$ATERM_GPU` alone — so a default
+    /// resolver (`resolve_want_gpu`), not from `--gpu` alone — so a default
     /// launch (GPU-on default) and a config `gpu = true` both report a GPU backend,
-    /// and `$ATERM_CPU` / `gpu = false` report cpu. This pins the precedence the
+    /// and `--cpu` / `gpu = false` report cpu. This pins the precedence the
     /// diagnostics reader relies on to match what `main` actually selects.
     #[test]
     fn renderer_label_tracks_resolved_gpu_precedence() {
         use crate::app_config::resolve_want_gpu_with;
-        // $ATERM_CPU forces CPU regardless of $ATERM_GPU or config.
+        // --cpu forces CPU regardless of config (the flags are exclusive in
+        // practice — the last one given wins — but the core stays total).
         assert_eq!(
             renderer_label(resolve_want_gpu_with(true, true, Some(true))),
             "cpu"
         );
-        // $ATERM_GPU forces GPU even when config sets gpu = false.
+        // --gpu forces GPU even when config sets gpu = false.
         assert_eq!(
             renderer_label(resolve_want_gpu_with(false, true, Some(false))),
             GPU_BACKEND_LABEL
         );
-        // With neither env set, config decides.
+        // With neither flag given, config decides.
         assert_eq!(
             renderer_label(resolve_want_gpu_with(false, false, Some(false))),
             "cpu"
@@ -4676,7 +4695,7 @@ ink = "rainbow"
             renderer_label(resolve_want_gpu_with(false, false, Some(true))),
             GPU_BACKEND_LABEL
         );
-        // The regression: a DEFAULT launch (no env, no config) renders on GPU, so
+        // The regression: a DEFAULT launch (no flag, no config) renders on GPU, so
         // the report must say GPU — not "cpu" as the old env-only check did.
         assert_eq!(
             renderer_label(resolve_want_gpu_with(false, false, None)),
@@ -4687,7 +4706,7 @@ ink = "rainbow"
     /// The label must name the backend this platform actually negotiates. Every
     /// other assertion above compares against the constant itself and so cannot
     /// see it being WRONG: Windows restricts wgpu to DX12
-    /// (`aterm_gpu::backends_from_env`) while the report said "vulkan", which is
+    /// (`aterm_gpu::default_backends`) while the report said "vulkan", which is
     /// the one line a bug reporter is asked to paste.
     #[test]
     fn the_backend_label_names_this_platform_s_backend() {

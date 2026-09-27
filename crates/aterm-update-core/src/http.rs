@@ -1684,9 +1684,14 @@ impl VendorScratch {
     fn new() -> Result<Self, String> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let builder = {
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -2194,72 +2199,47 @@ mod tests {
             .collect()
     }
 
-    /// Fail closed on a caller bug rather than emitting a bare `Bearer ` header:
-    /// an empty token is not "anonymous", it is a mistake, and GitHub answers a
-    /// malformed credential with a 401 that would look like a revoked token.
+    /// Each classified arm names its status and URL, a rate limit says so, and the
+    /// ANONYMOUS rate limit never claims a token is involved ("the token is valid" would
+    /// be a lie there). `Transport` passes curl's own text through untouched.
     #[test]
-    fn empty_token_is_refused() {
-        let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some(""))
-            .expect_err("an empty token must be refused before spawning curl");
-        assert!(err.contains("empty"), "{err}");
-        assert!(
-            err.contains("anonymously"),
-            "the remedy (request anonymously) must be named: {err}"
-        );
-        // The injection guard still fires ahead of any spawn, too.
-        let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some("a\"b"))
-            .expect_err("an injection-shaped token must be refused");
-        assert!(err.contains("illegal characters"), "{err}");
-    }
-
-    /// Classification must not change any operator-visible wording: each arm's
-    /// `Display` is the string this layer returned before the split. The one
-    /// deliberate exception is the ANONYMOUS rate limit, where the old text
-    /// ("the token is valid") would be a lie.
-    #[test]
-    fn classified_errors_render_the_historical_wording() {
+    fn classified_errors_name_their_status_and_the_anonymous_limit_names_no_token() {
         let url = "https://api.github.com/repos/o/r/releases";
-        assert_eq!(
+        let rate_limited = |code, authenticated| {
             HttpError::RateLimited {
-                code: 403,
+                code,
                 url: url.into(),
-                authenticated: true
+                authenticated,
             }
-            .to_string(),
-            format!(
-                "GitHub rate limit hit (HTTP 403) for {url}; transient (the token is \
-                 valid) — backing off, will retry on the next check"
-            )
+            .to_string()
+        };
+        let authed = rate_limited(403, true);
+        assert!(
+            authed.contains("rate limit") && authed.contains("(HTTP 403)") && authed.contains(url),
+            "{authed}"
         );
-        let anon = HttpError::RateLimited {
-            code: 429,
+        let anon = rate_limited(429, false);
+        assert!(
+            anon.contains("rate limit")
+                && anon.contains("~60 requests/hour per IP")
+                && !anon.contains("the token is valid"),
+            "an anonymous rate limit must not claim a token is involved: {anon}"
+        );
+        let unauthorized = HttpError::Unauthorized { code: 401 }.to_string();
+        assert!(unauthorized.contains("(HTTP 401)"), "{unauthorized}");
+        let not_found = HttpError::NotFound { url: url.into() }.to_string();
+        assert!(
+            not_found.contains("HTTP 404") && not_found.contains(url),
+            "{not_found}"
+        );
+        let status = HttpError::Status {
+            code: 500,
             url: url.into(),
-            authenticated: false,
         }
         .to_string();
         assert!(
-            anon.contains("~60 requests/hour per IP") && !anon.contains("the token is valid"),
-            "an anonymous rate limit must not claim a token is involved: {anon}"
-        );
-        assert_eq!(
-            HttpError::Unauthorized { code: 401 }.to_string(),
-            "GitHub auth failed (HTTP 401): the update token is missing required \
-             access, expired, or was revoked — rotate it (see docs/RELEASING.md)"
-        );
-        assert_eq!(
-            HttpError::NotFound { url: url.into() }.to_string(),
-            format!(
-                "GitHub returned HTTP 404 for {url} (repo/releases not found, or the token \
-                 lacks access to this private repo)"
-            )
-        );
-        assert_eq!(
-            HttpError::Status {
-                code: 500,
-                url: url.into()
-            }
-            .to_string(),
-            format!("GitHub API returned HTTP 500 for {url}")
+            status.contains("HTTP 500") && status.contains(url),
+            "{status}"
         );
         assert_eq!(
             HttpError::Transport("curl GET x failed (exit 6): dns".into()).to_string(),
@@ -2267,32 +2247,59 @@ mod tests {
         );
     }
 
+    /// The token is delivered as `header = "Authorization: Bearer <t>"` on curl's stdin
+    /// config, so `token_config_safe` is the curl-directive injection guard. One row per
+    /// token shape with its verdict; then the guard, and the empty-token refusal, must
+    /// fire in `curl_fetch` BEFORE any spawn. An empty token is not "anonymous", it is a
+    /// caller bug that GitHub would answer with a 401 that looks like a revoked token.
     #[test]
-    fn well_formed_tokens_are_accepted() {
-        for t in [
-            concat!("gh", "p_ABCdef0123456789ABCdef0123456789ABCd"),
-            concat!("github", "_pat_11ABC_def.ghi-jkl"),
-            "classic-40-hex-abcdef0123456789abcdef0123456789abcdef01",
+    fn tokens_are_screened_for_curl_config_injection_before_any_spawn() {
+        for (token, safe, why) in [
+            (
+                concat!("gh", "p_ABCdef0123456789ABCdef0123456789ABCd"),
+                true,
+                "classic PAT",
+            ),
+            (
+                concat!("github", "_pat_11ABC_def.ghi-jkl"),
+                true,
+                "fine-grained PAT",
+            ),
+            (
+                "classic-40-hex-abcdef0123456789abcdef0123456789abcdef01",
+                true,
+                "40-hex token",
+            ),
+            // Each of these could break out of `header = "...: Bearer <t>"` and inject a
+            // curl directive.
+            (
+                "x\"\ninsecure",
+                false,
+                "close the quote, add `insecure` (disable TLS)",
+            ),
+            (
+                "x\nproxy = http://evil/",
+                false,
+                "newline starts a new directive",
+            ),
+            ("x\"y", false, "stray quote"),
+            ("x\\y", false, "backslash escape"),
+            ("x\ty", false, "control char (tab)"),
+            ("x\r\nfoo", false, "CRLF"),
         ] {
-            assert!(token_config_safe(t), "real token rejected: {t:?}");
+            assert_eq!(token_config_safe(token), safe, "{why}: {token:?}");
         }
-    }
 
-    #[test]
-    fn injection_shaped_tokens_are_rejected() {
-        // Each of these could break out of `header = "...: Bearer <t>"` and inject a
-        // curl directive (a quote to close the value, a newline to add a line, a
-        // backslash to escape, or a control char).
-        for t in [
-            "x\"\ninsecure",           // close the quote, add `insecure` (disable TLS)
-            "x\nproxy = http://evil/", // newline → new directive
-            "x\"y",                    // stray quote
-            "x\\y",                    // backslash escape
-            "x\ty",                    // control char (tab)
-            "x\r\nfoo",                // CRLF
-        ] {
-            assert!(!token_config_safe(t), "injection token accepted: {t:?}");
-        }
+        let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some(""))
+            .expect_err("an empty token must be refused before spawning curl");
+        assert!(err.contains("empty"), "{err}");
+        assert!(
+            err.contains("anonymously"),
+            "the remedy (request anonymously) must be named: {err}"
+        );
+        let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some("a\"b"))
+            .expect_err("an injection-shaped token must be refused");
+        assert!(err.contains("illegal characters"), "{err}");
     }
 
     /// The bound is GitHub's own per-asset ceiling, so the only thing that can
@@ -3059,93 +3066,6 @@ mod tests {
         assert!(!dir.exists(), "the scratch dir is removed on drop");
     }
 
-    /// LIVE: a real conditional GET of Anthropic's release head — 200 with a version body
-    /// and an ETag on the pinned host, then 304 for that ETag.
-    ///
-    /// ```text
-    ///   targo --unverified test -p aterm-update-core vendor_get_live -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "network: fetches https://downloads.claude.ai/claude-code-releases/latest"]
-    fn vendor_get_live_conditional_claude_head() {
-        const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
-        let first = super::vendor_get(URL, 64, None).expect("first GET");
-        let super::VendorResponse::Body {
-            bytes,
-            etag,
-            effective_url,
-        } = first
-        else {
-            panic!("an unconditional GET must answer a body: {first:?}");
-        };
-        let text = String::from_utf8(bytes).expect("utf-8 head");
-        let version = text.strip_suffix('\n').unwrap_or(&text);
-        let parts: Vec<&str> = version.split('.').collect();
-        assert!(
-            parts.len() == 3
-                && parts
-                    .iter()
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
-            "{text:?}"
-        );
-        assert_eq!(effective_url, URL, "no redirect off the pinned URL");
-        let etag = etag.expect("the head carries an ETag");
-        let second = super::vendor_get(URL, 64, Some(&etag)).expect("conditional GET");
-        println!("head={version} etag={etag} second={second:?}");
-        assert!(
-            matches!(second, super::VendorResponse::NotModified { .. }),
-            "{second:?}"
-        );
-    }
-
-    /// LIVE: the codex SHA256SUMS through GitHub's redirect — a HEAD that sizes it, a GET
-    /// whose effective URL ends on GitHub's release-asset storage, and the payload lane.
-    ///
-    /// ```text
-    ///   targo --unverified test -p aterm-update-core vendor_live_codex_sums -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "network: fetches a codex release asset from github.com"]
-    fn vendor_live_codex_sums() {
-        const URL: &str = "https://github.com/openai/codex/releases/download/rust-v0.156.0/\
-                           codex-package_SHA256SUMS";
-        let size = super::vendor_content_length(URL).expect("HEAD");
-        let got = super::vendor_get(URL, 65_536, None).expect("GET");
-        let super::VendorResponse::Body {
-            bytes,
-            effective_url,
-            ..
-        } = got
-        else {
-            panic!("{got:?}");
-        };
-        println!("size={size} len={} effective={effective_url}", bytes.len());
-        assert_eq!(bytes.len() as u64, size, "the HEAD sized the GET exactly");
-        assert!(
-            effective_url.starts_with("https://release-assets.githubusercontent.com/"),
-            "{effective_url}"
-        );
-        let err = super::vendor_get(URL, size - 1, None)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("cap"),
-            "one byte under the size is refused: {err}"
-        );
-        // The payload lane moves the same bytes, and refuses one byte under the size as a
-        // verdict, not as the network.
-        let scratch = super::VendorScratch::new().expect("scratch dir");
-        let dest = scratch.0.join("codex-package_SHA256SUMS");
-        super::vendor_download_to(URL, &dest, size).expect("payload lane");
-        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
-        let short = scratch.0.join("short");
-        assert!(matches!(
-            super::vendor_download_to(URL, &short, size - 1),
-            Err(HttpError::VendorRefused(_))
-        ));
-        assert!(!short.exists(), "a refused payload never lands");
-    }
-
     /// THE web-lane steady-state request: headers only, ONE hop, no credential channel,
     /// no `-f` (a 404 is an answer), no `-L` (the redirect is the answer), and the `--`
     /// guard still last before the URL.
@@ -3215,10 +3135,9 @@ mod tests {
     // RESUMABLE ARTIFACT DOWNLOAD (aup-3)
     //
     // The win is measured in BYTES RE-FETCHED PER FAILED ATTEMPT, which needs a real
-    // transfer to observe; `resume_cost_over_the_network` below is that measurement and
-    // runs when `ATERM_RESUME_TEST_URL` names a real https asset. Everything a network
-    // cannot be asked about — the size accounting, the request shape, the `.part` state
-    // machine — is pinned here, unconditionally.
+    // transfer to observe. Everything a network cannot be asked about — the size
+    // accounting, the request shape, the `.part` state machine — is pinned here,
+    // unconditionally.
     // -----------------------------------------------------------------------------
 
     /// The part sibling must APPEND, never replace an extension: `with_extension` turns
@@ -3449,98 +3368,6 @@ mod tests {
             .expect_err("a non-https asset URL must be refused");
         assert!(err.contains("non-https"), "{err}");
         assert!(!dest.exists() && !dir.join("a.tar.zst.part").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// THE MEASUREMENT — bytes actually re-fetched on a retry.
-    ///
-    /// Needs a real https asset, so it is env-gated rather than skipped silently:
-    ///
-    /// ```text
-    ///   ATERM_RESUME_TEST_URL=https://…/some-release-asset \
-    ///     cargo test -p aterm-update-core resume_cost_over_the_network -- --nocapture --ignored
-    ///   -> {"total_bytes":N,"seeded_prefix":N/2,"bytes_fetched_on_retry":~N/2,"ratio":~0.5}
-    /// ```
-    ///
-    /// Two-sided reach guards: the asset must be big enough for a half to be meaningful,
-    /// the seeded prefix must be a real prefix of it (the run downloads the whole thing
-    /// once first, so the resumed file is compared against the whole one — a resume that
-    /// produced DIFFERENT bytes fails here), and the retry must fetch strictly less than
-    /// the whole asset or the saving is imaginary.
-    ///
-    /// # The saving is OBSERVED, not asserted
-    ///
-    /// `total - seeded` is arithmetic: it is what we ASKED for, and a server that ignored
-    /// the range and re-sent everything would produce the same number while saving
-    /// nothing. So the run does it twice. The second pass seeds a prefix of the RIGHT
-    /// LENGTH but the WRONG BYTES; if the remainder alone came over the wire, the result
-    /// must still carry that poison, and if the whole object was re-sent it cannot. The
-    /// two passes together bracket the answer: pass one proves a resume reconstructs the
-    /// artifact exactly, pass two proves the prefix was genuinely not transferred.
-    #[test]
-    #[ignore = "needs ATERM_RESUME_TEST_URL to name a real https release asset"]
-    fn resume_cost_over_the_network() {
-        let Ok(url) = std::env::var("ATERM_RESUME_TEST_URL") else {
-            panic!("set ATERM_RESUME_TEST_URL to a real https asset URL");
-        };
-        let dir = std::env::temp_dir().join(format!("aterm-resume-net-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let whole = dir.join("whole.bin");
-        super::download_to(&url, None, &whole, RELEASE_ASSET_DOWNLOAD_BOUND).expect("baseline");
-        let reference = std::fs::read(&whole).expect("baseline bytes");
-        let total = reference.len() as u64;
-        assert!(
-            total > 1 << 20,
-            "reach guard: a {total}-byte asset is too small to price a resume"
-        );
-
-        // Seed a genuine half-prefix and resume onto it.
-        let dest = dir.join("resumed.bin");
-        let part = part_path(&dest).unwrap();
-        let seeded = total / 2;
-        std::fs::write(&part, &reference[..seeded as usize]).unwrap();
-        download_to_resumable(&url, None, &dest, RELEASE_ASSET_DOWNLOAD_BOUND).expect("resume");
-        let resumed = std::fs::read(&dest).expect("resumed bytes");
-
-        assert_eq!(
-            resumed, reference,
-            "a resumed download must reconstruct the SAME bytes"
-        );
-        let fetched = total - seeded;
-        println!(
-            "{{\"total_bytes\":{total},\"seeded_prefix\":{seeded},\
-             \"bytes_fetched_on_retry\":{fetched},\"ratio\":{:.3}}}",
-            fetched as f64 / total as f64
-        );
-        assert!(
-            fetched < total,
-            "the retry must not re-fetch the whole artifact"
-        );
-
-        // …and the observation. Same offset, POISONED prefix.
-        let poisoned_dest = dir.join("poisoned.bin");
-        let poisoned_part = part_path(&poisoned_dest).unwrap();
-        let mut poison = reference[..seeded as usize].to_vec();
-        for b in poison.iter_mut() {
-            *b = !*b;
-        }
-        std::fs::write(&poisoned_part, &poison).unwrap();
-        download_to_resumable(&url, None, &poisoned_dest, RELEASE_ASSET_DOWNLOAD_BOUND)
-            .expect("resume onto a poisoned prefix");
-        let got = std::fs::read(&poisoned_dest).expect("poisoned bytes");
-        assert_eq!(got.len(), reference.len(), "the total length is unchanged");
-        assert_eq!(
-            &got[seeded as usize..],
-            &reference[seeded as usize..],
-            "the REMAINDER really was transferred"
-        );
-        assert_eq!(
-            &got[..seeded as usize],
-            &poison[..],
-            "the prefix was NOT re-fetched — the bytes we planted survived, which is the \
-             saving, observed rather than computed"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

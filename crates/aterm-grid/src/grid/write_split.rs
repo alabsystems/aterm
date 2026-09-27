@@ -19,33 +19,12 @@
 
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 use super::StyleId;
 use super::write::stale_extras_cols;
-use super::{Cell, CellFlags, Grid, PackedColor, PackedColors};
+use super::{Cell, CellFlags, Grid, PackedColors};
 
 impl Grid {
-    /// Write a styled character at cursor position WITHOUT advancing the cursor.
-    ///
-    /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
-    pub fn write_char_at_cursor(
-        &mut self,
-        c: char,
-        fg: PackedColor,
-        bg: PackedColor,
-        flags: CellFlags,
-    ) {
-        let cursor_row = self.storage.cursor.row;
-        let cursor_col = self.storage.cursor.col;
-        // Drop a stale extras-map entry before overwriting (#7456).
-        let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
-        if let Some(row) = self.row_mut(cursor_row) {
-            row.write_char_styled(cursor_col, c, fg, bg, flags);
-        }
-        self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
-        self.storage.mark_content_cell(cursor_row, cursor_col);
-    }
-
     /// Write a styled character at cursor with pre-computed packed colors.
     ///
     /// Avoids per-character `convert_legacy_colors` — caller pre-computes once.
@@ -74,25 +53,11 @@ impl Grid {
         self.storage.mark_content_cell(cursor_row, cursor_col);
     }
 
-    /// Write a wide (double-width) character at cursor WITHOUT advancing.
-    ///
-    /// Returns `true` if written successfully, `false` if insufficient room.
-    ///
-    /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
-    pub fn write_wide_char_at_cursor(
-        &mut self,
-        c: char,
-        fg: PackedColor,
-        bg: PackedColor,
-        flags: CellFlags,
-    ) -> bool {
-        self.write_wide_char_at_cursor_packed(c, Cell::convert_colors(fg, bg), flags)
-    }
-
     /// Write a wide character at cursor with pre-computed packed colors.
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     #[inline]
+    #[cfg(test)]
     pub fn write_wide_char_at_cursor_packed(
         &mut self,
         c: char,
@@ -140,25 +105,11 @@ impl Grid {
         false
     }
 
-    /// Pre-wrap for wide character: resolve pending wrap and advance to next
-    /// line if cursor can't fit a 2-cell character at its current position.
-    ///
-    /// REQUIRES: self.storage.visible_rows > 0
-    pub fn pre_wrap_wide_if_needed(&mut self) {
-        // Resolve pending wrap first — a wide char after pending wrap must
-        // wrap to the next line before attempting the width check.
-        self.resolve_pending_wrap();
-        let effective_cols = self.storage.effective_cols_for_row(self.storage.cursor.row);
-        if self.storage.cursor.col.saturating_add(1) >= effective_cols {
-            self.advance_autowrap_line();
-        }
-    }
-
     /// Pre-wrap for wide character with pre-computed effective column count.
     ///
-    /// Like `pre_wrap_wide_if_needed` but skips redundant `resolve_pending_wrap`
-    /// (caller must have already resolved it) and reuses `effective_cols` to
-    /// avoid a second ring-buffer lookup.
+    /// Skips a redundant `resolve_pending_wrap` (the caller must have already
+    /// resolved it) and reuses `effective_cols` to avoid a second ring-buffer
+    /// lookup.
     ///
     /// Returns the effective_cols for the (possibly new) cursor row.
     ///
@@ -314,12 +265,6 @@ impl Grid {
         }
     }
 
-    /// Advance cursor by 2 columns (for wide char) without wrapping.
-    pub fn advance_cursor_wide_no_wrap(&mut self) {
-        let effective_cols = self.storage.effective_cols_for_row(self.storage.cursor.row);
-        self.advance_cursor_wide_no_wrap_ecols(effective_cols);
-    }
-
     /// Advance cursor by 2 columns (for wide char) without wrapping,
     /// using pre-computed effective column count.
     ///
@@ -334,17 +279,6 @@ impl Grid {
             self.storage.mark_pending_wrap();
         }
         self.storage.cursor.col = next.min(max_col);
-    }
-
-    /// Advance cursor by 2 columns (for wide char) with deferred autowrap.
-    ///
-    /// When the wide char fills to the end of the line, sets `pending_wrap`
-    /// instead of wrapping immediately, matching xterm behavior.
-    ///
-    /// REQUIRES: self.storage.visible_rows > 0
-    pub fn advance_cursor_wide_wrap(&mut self) {
-        let effective_cols = self.storage.effective_cols_for_row(self.storage.cursor.row);
-        self.advance_cursor_wide_wrap_ecols(effective_cols);
     }
 
     /// Advance cursor by 2 columns with deferred autowrap, using pre-computed
@@ -737,6 +671,7 @@ impl Grid {
     /// REQUIRES: auto_wrap enabled, no insert mode, COMPLEX flag set in flags
     /// REQUIRES: `self.storage.visible_rows > 0`
     #[inline]
+    #[cfg(test)]
     pub fn write_emoji_run_autowrap(
         &mut self,
         chars: &[char],
@@ -1025,7 +960,8 @@ impl Grid {
     ///
     /// Test-only: delegates to the combined write+advance method in write.rs
     /// which is behind `#[cfg(test)]`. Production code uses the split primitives
-    /// (pre_wrap_wide_if_needed + write_wide_char_at_cursor + advance_cursor_wide_wrap).
+    /// (`pre_wrap_wide_ecols` + `write_wide_char_at_cursor_packed_ecols` +
+    /// `advance_cursor_wide_wrap_ecols`).
     #[cfg(test)]
     pub(crate) fn write_wide_char_wrap_with_style_id(
         &mut self,
@@ -1041,8 +977,8 @@ impl Grid {
     ///
     /// Test-only: delegates to the combined write+advance method in write.rs
     /// which is behind `#[cfg(test)]`. Production code uses the split primitives
-    /// (write_wide_char_at_cursor + advance_cursor_wide_no_wrap).
-    #[cfg(any(test, feature = "testing"))]
+    /// (`write_wide_char_at_cursor_packed_ecols` + `advance_cursor_wide_no_wrap_ecols`).
+    #[cfg(test)]
     pub fn write_wide_char_with_style_id(
         &mut self,
         c: char,

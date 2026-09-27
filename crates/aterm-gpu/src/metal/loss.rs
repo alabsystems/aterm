@@ -77,7 +77,9 @@ use super::ffi::{AutoreleasePool, Id, Sel, msg, sel};
 
 /// `MTLCommandBufferStatus` (`MTLCommandBuffer.h:56-63`).
 pub(crate) const STATUS_NOT_ENQUEUED: usize = 0;
+#[cfg(test)]
 pub(crate) const STATUS_ENQUEUED: usize = 1;
+#[cfg(test)]
 pub(crate) const STATUS_COMMITTED: usize = 2;
 pub(crate) const STATUS_SCHEDULED: usize = 3;
 pub(crate) const STATUS_COMPLETED: usize = 4;
@@ -319,6 +321,7 @@ impl LossLatch {
     /// Exists so a test can pin that `wait_outcome` feeds the latch even when
     /// every outcome is `Completed` — see the comment in `record`.
     #[cfg(debug_assertions)]
+    #[cfg(test)]
     pub(crate) fn fed_count(&self) -> usize {
         self.fed.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -341,7 +344,7 @@ mod tests {
 
     /// Every test that needs a GPU skips LOUDLY on a machine without one.
     fn device() -> Option<Device> {
-        let d = Device::system_default();
+        let d = Device::preferred();
         if d.is_none() {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }

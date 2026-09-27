@@ -3,8 +3,8 @@
 
 //! Shell selection + argv mapping for the Windows spawn.
 //!
-//! Selection order: `%ATERM_SHELL%` → `pwsh.exe` → `powershell.exe` →
-//! `%COMSPEC%` → literal `cmd.exe`. `%SHELL%` is deliberately NOT consulted: in
+//! Selection order: the caller's override (config `shell` / `--shell`) →
+//! `pwsh.exe` → `powershell.exe` → `%COMSPEC%` → literal `cmd.exe`. `%SHELL%` is deliberately NOT consulted: in
 //! git-bash/MSYS sessions it holds a POSIX path (`/usr/bin/bash`) that
 //! `CreateProcessW` cannot exec. No login-dash `argv[0]` either — that is a
 //! POSIX login-shell convention; PowerShell/cmd would treat it as a bad path.
@@ -19,52 +19,6 @@ use std::path::Path;
 
 use super::cmdline::wide_nul;
 use super::ffi;
-
-/// The shell family an `%ATERM_EXEC%` command is mapped through (detected from
-/// the lowercased file stem of the resolved shell path).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShellFamily {
-    /// `pwsh` / `powershell` — `-NoExit -Command <cmd>`.
-    Pwsh,
-    /// `cmd` — `/K <cmd>`.
-    Cmd,
-    /// Anything else: `%ATERM_EXEC%` is IGNORED (bare shell) — we cannot know a
-    /// foreign shell's "run this then stay interactive" flag, and guessing one
-    /// would garble its argv.
-    Other,
-}
-
-/// Classify `shell` by its file stem (case-insensitive).
-pub(crate) fn shell_family(shell: &OsStr) -> ShellFamily {
-    let stem = Path::new(shell)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase);
-    match stem.as_deref() {
-        Some("pwsh" | "powershell") => ShellFamily::Pwsh,
-        Some("cmd") => ShellFamily::Cmd,
-        _ => ShellFamily::Other,
-    }
-}
-
-/// The argv for "run `%ATERM_EXEC%`'s command, then stay interactive", by
-/// resolved shell family (see [`ShellFamily`]).
-pub(crate) fn aterm_exec_argv(shell: &OsStr, cmd: &OsStr) -> Vec<OsString> {
-    match shell_family(shell) {
-        ShellFamily::Pwsh => vec![
-            shell.to_os_string(),
-            OsString::from("-NoExit"),
-            OsString::from("-Command"),
-            cmd.to_os_string(),
-        ],
-        ShellFamily::Cmd => vec![
-            shell.to_os_string(),
-            OsString::from("/K"),
-            cmd.to_os_string(),
-        ],
-        ShellFamily::Other => vec![shell.to_os_string()],
-    }
-}
 
 /// Whether the resolved shell is `wsl.exe` (by file stem, case-insensitive) —
 /// the one shell whose `shell_args` are launcher options rather than shell
@@ -213,8 +167,8 @@ pub fn classify_shell_name(name: &OsStr) -> ShellResolution {
     ShellResolution::Unresolved
 }
 
-/// Resolve a shell NAME the user asked for (config `shell` key, `--shell` flag,
-/// or `%ATERM_SHELL%`) to a runnable program.
+/// Resolve a shell NAME the user asked for (config `shell` key or `--shell` flag)
+/// to a runnable program.
 ///
 /// Defined IN TERMS OF [`classify_shell_name`] so the spawn and the config
 /// validator can never drift: there is one resolution, and this is the arm that
@@ -284,18 +238,13 @@ fn discover_git_bash() -> Option<OsString> {
 }
 
 /// Select the interactive shell. Precedence: the caller's `override_shell`
-/// (config `shell` / `--shell`) → `%ATERM_SHELL%` → `pwsh.exe` → `powershell.exe`
-/// → `%COMSPEC%` → literal `cmd.exe`. See the module docs for the deliberate
-/// `%SHELL%` omission; `override_shell`/`ATERM_SHELL` both go through
-/// [`resolve_shell_name`] (path-like verbatim, else alias discovery, else PATH).
+/// (config `shell` / `--shell`) → `pwsh.exe` → `powershell.exe` → `%COMSPEC%` →
+/// literal `cmd.exe`. See the module docs for the deliberate `%SHELL%` omission;
+/// `override_shell` goes through [`resolve_shell_name`] (path-like verbatim, else
+/// alias discovery, else PATH).
 pub(crate) fn select_shell(override_shell: Option<&OsStr>) -> OsString {
     if let Some(ov) = override_shell.filter(|o| !o.is_empty()) {
         return resolve_shell_name(ov);
-    }
-    if let Some(sh) = std::env::var_os("ATERM_SHELL")
-        && !sh.is_empty()
-    {
-        return resolve_shell_name(&sh);
     }
     if let Some(p) = search_path("pwsh") {
         return p;
@@ -314,8 +263,8 @@ pub(crate) fn select_shell(override_shell: Option<&OsStr>) -> OsString {
 /// Resolve the spawn target: `(program, argv)`. Precedence is identical to the
 /// Unix seam: `exec_command` (`-e`, runs the command directly — when it exits
 /// the session closes) > `argv_override` (the future shell-integration hook;
-/// program stays the selected shell) > `%ATERM_EXEC%` (run then stay
-/// interactive, by shell family) > bare interactive `[shell]`.
+/// program stays the selected shell) > the config `shell_args` > bare
+/// interactive `[shell]`.
 pub(crate) fn resolve_spawn_target(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
@@ -359,10 +308,6 @@ pub(crate) fn resolve_spawn_target(
     if let Some(args) = shell_args.filter(|a| !a.is_empty()) {
         let mut argv = vec![shell.clone()];
         argv.extend(args.iter().map(OsString::from));
-        return (shell, argv);
-    }
-    if let Some(cmd) = std::env::var_os("ATERM_EXEC") {
-        let argv = aterm_exec_argv(&shell, &cmd);
         return (shell, argv);
     }
     let argv = vec![shell.clone()];
@@ -492,47 +437,6 @@ mod tests {
             "a full path to a batch file IS a runnable lpApplicationName \
              (CreateProcess re-invokes the command interpreter for it)"
         );
-    }
-
-    #[test]
-    fn family_detection_is_stem_and_case_insensitive() {
-        for (s, f) in [
-            ("pwsh.exe", ShellFamily::Pwsh),
-            (
-                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
-                ShellFamily::Pwsh,
-            ),
-            ("PowerShell.EXE", ShellFamily::Pwsh),
-            ("powershell", ShellFamily::Pwsh),
-            ("cmd.exe", ShellFamily::Cmd),
-            ("C:\\Windows\\System32\\CMD.EXE", ShellFamily::Cmd),
-            ("nu.exe", ShellFamily::Other),
-            ("bash.exe", ShellFamily::Other),
-        ] {
-            assert_eq!(shell_family(OsStr::new(s)), f, "family of {s}");
-        }
-    }
-
-    #[test]
-    fn aterm_exec_argv_shapes_per_family() {
-        let cmd = OsStr::new("dir C:\\");
-        let pwsh = aterm_exec_argv(OsStr::new("pwsh.exe"), cmd);
-        assert_eq!(
-            pwsh,
-            ["pwsh.exe", "-NoExit", "-Command", "dir C:\\"]
-                .map(OsString::from)
-                .to_vec()
-        );
-        let cmdsh = aterm_exec_argv(OsStr::new("C:\\Windows\\System32\\cmd.exe"), cmd);
-        assert_eq!(
-            cmdsh,
-            ["C:\\Windows\\System32\\cmd.exe", "/K", "dir C:\\"]
-                .map(OsString::from)
-                .to_vec()
-        );
-        // Unknown family: ATERM_EXEC ignored, bare shell (documented).
-        let other = aterm_exec_argv(OsStr::new("nu.exe"), cmd);
-        assert_eq!(other, [OsString::from("nu.exe")].to_vec());
     }
 
     #[test]

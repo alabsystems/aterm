@@ -84,6 +84,7 @@ impl MmapMut {
     ///
     /// Returns an I/O error if the file metadata cannot be read, the file is
     /// empty, or the platform map call fails.
+    #[cfg(test)]
     pub unsafe fn map_read(file: &File) -> io::Result<Self> {
         // SAFETY: forwarded caller contract (no concurrent truncation).
         unsafe { Self::map_inner(file, false) }

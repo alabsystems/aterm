@@ -67,7 +67,11 @@ impl FakeRepo {
         me.script("tools/verify.sh", "exit 0");
         me.script("tools/grep_guard.sh", "echo 'GUARD: PASS'; exit 0");
         me.script("tools/license_check.sh", "echo 'LICENSE: PASS'; exit 0");
-        for name in aterm_verify::stages::RELEASE_SUITES {
+        for name in aterm_verify::stages::DELIVERY_SUITES {
+            me.script(&format!("tools/{name}"), "exit 0");
+        }
+        // The live lanes, from their roster for the same reason as the two below.
+        for name in aterm_verify::stages::LIVE_ATERM_SUITES {
             me.script(&format!("tools/{name}"), "exit 0");
         }
         // DERIVED FROM THE ROSTER, never re-typed. This list was a hand-written copy of
@@ -103,6 +107,10 @@ impl FakeRepo {
         me.objc_alert_driver(0);
         me.objc_swizzle_driver(0);
         me.objc_bound_driver(0);
+        // And the one `aterm` binary the live lanes are handed, in the driver
+        // lane's dir where their stage's own build leaves it.
+        fs::create_dir_all(me.root.join("target-drivers/debug")).expect("mkdir");
+        me.script("target-drivers/debug/aterm", "echo 'aterm: stub'");
         me
     }
 
@@ -177,14 +185,18 @@ impl FakeRepo {
         self
     }
 
-    /// A stand-in `objc_event_drive` that dies by `SIGABRT` — the shape of
-    /// the v0.72.0 crash the real driver reproduces, and the one reading
-    /// where this stage differs from its siblings.
+    /// A stand-in `objc_event_drive` that dies by a signal, leaving no exit
+    /// status — the reading the v0.72.0 crash (a `SIGABRT`) reaches, and the
+    /// one where this stage differs from its siblings. The stub dies by
+    /// `SIGKILL`, not `SIGABRT`: the ladder reads every signal death alike
+    /// (`objc_event_outcome(None)`), and a `SIGABRT` made macOS write a crash
+    /// report for the stub's shell (`/bin/sh`, filed as `bash`) on every run
+    /// (grep_guard B16).
     fn objc_event_driver_aborting(&self) -> &Self {
         fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
         self.script(
             "target-drivers/debug/examples/objc_event_drive",
-            "echo 'objc-event-drive: stub about to abort'; kill -ABRT $$",
+            "echo 'objc-event-drive: stub about to die by a signal'; kill -KILL $$",
         );
         self
     }
@@ -243,7 +255,11 @@ case "$*" in
 # These are real spawn-time fixture preconditions, not runner-wide overrides:
 # an absent machine table still authorizes the product's per-user defaults.
 test -z "${ATERM_NO_REROUTE+set}${ATERM_NO_AUTO_UPDATE+set}" || exit 81
-test "$ATERM_CONTROL_SOCK" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
+test "$1" = --control-sock && test "$2" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
+# A headless launch carries its lifeline: `--lifeline-fd 0` on a FIFO stdin.
+if test "$3" = --headless; then
+  test "$4" = --lifeline-fd && test "$5" = 0 && test -p /dev/stdin || exit 92
+fi
 test "$HOME" = "${XDG_CONFIG_HOME%/cfg}/home" || exit 89
 test -d "$HOME" || exit 90
 config="$XDG_CONFIG_HOME/aterm/aterm.toml"
@@ -260,8 +276,8 @@ exec sleep 300
 GUI
     cat >"$CARGO_TARGET_DIR/debug/aterm-ctl" <<'CTL'
 #!/bin/sh
-test "$ATERM_CONTROL_SOCK" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
-test "$ATERM_NO_CONTROL_SOCK" = 0 || exit 89
+test "$1" = --sock && test "$2" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
+shift 2
 case "$1" in
   cursor)  echo "OK row=0 col=0" ;;
   metrics) echo "OK frames=41 max_input_present_ms=8.100 redraw_retry_gated=0 present_drops=0 sync_rel_timeout=0 perf_reduced=0 wake_heals=0 " ;;
@@ -303,9 +319,6 @@ exit 0"#
     ) -> Ctx {
         let mut env = EnvSnapshot::capture();
         env.trust_stage2_bin = Some(self.stage2.clone());
-        // The GUI smoke measures a real window; a synthetic repo has none, so it
-        // takes its honest skip instead of trying to open one.
-        env.skip_gui_smoke = Some("1".into());
         // Point the Tier-2 prover locations inside the sandbox so these tests
         // decide the same thing on a machine that has trust-mc built and on one
         // that does not.
@@ -359,8 +372,9 @@ exit 0"#
         // disk preflight whenever the HOST volume held less than it — measured
         // 2026-09-23 inside a merge-contract run at 17.6 GiB free: 11 failures
         // here, 12 in environment_contract.rs, every one a `disk preflight`
-        // COULD NOT RUN. The preflight itself is measured by its own laws, which
-        // set the floor they need.
+        // COULD NOT RUN. The estimate that replaced that floor would refuse them
+        // too, since an in-place run is budgeted cold. The preflight itself is
+        // measured by its own laws, which set the requirement they need.
         Ctx::new(
             self.root.clone(),
             mode,
@@ -370,6 +384,9 @@ exit 0"#
             self.scratch.clone(),
         )
         .with_disk_floor(0)
+        // The GUI smoke measures a real window; a synthetic repo has none, so it
+        // takes its honest skip instead of trying to open one.
+        .with_gui_smoke_skipped(true)
     }
 
     fn run(&self, mode: Mode, scope: Scope, selftest: bool) -> (String, i32) {
@@ -462,12 +479,31 @@ fn the_ladder_opens_by_naming_the_toolchain_every_stage_below_will_run() {
 /// in the LOG the guard's `FAIL` comes before the build's finish; in the LADDER
 /// (the negative control, which is and stays in declared order) the build's
 /// block still comes first.
+///
+/// THE BUILD WAITS FOR THE GUARD'S LINE, NOT FOR A SECOND (2026-09-24). The
+/// driver's one-second sleep raced the guard's stage on the wall clock: inside
+/// a real gate's test stage the guard took 6.0 s and the build 4.4 s, and the
+/// ordering the test asserts went red on a product that logged as it should.
+/// The workspace build now blocks until the guard's `FAIL` is in the log,
+/// bounded: a gate that logs as stages finish always lets the build finish
+/// second. One that holds finish lines back at all — in declared order, or in
+/// finish order but written only after the stages are over — never shows the
+/// guard's line while the build waits, so the build FAILS at its bound and the
+/// `— ok (` lookup below names it. The ordering assertion alone cannot tell a
+/// log written late in finish order from one written live.
 #[test]
 fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
     let repo = FakeRepo::new();
-    repo.with_stage2("sleep 1; exit 0");
-    repo.script("tools/grep_guard.sh", "echo 'GUARD: FAIL'; exit 1");
     let log_path = repo.scratch.join("progress.log");
+    repo.with_stage2(&format!(
+        "case \"$*\" in\n  *'build --workspace'*)\n    i=0\n    \
+         while ! grep -qF 'finish grep guards — FAIL' '{log}' && [ \"$i\" -lt 600 ]; do\n      \
+         sleep 0.05; i=$((i + 1))\n    done\n    \
+         grep -qF 'finish grep guards — FAIL' '{log}' || \
+         {{ echo 'the guard FAIL was never readable while the build ran'; exit 1; }} ;;\nesac\nsleep 1; exit 0",
+        log = log_path.display()
+    ));
+    repo.script("tools/grep_guard.sh", "echo 'GUARD: FAIL'; exit 1");
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -521,10 +557,12 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        35,
-        "32 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
+        38,
+        "34 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
          2026-09-14, the conformance-release prime since 2026-09-22, the measuring \
-         tests since 2026-09-23) plus the three --full tiers"
+         tests since 2026-09-23, the window-server unit tests and the foreground \
+         handback since 2026-09-26) plus the four --full tiers (the Codex live upgrade \
+         the fourth, 2026-09-26)"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -853,7 +891,7 @@ fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
         )
     );
     // and the skips are named beside it
-    assert!(ladder.contains("      - gui smoke (ATERM_SKIP_GUI_SMOKE)"));
+    assert!(ladder.contains("      - gui smoke (--skip-gui-smoke)"));
 }
 
 #[test]
@@ -1260,13 +1298,19 @@ fn selftest_skips_every_command_and_checks_only_the_harness() {
             "a selftest skip must say it is one: {label}"
         );
     }
-    // One skip per command the fast ladder would run: 40 fixed rows plus the 11
+    // One skip per command the fast ladder would run: 48 fixed rows plus the 11
     // atpkg publish-tooling suites in `stages::ATPKG_SUITES` (the prerelease
     // gate, the index suites, the vendor/ALab lanes and the packers among them).
-    // A LITERAL, not `40 + ATPKG_SUITES.len()`: every other test iterates that
+    // A LITERAL, not `48 + ATPKG_SUITES.len()`: every other test iterates that
     // roster, so a count derived from it would let a suite leave the ladder
-    // with the whole crate green. Adding or removing a stage moves this number.
-    assert_eq!(skips.len(), 51, "{skips:#?}");
+    // with the whole crate green. Adding or removing a stage moves this number
+    // (41 since 2026-09-26: the window-server unit tests; 49 later that day:
+    // `DELIVERY_SUITES` grew 4 -> 9 (+5) and the live aterm lanes added their
+    // build and their two lanes (+3) — 52 + 5 + 3 = 60; 48 the same evening,
+    // when the Codex lane left for `--full` and the per-commit row kept its
+    // build and the handback lane — 60 - 1 = 59, the count a real
+    // `tools/verify.sh --selftest` printed on this tree).
+    assert_eq!(skips.len(), 59, "{skips:#?}");
     assert_eq!(
         skips
             .iter()
@@ -1383,23 +1427,53 @@ fn the_full_tier_reports_an_unavailable_prover_prominently_and_never_as_discharg
 fn the_pure_guards_do_not_wait_for_the_build() {
     // The reason this is a program and not a script: on a real tree the build is
     // minutes and the guards are milliseconds.
+    //
+    // A RENDEZVOUS, not a stopwatch (the load-sensitive test audit of
+    // 2026-09-27). Every main-lane stage holds until every pure guard has
+    // finished, so the guards must be able to run while the build is in flight:
+    // a scheduler that queued them behind the build deadlocks here, and the
+    // build's bounded wait turns that into a failure. The old form timed the
+    // run against 60 ms per main stage + 400 ms of slack, which a loaded gate's
+    // oversleeps could exceed, and which a guards-behind-the-build scheduler
+    // passed anyway: the guards do no work, so serialising them cost nothing a
+    // clock could see.
     let repo = FakeRepo::new();
     let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
     let specs = plan::plan(&ctx);
-    let slow_build = |s: &StageSpec| {
-        if s.lane == Lane::MainTarget {
-            std::thread::sleep(std::time::Duration::from_millis(60));
+    let pure = specs.iter().filter(|s| s.lane == Lane::Pure).count();
+    assert!(pure > 0, "no pure guards in the plan: nothing to overlap");
+    let finished = std::sync::Mutex::new(0_usize);
+    let guard_done = std::sync::Condvar::new();
+    let starved = std::sync::atomic::AtomicBool::new(false);
+    let build_holds_for_the_guards = |s: &StageSpec| {
+        match s.lane {
+            // Once one main stage has starved, the rest need not wait 30 s each
+            // to fail the same way.
+            Lane::MainTarget if !starved.load(std::sync::atomic::Ordering::SeqCst) => {
+                let count = finished.lock().expect("pure count");
+                let (_count, wait) = guard_done
+                    .wait_timeout_while(count, std::time::Duration::from_secs(30), |done| {
+                        *done < pure
+                    })
+                    .expect("pure count");
+                if wait.timed_out() {
+                    starved.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Lane::Pure => {
+                *finished.lock().expect("pure count") += 1;
+                guard_done.notify_all();
+            }
+            _ => {}
         }
         Report::new(s.title.clone())
     };
-    let start = std::time::Instant::now();
-    let reports = sched::run_stages(&specs, slow_build, |_, _| {});
-    let elapsed = start.elapsed();
+    let reports = sched::run_stages(&specs, build_holds_for_the_guards, |_, _| {});
     assert_eq!(reports.len(), specs.len());
-    let main_stages = specs.iter().filter(|s| s.lane == Lane::MainTarget).count() as u64;
     assert!(
-        elapsed < std::time::Duration::from_millis(60 * main_stages + 400),
-        "the main lane is serial, everything else overlaps it: {elapsed:?}"
+        !starved.load(std::sync::atomic::Ordering::SeqCst),
+        "the main lane held 30 s for {pure} pure guards that could not run beside it: \
+         they waited for the build"
     );
 }
 
@@ -1439,6 +1513,8 @@ fn the_root_is_found_by_its_markers_not_by_the_binarys_location() {
 /// not depend on the shell that ran the test: `<inherited>` is this test
 /// process's own value (set or not), `<unset>` is one the gate removed, and
 /// paths under the fake repo or stage2 are spelled `<root>` / `<stage2>`.
+/// macOS only, with the one test that records.
+#[cfg(target_os = "macos")]
 const RECORDED_ENV: [&str; 4] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_JOBS",
@@ -1730,9 +1806,343 @@ exit {suite_exit}
     }
 }
 
+/// A repo whose stage2 builds the live lanes' `aterm` into the driver lane (or
+/// exits `build_exit`), with a STALE `aterm` in `<root>/target/debug` — the
+/// lanes' own default — and each lane stubbed to resolve its binary exactly as
+/// its script does, append `<lane> <what the binary printed>` to the trace, and
+/// exit as told. FakeRepo seeds a driven `aterm` for the whole-ladder tests;
+/// this one is removed, so what the stage drives is what its OWN build left.
+fn live_lane_repo(build_exit: i32, handback_exit: i32, codex_exit: i32) -> (FakeRepo, PathBuf) {
+    let repo = FakeRepo::new();
+    let trace = repo.scratch.join("live-order");
+    let target = repo.root.join("target-drivers");
+    fs::remove_file(target.join("debug/aterm")).expect("unseed the driven aterm");
+    repo.with_stage2(&format!(
+        r#"test "$CARGO_TARGET_DIR" = {target} || exit 70
+test "$CARGO_BUILD_JOBS" = 8 || exit 71
+case "$*" in
+  '--unverified build -q -p aterm --bin aterm')
+    echo build >> {trace}
+    test {build_exit} = 0 || exit {build_exit}
+    mkdir -p "$CARGO_TARGET_DIR/debug"
+    printf '#!/bin/sh\necho fresh-aterm\n' > "$CARGO_TARGET_DIR/debug/aterm"
+    chmod 755 "$CARGO_TARGET_DIR/debug/aterm"
+    ;;
+  *) exit 74 ;;
+esac
+"#,
+        target = sh_quote(&target.display().to_string()),
+        trace = sh_quote(&trace.display().to_string()),
+    ));
+    fs::create_dir_all(repo.root.join("target/debug")).expect("shared target");
+    repo.script("target/debug/aterm", "echo stale-aterm");
+    let root = sh_quote(&repo.root.display().to_string());
+    let tr = sh_quote(&trace.display().to_string());
+    // tools/test-foreground-handback.sh's resolution: `--binary`, else the
+    // checkout's target/debug/aterm; `2` when there is none.
+    repo.script(
+        "tools/test-foreground-handback.sh",
+        &format!(
+            r#"BIN={root}/target/debug/aterm
+while [ $# -gt 0 ]; do case $1 in --binary) BIN=$2; shift 2 ;; *) exit 2 ;; esac; done
+[ -x "$BIN" ] || {{ echo "no aterm binary at $BIN" >&2; exit 2; }}
+echo "handback $("$BIN")" >> {tr}
+exit {handback_exit}
+"#
+        ),
+    );
+    // tools/test-codex-live-upgrade.sh's: the first argument, else the
+    // checkout's target/debug/aterm; `77` (SKIP) when there is none.
+    repo.script(
+        "tools/test-codex-live-upgrade.sh",
+        &format!(
+            r#"A=${{1:-{root}/target/debug/aterm}}
+[ -x "$A" ] || {{ echo "SKIP: no aterm at $A"; exit 77; }}
+echo "codex $("$A")" >> {tr}
+test {codex_exit} = 77 && echo 'SKIP: the store holds no Codex older than 0.157.1 to upgrade from'
+exit {codex_exit}
+"#
+        ),
+    );
+    (repo, trace)
+}
+
+/// The lanes as a person ran them before 2026-09-26 — by hand, no argument —
+/// which is each stage's NEGATIVE CONTROL: with a stale binary in
+/// `<root>/target/debug` the lane drives THAT, and with none it answers its
+/// not-run code; neither says anything about this tree.
+fn live_lane_by_hand(repo: &FakeRepo, trace: &Path, suite: &str, lane: &str, not_run: i32) {
+    fs::write(trace, "").expect("reset the trace");
+    std::process::Command::new(repo.root.join(suite))
+        .current_dir(&repo.root)
+        .output()
+        .expect("the lane as run by hand");
+    assert_eq!(
+        fs::read_to_string(trace).expect("the control ran"),
+        format!("{lane} stale-aterm\n"),
+        "the control must demonstrate the stale fallback"
+    );
+    fs::remove_file(repo.root.join("target/debug/aterm")).expect("rm stale");
+    let bare = std::process::Command::new(repo.root.join(suite))
+        .current_dir(&repo.root)
+        .output()
+        .expect("the lane with no binary at all");
+    assert_eq!(bare.status.code(), Some(not_run), "{bare:?}");
+    repo.script("target/debug/aterm", "echo stale-aterm");
+    fs::write(trace, "").expect("reset the trace");
+}
+
+/// THE FOREGROUND HANDBACK, on its own: the stage builds the `aterm` the lane
+/// drives, in the driver lane's dir, before the lane starts; it hands the lane
+/// that binary as `--binary <path>`, so the lane's own `<root>/target/debug/aterm`
+/// default cannot answer; a failed build runs nothing; and the lane's not-run
+/// code, `2`, is COULD NOT RUN with the lane's reason, never a pass. Off macOS,
+/// where the lane has never been measured and its bash row pins macOS's
+/// `/bin/bash` 3.2, the stage is ONE named skip and builds nothing.
+#[test]
+fn the_foreground_handback_drives_the_aterm_its_stage_built_and_never_reads_not_run_as_a_pass() {
+    for (build_exit, handback_exit) in [(0, 0), (19, 0), (0, 1), (0, 2)] {
+        let (repo, trace) = live_lane_repo(build_exit, handback_exit, 0);
+        live_lane_by_hand(
+            &repo,
+            &trace,
+            "tools/test-foreground-handback.sh",
+            "handback",
+            2,
+        );
+
+        let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::ForegroundHandback)
+            .expect("the foreground handback is planned");
+        let report = stages::run_stage(&ctx, &spec);
+        let what = format!("({build_exit}, {handback_exit})\n{}", report.render());
+        let measured = fs::read_to_string(&trace).expect("the stage ran its children");
+        let runs = cfg!(target_os = "macos");
+        let want = match (runs, build_exit) {
+            (false, _) => "",
+            (true, 0) => "build\nhandback fresh-aterm\n",
+            (true, _) => "build\n",
+        };
+        assert_eq!(measured, want, "{what}");
+
+        let result = tally(std::slice::from_ref(&report));
+        assert_eq!(
+            result.gate_failures.len(),
+            usize::from(runs && (build_exit != 0 || handback_exit == 1)),
+            "{what}"
+        );
+        assert_eq!(
+            result.could_not_run.len(),
+            usize::from(runs && build_exit == 0 && handback_exit == 2),
+            "{what}"
+        );
+        assert_eq!(result.skipped(), usize::from(!runs), "{what}");
+        let rendered = report.render();
+        if !runs {
+            assert!(
+                rendered.contains(&format!(
+                    "  skip  test-foreground-handback.sh (macOS only: {})",
+                    stages::live_aterm_macos_only(stages::FOREGROUND_HANDBACK_SUITE)
+                )),
+                "{what}"
+            );
+        }
+        assert_eq!(
+            rendered
+                .contains("  not run: test-foreground-handback.sh — the aterm build above failed"),
+            runs && build_exit != 0,
+            "{what}"
+        );
+        if runs && build_exit == 0 && handback_exit == 2 {
+            assert!(
+                rendered.contains("test-foreground-handback.sh: NOT RUN — "),
+                "{what}"
+            );
+        }
+        // The Codex lane is `--full`'s: the per-commit stage never starts it.
+        assert!(!measured.contains("codex"), "{what}");
+    }
+}
+
+/// A HEADLESS `aterm` THAT DIES AT STARTUP IS A FINDING, NOT A BROKEN MACHINE.
+///
+/// The REAL `tools/test-foreground-handback.sh`, run by its stage against a
+/// just-built `aterm` that exits before it answers — the shape of a tree whose
+/// `aterm --headless` panics at startup. Until 2026-09-26 the lane answered
+/// that with `2`, which the stage reads as COULD NOT RUN and the verdict as
+/// "NOT a finding about your change — the environment is broken" (reproduced:
+/// exit 2 after 20.6 s). The gate's own control-socket smoke records the same
+/// shape as FAIL, and so does this lane now: a FAIL row and exit `1`, at once.
+///
+/// NEGATIVE CONTROL, so the case can tell the two apart: the lane's real
+/// not-run paths — no binary, an argument it does not know — still answer `2`,
+/// with a `NOT RUN: ` reason the stage quotes as COULD NOT RUN.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_headless_aterm_that_dies_at_startup_fails_the_handback_and_is_never_could_not_run() {
+    let repo = FakeRepo::new();
+    let real = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools")
+        .join(stages::FOREGROUND_HANDBACK_SUITE);
+    let lane = repo
+        .root
+        .join("tools")
+        .join(stages::FOREGROUND_HANDBACK_SUITE);
+    fs::copy(&real, &lane).expect("the real lane");
+    // …and the library it sources, as a real checkout carries it: without it the
+    // lane stops at its not-run check before it ever boots the aterm under test.
+    fs::copy(
+        real.with_file_name("lib-lifeline.sh"),
+        lane.with_file_name("lib-lifeline.sh"),
+    )
+    .expect("the lane's lifeline library");
+    let target = repo.root.join("target-drivers");
+    fs::remove_file(target.join("debug/aterm")).expect("unseed the driven aterm");
+    repo.with_stage2(
+        r#"case "$*" in
+  '--unverified build -q -p aterm --bin aterm')
+    mkdir -p "$CARGO_TARGET_DIR/debug"
+    printf '#!/bin/sh\necho "thread main panicked at startup" >&2\nexit 101\n' > "$CARGO_TARGET_DIR/debug/aterm"
+    chmod 755 "$CARGO_TARGET_DIR/debug/aterm"
+    ;;
+  *) exit 74 ;;
+esac
+"#,
+    );
+
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ForegroundHandback)
+        .expect("the foreground handback is planned");
+    let t = std::time::Instant::now();
+    let report = stages::run_stage(&ctx, &spec);
+    let took = t.elapsed();
+    let rendered = report.render();
+    let result = tally(std::slice::from_ref(&report));
+    assert_eq!(
+        result.gate_failures,
+        [
+            "test-foreground-handback.sh: a check failed against the live aterm — its rows above \
+             say which"
+        ],
+        "{rendered}"
+    );
+    assert!(result.could_not_run.is_empty(), "{rendered}");
+    assert!(
+        rendered.contains("FAIL  boot: /bin/zsh — the headless instance exited before it answered"),
+        "the lane's own row names the early exit: {rendered}"
+    );
+    assert!(
+        rendered.contains("thread main panicked at startup"),
+        "…and shows the instance's log: {rendered}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "an instance that has exited is not waited on for the 20 s deadline: {took:?}"
+    );
+
+    // The negative control: the lane's real not-run paths, still 2, still
+    // COULD NOT RUN with the reason the lane printed.
+    for (args, reason) in [
+        (
+            vec!["--binary", "/nonexistent/aterm"],
+            "no aterm binary at /nonexistent/aterm (targo --unverified build -p aterm)",
+        ),
+        (vec!["--bogus"], "unknown argument: --bogus"),
+    ] {
+        let out = std::process::Command::new(&lane)
+            .args(&args)
+            .current_dir(&repo.root)
+            .output()
+            .expect("the lane runs");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        let transcript = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stages::live_aterm_outcome(stages::FOREGROUND_HANDBACK_SUITE, Some(2), &transcript),
+            (
+                aterm_verify::Outcome::Fail(aterm_verify::Severity::CouldNotRun),
+                format!("test-foreground-handback.sh: NOT RUN — {reason} (exit 2, never a pass)")
+            ),
+            "{args:?}"
+        );
+    }
+}
+
+/// THE CODEX LIVE UPGRADE IS `--full`'S, RUNS ALONE, AND ITS SKIP IS A NAMED
+/// SKIP. It reads this machine's managed store and the vendor's Codex, so the
+/// per-commit ladder never plans it (`plan.rs` has the reasoning); under
+/// `--full` it builds the `aterm` it drives and hands it over as the first
+/// argument, a failed build runs nothing, and its `77` — no older managed Codex
+/// on this Mac — is a SKIP carrying the lane's own reason, counted, never a
+/// pass, and forfeiting the run's contract claim, as the trust-mc floor's
+/// absent prover does.
+#[test]
+fn the_codex_live_upgrade_is_full_only_and_reads_its_not_run_code_as_a_named_skip() {
+    for (build_exit, codex_exit) in [(0, 0), (19, 0), (0, 1), (0, 77)] {
+        let (repo, trace) = live_lane_repo(build_exit, 0, codex_exit);
+        live_lane_by_hand(
+            &repo,
+            &trace,
+            "tools/test-codex-live-upgrade.sh",
+            "codex",
+            77,
+        );
+
+        let fast = plan::plan(&repo.ctx(Mode::Fast, Scope::workspace(), false));
+        assert!(fast.iter().all(|s| s.id != StageId::CodexLiveUpgrade));
+        let ctx = repo.ctx(Mode::Full, Scope::workspace(), false);
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::CodexLiveUpgrade)
+            .expect("the Codex live upgrade is planned under --full");
+        assert!(spec.exclusive, "it runs alone");
+        let report = stages::run_stage(&ctx, &spec);
+        let what = format!("({build_exit}, {codex_exit})\n{}", report.render());
+        let measured = fs::read_to_string(&trace).expect("the stage ran");
+        let runs = cfg!(target_os = "macos");
+        let want = match (runs, build_exit) {
+            (false, _) => "",
+            (true, 0) => "build\ncodex fresh-aterm\n",
+            (true, _) => "build\n",
+        };
+        assert_eq!(measured, want, "{what}");
+
+        let result = tally(std::slice::from_ref(&report));
+        assert_eq!(
+            result.gate_failures.len(),
+            usize::from(runs && (build_exit != 0 || codex_exit == 1)),
+            "{what}"
+        );
+        assert_eq!(result.could_not_run.len(), 0, "{what}");
+        let skipped = !runs || (build_exit == 0 && codex_exit == 77);
+        assert_eq!(result.skipped(), usize::from(skipped), "{what}");
+        if runs && build_exit == 0 && codex_exit == 77 {
+            assert!(
+                report.render().contains(
+                    "  skip  test-codex-live-upgrade.sh: NOT RUN — the store holds no Codex older \
+                     than 0.157.1 to upgrade from (exit 77: this machine lacks a prerequisite; a \
+                     named skip, never a pass)"
+                ),
+                "the lane's own reason is the label: {what}"
+            );
+        }
+        // A skip is never a pass: the run cannot claim the contract.
+        let v = verdict(Mode::Full, &Scope::workspace(), false, &result);
+        assert_eq!(
+            v.claims_merge_contract,
+            !result.failed() && !skipped,
+            "{what}"
+        );
+    }
+}
+
 /// A stand-in driver that appends one normalised line per invocation —
 /// `<tag> <VAR>=<value>… -- <argv…>` — and exits 0. The SAME body recorded
 /// `fixtures/fast-invocations.txt` from the 18f19eea6 gate.
+#[cfg(target_os = "macos")]
 fn recording_shim(tag: &str, record: &Path, root: &Path, stage2: &Path) -> String {
     let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let mut s = String::new();
@@ -1979,7 +2389,7 @@ fn a_hung_test_run_names_the_test_in_the_ladder() {
     // One value, used for both the ceiling and the sentence the block must print, so the
     // two cannot drift the way they just did when the ceiling was raised.
     const CEILING_SECS: u32 = 30;
-    ctx.env.stage_timeout = Some(CEILING_SECS.to_string().into());
+    ctx.child_ceiling = Some(std::time::Duration::from_secs(CEILING_SECS.into()));
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::Test)

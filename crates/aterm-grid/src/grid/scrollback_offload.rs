@@ -65,8 +65,53 @@
 use aterm_scrollback::{Line, ScrollbackStorage};
 
 use super::Grid;
-use super::state::PendingScrollbackSettings;
+use super::state::{DetachedReaderAim, PendingScrollbackSettings};
 use crate::Damage;
+
+/// One reader-facing viewport gesture, as the detach window records it
+/// (design ruling 238; see [`Grid::note_detached_reader_motion`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderMotion {
+    /// `scroll_display(delta)`: up positive, toward the live bottom negative.
+    By(i32),
+    /// `scroll_to_top`.
+    Top,
+    /// `scroll_to_bottom`.
+    Live,
+}
+
+/// A live-relative aim of `rows`, taken at `at_counter`, grown by the lines
+/// that scrolled into history since (`counter`) — the SCR-1 repin's rule: a
+/// reader off the live bottom rides up with the content they were reading; a
+/// reader AT the live bottom stays there.
+fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize {
+    if rows == 0 {
+        return 0;
+    }
+    rows.saturating_add(usize::try_from(counter.saturating_sub(at_counter)).unwrap_or(usize::MAX))
+}
+
+impl DetachedReaderAim {
+    /// The `display_offset` this aim names once the whole history (`sb` lines)
+    /// is back with the row counter at `counter`, given `restored` — where the
+    /// re-attach's own rule would put the reader. An aim ABOVE the attached
+    /// rows lands at least as far up as the reader asked and never below the
+    /// place the restore gives them: they reached UP for history, and the
+    /// restore is already their place in it.
+    fn resolve(self, counter: u64, sb: usize, restored: usize) -> usize {
+        match self {
+            DetachedReaderAim::Above { rows, at_counter } => {
+                grown_from_live(rows, at_counter, counter)
+                    .max(restored)
+                    .min(sb)
+            }
+            DetachedReaderAim::FromTop { rows } => sb.saturating_sub(rows),
+            DetachedReaderAim::At { rows, at_counter } => {
+                grown_from_live(rows, at_counter, counter).min(sb)
+            }
+        }
+    }
+}
 
 /// The off-screen scrollback of a grid, detached and awaiting off-thread rewrap
 /// to `new_cols`. `Send`, so the expensive decompress + rewrap runs on a worker
@@ -132,6 +177,12 @@ pub struct PendingScrollbackReflow {
     /// `Some` from the first step until completion: the store's own limits,
     /// out of the way of the streaming reads (see [`LiftedStoreLimits`]).
     lifted_limits: Option<LiftedStoreLimits>,
+    /// The history lines this job detached (tiered + lazy + ring), fixed at
+    /// detach: the denominator of its progress ([`Self::lines_done`]).
+    lines_total: usize,
+    /// Input lines the steps have read so far (every read line is rewrapped
+    /// by the step that completes its logical run).
+    lines_read: usize,
 }
 
 /// Where an incrementally-stepped rewrap currently is. Private: callers only
@@ -272,8 +323,26 @@ const _: fn() = || {
 impl PendingScrollbackReflow {
     /// The width this history will be rewrapped to.
     #[must_use]
+    #[cfg(test)]
     pub fn new_cols(&self) -> u16 {
         self.new_cols
+    }
+
+    /// How far the rewrap is: input lines read so far, of
+    /// [`Self::lines_total`]. Monotone, and equal to the total once the last
+    /// step has read everything (the step that returns `Done`). The progress
+    /// a watcher shows (design ruling 233); O(1), no store access.
+    #[must_use]
+    pub fn lines_done(&self) -> usize {
+        self.lines_read.min(self.lines_total)
+    }
+
+    /// The history lines this job detached, fixed at detach (unlike
+    /// [`Self::line_count`], which moves as the stream consumes input and
+    /// re-fills the store with output).
+    #[must_use]
+    pub fn lines_total(&self) -> usize {
+        self.lines_total
     }
 
     /// The number of history lines to rewrap (for logging / progress) —
@@ -380,6 +449,7 @@ impl PendingScrollbackReflow {
             } => {
                 let total_left = *store_input_left + (self.lazy_lines.len() - *next_lazy);
                 let read = budget.min(total_left);
+                self.lines_read = self.lines_read.saturating_add(read);
                 let appended_from = carry.len();
                 carry.reserve(read);
                 let from_store = read.min(*store_input_left);
@@ -500,6 +570,7 @@ impl PendingScrollbackReflow {
                 let end = next_input.saturating_add(budget).min(total);
                 let appended_from = carry.len();
                 carry.reserve(end - *next_input);
+                self.lines_read = self.lines_read.saturating_add(end - *next_input);
                 for line in &mut self.ring_lines[*next_input..end] {
                     // Take by replace (blank left behind, freed below): the
                     // ring lines are already materialized, so a "read" here is
@@ -566,6 +637,7 @@ fn carve_completed_runs(
 impl ReflowedScrollback {
     /// The width this history was rewrapped to.
     #[must_use]
+    #[cfg(test)]
     pub fn new_cols(&self) -> u16 {
         self.new_cols
     }
@@ -692,12 +764,17 @@ impl Grid {
         // to the lazy buffer instead of dropped (audit bug B).
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
+        // Ruling 238: the window opens with no reader aim.
+        self.storage.detached_reader_aim = None;
 
         let phase = ReflowPhase::start(&store);
+        let lines_total = store.line_count() + lazy_lines.len() + ring_lines.len();
         Some(PendingScrollbackReflow {
             store,
             lazy_lines,
             ring_lines,
+            lines_total,
+            lines_read: 0,
             new_cols,
             prev_offset,
             detach_live_bottom_gen,
@@ -727,6 +804,13 @@ impl Grid {
         // The reflow window is over: stop staging scroll-off as "detached" — the
         // store (old or freshly attached below) is authoritative again.
         self.storage.scrollback_detached_for_reflow = false;
+        // Ruling 238: where the reader asked to go while the history was away,
+        // and the row counter the aim's growth is measured to — sampled BEFORE
+        // this re-attach moves any line. Taken on every branch; applied only on
+        // the normal one (an erase resets the viewport, a replacement store was
+        // never the history the reader aimed into).
+        let reader_aim = self.storage.detached_reader_aim.take();
+        let counter_at_reattach = self.storage.absolute_row_counter;
 
         if self.storage.scrollback.is_some() {
             // A terminal reset re-created the tiered store during the reflow; don't
@@ -838,10 +922,22 @@ impl Grid {
         // reader left. Unchanged by this fix and strictly better than the snap it
         // replaces; a width reflow has no pre→post absolute-row map to do better with
         // (see `reflow.rs`'s note on the missing anchor).
+        //
+        // THE READER'S AIM (design ruling 238). A reader who asked, while the
+        // history was away, for more than the attached rows could show — a
+        // scroll up over a history that was not there moved nothing — is owed
+        // that place now it is back, so they need not scroll again: at least
+        // as far up as they asked (never below the restore), the top if they
+        // asked for the top, the live bottom if they came back to it. Gestures
+        // that fit the attached rows record no aim, and the rule stands.
         let reader_descended_to_live =
             self.storage.reader_live_bottom_gen != reflowed.detach_live_bottom_gen;
         if !(reader_descended_to_live && self.storage.display_offset == 0) {
             self.storage.display_offset = reflowed.prev_offset.min(sb);
+        }
+        if let Some(aim) = reader_aim {
+            self.storage.display_offset =
+                aim.resolve(counter_at_reattach, sb, self.storage.display_offset);
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
@@ -926,11 +1022,15 @@ impl Grid {
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
+        self.storage.detached_reader_aim = None;
         let phase = ReflowPhase::start(&store);
+        let lines_total = store.line_count() + lazy_lines.len();
         Some(PendingScrollbackReflow {
             store,
             lazy_lines,
             ring_lines: Vec::new(),
+            lines_total,
+            lines_read: 0,
             new_cols: self.storage.cols,
             prev_offset,
             detach_live_bottom_gen,
@@ -1026,6 +1126,110 @@ impl Grid {
         }
     }
 
+    /// RULING 238: a reader-facing viewport gesture made while the history is
+    /// away for a reflow, called by the primitive AFTER it moved the viewport
+    /// over what is attached; `before` is the offset it moved from. Outside a
+    /// detach window this does nothing.
+    ///
+    /// A gesture that fits the attached rows records nothing: the re-attach's
+    /// restore rule (audit #7 and its tests) is the law for those. A gesture
+    /// that asks for MORE — up past the attached top, which while the tiered
+    /// history is out is usually the live bottom itself — is kept as the
+    /// reader's aim, which the re-attach applies, so a scroll up over a history
+    /// that is not there yet is not lost. The viewport meanwhile rests at the
+    /// attached top, and a scroll back down spends the aim first (the view
+    /// does not move until the aim is back inside what is attached), after
+    /// which the reader's exact place is kept (`At`). `Top` aims at the top of
+    /// the whole history. `Live` — the End press, a keystroke's snap — brings
+    /// an aim back to the live bottom; with no aim it records nothing (the
+    /// audit-#7 residual: an End that moved nothing is not evidence of a
+    /// choice).
+    pub(crate) fn note_detached_reader_motion(&mut self, motion: ReaderMotion, before: usize) {
+        if !self.storage.scrollback_detached_for_reflow {
+            return;
+        }
+        let counter = self.storage.absolute_row_counter;
+        let attached = self.storage.scrollback_lines();
+        let current = self.storage.detached_reader_aim;
+        let next = match motion {
+            ReaderMotion::Top => Some(DetachedReaderAim::FromTop { rows: 0 }),
+            ReaderMotion::Live => current.map(|_| DetachedReaderAim::At {
+                rows: 0,
+                at_counter: counter,
+            }),
+            ReaderMotion::By(0) => return,
+            ReaderMotion::By(delta) => {
+                let by = i64::from(delta);
+                let moved = |rows: usize, by: i64| {
+                    let rows = i64::try_from(rows).unwrap_or(i64::MAX);
+                    usize::try_from(rows.saturating_add(by).max(0)).unwrap_or(usize::MAX)
+                };
+                match current {
+                    Some(DetachedReaderAim::FromTop { rows }) => Some(DetachedReaderAim::FromTop {
+                        rows: moved(rows, -by),
+                    }),
+                    // Where the reader stood: past the attached top by an aim,
+                    // else wherever the viewport was.
+                    aim => {
+                        let from = match aim {
+                            Some(DetachedReaderAim::Above { rows, at_counter }) => {
+                                grown_from_live(rows, at_counter, counter)
+                            }
+                            _ => before,
+                        };
+                        let want = moved(from, by);
+                        if want > attached {
+                            Some(DetachedReaderAim::Above {
+                                rows: want,
+                                at_counter: counter,
+                            })
+                        } else if aim.is_some() {
+                            // Back inside the attached rows after aiming past
+                            // them: the viewport goes exactly there, and that
+                            // is where the reader is — the live bottom
+                            // included, which is them choosing it.
+                            self.set_display_offset_in_window(want);
+                            Some(DetachedReaderAim::At {
+                                rows: want,
+                                at_counter: counter,
+                            })
+                        } else {
+                            // Every gesture so far fit: the restore rule stands.
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(DetachedReaderAim::Above { .. } | DetachedReaderAim::FromTop { .. }) = next {
+            // The aim is past the attached top: the viewport rests there.
+            self.set_display_offset_in_window(attached);
+        }
+        self.storage.detached_reader_aim = next;
+    }
+
+    /// Put the viewport at `offset` (clamped to what is attached) with the
+    /// targeted display-offset damage — the aim's own correction of where a
+    /// primitive left it (ruling 238). Not a gesture record of its own.
+    fn set_display_offset_in_window(&mut self, offset: usize) {
+        let target = offset.min(self.storage.scrollback_lines());
+        let old = self.storage.display_offset;
+        if target == old {
+            return;
+        }
+        self.storage.display_offset = target;
+        let dmg = crate::damage::compute_display_offset_damage(old, target, self.rows());
+        self.storage.damage.apply_display_offset_damage(dmg);
+    }
+
+    /// Whether the reader has aimed the viewport inside the open detach window
+    /// (ruling 238) — a keystroke's snap to the live bottom must then reach
+    /// [`Grid::scroll_to_bottom`] even though the viewport already sits at 0.
+    #[must_use]
+    pub fn reader_aim_held(&self) -> bool {
+        self.storage.detached_reader_aim.is_some()
+    }
+
     /// True while a detach window is open: the tiered store is out for an
     /// off-thread reflow and scroll-off is being staged for re-attach. MUST be
     /// false again after [`reattach_reflowed_scrollback`](Self::reattach_reflowed_scrollback)
@@ -1053,23 +1257,18 @@ impl Grid {
     /// detach window is closed.
     ///
     /// This was stated as a compiler obligation (`ensures
-    /// !self.storage.scrollback_detached_for_reflow`, first measured provable
-    /// on stage2 51bf8a270, 2026-08-05). The clause is WITHDRAWN for now
-    /// because it ICEs the toolchain rather than proving anything:
-    /// `trustc 1.99.0-dev (6fbfab9f8)` panics with `trimmed_def_paths called,
-    /// diagnostics were expected but none were emitted` (rustc_errors/src/
-    /// lib.rs:478, in `DiagCtxtInner::drop`) whenever this crate is compiled
-    /// under `-Ztrust-verify=off` — which is the workspace-wide setting at
-    /// `.cargo/config.toml:35`, i.e. every ordinary build. Isolated to this one
-    /// clause by single-variable bisect: removing it compiles the crate clean,
-    /// restoring it panics, all else held equal. It also cannot survive the
-    /// public snapshot, whose `rust-toolchain.toml` is swapped to stock 1.97.1
-    /// by `publish/transforms.sh:81` and cannot PARSE `ensures` at all (`#[cfg]`
-    /// strips after parsing, so gating would not have helped).
+    /// !self.storage.scrollback_detached_for_reflow`, provable since trust
+    /// stage2 51bf8a270). The clause is WITHDRAWN because the public snapshot
+    /// cannot build it: the export replaces `rust-toolchain.toml` with a stock
+    /// pin (`publish/public-rust-toolchain.toml`, copied by
+    /// `publish/transforms.sh`), and stock rustc cannot PARSE `ensures` at all —
+    /// `#[cfg]` strips after parsing, so gating would not help. (It was first
+    /// withdrawn because an August trustc ICEd on it under `-Ztrust-verify=off`;
+    /// the promoted seal compiles it cleanly, and
+    /// `tools/test-trust-contract-probe.sh` pins that shape.)
     ///
-    /// The obligation is kept as debug assertions on both exits until the
-    /// toolchain can carry it. RESTORE THE CLAUSE once trustc stops ICEing with
-    /// verification off and the public lane can parse contracts.
+    /// The obligation is kept as debug assertions on both exits. RESTORE THE
+    /// CLAUSE once the public lane can parse contracts.
     pub fn abort_reflow_offload(&mut self) {
         if !self.storage.scrollback_detached_for_reflow {
             debug_assert!(
@@ -1080,8 +1279,10 @@ impl Grid {
         }
         self.storage.scrollback_detached_for_reflow = false;
         // The job (and the history a deficit fill would have pulled) is lost:
-        // drop the debt with it (fixwave5).
+        // drop the debt with it (fixwave5) — and the reader's aim into it
+        // (ruling 238): the history they aimed at is gone.
         self.storage.pending_fill_target = None;
+        self.storage.detached_reader_aim = None;
         if self.storage.scrollback.is_some() {
             // A reset/recovery path installed a replacement store before the
             // failed worker was noticed. It is authoritative: replay the newest
@@ -1803,6 +2004,50 @@ mod tests {
             }
         }
         assert!(g.scrollback_lines() > 30, "history preserved");
+        g.assert_invariants();
+    }
+
+    /// THE REWRAP'S PROGRESS (design ruling 233): `lines_done` of the fixed
+    /// `lines_total` climbs monotonically step by step, through both the
+    /// store and the ring phase, and has read every detached line by the
+    /// step that returns `Done`; the total never moves while the store
+    /// swaps input for output underneath it.
+    #[test]
+    fn reflow_progress_climbs_to_the_detached_total() {
+        let (rows, cols) = (10u16, 30u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        for i in 0..400 {
+            logical_line(&mut g, &format!("P{i}"));
+        }
+        let mut job = g.resize_offloading_scrollback(rows, 15).expect("job");
+        let total = job.lines_total();
+        assert_eq!(total, job.line_count(), "the total is what was detached");
+        assert!(total > 300, "{total}");
+        assert_eq!(job.lines_done(), 0);
+        let mut last = 0;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match job.reflow_step(37) {
+                ReflowStep::InProgress(next) => {
+                    assert!(next.lines_done() >= last, "monotone");
+                    assert!(next.lines_done() <= total);
+                    assert_eq!(next.lines_total(), total, "fixed at detach");
+                    last = next.lines_done();
+                    job = next;
+                }
+                ReflowStep::Done(done) => {
+                    assert_eq!(
+                        last + 37.min(total - last),
+                        total,
+                        "the last step read the rest"
+                    );
+                    g.reattach_reflowed_scrollback(done);
+                    break;
+                }
+            }
+        }
+        assert!(steps > 5, "{steps}");
         g.assert_invariants();
     }
 

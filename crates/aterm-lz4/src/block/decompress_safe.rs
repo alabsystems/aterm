@@ -11,9 +11,7 @@ use crate::block::MINMATCH;
 use crate::sink::Sink;
 use crate::sink::SliceSink;
 
-#[allow(unused_imports)]
 use alloc::vec;
-#[allow(unused_imports)]
 use alloc::vec::Vec;
 
 /// Read an integer.
@@ -414,18 +412,6 @@ pub fn decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize, Decompr
     decompress_internal::<false, _>(input, &mut SliceSink::new(output, 0), b"")
 }
 
-/// Decompress all bytes of `input` into `output`.
-///
-/// Returns the number of bytes written (decompressed) into `output`.
-#[inline]
-pub fn decompress_into_with_dict(
-    input: &[u8],
-    output: &mut [u8],
-    ext_dict: &[u8],
-) -> Result<usize, DecompressError> {
-    decompress_internal::<true, _>(input, &mut SliceSink::new(output, 0), ext_dict)
-}
-
 /// Decompress all bytes of `input` into a new vec. The first 4 bytes are the uncompressed size in
 /// little endian. Can be used in conjunction with `compress_prepend_size`
 #[inline]
@@ -454,37 +440,6 @@ pub fn decompress(input: &[u8], min_uncompressed_size: usize) -> Result<Vec<u8>,
     Ok(decompressed)
 }
 
-/// Decompress all bytes of `input` into a new vec. The first 4 bytes are the uncompressed size in
-/// little endian. Can be used in conjunction with `compress_prepend_size_with_dict`
-#[inline]
-pub fn decompress_size_prepended_with_dict(
-    input: &[u8],
-    ext_dict: &[u8],
-) -> Result<Vec<u8>, DecompressError> {
-    let (uncompressed_size, input) = super::uncompressed_size(input)?;
-    decompress_with_dict(input, uncompressed_size, ext_dict)
-}
-
-/// Decompress all bytes of `input` into a new vec.
-/// The passed parameter `min_uncompressed_size` needs to be equal or larger than the uncompressed size.
-///
-/// # Panics
-/// May panic if the parameter `min_uncompressed_size` is smaller than the
-/// uncompressed data.
-#[inline]
-#[cfg_attr(trust_verify, trust::skip)] // idiomatic allocation panic (vec!); wrapped logic verified in the inner fn
-pub fn decompress_with_dict(
-    input: &[u8],
-    min_uncompressed_size: usize,
-    ext_dict: &[u8],
-) -> Result<Vec<u8>, DecompressError> {
-    let mut decompressed: Vec<u8> = vec![0; min_uncompressed_size];
-    let decomp_len =
-        decompress_internal::<true, _>(input, &mut SliceSink::new(&mut decompressed, 0), ext_dict)?;
-    decompressed.truncate(decomp_len);
-    Ok(decompressed)
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -494,8 +449,6 @@ mod test {
         assert_eq!(decompress(&[0x30, b'a', b'4', b'9'], 3).unwrap(), b"a49");
     }
 
-    // this error test is only valid in safe-decode.
-    #[cfg(feature = "safe-decode")]
     #[test]
     fn offset_oob() {
         decompress(&[0x10, b'a', 2, 0], 4).unwrap_err();

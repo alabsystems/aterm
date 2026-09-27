@@ -9,6 +9,10 @@
 /// One live message as carried: every field a string or a number, every
 /// intent as its [`crate::model::Intent::encode`] form, the hold as its
 /// [`crate::model::Hold::encode`] word.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a plain wire record: each flag is an independent fact the handoff ships"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CarriedMessage {
     /// The parent's id — the successor keeps it and raises `next_id` past it.
@@ -48,6 +52,10 @@ pub struct CarriedMessage {
     /// The words the row finishes with (`Message::finished`); an older
     /// parent's rows carry none and derive them from the title.
     pub finished: Option<String>,
+    /// A record about a PREVIOUS RUN (`Message::retrospective`, ruling 259):
+    /// it keeps its lower rank across the handoff (ruling 263); an older
+    /// parent's rows carry `false`.
+    pub retrospective: bool,
 }
 
 /// Everything the successor needs: the next id and the live rows in glass

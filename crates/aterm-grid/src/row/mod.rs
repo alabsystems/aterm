@@ -126,16 +126,6 @@ impl Row {
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_WIDE_CHARS;
     }
 
-    /// Mark this row as containing at least one cell with a `StyleId`.
-    ///
-    /// Set on any cell write whose `CellFlags::USES_STYLE_ID` bit is set so
-    /// `extract_row_extras` can skip the per-cell scan on style-free rows
-    /// (#7872). Cleared by [`Row::clear`] and [`Row::erase`].
-    #[inline]
-    pub fn mark_has_style_id(&mut self) {
-        self.flags |= RowFlags::DIRTY | RowFlags::HAS_STYLE_ID;
-    }
-
     /// Check if this row contains any cell with a `StyleId`.
     #[must_use]
     #[inline]
@@ -188,31 +178,6 @@ impl Row {
         } else {
             self.flags -= RowFlags::WRAPPED;
         }
-    }
-
-    /// Restore serializable row flags from a checkpoint byte.
-    ///
-    /// Sets WRAPPED, DOUBLE_WIDTH, DOUBLE_HEIGHT_TOP, DOUBLE_HEIGHT_BOTTOM,
-    /// and HAS_WIDE_CHARS from the serialized bits. DIRTY is always set
-    /// (restored rows need re-render). Internal-only flags not present in
-    /// the serialized byte are unaffected.
-    ///
-    /// This avoids `set_line_size()` which has side effects (clearing the
-    /// second half of cells for double-width rows) that would destroy
-    /// already-deserialized cell data.
-    #[inline]
-    pub fn restore_checkpoint_flags(&mut self, bits: u8) {
-        // Mask to only the flags that are serialized (exclude DIRTY).
-        const SERIALIZABLE: u8 = RowFlags::WRAPPED.bits()
-            | RowFlags::DOUBLE_WIDTH.bits()
-            | RowFlags::DOUBLE_HEIGHT_TOP.bits()
-            | RowFlags::DOUBLE_HEIGHT_BOTTOM.bits()
-            | RowFlags::HAS_WIDE_CHARS.bits();
-        // Clear serializable flags, then set from checkpoint bits.
-        self.flags -= RowFlags::from_bits_retain(SERIALIZABLE);
-        self.flags |= RowFlags::from_bits_retain(bits & SERIALIZABLE);
-        // Restored rows always need re-render.
-        self.flags |= RowFlags::DIRTY;
     }
 
     /// Check if this row is dirty (needs re-render).
@@ -557,7 +522,7 @@ mod clear;
 mod fmt;
 mod write;
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, kani))]
 mod style_id_write;
 
 #[cfg(test)]

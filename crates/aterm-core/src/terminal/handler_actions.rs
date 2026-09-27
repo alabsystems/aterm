@@ -100,14 +100,6 @@ impl ActionSink for TerminalHandler<'_> {
             return;
         }
 
-        // Capture text for CopyToClipboard mode (OSC 1337) before fast-path write.
-        // The fast paths bypass write_char, so we must capture here.
-        if let Some(state) = self.clipboard.copy_state.as_mut() {
-            for &byte in data {
-                state.push(byte as char);
-            }
-        }
-
         // SELECTION CUSTODY — ordinary output damages the rows it OVERWRITES; see
         // `TerminalHandler::write_char`, which brackets the per-character paths this
         // one bypasses (including both fallbacks above). Bracketing the BULK call
@@ -172,8 +164,6 @@ impl ActionSink for TerminalHandler<'_> {
     /// - **0x88** (HTS): Tab set - same as ESC H
     /// - **0x8D** (RI): Reverse index - same as ESC M
     /// - **0x8E/0x8F** (SS2/SS3): Single shift - same as ESC N/O
-    ///
-    /// See `docs/ESCAPE_SEQUENCE_MATRIX.md` for complete control code coverage.
     fn execute(&mut self, byte: u8) {
         self.note_sync_open_action();
         // Per VT220 spec: a control character arriving mid-sequence cancels
@@ -221,18 +211,10 @@ impl ActionSink for TerminalHandler<'_> {
             }
             0x09 => {
                 // HT (Horizontal Tab)
-                // Capture tab for CopyToClipboard (OSC 1337)
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\t');
-                }
                 self.grid.tab_margin(self.modes.left_right_margin_mode);
             }
             0x0A..=0x0C => {
                 // LF, VT, FF
-                // Capture newline for CopyToClipboard (OSC 1337)
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\n');
-                }
                 // In new line mode (LNM), LF also performs CR
                 if self.modes.new_line_mode {
                     self.grid
@@ -245,10 +227,6 @@ impl ActionSink for TerminalHandler<'_> {
             }
             0x0D => {
                 // CR (Carriage Return)
-                // Capture CR for CopyToClipboard (OSC 1337)
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\r');
-                }
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
             }
@@ -266,10 +244,6 @@ impl ActionSink for TerminalHandler<'_> {
             0x84 => {
                 // IND (Index) - same as ESC D
                 // Move cursor down, scroll if at bottom of scroll region
-                // Capture newline for CopyToClipboard (matches ESC D path)
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\n');
-                }
                 // Per VT510: when DECLRMM is active, IND at the scroll boundary
                 // scrolls only within horizontal margins (#7407).
                 // Line feed, honoring DECLRMM left/right margins (#7687).
@@ -278,10 +252,6 @@ impl ActionSink for TerminalHandler<'_> {
             0x85 => {
                 // NEL (Next Line) - same as ESC E
                 // Move cursor to start of next line, scroll if needed
-                // Capture newline for CopyToClipboard (matches ESC E path)
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\n');
-                }
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
                 // Per VT510: when DECLRMM is active, NEL at the scroll boundary
@@ -573,8 +543,10 @@ impl TerminalHandler<'_> {
     /// Handle one parsed Kitty graphics command (KITTY-CORE display slice):
     /// delete (clear store), put/display (place a stored image), or transmit /
     /// transmit-and-display (decode, store by id, optionally place). Chunked
-    /// (`m=1`), query, animation, and non-direct mediums are deferred — so
-    /// `kitty_graphics` stays advertised FALSE until those land (no false advertise).
+    /// (`m=1`) transfers are assembled here before dispatch; the per-action
+    /// handling is `handle_complete_kitty_command`, which lists what is
+    /// still missing. `kitty_graphics` is advertised TRUE on the strength of
+    /// this core (`aterm-types` `terminal_core.rs`).
     /// Assemble CHUNKED Kitty transmissions (`m=1`) before handling. The first
     /// `m=1` chunk seeds the pending command (moved in whole, payload included);
     /// continuation chunks append their payload; the `m=0` chunk finalizes and
@@ -666,11 +638,11 @@ impl TerminalHandler<'_> {
     /// host installs the opt-in resolver — the non-direct file/temp/shm
     /// mediums.
     ///
-    /// `kitty_graphics` stays advertised FALSE (no false advertise) for the
-    /// pieces still missing, which are no longer the ones an earlier version of
-    /// this comment named: placement ids (`p=`) and delete-by-point/number
-    /// (`x=`/`y=` are not even parsed), animation CONTROL (`a=a`), source
-    /// cropping, z-index compositing between images, and Unicode placeholders.
+    /// `kitty_graphics` is advertised TRUE for this core. Still missing (they
+    /// degrade by skipping, never by drawing garbage): placement ids (`p=`) and
+    /// delete-by-point/number (`x=`/`y=` are not even parsed), animation CONTROL
+    /// (`a=a`), source cropping, z-index compositing between images, and Unicode
+    /// placeholders.
     #[allow(
         clippy::too_many_lines,
         reason = "single per-action dispatch (transmit/frame/display/delete) with inline global-byte-budget accounting per arm"
@@ -783,10 +755,11 @@ impl TerminalHandler<'_> {
                     // the parser reads no x=/y= keys), by number (n/N — numbers
                     // are not mapped to ids at transmit), by placement id (q/Q),
                     // by column/row/z (x/y/z). Deleting NOTHING is the honest
-                    // fallback: it is recoverable, matches the advertised
-                    // `kitty_graphics = false` posture, and is strictly closer to
-                    // the spec than the previous behavior — which answered every
-                    // one of these by destroying the entire store.
+                    // fallback: it is recoverable, keeps the TRUE `kitty_graphics`
+                    // advertisement honest (an unsupported selector degrades by
+                    // skipping, never by destroying data), and is strictly closer
+                    // to the spec than the previous behavior — which answered
+                    // every one of these by destroying the entire store.
                     Some(_) => {}
                 }
             }

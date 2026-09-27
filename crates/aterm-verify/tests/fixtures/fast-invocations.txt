@@ -39,6 +39,19 @@
 #     `--skip measuring:: --skip launchd_copy_tests::`, and the exclusive
 #     measuring stage runs the same selection with those two as the filter —
 #     one selection split in two, the tests that measure the machine run alone.
+#   * exception 8 (2026-09-26): the window-server unit tests, in the driver
+#     lane (<root>/target-drivers, 8) — aterm-gui's AppKit rows that open a
+#     WindowServer connection are `#[ignore]`d in every parallel test run, so
+#     the driver builds row compiles their binary (`test --no-run -q -p
+#     aterm-gui --lib`) and the stage runs exactly them (`-- --ignored
+#     ::window_server::`), after the smokes' barrier.
+#   * exception 9 (2026-09-26): the live aterm lanes' build, twice, in the
+#     driver lane (<root>/target-drivers, 8) — `build -q -p aterm --bin aterm`,
+#     the one binary tools/test-foreground-handback.sh is handed (and, under
+#     --full only, tools/test-codex-live-upgrade.sh). Once as the driver builds
+#     row's prebuild at t0, and once as the foreground handback stage's own
+#     first child (a fingerprint no-op after the prebuild), the redraw
+#     harness's shape.
 # `<inherited>` means the child got the test process's own value.
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --workspace
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --doc --workspace --no-fail-fast
@@ -58,6 +71,8 @@ targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherit
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-gui -p aterm-objc --example objc_live_class_audit --example objc_ime_drive --example objc_toolbar_drive --example objc_window_drive --example objc_event_drive --example objc_alert_drive --example objc_swizzle_drive --example objc_bound_drive
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-objc --example objc_bound_drive
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-objc --example objc_swizzle_drive
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --no-run -q -p aterm-gui --lib
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test -p aterm-gui --lib --no-fail-fast -- --ignored ::window_server::
 targo CARGO_TARGET_DIR=<root>/target-regex CARGO_BUILD_JOBS=4 RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=1 -- --unverified test -p aterm-search --features regex --no-fail-fast
 targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified run -q -p xtask -- gate citations
 targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified run -q -p xtask -- gate counts
@@ -72,3 +87,5 @@ targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherit
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p atpkg
 targo CARGO_TARGET_DIR=<root>/target/conformance-release CARGO_BUILD_JOBS=6 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --locked --release -p aterm
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm --bin aterm
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm --bin aterm

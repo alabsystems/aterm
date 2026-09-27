@@ -87,7 +87,14 @@ pub const MAX_FDS: usize = 64;
 /// over-budgeting is the measured `MSG_CTRUNC` leak (see the module docs), and
 /// half a kilobyte of stack is a cheap way to make a peer's over-send visible
 /// enough to close. Beyond this the kernel truncates and the leak is
-/// unavoidable — which is why truncation is fatal.
+/// unavoidable — which is why truncation is fatal. Gated as `scm` is, its one reader.
+#[cfg(any(
+    target_vendor = "apple",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 pub const CONTROL_FDS: usize = 2 * MAX_FDS;
 
 /// The borrowed-descriptor type [`send_with_fds`] takes: `BorrowedFd` on Unix,

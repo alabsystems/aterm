@@ -234,6 +234,17 @@ fn label_is_listed(label: &str) -> bool {
 /// the answer decides what gets deleted.
 fn owner_pid_of_label(label: &str) -> Option<u32> {
     let rest = label.strip_prefix(LABEL_PREFIX)?;
+    // The integration tests deleted on 2026-09-24 submitted `test.<stem>[.<x>].<pid>` jobs
+    // (`test.clean.<pid>`, `test.view-write.<n>.<pid>` …). Nothing submits that shape any
+    // more, and a submitted job is respawned by launchd after every exit, so one left by a
+    // killed test run relaunched and throttled for days (five on m7, 2026-09-26). Its
+    // trailing pid is its owner; the dead-pid check decides.
+    if let Some(test) = rest.strip_prefix("test.") {
+        let (stem, pid) = test.rsplit_once('.')?;
+        return (!stem.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| pid.parse().ok())
+            .flatten();
+    }
     let mut fields = rest.rsplitn(4, '-');
     let nonce = fields.next()?;
     let seq = fields.next()?;
@@ -302,10 +313,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// The sweeps read the owning pid off our labels only — the heal's and the retired
-    /// lanes' stems — never an integration test's `test.` label, a foreign label, or a
-    /// foreign name that merely has our SHAPE: the stem and the seq and nonce fields are
-    /// read, not discarded, because the answer decides what gets deleted.
+    /// The sweeps read the owning pid off our labels only — the heal's, the retired lanes'
+    /// stems, and the retired integration tests' `test.<stem>….<pid>` — never a foreign
+    /// label or a foreign name that merely has our SHAPE: the stem and the seq and nonce
+    /// fields are read, not discarded, because the answer decides what gets deleted.
     #[test]
     fn the_sweep_reads_the_owning_pid_off_our_labels_only() {
         for (label, pid) in [
@@ -321,7 +332,11 @@ mod tests {
                 "systems.alab.atpkg.replica-4281-0-18d4bf618a493520",
                 Some(4281),
             ),
-            ("systems.alab.atpkg.test.clean.123", None),
+            ("systems.alab.atpkg.test.clean.123", Some(123)),
+            ("systems.alab.atpkg.test.view-write.4.5521", Some(5521)),
+            ("systems.alab.atpkg.test.no-such-label", None),
+            ("systems.alab.atpkg.test.clean.12a", None),
+            ("systems.alab.atpkg.test..77", None),
             ("com.apple.Finder", None),
             ("systems.alab.atpkg.odd", None),
             ("systems.alab.atpkg.mytool-48213-1-a7f3", None),

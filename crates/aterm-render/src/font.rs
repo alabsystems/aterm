@@ -248,6 +248,11 @@ pub enum FaceBytes {
     Vec(Arc<Vec<u8>>),
     /// The mapping arm of discovery (`font_file::admit_font_file`).
     Mapped(Arc<crate::font_file::MappedFontFile>),
+    /// A face compiled INTO the binary (`include_bytes!` — the bundled font
+    /// stack, `crate::bundled`). Borrowed, never copied: the pages are the
+    /// executable's own read-only data, faulted in per glyph like a mapping,
+    /// so a bundled chain face costs no anonymous heap at the seal.
+    Static(&'static [u8]),
 }
 
 impl FaceBytes {
@@ -260,6 +265,9 @@ impl FaceBytes {
             (FaceBytes::Slice(a), FaceBytes::Slice(b)) => Arc::ptr_eq(a, b),
             (FaceBytes::Vec(a), FaceBytes::Vec(b)) => Arc::ptr_eq(a, b),
             (FaceBytes::Mapped(a), FaceBytes::Mapped(b)) => Arc::ptr_eq(a, b),
+            (FaceBytes::Static(a), FaceBytes::Static(b)) => {
+                a.as_ptr() == b.as_ptr() && a.len() == b.len()
+            }
             _ => false,
         }
     }
@@ -288,6 +296,17 @@ impl FaceBytes {
     pub fn is_mapped(&self) -> bool {
         matches!(self, FaceBytes::Mapped(_))
     }
+
+    /// Whether the bytes are ANONYMOUS HEAP — a copy this process owns — as
+    /// opposed to file-backed pages: a mapping of a font file, or a face
+    /// compiled into the executable ([`FaceBytes::Static`], the bundled stack),
+    /// whose read-only pages are the binary's own and are evictable like a
+    /// mapping. Diagnostics: the seal's residency split
+    /// (`AdmittedFontSources::discovered_residency`).
+    #[must_use]
+    pub fn is_heap(&self) -> bool {
+        matches!(self, FaceBytes::Slice(_) | FaceBytes::Vec(_))
+    }
 }
 
 impl From<Arc<[u8]>> for FaceBytes {
@@ -310,6 +329,7 @@ impl core::ops::Deref for FaceBytes {
             FaceBytes::Slice(b) => b,
             FaceBytes::Vec(b) => b,
             FaceBytes::Mapped(b) => b,
+            FaceBytes::Static(b) => b,
         }
     }
 }
@@ -320,6 +340,7 @@ impl core::fmt::Debug for FaceBytes {
             FaceBytes::Slice(_) => "Slice",
             FaceBytes::Vec(_) => "Vec",
             FaceBytes::Mapped(_) => "Mapped",
+            FaceBytes::Static(_) => "Static",
         };
         f.debug_struct("FaceBytes")
             .field("arm", &arm)
@@ -510,48 +531,6 @@ impl Font {
     #[must_use]
     pub fn lookup_glyph_index(&self, ch: char) -> u16 {
         self.char_to_glyph.get(&ch).map_or(0, |g| g.get())
-    }
-
-    /// Design units per em.
-    #[inline]
-    #[must_use]
-    pub fn units_per_em(&self) -> f32 {
-        self.upem
-    }
-
-    /// The family this face advertises in its `name` table (ID 1, or the
-    /// typographic family 16 when the face declares one), or `None` when it
-    /// names itself in an encoding this reader cannot decode.
-    ///
-    /// Read from the file on demand rather than cached at parse time: the only
-    /// callers are diagnostics and the resolver-identity assertions, so a
-    /// per-face `String` would be paid by every one of the thousands of faces a
-    /// font scan constructs and read by almost none of them. `Self::data` and
-    /// `Self::index` are retained for outline reads anyway, so re-parsing here
-    /// costs a table walk and no I/O.
-    #[must_use]
-    pub fn name(&self) -> Option<String> {
-        use ttf_parser::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
-        let face = ttf_parser::Face::parse(&self.data, self.index).ok()?;
-        let names = face.names();
-        let mut family = None;
-        for i in 0..names.len() {
-            let Some(record) = names.get(i) else { continue };
-            // TYPOGRAPHIC_FAMILY wins where both exist — it is the name that
-            // groups the styled members of one family (the "Noto Sans" that
-            // "Noto Sans SemiBold" belongs to), which is what a caller asking a
-            // face what it IS means.
-            match record.name_id {
-                TYPOGRAPHIC_FAMILY => {
-                    if let Some(name) = record.to_string() {
-                        return Some(name);
-                    }
-                }
-                FAMILY if family.is_none() => family = record.to_string(),
-                _ => {}
-            }
-        }
-        family
     }
 
     /// Design-units → pixels at `px`.

@@ -16,7 +16,9 @@ aterm-messages = { workspace = true }
 # The macOS arm: Mach host statistics, `sysctlbyname`, libproc (declared in the
 # first-party `libc`, each with its oracle row) and `NSProcessInfo` through the
 # first-party Objective-C layer. No other platform links anything: the Linux
-# parsers are pure over `&str`, and there is no live Linux sampler yet.
+# sampler reads `/proc` and `/sys` through std alone (bounded 4 KiB reads; the
+# clock tick and page size from `/proc/self/auxv`), under a root the tests
+# point at a fixture tree.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
 aterm-objc = { workspace = true }

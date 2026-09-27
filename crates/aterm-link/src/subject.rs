@@ -163,54 +163,6 @@ pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject
     })
 }
 
-/// A parsed `/f/<F>/term/<node>/<sid>/in/<src>` drive subject — a shape this
-/// FLEET RESERVES and this node no longer serves. Seven segments again, and
-/// again by position: `f`, `<F>`, `term`, `<node>`, `<sid>`, `in`, `<src>`.
-///
-/// ROUND 21 CUT THE FACE AND KEPT THE SUBJECT. Nothing in this crate parses one
-/// off the wire any more — there is no `term` subscription and no function that
-/// writes to a PTY — but the shape stays defined here, and the node ring stays
-/// eight grants wide, for two reasons: an older node on this wire may still
-/// publish one, and a fleet that had forgotten what the subject looks like
-/// could not tell such a record from a stranger's forgery. The parse is still
-/// left-anchored and by position, which is the property that made an
-/// eight-segment forgery detectable; its only in-tree caller is now its own
-/// test, and that is the intended end state rather than an oversight.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TermInAddr {
-    pub sid: String,
-    pub src: String,
-}
-
-/// Parse a `term/…/in/<src>` subject, or refuse.
-///
-/// # Errors
-///
-/// [`Reject::Malformed`] for anything that is not that shape.
-pub fn parse_term_in(fleet: &str, node: &str, subject: &str) -> Result<TermInAddr, Reject> {
-    let segs: Vec<&str> = subject.split('/').collect();
-    if segs.len() != 8 || !segs[0].is_empty() {
-        return Err(Reject::Malformed);
-    }
-    if segs[1] != "f" || segs[2] != fleet || segs[3] != "term" || segs[4] != node || segs[6] != "in"
-    {
-        return Err(Reject::Malformed);
-    }
-    if !is_principal(segs[5]) || !segs[5].starts_with("s-") || !is_principal(segs[7]) {
-        return Err(Reject::Malformed);
-    }
-    Ok(TermInAddr {
-        sid: segs[5].to_string(),
-        src: segs[7].to_string(),
-    })
-}
-
-/// `/f/<F>/in/<node>/<sid>/<src>/<kind>` — the address to send TO an owner.
-#[must_use]
-pub fn in_subject(fleet: &str, node: &str, sid: &str, src: &str, kind: &str) -> String {
-    format!("/f/{fleet}/in/{node}/{sid}/{src}/{kind}")
-}
-
 /// `/f/<F>/pub/<node>/node/<leaf>` — the node's own face.
 #[must_use]
 pub fn node_face(fleet: &str, node: &str, leaf: &str) -> String {
@@ -298,15 +250,8 @@ pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
     })
 }
 
-/// The node's own `term` subtree: the drive face for the sessions it hosts.
-#[must_use]
-pub fn term_filter(fleet: &str, node: &str) -> String {
-    format!("/f/{fleet}/term/{node}/>")
-}
-
 #[cfg(test)]
 mod tests {
-
     /// **A TOPIC IS ONE SUBJECT SEGMENT.** `[a-z0-9][a-z0-9._-]{0,31}`: it must
     /// open alphanumeric so it can never read as a flag or a relative path, it
     /// may not hold a `/` because it IS a segment, and it is bounded for the
@@ -398,32 +343,6 @@ mod tests {
             "/f/f1/in/n-a/s-b/s-1/answer/x",  // eight again
         ] {
             assert_eq!(parse_in("f1", "n-a", bad), Err(Reject::Malformed), "{bad}");
-        }
-    }
-
-    /// The drive face has the same left-anchored rule, and its literal `in`
-    /// sits at position SIX — a subject that puts something else there is not a
-    /// drive record whatever else it looks like.
-    #[test]
-    fn the_drive_subject_is_pinned_too() {
-        assert_eq!(
-            parse_term_in("f1", "n-a", "/f/f1/term/n-a/s-b/in/h-andrew"),
-            Ok(TermInAddr {
-                sid: "s-b".into(),
-                src: "h-andrew".into()
-            })
-        );
-        for bad in [
-            "/f/f1/term/n-a/s-b/out",
-            "/f/f1/term/n-a/s-b/screen",
-            "/f/f1/term/n-a/s-b/in/h-andrew/x",
-            "/f/f1/term/n-z/s-b/in/h-andrew",
-        ] {
-            assert_eq!(
-                parse_term_in("f1", "n-a", bad),
-                Err(Reject::Malformed),
-                "{bad}"
-            );
         }
     }
 

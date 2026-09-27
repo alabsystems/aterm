@@ -2091,6 +2091,67 @@ fn is_1049h_at_pending_wrap_divergence(input: &[u8]) -> bool {
     wrap_reset_gate(input, |op| op == WrapResetOp::AltScreen1049Set).is_some()
 }
 
+/// Class A1: a SECOND CSI ?1049 h while the alternate screen is already up.
+/// xterm's `srm_OPT_ALTBUF_CURSOR` set is `CursorSave; ToAlternate;
+/// ClearScreen` (charproc.c), and only `ToAlternate` stands down when the alt
+/// screen is up (`if (screen->whichBuf == 0)`), so the save — into the ALT
+/// slot — and the clear still run; alacritty's set of the same mode does
+/// nothing on the alt screen, keeping what it shows. aterm matches xterm
+/// (handler_dec.rs `enter_alternate_screen`). Gate: the counterfactual that
+/// spells each such repeat as xterm runs it reproduces aterm exactly.
+fn is_repeated_1049h_divergence(input: &[u8]) -> bool {
+    let Some(counterfactual) = repeated_1049h_counterfactual(input) else {
+        return false;
+    };
+    let (a, b) = (aterm_screen(input), alacritty_screen(&counterfactual));
+    a.rows == b.rows && a.cursor == b.cursor
+}
+
+/// `input` with every CSI ?1049 h issued while the alternate screen is already
+/// up spelled as xterm runs it — DECSC (`ESC 7`, which saves into the current,
+/// alt, slot) then ED 2 (a BCE clear that moves no cursor); `None` when there is
+/// no such repeat, or one this rewrite cannot state exactly (a parameter list
+/// naming 1049 among other modes). The alternate screen is tracked through
+/// CSI ? … h / l naming 47, 1047 or 1049; a mis-tracked state only makes the
+/// gate's exact match fail, never pass.
+fn repeated_1049h_counterfactual(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() + 8);
+    let (mut alt, mut repeated) = (false, false);
+    let mut i = 0;
+    while i < input.len() {
+        if input[i..].starts_with(b"\x1b[?") {
+            let mut j = i + 3;
+            while j < input.len() && (input[j].is_ascii_digit() || input[j] == b';') {
+                j += 1;
+            }
+            if let Some(&last) = input.get(j)
+                && (last == b'h' || last == b'l')
+            {
+                let set = last == b'h';
+                let modes: Vec<&[u8]> = input[i + 3..j].split(|&b| b == b';').collect();
+                if set && alt && modes.contains(&b"1049".as_slice()) {
+                    if modes.len() != 1 {
+                        return None;
+                    }
+                    out.extend_from_slice(b"\x1b7\x1b[2J");
+                    repeated = true;
+                    i = j + 1;
+                    continue;
+                }
+                if modes
+                    .iter()
+                    .any(|m| matches!(*m, b"47" | b"1047" | b"1049"))
+                {
+                    alt = set;
+                }
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    repeated.then_some(out)
+}
+
 /// Class C5: an ICH, DCH or ECH at a pending wrap, or an IL / DL there with the
 /// cursor row inside the scroll region, possibly followed by output. xterm
 /// resets the wrap in each (util.c `InsertChar`, `DeleteChar`, `ClearRight` via
@@ -2190,6 +2251,14 @@ fn matched_alacritty_divergence(input: &[u8]) -> Option<&'static PinnedDivergenc
     }
     if is_mixed_wrap_reset_divergence(input) {
         return Some(&MIXED_WRAP_RESET_PIN);
+    }
+    static REPEATED_1049H_PIN: PinnedDivergence = PinnedDivergence {
+        name: "a repeated 1049h clears the alt screen (class A1)",
+        input: b"\x1b[?1049h!\x1b[?1049h",
+        why: "xterm charproc.c srm_OPT_ALTBUF_CURSOR set is CursorSave; ToAlternate; ClearScreen, and only ToAlternate stands down on the alt screen, so a second 1049h saves the cursor into the alt slot and clears; alacritty's set is a no-op there and keeps what the alt screen shows. Proven per input by the counterfactual gate (DECSC + ED 2 in its place). aterm matches xterm.",
+    };
+    if is_repeated_1049h_divergence(input) {
+        return Some(&REPEATED_1049H_PIN);
     }
     static DEC_GRAPHICS_PIN: PinnedDivergence = PinnedDivergence {
         name: "alacritty GL/charset class (DEC-graphics glyph family)",
@@ -3649,6 +3718,34 @@ fn sgr21_cells_at_ed0_pending_wrap_proptest_divergence_is_classified_by_the_coun
     assert_eq!(
         matched.name,
         "ED/EL at pending wrap resets the wrap (class C2, print cascade)"
+    );
+}
+
+/// Class A1, pinned: the input the proptest found diverges, and is classified
+/// by its counterfactual gate; a single 1049h, and one after the alt screen was
+/// left, are no repeat.
+#[test]
+fn a_repeated_1049h_is_the_xterm_clear() {
+    let input = b"\x1b[?1049h!\x1b[?1049h";
+    assert!(diff_screens(input).is_some(), "the engines really differ");
+    assert!(is_repeated_1049h_divergence(input));
+    assert_eq!(
+        matched_alacritty_divergence(input).map(|pin| pin.name),
+        Some("a repeated 1049h clears the alt screen (class A1)")
+    );
+    assert_eq!(
+        repeated_1049h_counterfactual(input).as_deref(),
+        Some(b"\x1b[?1049h!\x1b7\x1b[2J".as_slice())
+    );
+    assert_eq!(repeated_1049h_counterfactual(b"\x1b[?1049h!"), None);
+    assert_eq!(
+        repeated_1049h_counterfactual(b"\x1b[?1049h!\x1b[?1049l\x1b[?1049h"),
+        None
+    );
+    assert_eq!(
+        repeated_1049h_counterfactual(b"\x1b[?1049h!\x1b[?1049;25h"),
+        None,
+        "a list naming 1049 among other modes is not rewritten"
     );
 }
 

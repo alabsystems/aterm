@@ -10,7 +10,7 @@
 //! Terminal query/manipulation APIs that consume these types live in
 //! `aterm-core`'s terminal shell/block accessors.
 
-use crate::shell_types::{current_time_ms, elapsed_ms};
+use crate::shell_types::current_time_ms;
 
 /// The state of an output block.
 ///
@@ -188,36 +188,6 @@ impl OutputBlock {
         matches!(self.exit_code, Some(code) if code != 0)
     }
 
-    /// Calculate the command execution duration in milliseconds.
-    ///
-    /// Returns the time between command execution start (C) and completion (D).
-    /// Returns `None` if timestamps are incomplete or inconsistent.
-    #[must_use]
-    pub fn exec_duration_ms(&self) -> Option<u64> {
-        elapsed_ms(self.command_exec_start_time_ms, self.command_end_time_ms)
-    }
-
-    /// Calculate the total command duration in milliseconds.
-    ///
-    /// Returns the wall-clock time from prompt display (A) to completion (D),
-    /// spanning all phases: prompt, input, and execution.
-    /// Returns `None` if either timestamp is missing or inconsistent.
-    #[must_use]
-    pub fn command_duration_ms(&self) -> Option<u64> {
-        elapsed_ms(self.prompt_time_ms, self.command_end_time_ms)
-    }
-
-    /// Get the typed row span for the prompt portion of this block.
-    #[must_use]
-    pub fn prompt_row_span(&self) -> RowSpan {
-        let end = self
-            .command_start_row
-            .or(self.output_start_row)
-            .or(self.end_row)
-            .unwrap_or(self.prompt_start_row.saturating_add(1));
-        RowSpan::new(self.prompt_start_row, end)
-    }
-
     /// Get the typed row span for the command portion of this block.
     #[must_use]
     pub fn command_row_span(&self) -> Option<RowSpan> {
@@ -238,12 +208,6 @@ impl OutputBlock {
 
     /// Compatibility shim for callers still using tuple row ranges.
     #[must_use]
-    pub fn prompt_rows(&self) -> (u64, u64) {
-        self.prompt_row_span().as_tuple()
-    }
-
-    /// Compatibility shim for callers still using tuple row ranges.
-    #[must_use]
     pub fn command_rows(&self) -> Option<(u64, u64)> {
         self.command_row_span().map(RowSpan::as_tuple)
     }
@@ -252,89 +216,6 @@ impl OutputBlock {
     #[must_use]
     pub fn output_rows(&self) -> Option<(u64, u64)> {
         self.output_row_span().map(RowSpan::as_tuple)
-    }
-
-    /// Check if a given row falls within this block.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - Absolute row number to check
-    #[must_use]
-    pub fn contains_row(&self, row: u64) -> bool {
-        if row < self.prompt_start_row {
-            return false;
-        }
-        match self.end_row {
-            Some(end) => row < end,
-            None => true, // Block is still in progress
-        }
-    }
-
-    /// Check if a given row is visible (not part of collapsed output).
-    ///
-    /// When a block is collapsed, only the prompt and command portions are
-    /// visible; the output portion is hidden.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - Absolute row number to check
-    #[must_use]
-    pub fn is_row_visible(&self, row: u64) -> bool {
-        if !self.contains_row(row) {
-            return true; // Not our row, doesn't matter
-        }
-        if !self.collapsed {
-            return true; // Not collapsed, everything visible
-        }
-        // Collapsed: only prompt and command visible
-        match self.output_start_row {
-            Some(output_start) => row < output_start,
-            None => true, // No output yet, everything visible
-        }
-    }
-
-    /// Get the number of visible rows in this block.
-    ///
-    /// When collapsed, this excludes the output portion.
-    /// Returns count as `usize` since row counts fit in memory.
-    #[must_use]
-    pub fn visible_row_count(&self) -> usize {
-        let end = self.end_row.unwrap_or(
-            self.output_start_row.unwrap_or(
-                self.command_start_row
-                    .unwrap_or(self.prompt_start_row.saturating_add(1)),
-            ),
-        );
-        // Row-count differences are small — saturate on 32-bit for safety
-        let total =
-            usize::try_from(end.saturating_sub(self.prompt_start_row)).unwrap_or(usize::MAX);
-
-        if self.collapsed {
-            // Only count rows before output starts
-            if let Some(output_start) = self.output_start_row {
-                usize::try_from(output_start.saturating_sub(self.prompt_start_row))
-                    .unwrap_or(usize::MAX)
-            } else {
-                total
-            }
-        } else {
-            total
-        }
-    }
-
-    /// Get the number of hidden rows (collapsed output rows).
-    ///
-    /// Returns count as `usize` since row counts fit in memory.
-    #[must_use]
-    pub fn hidden_row_count(&self) -> usize {
-        if !self.collapsed {
-            return 0;
-        }
-        if let Some(rows) = self.output_row_span() {
-            usize::try_from(rows.row_count()).unwrap_or(usize::MAX)
-        } else {
-            0
-        }
     }
 }
 

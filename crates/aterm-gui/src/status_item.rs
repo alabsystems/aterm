@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// The menu-bar status item is an AppKit surface; off macOS the types compile
-// for the shared Wake plumbing and everything else is intentionally idle.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// The menu-bar status item is an AppKit surface; off macOS only the fleet
+// glance and the handle type compile (the host's `install_status_item` answers
+// `None` there itself), and the menu vocabulary is gated to macOS and the tests.
 
 //! The menu-bar OPERATOR status item (macOS `NSStatusItem`).
 //!
@@ -37,7 +37,8 @@
 /// every binary; `docs/OPERATOR.md` is named as optional enhancement only. The
 /// agent CLI authenticates from its own config, so this carries no secrets
 /// (aterm strips agent env vars from children by design).
-pub const OPERATOR_LAUNCH_LINE: &str = "claude \"You are this machine's aterm fleet operator. Run 'aterm help introspection' to learn how to see and drive sessions, set your role with: aterm ctl @self meta set role operator - then await fleet instructions from the human. If a docs/OPERATOR.md exists in your cwd, read and follow it too.\"";
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) const OPERATOR_LAUNCH_LINE: &str = "claude \"You are this machine's aterm fleet operator. Run 'aterm help introspection' to learn how to see and drive sessions, set your role with: aterm ctl @self meta set role operator - then await fleet instructions from the human. If a docs/OPERATOR.md exists in your cwd, read and follow it too.\"";
 
 /// One user action from the status-item menu. Carried by `Wake::OperatorAction`
 /// from the AppKit callback to the event loop, which dispatches on `App`.
@@ -46,7 +47,8 @@ pub const OPERATOR_LAUNCH_LINE: &str = "claude \"You are this machine's aterm fl
 /// never to the main-menu `ATermMenuTarget`, so they can never collide with
 /// `MenuAction` tags). Stable once assigned; never reuse a retired tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OperatorAction {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) enum OperatorAction {
     /// Spawn a fresh tab session and launch the operator agent in it.
     Start,
     /// Focus the operator session's tab and raise its window.
@@ -69,13 +71,16 @@ pub enum OperatorAction {
 /// payload`. Payloads are small monotonic counters (window/session ids) or pids,
 /// so `payload < BAND` always holds in practice; an out-of-range payload encodes
 /// to `0` (the inert tag) rather than aliasing another row — fail closed.
+#[cfg(any(target_os = "macos", test))]
 const TAG_BAND: isize = 1_000_000_000_000;
 
+#[cfg(any(target_os = "macos", test))]
 impl OperatorAction {
     /// The `NSMenuItem.tag` this action rides in. `0` is never used (an untagged
     /// item decodes to `None` and stays inert). Fixed actions keep their original
     /// small tags; payload actions ride the [`TAG_BAND`] codec.
-    pub fn tag(self) -> isize {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn tag(self) -> isize {
         let packed = |kind: isize, payload: u64| -> isize {
             isize::try_from(payload)
                 .ok()
@@ -94,7 +99,8 @@ impl OperatorAction {
     }
 
     /// Inverse of [`tag`](Self::tag); unknown tags are `None` (inert item).
-    pub fn from_tag(tag: isize) -> Option<Self> {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn from_tag(tag: isize) -> Option<Self> {
         match tag {
             1 => Some(OperatorAction::Start),
             2 => Some(OperatorAction::Show),
@@ -119,7 +125,7 @@ impl OperatorAction {
 
 /// The operator's classified state, derived purely from session titles.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OperatorState {
+pub(crate) enum OperatorState {
     /// No session identifies as the operator.
     NotRunning,
     /// An operator session exists; the payload is its self-reported detail (the
@@ -132,7 +138,7 @@ pub enum OperatorState {
 /// `App::status_session_row` from the registry snapshot; pure data so
 /// [`classify`] stays lock-free and testable.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionRow {
+pub(crate) struct SessionRow {
     /// Process-local session id (the `@<n>` selector and Show/close target).
     pub id: u64,
     /// Effective title: user meta title when set, else the live OSC title.
@@ -146,18 +152,39 @@ pub struct SessionRow {
     /// from a sibling instance, whose verdict this instance does not read.
     pub agent: Option<AgentFact>,
     /// Whether a supervisor's claim on the session is live (`status
-    /// supervisor=`). A supervised session's prompts, questions and limits
-    /// raise no row of their own: its supervisor answers the rote boxes and
-    /// escalates the rest through keyed `attention`, which still shows. A
-    /// wall the supervisor does not escalate (an overload, an API error, the
-    /// login, a full context) still raises its row.
+    /// supervisor=`). A supervised session's prompts, questions and walls
+    /// raise no row of their own: in the fully automatic default its
+    /// supervisor answers them, and what it cannot — a point the owner's
+    /// `[harness]` limited, or the irreducible (a lost login) — it escalates
+    /// through keyed `attention`, which still shows and notifies. The one
+    /// verdict the supervisor never sees still raises its row: Claude Code's
+    /// critical-memory banner under a running spinner
+    /// ([`outlives_supervision`]).
     pub supervised: bool,
+    /// The SERVER's published input stall (`status input=stalled|stopped`),
+    /// or `None`: its program has stopped reading its input, or its job is
+    /// stopped with input queued. Raises the most severe row of all,
+    /// supervised or not ([`EscalationKind::Unresponsive`]). `None` for a
+    /// sibling instance's row, like [`Self::agent`].
+    pub input_stall: Option<InputStallRow>,
+}
+
+/// The stall half of one [`SessionRow`] — `input_stall::menu_row`'s words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InputStallRow {
+    /// The server's own attention words for the stall (`<prog> is frozen:
+    /// not reading input since <HH:MM> (…) — restart it: …`), the text its
+    /// `meta attention=` entry carries.
+    pub text: String,
+    /// The EPISODE's identity (a hash of when its oldest unread byte was
+    /// accepted): one notification per stall, however its text moves.
+    pub key: u64,
 }
 
 /// The published agent verdict one [`SessionRow`] carries — the
 /// `SessionTimeline` publication, copied under its leaf lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentFact {
+pub(crate) struct AgentFact {
     /// `agent=`: `busy|prompt|question|wall:<kind>|idle|survey|unknown`.
     pub word: &'static str,
     /// `agent_detail=` (raw): a prompt's `kind[:verdict]`, a limit's reset.
@@ -173,7 +200,14 @@ pub struct AgentFact {
 /// What an escalation row is about, MOST SEVERE FIRST: the derived order is
 /// the menu's row order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EscalationKind {
+pub(crate) enum EscalationKind {
+    /// The server's published input stall ([`SessionRow::input_stall`]): the
+    /// program has left its input unread past a stall, or its job is stopped
+    /// with input queued. FIRST, ahead of typed attention (2026-09-24): the
+    /// incident's frozen Claude Code sat under its supervisor's "answer this
+    /// box" badge for 2h41m, and no box can be answered by a program that
+    /// reads nothing — the one remedy is a restart.
+    Unresponsive,
     /// Typed `meta set attention` — someone (a supervisor, a script) asked
     /// for the human explicitly.
     Attention,
@@ -191,13 +225,14 @@ pub enum EscalationKind {
 
 impl EscalationKind {
     /// Whether a transition into this kind posts a native notification.
-    pub fn notifies(self) -> bool {
+    pub(crate) fn notifies(self) -> bool {
         !matches!(self, Self::Title)
     }
 
     /// The notification's title for this kind — aterm's own words.
-    pub fn headline(self) -> &'static str {
+    pub(crate) fn headline(self) -> &'static str {
         match self {
+            Self::Unresponsive => "aterm · program frozen",
             Self::Attention => "aterm · needs you",
             Self::Prompt => "aterm · approval waiting",
             Self::Question => "aterm · question waiting",
@@ -210,7 +245,7 @@ impl EscalationKind {
 /// One session's escalation: at most one per session, the most severe of
 /// what it carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Escalation {
+pub(crate) struct Escalation {
     /// Process-local session id — the [`OperatorAction::FocusSession`] payload.
     pub session: u64,
     /// What it is about.
@@ -231,6 +266,10 @@ pub struct Escalation {
 const ROW_TITLE_MAX: usize = 32;
 /// Byte budget for the `<kind> <command>` part of a row.
 const ROW_WHAT_MAX: usize = 72;
+/// Byte budget for a stall row's text: the server's attention cap
+/// (`session_timeline::META_ATTENTION_KEYED_MAX`), so the row carries every
+/// word the attention entry does.
+const STALL_TEXT_MAX: usize = crate::session_timeline::META_ATTENTION_KEYED_MAX;
 
 /// `s` folded to one line (control characters and runs of whitespace become
 /// one space) and clipped to `max` bytes on a char boundary, with `…` when
@@ -241,7 +280,7 @@ const ROW_WHAT_MAX: usize = 72;
 /// and isolates, zero-width and other invisible format characters) are
 /// dropped too: a box's command is program-written text the human approves
 /// from, and `rm -rf \u{202e}…` must not render reordered in a menu row.
-pub fn fold_clip(s: &str, max: usize) -> String {
+pub(crate) fn fold_clip(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut space = false;
     for c in s.chars() {
@@ -299,6 +338,22 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
             Some((EscalationKind::Prompt, what))
         }
         "question" => Some((EscalationKind::Question, "question".to_string())),
+        // The server's own stall word: the row normally comes from
+        // `SessionRow::input_stall` first, with its remedy; this arm is the
+        // same fact carried by the verdict alone.
+        "wall:unresponsive" => Some((
+            EscalationKind::Unresponsive,
+            "frozen: not reading input".to_string(),
+        )),
+        // Claude Code's critical-memory banner: no reset to wait for, and
+        // the one remedy is the human's — say it (2026-09-24).
+        "wall:memory" => Some((
+            EscalationKind::Wall,
+            format!(
+                "memory critical \u{2014} restart it, then {}",
+                aterm_phase::resume_hint(aterm_phase::Program::Claude).unwrap_or("resume it")
+            ),
+        )),
         word => {
             // `wall:usage-session` → `usage-session`, the kind aterm-phase
             // names; a reset time rides it.
@@ -314,15 +369,51 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
     }
 }
 
-/// The ONE escalation a session row carries, or `None`. Typed attention wins
-/// (someone asked for the human in words); then the agent verdict — unless a
+/// A verdict whose row a live supervisor does not take over, because the
+/// supervisor never sees it: `wall:memory`, Claude Code's critical-memory
+/// banner, which it draws under a RUNNING spinner. The supervisor decides
+/// only where a turn has ended, and waits under a spinner for as long as it
+/// runs; the 2026-09-24 incident's supervised worker sat under its spinner,
+/// 36 minutes into a turn and reading no input for 2h41m. The review of
+/// that day found nobody escalating the banner there: this row is the
+/// escalation. So is `wall:unresponsive`, the stall the SERVER publishes:
+/// a supervisor presses nothing into a program that reads nothing.
+fn outlives_supervision(word: &str) -> bool {
+    matches!(word, "wall:memory" | "wall:unresponsive")
+}
+
+/// A supervised session's stall row ([`escalation`]): the server's words with
+/// the resume step (`, then claude --continue`) handed to the harness, which
+/// relaunches the agent on its conversation once the signal ends it (U1).
+fn hosted_stall_text(text: &str) -> String {
+    let Some(hint) = aterm_phase::resume_hint(aterm_phase::Program::Claude) else {
+        return text.to_string();
+    };
+    match text.strip_suffix(&format!(", then {hint}")) {
+        Some(head) => format!("{head} \u{2014} the harness relaunches it on its conversation"),
+        None => text.to_string(),
+    }
+}
+
+/// What a SUPERVISED session's `wall:memory` row says: the harness restarts
+/// the agent at its next idle point and carries it on (D3) — information,
+/// the remedy being taken, not asked of a person.
+const SUPERVISED_MEMORY: &str = "memory critical \u{2014} restarting it at its next idle point";
+
+/// The ONE escalation a session row carries, or `None`. A published input
+/// stall wins over everything, supervised or not
+/// ([`EscalationKind::Unresponsive`]: whatever a box or a badge asks, the
+/// program cannot read the answer). Then typed attention (someone asked for
+/// the human in words); then the agent verdict — unless a
 /// live supervisor holds the session: it answers the rote boxes and escalates
 /// every other prompt, question and wall aterm-phase names through its own
 /// keyed attention (the turn-end decider acts on or escalates every wall
 /// kind), so the verdict's row would be a second row for one point; a
 /// supervisor that stops or faults releases its claim and the rows are
-/// back — then the legacy `⚠` title.
-pub fn escalation(row: &SessionRow) -> Option<Escalation> {
+/// back — then the legacy `⚠` title. The exception is a verdict the
+/// supervisor never sees ([`outlives_supervision`]): its row is raised
+/// supervised or not.
+pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     let title = fold_clip(stripped_title(&row.title), ROW_TITLE_MAX);
     let body_for = |what: &str| {
         if title.is_empty() {
@@ -331,6 +422,26 @@ pub fn escalation(row: &SessionRow) -> Option<Escalation> {
             format!("{title}: {what}")
         }
     };
+    if let Some(stall) = &row.input_stall {
+        // The whole remedy, never clipped to a row's `<kind> <command>`
+        // budget: `signal term` and `claude --continue` sit at its end. A
+        // SUPERVISED session's resume is the harness's (U1): once the signal
+        // ends it, its host relaunches it on its conversation and carries it
+        // on — so the row names the one step a person takes, and what follows.
+        let text = if row.supervised {
+            hosted_stall_text(&stall.text)
+        } else {
+            stall.text.clone()
+        };
+        let body = body_for(&fold_clip(&text, STALL_TEXT_MAX));
+        return Some(Escalation {
+            session: row.id,
+            kind: EscalationKind::Unresponsive,
+            key: stall.key,
+            label: format!("⚠ {body}"),
+            body,
+        });
+    }
     if let Some(message) = row
         .attention
         .as_deref()
@@ -352,9 +463,17 @@ pub fn escalation(row: &SessionRow) -> Option<Escalation> {
         });
     }
     if let Some(fact) = &row.agent
-        && !row.supervised
+        && (!row.supervised || outlives_supervision(fact.word))
         && let Some((kind, what)) = agent_escalation(fact)
     {
+        // A supervised session's memory banner is the harness's to answer:
+        // it restarts the agent at its next idle point (D3), so the row says
+        // what happens, not what a person should do.
+        let what = if row.supervised && fact.word == "wall:memory" {
+            SUPERVISED_MEMORY.to_string()
+        } else {
+            what
+        };
         let what = fold_clip(&what, ROW_WHAT_MAX);
         let body = body_for(&what);
         return Some(Escalation {
@@ -382,7 +501,7 @@ pub fn escalation(row: &SessionRow) -> Option<Escalation> {
 /// One window of this instance as the menu shows it (row order = id order,
 /// which the windows map already keeps stable and ascending).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WindowRow {
+pub(crate) struct WindowRow {
     /// Logical window id — the [`OperatorAction::FocusWindow`] payload.
     pub id: u64,
     /// The composed chrome title the window shows right now.
@@ -396,7 +515,7 @@ pub struct WindowRow {
 /// A sibling aterm instance discovered through the shared control-socket dir,
 /// summarized by the background fleet scan (never dialed on the UI thread).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InstanceRow {
+pub(crate) struct InstanceRow {
     /// The sibling's pid — the [`OperatorAction::RaiseInstance`] payload; `0`
     /// means the graph entry predates pid recording (row renders disabled).
     pub pid: u32,
@@ -411,17 +530,17 @@ pub struct InstanceRow {
 /// The shortest spacing between two notifications for ONE session. A verdict
 /// that flaps (a misread box re-read a moment later as a new one) costs one
 /// notification per window, never one per flap; the menu row stays current.
-pub const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
 /// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across
 /// the instance — ten agents hitting one usage limit together page once or a
 /// few times, not ten times. The menu lists every one of them regardless.
-pub const NOTIFY_BURST: usize = 3;
+pub(crate) const NOTIFY_BURST: usize = 3;
 /// The window [`NOTIFY_BURST`] is counted over.
-pub const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One native notification the herald decided to post.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HeraldNotice {
+pub(crate) struct HeraldNotice {
     /// The session it is about (the delivery thread's focus suppression).
     pub session: u64,
     /// aterm's own headline for the kind ([`EscalationKind::headline`]).
@@ -432,7 +551,7 @@ pub struct HeraldNotice {
 
 /// What one [`Herald::note`] decided.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HeraldOutcome {
+pub(crate) struct HeraldOutcome {
     /// The session's menu row appeared, changed or went away — re-render.
     pub row_moved: bool,
     /// Post exactly this notification.
@@ -441,7 +560,7 @@ pub struct HeraldOutcome {
 
 /// Why a transition into an escalation posted nothing (test-visible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeraldQuiet {
+pub(crate) enum HeraldQuiet {
     /// The same `(kind, key)` as the last note — the same box re-read.
     Same,
     /// The kind never notifies ([`EscalationKind::notifies`]).
@@ -485,7 +604,7 @@ struct HeraldSlot {
 /// few seconds therefore page twice, not once and then never — and never
 /// for a box already gone.
 #[derive(Debug, Default)]
-pub struct Herald {
+pub(crate) struct Herald {
     slots: std::collections::HashMap<u64, HeraldSlot>,
     /// Post times inside the last [`NOTIFY_BURST_WINDOW`], oldest first.
     recent: std::collections::VecDeque<std::time::Instant>,
@@ -497,7 +616,7 @@ impl Herald {
     /// Fold `session`'s current escalation. `looking` is true when the
     /// session is the focused pane of a focused window (the notification
     /// suppression set).
-    pub fn note(
+    pub(crate) fn note(
         &mut self,
         session: u64,
         current: Option<&Escalation>,
@@ -625,12 +744,12 @@ impl Herald {
 
     /// Why the last [`Self::note`] posted nothing, when it had a transition
     /// or a re-read to judge; `None` after a post or a cleared escalation.
-    pub fn last_quiet(&self) -> Option<HeraldQuiet> {
+    pub(crate) fn last_quiet(&self) -> Option<HeraldQuiet> {
         self.last_quiet
     }
 
     /// Forget a retired session.
-    pub fn retire(&mut self, session: u64) {
+    pub(crate) fn retire(&mut self, session: u64) {
         self.slots.remove(&session);
     }
 }
@@ -640,7 +759,7 @@ impl Herald {
 /// `windows` and `instances` start empty out of [`classify`] (they are not
 /// session facts) and are filled by the caller before rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FleetGlance {
+pub(crate) struct FleetGlance {
     /// Operator state (see [`OperatorState`]).
     pub operator: OperatorState,
     /// The operator session's process-local id, when one is running — what
@@ -680,7 +799,7 @@ impl FleetGlance {
     /// menu titles natively — safe here, unlike aterm's own overlay renderer).
     /// Sibling escalations badge too — the icon answers "does ANY aterm need
     /// me", as far as the last background scan saw.
-    pub fn button_title(&self) -> &'static str {
+    pub(crate) fn button_title(&self) -> &'static str {
         if !self.warnings.is_empty() || self.instances.iter().any(|i| i.warnings > 0) {
             "❯⚠"
         } else {
@@ -689,7 +808,7 @@ impl FleetGlance {
     }
 
     /// One line summarizing the operator for the menu header (disabled item).
-    pub fn header_line(&self) -> String {
+    pub(crate) fn header_line(&self) -> String {
         match &self.operator {
             OperatorState::NotRunning => "Operator: not running".to_string(),
             OperatorState::Running(detail) if detail.is_empty() => "Operator: running".to_string(),
@@ -701,7 +820,8 @@ impl FleetGlance {
     /// folded beside it (design §5.1 — one row, no separate live term). Pure
     /// so the label is testable off macOS; both menu builders render it
     /// verbatim.
-    pub fn sessions_line(&self) -> String {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn sessions_line(&self) -> String {
         format!(
             "Sessions: {} \u{b7} Connections: {}",
             self.sessions, self.connections
@@ -783,15 +903,16 @@ fn title_operator_detail(title: &str) -> Option<String> {
 ///   the title either way (the title stays the human-readable status line).
 /// * Warnings — one row per session, from [`escalation`]: typed `attention`
 ///   renders `⚠ <message>`; an unsupervised agent's prompt, question or wall
-///   — or a supervised agent's wall its supervisor does not escalate —
-///   renders `⚠ <tab title>: <kind> <command>`; a `⚠`-prefixed title renders
-///   as itself. Rows are ordered most severe first ([`EscalationKind`]), in
-///   roster order within a kind.
+///   — or a supervised agent's `wall:memory`, which its supervisor never
+///   sees — renders `⚠ <tab title>: <kind> <command>` (a supervised one
+///   raises only its supervisor's `attention` otherwise); a `⚠`-prefixed
+///   title renders as itself. Rows are ordered most severe first
+///   ([`EscalationKind`]), in roster order within a kind.
 ///
 /// An operator whose own row escalates still counts as running (its warning
 /// row carries the detail). `windows`/`instances` start empty — the caller
 /// owns those facts.
-pub fn classify(rows: &[SessionRow]) -> FleetGlance {
+pub(crate) fn classify(rows: &[SessionRow]) -> FleetGlance {
     let mut escalations: Vec<Escalation> = rows.iter().filter_map(escalation).collect();
     // Most severe first; roster order within a kind (the sort is stable).
     escalations.sort_by_key(|e| e.kind);
@@ -846,7 +967,8 @@ pub fn classify(rows: &[SessionRow]) -> FleetGlance {
 /// One row of the rendered status menu — the pure model the AppKit half only
 /// paints (the tab context menu's "the description IS the menu" discipline).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StatusRow {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) enum StatusRow {
     /// A disabled information line.
     Info(String),
     /// A separator.
@@ -866,7 +988,8 @@ pub enum StatusRow {
 /// unit-testable off macOS. Layout: operator header + management actions,
 /// this instance's windows (click focuses), escalation rows (click focuses the
 /// session's tab), the session count, then sibling instances (click activates).
-pub fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
     let mut rows = vec![StatusRow::Info(glance.header_line())];
     match glance.operator {
         OperatorState::NotRunning => {
@@ -967,26 +1090,17 @@ pub fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{StatusItemHandle, install, update};
+pub(crate) use macos::{StatusItemHandle, install, update};
 
 /// Non-macOS no-op handle: there is no menu-bar status item off macOS. Held by
 /// `App` in the same field on every target so the struct shape is
 /// platform-independent (the `MenuHandle` pattern).
 #[cfg(not(target_os = "macos"))]
-pub type StatusItemHandle = ();
-
-/// Non-macOS stub: installing a status item is a no-op that installs nothing.
-#[cfg(not(target_os = "macos"))]
-pub fn install(
-    _proxy: &winit::event_loop::EventLoopProxy<crate::Wake>,
-    _glance: &FleetGlance,
-) -> Option<StatusItemHandle> {
-    None
-}
+pub(crate) type StatusItemHandle = ();
 
 /// Non-macOS stub: nothing to refresh.
 #[cfg(not(target_os = "macos"))]
-pub fn update(_handle: &StatusItemHandle, _glance: &FleetGlance) {}
+pub(crate) fn update(_handle: &StatusItemHandle, _glance: &FleetGlance) {}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -1002,7 +1116,7 @@ mod macos {
     /// releasing an `NSStatusItem` REMOVES it from the menu bar, and AppKit holds
     /// a menu item's target only weakly — so `App` keeps this handle in a field
     /// for the process lifetime (the `MenuHandle` rule).
-    pub struct StatusItemHandle {
+    pub(crate) struct StatusItemHandle {
         /// The single `statusAction:` relay target every item is wired to.
         target: Retained<StatusTarget>,
         /// The bar item itself; dropping it would vanish the icon.
@@ -1073,7 +1187,10 @@ mod macos {
     /// Called once when the first OS window attaches (never headless). Returns
     /// the retained handle for `App` to keep alive; best-effort `None` off the
     /// main thread — never a panic (the `menu::install` contract).
-    pub fn install(proxy: &EventLoopProxy<Wake>, glance: &FleetGlance) -> Option<StatusItemHandle> {
+    pub(crate) fn install(
+        proxy: &EventLoopProxy<Wake>,
+        glance: &FleetGlance,
+    ) -> Option<StatusItemHandle> {
         let main = MainThread::new()?;
         let target = StatusTarget::alloc_init(main, proxy.clone())?;
         let item = autoreleasepool(|_| {
@@ -1104,7 +1221,7 @@ mod macos {
     /// Re-render the bar button title and rebuild the menu wholesale from
     /// `glance` — the `update_version_menu` mutation pattern. Main-thread
     /// guarded: a call off the main thread is a silent no-op.
-    pub fn update(handle: &StatusItemHandle, glance: &FleetGlance) {
+    pub(crate) fn update(handle: &StatusItemHandle, glance: &FleetGlance) {
         let Some(_main) = MainThread::new() else {
             return;
         };
@@ -1671,6 +1788,263 @@ mod tests {
         let mut badged = supervised("wall:overloaded");
         badged.attention = Some("claude wall: 529".into());
         assert_eq!(escalation(&badged).unwrap().kind, EscalationKind::Attention);
+    }
+
+    /// `wall:memory` names its remedy instead of a bare kind: Claude Code's
+    /// critical-memory banner has no reset to wait for, only a restart and a
+    /// resume. SUPERVISED it raises a row too — the banner is drawn under a
+    /// running spinner, where the supervisor waits for the turn to end (the
+    /// review of 2026-09-24 found it said by nobody there) — and the row says
+    /// what the harness does: it restarts the agent at its next idle point
+    /// (D3). The supervisor's own attention still wins when it has said
+    /// something. NEGATIVE CONTROL: every other wall, supervised, is still
+    /// the supervisor's.
+    #[test]
+    fn a_memory_wall_row_names_the_restart_supervised_or_not() {
+        let label = "\u{26a0} worker: memory critical \u{2014} restart it, then claude --continue";
+        let esc = escalation(&agent_row(9, "worker", "wall:memory", 1)).expect("a row");
+        assert_eq!(esc.kind, EscalationKind::Wall);
+        assert_eq!(esc.label, label);
+        let mut supervised = SessionRow {
+            supervised: true,
+            ..agent_row(9, "worker", "wall:memory", 1)
+        };
+        let hosted = escalation(&supervised).expect("a row");
+        assert_eq!(hosted.kind, EscalationKind::Wall);
+        assert_eq!(
+            hosted.label,
+            "\u{26a0} worker: memory critical \u{2014} restarting it at its next idle point"
+        );
+        supervised.attention = Some("claude wall: memory critical".into());
+        assert_eq!(
+            escalation(&supervised).unwrap().kind,
+            EscalationKind::Attention
+        );
+        for word in [
+            "wall:overloaded",
+            "wall:context",
+            "wall:usage-session",
+            "wall:spend",
+            "prompt",
+        ] {
+            let supervised = SessionRow {
+                supervised: true,
+                ..agent_row(9, "worker", word, 1)
+            };
+            assert_eq!(escalation(&supervised), None, "{word}");
+        }
+    }
+
+    /// A stall row as `App::status_session_row` builds it: the server's
+    /// attention words for `fact`, with the clock fixed so the text is exact.
+    fn stall_row(
+        fact: &crate::input_stall::InputStallFact,
+        program: Option<&str>,
+        reader: Option<aterm_phase::Program>,
+        clock: Option<&str>,
+        waited: std::time::Duration,
+    ) -> InputStallRow {
+        InputStallRow {
+            text: crate::input_stall::attention_text(
+                fact,
+                program,
+                reader,
+                "s-b7cf523445a1b0d8658e",
+                clock,
+                waited,
+            ),
+            key: crate::input_stall::episode_key(fact),
+        }
+    }
+
+    fn incident_stall() -> crate::input_stall::InputStallFact {
+        crate::input_stall::InputStallFact {
+            word: aterm_session::input_backlog::InputWord::Stalled,
+            since: std::time::Instant::now(),
+            bytes: 1,
+            stopped: false,
+            rss_mb: Some(39_731),
+            restart: crate::input_stall::Restart::default(),
+        }
+    }
+
+    /// THE INCIDENT'S MENU (2026-09-24): a supervised Claude Code showing an
+    /// approval box, the supervisor's "answer this box" badge standing as
+    /// typed attention — and a published stall. The stall's row wins over
+    /// both, supervised or not, with the restart and the resume command in
+    /// full. A program with no resume command gets the restart alone, and a
+    /// stopped job gets `signal cont`. NEGATIVE CONTROL: the same row with no
+    /// stall is the supervisor's badge again.
+    #[test]
+    fn a_stall_row_beats_typed_attention_and_supervision() {
+        let fact = incident_stall();
+        let mut worker = SessionRow {
+            supervised: true,
+            attention: Some("answer this box: 4. Chat about this".into()),
+            ..agent_row(3, "\u{2733} worker", "wall:unresponsive", 9)
+        };
+        worker.input_stall = Some(stall_row(
+            &fact,
+            Some("claude"),
+            Some(aterm_phase::Program::Claude),
+            Some("14:02"),
+            std::time::Duration::from_secs(9660),
+        ));
+        let esc = escalation(&worker).expect("a stall row");
+        assert_eq!(esc.kind, EscalationKind::Unresponsive);
+        assert_eq!(esc.kind.headline(), "aterm \u{00b7} program frozen");
+        assert!(esc.kind.notifies());
+        assert_eq!(
+            esc.label,
+            "\u{26a0} worker: claude is frozen: not reading input since 14:02 (1 B queued, rss \
+             38.8 GB) \u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term \
+             \u{2014} the harness relaunches it on its conversation",
+            "supervised: the resume is the harness's (U1)"
+        );
+        let unsupervised = SessionRow {
+            supervised: false,
+            ..worker.clone()
+        };
+        assert!(
+            escalation(&unsupervised)
+                .expect("a stall row")
+                .label
+                .ends_with("signal term, then claude --continue"),
+            "unsupervised: the resume is the person's"
+        );
+        assert_eq!(esc.label, format!("\u{26a0} {}", esc.body));
+        assert_eq!(esc.key, crate::input_stall::episode_key(&fact));
+        // Most severe of all: ahead of typed attention in the menu's order.
+        let g = classify(&[
+            row(1, "zsh", None, Some("deploy needs a human")),
+            agent_row(2, "builder", "prompt", 5),
+            worker.clone(),
+        ]);
+        assert_eq!(g.warnings[0].0, 3, "{:?}", g.warnings);
+        // A program with no resume command: the restart alone.
+        let vim = SessionRow {
+            id: 4,
+            title: "notes".into(),
+            input_stall: Some(stall_row(
+                &fact,
+                Some("vim"),
+                None,
+                Some("14:02"),
+                std::time::Duration::ZERO,
+            )),
+            ..SessionRow::default()
+        };
+        let esc = escalation(&vim).expect("a stall row for any program");
+        assert_eq!(esc.kind, EscalationKind::Unresponsive);
+        assert!(esc.body.starts_with("notes: vim is frozen"), "{}", esc.body);
+        assert!(esc.body.ends_with("signal term"), "{}", esc.body);
+        assert!(!esc.body.contains("--continue"), "{}", esc.body);
+        // A stopped job: resume it.
+        let stopped = crate::input_stall::InputStallFact {
+            word: aterm_session::input_backlog::InputWord::Stopped,
+            stopped: true,
+            ..fact.clone()
+        };
+        let esc = escalation(&SessionRow {
+            input_stall: Some(stall_row(
+                &stopped,
+                Some("claude"),
+                Some(aterm_phase::Program::Claude),
+                Some("14:02"),
+                std::time::Duration::ZERO,
+            )),
+            ..worker.clone()
+        })
+        .expect("a stopped row");
+        assert_eq!(esc.kind, EscalationKind::Unresponsive);
+        assert!(
+            esc.body.ends_with(
+                "claude is stopped with input queued since 14:02 \u{2014} resume it: \
+                            aterm ctl @s-b7cf523445a1b0d8658e signal cont"
+            ),
+            "{}",
+            esc.body
+        );
+        // The verdict alone (no stall half) still names it, supervised.
+        let bare = SessionRow {
+            input_stall: None,
+            attention: None,
+            ..worker.clone()
+        };
+        let esc = escalation(&bare).expect("the verdict's row");
+        assert_eq!(esc.kind, EscalationKind::Unresponsive);
+        assert_eq!(esc.body, "worker: frozen: not reading input");
+        // NEGATIVE CONTROL: no stall — the supervisor's badge is the row.
+        worker.input_stall = None;
+        worker.agent.as_mut().unwrap().word = "prompt";
+        assert_eq!(escalation(&worker).unwrap().kind, EscalationKind::Attention);
+    }
+
+    /// ONE NOTIFICATION PER EPISODE: the herald keys a stall row by its
+    /// episode, so a row whose text moves — the `for <dur>` clause of a zone
+    /// with no clock, the byte count of a later reading — re-renders the menu
+    /// and posts nothing new; a stalled job that turns stopped is the same
+    /// episode. A new episode after a thaw notifies again. NEGATIVE CONTROL:
+    /// keyed by its text, as typed attention is, the same row would have
+    /// posted twice.
+    #[test]
+    fn a_stall_notifies_once_per_episode_while_its_text_moves() {
+        let fact = incident_stall();
+        let row_at = |fact: &crate::input_stall::InputStallFact, secs: u64| SessionRow {
+            id: 5,
+            title: "worker".into(),
+            input_stall: Some(stall_row(
+                fact,
+                Some("claude"),
+                Some(aterm_phase::Program::Claude),
+                None,
+                std::time::Duration::from_secs(secs),
+            )),
+            ..SessionRow::default()
+        };
+        let first = escalation(&row_at(&fact, 10)).unwrap();
+        let later = escalation(&row_at(
+            &crate::input_stall::InputStallFact {
+                bytes: 7,
+                ..fact.clone()
+            },
+            95,
+        ))
+        .unwrap();
+        assert_ne!(first.label, later.label, "the text moved");
+        assert_eq!(first.key, later.key, "the episode did not");
+        let turned = crate::input_stall::InputStallFact {
+            word: aterm_session::input_backlog::InputWord::Stopped,
+            stopped: true,
+            ..fact.clone()
+        };
+        assert_eq!(escalation(&row_at(&turned, 120)).unwrap().key, first.key);
+
+        let now = std::time::Instant::now();
+        let mut h = Herald::default();
+        let posted = h.note(5, Some(&first), false, now);
+        assert_eq!(
+            posted.notice.as_ref().map(|n| n.title),
+            Some("aterm \u{00b7} program frozen")
+        );
+        let moved = h.note(5, Some(&later), false, now + NOTIFY_SESSION_FLOOR * 2);
+        assert!(moved.row_moved && moved.notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
+        // The stall clears, and a NEW episode begins: a new notification.
+        let _ = h.note(5, None, false, now + NOTIFY_SESSION_FLOOR * 3);
+        let next = crate::input_stall::InputStallFact {
+            since: fact.since + std::time::Duration::from_secs(600),
+            ..fact.clone()
+        };
+        let again = escalation(&row_at(&next, 10)).unwrap();
+        assert_ne!(again.key, first.key);
+        assert!(
+            h.note(5, Some(&again), false, now + NOTIFY_SESSION_FLOOR * 4)
+                .notice
+                .is_some()
+        );
+        // NEGATIVE CONTROL: keyed by text, the moved row is a second notice.
+        assert_ne!(text_key(&first.label), text_key(&later.label));
     }
 
     #[test]

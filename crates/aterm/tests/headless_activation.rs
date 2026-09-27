@@ -62,6 +62,9 @@ const MAX_SOCK_PATH: usize = 100;
 /// remove) on every exit path — Drop runs on panic too.
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: String,
@@ -140,11 +143,12 @@ fn boot() -> Option<Instance> {
     hermetic_env(&mut cmd, &tmp);
     // AFTER the fixture: `apply` strips every `ATERM_*`, explicit ones included.
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", "120")
+        .args(launch_isolation::control_sock(&tmp))
+        .args(["--lines", "40", "--columns", "120"])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -156,6 +160,7 @@ fn boot() -> Option<Instance> {
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,
@@ -357,8 +362,10 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
     })
 }
 
-/// The two honest reasons this test cannot run at all, as SKIP reasons: the
-/// gate's explicit opt-out, and no probe tool. A missing WindowServer session
+/// The one honest reason this test cannot run at all, as a SKIP reason: no
+/// probe tool. (The gate's `--skip-gui-smoke` is the windowed smoke's opt-out;
+/// this test opens no window, so it has none — until 2026-09-24 it read the
+/// `ATERM_SKIP_GUI_SMOKE` export that flag replaced.) A missing WindowServer session
 /// (an SSH login, a CI box) is deliberately NOT a skip — `ioreg -c IOHIDSystem`
 /// exits 0 whether or not the class matches, so the `gui_smoke_unavailable`
 /// rung it would copy never fires, and skipping on `SSH_CONNECTION` would
@@ -367,9 +374,6 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
 /// `frontmost=-1`, the policy half still runs, and `boot()` SKIPs by itself if
 /// AppKit refuses to start; the test says which case it saw.
 fn cannot_present() -> Option<String> {
-    if std::env::var_os("ATERM_SKIP_GUI_SMOKE").is_some_and(|v| v == "1") {
-        return Some("ATERM_SKIP_GUI_SMOKE=1".into());
-    }
     if probe_tool().is_none() {
         return Some("neither /usr/bin/osascript nor /usr/bin/swift is available".into());
     }

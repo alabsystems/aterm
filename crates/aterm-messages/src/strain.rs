@@ -44,7 +44,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 
-use crate::model::{Hold, Load, Message, MessageId, Meter, Severity, tags};
+use crate::model::{Hold, Intent, Load, Message, MessageId, Meter, Severity, tags};
 use crate::text::{clip, truncate};
 use crate::{
     Duration, FEEL_MIN_HITCHES, FEEL_MIN_KEYS, FEEL_RING, FEEL_WINDOW, FREEZE_MS,
@@ -75,7 +75,7 @@ pub enum MemoryLevel {
 impl MemoryLevel {
     /// The Details word.
     #[must_use]
-    pub const fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Warn => "warn",
@@ -101,7 +101,7 @@ pub enum Thermal {
 impl Thermal {
     /// The Details word.
     #[must_use]
-    pub const fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Nominal => "nominal",
             Self::Fair => "fair",
@@ -216,6 +216,9 @@ pub struct SessionRef {
     pub receiving_keys: bool,
     /// In another window than the focused one.
     pub elsewhere: bool,
+    /// The host's id of the window it is in: where `Show tab N` goes, from
+    /// whichever window's band it is pressed (ruling 247).
+    pub window: u64,
 }
 
 /// An aterm job that already has a live row (its load words explain it).
@@ -254,7 +257,7 @@ pub enum Family {
 impl Family {
     /// The family of a command name, if it is one.
     #[must_use]
-    pub fn of(name: &str) -> Option<Self> {
+    pub(crate) fn of(name: &str) -> Option<Self> {
         Some(match name {
             "fileproviderd" => Self::FileSync,
             "bird" | "cloudd" => Self::ICloudSync,
@@ -296,6 +299,8 @@ pub enum Culprit {
         elsewhere: bool,
         /// The person is typing into it: their own command, never explained.
         receiving_keys: bool,
+        /// The host's id of the window the tab is in.
+        window: u64,
     },
     /// Under an aterm job that already has this row.
     OwnJob(MessageId),
@@ -340,7 +345,7 @@ impl StrainKind {
 
     /// The priority: higher outranks lower.
     #[must_use]
-    pub const fn rank(self) -> u8 {
+    pub(crate) const fn rank(self) -> u8 {
         match self {
             Self::Memory => 4,
             Self::Heat => 3,
@@ -362,7 +367,7 @@ impl StrainKind {
 
     /// The title's words when no culprit is named.
     #[must_use]
-    pub const fn resource_words(self) -> &'static str {
+    pub(crate) const fn resource_words(self) -> &'static str {
         match self {
             Self::Memory => "low memory",
             Self::Heat => "heat",
@@ -396,7 +401,7 @@ pub struct Gate {
 impl Gate {
     /// Both hold.
     #[must_use]
-    pub const fn open(self) -> bool {
+    pub(crate) const fn open(self) -> bool {
         self.enabled && self.focused_on_screen
     }
 }
@@ -440,7 +445,7 @@ pub enum StrainOut {
 /// Why an episode did not reach the glass: the closed list its record's
 /// `not shown:` line reads from (ruling 209).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NotShown {
+pub(crate) enum NotShown {
     /// Nobody was typing.
     NoTyping,
     /// The load was the session the person typed into.
@@ -465,10 +470,10 @@ impl NotShown {
             Self::NoTyping => "no typing".into(),
             Self::OwnCommand => "your own command".into(),
             Self::ExplainedBy(title) => format!("explained by {title}"),
-            Self::Quiet => "quiet after last episode".into(),
-            Self::NoHeavyCause => "no heavy cause".into(),
+            Self::Quiet => "shown recently".into(),
+            Self::NoHeavyCause => "nothing heavy was running".into(),
             Self::AtermItself => "aterm itself".into(),
-            Self::RecordsOnly => "records only".into(),
+            Self::RecordsOnly => "the band was off".into(),
         }
     }
 }
@@ -543,6 +548,7 @@ fn classify(
                 tab: s.tab,
                 elsewhere: s.elsewhere,
                 receiving_keys: s.receiving_keys,
+                window: s.window,
             };
             return (culprit, Some(i));
         }
@@ -709,7 +715,7 @@ const BLATHER: [&str; 5] = ["may", "detected", "consider", "fyi", "usage"];
 /// Whether `s` says anything from the blather list: one of its words, a
 /// `%`, or `load average`.
 #[must_use]
-pub fn says_blather(s: &str) -> bool {
+pub(crate) fn says_blather(s: &str) -> bool {
     let lower = s.to_lowercase();
     s.contains('%')
         || lower.contains("load average")
@@ -727,6 +733,9 @@ fn safe_name(raw: &str, words: usize, chars: usize) -> Option<String> {
         .map(|c| match c {
             ':' | ';' | '%' => ' ',
             '\u{2014}' => '-',
+            // The title quotes a measured name (ruling 243): a quote inside
+            // it would end the quote early.
+            '\'' => '\u{2019}',
             c => c,
         })
         .collect();
@@ -742,8 +751,17 @@ fn safe_name(raw: &str, words: usize, chars: usize) -> Option<String> {
 }
 
 /// The words for a culprit, `None` where none may be said (an own job, aterm,
-/// the resource, or a name that did not survive [`safe_name`]).
-fn culprit_words(c: &Culprit, cfg: &StrainConfig) -> Option<String> {
+/// the resource, or a name that did not survive [`safe_name`]). A MEASURED
+/// NAME is quoted, so it reads as the culprit and not as English (`Typing
+/// slowed by 'yes'`, design ruling 243). On the live row the tab it runs in
+/// is the row's `Show tab 2` capsule ([`culprit_tab`]), never the title's as
+/// well (ruling 259: `(tab 2)` beside `Show tab 2` said it twice); where no
+/// capsule names it — a record, a Details line — it is words, `in tab 2`,
+/// and a tab in another window is `in another window` (`elsewhere` on the
+/// live row, which keeps to six words), never a parenthesis.
+/// A family or the services noun is words of ours, unquoted.
+fn culprit_words(c: &Culprit, cfg: &StrainConfig, capsule: bool) -> Option<String> {
+    let quoted = |name: String| format!("'{name}'");
     match c {
         Culprit::Session {
             program,
@@ -751,27 +769,64 @@ fn culprit_words(c: &Culprit, cfg: &StrainConfig) -> Option<String> {
             elsewhere,
             ..
         } => {
-            // `in another window` would be a seventh word: the six-word
-            // form keeps the fact and spends two.
-            let tail = if *elsewhere {
-                " (another window)".to_string()
+            // `elsewhere` on the live row: `in another window` would make the
+            // title seven words (ruling 76's six).
+            let tail = if *elsewhere && capsule {
+                " elsewhere".to_string()
+            } else if *elsewhere {
+                " in another window".to_string()
+            } else if capsule && culprit_tab(c).is_some() || *tab == 0 {
+                String::new()
             } else {
                 format!(" in tab {tab}")
             };
-            let prog = safe_name(program, 1, CAUSE_CHARS.saturating_sub(tail.len()))?;
-            Some(format!("{prog}{tail}"))
+            let prog = safe_name(program, 1, CAUSE_CHARS.saturating_sub(tail.len() + 2))?;
+            Some(format!("{}{tail}", quoted(prog)))
         }
-        Culprit::App(name) => safe_name(name, CAUSE_WORDS, APP_CHARS.min(CAUSE_CHARS)),
+        Culprit::App(name) => {
+            safe_name(name, CAUSE_WORDS, APP_CHARS.min(CAUSE_CHARS - 2)).map(quoted)
+        }
         Culprit::Family(f) => Some(f.words().to_string()),
-        Culprit::Process(name) => safe_name(name, CAUSE_WORDS, COMM_CHARS.min(CAUSE_CHARS)),
+        Culprit::Process(name) => {
+            safe_name(name, CAUSE_WORDS, COMM_CHARS.min(CAUSE_CHARS - 2)).map(quoted)
+        }
         Culprit::Services => Some(cfg.services_noun.to_string()),
         Culprit::OwnJob(_) | Culprit::Aterm | Culprit::Resource => None,
     }
 }
 
-/// The cause's words: the culprit's, else the resource's.
-fn cause_words(kind: StrainKind, c: &Culprit, cfg: &StrainConfig) -> (String, bool) {
-    match culprit_words(c, cfg) {
+/// The navigation to the tab a named culprit runs in, when that tab is in
+/// the focused window — the strain row's `Show tab N` capsule (design
+/// rulings 243 and 247). It names the window as well as the tab: the band is
+/// app-wide, so a press from another window's band still lands on this
+/// tab. `None` for every other culprit, and for a tab in another window
+/// (the title cannot say which window).
+///
+/// scope-waiver: "app-wide" describes where the derived navigation may be
+/// shown. This pure projection copies the culprit's window and tab into an
+/// intent; copying that result does not multiply a budget or change its
+/// destination, and this function owns no scope-enforcing state.
+#[must_use]
+pub fn culprit_tab(c: &Culprit) -> Option<Intent> {
+    match c {
+        Culprit::Session {
+            tab,
+            elsewhere: false,
+            window,
+            ..
+        } if *tab > 0 => Some(Intent::ShowTab {
+            tab: *tab,
+            window: *window,
+        }),
+        _ => None,
+    }
+}
+
+/// The cause's words: the culprit's, else the resource's — for the live
+/// row's title when `capsule` (its `Show tab N` names the tab), else for a
+/// record's.
+fn cause_words(kind: StrainKind, c: &Culprit, cfg: &StrainConfig, capsule: bool) -> (String, bool) {
+    match culprit_words(c, cfg, capsule) {
         Some(w) => (w, true),
         None => (kind.resource_words().to_string(), false),
     }
@@ -781,12 +836,12 @@ fn cause_words(kind: StrainKind, c: &Culprit, cfg: &StrainConfig) -> (String, bo
 /// and 48 characters, drawn from closed lists and measured names made safe.
 #[must_use]
 pub fn title(kind: StrainKind, c: &Culprit, cfg: &StrainConfig) -> String {
-    format!("{TITLE_HEAD}{}", cause_words(kind, c, cfg).0)
+    format!("{TITLE_HEAD}{}", cause_words(kind, c, cfg, true).0)
 }
 
 /// A span as a record says it: `40 s`, `3m 12s`, `1h 5m`.
 #[must_use]
-pub fn span_words(d: Duration) -> String {
+pub(crate) fn span_words(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
         format!("{s} s")
@@ -821,21 +876,6 @@ pub fn level_fault(msg: &Message) -> Option<&'static str> {
     let level = msg.meter.as_ref().is_some_and(|m| m.level);
     (level && !(msg.tag == tags::SYSTEM && msg.key.as_deref() == Some(STRAIN_KEY)))
         .then_some("a level off the strain row")
-}
-
-/// A level row's accessible DESCRIPTION: its load words and its stats. The
-/// accessible NAME is the title, which changes only with the cause, so a
-/// screen reader is not re-told the numbers every two seconds.
-#[must_use]
-pub fn level_description(msg: &Message) -> String {
-    let Some(m) = msg.meter.as_ref() else {
-        return String::new();
-    };
-    match (m.load.map(Load::words), m.stats.is_empty()) {
-        (Some(l), false) => format!("{l}{PIECE_SEP}{}", m.stats),
-        (Some(l), true) => l.to_string(),
-        (None, _) => m.stats.clone(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,18 +1131,6 @@ impl StrainTracker {
         }
     }
 
-    /// The configuration.
-    #[must_use]
-    pub fn config(&self) -> StrainConfig {
-        self.cfg
-    }
-
-    /// Change the configuration (a hot reload). Turning the glass off
-    /// while a row shows leaves it to fold as usual.
-    pub fn set_config(&mut self, cfg: StrainConfig) {
-        self.cfg = cfg;
-    }
-
     /// The state's word, for `ctl metrics`: `calm`, `suspect` or `open`.
     #[must_use]
     pub fn state_word(&self) -> &'static str {
@@ -1302,7 +1330,7 @@ impl StrainTracker {
 
     /// The heaviest kind now, by priority.
     #[must_use]
-    pub fn verdict(&self) -> Option<StrainKind> {
+    pub(crate) fn verdict(&self) -> Option<StrainKind> {
         StrainKind::ALL
             .into_iter()
             .find(|k| self.kinds[k.index()].heavy)
@@ -1755,7 +1783,7 @@ impl StrainTracker {
                     let words = if reason == NotShown::AtermItself {
                         "aterm".to_string()
                     } else {
-                        cause_words(kind, &cause, &self.cfg).0
+                        cause_words(kind, &cause, &self.cfg, false).0
                     };
                     let mut lines = self.details(kind);
                     lines.push(format!("not shown: {}", reason.words()));
@@ -1785,8 +1813,10 @@ impl StrainTracker {
         if let Some(l) = self.typing_line() {
             lines.push(l);
         }
-        if let Some((owner, ms)) = &self.worst_turn {
-            lines.push(format!("turn: {owner} {ms} ms"));
+        // The turn's owner is the watchdog's stall line in aterm.log; the
+        // record says what the person felt.
+        if let Some((_, ms)) = &self.worst_turn {
+            lines.push(format!("longest pause in aterm: {ms} ms"));
         }
         lines.push(format!("not shown: {}", reason.words()));
         Message::new(
@@ -1901,11 +1931,11 @@ impl StrainTracker {
             return StrainOut::None;
         };
         let start = self.episode_start.unwrap_or(open_since);
-        let (words, _) = cause_words(kind, &cause, &self.cfg);
+        let (words, _) = cause_words(kind, &cause, &self.cfg, false);
         let mut lines = self.details(kind);
         let shown = self.shown.is_some();
         lines.push(match (shown, &self.why) {
-            (true, _) => format!("on glass {}", span_words(since(now, open_since))),
+            (true, _) => format!("shown for {}", span_words(since(now, open_since))),
             (false, Some((reason, ..))) => format!("not shown: {}", reason.words()),
             (false, None) => format!("not shown: {}", NotShown::RecordsOnly.words()),
         });
@@ -1976,24 +2006,42 @@ impl StrainTracker {
         }
     }
 
-    /// The stats beside the gauge (never spoken).
+    /// The stats beside the rail, in PLAIN words (design ruling 243): how
+    /// many cores are busy (`6 of 8 cores`), how much memory is used (`23 of
+    /// 24 GB used`, or `memory full · swapping` once it swaps; nothing when
+    /// neither was measured), `waiting on disk`. The exact figures — an I/O stall's percent, a swap rate — are
+    /// Details' and the log's ([`Self::details`]). Never spoken.
     fn stats(&self, kind: StrainKind) -> String {
         let cores = self.last.as_ref().map_or(0, |r| r.cores);
-        let busy = format!("{} of {cores} cores", cores_words(self.busy_mc()));
+        let whole = self.busy_mc().saturating_add(500) / 1000;
+        let busy = format!(
+            "{} of {cores} cores",
+            whole.clamp(1, u32::from(cores).max(1))
+        );
         match kind {
             StrainKind::Cpu | StrainKind::LowPower => busy,
             StrainKind::Heat => format!("throttled{PIECE_SEP}{busy}"),
             StrainKind::Memory => {
-                let swap = format!(
-                    "swap {} MB/s",
-                    self.swap_kib_s.map_or(0, |s| s.saturating_add(512) / 1024)
-                );
-                match self.last.as_ref().and_then(|r| r.mem_used_mib) {
-                    Some(used) => format!("{} GB{PIECE_SEP}{swap}", (u64::from(used) + 512) / 1024),
-                    None => swap,
+                let swapping = self.swap_kib_s.is_some_and(|s| s >= 512);
+                let r = self.last.as_ref();
+                let gb = |mib: u32| (u64::from(mib) + 512) / 1024;
+                match (
+                    swapping,
+                    r.and_then(|r| r.mem_used_mib),
+                    r.map_or(0, |r| r.mem_mib),
+                ) {
+                    (false, Some(used), total) if total > 0 => {
+                        format!("{} of {} GB used", gb(used), gb(total))
+                    }
+                    (false, Some(used), _) => format!("{} GB used", gb(used)),
+                    (true, ..) => format!("memory full{PIECE_SEP}swapping"),
+                    // Neither measured (an episode entered on Critical
+                    // pressure or PSI with no swap, and no used figure):
+                    // nothing is claimed (ruling 247).
+                    (false, None, _) => String::new(),
                 }
             }
-            StrainKind::Disk => format!("I/O stall {}%", (self.gauge(StrainKind::Disk) + 5) / 10),
+            StrainKind::Disk => "waiting on disk".to_string(),
         }
     }
 
@@ -2007,7 +2055,7 @@ impl StrainTracker {
                 .find(|(j, _)| j == id)
                 .map_or_else(|| "an aterm job".to_string(), |(_, t)| t.clone()),
             Culprit::Aterm => "aterm".to_string(),
-            c => culprit_words(c, &self.cfg).unwrap_or_else(|| "a process".to_string()),
+            c => culprit_words(c, &self.cfg, false).unwrap_or_else(|| "a process".to_string()),
         }
     }
 
@@ -2059,6 +2107,16 @@ impl StrainTracker {
         if let Some(l) = self.typing_line() {
             lines.push(l);
         }
+        // The exact disk figure the row's plain words leave out (ruling 243).
+        if kind == StrainKind::Disk
+            && let Some(pm) = self
+                .last
+                .as_ref()
+                .and_then(|r| r.psi)
+                .and_then(|p| p.io_full_pm)
+        {
+            lines.push(format!("disk: I/O stall {}%", (pm.min(1000) + 5) / 10));
+        }
         if let Some(r) = self.last.as_ref() {
             if let Some(p) = r.pressure {
                 let mut l = format!("memory: pressure {}", p.word());
@@ -2090,7 +2148,7 @@ impl StrainTracker {
 
     /// The strain row for `kind` and `cause`.
     fn row(&self, kind: StrainKind, cause: &Culprit) -> Message {
-        let (words, named) = cause_words(kind, cause, &self.cfg);
+        let (words, named) = cause_words(kind, cause, &self.cfg, true);
         let critical = self.critical_pushed
             || self
                 .last
@@ -2105,14 +2163,26 @@ impl StrainTracker {
             load: named.then(|| kind.load()),
             ..Meter::level(self.gauge(kind), self.stats(kind))
         };
-        Message::new(tags::SYSTEM, severity, format!("{TITLE_HEAD}{words}"))
+        // The row declares the one load its kind explains, so its slot is
+        // sized to those words (`CPU busy`, not `network busy`) and its stats
+        // keep their cells at 80 columns; a later kind's load widens the slot
+        // once (design ruling 221).
+        // The navigation to the program the title names, when it runs in a
+        // tab of the focused window (ruling 243).
+        let show = culprit_tab(cause);
+        let msg = Message::new(tags::SYSTEM, severity, format!("{TITLE_HEAD}{words}"))
             .key(STRAIN_KEY)
             .hold(Hold::Live {
                 stale_after: STALE_STRAIN,
             })
+            .loads([kind.load()])
             .meter(meter)
             .no_excerpt()
-            .lines(self.details(kind))
+            .lines(self.details(kind));
+        match show {
+            Some(intent) => msg.action(intent),
+            None => msg,
+        }
     }
 }
 

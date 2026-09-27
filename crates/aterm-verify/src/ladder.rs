@@ -12,7 +12,8 @@
 
 use crate::exec::Run;
 
-/// Why a stage failed — the distinction `.githooks/pre-push` already draws.
+/// Why a stage failed — the distinction `tools/verify.sh`'s exit codes draw
+/// (`1` FAILED, `3` COULD NOT RUN; [`crate::exit`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     /// A real finding about the tree: a lint, a test, a guard, a proof.
@@ -170,15 +171,6 @@ impl Report {
             outcome,
             label: label.into(),
         });
-    }
-
-    /// Record an outcome by boolean, the shape most ported stages want.
-    pub fn decide(&mut self, ok: bool, label: impl Into<String>) {
-        if ok {
-            self.pass(label);
-        } else {
-            self.fail(label);
-        }
     }
 
     #[must_use]

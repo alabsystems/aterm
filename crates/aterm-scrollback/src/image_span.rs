@@ -111,13 +111,6 @@ impl ImageSpan {
         ))
     }
 
-    /// Get the span width in columns.
-    #[inline]
-    #[must_use]
-    pub const fn width(&self) -> u16 {
-        self.end_col.saturating_sub(self.start_col)
-    }
-
     /// Bytes this span contributes to its LINE's memory footprint: the struct
     /// plus this row's SHARE of the shared payload
     /// ([`ImageData::per_row_bytes`]).

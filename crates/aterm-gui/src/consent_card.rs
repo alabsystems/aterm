@@ -192,8 +192,9 @@ pub(crate) const FDA_DETAIL: &str = "Full Disk Access may already be enabled";
 /// (R17; `message_reporters::file_access_granted`). It names the fact and
 /// stops: which services the grant covers and how far it reaches are §7 S4's
 /// and S1's measurements, and neither has been run. The success glyph is the
-/// row's own; the words carry no marker.
-pub(crate) const GRANTED_CAPTION: &str = "Full disk access \u{2014} granted to aterm";
+/// row's own; the words carry no marker. The question's own noun, one
+/// clause (audit 2026-09-24): it is a record's title.
+pub(crate) const GRANTED_CAPTION: &str = "Full Disk Access granted";
 
 /// The words the row takes after *Open Settings* (R16): `openURL:` reports
 /// only that System Settings TOOK the URL, never that it scrolled to the row,
@@ -264,16 +265,33 @@ pub(crate) fn read_marker(config_path: Option<&Path>) -> Option<Marker> {
         .and_then(|text| Marker::parse(&text))
 }
 
+/// Every marker write in this process holds this: the owner's answer and an
+/// `opened` can be recorded from two workers at once, and `record_marker`'s
+/// keep-`not-now` check must see the other's write, not race it.
+static MARKER_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Record `marker`. Best-effort, worker thread only: an unwritable config
 /// directory means the card comes back at the next launch, which errs toward
-/// disclosure.
+/// disclosure. An `opened` never replaces a `not-now` (see the body).
 pub(crate) fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::io::Result<()> {
+    let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
     let Some(path) = marker_path(config_path) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no config directory to record the answer in",
         ));
     };
+    // An `opened` never replaces a `not-now`. That answer is the owner's, and
+    // the Security page's *Open Privacy & Security…* — which `key` can press
+    // exactly like a hand — is not an answer to the card: replacing it would
+    // bring back a question the owner declined for good.
+    if marker == Marker::Opened
+        && crate::config_marker::read_marker(&path, MAX_MARKER_BYTES)
+            .and_then(|text| Marker::parse(&text))
+            == Some(Marker::NotNow)
+    {
+        return Ok(());
+    }
     crate::config_marker::write_marker(&path, marker.as_str(), MAX_MARKER_BYTES)
 }
 
@@ -281,6 +299,7 @@ pub(crate) fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::
 /// acknowledged. Only an `opened` marker is touched: a `not-now` answer is
 /// the owner's and stays. Worker thread only.
 pub(crate) fn clear_opened(config_path: Option<&Path>) -> std::io::Result<()> {
+    let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
     let Some(path) = marker_path(config_path) else {
         return Ok(());
     };
@@ -994,6 +1013,12 @@ mod tests {
 
         record_marker(Some(&config), Marker::NotNow).unwrap();
         assert_eq!(read_marker(Some(&config)), Some(Marker::NotNow));
+        record_marker(Some(&config), Marker::Opened).unwrap();
+        assert_eq!(
+            read_marker(Some(&config)),
+            Some(Marker::NotNow),
+            "opening Settings is not an answer: it never replaces the owner's not-now"
+        );
         clear_opened(Some(&config)).unwrap();
         assert_eq!(
             read_marker(Some(&config)),
@@ -1070,7 +1095,15 @@ mod tests {
             ] {
                 assert!(!lower.contains(promise), "{promise:?} in {text:?}");
             }
-            assert!(text.contains(" \u{2014} "), "title — detail: {text:?}");
+            if text == GRANTED_CAPTION {
+                assert!(
+                    aterm_messages::text::glass_title_fault(&text).is_none(),
+                    "a record title in the title form: {text:?}"
+                );
+                assert!(text.contains("Full Disk Access"), "the question's noun");
+            } else {
+                assert!(text.contains(" \u{2014} "), "title — detail: {text:?}");
+            }
             assert!(!text.contains('\n'));
             assert!(
                 text.chars().next().is_some_and(char::is_alphanumeric),

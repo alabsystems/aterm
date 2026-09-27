@@ -2481,7 +2481,7 @@ mod tests {
         // budget measured from the wrong origin (the printed line is `13 + len`, so 76
         // permitted 89 columns) in the wrong unit (an em-dash costs 3 bytes for one
         // column). It was simultaneously too loose and too tight, and it passed while the
-        // defect shipped. `tests/transcript_grid.rs` measures RENDERED columns at width
+        // defect shipped. `tests/it/transcript_grid.rs` measures RENDERED columns at width
         // 80, through the same primitive that prints them.
         //
         // What IS pinned here is that no element hand-breaks its own prose: the wrapper

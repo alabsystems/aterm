@@ -6,17 +6,15 @@
 //! These tests cover the three acceptance criteria from the techlead brief:
 //!
 //! 1. Round-trip: `hardened → TOML → parse → equal`.
-//! 2. Schema validation: malformed TOML / wrong `schema_version` falls back to
-//!    Hardened.
-//! 3. Profile refinement ordering: `hardened ⊆ standard ⊆ permissive` over
+//! 2. Profile refinement ordering: `hardened ⊆ standard ⊆ permissive` over
 //!    the unmatched-default response rank.
 //!
 //! A wider profile matrix against every concrete sequence lives with the
 //! engine (#7992) once the decision tree exists.
 
 use super::{
-    Defaults, MirrorField, MirrorSnapshot, OriginTag, Policy, Profile, RateLimit, Response, Rule,
-    SCHEMA_VERSION, aliases, engine::PolicyEngine, profiles, profiles::refinement::response_rank,
+    Defaults, OriginTag, Policy, Profile, RateLimit, Response, Rule, SCHEMA_VERSION, aliases,
+    engine::PolicyEngine, profiles, profiles::refinement::response_rank,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,61 +46,6 @@ fn permissive_roundtrips_through_toml() {
     let ser = original.to_toml().expect("permissive serializes");
     let parsed: Policy = aterm_toml::from_str(&ser).expect("permissive parses");
     assert_eq!(original, parsed);
-}
-
-// ---------------------------------------------------------------------------
-// Fail-closed loader
-// ---------------------------------------------------------------------------
-
-#[test]
-fn malformed_toml_falls_back_to_hardened() {
-    let (policy, fell_back) = Policy::from_toml_or_hardened("<<< not toml >>>");
-    assert!(fell_back, "malformed TOML must signal fall-back");
-    assert_eq!(policy, profiles::hardened());
-}
-
-#[test]
-fn unknown_schema_version_falls_back_to_hardened() {
-    // Build a valid-shape TOML but with schema_version = 9999.
-    let mut future = profiles::standard();
-    future.schema_version = 9_999;
-    let raw = future.to_toml().expect("serialize future policy");
-    let (policy, fell_back) = Policy::from_toml_or_hardened(&raw);
-    assert!(fell_back, "unknown schema_version must fall back");
-    assert_eq!(policy, profiles::hardened());
-}
-
-#[test]
-fn unknown_field_rejected_via_deny_unknown_fields() {
-    // `extra_field` is not in the Policy schema; serde(deny_unknown_fields)
-    // must reject and the fallback kicks in.
-    let toml_src = r#"
-schema_version = 1
-profile = "Standard"
-extra_field = "boom"
-[defaults]
-unmatched = "warn"
-"#;
-    let (policy, fell_back) = Policy::from_toml_or_hardened(toml_src);
-    assert!(fell_back, "unknown field must trigger fall-back");
-    assert_eq!(policy, profiles::hardened());
-}
-
-#[test]
-fn valid_minimal_toml_parses_cleanly() {
-    let toml_src = r#"
-schema_version = 1
-profile = "Permissive"
-[defaults]
-unmatched = "execute"
-"#;
-    let (policy, fell_back) = Policy::from_toml_or_hardened(toml_src);
-    assert!(!fell_back, "valid TOML must not fall back");
-    assert_eq!(policy.schema_version, SCHEMA_VERSION);
-    assert_eq!(policy.profile, Profile::Permissive);
-    assert_eq!(policy.defaults.unmatched, Response::Execute);
-    assert!(policy.rules.is_empty());
-    assert!(policy.rate_limits.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -344,268 +287,6 @@ fn manually_built_policy_roundtrips() {
 }
 
 // ---------------------------------------------------------------------------
-// Mirror-field invariant (§4.5 + §6.1)
-// ---------------------------------------------------------------------------
-//
-// These tests exercise the read (`mirror_snapshot`) and write
-// (`set_mirror_bool`) halves of the §6.1 invariant:
-//
-//     policy_engine.effective_response_pty(field) == Execute
-//         iff  modes.allow_<field> == true
-//
-// Wiring into `Terminal` / `aterm-core` is out of scope for this crate; the
-// follow-up issue tests the end-to-end consistency once handlers consult the
-// engine. Here we verify the local algebra: snapshot matches probe, and
-// `set → snapshot` round-trips in both directions.
-
-/// Helper: assert that `snapshot.get(field) == (effective_response_pty(field)
-/// == Execute)` for every mirror field. The body of the §6.1 invariant, run
-/// as a check against any engine state.
-fn assert_snapshot_matches_engine(eng: &PolicyEngine, label: &str) {
-    let snap = eng.mirror_snapshot();
-    for field in MirrorField::ALL {
-        let rsp = eng.effective_response_pty(field);
-        let bool_is_exec = snap.get(field);
-        assert_eq!(
-            bool_is_exec,
-            rsp == Response::Execute,
-            "{label}: mirror snapshot out of sync with engine for {field:?} \
-             (snapshot = {bool_is_exec}, effective_response_pty = {rsp:?})"
-        );
-    }
-}
-
-/// Each built-in profile's snapshot agrees with its engine (the §6.1
-/// invariant), and pins the values the profile implies at Pty origin:
-/// `(label, engine, allow_* for osc52 query/set, window ops, notifications,
-/// palette — or `None` where the profile's rules leave them to the
-/// invariant alone, nonce required)`.
-#[test]
-fn mirror_snapshot_matches_effective_response_on_every_builtin() {
-    for (label, eng, allows, nonce) in [
-        // Permissive's wildcard `response any` catches every Pty-origin probe
-        // with Execute, and nonce is not required.
-        (
-            "permissive",
-            PolicyEngine::new(profiles::permissive()),
-            Some(true),
-            false,
-        ),
-        // Standard requires the nonce; every per-field allow_* bool is observed
-        // as `true` at Pty origin because the rules' strict origin_min gates
-        // fall through to the `response any` wildcard (see engine::tests
-        // `builtin_profile_decisions`, "standard clip set, pty").
-        ("standard", PolicyEngine::standard(), None, true),
-        // Hardened's unmatched-default is Drop; no rule fires at Pty origin so
-        // every allow_* probe returns Drop → bool = false.
-        ("hardened", PolicyEngine::hardened(), Some(false), true),
-    ] {
-        assert_snapshot_matches_engine(&eng, label);
-        let snap = eng.mirror_snapshot();
-        if let Some(allow) = allows {
-            for (field, value) in [
-                ("allow_osc52_query", snap.allow_osc52_query),
-                ("allow_osc52_set", snap.allow_osc52_set),
-                ("allow_window_ops", snap.allow_window_ops),
-                ("allow_notifications", snap.allow_notifications),
-                ("allow_palette_reconfigure", snap.allow_palette_reconfigure),
-            ] {
-                assert_eq!(value, allow, "{label}: {field}");
-            }
-        }
-        assert_eq!(
-            snap.require_shell_integration_nonce, nonce,
-            "{label}: nonce"
-        );
-    }
-}
-
-#[test]
-fn policy_engine_standard_matches_new_of_standard_profile() {
-    // `PolicyEngine::standard` is a convenience constructor; verify it is
-    // observationally equivalent to `PolicyEngine::new(profiles::standard())`.
-    let a = PolicyEngine::standard();
-    let b = PolicyEngine::new(profiles::standard());
-    assert_eq!(a.policy(), b.policy());
-    assert_eq!(a.mirror_snapshot(), b.mirror_snapshot());
-}
-
-#[test]
-fn set_mirror_bool_then_effective_response_roundtrips_true() {
-    // For every field and every profile, setting the bool to `true` must
-    // leave `effective_response_pty == Execute`.
-    for starting in [
-        profiles::permissive(),
-        profiles::standard(),
-        profiles::hardened(),
-    ] {
-        for field in MirrorField::ALL {
-            let mut eng = PolicyEngine::new(starting.clone());
-            eng.set_mirror_bool(field, true);
-            assert_eq!(
-                eng.effective_response_pty(field),
-                Response::Execute,
-                "field {field:?} on profile {:?} did not become Execute after set(true)",
-                starting.profile,
-            );
-            assert!(
-                eng.mirror_snapshot().get(field),
-                "snapshot.get({field:?}) did not become true after set(true) on profile {:?}",
-                starting.profile,
-            );
-        }
-    }
-}
-
-#[test]
-fn set_mirror_bool_then_effective_response_roundtrips_false() {
-    // For every field and every profile, setting the bool to `false` must
-    // leave `effective_response_pty != Execute`.
-    for starting in [
-        profiles::permissive(),
-        profiles::standard(),
-        profiles::hardened(),
-    ] {
-        for field in MirrorField::ALL {
-            let mut eng = PolicyEngine::new(starting.clone());
-            eng.set_mirror_bool(field, false);
-            assert_ne!(
-                eng.effective_response_pty(field),
-                Response::Execute,
-                "field {field:?} on profile {:?} stayed Execute after set(false)",
-                starting.profile,
-            );
-            assert!(
-                !eng.mirror_snapshot().get(field),
-                "snapshot.get({field:?}) stayed true after set(false) on profile {:?}",
-                starting.profile,
-            );
-        }
-    }
-}
-
-#[test]
-fn mirror_invariant_holds_for_every_field_after_arbitrary_sequence() {
-    // Drive a field through true → false → true → false and verify the
-    // §6.1 invariant at every step. Use Hardened as the starting point so
-    // the initial state is all-false.
-    let mut eng = PolicyEngine::hardened();
-    for field in MirrorField::ALL {
-        for value in [true, false, true, false] {
-            eng.set_mirror_bool(field, value);
-            assert_snapshot_matches_engine(&eng, &format!("after set({field:?}, {value})"));
-            assert_eq!(eng.mirror_snapshot().get(field), value);
-        }
-    }
-}
-
-#[test]
-fn set_mirror_bool_does_not_grow_rule_list_unboundedly() {
-    // Calling set_mirror_bool repeatedly for the same field must not
-    // accumulate stale mirror rules: each call removes the previous
-    // mirror-tagged rule before inserting the new one.
-    let mut eng = PolicyEngine::hardened();
-    let starting_len = eng.policy().rules.len();
-
-    // 10 alternating toggles for every field.
-    for _ in 0..5 {
-        for field in MirrorField::ALL {
-            eng.set_mirror_bool(field, true);
-            eng.set_mirror_bool(field, false);
-        }
-    }
-
-    // At most one mirror rule per rule-gated field (5 of them — the nonce
-    // field does not create a rule). So the final rule count is the
-    // original plus at most five.
-    let final_len = eng.policy().rules.len();
-    assert!(
-        final_len <= starting_len + 5,
-        "rule list grew unboundedly: {starting_len} → {final_len}"
-    );
-}
-
-#[test]
-fn set_mirror_bool_require_nonce_updates_defaults_only() {
-    // The require-nonce field is not a per-sequence rule (§6.4). Writing it
-    // must change defaults.shell_integration_require_nonce and leave the
-    // rule list intact.
-    let mut eng = PolicyEngine::hardened();
-    let rule_count_before = eng.policy().rules.len();
-
-    eng.set_mirror_bool(MirrorField::RequireShellIntegrationNonce, false);
-    assert!(!eng.policy().defaults.shell_integration_require_nonce);
-    assert_eq!(eng.policy().rules.len(), rule_count_before);
-    assert!(!eng.mirror_snapshot().require_shell_integration_nonce);
-
-    eng.set_mirror_bool(MirrorField::RequireShellIntegrationNonce, true);
-    assert!(eng.policy().defaults.shell_integration_require_nonce);
-    assert_eq!(eng.policy().rules.len(), rule_count_before);
-    assert!(eng.mirror_snapshot().require_shell_integration_nonce);
-}
-
-#[test]
-fn mirror_fields_are_independent() {
-    // Setting one field's bool must not flip any other field's bool.
-    let mut eng = PolicyEngine::hardened();
-    let baseline = eng.mirror_snapshot();
-
-    eng.set_mirror_bool(MirrorField::AllowOsc52Set, true);
-    let after = eng.mirror_snapshot();
-
-    assert!(after.allow_osc52_set);
-    // Every other field must match the baseline.
-    for field in MirrorField::ALL {
-        if field == MirrorField::AllowOsc52Set {
-            continue;
-        }
-        assert_eq!(
-            baseline.get(field),
-            after.get(field),
-            "setting AllowOsc52Set disturbed {field:?}"
-        );
-    }
-}
-
-#[test]
-fn mirror_snapshot_default_is_all_false() {
-    // The `Default` derive on MirrorSnapshot must produce all-false (a
-    // fail-closed baseline). The `Terminal` wiring issue depends on this to
-    // safely initialize before any policy is loaded.
-    let snap = MirrorSnapshot::default();
-    for field in MirrorField::ALL {
-        assert!(!snap.get(field));
-    }
-}
-
-#[test]
-fn mirror_snapshot_set_then_get_roundtrips() {
-    let mut snap = MirrorSnapshot::default();
-    for field in MirrorField::ALL {
-        snap.set(field, true);
-        assert!(snap.get(field));
-        snap.set(field, false);
-        assert!(!snap.get(field));
-    }
-}
-
-#[test]
-fn mirror_rules_survive_toml_roundtrip() {
-    // Mirror rules are stored in the policy's rule vector (tagged via
-    // prompt_id). They MUST round-trip through TOML so that a policy
-    // serialized after set_mirror_bool deserializes to an equivalent engine.
-    let mut eng = PolicyEngine::hardened();
-    eng.set_mirror_bool(MirrorField::AllowOsc52Set, true);
-    eng.set_mirror_bool(MirrorField::AllowNotifications, true);
-
-    let snap_before = eng.mirror_snapshot();
-    let ser = eng.policy().to_toml().expect("serialize");
-    let parsed: Policy = aterm_toml::from_str(&ser).expect("parse");
-    let reloaded = PolicyEngine::new(parsed);
-    assert_eq!(reloaded.mirror_snapshot(), snap_before);
-}
-
-// ---------------------------------------------------------------------------
 // OriginTag trust lattice — exhaustive order proofs
 // ---------------------------------------------------------------------------
 //
@@ -634,18 +315,23 @@ const ALL_ORIGINS: [OriginTag; 8] = [
 
 /// Compile-time guard: adding an `OriginTag` variant without extending
 /// [`ALL_ORIGINS`] (and the proofs below) is a hard error. The match is
-/// exhaustive without a wildcard because these tests live in the defining crate.
-#[allow(dead_code)]
-fn origin_exhaustiveness_guard(o: OriginTag) {
-    match o {
-        OriginTag::Host
-        | OriginTag::ConfigFile
-        | OriginTag::User
-        | OriginTag::UserTyped
-        | OriginTag::Ai
-        | OriginTag::PtySafe
-        | OriginTag::Pty
-        | OriginTag::NetworkUntrusted => {}
+/// exhaustive without a wildcard because these tests live in the defining crate,
+/// and walking [`ALL_ORIGINS`] through it pins that the list names every variant
+/// exactly once, in trust order.
+#[test]
+fn all_origins_names_every_variant_once_in_order() {
+    for (index, &origin) in ALL_ORIGINS.iter().enumerate() {
+        let position = match origin {
+            OriginTag::Host => 0,
+            OriginTag::ConfigFile => 1,
+            OriginTag::User => 2,
+            OriginTag::UserTyped => 3,
+            OriginTag::Ai => 4,
+            OriginTag::PtySafe => 5,
+            OriginTag::Pty => 6,
+            OriginTag::NetworkUntrusted => 7,
+        };
+        assert_eq!(position, index, "ALL_ORIGINS[{index}] is {origin:?}");
     }
 }
 

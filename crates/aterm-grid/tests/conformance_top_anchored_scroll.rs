@@ -188,6 +188,31 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
     footer_corrupted.insert("footer", 0);
     assert!(!validate_scroll(&model, &prev, &footer_corrupted).0);
 
+    // The `Buggy=1` scroll runs to the SCREEN bottom instead of the DECSTBM
+    // bottom margin. Replayed on a real grid rather than edited into a healthy
+    // projection: the interior scroll runs with its bottom margin at the screen
+    // bottom, and `footer` is read off the real rows, which lost it. The healthy
+    // model rejects that transition; the `Buggy=1` model's Scroll is exactly it.
+    let (prev, slipped) = real_scroll_transition_in_region(
+        "ChooseInteriorOverlapping",
+        1,
+        ROWS - 1,
+        true,
+        true,
+        ROWS,
+    );
+    assert_eq!(
+        slipped["footer"], 0,
+        "a scroll to the screen bottom moves the footer"
+    );
+    assert!(!validate_scroll(&model, &prev, &slipped).0);
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    assert_eq!(
+        buggy.successors("Scroll", &prev),
+        vec![slipped],
+        "the real screen-bottom scroll is the Buggy=1 Scroll successor"
+    );
+
     let (prev, mut anchor_lost) =
         real_scroll_transition("ChooseArchivalOverlapping", 0, true, true);
     anchor_lost.insert("footer_anchor", 0);

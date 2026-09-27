@@ -16,7 +16,7 @@ use crate::model::{
     ActionIndex, Glyph, Hold, Intent, Message, MessageId, Meter, Origin, Restatement, Severity,
     Tag, WallStamp, every_intent, tags,
 };
-use crate::text::{sanitize, shape_detail, shape_path, trim_words, wrap};
+use crate::text::{sanitize, shape_detail, shape_path, trim_words};
 use crate::wire::{NoticeRequest, PostRequest, WireGate, apply, parse_read_args};
 use crate::words::{abbreviate_paths_in, date_words, home_abbreviate, relative_words, stamp_words};
 use crate::{
@@ -124,8 +124,7 @@ fn lossy(line: &LogLine) -> LogLine {
 
 /// Random bytes and every prefix of every valid line decode or error and
 /// never panic; whatever decodes re-encodes to a line that decodes to the
-/// same value; a replay of the soup keeps the ring bounded and compacts to
-/// the identity.
+/// same value; a replay of the soup keeps the ring bounded.
 #[test]
 fn codec_survives_random_bytes_and_truncations() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -176,6 +175,7 @@ fn codec_survives_random_bytes_and_truncations() {
             title: rand_str(&mut rng, 30),
             detail: vec![rand_str(&mut rng, 30)],
             repeats: 3,
+            mark: None,
         });
         valid.push(LogLine::Acted {
             id: MessageId::from_raw(i).unwrap(),
@@ -208,15 +208,6 @@ fn codec_survives_random_bytes_and_truncations() {
         }
     }
     assert!(log.len() <= LOG_CAP);
-    let compact = log.compact_lines();
-    let mut again = MessageLog::empty();
-    for line in compact {
-        again.replay(line);
-    }
-    assert_eq!(
-        again.records().collect::<Vec<_>>(),
-        log.records().collect::<Vec<_>>()
-    );
 }
 
 /// Every small decoder and both wire parsers survive junk; what they admit
@@ -358,13 +349,6 @@ fn text_shapers_never_panic_and_respect_caps() {
             }
             let t = trim_words(&s, cap);
             assert!(t.chars().count() <= cap.max(s.chars().count()));
-            let w = wrap(&s, cap);
-            assert!(!w.is_empty());
-            if cap > 0 {
-                for line in &w {
-                    assert!(line.chars().count() <= cap, "wrap({s:?}, {cap}) → {line:?}");
-                }
-            }
             let _ = sanitize(&s, cap);
         }
     }

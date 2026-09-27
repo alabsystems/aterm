@@ -608,15 +608,6 @@ impl PillFade {
         }
         None
     }
-
-    /// Drop the pill immediately (e.g. the window's content was replaced).
-    #[allow(
-        dead_code,
-        reason = "lifecycle hook for pane-layout transitions; kept with the type"
-    )]
-    pub(crate) fn clear(&mut self) {
-        self.last_touch = None;
-    }
 }
 
 #[cfg(test)]

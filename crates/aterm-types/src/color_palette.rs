@@ -197,14 +197,10 @@ impl ColorPalette {
         self.overrides.len()
     }
 
-    /// Returns the overridden (index, color) pairs.
-    ///
-    /// Only non-default entries are stored. Use this for efficient
-    /// serialization — iterate overrides rather than all 256 slots.
-    #[must_use]
-    // Skip: iterator/collect absent std bodies.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub fn overrides(&self) -> &[(u8, Rgb)] {
+    /// The overridden (index, color) pairs — the tests' view of what the
+    /// cache must agree with.
+    #[cfg(test)]
+    fn overrides(&self) -> &[(u8, Rgb)] {
         &self.overrides
     }
 

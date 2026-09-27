@@ -22,7 +22,7 @@
 //! EXCLUSIVE advisory lock on its file, so two brokers can never serve one log.
 
 use crate::brecord::{BrokerRecord, GroupCommit};
-use astream_wire::{Filter, Frame, FrameError, Offset, Subject};
+use astream_wire::{Filter, Frame, FrameError, Offset};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -53,8 +53,7 @@ pub const BIND_SUBJECT: &str = "/a/bind";
 /// offset but is never delivered, never enters the dedup map, the per-producer
 /// high-water map or the last-value index, and is refused to a client publish by
 /// name. Kept as one predicate so a new hidden kind cannot be added to the store and
-/// forgotten on a delivery path (the leak class the audit found: commit records
-/// reaching a wildcard subscriber).
+/// forgotten on a delivery path (e.g. commit records reaching a wildcard subscriber).
 #[must_use]
 pub fn is_hidden_subject(subject: &str) -> bool {
     matches!(subject, COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT)
@@ -76,12 +75,11 @@ pub fn is_hidden_subject(subject: &str) -> bool {
 /// sequence is derived from an offset, so it is NOT an incarnation, and the last-will
 /// fence must not read it as one. `ACK_SEQ_BASE | offset` is above every
 /// incarnation-derived sequence a producer will ever publish, so folding acks into the
-/// fence's high water put the fence above every will that producer could register and
-/// suppressed its goodbye for good — one ack, and the node reads `live` forever. The
-/// log keeps the halves apart in both directions: acks never enter
-/// [`BrokerLog::producer_high_water`], and a will offered a sequence in this half is
-/// REFUSED at registration (`stage_will_register`) rather than accepted
-/// and left permanently unfenceable.
+/// fence's high water would put the fence above every will that producer could register
+/// and suppress its goodbye for good. The log keeps the halves apart in both
+/// directions: acks never enter [`BrokerLog::producer_high_water`], and a will offered
+/// a sequence in this half is REFUSED at registration (`stage_will_register`) rather
+/// than accepted and left permanently unfenceable.
 pub const ACK_SEQ_BASE: u64 = 1 << 63;
 
 /// A connection's registered LAST WILL: the record the broker appends on that
@@ -119,12 +117,13 @@ impl WillRecord {
     /// broker cannot read is one it does not fire).
     fn from_record(rec: &BrokerRecord) -> Option<WillRecord> {
         let len = u32::from_le_bytes(rec.body.get(..4)?.try_into().ok()?) as usize;
-        let subject = String::from_utf8(rec.body.get(4..4 + len)?.to_vec()).ok()?;
+        let end = len.checked_add(4)?; // a u32 length can overflow a 32-bit usize
+        let subject = String::from_utf8(rec.body.get(4..end)?.to_vec()).ok()?;
         Some(WillRecord {
             producer_id: rec.producer_id,
             producer_seq: rec.producer_seq,
             subject,
-            body: rec.body.get(4 + len..)?.to_vec(),
+            body: rec.body.get(end..)?.to_vec(),
         })
     }
 }
@@ -165,8 +164,8 @@ fn literal_prefix(filter: &Filter) -> String {
 pub struct BrokerLog {
     file: File,
     /// The DURABLE bytes only (recovered prefix + everything a successful batch fsync
-    /// has committed). Staged-but-unsynced bytes live in the file beyond this length
-    /// and in `staged_bytes`; a failed fsync truncates the file back to here.
+    /// has committed). Staged bytes live in `staged_bytes` until `commit_batch`
+    /// writes them; a failed write or fsync truncates the file back to here.
     mirror: Vec<u8>,
     /// Committed records, each behind an `Arc` so the egress catch-up (`read_from`)
     /// hands subscribers cheap shared handles instead of deep-copying subject+body.
@@ -195,12 +194,10 @@ pub struct BrokerLog {
     /// FIRING is exempt from the bound. Without the reservation the check at
     /// registration reads the same count for every live connection, so N connections
     /// registering wills for N DISTINCT new subjects all pass it, and the firings then
-    /// take the producer one subject past the cap per connection — new unbounded
-    /// durable state in the very index the bound exists to cap.
+    /// take the producer one subject past the cap per connection.
     ///
     /// Rebuilt on open from the log's own `/a/will` records (see
     /// [`pending_wills`](Self::pending_wills)), so a reservation survives a restart.
-    /// An in-memory-only one would re-open the hole at the next open.
     ///
     /// DELIBERATELY CONSERVATIVE, always in the direction that keeps the cap. A
     /// reservation is released when a record on that subject lands under that
@@ -211,10 +208,10 @@ pub struct BrokerLog {
     /// commits. Each of those holds one extra unit of one producer's budget — never
     /// more than the budget itself, since a registration that would exceed it is
     /// refused — and the next open rebuilds the set from the wills that would actually
-    /// fire, at most one per producer. What was given up: a producer that registers
-    /// wills on many connections for many subjects reaches its cap sooner than its
-    /// landed subjects alone would say. The alternative, releasing a reservation a
-    /// live connection's will could still use, is the hole itself.
+    /// fire, at most one per producer. The cost: a producer that registers wills on
+    /// many connections for many subjects reaches its cap sooner than its landed
+    /// subjects alone would say. The alternative, releasing a reservation a live
+    /// connection's will could still use, would let the firings overshoot the cap.
     will_reserved: HashMap<u64, HashSet<String>>,
     /// Per-producer HIGH WATER: the largest `producer_seq` that producer has landed,
     /// over the visible (non-hidden) records. A will FIRES only if nothing above its
@@ -228,10 +225,11 @@ pub struct BrokerLog {
     path: PathBuf,
     /// THIS LOG IS A REPLICA: it took a leader's record while it was still empty, or an
     /// operator declared it one. Durable, in the `<log>.replica` marker beside the
-    /// file, because the property must survive the restart it exists to make safe. A replica's log is the leader's spine and
-    /// NOTHING may be appended to it on this broker's own initiative — in particular
-    /// no will may FIRE here (see [`stage_will_fire`](Self::stage_will_fire)); its
-    /// wills fire on the leader and arrive by replication like every other record.
+    /// file, because the property must survive the restart it exists to make safe. A
+    /// replica's log is the leader's spine and NOTHING may be appended to it on this
+    /// broker's own initiative — in particular no will may FIRE here (see
+    /// [`stage_will_fire`](Self::stage_will_fire)); its wills fire on the leader and
+    /// arrive by replication like every other record.
     replica: bool,
     /// The producer-id BINDING table: `producer id -> (principal, the offset of the
     /// /a/bind record that bound it)`. Rebuilt on open from those records, so a
@@ -242,38 +240,40 @@ pub struct BrokerLog {
     /// Per-group last fully-processed offset (resume is `upto + 1`). Rebuilt from
     /// the records' `commit` annotations on open, so it survives a broker restart.
     group_commits: HashMap<String, u64>,
-    /// Records written to the file (page cache) but NOT yet covered by an fsync, with
-    /// their bytes and an in-batch dedup view. They become durable (promoted into
-    /// `records`/`dedup`/`group_commits`/`mirror`, advancing `next`) only when
-    /// [`commit_batch`](Self::commit_batch) fsyncs them — this is group commit: one
-    /// fsync amortized over a whole batch, with the SAME Strict durability contract
-    /// (ack ⟹ fsync'd).
+    /// Records staged into the in-flight batch, with their encoded frames
+    /// (`staged_bytes`) and an in-batch dedup view. They reach the file and become
+    /// durable (promoted into `records`/`dedup`/`group_commits`/`mirror`, advancing
+    /// `next`) only when [`commit_batch`](Self::commit_batch) writes and fsyncs them —
+    /// this is group commit: one write and one fsync amortized over a whole batch,
+    /// with the SAME Strict durability contract (ack ⟹ fsync'd).
     staged: Vec<BrokerRecord>,
     staged_bytes: Vec<u8>,
     staged_dedup: HashMap<(u64, u64), Offset>,
     /// Subjects the in-flight batch would ADD to `last`, per producer — so the
     /// distinct-subject bound counts a batch's own new subjects too and one batch
     /// cannot overshoot it.
-    staged_new_subjects: HashMap<u64, Vec<String>>,
+    staged_new_subjects: HashMap<u64, HashSet<String>>,
     /// Bindings the in-flight batch would add, so two `Attach`es inside one batch
     /// see each other's binding instead of both appending.
     staged_bind: HashMap<u64, (String, Offset)>,
     /// What an `ack` promises (see [`Durability`]). Strict fsyncs each batch; Relaxed
     /// skips the fsync (ack on page-cache write).
     durability: Durability,
-    /// `Some(reason)` once a failed batch could NOT be rolled back (the truncate of the
-    /// staged suffix itself failed): the file no longer provably equals the durable
-    /// mirror, so every further mutation is refused until the log is reopened (the
-    /// recovery scan re-establishes the prefix). Without this, the next successful
-    /// batch would append records with the SAME seqs after the orphaned suffix, and
-    /// recovery would resurrect the rolled-back records and drop the acked ones.
+    /// `Some(reason)` once the file or its sidecars no longer provably match this
+    /// state: a failed batch could not be rolled back (the truncate itself failed), a
+    /// retention rewrite failed half-way, or the anti-rollback watermark could not be
+    /// advanced over promoted records. Every further mutation is refused until the log
+    /// is reopened (the recovery scan re-establishes the prefix). Without this, after
+    /// a failed rollback the next batch would append records with the SAME seqs after
+    /// the orphaned suffix, and recovery would resurrect the rolled-back records and
+    /// drop the acked ones.
     poisoned: Option<String>,
     /// The documented fault-injection seam ([`inject_faults`](Self::inject_faults)).
     faults: InjectedFaults,
     /// Encrypt-at-rest key. `Some` seals every record's payload on disk under
     /// XChaCha20-Poly1305 (bound to its log index as AAD); `None` writes plaintext
-    /// frames. Set only via [`open_encrypted`](Self::open_encrypted). The key is
-    /// never written to the log.
+    /// frames. Set only by the `open_encrypted*` constructors. The key is never
+    /// written to the log.
     at_rest_key: Option<[u8; 32]>,
     /// Anti-rollback: when `Some(path)`, an authenticated monotonic head watermark is
     /// maintained in the sidecar at `path` after every durable commit, and checked on
@@ -347,6 +347,19 @@ fn read_base(path: &Path) -> io::Result<Offset> {
     }
 }
 
+/// Create `path` as a NEW file, first removing whatever entry holds the name. The
+/// log's sidecars are written at fixed names beside it, and `create_new` (O_EXCL)
+/// never follows a symlink: a link planted at one of those names by someone who can
+/// write the log directory cannot redirect the write onto another file.
+fn create_fresh(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    opts.write(true).create_new(true).open(path)
+}
+
 /// Durably persist the retention base offset via tmp-file rename.
 #[cfg(feature = "retention")]
 fn write_base(path: &Path, base: u64) -> io::Result<()> {
@@ -355,7 +368,7 @@ fn write_base(path: &Path, base: u64) -> io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = create_fresh(&tmp, &mut OpenOptions::new())?;
         f.write_all(&base.to_le_bytes())?;
         f.sync_all()?;
     }
@@ -383,7 +396,7 @@ fn log_identity(durable_frames: &[u8]) -> [u8; 16] {
     [0u8; 16]
 }
 
-/// Read + authenticate the persisted watermark, returning `(log_identity, head)`.
+/// Read + authenticate the persisted watermark, returning `(log_identity, base, head)`.
 /// `Ok(None)` if the sidecar does not exist; `Err` if it exists but fails to
 /// authenticate (tampered or wrong key).
 #[cfg(feature = "anti-rollback")]
@@ -434,7 +447,7 @@ fn write_watermark(
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = create_fresh(&tmp, &mut OpenOptions::new())?;
         f.write_all(&sealed)?;
         f.sync_all()?;
     }
@@ -461,19 +474,23 @@ fn seal_disk_payload(_key: Option<&[u8; 32]>, _index: u64, payload: Vec<u8>) -> 
 /// Open a disk record's payload: `Some(plaintext)` on success, `None` if a key is
 /// set and the payload fails to authenticate (wrong key or a tampered record).
 #[cfg(feature = "at-rest")]
-fn open_disk_payload(key: Option<&[u8; 32]>, index: u64, frame_payload: &[u8]) -> Option<Vec<u8>> {
+fn open_disk_payload(
+    key: Option<&[u8; 32]>,
+    index: u64,
+    frame_payload: Vec<u8>,
+) -> Option<Vec<u8>> {
     match key {
-        Some(k) => astream_aead::open(k, &index.to_le_bytes(), frame_payload).ok(),
-        None => Some(frame_payload.to_vec()),
+        Some(k) => astream_aead::open(k, &index.to_le_bytes(), &frame_payload).ok(),
+        None => Some(frame_payload),
     }
 }
 #[cfg(not(feature = "at-rest"))]
 fn open_disk_payload(
     _key: Option<&[u8; 32]>,
     _index: u64,
-    frame_payload: &[u8],
+    frame_payload: Vec<u8>,
 ) -> Option<Vec<u8>> {
-    Some(frame_payload.to_vec())
+    Some(frame_payload)
 }
 
 /// A point on the durability dial — what an `ack` promises. Orthogonal to the
@@ -543,8 +560,9 @@ pub(crate) enum StageErr {
     /// OWN making (a will firing at open). Not a failure — the intended outcome of
     /// the leader/replica split; the file is untouched.
     Replica(String),
-    /// An I/O error while appending bytes — the batch is poisoned and must be aborted.
-    /// Also raised for every mutation once the log is [poisoned](BrokerLog#poison).
+    /// An I/O error while staging (the replica marker could not be written) — the
+    /// batch is poisoned and must be aborted. Also raised for every mutation once the
+    /// log is [poisoned](BrokerLog#poison).
     Io(io::Error),
 }
 
@@ -636,9 +654,10 @@ fn replica_marker_path(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-/// fsync the directory that names a just-created log file, so the directory entry
-/// (not only the file's data) survives a power loss. `sync_data` on the file alone
-/// never persists the entry that names it.
+/// fsync the directory that names `path` (a just-created log, or a sidecar just
+/// created or renamed into place), so the directory entry — not only the file's data
+/// — survives a power loss. `sync_data` on the file alone never persists the entry
+/// that names it.
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let parent = match path.parent() {
@@ -670,6 +689,30 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// Open (creating if absent) and exclusively lock the log file, then fsync its
+/// directory, returning whether this call created the file. `sync_dir` is
+/// [`sync_parent_dir`], injectable so a test can see it.
+fn open_log_file(path: &Path, sync_dir: fn(&Path) -> io::Result<()>) -> io::Result<(File, bool)> {
+    let (file, created) = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => (f, true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            (OpenOptions::new().read(true).write(true).open(path)?, false)
+        }
+        Err(e) => return Err(e),
+    };
+    lock_exclusive(&file, path)?;
+    // On EVERY open, not only the one that creates the file: that open may have died
+    // (or failed) before its directory fsync, and a record acked into a file whose
+    // entry is not durable can vanish with it on a power loss.
+    sync_dir(path)?;
+    Ok((file, created))
 }
 
 impl BrokerLog {
@@ -823,11 +866,23 @@ impl BrokerLog {
                         ),
                     ));
                 }
-                // Bind to THIS log. Fail-closed maintenance means a non-empty log's
-                // watermark is non-zero and carries this log's identity, so a watermark
-                // spliced from a DIFFERENT same-key log (its own identity), or a stale
-                // zero, is refused — a key-less attacker cannot mint a matching one.
-                if head > 0 && (persisted_head == 0 || persisted_id != log_id) {
+                // Bind to THIS log. A non-empty log's watermark always carries this
+                // log's identity — the first commit binds it before writing a byte
+                // (`prebind_watermark`) — so a watermark spliced from a DIFFERENT
+                // same-key log (its own identity), or an unbound zero one, is refused:
+                // a key-less attacker cannot mint a matching one. A log AHEAD of its own
+                // bound watermark is only the crash lag advanced below.
+                //
+                // An EMPTY log has no identity. It may sit under an unbound watermark,
+                // or under a pre-bind whose records never landed — at exactly this base
+                // and head. A bound watermark any other empty log sits under is a log
+                // truncated away with its base sidecar moved up to hide it.
+                let bound = if head > base {
+                    persisted_id == log_id
+                } else {
+                    persisted_id == [0u8; 16] || (persisted_base, persisted_head) == (base, head)
+                };
+                if !bound {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "anti-rollback: the watermark does not belong to this log \
@@ -898,6 +953,44 @@ impl BrokerLog {
         Ok(())
     }
 
+    /// Before the first record of an EMPTY log is written, bind the watermark to the
+    /// identity that record will give the log (at the unchanged head). Otherwise a
+    /// crash between that record's fsync and the watermark update after it leaves a
+    /// non-empty log under an unbound watermark, which a verified open must refuse
+    /// (it is also what a watermark spliced from a fresh log looks like) — where
+    /// this way it is only a log ahead of its own watermark, the ordinary crash lag.
+    /// `first_frames` are the frames about to be written. A no-op on a non-empty log,
+    /// whose identity is fixed, or when anti-rollback is off.
+    #[cfg(feature = "anti-rollback")]
+    fn prebind_watermark(&self, first_frames: &[u8]) -> io::Result<()> {
+        if let (true, Some(hw), Some(key)) = (
+            self.mirror.is_empty(),
+            &self.head_watermark,
+            self.at_rest_key.as_ref(),
+        ) {
+            let log_id = log_identity(first_frames);
+            write_watermark(hw, key, &log_id, self.base.0, self.next.0)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "anti-rollback"))]
+    fn prebind_watermark(&self, _first_frames: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// [`advance_watermark`](Self::advance_watermark) over records that were just
+    /// promoted. They are already durable and visible, so a failure cannot be undone
+    /// by a rollback: it POISONS the log instead. Otherwise a retry of the same key
+    /// would be acked as a dedup hit the watermark does not cover — or, on the
+    /// un-batched path, which records the key in dedup only after this returns, be
+    /// appended a second time. A reopen re-establishes the watermark.
+    fn cover_head(&mut self) -> io::Result<()> {
+        self.advance_watermark().inspect_err(|e| {
+            self.poisoned = Some(format!("anti-rollback watermark update failed: {e}"));
+        })
+    }
+
     fn open_inner(
         path: &Path,
         durability: Durability,
@@ -905,24 +998,7 @@ impl BrokerLog {
         at_rest_key: Option<[u8; 32]>,
         anti_rollback: AntiRollbackMode,
     ) -> io::Result<(BrokerLog, u64)> {
-        // Create-or-open, remembering whether WE created it (then the directory entry
-        // must be fsync'd too — the file's own fsyncs never persist its name).
-        let (mut file, created) = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(f) => (f, true),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                (OpenOptions::new().read(true).write(true).open(path)?, false)
-            }
-            Err(e) => return Err(e),
-        };
-        lock_exclusive(&file, path)?;
-        if created {
-            sync_parent_dir(path)?;
-        }
+        let (mut file, created) = open_log_file(path, sync_parent_dir)?;
         // A log that ever took a replicated record is a replica FOREVER, across every
         // constructor: the marker beside it is read before a single record is decoded.
         // A log WE just created carries none of that history, so a marker left beside
@@ -960,10 +1036,16 @@ impl BrokerLog {
         let dropped = (existing.len() - valid_len) as u64;
         if dropped > 0 {
             file.set_len(valid_len as u64)?;
-            file.sync_all()?; // make the torn-tail truncation durable before appending
         }
+        // fsync even when nothing was cut: a writer that died between a batch's write
+        // and its fsync leaves complete records it never acked, only in the page
+        // cache. Recovery accepts them, so they must be durable before this process
+        // serves them or acks a retry as their dedup hit. When something was cut, the
+        // same fsync keeps a power loss from resurrecting it.
+        file.sync_all()?;
         file.seek(SeekFrom::End(0))?;
-        let mirror = existing[..valid_len].to_vec();
+        existing.truncate(valid_len);
+        let mirror = existing;
         let records = scanned.records;
         let mut dedup = HashMap::new();
         let mut group_commits: HashMap<String, u64> = HashMap::new();
@@ -1007,7 +1089,7 @@ impl BrokerLog {
             anti_rollback,
             path,
             at_rest_key.as_ref(),
-            &existing,
+            &mirror,
             base.0,
             next.0,
         )?;
@@ -1135,11 +1217,7 @@ impl BrokerLog {
             return Ok(());
         }
         let marker = replica_marker_path(&self.path);
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&marker)?;
+        let mut f = create_fresh(&marker, &mut OpenOptions::new())?;
         f.write_all(REPLICA_MARKER_NOTE)?;
         f.sync_all()?;
         sync_parent_dir(&marker)?;
@@ -1280,8 +1358,8 @@ impl BrokerLog {
 
     // ---- group commit: stage many records, then ONE fsync covers the batch ----
     //
-    // The writer thread stages each queued op (writing its bytes to the page cache,
-    // no fsync), then calls `commit_batch` once. Durability is unchanged: a staged
+    // The writer thread stages each queued op (encoding its bytes into the batch
+    // buffer), then calls `commit_batch` once to write and fsync them all. Durability is unchanged: a staged
     // record is NOT acked, NOT in `dedup`, and NOT visible to subscribers (head does
     // not advance) until the batch fsync makes it durable. So `ack ⟹ fsync'd` still
     // holds — the fsync is merely amortized over the batch instead of per message.
@@ -1452,7 +1530,7 @@ impl BrokerLog {
         // change under the decision. The connection thread asks the same question
         // before it queues the op, but it reads the PROMOTED head and then drops the
         // lock: between that read and this staging, this connection's own pipelined
-        // records are written but not promoted, so `head()` still says 0 on a log that
+        // records are staged but not promoted, so `head()` still says 0 on a log that
         // is about to hold records of its own. A hidden record admitted on the strength
         // of "still empty" and staged onto an OWNED log is the injection this rule
         // exists to refuse — the broker itself fires that `/a/will` at its next open,
@@ -1460,7 +1538,7 @@ impl BrokerLog {
         // id, outside the capability matrix; an `/a/bind` locks a victim principal out
         // of attaching for good.
         //
-        // The admission test and the marking are now ONE predicate (`declares`),
+        // The admission test and the marking are ONE predicate (`declares`),
         // evaluated once, here: a hidden record lands only on a log that is already a
         // replica or is still empty at STAGE time — which is exactly the log that this
         // record declares a replica.
@@ -1494,9 +1572,9 @@ impl BrokerLog {
                 // Already held, byte for byte: idempotent re-shipping, and NOTHING is
                 // appended. It is also nothing to infer ownership from — this branch
                 // is reachable for any record already on the log, so a reader that
-                // fetches record 0 and echoes it back reaches it too. Marking here
-                // meant one such echo, appending not a single byte, permanently
-                // disabled will-firing for every producer on the broker.
+                // fetches record 0 and echoes it back reaches it too; marking here
+                // would let one such echo, appending not a single byte, disable
+                // will-firing for every producer on the broker for good.
                 return Ok((rec.seq, true));
             }
             return Err(StageErr::Diverged(format!(
@@ -1538,8 +1616,13 @@ impl BrokerLog {
         // holds the other way round: a marker I/O error is `StageErr::Io`, which
         // poisons the batch, and `process_batch` then aborts it — this record and every
         // byte of it roll back with it.
+        //
+        // EXEMPT from the distinct-subject bound: that is the leader's admission
+        // policy, already applied to this record, and a follower's own count can
+        // differ from the leader's (will reservations are rebuilt only when a log
+        // reopens). Refusing here would stall the follower on a committed record.
         let seq = rec.seq;
-        self.stage_record(rec)?;
+        self.stage_record_bounded(rec, false)?;
         if declares {
             self.mark_replica().map_err(StageErr::Io)?;
         }
@@ -1560,10 +1643,8 @@ impl BrokerLog {
     ///
     /// A registration that passes also RESERVES that subject against the producer's
     /// budget (`will_reserved`, promoted when the batch commits and rebuilt on open),
-    /// so the next registration sees it. Checking without reserving read the same
-    /// count for every live connection: N connections registering wills for N distinct
-    /// new subjects all passed, and the firings — exempt from the bound by design —
-    /// took the producer N subjects past the cap.
+    /// so the next registration sees it — the firings are exempt from the bound, and
+    /// the reservation is what keeps them from overshooting it.
     pub(crate) fn stage_will_register(&mut self, will: &WillRecord) -> Result<Offset, StageErr> {
         self.check_poisoned_stage()?;
         // THE FENCE IS WHAT MAKES A STALE GOODBYE HARMLESS, and it does not reach into
@@ -1593,7 +1674,7 @@ impl BrokerLog {
         };
         let pending = self.staged_new_subjects.get(&will.producer_id);
         let already_queued = pending.is_some_and(|p| p.contains(&will.subject));
-        if !already_queued && self.subject_bound_exceeded(&probe, pending.map_or(0, Vec::len)) {
+        if !already_queued && self.subject_bound_exceeded(&probe, pending.map_or(0, HashSet::len)) {
             return Err(StageErr::SubjectBound(subject_bound_msg(will.producer_id)));
         }
         self.stage_record(BrokerRecord {
@@ -1618,7 +1699,7 @@ impl BrokerLog {
             self.staged_new_subjects
                 .entry(will.producer_id)
                 .or_default()
-                .push(will.subject.clone());
+                .insert(will.subject.clone());
         }
         Ok(seq)
     }
@@ -1713,6 +1794,12 @@ impl BrokerLog {
     /// what makes re-firing every one of them on open idempotent. On a REPLICA the
     /// caller must not fire any of them at all — see [`is_replica`](Self::is_replica).
     pub fn pending_wills(&self) -> Vec<WillRecord> {
+        self.latest_wills().into_iter().map(|(_, w)| w).collect()
+    }
+
+    /// [`pending_wills`](Self::pending_wills), each with the offset of its `/a/will`
+    /// record.
+    fn latest_wills(&self) -> Vec<(Offset, WillRecord)> {
         let mut latest: HashMap<u64, (Offset, WillRecord)> = HashMap::new();
         for rec in &self.records {
             if rec.subject != WILL_SUBJECT {
@@ -1724,7 +1811,42 @@ impl BrokerLog {
         }
         let mut out: Vec<(Offset, WillRecord)> = latest.into_values().collect();
         out.sort_by_key(|(off, _)| off.0);
-        out.into_iter().map(|(_, w)| w).collect()
+        out
+    }
+
+    /// The lowest record below `min` that retention must not drop, with what it
+    /// holds. Bindings and wills live ONLY in their records — an open rebuilds both
+    /// from the log — so compacting one away loses it at the next open: a bound
+    /// producer id free for any principal to attach under, or a goodbye never said.
+    /// A will that can no longer append anything is not held: one already fired or
+    /// otherwise on the log (its key dedups), fenced by a later record of its producer,
+    /// or superseded by a later registration.
+    #[cfg(feature = "retention")]
+    fn retention_blocker(&self, min: u64) -> Option<(u64, String)> {
+        let bindings =
+            self.bind
+                .iter()
+                .filter(|(_, (_, off))| off.0 < min)
+                .map(|(id, (principal, off))| {
+                    let what = format!("producer {id}'s binding to principal {principal:?}");
+                    (off.0, what)
+                });
+        let wills = self
+            .latest_wills()
+            .into_iter()
+            .filter(|(off, w)| {
+                off.0 < min
+                    && !self.dedup.contains_key(&(w.producer_id, w.producer_seq))
+                    && self
+                        .high_water
+                        .get(&w.producer_id)
+                        .is_none_or(|&hw| hw <= w.producer_seq)
+            })
+            .map(|(off, w)| {
+                let what = format!("producer {}'s pending last will", w.producer_id);
+                (off.0, what)
+            });
+        bindings.chain(wills).min_by_key(|(off, _)| *off)
     }
 
     /// The principal a producer id is bound to (durable or in the in-flight batch),
@@ -1760,16 +1882,15 @@ impl BrokerLog {
             )));
         }
         let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
-        self.staged_bind
-            .insert(producer_id, (principal.clone(), seq));
         self.stage_record(BrokerRecord {
             seq,
             producer_id,
             producer_seq: 0,
             subject: BIND_SUBJECT.to_string(),
-            body: principal.into_bytes(),
+            body: principal.clone().into_bytes(),
             commit: None,
         })?;
+        self.staged_bind.insert(producer_id, (principal, seq));
         Ok((seq, false))
     }
 
@@ -1782,8 +1903,8 @@ impl BrokerLog {
         Frame::new(payload).encode()
     }
 
-    /// Encode `rec` and append its bytes to the file WITHOUT fsync, recording it in the
-    /// in-flight batch (and the in-batch dedup view). Not durable until `commit_batch`.
+    /// Encode `rec` into the in-flight batch (and the in-batch dedup view). Nothing
+    /// reaches the file until `commit_batch` writes the batch in one call.
     fn stage_record(&mut self, rec: BrokerRecord) -> Result<(), StageErr> {
         self.stage_record_bounded(rec, true)
     }
@@ -1797,33 +1918,30 @@ impl BrokerLog {
         rec: BrokerRecord,
         enforce_bound: bool,
     ) -> Result<(), StageErr> {
-        // The distinct-subject bound is checked BEFORE any byte is written, counting
+        // The distinct-subject bound is checked BEFORE the record is staged, counting
         // the durable index and this batch's own not-yet-promoted new subjects, so a
-        // refusal leaves the file untouched and one batch cannot overshoot the cap.
+        // refusal leaves the batch untouched and one batch cannot overshoot the cap.
         // An EXEMPT record is still counted — it really does add an index entry — but
-        // it is never refused.
-        if !is_hidden_subject(&rec.subject) && !self.last.contains_key(&rec.subject) {
-            let queued = self
-                .staged_new_subjects
-                .get(&rec.producer_id)
-                .map_or(0, Vec::len);
-            let already_queued = self
-                .staged_new_subjects
-                .get(&rec.producer_id)
-                .is_some_and(|p| p.contains(&rec.subject));
-            if !already_queued {
-                if enforce_bound && self.subject_bound_exceeded(&rec, queued) {
-                    return Err(StageErr::SubjectBound(subject_bound_msg(rec.producer_id)));
-                }
-                self.staged_new_subjects
-                    .entry(rec.producer_id)
-                    .or_default()
-                    .push(rec.subject.clone());
-            }
+        // it is never refused. It is queued only once staged: a record refused for
+        // size spends none of the budget.
+        let queued = self.staged_new_subjects.get(&rec.producer_id);
+        let new_subject = !is_hidden_subject(&rec.subject)
+            && !self.last.contains_key(&rec.subject)
+            && !queued.is_some_and(|p| p.contains(&rec.subject));
+        if new_subject
+            && enforce_bound
+            && self.subject_bound_exceeded(&rec, queued.map_or(0, HashSet::len))
+        {
+            return Err(StageErr::SubjectBound(subject_bound_msg(rec.producer_id)));
         }
         let frame = self.encode_for_disk(&rec).map_err(|_| StageErr::TooLarge)?;
-        self.file.write_all(&frame).map_err(StageErr::Io)?; // page cache, NO fsync
         self.staged_bytes.extend_from_slice(&frame);
+        if new_subject {
+            self.staged_new_subjects
+                .entry(rec.producer_id)
+                .or_default()
+                .insert(rec.subject.clone());
+        }
         if !is_hidden_subject(&rec.subject) {
             self.staged_dedup
                 .insert((rec.producer_id, rec.producer_seq), rec.seq);
@@ -1843,10 +1961,10 @@ impl BrokerLog {
         // registered?", and a will's sequence is its incarnation's reserved top. An
         // ack's sequence is not an incarnation at all — it is `ACK_SEQ_BASE | offset`,
         // above every incarnation-derived sequence there is — so one ack folded in
-        // here fenced every will that producer could ever register, permanently and
-        // with nothing logged (the firing is fire-and-forget). The reserved half is
-        // excluded instead, here and in the rebuild on open; a will is refused that
-        // half at registration, so nothing the fence has to protect lives there.
+        // here would fence every will that producer could ever register, permanently
+        // and with nothing logged (the firing is fire-and-forget). The reserved half is
+        // excluded, here and in the rebuild on open; a will is refused that half at
+        // registration, so nothing the fence has to protect lives there.
         if rec.producer_seq < ACK_SEQ_BASE {
             let hw = self
                 .high_water
@@ -1876,10 +1994,11 @@ impl BrokerLog {
         }
     }
 
-    /// fsync ONCE for the whole staged batch, then promote every staged record to the
-    /// durable state (dedup, group commits, offset spine, mirror) — making them
-    /// ack-able and visible to subscribers. An empty batch is a no-op (no fsync). On
-    /// fsync error nothing is promoted and the staged suffix is rolled back, so the
+    /// Write the whole staged batch in ONE call and fsync it ONCE, then promote every
+    /// staged record to the durable state (dedup, group commits, offset spine, mirror)
+    /// — making them ack-able and visible to subscribers. An empty batch is a no-op
+    /// (no write, no fsync). On a write or fsync error nothing is promoted and the
+    /// written suffix is rolled back, so the
     /// on-disk log + mirror stay a clean durable prefix (the atomic-append contract,
     /// at batch granularity); if that rollback itself fails the log POISONS itself
     /// (every later mutation errors until reopen) rather than build on an unknown
@@ -1900,14 +2019,16 @@ impl BrokerLog {
                 "offset overflow",
             ));
         }
-        // Strict: fsync the whole batch before promoting (ack ⟹ on disk). Relaxed:
-        // skip the fsync — the bytes are already in the page cache from staging, so the
+        // Strict: write + fsync the whole batch before promoting (ack ⟹ on disk).
+        // Relaxed: skip the fsync — the write puts the bytes in the page cache, so the
         // ack means page-cache-durable (survives a process crash, not power loss).
-        if self.durability == Durability::Strict {
-            if let Err(e) = self.sync_data() {
-                self.abort_batch();
-                return Err(e);
-            }
+        let strict = self.durability == Durability::Strict;
+        let res = self.prebind_watermark(&self.staged_bytes);
+        let res = res.and_then(|()| self.file.write_all(&self.staged_bytes));
+        let res = res.and_then(|()| if strict { self.sync_data() } else { Ok(()) });
+        if let Err(e) = res {
+            self.abort_batch();
+            return Err(e);
         }
         self.mirror.extend_from_slice(&self.staged_bytes);
         self.staged_bytes.clear();
@@ -1947,13 +2068,12 @@ impl BrokerLog {
             self.records.push(Arc::new(rec));
         }
         // The batch is durable; advance the anti-rollback watermark to the new head.
-        self.advance_watermark()?;
-        Ok(())
+        self.cover_head()
     }
 
     /// Discard the staged (unsynced) batch, truncating the file back to the durable
-    /// mirror length so disk + mirror remain a clean prefix. Used when a batch is
-    /// poisoned by an append I/O error, or its fsync failed. If the truncate (or the
+    /// mirror length so disk + mirror remain a clean prefix. Used when staging hit an
+    /// I/O error, or the batch's write or fsync failed. If the truncate (or the
     /// seek back to the end) fails, the on-disk suffix is unknown: the log is POISONED
     /// and refuses every further mutation until reopened.
     pub(crate) fn abort_batch(&mut self) {
@@ -1995,22 +2115,25 @@ impl BrokerLog {
     /// Encode + atomically append a record, then advance the offset spine and apply
     /// any carried group commit. (Shared by publish/commit/process_and_produce.)
     fn append_record(&mut self, rec: BrokerRecord) -> io::Result<()> {
+        // Checked BEFORE any byte is written: a record with no successor offset must
+        // never reach the disk.
+        let next = rec
+            .seq
+            .checked_next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "offset overflow"))?;
         let frame = self
             .encode_for_disk(&rec)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message too large"))?;
+        self.prebind_watermark(&frame)?; // before a byte is written
         self.append_frame(&frame)?; // Strict: on disk when this returns Ok
         self.index_last(&rec);
         if let Some(c) = &rec.commit {
             let e = self.group_commits.entry(c.group.clone()).or_insert(0);
             *e = (*e).max(c.upto);
         }
-        self.next = rec
-            .seq
-            .checked_next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "offset overflow"))?;
+        self.next = next;
         self.records.push(Arc::new(rec));
-        self.advance_watermark()?;
-        Ok(())
+        self.cover_head()
     }
 
     /// LAST-VALUE query (retained state): the most recent record of every subject
@@ -2062,8 +2185,8 @@ impl BrokerLog {
         }
         let prefix = literal_prefix(filter);
         // `>=`, not `>`: a WILDCARD-FREE filter's literal prefix IS the only subject it
-        // can match, so a resume cursor equal to the prefix must EXCLUDE it — with `>`
-        // the range restarted at `Included(prefix)` and the same row came back forever.
+        // can match, so a resume cursor equal to the prefix must EXCLUDE it (with `>`
+        // the range would restart at `Included(prefix)` and return that row forever).
         // The empty first-page cursor still takes the `Included` branch ("" < "/").
         let lower: Bound<String> = if after >= prefix.as_str() && !after.is_empty() {
             Bound::Excluded(after.to_string())
@@ -2071,25 +2194,20 @@ impl BrokerLog {
             Bound::Included(prefix.clone())
         };
         let mut visited = 0usize;
-        let mut resume;
         for (subject, off) in self.last.range((lower, Bound::Unbounded)) {
             if !subject.starts_with(&prefix) {
                 break; // past the filter's literal prefix: nothing later can match
             }
             visited += 1;
-            resume = Some(subject.clone());
-            let matched = off.0 < visible
-                && Subject::new(subject.as_str()).is_ok_and(|subj| filter.matches(&subj));
+            let matched = off.0 < visible && filter.matches_str(subject);
             if matched {
-                if let Some(rec) = usize::try_from(off.0)
-                    .ok()
-                    .and_then(|i| self.records.get(i))
-                {
+                if let Some(rec) = self.record_at(off.0) {
                     out.push(rec.clone());
                 }
             }
             if out.len() >= max || visited >= scan_max {
-                return (out, resume);
+                // The resume cursor is the last entry VISITED, matched or not.
+                return (out, Some(subject.clone()));
             }
         }
         // The range ran out: the answer is complete, so there is nothing to resume.
@@ -2122,27 +2240,32 @@ impl BrokerLog {
         if max == 0 {
             return (out, from);
         }
-        let limit = from.saturating_add(scan_max as u64).min(visible);
-        let mut next = from;
-        let mut off = from;
+        // Nothing below the retained base exists to scan: start at the earliest
+        // retained record, as `read_from` does, so a pruned range costs no budget.
+        let start = from.max(self.base.0);
+        let limit = start.saturating_add(scan_max as u64).min(visible);
+        let mut next = start;
+        let mut off = start;
         while off < limit {
             next = off.saturating_add(1);
-            let scanned = usize::try_from(off).ok().and_then(|i| self.records.get(i));
-            if let Some(rec) = scanned {
-                if !is_hidden_subject(&rec.subject) {
-                    if let Ok(subj) = Subject::new(rec.subject.as_str()) {
-                        if filter.matches(&subj) {
-                            out.push(rec.clone());
-                            if out.len() >= max {
-                                break;
-                            }
-                        }
+            if let Some(rec) = self.record_at(off) {
+                if !is_hidden_subject(&rec.subject) && filter.matches_str(&rec.subject) {
+                    out.push(rec.clone());
+                    if out.len() >= max {
+                        break;
                     }
                 }
             }
             off = next;
         }
         (out, next)
+    }
+
+    /// The retained record at ABSOLUTE offset `off` (records are held base-relative),
+    /// or `None` if it was pruned or is not committed.
+    fn record_at(&self, off: u64) -> Option<&Arc<BrokerRecord>> {
+        let i = usize::try_from(off.checked_sub(self.base.0)?).ok()?;
+        self.records.get(i)
     }
 
     /// How many DISTINCT subjects `producer_id` has created in the last-value index.
@@ -2162,9 +2285,6 @@ impl BrokerLog {
         self.will_reserved.get(&producer_id).map_or(0, HashSet::len)
     }
 
-    /// Hand out every committed record with `seq >= start`, in order, as cheap `Arc`
-    /// clones — the egress read path does NO deep copy of subject/body, so the lock is
-    /// released (the caller writes outside it) without paying for the payload bytes.
     /// The lowest offset still retained (records below it were pruned by retention).
     pub fn base(&self) -> Offset {
         self.base
@@ -2174,6 +2294,13 @@ impl BrokerLog {
     /// records keep their ABSOLUTE offsets, so a consumer at a surviving offset is
     /// unaffected; one below the new base catches up from the earliest retained.
     /// Returns the number of records dropped.
+    ///
+    /// REFUSED (`InvalidInput`, naming the offset — the highest floor it can take)
+    /// when the dropped prefix holds a producer binding or a will that could still
+    /// fire: those live only in their own records, so compaction would lose them at
+    /// the next open. Group commits are not held back: after a reopen, a group whose
+    /// last commit record was dropped resumes from the base (the earliest retained
+    /// record), and may re-read records it had already committed.
     ///
     /// Cold + explicit: no batch may be staged. The kept suffix is rewritten
     /// atomically (tmp + rename); then the base floor (and, under anti-rollback, the
@@ -2194,6 +2321,16 @@ impl BrokerLog {
         let min = min_offset.0.clamp(self.base.0, self.next.0);
         if min <= self.base.0 {
             return Ok(0);
+        }
+        if let Some((off, what)) = self.retention_blocker(min) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "retention: the record at offset {off}, below the floor {min}, holds \
+                     {what}, which only that record keeps across a restart; the highest \
+                     floor retention can take now is {off}"
+                ),
+            ));
         }
         let drop_count = min - self.base.0;
         // Byte offset of the first KEPT record in the durable mirror.
@@ -2216,8 +2353,19 @@ impl BrokerLog {
         let mut tmp = self.path.as_os_str().to_os_string();
         tmp.push(".compact");
         let tmp = PathBuf::from(tmp);
+        // The copy REPLACES the log, so it carries the log's permissions — and is
+        // created with them (then set exactly, past the umask), so the kept records
+        // are never readable more widely than the log they came from, even briefly.
+        let perms = self.file.metadata()?.permissions();
         {
-            let mut f = File::create(&tmp)?;
+            let mut opts = OpenOptions::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                opts.mode(perms.mode());
+            }
+            let mut f = create_fresh(&tmp, &mut opts)?;
+            f.set_permissions(perms)?;
             f.write_all(&kept)?;
             f.sync_all()?;
         }
@@ -2268,15 +2416,39 @@ impl BrokerLog {
         write_base(&self.path, min)
     }
 
+    /// Hand out every committed record with `seq >= start` (from the earliest retained
+    /// one if `start` was pruned), in order, as cheap `Arc` clones — the egress read
+    /// path does NO deep copy of subject/body, so the lock is released (the caller
+    /// writes outside it) without paying for the payload bytes.
     pub fn read_from(&self, start: Offset) -> Vec<Arc<BrokerRecord>> {
+        self.read_range(start, usize::MAX)
+    }
+
+    /// [`read_from`](Self::read_from), BOUNDED: at most `max` records from `start`
+    /// (from the earliest retained one if `start` was pruned), in order, as cheap `Arc`
+    /// clones. Copying the handles is the whole cost of a read made under the log lock,
+    /// and it grows with the suffix: a reader that holds the lock while it copies — a
+    /// subscriber catching up, a fork's snapshot — takes a long suffix this way in
+    /// pieces, releasing the lock between them.
+    pub fn read_range(&self, start: Offset, max: usize) -> Vec<Arc<BrokerRecord>> {
         // Records sit at absolute offsets base..next; map `start` to an index (clamp a
         // below-base request for pruned records to the earliest retained). Clamp in u64
         // space then narrow — a lossy `as usize` would wrap a >2^32 offset on 32-bit.
-        let from = start
-            .0
-            .saturating_sub(self.base.0)
-            .min(self.records.len() as u64) as usize;
-        self.records[from..].to_vec()
+        let len = self.records.len();
+        let from = start.0.saturating_sub(self.base.0).min(len as u64) as usize;
+        let to = from.saturating_add(max).min(len);
+        self.records[from..to].to_vec()
+    }
+
+    /// How many retained records a handle OUTSIDE the log still shares: copies a
+    /// reader took and has not yet delivered and dropped. For tests of how much a
+    /// reader copies out of the log at once.
+    #[cfg(test)]
+    pub(crate) fn shared_records(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|r| Arc::strong_count(r) > 1)
+            .count()
     }
 
     /// A COUNTERFACTUAL snapshot as SHARED handles: the committed records with the one
@@ -2310,7 +2482,8 @@ impl BrokerLog {
 
     /// [`fork_shared`](Self::fork_shared) materialized as OWNED records (a deep copy
     /// of every payload). Kept for callers that want owned data; the broker's
-    /// fork-delivery path uses `fork_shared` so the copy never happens under the lock.
+    /// fork-delivery path reads the log in bounded pieces
+    /// ([`read_range`](Self::read_range)) and copies no payload at all.
     pub fn fork(&self, fork_at: Offset, replacement: BrokerRecord) -> Vec<BrokerRecord> {
         self.fork_shared(fork_at, replacement)
             .into_iter()
@@ -2443,7 +2616,7 @@ fn scan(bytes: &[u8], key: Option<&[u8; 32]>, base: u64) -> Scan {
                 // Decrypt the sealed payload (identity when no key is set); a COMPLETE
                 // frame that fails to authenticate is a wrong key or a tampered record
                 // — a corrupt tail, never silently discarded.
-                let payload = match open_disk_payload(key, expected, &d.frame.payload) {
+                let payload = match open_disk_payload(key, expected, d.frame.payload) {
                     Some(p) => p,
                     None => {
                         return corrupt(
@@ -2454,6 +2627,14 @@ fn scan(bytes: &[u8], key: Option<&[u8; 32]>, base: u64) -> Scan {
                     }
                 };
                 match BrokerRecord::from_payload(&payload) {
+                    // No offset follows u64::MAX, so the log never writes a record
+                    // there; refusing one also keeps `base + records` from overflowing.
+                    Some(r) if r.seq.0 == u64::MAX => {
+                        return corrupt(
+                            out,
+                            "record at offset u64::MAX, which the log never assigns".to_string(),
+                        );
+                    }
                     Some(r) if r.seq.0 == expected => {
                         out.push(r);
                         // A decoded frame always consumes >= its header; guard anyway so
@@ -2515,11 +2696,44 @@ mod tests {
     use super::*;
     use crate::brecord::BREC_VERSION;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+    /// Removes its paths when dropped, each with every `<path>.*` sidecar beside it
+    /// (`.hw`, `.base`, `.replica`, a `.hw.tmp` planted as a directory, …), so a test
+    /// leaves nothing behind whether it passes or panics. Bound before the log that
+    /// uses the paths, so it drops after it.
+    struct Cleanup(Vec<PathBuf>);
+
+    impl Cleanup {
+        fn new<P: AsRef<Path>>(paths: &[P]) -> Cleanup {
+            Cleanup(paths.iter().map(|p| p.as_ref().to_path_buf()).collect())
+        }
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_dir_all(path);
+                let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+                    continue;
+                };
+                let prefix = format!("{}.", name.to_string_lossy());
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(entry.path());
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
+    /// A log path unique to this process and `tag`, and the guard that removes it.
+    fn tmp(tag: &str) -> (Cleanup, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
             "astream_brokerlog_{}_{tag}.log",
             std::process::id()
-        ))
+        ));
+        (Cleanup::new(&[&path]), path)
     }
 
     fn rec(seq: u64, pid: u64, pseq: u64) -> BrokerRecord {
@@ -2556,6 +2770,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = Cleanup::new(&[&dir]);
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
         // Running as root (or on a filesystem that ignores the mode) defeats the
@@ -2575,9 +2790,35 @@ mod tests {
         }
     }
 
+    /// An open that finds the log already present still fsyncs its directory: the
+    /// open that created it may have died (or failed) before its own directory
+    /// fsync, and records acked into a file whose entry is not durable can vanish
+    /// with it on a power loss.
+    #[test]
+    fn opening_an_existing_log_still_fsyncs_its_directory() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SYNCS: AtomicUsize = AtomicUsize::new(0);
+        fn counting(_: &Path) -> io::Result<()> {
+            SYNCS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn failing(_: &Path) -> io::Result<()> {
+            Err(io::Error::other("injected directory fsync failure"))
+        }
+        let (_tmp, path) = tmp("dirsync");
+        let _ = std::fs::remove_file(&path);
+        // The first open creates the file, but its directory fsync fails.
+        assert!(open_log_file(&path, failing).is_err());
+        assert!(path.exists(), "the file was created");
+        // The next open finds the file there and must still fsync the directory.
+        let (_file, created) = open_log_file(&path, counting).unwrap();
+        assert!(!created);
+        assert_eq!(SYNCS.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn publish_dedup_and_recover() {
-        let path = tmp("dedup");
+        let (_tmp, path) = tmp("dedup");
         let _ = std::fs::remove_file(&path);
         {
             let mut log = BrokerLog::open(&path).unwrap();
@@ -2606,14 +2847,13 @@ mod tests {
             (Offset(0), true),
             "dedup survived restart"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A torn tail — a trailing frame cut mid-payload — is truncated on open, durably,
     /// and the intact prefix is recovered whole.
     #[test]
     fn torn_tail_is_truncated_and_prefix_recovered() {
-        let path = tmp("torn");
+        let (_tmp, path) = tmp("torn");
         let _ = std::fs::remove_file(&path);
         let clean_len = write_log(&path, 5);
         // Append the first 20 bytes of what would be record 5 (a torn write).
@@ -2643,7 +2883,6 @@ mod tests {
         assert_eq!(log.head(), Offset(5));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), clean_len);
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A complete-but-corrupt frame in the MIDDLE of the log (a flipped byte in record
@@ -2651,7 +2890,7 @@ mod tests {
     /// untouched; only the explicit `open_repair` truncates, reporting what it dropped.
     #[test]
     fn mid_log_corruption_refuses_to_open_and_repair_is_explicit() {
-        let path = tmp("midcorrupt");
+        let (_tmp, path) = tmp("midcorrupt");
         let _ = std::fs::remove_file(&path);
         let clean_len = write_log(&path, 5);
         let one = rec(0, 1, 1).encode().unwrap().len() as u64; // every record here is the same size
@@ -2711,7 +2950,6 @@ mod tests {
         let (log, dropped) = BrokerLog::open_repair(&path, Durability::Strict).unwrap();
         assert_eq!((dropped, log.head()), (3 * one, Offset(2)));
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A record-format mismatch (an older/newer BREC_VERSION) mid-log, an offset gap
@@ -2742,7 +2980,7 @@ mod tests {
         bad[20] ^= 0x55;
         c.extend_from_slice(&bad);
         for (tag, bytes, want_offset) in [("alien", a, 3u64), ("gap", b, 3), ("badlast", c, 3)] {
-            let path = tmp(&format!("corrupt_{tag}"));
+            let (_tmp, path) = tmp(&format!("corrupt_{tag}"));
             let _ = std::fs::remove_file(&path);
             std::fs::write(&path, &bytes).unwrap();
             let err = BrokerLog::open(&path).err().expect("must refuse to open");
@@ -2764,7 +3002,6 @@ mod tests {
             );
             assert_eq!(dropped as usize, bytes.len() - 3 * one.len(), "{tag}");
             drop(log);
-            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -2772,7 +3009,7 @@ mod tests {
     /// brokers serving one log) fails AlreadyExists until the first is closed.
     #[test]
     fn open_log_is_exclusively_locked() {
-        let path = tmp("lock");
+        let (_tmp, path) = tmp("lock");
         let _ = std::fs::remove_file(&path);
         let first = BrokerLog::open(&path).unwrap();
         let err = BrokerLog::open(&path).err().expect("must refuse to open");
@@ -2784,7 +3021,6 @@ mod tests {
         let third = BrokerLog::open(&path).unwrap();
         drop(third);
         drop(again);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A failed batch fsync rolls the staged suffix back: nothing promoted (head,
@@ -2792,7 +3028,7 @@ mod tests {
     /// reopen recovers exactly that prefix.
     #[test]
     fn failed_fsync_rolls_the_staged_batch_back() {
-        let path = tmp("fsyncfault");
+        let (_tmp, path) = tmp("fsyncfault");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         log.publish(1, 1, "/a/s/x".into(), b"durable".to_vec())
@@ -2808,9 +3044,10 @@ mod tests {
             (Offset(1), false)
         );
         log.stage_commit("g".into(), 0).unwrap();
-        assert!(
-            std::fs::metadata(&path).unwrap().len() > durable_len,
-            "staged bytes are on disk (page cache) before the fsync"
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            durable_len,
+            "staging only buffers the batch: commit_batch writes it in one call"
         );
         let err = log.commit_batch().unwrap_err();
         assert!(err.to_string().contains("injected fsync fault"), "{err}");
@@ -2841,7 +3078,6 @@ mod tests {
         assert_eq!(log.head(), Offset(2));
         assert_eq!(log.read_from(Offset(1))[0].body, b"retry");
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// If the rollback truncate itself fails the log POISONS: every later mutation is
@@ -2849,7 +3085,7 @@ mod tests {
     /// re-establishes the prefix from the bytes actually on disk.
     #[test]
     fn failed_rollback_poisons_the_log_until_reopen() {
-        let path = tmp("poison");
+        let (_tmp, path) = tmp("poison");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         log.publish(1, 1, "/a/s/x".into(), b"durable".to_vec())
@@ -2886,7 +3122,250 @@ mod tests {
         assert_eq!(log.read_from(Offset(1))[0].body, b"orphan");
         assert!(log.poisoned().is_none());
         drop(log);
+    }
+
+    /// A batch whose anti-rollback watermark write fails after its fsync is durable
+    /// but not covered, so nothing may be acknowledged on the strength of it: the log
+    /// poisons, and a retried key is refused rather than acked as a dedup hit.
+    /// A crash between the first commit's fsync and its watermark update leaves the
+    /// log ahead of the watermark the commit bound to it BEFORE writing a byte
+    /// (identity of its first record, the old head). That is the ordinary lagging
+    /// case: a verified open accepts it and advances the watermark. The same state
+    /// with an unbound (zero-identity) watermark stays refused.
+    #[cfg(feature = "anti-rollback")]
+    #[test]
+    fn a_log_ahead_of_its_own_bound_watermark_opens_verified() {
+        const KEY: [u8; 32] = [0x24; 32];
+        let (_tmp, path) = tmp("hwlag");
+        let hw = watermark_path(&path);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&hw);
+        let mut log = BrokerLog::open_encrypted_verified_init(&path, KEY).unwrap();
+        log.stage_publish(1, 1, "/a/s/x".into(), b"one".to_vec())
+            .unwrap();
+        log.commit_batch().unwrap();
+        let id = log_identity(log.bytes());
+        drop(log);
+        // Roll the watermark back to what the first commit bound before its write.
+        write_watermark(&hw, &KEY, &id, 0, 0).unwrap();
+        let log = BrokerLog::open_encrypted_verified(&path, KEY)
+            .expect("a log ahead of its own bound watermark was refused");
+        assert_eq!(log.head(), Offset(1));
+        drop(log);
+        assert_eq!(read_watermark(&hw, &KEY).unwrap(), Some((id, 0, 1)));
+        // An unbound watermark (no identity) under the same log is still refused.
+        write_watermark(&hw, &KEY, &[0u8; 16], 0, 0).unwrap();
+        assert!(BrokerLog::open_encrypted_verified(&path, KEY).is_err());
+    }
+
+    /// An EMPTY log under a bound watermark is accepted only as a pre-bind whose
+    /// records never landed (at exactly the watermark's base and head) — never as a
+    /// log truncated to nothing with its base sidecar moved up to the watermark's
+    /// head, which is what a key-less rollback of a whole log would look like.
+    #[cfg(all(feature = "anti-rollback", feature = "retention"))]
+    #[test]
+    fn an_empty_log_is_accepted_only_under_its_own_pre_bind() {
+        const KEY: [u8; 32] = [0x25; 32];
+        let (_tmp, path) = retained_path("hwempty");
+        let hw = watermark_path(&path);
+        let _ = std::fs::remove_file(&hw);
+        let mut log = BrokerLog::open_encrypted_verified_init(&path, KEY).unwrap();
+        for i in 0..3u64 {
+            log.publish(1, i, "/a/s/x".into(), b"x".to_vec()).unwrap();
+        }
+        drop(log);
+        // The attack: every record gone, the base moved up to the head.
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        write_base(&path, 3).unwrap();
+        assert!(
+            BrokerLog::open_encrypted_verified(&path, KEY).is_err(),
+            "a log truncated to nothing was accepted"
+        );
+        // The crash: retention emptied the log, and the next first commit bound the
+        // watermark but its records never landed.
+        write_watermark(&hw, &KEY, &[7u8; 16], 3, 3).unwrap();
+        let log = BrokerLog::open_encrypted_verified(&path, KEY)
+            .expect("an empty log under its own pre-bind was refused");
+        assert_eq!((log.base(), log.head()), (Offset(3), Offset(3)));
+        drop(log);
+    }
+
+    #[cfg(feature = "anti-rollback")]
+    #[test]
+    fn a_failed_watermark_write_poisons_the_batched_path() {
+        let (_tmp, path) = tmp("hwbatch");
+        let hw_tmp = {
+            let mut s = watermark_path(&path).into_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(watermark_path(&path));
+        let _ = std::fs::remove_dir(&hw_tmp);
+        let mut log = BrokerLog::open_encrypted_verified_init(&path, [0x42; 32]).unwrap();
+        log.stage_publish(1, 1, "/a/s/x".into(), b"one".to_vec())
+            .unwrap();
+        log.commit_batch().unwrap();
+        std::fs::create_dir(&hw_tmp).unwrap();
+        log.stage_publish(1, 2, "/a/s/x".into(), b"two".to_vec())
+            .unwrap();
+        assert!(log.commit_batch().is_err());
+        std::fs::remove_dir(&hw_tmp).unwrap();
+        assert!(log.poisoned().is_some());
+        assert!(
+            matches!(
+                log.stage_publish(1, 2, "/a/s/x".into(), b"two".to_vec()),
+                Err(StageErr::Io(_))
+            ),
+            "a retry was acknowledged past a watermark that does not cover it"
+        );
+        drop(log);
+        let log = BrokerLog::open_encrypted_verified(&path, [0x42; 32]).unwrap();
+        assert_eq!(log.head(), Offset(2));
+        drop(log);
+    }
+
+    #[cfg(feature = "retention")]
+    fn retained_path(tag: &str) -> (Cleanup, PathBuf) {
+        let (guard, path) = tmp(tag);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(base_path(&path));
+        (guard, path)
+    }
+
+    /// A producer binding lives only in its `/a/bind` record, so retention refuses
+    /// a floor above it (the next open would rebuild the table without it, freeing
+    /// the id for any principal) and the log is untouched; a floor at or below it
+    /// compacts as usual, and the binding survives a reopen.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn retention_refuses_to_drop_a_producer_binding() {
+        let (_tmp, path) = retained_path("retbind");
+        let mut log = BrokerLog::open(&path).unwrap();
+        log.publish(1, 1, "/a/s/x".into(), b"a".to_vec()).unwrap(); // 0
+        log.publish(1, 2, "/a/s/x".into(), b"b".to_vec()).unwrap(); // 1
+        assert_eq!(
+            log.stage_bind(7, "alice".into()).unwrap(),
+            (Offset(2), false)
+        );
+        log.commit_batch().unwrap();
+        log.publish(1, 3, "/a/s/x".into(), b"c".to_vec()).unwrap(); // 3
+        let bytes = log.bytes().len();
+        let err = log.retain_before(Offset(3)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offset 2") && msg.contains("binding") && msg.contains("alice"),
+            "{msg}"
+        );
+        assert_eq!((log.base(), log.bytes().len()), (Offset(0), bytes));
+        assert!(log.poisoned().is_none());
+        assert_eq!(log.retain_before(Offset(2)).unwrap(), 2);
+        drop(log);
+        let log = BrokerLog::open(&path).unwrap();
+        assert_eq!(log.base(), Offset(2));
+        assert_eq!(log.binding(7), Some(("alice", Offset(2))));
+        drop(log);
+    }
+
+    /// A will that would still fire lives only in its `/a/will` record, so
+    /// retention refuses a floor above it. A will that can no longer append anything
+    /// — already fired (its key is on the log), fenced by a later record of its
+    /// producer, or superseded by a later registration — does not hold the floor.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn retention_refuses_to_drop_a_pending_will_only() {
+        let will = |producer_id, producer_seq, subject: &str| WillRecord {
+            producer_id,
+            producer_seq,
+            subject: subject.to_string(),
+            body: b"gone".to_vec(),
+        };
+        let (_tmp, path) = retained_path("retwill");
+        let mut log = BrokerLog::open(&path).unwrap();
+        log.stage_will_register(&will(9, 4, "/f/x/gone")).unwrap(); // 0: pending
+        log.stage_will_register(&will(8, 4, "/f/y/gone")).unwrap(); // 1: will be fired
+        log.stage_will_register(&will(6, 4, "/f/z/gone")).unwrap(); // 2: will be fenced
+        log.stage_will_register(&will(5, 4, "/f/w/old")).unwrap(); // 3: superseded
+        log.stage_will_register(&will(5, 4, "/f/w/new")).unwrap(); // 4: pending
+        log.commit_batch().unwrap();
+        log.stage_will_fire(will(8, 4, "/f/y/gone")).unwrap(); // 5
+        log.stage_publish(6, 5, "/f/z/live".into(), b"live".to_vec())
+            .unwrap(); // 6
+        log.commit_batch().unwrap();
+
+        // Producer 9's will at offset 0 is pending: nothing above offset 0 may go.
+        let err = log.retain_before(Offset(1)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains("offset 0") && err.to_string().contains("will"),
+            "{err}"
+        );
+        assert_eq!(log.base(), Offset(0));
+        assert!(log.poisoned().is_none());
+        // Fire it; then the fired, fenced and superseded ones go, and the pending
+        // will at offset 4 holds the floor there.
+        log.stage_will_fire(will(9, 4, "/f/x/gone")).unwrap(); // 7
+        log.commit_batch().unwrap();
+        let err = log.retain_before(Offset(6)).unwrap_err();
+        assert!(err.to_string().contains("offset 4"), "{err}");
+        assert_eq!(log.retain_before(Offset(4)).unwrap(), 4);
+        drop(log);
+        let log = BrokerLog::open(&path).unwrap();
+        assert_eq!(log.pending_wills(), vec![will(5, 4, "/f/w/new")]);
+        drop(log);
+    }
+
+    /// A bind the log refuses (too large to store) leaves no binding behind, not
+    /// even for the rest of its batch: the same producer can still bind for real.
+    #[test]
+    fn a_refused_bind_leaves_no_phantom_binding() {
+        let (_tmp, path) = tmp("bindphantom");
+        let _ = std::fs::remove_file(&path);
+        let mut log = BrokerLog::open(&path).unwrap();
+        let huge = "p".repeat(crate::MAX_RECORD_PAYLOAD);
+        assert!(matches!(log.stage_bind(7, huge), Err(StageErr::TooLarge)));
+        assert!(log.binding(7).is_none(), "a refused bind left a binding");
+        assert_eq!(
+            log.stage_bind(7, "alice".into()).unwrap(),
+            (Offset(0), false)
+        );
+        log.commit_batch().unwrap();
+        assert_eq!(log.binding(7), Some(("alice", Offset(0))));
+        drop(log);
+    }
+
+    /// A record refused for size spends none of its producer's distinct-subject
+    /// budget, so the next new subject in the same batch still fits under the cap.
+    #[test]
+    fn a_record_refused_for_size_spends_no_subject_budget() {
+        let (_tmp, path) = tmp("budgetphantom");
+        let _ = std::fs::remove_file(&path);
+        let mut log = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+        for i in 0..MAX_SUBJECTS_PER_PRODUCER as u64 - 1 {
+            log.stage_publish(1, i, format!("/a/s/{i}"), Vec::new())
+                .unwrap();
+        }
+        log.commit_batch().unwrap();
+        assert_eq!(log.subjects_per_producer(1), MAX_SUBJECTS_PER_PRODUCER - 1);
+        let too_big = vec![0u8; crate::MAX_RECORD_PAYLOAD];
+        assert!(matches!(
+            log.stage_publish(1, 1 << 40, "/a/big".into(), too_big),
+            Err(StageErr::TooLarge)
+        ));
+        assert!(
+            log.stage_publish(1, (1 << 40) + 1, "/a/last".into(), b"x".to_vec())
+                .is_ok(),
+            "the refused record spent the producer's last subject"
+        );
+        log.commit_batch().unwrap();
+        assert_eq!(log.subjects_per_producer(1), MAX_SUBJECTS_PER_PRODUCER);
+        drop(log);
     }
 
     /// Replica staging keeps the follower's log an identical prefix of the leader's:
@@ -2894,7 +3373,7 @@ mod tests {
     /// gap or a different record at a held offset is refused by offset.
     #[test]
     fn stage_replica_extends_dedups_or_refuses_by_offset() {
-        let path = tmp("replica");
+        let (_tmp, path) = tmp("replica");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         assert_eq!(log.stage_replica(rec(0, 7, 1)).unwrap(), (Offset(0), false));
@@ -2933,14 +3412,13 @@ mod tests {
             (Offset(0), true)
         );
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The reserved commit subject cannot be published to (batched or not, as a
     /// publish or a transaction output): it would bypass dedup and never be delivered.
     #[test]
     fn reserved_commit_subject_is_refused_for_publishes() {
-        let path = tmp("reserved");
+        let (_tmp, path) = tmp("reserved");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         assert!(matches!(
@@ -2964,14 +3442,13 @@ mod tests {
         assert_eq!(log.commit("g".into(), 3).unwrap(), Offset(0));
         assert!(log.dedup.is_empty());
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// `fork_shared` swaps exactly one record and SHARES every other one (no payload
     /// copy under the lock).
     #[test]
     fn fork_shared_swaps_one_and_shares_the_rest() {
-        let path = tmp("fork");
+        let (_tmp, path) = tmp("fork");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         for i in 1..=3 {
@@ -2992,11 +3469,10 @@ mod tests {
         // Out of range: the records as-is.
         assert_eq!(log.fork_shared(Offset(9), rec(0, 0, 0)).len(), 3);
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     // -----------------------------------------------------------------------
-    // Round 4. Two things the writer decides, and one it must stop deciding.
+    // Replica admission, the will fence and the reserved ack half.
     // -----------------------------------------------------------------------
 
     /// The `/a/will` body a forged registration would carry.
@@ -3028,10 +3504,10 @@ mod tests {
     /// This is the whole of the injection: a `/a/will` admitted on the strength of
     /// "the log is still empty" and staged onto a log the broker OWNS, which then
     /// fires it at the next open as an arbitrary publish outside the capability
-    /// matrix. The admission test now lives where the append does.
+    /// matrix. The admission test lives where the append does.
     #[test]
     fn a_hidden_replicate_is_refused_once_this_batch_has_staged_a_record() {
-        let path = tmp("injectstaged");
+        let (_tmp, path) = tmp("injectstaged");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(replica_marker_path(&path));
         let mut log = BrokerLog::open(&path).unwrap();
@@ -3065,7 +3541,26 @@ mod tests {
         assert!(!log.is_replica());
         assert!(!replica_marker_path(&path).exists());
         drop(log);
+    }
+
+    /// Writing the replica marker never follows a symlink planted at its name: the
+    /// file the link points to stays untouched, and the marker is a file of its own.
+    #[test]
+    #[cfg(unix)]
+    fn the_replica_marker_does_not_follow_a_planted_symlink() {
+        let (_tmp, path) = tmp("markerlink");
+        let marker = replica_marker_path(&path);
+        let victim = path.with_extension("victim");
+        let _victim = Cleanup::new(&[&victim]);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(&victim, b"precious").unwrap();
+        let mut log = BrokerLog::open(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        log.declare_replica().unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!std::fs::symlink_metadata(&marker).unwrap().is_symlink());
+        drop(log);
     }
 
     /// A replicated record REFUSED FOR SIZE does not declare the log a replica. The
@@ -3075,7 +3570,7 @@ mod tests {
     /// the body length — no capability, not one byte appended.
     #[test]
     fn a_replicate_refused_for_size_does_not_declare_the_log_a_replica() {
-        let path = tmp("injectsize");
+        let (_tmp, path) = tmp("injectsize");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(replica_marker_path(&path));
         let mut log = BrokerLog::open(&path).unwrap();
@@ -3102,7 +3597,6 @@ mod tests {
         assert_eq!(log.stage_will_fire(will).unwrap(), (Offset(1), false));
         log.commit_batch().unwrap();
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The follower bring-up the rule exists to allow is unchanged: an EMPTY log
@@ -3111,7 +3605,7 @@ mod tests {
     /// leader's own first records are — lands beside it.
     #[test]
     fn a_leaders_first_batch_still_declares_an_empty_log_and_carries_its_hidden_records() {
-        let path = tmp("bringup");
+        let (_tmp, path) = tmp("bringup");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(replica_marker_path(&path));
         let mut log = BrokerLog::open(&path).unwrap();
@@ -3136,19 +3630,46 @@ mod tests {
         log.commit_batch().unwrap();
         assert_eq!(log.head(), Offset(3));
         drop(log);
+    }
+
+    /// A replica takes every record its leader committed: the distinct-subject bound
+    /// is the LEADER's admission policy, and a follower's view of it can differ (its
+    /// will reservations are rebuilt only when IT reopens). Here the follower still
+    /// holds the reservations of every will the leader shipped, while the leader —
+    /// reopened, holding only the latest — accepted a publish on a new subject.
+    #[test]
+    fn a_replica_takes_a_record_its_own_subject_budget_would_refuse() {
+        let (_tmp, path) = tmp("replicabound");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(replica_marker_path(&path));
+        let mut log = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+        let n = MAX_SUBJECTS_PER_PRODUCER as u64;
+        for i in 0..n {
+            let will = will_body(&format!("/f/x/gone{i}"), b"gone");
+            log.stage_replica(replicated(i, WILL_SUBJECT, will))
+                .unwrap();
+        }
+        log.commit_batch().unwrap();
+        assert_eq!(log.will_reserved_subjects(4242), MAX_SUBJECTS_PER_PRODUCER);
+        assert_eq!(
+            log.stage_replica(replicated(n, "/f/x/new", b"hello".to_vec()))
+                .unwrap(),
+            (Offset(n), false),
+            "the follower refused a record its leader committed"
+        );
+        log.commit_batch().unwrap();
+        drop(log);
     }
 
     /// AN ACK IS NOT AN INCARNATION. `ack` keys its record `ACK_SEQ_BASE | offset`,
     /// which is above every sequence a will can hold, so folding acks into the fence's
-    /// high water fenced that producer's will permanently — the goodbye never landed,
-    /// on the connection's end or on any later open, and the refusal reached nobody.
-    /// The reserved half is excluded on all three paths the fence reads: the durable
-    /// fold, the in-flight batch, and the rebuild on open.
+    /// high water would fence that producer's will permanently — the goodbye would
+    /// never land, on the connection's end or on any later open, and the refusal would
+    /// reach nobody. The reserved half is excluded on all three paths the fence reads:
+    /// the durable fold, the in-flight batch, and the rebuild on open.
     #[test]
     fn an_ack_does_not_raise_the_will_fence() {
-        let path = tmp("ackfence");
+        let (_tmp, path) = tmp("ackfence");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         log.publish(7, 5, "/f/x/live".into(), b"state=live".to_vec())
@@ -3176,7 +3697,6 @@ mod tests {
             "the rebuild on open took the ack for an incarnation"
         );
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A will may not be registered in the reserved half. The fence does not reach
@@ -3185,7 +3705,7 @@ mod tests {
     /// Refused at REGISTRATION, the only point where the client is listening.
     #[test]
     fn a_will_in_the_reserved_ack_half_is_refused_at_registration() {
-        let path = tmp("willreserved");
+        let (_tmp, path) = tmp("willreserved");
         let _ = std::fs::remove_file(&path);
         let mut log = BrokerLog::open(&path).unwrap();
         let will = WillRecord {
@@ -3208,7 +3728,6 @@ mod tests {
         log.commit_batch().unwrap();
         assert_eq!(log.pending_wills(), vec![ok]);
         drop(log);
-        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -3217,24 +3736,32 @@ mod tests {
 /// an in-memory reference model of the log's observable semantics (the SPEC), and
 /// assert they agree — at every flush, and after recovery from a simulated crash.
 ///
-/// This is "model astream and verify the implementation against the model." The model is
-/// a deliberately-trivial spec (a `Vec` + two `HashMap`s); the real log adds encoding,
-/// fsync, the recovery scan, and rollback. Agreement over many seeded random sequences
-/// cross-checks offset assignment, exactly-once dedup (the durable AND the in-batch
-/// dedup maps are compared directly, so the commit-subject-skips-dedup rule is
-/// load-bearing: producer 0 publishes are in the mix and a commit record's (0,0) key
-/// must NOT shadow them), the group-commit `.max()` monotonicity, the reserved-subject
-/// refusal, and CRASH RECOVERY: a random step drops the log with an unsynced staged
-/// batch and cuts the file mid-frame (or zero-fills the tail), and the reopened log must
-/// equal the model's rule "the staged records wholly on disk landed; the torn one and
-/// everything after it did not". The model shares the impl's staging vocabulary (it is a
-/// spec of the same interface, not a foreign oracle); what it independently pins down is
-/// the observable state after every flush and crash. Std-only (a seeded xorshift PRNG):
-/// reproducible, and no third-party dev-dependency.
+/// The model is a deliberately-trivial spec (a `Vec` + two `HashMap`s); the real log
+/// adds encoding, fsync, the recovery scan, and rollback. Agreement over many seeded
+/// random sequences cross-checks offset assignment, exactly-once dedup (the durable AND
+/// the in-batch dedup maps are compared directly, so the commit-subject-skips-dedup
+/// rule is load-bearing: producer 0 publishes are in the mix and a commit record's
+/// (0,0) key must NOT shadow them), the group-commit `.max()` monotonicity, the
+/// reserved-subject refusal, and CRASH RECOVERY: a random step drops the log with an
+/// unsynced staged batch and cuts the file mid-frame (or zero-fills the tail), and the
+/// reopened log must equal the model's rule "the staged records wholly on disk landed;
+/// the torn one and everything after it did not". The model shares the impl's staging
+/// vocabulary (it is a spec of the same interface, not a foreign oracle); what it
+/// independently pins down is the observable state after every flush and crash.
+/// Std-only (a seeded xorshift PRNG): reproducible, and no third-party dev-dependency.
 #[cfg(test)]
 mod model_tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Removes a seed's log when dropped, so a failing seed leaves nothing behind.
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     /// xorshift64* — a tiny deterministic PRNG (std-only, reproducible per seed).
     struct Rng(u64);
@@ -3458,10 +3985,10 @@ mod model_tests {
         for seed in 0..SEEDS {
             let path = std::env::temp_dir().join(format!("astream_model_{pid_proc}_{seed}.log"));
             let _ = std::fs::remove_file(&path);
+            let _tmp = Cleanup(path.clone());
 
             let mut model = Model::default();
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let mut crashes = 0u32;
             {
                 let mut log = BrokerLog::open(&path).unwrap();
                 let steps = 6 + rng.below(26);
@@ -3533,7 +4060,18 @@ mod model_tests {
                             if landed < lens.len() && !zero_fill {
                                 keep += rng.below(lens[landed] as u64) as usize;
                             }
+                            // The process dies inside `commit_batch`, between the
+                            // batch's write and its fsync: the staged bytes reached the
+                            // file, and the crash keeps only a prefix of them.
+                            let staged = log.staged_bytes.clone();
+                            assert_eq!(staged.len(), lens.iter().sum::<usize>());
                             drop(log);
+                            OpenOptions::new()
+                                .append(true)
+                                .open(&path)
+                                .unwrap()
+                                .write_all(&staged)
+                                .unwrap();
                             {
                                 let f = OpenOptions::new().write(true).open(&path).unwrap();
                                 if zero_fill {
@@ -3547,7 +4085,6 @@ mod model_tests {
                             }
                             log = BrokerLog::open(&path).unwrap();
                             model.crash(landed);
-                            crashes += 1;
                             assert_eq!(
                                 log.bytes().len(),
                                 durable_len + lens[..landed].iter().sum::<usize>(),
@@ -3566,7 +4103,6 @@ mod model_tests {
                 model.commit_batch();
                 compare(&log, &model, &format!("seed {seed} final-flush"));
             }
-            let _ = crashes;
 
             // RECOVERY: reopen from disk; the recovered state must equal the model.
             let mut log2 = BrokerLog::open(&path).unwrap();
@@ -3582,7 +4118,6 @@ mod model_tests {
                 );
             }
             log2.abort_batch(); // discard the throwaway dedup probes (none staged)
-            let _ = std::fs::remove_file(&path);
         }
     }
 }

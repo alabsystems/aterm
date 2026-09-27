@@ -1,0 +1,13 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, permission_enter_plan_mode (zn, hideIndexes, NO footer), on the measured 2.1.280/2.1.281 box geometry · entering plan mode, footerless
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Enter plan mode?
+
+  Claude wants to enter plan mode to explore and design an implementation approach.
+
+  No code changes will be made until you approve the plan.
+
+  ❯ Yes, enter plan mode
+    No, start implementing now

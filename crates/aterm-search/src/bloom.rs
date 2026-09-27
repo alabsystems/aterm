@@ -24,11 +24,13 @@
 //! use aterm_search::BloomFilter;
 //!
 //! let mut bloom = BloomFilter::with_size(10_000);
-//! bloom.insert("hello");
-//! assert!(bloom.might_contain("hello")); // Definitely true
-//! // might_contain("xyz") could return true (false positive)
-//! // but if it returns false, "xyz" is definitely not present
+//! bloom.insert_bytes(b"hel"); // SearchIndex inserts one trigram at a time
+//! assert_eq!(bloom.item_count(), 1);
 //! ```
+//!
+//! Membership is queried through [`crate::SearchIndex::might_contain`], which
+//! probes every trigram of the query: `false` means definitely absent, `true`
+//! means possibly present (verify with the actual search).
 
 /// Number of hash functions (k=7 is optimal for 1% FPR with m/n ~= 10)
 const K: usize = 7;
@@ -221,6 +223,7 @@ impl BloomFilter {
     }
 
     /// Insert a string into the bloom filter.
+    #[cfg(test)]
     pub fn insert(&mut self, s: &str) {
         let (h1, h2) = Self::hash_pair(s.as_bytes());
 
@@ -251,6 +254,7 @@ impl BloomFilter {
     /// Returns `false` if definitely not present (no false negatives).
     /// Returns `true` if possibly present (may be false positive).
     #[must_use]
+    #[cfg(test)]
     pub fn might_contain(&self, s: &str) -> bool {
         self.might_contain_bytes(s.as_bytes())
     }

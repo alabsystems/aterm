@@ -349,7 +349,7 @@ fn license_arms(expr: &str) -> Vec<String> {
 /// Is the Apache-2.0 grant UNAVOIDABLE for this expression? A dual
 /// `MIT OR Apache-2.0` fork can be redistributed under MIT, which carries no
 /// §4(b) obligation; a bare `Apache-2.0` fork cannot.
-fn apache_is_mandatory(expr: &str) -> bool {
+pub(crate) fn apache_is_mandatory(expr: &str) -> bool {
     let arms: Vec<&str> = expr.split(" OR ").collect();
     !arms.is_empty()
         && arms
@@ -1947,7 +1947,11 @@ mod tests {
         // window_delegate.rs set_fullscreen and dragged_paths) make 90. The
         // pin worked exactly as intended: it caught both edits on the runs
         // that made them, and the count is the honest size of the fork.
-        assert_eq!(patch, 121, "`{LOCAL_PATCH_MARKER}` marker count");
+        // 121 -> 122 on 2026-09-26: app_state.rs's waker stop in a nested run
+        // loop (measured.rs, the note of that date). 122 -> 123 on
+        // 2026-09-27: the waker became aterm_objc::WakeTimer (measured.rs,
+        // the note of that date).
+        assert_eq!(patch, 123, "`{LOCAL_PATCH_MARKER}` marker count");
         let by_name: BTreeMap<&str, (u64, u64)> = forks
             .iter()
             .map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers)))
@@ -1956,7 +1960,7 @@ mod tests {
         assert_eq!(by_name["smol_str"], (4, 0));
         assert_eq!(by_name["libm"], (1, 0));
         assert_eq!(by_name["pkg-config"], (1, 0));
-        assert_eq!(by_name["winit"], (0, 121));
+        assert_eq!(by_name["winit"], (0, 123));
     }
 
     /// The patch table PARTITIONED. Five vendored forks — third-party source

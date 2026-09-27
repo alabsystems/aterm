@@ -2,12 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! #8001: capability-ceremony structural audit.
+//! #8001: capability-token structural audit.
 //!
-//! Validates that each capability-token auth module in `aterm-core`
-//! exposes the `as_host_auth_token` ceremony defined by the
-//! `aterm_provenance::HostAuthorizationToken<'_>` lifetime gate, and that
-//! the capability structs cannot be constructed outside their owning
+//! Validates that the capability structs of each capability-token auth
+//! module in `aterm-core` cannot be constructed outside their owning
 //! module.
 //!
 //! # Why a source-scanning test (and not a `trybuild` compile-fail)
@@ -18,34 +16,24 @@
 //! matrix would duplicate what rustc enforces. What a refactor *can*
 //! silently regress is:
 //!
-//! 1. Deleting `as_host_auth_token` on a capability struct (the lift
-//!    becomes unreachable without reintroducing the old bool gate).
-//! 2. Making `_seal` public (downstream code can forge a capability).
-//! 3. Making a capability struct `#[derive(Default)]` or adding a
+//! 1. Making `_seal` public (downstream code can forge a capability).
+//! 2. Making a capability struct `#[derive(Default)]` or adding a
 //!    `new()` constructor outside the minting path.
 //!
 //! The test below scans the committed sources of the capability modules
 //! listed in [`CAPABILITY_MODULES`] and fails on any of those
-//! regressions. Together with the
-//! per-module unit tests (`as_host_auth_token_lifts_pty_to_host`) in
-//! each `_auth.rs` file, this closes the #8001 acceptance criterion
-//! that "handler code cannot construct the token without going through
+//! regressions, which closes the #8001 acceptance criterion that
+//! "handler code cannot construct the token without going through
 //! `authorize()`."
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// All capability-token auth modules that must expose the ceremony.
+/// All capability-token auth modules whose capability structs are audited.
 ///
 /// Each entry is the module file name (under
 /// `crates/aterm-core/src/terminal/`) paired with a list of capability
-/// struct names that must carry a private `_seal: ()` field and — for
-/// every module except `modal_auth` — an `as_host_auth_token` method.
-///
-/// `modal_auth` is the exception: its capability types live in
-/// `aterm-ssh-conductor` and `aterm-tmux` (`ConductorActivationToken`
-/// and `TmuxActivationToken`), which already carry the ceremony
-/// upstream. We still audit the module for private-seal preservation.
+/// struct names that must carry a private `_seal: ()` field.
 ///
 /// `hyperlink_auth.rs` is deliberately ABSENT: OSC 8 acceptance is not a
 /// host decision — a URI that clears the byte cap, the control/BiDi scans
@@ -54,20 +42,17 @@ use std::path::{Path, PathBuf};
 /// reachable setting is "granted" audits as a decision nobody makes, so
 /// that module keeps only its host-minted scheme set. Add a row here when
 /// a capability gains a policy, never to restore ceremony for its own sake.
-const CAPABILITY_MODULES: &[(&str, &[&str], bool)] = &[
-    // (file, capability struct names, requires_as_host_auth_token_in_file)
+const CAPABILITY_MODULES: &[(&str, &[&str])] = &[
+    // (file, capability struct names)
     (
         "clipboard_auth.rs",
         &["ClipboardWriteCapability", "ClipboardQueryCapability"],
-        true,
     ),
-    // Shell integration attaches `as_host_auth_token` to the auth state,
-    // not to a capability struct — it has no per-invocation capability
-    // type. Still must carry the ceremony method in-file.
-    ("shell_integration_auth.rs", &[], true),
-    ("response_capability.rs", &["ResponseCapability"], true),
-    ("window_auth.rs", &["WindowOpsCapability"], true),
-    ("dcs_auth.rs", &["DcsEmitCapability"], true),
+    ("response_capability.rs", &["ResponseCapability"]),
+    ("window_auth.rs", &["WindowOpsCapability"]),
+    // `dcs_auth.rs` left 2026-09-25 with the raw DCS callback it gated: no
+    // host could install that callback or revoke the gate any more, so the
+    // capability had become ceremony over a policy that cannot refuse.
 ];
 
 /// The modules whose ceremony would be a lie, paired with the reason. A
@@ -103,41 +88,12 @@ fn read_module(file: &str) -> String {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
 }
 
-/// Each capability module (except `modal_auth`) exposes
-/// `as_host_auth_token` returning `HostAuthorizationToken<'_>`. Deleting
-/// this method would silently remove the #8001 lift ceremony.
-#[test]
-fn every_capability_module_exposes_as_host_auth_token() {
-    for (file, _caps, requires_method) in CAPABILITY_MODULES {
-        if !*requires_method {
-            continue;
-        }
-        let src = read_module(file);
-        assert!(
-            src.contains("fn as_host_auth_token("),
-            "{file}: expected an `fn as_host_auth_token(` definition (#8001 ceremony)"
-        );
-        assert!(
-            src.contains("aterm_provenance::HostAuthorizationToken"),
-            "{file}: expected the ceremony to return a `aterm_provenance::HostAuthorizationToken`"
-        );
-        assert!(
-            src.contains("__new_for_capability_only"),
-            "{file}: expected `HostAuthorizationToken::__new_for_capability_only()` call \
-             (the only public constructor of the capability-seal token)"
-        );
-    }
-}
-
 /// Each capability struct carries a private `_seal: ()` field. This is
 /// the structural guarantee that handler code outside the module cannot
 /// construct the capability — the type's only field is inaccessible.
 #[test]
 fn every_capability_struct_has_private_seal() {
-    for (file, caps, _) in CAPABILITY_MODULES {
-        if caps.is_empty() {
-            continue;
-        }
+    for (file, caps) in CAPABILITY_MODULES {
         let src = read_module(file);
         for cap in *caps {
             // Find the struct definition and verify it contains `_seal: ()`.
@@ -164,10 +120,7 @@ fn every_capability_struct_has_private_seal() {
 /// multiple dispatches.
 #[test]
 fn capability_structs_do_not_derive_default_or_clone() {
-    for (file, caps, _) in CAPABILITY_MODULES {
-        if caps.is_empty() {
-            continue;
-        }
+    for (file, caps) in CAPABILITY_MODULES {
         let src = read_module(file);
         for cap in *caps {
             let struct_header = format!("struct {cap}");
@@ -231,20 +184,13 @@ fn host_auth_token_constructor_is_capability_sealed() {
         "HostAuthorizationToken constructor must stay `#[doc(hidden)]` \
          so cargo doc does not surface it as an inviting public API"
     );
-    // `NetworkAuthorizationToken` mirrors the same seal.
-    assert!(
-        src.contains("NetworkAuthorizationToken"),
-        "NetworkAuthorizationToken capability type must remain defined alongside \
-         HostAuthorizationToken (the two ceremonies are the bottom edges of the lattice)"
-    );
     // #8013: the constructor MUST also carry the feature gate. Without the
     // gate, any workspace crate can mint a token and bypass the provenance
     // lattice. `aterm audit policy --seals` enforces the same
     // invariant in CI; this test catches the regression locally too.
     assert!(
         src.contains("#[cfg(any(test, feature = \"internal-mint\"))]"),
-        "HostAuthorizationToken / NetworkAuthorizationToken \
-         __new_for_capability_only constructors must be gated behind \
+        "HostAuthorizationToken::__new_for_capability_only must be gated behind \
          #[cfg(any(test, feature = \"internal-mint\"))]. See #8013 and \
          aterm audit policy --seals."
     );
@@ -256,7 +202,7 @@ fn host_auth_token_constructor_is_capability_sealed() {
 #[test]
 fn all_capability_modules_exist() {
     let dir = terminal_src_dir();
-    for (file, _, _) in CAPABILITY_MODULES {
+    for (file, _) in CAPABILITY_MODULES {
         let path = dir.join(file);
         assert!(
             path.is_file(),
@@ -272,7 +218,7 @@ fn all_capability_modules_exist() {
 /// `CAPABILITY_MODULES`, are both this test failing.
 #[test]
 fn a_module_with_no_policy_carries_no_capability_ceremony() {
-    let listed: Vec<&str> = CAPABILITY_MODULES.iter().map(|(f, _, _)| *f).collect();
+    let listed: Vec<&str> = CAPABILITY_MODULES.iter().map(|(f, _)| *f).collect();
     for (file, forbidden) in CEREMONY_FREE_MODULES {
         assert!(
             !listed.contains(file),

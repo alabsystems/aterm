@@ -38,7 +38,7 @@ const MOD_SHIFT: u8 = 1 << 3;
 /// event compare equal. Characters are folded to lowercase (so `"T"` and `"t"`
 /// name the same physical key; SHIFT is carried separately in the mask).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum KeyToken {
+pub(crate) enum KeyToken {
     /// A printable character key, lowercased (`a`, `=`, `[`).
     Char(char),
     /// A named non-printable key (Enter, Tab, Escape, F1, arrows, …).
@@ -49,7 +49,7 @@ pub enum KeyToken {
 /// are equal iff they name the same modifiers and key, regardless of how they
 /// were spelled (`"cmd+T"` == `"shift+cmd+t"`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Chord {
+pub(crate) struct Chord {
     mods: u8,
     key: KeyToken,
 }
@@ -58,7 +58,7 @@ pub struct Chord {
 /// hardcoded `on_key` behavior, so a binding does EXACTLY what the built-in key
 /// did (no new capability, just a configurable trigger).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
+pub(crate) enum Action {
     /// Open a new in-window tab (Cmd-T).
     NewTab,
     /// Reopen the most recently closed native tab (Cmd-Shift-T on macOS).
@@ -489,7 +489,7 @@ const SHIFT_COMPOSED_ASCII: &[char] = &[
 /// caution's "write it as" half — a warning that only says "this may not work"
 /// is barely better than silence.
 #[must_use]
-pub fn unshifted_us_spelling(c: char) -> Option<char> {
+pub(crate) fn unshifted_us_spelling(c: char) -> Option<char> {
     let pairs = [
         ('~', '`'),
         ('!', '1'),
@@ -520,7 +520,7 @@ pub fn unshifted_us_spelling(c: char) -> Option<char> {
 /// Whether `chord` names a key that a live press can never produce on a
 /// US/UK layout — see [`SHIFT_COMPOSED_ASCII`]. Returns the offending glyph.
 #[must_use]
-pub fn shift_composed_key(chord: &Chord) -> Option<char> {
+pub(crate) fn shift_composed_key(chord: &Chord) -> Option<char> {
     match chord.key {
         KeyToken::Char(c) if SHIFT_COMPOSED_ASCII.contains(&c) => Some(c),
         _ => None,
@@ -568,7 +568,7 @@ impl Chord {
     /// `None` for a bare modifier press or an unmappable key (which can never be
     /// a binding target).
     #[must_use]
-    pub fn from_event(logical: &WinitKey, mods: ModifiersState) -> Option<Chord> {
+    pub(crate) fn from_event(logical: &WinitKey, mods: ModifiersState) -> Option<Chord> {
         let key = match logical {
             WinitKey::Character(s) => {
                 let mut chars = s.chars();
@@ -693,7 +693,7 @@ fn named_key_display(named: NamedKey) -> &'static str {
 /// `on_key`. Empty (the default with no config) means the lookup is one hash
 /// probe that always misses, so the hardcoded path runs unchanged.
 #[derive(Clone, Debug, Default)]
-pub struct Keybindings {
+pub(crate) struct Keybindings {
     map: HashMap<Chord, Action>,
 }
 
@@ -739,13 +739,13 @@ impl Keybindings {
     /// is parsed independently; a malformed chord OR an unknown action is WARNED
     /// to stderr and SKIPPED, so one bad line never disables the rest and the app
     /// always falls open to the hardcoded defaults. `None`/empty input yields an
-    /// empty map (zero behavioral change).
-    // Stderr-only ctor: every production caller now uses the `*_warn` variant (for the
-    // in-window notice), so this is exercised only by tests — allow dead_code on a plain
-    // (non-test) build rather than churn the test call-sites onto `*_warn(..).0`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// empty map (zero behavioral change). Production goes through
+    /// [`Self::resolved_warn`]; this config-only form backs the parsing tests.
+    #[cfg(test)]
     #[must_use]
-    pub fn from_config(table: Option<&std::collections::BTreeMap<String, String>>) -> Keybindings {
+    pub(crate) fn from_config(
+        table: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Keybindings {
         let (map, _unbinds, warns) = Self::collect(table);
         for w in &warns {
             crate::logging::stderr_line!("aterm-gui: {w}");
@@ -756,13 +756,9 @@ impl Keybindings {
     /// Like [`Self::from_config`] but RETURNS the warnings instead of printing them, so
     /// the GUI can surface dropped rules in an in-window notice (stderr is invisible to
     /// a Finder-launched .app). The map is byte-identical to `from_config`.
-    // Config-only ctor pair of `from_config`: production moved to `resolved_warn`
-    // (which consults `collect` directly so unbinds can mask the platform seeds),
-    // leaving both no-defaults ctors to the config-parsing tests — same allowance,
-    // same reason as `from_config` above.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     #[must_use]
-    pub fn from_config_warn(
+    pub(crate) fn from_config_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (Keybindings, Vec<String>) {
         let (map, _unbinds, warns) = Self::collect(table);
@@ -920,7 +916,7 @@ impl Keybindings {
     /// User `[keybindings]` entries are overlaid on top (see [`Self::resolved`]), so
     /// any of these can be rebound.
     #[must_use]
-    pub fn platform_defaults() -> Keybindings {
+    pub(crate) fn platform_defaults() -> Keybindings {
         let mut map = HashMap::new();
         for (chord_str, action_str) in Self::PLATFORM_DEFAULT_PAIRS {
             // These are compile-time constants; a parse failure is a build-time bug,
@@ -940,12 +936,13 @@ impl Keybindings {
 
     /// The EFFECTIVE keybindings the running app uses: the platform built-in
     /// defaults ([`Self::platform_defaults`]) with the user's `[keybindings]` table
-    /// overlaid on top (a user entry for the same chord WINS). This is what
-    /// `App::new` installs — distinct from [`Self::from_config`], which returns ONLY
-    /// the parsed config (no defaults) and backs the config-parsing tests.
-    #[cfg_attr(not(test), allow(dead_code))] // test-only now; App::new uses resolved_warn
+    /// overlaid on top (a user entry for the same chord WINS) — the tests' form of
+    /// [`Self::resolved_warn`], which is what `App::new` installs.
+    #[cfg(test)]
     #[must_use]
-    pub fn resolved(table: Option<&std::collections::BTreeMap<String, String>>) -> Keybindings {
+    pub(crate) fn resolved(
+        table: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Keybindings {
         Self::resolved_warn(table).0
     }
 
@@ -957,7 +954,7 @@ impl Keybindings {
     /// the user's own bindings overlay, so a masked seed falls through to the
     /// PTY encoder exactly as if it had never been seeded.
     #[must_use]
-    pub fn resolved_warn(
+    pub(crate) fn resolved_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (Keybindings, Vec<String>) {
         let mut kb = Keybindings::platform_defaults();
@@ -982,7 +979,7 @@ impl Keybindings {
     /// O(1) lookup: the [`Action`] bound to a live key event, or `None` (miss →
     /// fall through to the hardcoded `on_key` matches).
     #[must_use]
-    pub fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<Action> {
+    pub(crate) fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<Action> {
         if self.map.is_empty() {
             return None;
         }
@@ -1036,7 +1033,7 @@ impl Keybindings {
 /// protocol-aware app still gets `ESC[13;2u`); a `[key_sequences]` entry for the
 /// same chord overrides it unconditionally.
 #[derive(Clone, Debug, Default)]
-pub struct KeySequences {
+pub(crate) struct KeySequences {
     map: HashMap<Chord, Vec<u8>>,
 }
 
@@ -1046,9 +1043,11 @@ impl KeySequences {
     /// and any other char contributes its UTF-8 bytes — so BOTH a TOML basic string
     /// (`"\n"`, `"[A"`) and a TOML literal string (`'\e[A'`) work. A malformed
     /// chord OR byte-string is WARNED + SKIPPED (fail-open), like `[keybindings]`.
-    #[cfg_attr(not(test), allow(dead_code))] // stderr-only ctor; prod uses from_config_warn
+    #[cfg(test)]
     #[must_use]
-    pub fn from_config(table: Option<&std::collections::BTreeMap<String, String>>) -> KeySequences {
+    pub(crate) fn from_config(
+        table: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> KeySequences {
         let (map, warns) = Self::collect(table);
         for w in &warns {
             crate::logging::stderr_line!("aterm-gui: {w}");
@@ -1059,7 +1058,7 @@ impl KeySequences {
     /// Like [`Self::from_config`] but RETURNS the warnings instead of printing them
     /// (for the GUI's in-window config notice). The map is byte-identical.
     #[must_use]
-    pub fn from_config_warn(
+    pub(crate) fn from_config_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (KeySequences, Vec<String>) {
         let (map, warns) = Self::collect(table);
@@ -1113,7 +1112,7 @@ impl KeySequences {
     /// The raw bytes a live key event is bound to, or `None` (miss -> fall through to
     /// the default encoder).
     #[must_use]
-    pub fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<&[u8]> {
+    pub(crate) fn lookup(&self, logical: &WinitKey, mods: ModifiersState) -> Option<&[u8]> {
         if self.map.is_empty() {
             return None;
         }

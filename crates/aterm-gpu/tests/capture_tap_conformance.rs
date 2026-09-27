@@ -60,33 +60,50 @@ fn presented_phase_code(phase: PresentedFramePhase) -> i64 {
     }
 }
 
-fn presented_post(prev: &State, event: PresentedFrameEvent) -> (PresentedFrameDecision, State) {
-    let decision = presented_frame_transition(presented_phase(prev["phase"]), event)
-        .unwrap_or_else(|| panic!("shipping gate rejected enabled event {event:?}"));
+fn presented_outcome_code(outcome: PresentedFrameOutcome) -> i64 {
+    match outcome {
+        PresentedFrameOutcome::None => 0,
+        PresentedFrameOutcome::Frame => 1,
+        PresentedFrameOutcome::Error => 2,
+    }
+}
+
+/// Project one gate decision. `phase` and `result` are the DECISION's (a
+/// non-terminal decision carries no outcome, and no result exists before the
+/// terminal); the event supplies only what the gate does not decide — whether
+/// a copy was encoded (`accepted`) and whether the map succeeded (`mapped`).
+fn project_presented(
+    prev: &State,
+    event: PresentedFrameEvent,
+    decision: PresentedFrameDecision,
+) -> State {
     let mut post = prev.clone();
     post.insert("phase", presented_phase_code(decision.phase));
     match event {
         PresentedFrameEvent::EnqueueValid => {
             post.insert("accepted", 1);
             post.insert("mapped", 0);
-            post.insert("result", 0);
         }
         PresentedFrameEvent::RejectEnqueue => {
             post.insert("accepted", 0);
             post.insert("mapped", 0);
-            post.insert("result", 2);
         }
         PresentedFrameEvent::StartMap => {}
         PresentedFrameEvent::CompleteMap => {
             post.insert("mapped", 1);
-            post.insert("result", 1);
         }
         PresentedFrameEvent::MapError => {
             post.insert("mapped", 0);
-            post.insert("result", 2);
         }
     }
-    (decision, post)
+    post.insert("result", presented_outcome_code(decision.outcome));
+    post
+}
+
+fn presented_post(prev: &State, event: PresentedFrameEvent) -> (PresentedFrameDecision, State) {
+    let decision = presented_frame_transition(presented_phase(prev["phase"]), event)
+        .unwrap_or_else(|| panic!("shipping gate rejected enabled event {event:?}"));
+    (decision, project_presented(prev, event, decision))
 }
 
 #[test]
@@ -153,6 +170,36 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
         !model.check_invariant("SuccessRequiresMappedCopy", &fail_open),
         "negative control must expose a frame without a successful map"
     );
+
+    // NEGATIVE CONTROL: the reject arm copied from EnqueueValid. Projected like
+    // any shipping decision, it reserves the staging buffer with no copy.
+    let copied_arm = project_presented(
+        &initial,
+        PresentedFrameEvent::RejectEnqueue,
+        PresentedFrameDecision {
+            phase: PresentedFramePhase::Pending,
+            outcome: PresentedFrameOutcome::None,
+        },
+    );
+    assert!(
+        !model
+            .successors("RejectEnqueue", &initial)
+            .contains(&copied_arm)
+    );
+    assert!(!model.check_invariant("ReservedPhaseRequiresAcceptedCopy", &copied_arm));
+
+    // NEGATIVE CONTROL: a failed map whose arm forgot its outcome ends the
+    // one-shot with no error for the waiter to take.
+    let silent = project_presented(
+        &in_flight,
+        PresentedFrameEvent::MapError,
+        PresentedFrameDecision {
+            phase: PresentedFramePhase::Complete,
+            outcome: PresentedFrameOutcome::None,
+        },
+    );
+    assert!(!model.successors("MapError", &in_flight).contains(&silent));
+    assert!(!model.check_invariant("TerminalPhaseHasResult", &silent));
 }
 
 fn video_phase(raw: i64) -> VideoSlotPhase {
@@ -185,6 +232,7 @@ fn video_slot_post(prev: &State, event: VideoSlotEvent) -> (VideoSlotDecision, S
         VideoSlotEvent::MapError | VideoSlotEvent::Abort => {
             assert!(decision.count_drop);
             post.insert("dropped", prev["dropped"] + 1);
+            post.insert("errors", prev["errors"] + 1);
             post.insert("last_error", 1);
         }
     }
@@ -264,19 +312,22 @@ fn video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted() {
     );
 
     // NEGATIVE CONTROL 2: accepted invalid metadata disappeared as though it had
-    // been client decimation, so coverage was understated.
-    let mut silent_invalid = initial;
-    silent_invalid.insert("invalid", 1);
-    assert!(
-        !model
-            .successors("RejectInvalidMetadata", &model.init_state())
-            .contains(&silent_invalid),
-        "uncounted invalid-metadata loss must not conform"
-    );
-    assert!(
-        !model.check_invariant("InvalidMetadataIsCounted", &silent_invalid),
-        "negative control must expose understated dropped"
-    );
+    // been client decimation, so coverage was understated — also after a map
+    // error the take had already counted.
+    for before in [initial, failed_free] {
+        let mut silent_invalid = before.clone();
+        silent_invalid.insert("invalid", 1);
+        assert!(
+            !model
+                .successors("RejectInvalidMetadata", &before)
+                .contains(&silent_invalid),
+            "uncounted invalid-metadata loss must not conform"
+        );
+        assert!(
+            !model.check_invariant("InvalidMetadataIsCounted", &silent_invalid),
+            "negative control must expose understated dropped"
+        );
+    }
 }
 
 fn captured(seq: u64) -> CapturedFrame {
@@ -289,66 +340,118 @@ fn captured(seq: u64) -> CapturedFrame {
     }
 }
 
+/// One capture-store push: the shipping `ordered_capture_store_push`, or a
+/// one-line mis-write of it that a negative control replays.
+type Push = fn(&mut VecDeque<CapturedFrame>, &mut usize, usize, CapturedFrame) -> u64;
+
+/// Drive callback arrival 3,1,2 through `push` under a two-frame budget and
+/// project each step the way the model reads the store: its two lowest
+/// entries and the running eviction count.
+fn harvest_3_1_2(model: &Model, push: Push) -> [State; 3] {
+    let mut state = model.init_state();
+    let mut store = VecDeque::new();
+    let mut store_bytes = 0usize;
+    let mut evicted = 0u64;
+    [(3, 1), (1, 2), (2, 3)].map(|(seq, phase)| {
+        evicted += push(&mut store, &mut store_bytes, 2 * 16, captured(seq));
+        state.insert("harvest_phase", phase);
+        state.insert(
+            "store_first",
+            store.front().map_or(0, |frame| frame.seq as i64),
+        );
+        state.insert(
+            "store_second",
+            store.get(1).map_or(0, |frame| frame.seq as i64),
+        );
+        state.insert("evicted", evicted as i64);
+        state.clone()
+    })
+}
+
 /// Tier-1 binding for the harvested-store projection in `VideoTapSlot`.
 /// Complete callbacks in the adversarial order 3,1,2 and require shipping
 /// insertion plus byte-budget eviction to match each exact modeled successor.
 #[test]
 fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     let model = video_tap_slot_model();
+    let steps = harvest_3_1_2(&model, ordered_capture_store_push);
     let mut state = model.init_state();
-    let mut store = VecDeque::new();
-    let mut store_bytes = 0usize;
-    let budget_bytes = 2 * 16;
-    let mut evicted = 0u64;
-
-    for (seq, action, phase) in [
-        (3, "HarvestThree", 1),
-        (1, "HarvestOne", 2),
-        (2, "HarvestTwo", 3),
-    ] {
-        evicted +=
-            ordered_capture_store_push(&mut store, &mut store_bytes, budget_bytes, captured(seq));
-        let mut post = state.clone();
-        post.insert("harvest_phase", phase);
-        post.insert(
-            "store_first",
-            store.front().map_or(0, |frame| frame.seq as i64),
-        );
-        post.insert(
-            "store_second",
-            store.get(1).map_or(0, |frame| frame.seq as i64),
-        );
-        post.insert("evicted", evicted as i64);
-        assert_exact_step(&model, &state, &post, action);
-        state = post;
+    for (post, action) in steps
+        .iter()
+        .zip(["HarvestThree", "HarvestOne", "HarvestTwo"])
+    {
+        assert_exact_step(&model, &state, post, action);
+        state = post.clone();
     }
-    assert_eq!(
-        store.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
-        vec![2, 3]
-    );
-    assert_eq!(store_bytes, 2 * 16);
-    assert_eq!(evicted, 1);
+    assert_eq!((state["store_first"], state["store_second"]), (2, 3));
+    assert_eq!(state["evicted"], 1);
 
-    // NEGATIVE CONTROL: append in callback order. After 3,1 the store is
-    // unsorted; appending 2 then popping the first callback retains 1,2 instead
-    // of the newest capture tail 2,3.
-    let initial = model.init_state();
-    let three = model.successors("HarvestThree", &initial)[0].clone();
-    let mut callback_ordered = three.clone();
-    callback_ordered.insert("harvest_phase", 2);
-    callback_ordered.insert("store_first", 3);
-    callback_ordered.insert("store_second", 1);
+    // NEGATIVE CONTROLS: the same arrival through the push written wrong, one
+    // line each, projected exactly like the shipping one. Each lands on no
+    // model successor and is refused by its own law.
+    let three = model.successors("HarvestThree", &model.init_state())[0].clone();
+    let one = model.successors("HarvestOne", &three)[0].clone();
+
+    // The historical defect: append in callback order, evict the front.
+    let callback_order: Push = |store, bytes, budget, frame| {
+        *bytes += frame.rgba.len();
+        store.push_back(frame);
+        let mut evicted = 0;
+        while *bytes > budget {
+            let Some(oldest) = store.pop_front() else {
+                break;
+            };
+            *bytes -= oldest.rgba.len();
+            evicted += 1;
+        }
+        evicted
+    };
+    let [_, unsorted, wrong_tail] = harvest_3_1_2(&model, callback_order);
+    assert!(!model.successors("HarvestOne", &three).contains(&unsorted));
+    assert!(!model.check_invariant("HarvestedStoreSorted", &unsorted));
+    assert_eq!(
+        (wrong_tail["store_first"], wrong_tail["store_second"]),
+        (1, 2)
+    );
+    assert!(!model.check_invariant("BudgetKeepsNewestTail", &wrong_tail));
+
+    // Sorted insertion, but the budget pops the NEWEST frame.
+    let evict_newest: Push = |store, bytes, budget, frame| {
+        *bytes += frame.rgba.len();
+        let at = store
+            .iter()
+            .position(|existing| existing.seq > frame.seq)
+            .unwrap_or(store.len());
+        store.insert(at, frame);
+        let mut evicted = 0;
+        while *bytes > budget {
+            let Some(newest) = store.pop_back() else {
+                break;
+            };
+            *bytes -= newest.rgba.len();
+            evicted += 1;
+        }
+        evicted
+    };
+    let [_, sorted, newest_dropped] = harvest_3_1_2(&model, evict_newest);
+    assert_eq!(sorted, one, "the slip is invisible until the budget bites");
     assert!(
         !model
-            .successors("HarvestOne", &three)
-            .contains(&callback_ordered)
+            .successors("HarvestTwo", &one)
+            .contains(&newest_dropped)
     );
-    assert!(!model.check_invariant("HarvestedStoreSorted", &callback_ordered));
+    assert!(model.check_invariant("EvictionMatchesOverflow", &newest_dropped));
+    assert!(!model.check_invariant("BudgetKeepsNewestTail", &newest_dropped));
 
-    let mut wrong_tail = callback_ordered;
-    wrong_tail.insert("harvest_phase", 3);
-    wrong_tail.insert("store_first", 1);
-    wrong_tail.insert("store_second", 2);
-    wrong_tail.insert("evicted", 1);
-    assert!(!model.check_invariant("BudgetKeepsNewestTail", &wrong_tail));
+    // The right tail, but the push never reports what it truncated, so the
+    // take's `head_truncated` reads false.
+    let unreported: Push = |store, bytes, budget, frame| {
+        let _ = ordered_capture_store_push(store, bytes, budget, frame);
+        0
+    };
+    let [_, _, silent] = harvest_3_1_2(&model, unreported);
+    assert_eq!((silent["store_first"], silent["store_second"]), (2, 3));
+    assert!(!model.successors("HarvestTwo", &one).contains(&silent));
+    assert!(model.check_invariant("BudgetKeepsNewestTail", &silent));
+    assert!(!model.check_invariant("EvictionMatchesOverflow", &silent));
 }

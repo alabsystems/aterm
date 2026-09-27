@@ -883,12 +883,6 @@ struct TripState {
 pub const CHECK_CACHE: Duration = Duration::from_secs(2);
 
 impl Tripwire {
-    /// Arm on whatever `root` holds now.
-    #[must_use]
-    pub fn arm(root: &Path, path_env: &OsStr, toolchain: ToolchainIdentity) -> Self {
-        Self::arm_against(root, path_env, None, toolchain)
-    }
-
     /// Arm on `baseline` when there is one — the state a snapshot's sync
     /// VERIFIED equal to the caller's — and compare it with a fresh capture
     /// now, so anything that moved between the sync and the ladder trips the

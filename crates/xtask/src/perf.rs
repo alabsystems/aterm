@@ -2846,7 +2846,7 @@ mod tests {
     //
     // These three read the REAL tools/golden files. They are pure string work
     // over two small committed TSVs — microseconds — so they ride `cargo test`
-    // and therefore `tools/verify.sh --fast` at no marginal cost, which is the
+    // and therefore `tools/verify.sh` at no marginal cost, which is the
     // only way anything about the perf ledger can be in the merge contract at
     // all (the MEASURING half of `gate perf` cannot: see the module docs on
     // `gate_trend`, and the notes in docs/PERF-REGRESSION-DEFENCE.md).

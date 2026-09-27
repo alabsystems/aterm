@@ -584,12 +584,22 @@ impl CursorStateHandler<'_> {
     /// Handle DECSCUSR (Set Cursor Style).
     ///
     /// CSI Ps SP q
+    // The parameter decides which: a shape other than the host's is
+    // `SetCursorStyle`, the host's own shape `RestoreCursorStyle`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetCursorStyle",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "RestoreCursorStyle",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     pub(super) fn handle_decscusr(&mut self, params: &[u16]) {
@@ -610,9 +620,6 @@ impl CursorStateHandler<'_> {
                 // frontend blink timer; this covers a within-class change (e.g. steady
                 // block -> steady bar) with no grid write.
                 self.grid.mark_cursor_damage();
-                if let Some(callback) = self.cursor_style_callback {
-                    callback(style);
-                }
             }
         }
     }

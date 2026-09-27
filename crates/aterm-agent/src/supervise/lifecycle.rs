@@ -17,15 +17,15 @@
 //!   that doubles from 250 ms to 8 s.
 //! * At the start ([`Session::take_claim`], `claim.rs`) the session's
 //!   supervisor claim is taken, and then ([`Session::reconcile`]) the keyed
-//!   attention entry a previous supervisor left (owner `supervisor`,
-//!   [`is_ours`]) is adopted when the screen still shows its point — no
+//!   attention entry a previous supervisor left (owner `supervisor`: the
+//!   key is the proof, never the text) is adopted when the screen still shows its point — no
 //!   second badge, no second mail — and unset when it does not (the
 //!   stale-badge-after-a-restart case). A loop watching behind another
 //!   supervisor's claim settles nothing: the entry is that one's.
 //! * At the end ([`Session::release_attention`]) the badges this loop set
 //!   are cleared, if they are still its own, and the claim is released.
 
-use super::escalate::{is_ours, point_label, status_field};
+use super::escalate::{point_label, status_field};
 use super::*;
 
 impl<C: Ctl> Session<'_, C> {
@@ -40,13 +40,19 @@ impl<C: Ctl> Session<'_, C> {
         let Some(line) = meta.lines().find(|l| l.starts_with("OK")) else {
             return;
         };
-        self.cwd = line
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("cwd="))
-            .filter(|v| *v != "-" && !v.is_empty())
-            .map(super::super::report::pct_decode)
-            .filter(|p| p.starts_with('/'))
-            .map(PathBuf::from);
+        // The shell's reported directory (OSC 7) first; where it reported
+        // none, the agent process's own (`agent_cwd=`, 2026-09-27) — where it
+        // was launched, which is what `ApprovalCtx::cwd` means and exactly
+        // the folder Claude Code's trust dialog asks about.
+        let field = |key: &str| {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(key))
+                .filter(|v| *v != "-" && !v.is_empty())
+                .map(super::super::report::pct_decode)
+                .filter(|p| p.starts_with('/'))
+                .map(PathBuf::from)
+        };
+        self.cwd = field("cwd=").or_else(|| field("agent_cwd="));
     }
 
     /// A press or a dismissal the server did not take: parked on the hold
@@ -140,6 +146,11 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<(), Fail> {
         let pause = self.refusal_pause;
         self.refusal_pause = pause.saturating_mul(2).min(REFUSAL_PAUSE_MAX);
+        // The server refused it behind input the worker has not read: the
+        // next look reads `status` before it presses (`stall.rs`).
+        if why.contains("ERR busy input-unread") {
+            self.stall_suspect = true;
+        }
         review.note(&format!(
             "REFUSED seq={seq} backoff={} {}",
             pause.as_millis(),
@@ -154,9 +165,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A watch's first act after its claim: the keyed attention entry a
-    /// previous supervisor left on the worker (owner `supervisor`, text
-    /// [`is_ours`]) — a watcher that died, the host before a restart — is
-    /// settled. When the screen still shows its point (the same box or
+    /// previous supervisor left on the worker (owner `supervisor`) — a
+    /// watcher that died, the host before a restart — is settled. When the screen still shows its point (the same box or
     /// question, by [`point_label`]; a limit notice under a `limited:` text)
     /// it is ADOPTED: the point counts as escalated, so no second badge or
     /// mail goes out for it. Otherwise it is unset, by its key. The server
@@ -198,19 +208,21 @@ impl<C: Ctl> Session<'_, C> {
             }
             return Ok(());
         }
-        let Some(text) = standing_attention(&read.stdout).filter(|t| is_ours(t)) else {
+        let Some(text) = standing_attention(&read.stdout) else {
             return Ok(());
         };
-        let turn = turn_of(self.screen()?);
+        let screen = self.screen()?;
+        let turn = self.turn_of(screen);
         // An idle point the turn-end policy escalated (`claude idle: …`,
         // `claude wall: …`) is adopted like a box or a question: a loop that
         // restarted over it decides nothing new there (no work seen since),
         // so a badge cleared here would be raised by no one.
         let showing = match &turn.phase {
             Phase::Limited { .. } => text.starts_with(ATTENTION_PREFIX),
-            Phase::Prompt | Phase::Question | Phase::Idle => {
-                text.starts_with(&format!("{} (", point_label(&turn)))
-            }
+            Phase::Prompt | Phase::Question | Phase::Idle => text.starts_with(&format!(
+                "{} (",
+                point_label(self.reader(&turn.screen.rows), &turn)
+            )),
             _ => false,
         };
         let seq = turn.screen.seq;
@@ -248,24 +260,28 @@ impl<C: Ctl> Session<'_, C> {
             let _ = self.close_episode(seq, "the watcher ended", review);
         }
         if std::mem::take(&mut self.turn_end_badge) {
-            let _ = self.unset_if_ours(is_ours);
+            let _ = self.unset_if_ours(|_| true);
         }
         self.release_claim();
     }
 
-    /// The in-GUI host's loop: [`Self::watch`]'s, under `opts` (normally
+    /// The in-GUI host's loop: `Self::watch`'s, under `opts` (normally
     /// [`SuperviseOpts::hosted`]), until `stop` is set — checked at every
-    /// look, every wait of a turn, every wait on a handed point and every
-    /// ride-out pause, so the loop ends within one wait of it (20 s at most).
+    /// look, before every wait of a turn, every wait on a handed point and
+    /// every ride-out pause, and before EVERY wait by [`Self::call`], which
+    /// refuses one once the flag is set, as it refuses a write — so the loop
+    /// ends within one wait of it: the wait already asked for when the flag
+    /// landed, 20 s at most ([`WAIT_STEP`]); a ride-out pause, 8 s at most.
     /// The transport's [`Ctl::interrupter`] ends a parked wait at once, but
     /// it ends the connection with it, so the badges this loop raised can no
     /// longer be cleared: a host that wants them cleared sets the flag and
     /// lets the wait run out. Every line goes to `out` and, with
-    /// `opts.journal`, the journal; the approval ledger is kept at
-    /// [`approvals::default_path`] unless one was set. The badges it raised
-    /// are cleared as it ends. `Ok` for a stop or a spent budget, `Err` with
-    /// the reason for anything else (the session gone, an outage past its
-    /// window).
+    /// `opts.journal`, the journal; the approval ledger is kept where one was
+    /// set, else at `opts.ledger` — the host's, never the process's own state
+    /// directory by default. The badges it raised
+    /// are cleared as it ends. `Ok(())` for a stop or a spent budget, `Err`
+    /// with the reason for anything else (the session gone, an outage past
+    /// its window).
     pub fn run_hosted(
         &mut self,
         opts: &SuperviseOpts,
@@ -273,8 +289,11 @@ impl<C: Ctl> Session<'_, C> {
         out: &mut (dyn Write + Send),
     ) -> Result<(), String> {
         self.stop = Some(stop);
+        // No teller rides beside the hosted loop: the story lines it owes the
+        // window (`story chose …`) go out on its own connection.
+        self.tell_own = true;
         if self.ledger_path.is_none() {
-            self.ledger_path = approvals::default_path(self.sid.as_deref());
+            self.ledger_path.clone_from(&opts.ledger);
         }
         let allow = opts.allow();
         let mut warn = std::io::stderr();

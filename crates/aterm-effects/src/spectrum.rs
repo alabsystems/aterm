@@ -126,6 +126,7 @@ pub const SPECTRUM_STOPS: usize = 7;
 ///
 /// The bright waypoint is not a stop: [`spectrum_snap`] still resolves to the
 /// seven ROYGBIV anchors, and [`SPECTRUM_STOPS`] still counts seven.
+#[cfg(test)]
 const SPECTRUM_CROSSING_SEG: usize = 3;
 
 /// The LUT's length: **511 entries, just under 2 KiB**, and the length of the
@@ -138,7 +139,7 @@ pub const SPECTRUM_LUT_LEN: usize = 511;
 ///
 /// `85 * i` is anchor `i`, and the whole path is `510` units long. The
 /// generator then RESAMPLES that path by perceptual pace
-/// ([`generate_spectrum_lut`]), so a table index is a distance along the arc and
+/// (`generate_spectrum_lut`), so a table index is a distance along the arc and
 /// not a slot of it. Where the anchors ended up is [`SPECTRUM_ANCHOR_AT`],
 /// which is committed and re-derived by the generator.
 pub const SPECTRUM_STRIDE: usize = (SPECTRUM_LUT_LEN - 1) / (SPECTRUM_STOPS - 1);
@@ -208,6 +209,7 @@ const _: () = assert!(
 /// the pace's — the shipped table's own minimum there is `0.020`). Past `0.70`
 /// the hue keeps improving by hundredths and the perceptual spread pays for all
 /// of it.
+#[cfg(test)]
 const SPECTRUM_PACE_HUE_SHARE: f64 = 0.60;
 
 /// **THE SHARE OF THE PACE THAT IS BYTES** — `0.30`, and it is what keeps the
@@ -224,12 +226,14 @@ const SPECTRUM_PACE_HUE_SHARE: f64 = 0.60;
 /// the middle of the flat part of that curve (`0.15`
 /// through `0.60` all measure `4`), and it costs the hue spread nothing
 /// (`max/med 1.53 -> 1.58` between `0.0` and `0.30`).
+#[cfg(test)]
 const SPECTRUM_PACE_BYTE_SHARE: f64 = 0.30;
 
 /// How finely the pacing integral is taken, in samples per path slot. `64` puts
 /// about `32 600` samples on the path; the resulting entry positions move by
 /// less than a thousandth of a slot if it is doubled, which is two orders under
 /// the rounding that commits them.
+#[cfg(test)]
 const SPECTRUM_PACE_FINE: usize = 64;
 
 /// **THE MOST OF THE TABLE THE GREEN→BLUE CROSSING MAY HAVE** — `167` of the
@@ -310,10 +314,12 @@ const SPECTRUM_PACE_FINE: usize = 64;
 ///
 /// Stated with half an entry of margin either side of `167`, so that the
 /// floor this resolves through cannot be moved by a rounding change.
+#[cfg(test)]
 const SPECTRUM_CROSSING_SHARE_CAP: f64 =
     (SPECTRUM_CROSSING_ENTRY_CAP as f64 + 0.5) / (SPECTRUM_LUT_LEN - 1) as f64;
 
 /// [`SPECTRUM_CROSSING_SHARE_CAP`] in the unit it resolves to: table entries.
+#[cfg(test)]
 const SPECTRUM_CROSSING_ENTRY_CAP: usize = 167;
 
 /// **WHERE THE SEVEN NAMES LANDED**, in table indices — `@generated` beside
@@ -347,13 +353,16 @@ pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = [0, 58, 130, 237, 404, 4
 /// asks whether a burst that landed on the arc's warm third threw any light
 /// from the arc's COOL third — "no cyan the band does not have". The window is
 /// how "the crossing's colours" is spelled there. Nothing clamps to it.
+#[cfg(test)]
 pub const SPECTRUM_CYAN_LO: f64 = 165.0;
 /// The top of [`SPECTRUM_CYAN_LO`]'s window.
+#[cfg(test)]
 pub const SPECTRUM_CYAN_HI: f64 = 200.0;
 /// Below this HSV saturation a colour in the window is a GREY rather than a
 /// crossing colour, so a census that is asking "did this mark carry the
 /// crossing's light" must not count it. HSV `S` is a ratio and inflates without
 /// bound near black, which is what this floor is for.
+#[cfg(test)]
 pub const SPECTRUM_CYAN_SAT_MIN: f64 = 0.3;
 
 // ---------------------------------------------------------------------------
@@ -366,6 +375,7 @@ pub const SPECTRUM_CYAN_SAT_MIN: f64 = 0.3;
 /// what makes the family's reflected (ping-pong) sweep C¹ at both turnarounds
 /// instead of printing a crease each time it turns around at red or violet.
 #[inline]
+#[cfg(test)]
 fn smoothstep01(x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
@@ -407,6 +417,7 @@ pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
 
 /// HSV → unquantized sRGB `0..1`, hue in degrees. The crossing-roof generator
 /// stays in `f64` and rounds exactly once when it commits an entry to the LUT.
+#[cfg(test)]
 fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
     let h = hue_deg.rem_euclid(360.0) / 60.0;
     let c = v * s;
@@ -437,6 +448,7 @@ fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
 /// samples of this and a `u8` staircase would make that integral measure the
 /// rounding rather than the arc; rounding happens once, where an entry is
 /// committed.
+#[cfg(test)]
 fn spectrum_path(x: f64) -> [f64; 3] {
     let x = x.clamp(0.0, (SPECTRUM_LUT_LEN - 1) as f64);
     let seg = ((x / SPECTRUM_STRIDE as f64).floor() as usize).min(SPECTRUM_STOPS - 2);
@@ -463,6 +475,7 @@ fn spectrum_path(x: f64) -> [f64; 3] {
 
 /// The path colour as the byte triple an entry would commit — one rounding, and
 /// the same one [`spectrum_from_hsv`] performs.
+#[cfg(test)]
 fn spectrum_path_byte(x: f64) -> u32 {
     let c = spectrum_path(x);
     let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -476,6 +489,7 @@ fn spectrum_path_byte(x: f64) -> u32 {
 /// a step along the path, so that equal steps of the table are equal steps of
 /// the eye. Nothing that ships reads it — the arc's own colours are authored in
 /// sRGB and its rulings are stated in HSV.
+#[cfg(test)]
 fn spectrum_oklab(c: [f64; 3]) -> [f64; 3] {
     let lin = |v: f64| {
         if v <= 0.040_45 {
@@ -497,6 +511,7 @@ fn spectrum_oklab(c: [f64; 3]) -> [f64; 3] {
 
 /// The HSV hue of an unquantized triple, in degrees — [`spectrum_hsv`]'s hue,
 /// asked of the path rather than of a committed byte.
+#[cfg(test)]
 fn spectrum_path_hue(c: [f64; 3]) -> f64 {
     let (r, g, b) = (c[0], c[1], c[2]);
     let hi = r.max(g).max(b);
@@ -544,12 +559,14 @@ fn spectrum_path_hue(c: [f64; 3]) -> f64 {
 /// nothing at run time, and a test regenerates it so the committed bytes can
 /// never drift from the law that produced them.
 #[must_use]
+#[cfg(test)]
 pub fn generate_spectrum_lut() -> [u32; SPECTRUM_LUT_LEN] {
     generate_spectrum_table().lut
 }
 
 /// **THE GENERATOR'S FULL RESULT** — the table, and the two things about it
 /// that used to be arithmetic and are now measurements.
+#[cfg(test)]
 pub struct SpectrumTable {
     /// The committed [`SPECTRUM_LUT`].
     pub lut: [u32; SPECTRUM_LUT_LEN],
@@ -565,6 +582,7 @@ pub struct SpectrumTable {
 
 /// [`generate_spectrum_lut`]'s full result — see [`SpectrumTable`].
 #[must_use]
+#[cfg(test)]
 pub fn generate_spectrum_table() -> SpectrumTable {
     spectrum_table_at_cap(SPECTRUM_CROSSING_SHARE_CAP)
 }
@@ -574,6 +592,7 @@ pub fn generate_spectrum_table() -> SpectrumTable {
 /// `rainbow_kitty::ribbon` runs it across a range of caps and measures what
 /// each one costs yellow and buys the crossing. The shipped table is this
 /// function at [`SPECTRUM_CROSSING_SHARE_CAP`] and nothing else.
+#[cfg(test)]
 pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
     // THE SIX LEGS, in path slots: one per anchor interval, and nothing else.
     const LEGS: usize = SPECTRUM_STOPS - 1;
@@ -761,6 +780,7 @@ pub(crate) fn spectrum_crossing_span() -> f32 {
 
 /// Where along a leg the pace has spent `want` — the inverse of the cumulative
 /// cost, by binary search and one linear step inside the bracket it lands in.
+#[cfg(test)]
 fn spectrum_pace_at(cum: &[(f64, [f64; 3])], cost: &impl Fn([f64; 3]) -> f64, want: f64) -> f64 {
     if want <= 0.0 {
         return cum[0].0;
@@ -837,7 +857,7 @@ pub fn spectrum(t: f32) -> u32 {
 /// greyest cell on a typed line — to `(3, 95, 95)`, `S 0.97`, at the same
 /// relative luminance.
 ///
-/// **THE DIP ITSELF IS GONE SINCE 2026-09-15** ([`SPECTRUM_CROSSING_SEG`]): the
+/// **THE DIP ITSELF IS GONE SINCE 2026-09-15** (`SPECTRUM_CROSSING_SEG`): the
 /// crossing is drawn in HSV between two `S 1` anchors, so `SPECTRUM_LUT` is now
 /// `S 1.00` end to end and this is the identity on every read of the arc. It is
 /// kept because it is a FLOOR on a producer's own input and `bed_ink` is a
@@ -981,7 +1001,7 @@ pub(crate) fn spectrum_max_byte_rate() -> f32 {
 /// THE ONE SPECTRUM, resolved — 511 entries, 2 KB, `0x00RRGGBB`, red at index
 /// `0` and violet at index `510`.
 ///
-/// **`@generated` by [`generate_spectrum_lut`] — do not edit by hand.** The seven
+/// **`@generated` by `generate_spectrum_lut` — do not edit by hand.** The seven
 /// anchors sit verbatim at the indices [`SPECTRUM_ANCHOR_AT`] names; entries
 /// between them are the drawn path, resampled at an even PACE.
 ///

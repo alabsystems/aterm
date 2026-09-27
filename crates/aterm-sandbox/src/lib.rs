@@ -18,8 +18,7 @@
 //! Platform split: the cap gate and the `Limits` policy surface are shared; the
 //! actuator is per-platform (`src/unix.rs` = the POSIX `setrlimit` loop,
 //! `src/windows.rs` = a documented, capability-gated NO-OP until the Job Object
-//! resource lane lands). [`rlimits_actuated`] tells callers which one they got so
-//! the launcher startup notices stay honest.
+//! resource lane lands).
 //!
 //! STATUS (per §0.1): the cap gate and `setrlimit` application are tested (the
 //! application is verified by reading the limit back); not yet Trust-proven.
@@ -45,7 +44,7 @@ pub enum Sandbox {}
 /// **hard** ceiling is PRESERVED (never lowered) so the spawned `$SHELL` can
 /// still raise its own soft limit from its rc — see `set_limit` in the unix
 /// actuator. (On Windows these values are inert — no rlimit analogue is
-/// installed; see [`rlimits_actuated`].)
+/// installed; [`Limits::apply_to_job`] is the Windows lane.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     /// CPU seconds (`RLIMIT_CPU`).
@@ -146,14 +145,16 @@ impl Limits {
     /// policy *requested* that the OS *supports* is actually installed — is exactly
     /// the macOS no-op regression this best-effort-per-limit loop fixes: a requested
     /// limit the OS supports is never silently skipped because an earlier unsupported
-    /// one (e.g. `RLIMIT_AS` on macOS) errored. Tier-1 conformance drives this method
-    /// and projects `<<requested, supported, applied, done>>`
-    /// (`tests/conformance_sandbox.rs`).
+    /// one (e.g. `RLIMIT_AS` on macOS) errored. There is NO Tier-1 binding: the one
+    /// that existed drove a pure per-slot rule this loop never called (the loop runs
+    /// post-fork and may not allocate), so it bound a model to code that did not
+    /// ship and was retired (2026-09-25). `apply_actually_sets_the_limit` reads the
+    /// installed limit back.
     // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `Apply` projects the real
     // best-effort-per-limit apply loop onto the spec's `<<requested, supported,
-    // applied, done>>` — the projection `conformance_sandbox.rs` drives in Tier-1.
-    // The L2 obligation requires the projection NAME be present (Trust does not
-    // execute it); `aterm_sandbox::Sandbox::project_apply` is that witness.
+    // applied, done>>`. The L2 obligation requires the projection NAME be present
+    // (Trust does not execute it); `aterm_sandbox::Sandbox::project_apply` is that
+    // witness.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -199,94 +200,6 @@ impl Limits {
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
         imp::apply_to_job(self, job)
     }
-}
-
-/// Whether this build/platform actually installs the requested resource
-/// limits at the spawn seam. `true` on POSIX (`setrlimit` in the child before
-/// exec); `false` on Windows, where [`Limits::apply`] is a capability-gated
-/// NO-OP (a Job Objects lane is the follow-up) — callers must print the
-/// one-line posture notice so an unlimited child is never silent. Mirrors
-/// `aterm_containment::os_sandbox_actuated` in shape and honesty.
-#[must_use]
-pub const fn rlimits_actuated() -> bool {
-    cfg!(unix)
-}
-
-/// Whether this build/platform installs the requested resource limits on the
-/// spawned child's **Job Object** at the spawn seam. `true` on Windows, where
-/// [`Limits::apply_to_job`] folds the memory/CPU limits into the job the ConPTY
-/// seam assigns the child to (there is no POSIX `setrlimit` lane there — see
-/// [`rlimits_actuated`]); `false` elsewhere, where confinement is `setrlimit`
-/// instead. The two predicates are mutually exclusive per platform, so a
-/// launcher prints exactly one honest posture line. Note this reports the
-/// KERNEL lane exists on this platform; the child is only actually confined
-/// once the spawn seam calls [`Limits::apply_to_job`] against its job.
-#[must_use]
-pub const fn job_limits_actuated() -> bool {
-    cfg!(windows)
-}
-
-/// The per-restriction APPLY rule of `Limits::apply`, factored out as a pure
-/// function so the fail-closed "requested ∧ supported ⇒ applied" discipline is
-/// testable WITHOUT mutating the process-wide rlimits (and is the seam the
-/// `Sandbox.tla` Tier-1 conformance projects).
-///
-/// This is the body of the spec's (correct, `Buggy=FALSE`) `Apply` action, slot by
-/// slot: `applied[n]' = applied[n] ∨ (requested[n] ∧ supported[n])`. The real
-/// [`Limits::apply`] loop attempts every *requested* limit (a `Some(_)` field) and
-/// the OS accepts it iff that resource is *supported*; an unsupported one is skipped
-/// best-effort and never blocks the supported ones (the macOS `RLIMIT_AS` no-op the
-/// spec's `AllSupportedApplied` invariant forbids). `applied` here is the prior
-/// applied set (all-FALSE before the first apply) so the rule is monotone/idempotent,
-/// exactly as the spec models it.
-///
-/// TOTAL (Trust L0 panic-free): the three slices are the same K restriction
-/// slots, so equal lengths are the caller's invariant, not an assert —
-/// mismatched lengths are clamped to the shortest (and the slot count to 64)
-/// instead of panicking, a no-op for every real caller (K = 4 today).
-#[must_use]
-pub fn apply_step(requested: &[bool], supported: &[bool], applied: &[bool]) -> Vec<bool> {
-    // The three slices are the same K restriction slots, so their lengths are
-    // equal for every real caller (the Tier-1 conformance harness always passes
-    // K-length vectors). Clamp to the shortest instead of asserting equality:
-    // a reachable assert is a Trust L0 refutation, and under the documented
-    // invariant the clamp is a no-op — same `k`, same slots, same rule.
-    let k = requested.len();
-    let k = if supported.len() < k {
-        supported.len()
-    } else {
-        k
-    };
-    let k = if applied.len() < k { applied.len() } else { k };
-    // Slot-count bound: `k` counts restriction slots (4 today — `Limits` has
-    // four fields — and every kernel defines only ~16 `RLIMIT_*` resources),
-    // so clamping at 64 is a no-op for every real caller.
-    let k = k.min(64);
-    // Allocate the slot buffer at a CONSTANT size and truncate to `k`: the
-    // prover's bulk-allocation budget checks the count inside `from_elem`'s
-    // own frame, where a caller-side clamp on a variable count is invisible
-    // (it havocs the count — `.collect()` and `vec![false; k]` both refuted),
-    // but a constant count is provably bounded. `truncate` keeps `len == k`,
-    // so the result is behavior-identical. The fill loop then writes each
-    // slot with the spec rule via total `get` accesses (`n < k <= len` of
-    // every slice, so no `unwrap_or`/`get_mut` guard ever fires — they exist
-    // to keep the function panic-free by construction).
-    let mut out = vec![false; 64];
-    out.truncate(k);
-    let mut n = 0usize;
-    while n < k {
-        let was = applied.get(n).copied().unwrap_or(false);
-        let req = requested.get(n).copied().unwrap_or(false);
-        let sup = supported.get(n).copied().unwrap_or(false);
-        if let Some(slot) = out.get_mut(n) {
-            *slot = was || (req && sup);
-        }
-        // The `n < k` guard makes this add exact (`n + 1 <= k <= usize::MAX`,
-        // it can never wrap); `wrapping_add` states that as a fact instead of
-        // leaving an overflow obligation for the interval engine.
-        n = n.wrapping_add(1);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -357,9 +270,8 @@ mod tests {
     }
 
     // Windows: `apply` is a capability-gated NO-OP — the fail-closed gate still
-    // denies a weak cap (SEC-2 parity with the Unix child's exit-before-exec), a
-    // Trusted cap succeeds without installing any limit, and the posture predicate
-    // says so honestly (the launchers print the one-line notice from it).
+    // denies a weak cap (SEC-2 parity with the Unix child's exit-before-exec), and a
+    // Trusted cap succeeds without installing any limit.
     #[cfg(windows)]
     #[test]
     fn windows_apply_is_a_capgated_noop() {
@@ -375,16 +287,6 @@ mod tests {
             io::ErrorKind::PermissionDenied,
             "the cap gate must fail closed even though the actuator is a no-op"
         );
-        assert!(
-            !rlimits_actuated(),
-            "Windows must report rlimits NOT actuated (honest posture)"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_reports_rlimits_actuated() {
-        assert!(rlimits_actuated(), "POSIX setrlimit lane is real");
     }
 
     #[cfg(unix)]

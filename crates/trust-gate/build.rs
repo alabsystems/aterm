@@ -6,7 +6,8 @@
 // aterm-managed store's toolchain (`<prefix>/store/trust/<build>/bin/{targo,
 // trustc}`, reached through the `<prefix>/bin` shims — `aterm pkg which targo`;
 // on a machine that also has rustup, atpkg maintains ~/.rustup/toolchains/trust
-// -> <prefix>/store/trust/current so rustup's proxy resolves the same pin;
+// -> <prefix>/rustup/trust, its view of the store's current build, so rustup's
+// proxy resolves the same pin;
 // stated 2026-09-18) and .cargo/config.toml's verification opt-out is scoped to
 // that compiler by `[target.'cfg(trust_verify)']`, so an upstream rustc never
 // even sees the `-Z` flag. Before this crate, reaching an upstream rustc — a

@@ -73,6 +73,7 @@ impl HyperlinkSpan {
     /// Get the span width in columns.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub fn width(&self) -> u16 {
         self.end_col.saturating_sub(self.start_col)
     }

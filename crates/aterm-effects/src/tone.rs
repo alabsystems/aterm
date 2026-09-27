@@ -513,6 +513,7 @@ pub fn builtin() -> Option<&'static ToneModel> {
 /// The committed held-out sanity set (never seen by SGD) — the conformance
 /// tests' expectations file, exposed so hosts/tools can re-run the same
 /// audit. Format: `label \t lang \t text`.
+#[cfg(test)]
 pub const HOLDOUT_TSV: &str = include_str!("../data/tone_holdout.tsv");
 
 /// Parse one corpus/holdout TSV line (shared by the trainer and the
@@ -621,10 +622,45 @@ mod tests {
         assert_eq!(m.classify_opt(line, &mut s), Some(m.classify(line, &mut s)));
     }
 
+    /// CPU time the calling thread has run (`CLOCK_THREAD_CPUTIME_ID`): time
+    /// spent descheduled does not count, so a loaded gate machine cannot
+    /// charge its run queue to `classify` (the load-sensitive test audit of
+    /// 2026-09-27; the same clock as `aterm-render`'s `face_parse_cost.rs`).
+    #[cfg(unix)]
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut stamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `stamp` is initialized and writable for this one call.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut stamp) };
+        assert_eq!(rc, 0, "the thread CPU clock is readable");
+        std::time::Duration::new(
+            u64::try_from(stamp.tv_sec).expect("a non-negative CPU time"),
+            u32::try_from(stamp.tv_nsec).expect("nanoseconds under a second"),
+        )
+    }
+
+    /// Off unix there is no thread CPU clock in `libc`: the wall clock since
+    /// the first reading, with the load sensitivity that implies.
+    #[cfg(not(unix))]
+    fn thread_cpu_time() -> std::time::Duration {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
     /// The inference budget: <100 µs per line, AVERAGED over a batch (a
-    /// single wall-clock sample on shared CI would be noise). The lines are
-    /// long (≈120 chars) and multilingual — the worst realistic case the
-    /// input path will hand us at its throttled cadence.
+    /// single sample would be noise). The lines are long (≈120 chars) and
+    /// multilingual — the worst realistic case the input path will hand us
+    /// at its throttled cadence.
+    ///
+    /// Priced in THREAD CPU time, the cheapest of five batches of 200 (the
+    /// load-sensitive test audit of 2026-09-27). The wall clock charged every
+    /// moment the test thread sat descheduled beside 2 000 sibling tests and
+    /// other gates to `classify`; the CPU clock does not, and the minimum
+    /// sheds a batch that ran on a slow core or a cold cache. The regression
+    /// this guards — an order-of-magnitude costlier model — is CPU, and it
+    /// inflates every batch, so the ceilings below are unchanged.
     #[test]
     fn classification_fits_the_line_budget() {
         let m = builtin().expect("shipped model");
@@ -634,15 +670,18 @@ mod tests {
         for _ in 0..16 {
             let _ = m.classify(line, &mut s);
         }
-        let start = std::time::Instant::now();
-        let iters = 1000u32;
+        let iters = 200u32;
         let mut sink = 0usize;
-        for _ in 0..iters {
-            sink = sink.wrapping_add(m.classify(line, &mut s).index());
+        let mut cheapest = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let start = thread_cpu_time();
+            for _ in 0..iters {
+                sink = sink.wrapping_add(m.classify(line, &mut s).index());
+            }
+            cheapest = cheapest.min(thread_cpu_time().saturating_sub(start));
         }
-        let elapsed = start.elapsed();
         assert!(sink < usize::MAX, "keep the loop observable");
-        let per_line = elapsed / iters;
+        let per_line = cheapest / iters;
         // The <100 µs contract is a property of the OPTIMIZED build the app
         // ships (measured ~5–20 µs there); an unoptimized test profile runs
         // the same arithmetic ~10–20× slower, so debug asserts a loose

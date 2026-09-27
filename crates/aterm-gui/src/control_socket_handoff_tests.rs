@@ -23,6 +23,17 @@ fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
     (dir, plan)
 }
 
+/// How long a wait for an event may take before the test calls it a hang.
+const EVENT_WAIT: Duration = Duration::from_secs(30);
+
+/// The instance that bound `plan` leaves: its socket and token go. By path,
+/// because the fixture's files are that instance's own; the identity rule an
+/// exit really removes by is `owned_endpoint`'s, tested there.
+fn leave(plan: &control_auth::SocketPlan) {
+    let _ = std::fs::remove_file(&plan.sock_path);
+    let _ = std::fs::remove_file(&plan.token_path);
+}
+
 fn step(model: &Model, state: &mut BTreeMap<&'static str, i64>, action: &'static str) {
     let successors = model.successors(action, state);
     assert_eq!(successors.len(), 1, "{action} is not admitted at {state:?}");
@@ -77,8 +88,9 @@ fn incoming_control_preparation_requires_both_real_service_lanes() {
 #[test]
 fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     let (_dir, plan) = fixture();
-    let (parent, parent_token) =
-        bind_control_listener(&plan, None, || false, |_| false, None).unwrap();
+    let (parent, parent_token) = bind_control_listener(&plan, None, || false, |_| false, None)
+        .unwrap()
+        .into_parts();
     let token_before = std::fs::read(&plan.token_path).unwrap();
     let identity = crate::control_socket_identity::SocketIdentity::capture(
         &plan,
@@ -111,7 +123,12 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
             done_tx.send(result).unwrap();
         })
     };
-    began_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Every wait below is for an EVENT, bounded only against a hang: under
+    // the merge contract's parallel run on a loaded machine the successor's
+    // bind took longer than the 3 s this used to allow (2026-09-26, load
+    // average 32), and a short bound on an event is a flake, not a check.
+    // The negative checks — nothing done within 30 ms — keep their windows.
+    began_rx.recv_timeout(EVENT_WAIT).unwrap();
     let model = native_update_control_socket_handoff_model();
     let mut state = model.init_state();
     assert!(model.successors("Bind", &state).is_empty());
@@ -124,7 +141,7 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
 
     gate.release();
     step(&model, &mut state, "Commit");
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + EVENT_WAIT;
     while !observed_parent.load(Ordering::Acquire) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -143,9 +160,10 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
     drop(parent);
     let (successor, successor_token) = done_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(EVENT_WAIT)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .into_parts();
     child.join().unwrap();
     step(&model, &mut state, "Bind");
     assert_eq!(state["bound"], 1);
@@ -161,13 +179,15 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     let (accepted, _) = successor.accept().unwrap();
     control_auth::peer_check(&accepted).unwrap();
     drop((client, accepted, successor));
-    control_auth::cleanup_socket(&plan);
+    leave(&plan);
 }
 
 #[test]
 fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     let (_dir, plan) = fixture();
-    let (parent, token) = bind_control_listener(&plan, None, || false, |_| false, None).unwrap();
+    let (parent, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+        .unwrap()
+        .into_parts();
     let identity =
         crate::control_socket_identity::SocketIdentity::capture(&plan, &parent, token.as_str())
             .unwrap();
@@ -193,7 +213,7 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
     assert!(control_auth::socket_is_live(&plan.sock_path));
     drop(parent);
-    control_auth::cleanup_socket(&plan);
+    leave(&plan);
 
     // A crashed predecessor without Commit is not takeover authority either.
     let model = native_update_control_socket_handoff_model();
@@ -207,14 +227,17 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
 fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
     use std::os::fd::AsRawFd;
     let (_dir, plan) = fixture();
-    let (parent, token) = bind_control_listener(&plan, None, || false, |_| false, None).unwrap();
+    let (parent, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+        .unwrap()
+        .into_parts();
     let identity =
         crate::control_socket_identity::SocketIdentity::capture(&plan, &parent, token.as_str())
             .unwrap();
     drop(parent);
-    control_auth::cleanup_socket(&plan);
-    let (foreign, foreign_token) =
-        bind_control_listener(&plan, None, || false, |_| false, None).unwrap();
+    leave(&plan);
+    let (foreign, foreign_token) = bind_control_listener(&plan, None, || false, |_| false, None)
+        .unwrap()
+        .into_parts();
     assert_eq!(unsafe { libc::listen(foreign.as_raw_fd(), 1) }, 0);
     let _connections: Vec<_> = (0..128)
         .filter_map(|_| control_auth::connect_socket_nonblocking(&plan.sock_path).ok())
@@ -238,14 +261,16 @@ fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
     }
     assert!(model.successors("Bind", &state).is_empty());
     drop(foreign);
-    control_auth::cleanup_socket(&plan);
+    leave(&plan);
 }
 
 #[test]
 fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
     use std::os::fd::AsRawFd;
     let (_dir, plan) = fixture();
-    let (foreign, token) = bind_control_listener(&plan, None, || false, |_| false, None).unwrap();
+    let (foreign, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+        .unwrap()
+        .into_parts();
     let identity =
         crate::control_socket_identity::SocketIdentity::capture(&plan, &foreign, token.as_str())
             .unwrap();
@@ -291,7 +316,7 @@ fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
         step(&model, &mut state, action);
     }
     assert!(model.successors("Bind", &state).is_empty());
-    control_auth::cleanup_socket(&plan);
+    leave(&plan);
 }
 
 #[test]
@@ -334,7 +359,7 @@ fn a_transient_handoff_bind_failure_recovers_without_rewriting_credentials() {
     assert_eq!(state["attempts"], attempts);
     assert_eq!(state["bound"], 1);
     drop((client, accepted, listener));
-    control_auth::cleanup_socket(&plan);
+    leave(&plan);
 }
 
 #[test]
@@ -404,8 +429,9 @@ fn an_endpoint_arriving_during_handoff_backoff_is_preserved() {
                 foreign.is_none(),
                 "an occupied path cannot schedule more backoff"
             );
-            let (listener, token) =
-                bind_control_listener(&plan, None, || false, |_| false, None).unwrap();
+            let (listener, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+                .unwrap()
+                .into_parts();
             identity = Some(
                 crate::control_socket_identity::SocketIdentity::capture(
                     &plan,
@@ -427,5 +453,5 @@ fn an_endpoint_arriving_during_handoff_backoff_is_preserved() {
     assert_eq!(attempts, 2);
     assert!(identity.unwrap().matches_current(&plan));
     drop((connections, foreign));
-    control_auth::cleanup_socket(&plan);
+    leave(&plan);
 }

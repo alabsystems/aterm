@@ -11,7 +11,7 @@
 //! state set by writing to the last column.
 
 use super::Grid;
-#[cfg(any(test, feature = "fuzz", fuzzing, feature = "testing"))]
+#[cfg(any(test, feature = "fuzz", fuzzing))]
 use super::clamp_u16;
 
 impl Grid {
@@ -39,7 +39,7 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[inline]
     pub fn move_cursor_to(&mut self, row: u16, col: u16) {
         self.set_cursor(row, col);
@@ -50,7 +50,7 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
-    #[cfg(any(test, feature = "fuzz", fuzzing, feature = "testing"))]
+    #[cfg(any(test, feature = "fuzz", fuzzing))]
     #[inline]
     pub fn move_cursor_by(&mut self, dr: i32, dc: i32) {
         let new_row = clamp_u16(i32::from(self.storage.cursor.row) + dr);
@@ -457,6 +457,7 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     /// ENSURES: old(self.storage.cursor.col) > 0 implies self.storage.cursor.col == old(self.storage.cursor.col) - 1
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn backspace(&mut self) {
         self.storage.clear_pending_wrap();
         self.storage.cursor.col = self.storage.cursor.col.saturating_sub(1);
@@ -470,6 +471,7 @@ impl Grid {
     /// ENSURES: self.storage.saved_cursor.cursor == old(self.storage.cursor)
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn save_cursor(&mut self) {
         self.storage.save_cursor();
         debug_assert!(self.storage.saved_cursor().valid);
@@ -483,6 +485,7 @@ impl Grid {
     /// ENSURES: self.storage.saved_cursor.valid implies self.storage.cursor.row < self.storage.visible_rows
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
+    #[cfg(any(test, kani))]
     pub fn restore_cursor(&mut self) {
         let saved = self.storage.saved_cursor();
         if saved.valid {

@@ -349,24 +349,11 @@ impl Parser {
     /// Only use this for legacy applications that require C1 support. For modern
     /// UTF-8 terminals, use [`Parser::new()`] which disables C1 by default.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn with_c1_controls() -> Self {
         let mut parser = Self::new();
         parser.c1_controls_enabled = true;
         parser
-    }
-
-    /// Enable or disable 8-bit C1 control code interpretation.
-    ///
-    /// When disabled (default), bytes 0x80-0x9F are treated as invalid UTF-8.
-    /// When enabled, they are interpreted as C1 control codes.
-    pub fn set_c1_controls_enabled(&mut self, enabled: bool) {
-        self.c1_controls_enabled = enabled;
-    }
-
-    /// Check if 8-bit C1 control code interpretation is enabled.
-    #[must_use]
-    pub fn c1_controls_enabled(&self) -> bool {
-        self.c1_controls_enabled
     }
 
     /// Reset parser to ground state.
@@ -389,17 +376,6 @@ impl Parser {
     #[inline]
     pub fn state(&self) -> State {
         self.state
-    }
-
-    /// Get subparameter mask for the last CSI sequence.
-    ///
-    /// Bit `i` is set if `params[i]` was preceded by a colon (`:`) rather than
-    /// a semicolon (`;`), indicating it's a subparameter.
-    ///
-    /// Example: `ESC[4:3m` → `params=[4,3]`, `subparam_mask=0b10` (bit 1 set)
-    #[inline]
-    pub fn subparam_mask(&self) -> u32 {
-        self.subparam_mask
     }
 }
 

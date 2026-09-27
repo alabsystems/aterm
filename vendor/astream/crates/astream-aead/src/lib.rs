@@ -132,12 +132,26 @@ pub(crate) fn seal_in_place(key: &[u8; KEY_LEN], aad: &[u8], buf: &mut Vec<u8>, 
 /// [`AeadError`] if `sealed` is shorter than [`OVERHEAD`] or the tag does not
 /// verify.
 pub fn open(key: &[u8; KEY_LEN], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, AeadError> {
-    let mut buf = sealed.to_vec();
-    let plain = open_in_place(key, aad, &mut buf)?;
-    Ok(plain.to_vec())
+    if sealed.len() < OVERHEAD {
+        return Err(AeadError);
+    }
+    let (nonce, rest) = sealed.split_at(NONCE_LEN);
+    let (ct, tag) = rest.split_at(rest.len() - TAG_LEN);
+    // Only the ciphertext is copied, and decrypted in place once its tag has
+    // verified.
+    let mut plain = ct.to_vec();
+    XChaCha20Poly1305::new(key.into())
+        .decrypt_in_place_detached(
+            XNonce::from_slice(nonce),
+            aad,
+            &mut plain,
+            Tag::from_slice(tag),
+        )
+        .map_err(|_| AeadError)?;
+    Ok(plain)
 }
 
-/// Open in place — the one primitive both [`open`] and the record layer use.
+/// Open in place — the record layer's primitive.
 /// `buf` is `nonce ‖ ciphertext ‖ tag`; the tag is verified FIRST (constant
 /// time), and only then is the ciphertext decrypted in place, so on failure the
 /// buffer is untouched and nothing derived from an unauthentic message ever

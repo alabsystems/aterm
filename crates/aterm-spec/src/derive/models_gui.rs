@@ -165,11 +165,11 @@ pub fn tab_nav_model() -> Model {
     }
 }
 
-/// SPLIT-PANE TREE INTEGRITY — a tab's `PaneTree` (aterm-gui `pane.rs`) always keeps
-/// at least one leaf while the tab is open, and the FOCUSED leaf index never leaves
-/// the renderer's `0..leaf_count-1` range. This holds the split-pane feature
-/// (Cmd-D / Cmd-Shift-D split, Cmd-W / EOF close) to the same Trust bar as tabs:
-/// input + the solid cursor never route to a pane that no longer exists.
+/// SPLIT-PANE TREE INTEGRITY — the FOCUSED leaf index of a tab's `PaneTree`
+/// (aterm-gui `pane.rs`) never leaves the renderer's `0..leaf_count-1` range. This
+/// holds the split-pane feature (Cmd-D / Cmd-Shift-D split, Cmd-W / EOF close) to
+/// the same Trust bar as tabs: input + the solid cursor never route to a pane that
+/// no longer exists.
 ///
 /// `Buggy` gates the Close re-point: at `Buggy = 0` a Close that removes the focused
 /// last leaf drops `focused` to the new last index; at `Buggy = 1` it FORGETS the
@@ -177,6 +177,16 @@ pub fn tab_nav_model() -> Model {
 /// focus defect). So `ty` PROVES `FocusInRange` (Buggy=0) and CATCHES it (Buggy=1 →
 /// counterexample). SCOPE: only the `CloseOutcome::Collapsed` arm (the tab survives);
 /// a `LastPane` close is a tab-machine transition (`tab_nav` / `window_routing`).
+///
+/// No invariant says the tree is non-empty: `SplitTree` has no empty value (a sole
+/// leaf's `remove_leaf` reports `OnlyLeaf` and leaves it in place), so the claim
+/// would only restate Close's `leaf_count > 1` guard. The seam's real historical
+/// defect, 3c27540a7 (the removal elided from release builds, so `close_pane`
+/// reported `Collapsed` over a tree that still held the leaf), keeps a valid STATE
+/// and breaks the TRANSITION: no invariant here can see it, only a transition
+/// bind can, and only in a build that keeps the elided line out — which is why
+/// that fix carries its own both-profile regressions and the
+/// `no_tree_mutation_hides_inside_a_debug_assert` source guard.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -250,11 +260,6 @@ pub fn pane_tree_model() -> Model {
             },
         ],
         invariants: vec![
-            // The tab's tree is never empty while the tab is open (>= 1 leaf).
-            Invariant {
-                name: "TreeNonEmpty",
-                expr: gt(var("leaf_count"), int(0)),
-            },
             // Exactly-one in-range focused leaf: focused <= leaf_count - 1.
             Invariant {
                 name: "FocusInRange",
@@ -358,10 +363,10 @@ pub fn session_pool_model() -> Model {
 /// the mirror is `set_window_tabs(handle, titles, active)`, driven from
 /// `App::refresh_window_tabs` after EVERY tab mutation.
 ///
-/// Two-lane self-composition (cf. [`coalesce_model`]): one event stream drives BOTH a
-/// TRUTH lane `(count, active)` (the `TabIndex` machine of [`tab_nav_model`]) and a
-/// STRIP lane `(seg_count, selected)` (the control), re-synced to mirror the truth
-/// after each action. `ty` PROVES `StripMirrorsTruth` @Buggy=0; the Buggy branch in
+/// Two-lane self-composition (cf. [`recording_model`]'s live and replay lanes): one
+/// event stream drives BOTH a TRUTH lane `(count, active)` (the `TabIndex` machine of
+/// [`tab_nav_model`]) and a STRIP lane `(seg_count, selected)` (the control), re-synced
+/// to mirror the truth after each action. `ty` PROVES `StripMirrorsTruth` @Buggy=0; the Buggy branch in
 /// Close DROPS the strip re-sync (a missed `refresh_window_tabs`), freezing BOTH strip
 /// vars stale — so the strip shows an extra segment with an out-of-range selection,
 /// caught @Buggy=1.
@@ -531,10 +536,20 @@ pub fn tab_strip_model() -> Model {
 /// "swallow class" at `Buggy=1` (a close-collapse / new-window path that re-mirrors only
 /// the PER-WINDOW state via `sync_window` and forgets the global re-point) ->
 /// counterexample on `HandleMirrorsFront`. That is exactly the defect class fixed by
-/// routing `apply_close_outcome` / `create_window_internal` / `push_stub_tab` through
+/// routing `apply_close_outcome` / `create_window_internal` / the new-tab install through
 /// `resync_active_or_window`: without it the control socket keeps driving a stale, or
 /// just-closed, session — and `Owner`/aterm-ctl verbs bypass the per-request edge gate,
-/// so they hit whatever the stale handle points at.
+/// so they hit whatever the stale handle points at. The 2026-09-14 audit found the
+/// split and pane-focus moves in the same family. Every seam that CREATES the new
+/// front re-points in its install half, the part after the PTY spawn that moves the
+/// front — `install_new_tab`, `install_split_pane`, `install_window_state_with_parent`
+/// — rather than in each caller.
+///
+/// Tier-1: aterm-gui's `active_handle_conformance` drives a headless `App` through
+/// every one of those seams (the three install halves with a stub session, since the
+/// spawn needs an event loop), reads `truth` from the canonical tab model and
+/// `handle` from the real `active_handle`, and validates each front move against this
+/// model; the stale-handle step is the one it rejects.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -623,21 +638,39 @@ pub fn active_handle_model() -> Model {
     }
 }
 
-/// The cross-process `@<child>` proxy FORWARD is acyclic and TERMINATES (control.rs
+/// The cross-process `@<sid>` proxy FORWARD is acyclic and TERMINATES (control.rs
 /// `proxy_forward_plan` / `try_proxy_forward`). The recursion-topology refactor REMOVED
-/// the explicit hop-counter cap, leaving ONE structural invariant as the sole guard
-/// against a forward loop: the parent rewrites the child's own selector to `@.` (run on
-/// self) before relaying, so the child resolves the verb LOCALLY and never re-enters
-/// `try_proxy_forward`. A forward chain is therefore at most ONE cross-process hop — a
-/// child is never in its own proxy table, and the `@.` rewrite means it can't forward
-/// onward — so no A→B→A ping-pong (or unbounded relay-thread/fd growth) can form.
+/// the explicit hop-counter cap, so what bounds a forward chain is how each of the two
+/// hop kinds ENDS at its target:
 ///
-/// `ty` PROVES `OneHopNoCycle` at Buggy=0 — the rewrite-to-`@.` discipline caps the
-/// chain at depth 1 under any interleaving over the bounded space — and CATCHES the
-/// loop class at Buggy=1 (a forward that relays the ORIGINAL cross-selector instead of
-/// `@.`, so the child re-forwards and the chain grows past one hop) -> counterexample on
-/// `OneHopNoCycle`. This locks in the safety the removed hop-cap used to provide: if the
-/// `@.` rewrite ever regresses, the exhaustive check fails.
+/// * the CHILD hop (a session this aterm spawned): the parent rewrites the child's own
+///   selector to `@.` (run on self) before relaying, so the child resolves the verb
+///   LOCALLY and never re-enters `try_proxy_forward`;
+/// * the SIBLING hop (a same-uid aterm the user opened separately) keeps `@<sid>` — the
+///   sibling resolves it among its own tabs — and ends because the discovery entry it
+///   followed was published by the instance at that socket: there the sid is hosted
+///   locally, or the entry is stale and names the sibling's OWN socket, which the
+///   self-dial guard refuses.
+///
+/// A forward chain is therefore at most ONE cross-process hop, so no A→B→A ping-pong
+/// (or unbounded relay-thread/fd growth) can form.
+///
+/// `ty` PROVES `OneHopNoCycle` at Buggy=0 — a hop that ends at its target caps the chain
+/// at depth 1 under any interleaving over the bounded space — and CATCHES the loop class
+/// at Buggy=1 (a hop whose target forwards on: the original cross-selector relayed
+/// instead of `@.`, or a sibling that dials onward) -> counterexample on
+/// `OneHopNoCycle`. This locks in the safety the removed hop-cap used to provide.
+///
+/// Tier-1 binding, one test per hop kind in aterm-gui's `control::tests`, each taking
+/// the real first line `proxy_forward_plan` sends, stripping its handshake, and asking
+/// the real router again — with Owner scope, where forwarding is possible at all —
+/// whether the target would forward on; every hop is validated as this model's
+/// `Forward`, which `Buggy = 1` must reject:
+/// `proxy_forward_plan_conforms_to_proxy_forward_one_hop` asks in the forwarding
+/// process itself, where the child's sid IS forwardable, so only the `@.` rewrite can
+/// end the chain; `sibling_forward_plan_conforms_to_proxy_forward_one_hop` asks in the
+/// sibling's context (its store, its recorded self socket), for a sid it hosts and for
+/// a stale entry.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -661,10 +694,11 @@ pub fn proxy_forward_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // One forward hop: the parent dials the child and relays. The FIX rewrites
-            // the child's selector to `@.`, so the child runs the verb on ITSELF and the
-            // chain ENDS (active' = 0). The Buggy branch relays the original cross
-            // selector, so the child re-forwards and the chain CONTINUES (active' = 1).
+            // One forward hop, which ENDS at its target (active' = 0): a child runs the
+            // `@.`-rewritten verb on ITSELF; a sibling hosts the sid or refuses to dial
+            // itself. The Buggy branch is a target that forwards on — the original cross
+            // selector relayed to a child that re-forwards — so the chain CONTINUES
+            // (active' = 1).
             Action {
                 name: "Forward",
                 guard: Some(and_(

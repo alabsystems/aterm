@@ -219,11 +219,11 @@ impl Gui {
             .env("XDG_RUNTIME_DIR", s.path("run"))
             .env("XDG_CONFIG_HOME", s.path("cfg"))
             .env("SHELL", "/bin/sh")
-            .env("ATERM_LINES", "40")
-            .env("ATERM_COLUMNS", "120")
+            .args(["--lines", "40", "--columns", "120"])
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(err);
+        harness::arm_lifeline(&mut cmd, &s.dir);
         let child = cmd.spawn().expect("launch aterm-gui --headless");
         let ctl_sock = s.ctl_sock();
         let token = harness::World::wait_for_token_at(&ctl_sock);
@@ -836,6 +836,14 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
                 .any(|l| l.contains("none running")),
             "{out}"
         );
+        // No aterm.toml before this run: added, and no `.bak` promised or made.
+        let config = step(&out, "config");
+        assert!(
+            config.iter().any(|l| l.contains("add [fabric] command"))
+                && config.iter().all(|l| !l.contains("previous saved as")),
+            "{out}"
+        );
+        assert!(!s.dir.join("cfg/aterm/aterm.toml.bak").exists());
         // A cap already minted for this node is reused: no mint at all.
         std::fs::remove_file(s.dir.join("effects.trace")).expect("reset");
         let cap_before = cap_bytes(&s);
@@ -851,6 +859,9 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
                 .any(|l| l.contains("already") && l.contains("8 grants for")),
             "{out}"
         );
+        // No instance, so no proof: the summary says it was skipped.
+        assert!(!out.contains("the proof ran again"), "{out}");
+        assert!(out.contains("and the proof was skipped."), "{out}");
         guarded_broker_accepts_the_minted_caps(&s, &node);
         drop(broker);
     }
@@ -943,10 +954,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let broker_lines = step(&out, "broker");
     assert!(
         broker_lines.iter().any(|l| l.contains("FAILED")
-            && l.contains("does not manage")
-            && l.contains(&format!("pid {unmanaged_pid}"))
-            && l.contains(&format!("launchd {label} is not loaded"))
-            && l.contains("second broker")),
+            && l.contains(&format!("an unmanaged broker (pid {unmanaged_pid})"))
+            && l.contains("on --service none")),
         "the unmanaged broker must be named by pid, and the step must fail:\n{out}"
     );
     assert!(
@@ -971,7 +980,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     assert!(
         step(&dry, "broker")
             .iter()
-            .any(|l| l.contains("FAILED") && l.contains("does not manage")),
+            .any(|l| l.contains("FAILED") && l.contains("an unmanaged broker")),
         "{dry}"
     );
     assert!(!plist.exists());
@@ -1102,7 +1111,7 @@ fn tcp_is_refused_by_name_and_help_names_every_verb() {
         );
         let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:0", "--key-file", &key]);
         assert_eq!(code, 2, "{err}");
-        assert!(err.contains("FIXED port"), "{err}");
+        assert!(err.contains("fixed port, not 0"), "{err}");
     } else {
         let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000", "--key-file", &key]);
         assert_eq!(code, 2, "{err}");
@@ -1272,8 +1281,11 @@ fn review_off_names_a_session_the_fleet_holds() {
                 && l.contains(&format!("@{sid}"))
                 && l.contains("HELD")
                 && l.contains("hold=1")
+                && l.contains("origin=fleet")
                 && l.contains("off does not lift it")
-                && l.contains("relaunch instance")),
+                && l.contains("relaunch instance")
+                && !l.contains("aterm link")
+                && !l.contains(&format!("@{sid} hold off"))),
             "{args:?} must name the held session and what lifts it:\n{out}"
         );
     }
@@ -1282,6 +1294,35 @@ fn review_off_names_a_session_the_fleet_holds() {
     assert!(status.header().contains(" hold=1 "), "{}", status.header());
     drop(gui);
     drop(broker);
+}
+
+/// **A LOCAL HOLD IS NAMED WITH THE VERB THAT LIFTS IT.** The Owner's own
+/// `hold <sid> on` is `origin=local`, and the Owner's `hold <sid> off` lifts
+/// it: `off` says exactly that, in the spelling the catalog accepts.
+#[test]
+fn off_names_the_verb_that_lifts_a_local_hold() {
+    let s = Scratch::new("held-local");
+    let gui = Gui::boot(&s);
+    let sid = gui.boot_session();
+    let pid = gui.child.id();
+    let on = gui.verb(&format!("hold {sid} on reason=local%20test"));
+    assert!(on.ok(), "{}", on.header());
+    let (code, out, err) = s.fabric(&["off", "--service", "none", "--dry-run"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let held = step(&out, "held");
+    assert!(
+        held.iter().any(|l| l.contains("WARNING")
+            && l.contains(&format!("@{sid} (instance {pid}) is HELD"))
+            && l.contains("origin=local")
+            && l.contains(&format!("`aterm ctl --pid {pid} hold {sid} off` does"))
+            && !l.contains("relaunch")),
+        "{out}"
+    );
+    // The verb it names is the one that lifts it.
+    let off = gui.verb(&format!("hold {sid} off"));
+    assert!(off.ok(), "{}", off.header());
+    let status = gui.verb(&format!("@{sid} status"));
+    assert!(status.header().contains(" hold=0 "), "{}", status.header());
 }
 
 /// **`off` ACTS ON THE ROOT THE FABRIC IS ON** — the round-13 review's

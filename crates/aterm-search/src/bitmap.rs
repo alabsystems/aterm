@@ -65,6 +65,7 @@ pub(crate) struct SparseBitmap {
 /// panics when a 0-generic-param type alias shadows the name `IntoIter`
 /// elsewhere in its global symbol table ("IntoIter has 0 params but is
 /// being instantiated with 1 values"). See #8022.
+#[cfg(any(test, kani))]
 pub(crate) type SparseBitmapIntoIter = std::vec::IntoIter<u32>;
 
 /// Owned ordered range over a sparse bitmap. Materialized from a transient

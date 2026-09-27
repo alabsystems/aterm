@@ -244,6 +244,7 @@ impl CellExtra {
     /// Get extended flags (bits 3-15 of flags field).
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn extended_flags(&self) -> u16 {
         self.flags >> extra_flags::EXTENDED_SHIFT
     }
@@ -523,19 +524,6 @@ impl CellExtra {
     pub fn clear_char_marks(&mut self) {
         self.combining.clear();
         self.complex_char = None;
-    }
-
-    /// Get the Kitty graphics placeholder data for this cell.
-    #[must_use]
-    #[inline]
-    pub fn kitty_placeholder(&self) -> Option<&KittyPlaceholderData> {
-        self.kitty_placeholder.as_deref()
-    }
-
-    /// Set the Kitty graphics placeholder data for this cell.
-    #[inline]
-    pub fn set_kitty_placeholder(&mut self, data: Option<KittyPlaceholderData>) {
-        self.kitty_placeholder = data.map(Box::new);
     }
 
     /// Get the inline image reference for this cell (iTerm2 OSC 1337).

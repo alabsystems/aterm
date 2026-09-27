@@ -134,55 +134,30 @@ impl ViMode {
         self.active
     }
 
-    /// Get the current vi cursor.
-    #[must_use]
-    pub fn cursor(&self) -> ViModeCursor {
-        self.cursor
-    }
-
     /// Get the current cursor position.
     #[must_use]
     pub fn cursor_point(&self) -> ViPoint {
         self.cursor.point
     }
 
-    /// Access the marks.
-    #[must_use]
-    pub fn marks(&self) -> &ViMarks {
-        &self.marks
-    }
-
-    /// Mutable access to marks.
-    pub fn marks_mut(&mut self) -> &mut ViMarks {
-        &mut self.marks
-    }
-
     /// Get the last inline search state.
     #[must_use]
+    #[cfg(test)]
     pub fn inline_search(&self) -> Option<InlineSearchState> {
         self.inline_search
     }
 
     /// Access the search state.
     #[must_use]
+    #[cfg(test)]
     pub fn search(&self) -> &ViSearchState {
         &self.search
     }
 
     /// Mutable access to the search state.
+    #[cfg(test)]
     pub fn search_mut(&mut self) -> &mut ViSearchState {
         &mut self.search
-    }
-
-    /// Set custom semantic word separator characters.
-    pub fn set_separators(&mut self, separators: &str) {
-        self.separators = separators.to_string();
-    }
-
-    /// Get the current semantic word separators.
-    #[must_use]
-    pub fn separators(&self) -> &str {
-        &self.separators
     }
 
     /// Toggle vi mode on/off.
@@ -200,25 +175,12 @@ impl ViMode {
         }
     }
 
-    /// Activate vi mode at the given terminal cursor position.
-    pub fn activate(&mut self, terminal_cursor: ViPoint) {
-        if !self.active {
-            self.active = true;
-            self.cursor = ViModeCursor::new(terminal_cursor);
-        }
-    }
-
-    /// Deactivate vi mode.
-    pub fn deactivate(&mut self) {
-        self.active = false;
-        self.cancel_visual();
-    }
-
     /// Execute a basic motion (no grid content needed).
     ///
     /// For motions that require grid content (word, bracket, paragraph,
     /// search, marks), use [`Self::motion_with_grid`] instead. Those motions
     /// are silently ignored here.
+    #[cfg(test)]
     pub fn motion(
         &mut self,
         visible_rows: u16,
@@ -453,16 +415,19 @@ impl ViMode {
     /// Set a mark at the current cursor position.
     ///
     /// Returns `true` if the mark character is valid.
+    #[cfg(test)]
     pub fn set_mark(&mut self, mark: char) -> bool {
         self.marks.set(mark, self.cursor.point)
     }
 
     /// Record an inline search.
+    #[cfg(test)]
     pub fn set_inline_search(&mut self, state: InlineSearchState) {
         self.inline_search = Some(state);
     }
 
     /// Scroll the cursor by `delta` lines.
+    #[cfg(test)]
     pub fn scroll(&mut self, topmost_line: i32, bottommost_line: i32, delta: i32) {
         if !self.active {
             return;

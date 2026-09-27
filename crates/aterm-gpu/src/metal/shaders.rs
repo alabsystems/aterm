@@ -3,7 +3,7 @@
 
 //! The MSL twins of aterm's six WGSL shaders. The entry-point roster is NOT
 //! kept here — it is derived from [`crate::pipeline_table`], which is what
-//! `renderer.rs` builds its `wgpu` pipelines from; see [`libraries`] for the
+//! `renderer.rs` builds its `wgpu` pipelines from; see `libraries` for the
 //! drift that cost.
 //!
 //! # Why these are files and the WGSL was not
@@ -35,7 +35,7 @@
 //!
 //! Metal expresses the same pairing with
 //! `newTextureViewWithPixelFormat:` over a texture created with
-//! [`TEXTURE_USAGE_PIXEL_FORMAT_VIEW`](super::ffi::TEXTURE_USAGE_PIXEL_FORMAT_VIEW):
+//! `TEXTURE_USAGE_PIXEL_FORMAT_VIEW`:
 //! `Bgra8Unorm` <-> `Bgra8UnormSrgb` are a view-compatible pair, so the trick
 //! ports exactly rather than needing an approximation.
 //!
@@ -111,7 +111,7 @@ pub(crate) const SHIMMER: &str = include_str!("../../shaders/shimmer.metal");
 ///
 /// The `.metal` file is the ONLY thing this function decides; WHICH entry
 /// points that file must export comes off THE PIPELINE TABLE
-/// ([`crate::pipeline_table::entry_points`]), not from a roster maintained
+/// (`crate::pipeline_table::entry_points`), not from a roster maintained
 /// beside it.
 pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     match library {
@@ -142,6 +142,7 @@ pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
 /// what `renderer.rs` builds its pipelines from, so "the entry points the
 /// renderer asks for" and "the entry points the MSL must export" are now the
 /// same list read twice.
+#[cfg(test)]
 pub(crate) fn libraries() -> Vec<(ShaderLibrary, &'static str, Vec<&'static str>)> {
     ShaderLibrary::ALL
         .into_iter()
@@ -155,14 +156,17 @@ pub(crate) fn libraries() -> Vec<(ShaderLibrary, &'static str, Vec<&'static str>
 /// rect, the viewport and the sampler filters in [`super::ffi`] are honoured
 /// rather than merely spelled. Never compiled into a shipping pipeline — see
 /// the file's own header.
+#[cfg(test)]
 pub(crate) const STATE_PROBE: &str = include_str!("../../shaders/state_probe.metal");
 
 /// The verification-only compute kernels, CONCATENATED onto [`CELL`] by the
 /// parity test so the math under test is literally the shipped math. Never
 /// compiled into a shipping pipeline — see the file's own header.
+#[cfg(test)]
 pub(crate) const PARITY_KERNEL: &str = include_str!("../../shaders/parity_kernel.metal");
 
 /// [`CELL`] plus [`PARITY_KERNEL`], the source the parity test compiles.
+#[cfg(test)]
 pub(crate) fn cell_with_parity_kernels() -> String {
     format!("{CELL}\n{PARITY_KERNEL}")
 }
@@ -174,6 +178,7 @@ pub(crate) fn cell_with_parity_kernels() -> String {
 /// `fragment <ret> <name>(`, and the two verification-only sources
 /// ([`STATE_PROBE`], [`PARITY_KERNEL`]) are not part of any library. Anything
 /// clever here would be a parser nobody asked for.
+#[cfg(test)]
 pub(crate) fn defined_entry_points(src: &str) -> Vec<&str> {
     src.lines()
         .filter_map(|line| {
@@ -191,6 +196,7 @@ pub(crate) fn defined_entry_points(src: &str) -> Vec<&str> {
 /// line each declaration sits on — the scanned half of THE BINDING MAP whose
 /// tabled half is [`crate::pipeline_table::BindSpec`].
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct DeclaredBindings {
     /// The 1-based line of the `vertex`/`fragment` declaration itself.
     pub(crate) line: usize,
@@ -212,6 +218,7 @@ pub(crate) struct DeclaredBindings {
 /// paren-balance walk to the end of the parameter list — `[[...]]` attributes
 /// appear nowhere else in these sources, and anything cleverer would be a
 /// parser nobody asked for.
+#[cfg(test)]
 pub(crate) fn entry_point_bindings(src: &str, entry: &str) -> Option<DeclaredBindings> {
     // Byte offset of the declaration line's start.
     let mut offset = 0usize;

@@ -21,10 +21,12 @@ use aterm_core::terminal::RenderCell;
 /// Accessibility role for the terminal content view: an editable text area, the
 /// closest standard `AX` role for a terminal grid (VoiceOver reads its value and
 /// navigates by line/character).
-pub const ROLE_TEXT_AREA: &str = "AXTextArea";
+#[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
+pub(crate) const ROLE_TEXT_AREA: &str = "AXTextArea";
 
 /// Human-facing label announced for the terminal view.
-pub const LABEL: &str = "aterm terminal";
+#[cfg(any(a11y_tree, all(target_os = "macos", feature = "a11y-appkit"), test))]
+pub(crate) const LABEL: &str = "aterm terminal";
 
 /// Append one grid row to `text`: each cell's glyph char (control/NUL → space),
 /// up to `cols`, with trailing blanks trimmed, terminated by `'\n'`.
@@ -42,7 +44,7 @@ pub const LABEL: &str = "aterm terminal";
 /// routing all address the row by column. Dropping it would buy correct word navigation
 /// at the price of a caret that lands in the wrong place on every line with a wide glyph
 /// to its left.
-pub fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: usize) {
+pub(crate) fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: usize) {
     for cell in cells.iter().take(cols) {
         text.push(if cell.ch == '\0' || cell.ch.is_control() {
             ' '
@@ -58,11 +60,8 @@ pub fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: usize) {
 
 /// A plain-text + cursor snapshot of the visible grid for assistive technology.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the snapshot accessors are consumed by the macOS `a11y-appkit` publisher (an off-by-default feature) and the unit tests; retained as the stable provider API in the default build"
-)]
-pub struct AccessibleSnapshot {
+#[cfg(any(a11y_tree, all(target_os = "macos", feature = "a11y-appkit"), test))]
+pub(crate) struct AccessibleSnapshot {
     /// The visible screen as text: one line per row (trailing blanks trimmed),
     /// rows separated and terminated by `'\n'`.
     pub text: String,
@@ -74,17 +73,14 @@ pub struct AccessibleSnapshot {
     pub cursor: Option<(usize, usize)>,
 }
 
-#[allow(
-    dead_code,
-    reason = "accessors are consumed by the macOS `a11y-appkit` publisher (off-by-default) and tests"
-)]
+#[cfg(any(a11y_tree, all(target_os = "macos", feature = "a11y-appkit"), test))]
 impl AccessibleSnapshot {
     /// Build a snapshot from rendered rows of cells.
     ///
     /// `cursor` is `Some((row, col))` only when the cursor is visible; pass `None`
     /// to omit it (e.g. when hidden via DECTCEM).
     #[must_use]
-    pub fn from_cells(
+    pub(crate) fn from_cells(
         rows_cells: &[Vec<RenderCell>],
         cols: usize,
         cursor: Option<(usize, usize)>,
@@ -109,7 +105,7 @@ impl AccessibleSnapshot {
     /// clamped-with-padding: a short row yields a short line, exactly as the
     /// whole-frame projection does.
     #[must_use]
-    pub fn from_cells_in(
+    pub(crate) fn from_cells_in(
         rows_cells: &[Vec<RenderCell>],
         rows: std::ops::Range<usize>,
         cols: std::ops::Range<usize>,
@@ -133,18 +129,20 @@ impl AccessibleSnapshot {
 
     /// The accessibility value: the visible screen text (an `AX` value string).
     #[must_use]
-    pub fn value(&self) -> &str {
+    pub(crate) fn value(&self) -> &str {
         &self.text
     }
 
     /// The accessibility role string.
     #[must_use]
-    pub fn role(&self) -> &'static str {
+    #[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
+    pub(crate) fn role(&self) -> &'static str {
         ROLE_TEXT_AREA
     }
 
     /// The accessibility label.
     #[must_use]
+    #[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
     pub fn label(&self) -> &'static str {
         LABEL
     }
@@ -158,7 +156,8 @@ impl AccessibleSnapshot {
     /// column to the cursor line's trimmed length (so a caret parked in trailing
     /// whitespace maps to the end of that line's visible text).
     #[must_use]
-    pub fn cursor_offset(&self) -> Option<usize> {
+    #[cfg(any(all(target_os = "macos", feature = "a11y-appkit"), test))]
+    pub(crate) fn cursor_offset(&self) -> Option<usize> {
         let (crow, ccol) = self.cursor?;
         let mut off = 0usize;
         for (i, line) in self.text.split('\n').enumerate() {
@@ -173,7 +172,7 @@ impl AccessibleSnapshot {
 }
 
 #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
-pub use macos::apply_to_ns_view;
+pub(crate) use macos::apply_to_ns_view;
 
 #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
 mod macos {
@@ -192,7 +191,7 @@ mod macos {
     /// is unavailable. Must be called on the main thread (AppKit requirement),
     /// which the winit event loop guarantees. VoiceOver behavior itself is not
     /// machine-verifiable here and is validated manually.
-    pub fn apply_to_ns_view(window: &Window, snap: &AccessibleSnapshot) {
+    pub(crate) fn apply_to_ns_view(window: &Window, snap: &AccessibleSnapshot) {
         let view = crate::platform::ns_view_of(window);
         if view.is_null() {
             return;

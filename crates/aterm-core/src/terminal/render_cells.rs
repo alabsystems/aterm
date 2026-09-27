@@ -397,7 +397,8 @@ impl Terminal {
             // lead remains narrow. This also handles selector replay exactly:
             // `⌚︎️` is wide again (VS16 took effect) and therefore not text,
             // while an ineffective later VS16 at the row edge leaves VS15 active.
-            let text_presentation = !wide && !cell.is_wide() && marks.contains(&'\u{FE0E}');
+            let text_presentation =
+                !wide && !cell.is_wide() && marks.clone().any(|c| c == '\u{FE0E}');
 
             // Line decorations (SGR 4 family / 9 / 53).
             let cflags = eff_cell.flags();
@@ -480,25 +481,26 @@ impl Terminal {
             // requested by `cell_frame_into`. `marks()` reads the live combining
             // slice, or reconstructs a materialized cell's cluster tail.
             if let Some((clusters, combining_out)) = extras_out.as_mut() {
-                if marks.iter().copied().any(is_emoji_sequence_marker) {
+                if marks.clone().any(is_emoji_sequence_marker) {
                     // Multi-codepoint EMOJI sequence (ZWJ / skin-tone / keycap /
                     // regional-indicator pair): surface the whole grapheme for
                     // shaping. Skip a NUL base, matching `cluster_row_into`.
                     if raw != '\0' {
-                        let mut s = String::with_capacity(2 + marks.len());
+                        // Count UTF-8 bytes, not scalars: even a flag's two
+                        // scalars occupy eight bytes. Exact capacity avoids
+                        // growing the string and shrinking it again for Box.
+                        let bytes =
+                            raw.len_utf8() + marks.clone().map(char::len_utf8).sum::<usize>();
+                        let mut s = String::with_capacity(bytes);
                         s.push(raw);
-                        s.extend(marks.iter().copied());
+                        s.extend(marks);
                         clusters.push((col as usize, s.into_boxed_str()));
                     }
-                } else if !marks.is_empty() {
+                } else if marks.clone().next().is_some() {
                     // Plain combining diacritics: overlay every mark that has a
                     // glyph of its own (`draws_no_glyph` names the exceptions),
                     // matching `combining_row_into`.
-                    let overlay: Box<[char]> = marks
-                        .iter()
-                        .copied()
-                        .filter(|&c| !draws_no_glyph(c))
-                        .collect();
+                    let overlay: Box<[char]> = marks.filter(|&c| !draws_no_glyph(c)).collect();
                     if !overlay.is_empty() {
                         combining_out.push((col as usize, overlay));
                     }
@@ -519,6 +521,7 @@ impl Terminal {
     /// already CPU/GPU-consistent. `col` is the wide lead cell (the base char's
     /// column), matching where the renderer blits the glyph.
     #[must_use]
+    #[cfg(test)]
     pub fn cluster_row(&self, row: usize) -> Vec<(usize, Box<str>)> {
         let mut out = Vec::new();
         self.cluster_row_into(row, &mut out);
@@ -533,6 +536,7 @@ impl Terminal {
     /// still allocated per cluster — only the per-row container Vec is reused.
     ///
     /// `pub(crate)`: consumed only by [`cell_frame_into`](Self::cell_frame_into).
+    #[cfg(test)]
     pub(crate) fn cluster_row_into(&self, row: usize, out: &mut Vec<(usize, Box<str>)>) {
         out.clear();
         let Ok(visible_row) = u16::try_from(row) else {
@@ -582,6 +586,7 @@ impl Terminal {
     /// (`draws_no_glyph`). Marks are kept in arrival order so stacked
     /// diacritics layer correctly.
     #[must_use]
+    #[cfg(test)]
     pub fn combining_row(&self, row: usize) -> Vec<(usize, Box<[char]>)> {
         let mut out = Vec::new();
         self.combining_row_into(row, &mut out);
@@ -596,6 +601,7 @@ impl Terminal {
     /// are still allocated per cell — only the per-row container Vec is reused.
     ///
     /// `pub(crate)`: consumed only by [`cell_frame_into`](Self::cell_frame_into).
+    #[cfg(test)]
     pub(crate) fn combining_row_into(&self, row: usize, out: &mut Vec<(usize, Box<[char]>)>) {
         out.clear();
         let Ok(visible_row) = u16::try_from(row) else {
@@ -1604,7 +1610,6 @@ impl Terminal {
         // reused across frames, and a window that was split a moment ago left
         // per-pane runs here. Without this, dropping back to one pane would keep
         // scaling columns by a pane that no longer exists.
-        scratch.line_size_spans.clear();
         scratch.line_sizes.clear();
         scratch.line_sizes.extend((0..rows).map(|r| {
             u16::try_from(r)
@@ -1637,6 +1642,10 @@ impl Terminal {
         // a composed frame's panes left in a reused scratch would replace this
         // terminal's highlight wholesale.
         scratch.selections.clear();
+        // The host's pixel-resolution chrome rows (the message band's meter)
+        // are painted onto a composed frame after this extraction; a bare
+        // snapshot carries none.
+        scratch.chrome_rasters.clear();
 
         let cur = self.cursor();
         scratch.cursor_col = cur.col as usize;
@@ -1710,6 +1719,7 @@ impl Terminal {
         // sent. Each half answers only for itself; DECSCNM arms both because it
         // genuinely makes both authoritative.
         let implicit_blank = self.implicit_blank_render_cell();
+        scratch.implicit_blank = implicit_blank;
         if self.color.frame_background_authoritative || reverse_video {
             scratch.default_bg = (u32::from(implicit_blank.bg[0]) << 16)
                 | (u32::from(implicit_blank.bg[1]) << 8)
@@ -2000,6 +2010,14 @@ mod tests {
             fg: 0x0004_0506,
             inactive: true,
         }];
+        let line_capacities = [
+            scratch.line_size_spans[0].capacity(),
+            scratch.line_size_spans[1].capacity(),
+        ];
+        let bg_capacities = [
+            scratch.default_bg_spans[0].capacity(),
+            scratch.default_bg_spans[1].capacity(),
+        ];
 
         term.cell_frame_into(&mut scratch, 2, 8);
 
@@ -2013,6 +2031,10 @@ mod tests {
             scratch.default_bg_spans.iter().all(Vec::is_empty),
             "a direct terminal snapshot must not inherit split default provenance"
         );
+        for r in 0..2 {
+            assert_eq!(scratch.line_size_spans[r].capacity(), line_capacities[r]);
+            assert_eq!(scratch.default_bg_spans[r].capacity(), bg_capacities[r]);
+        }
         assert_eq!(
             scratch.selection_clip, None,
             "a direct terminal snapshot must not inherit a split selection clip"
@@ -2170,6 +2192,36 @@ mod tests {
             [fg.r, fg.g, fg.b],
             "DECSCNM swaps the implicit blank's live background"
         );
+    }
+
+    #[test]
+    fn frame_keeps_the_implicit_blank_from_its_own_extraction() {
+        let mut term = Terminal::new(2, 8);
+        let mut frame = crate::render::RenderInput::empty();
+        // The always-concrete blank is distinct from the renderer-facing
+        // COLOR_UNSET scalars of an unconfigured terminal.
+        term.cell_frame_into(&mut frame, 2, 8);
+        assert_eq!(frame.implicit_blank, term.implicit_blank_render_cell());
+        assert_eq!(frame.default_fg, crate::render::COLOR_UNSET);
+
+        term.process(b"\x1b]10;rgb:12/34/56\x1b\\\x1b]11;rgb:a1/b2/c3\x1b\\");
+        term.cell_frame_into(&mut frame, 2, 8);
+        let extracted = frame.implicit_blank;
+        assert_eq!(extracted.fg, [0x12, 0x34, 0x56]);
+        assert_eq!(extracted.bg, [0xa1, 0xb2, 0xc3]);
+        assert_eq!(frame.clone().implicit_blank, extracted);
+        let mut reused = crate::render::RenderInput::empty();
+        reused.clone_from(&frame);
+        assert_eq!(reused.implicit_blank, extracted);
+
+        // A later terminal mutation cannot recolour a retained cell frame.
+        term.process(b"\x1b[?5h");
+        assert_ne!(extracted, term.implicit_blank_render_cell());
+        assert_eq!(frame.implicit_blank, extracted);
+        term.cell_frame_into(&mut frame, 2, 8);
+        assert_eq!(frame.implicit_blank, term.implicit_blank_render_cell());
+        assert_eq!(frame.implicit_blank.fg, [0xa1, 0xb2, 0xc3]);
+        assert_eq!(frame.implicit_blank.bg, [0x12, 0x34, 0x56]);
     }
 
     #[test]
@@ -3441,6 +3493,66 @@ mod tests {
             !frame.combining[0].is_empty(),
             "test content must produce at least one combining-mark overlay"
         );
+    }
+
+    /// The same real-parser row must keep its glyphs, selectors and ordered
+    /// marks when its live split representation becomes a history grapheme.
+    #[test]
+    fn borrowed_marks_preserve_live_ring_and_tiered_rendering() {
+        const CORPUS: &str = "👩\u{200D}💻 👍🏽 🇺🇸 1\u{FE0F}\u{20E3} ❤\u{FE0F} ⌚\u{FE0E} e\u{0301}\u{0323} A\u{E0001} 中";
+        for tiered in [false, true] {
+            let mut term = if tiered {
+                Terminal::with_scrollback(3, 48, 1, crate::scrollback::Scrollback::with_defaults())
+            } else {
+                Terminal::new(3, 48)
+            };
+            term.process(CORPUS.as_bytes());
+            let live = term.cell_frame(3, 48);
+            assert_eq!(
+                live.clusters[0].len(),
+                4,
+                "the cluster arm must be exercised"
+            );
+            assert_eq!(live.combining[0].len(), 1, "only real diacritics overlay");
+            assert_eq!(live.combining[0][0].1.as_ref(), ['\u{0301}', '\u{0323}']);
+            assert!(live.cells[0].iter().any(|c| c.text_presentation));
+            assert!(live.cells[0].iter().any(|c| c.emoji_presentation));
+            assert!(!term.render_row(0).is_empty());
+
+            term.process(b"\r\nnew one\r\nnew two\r\nnew three\r\nnew four");
+            if tiered {
+                // The first row is older than the one-row ring; flush the
+                // deferred buffer so this arm genuinely reads the tier store.
+                let _ = term.grid_mut().scrollback_mut();
+            }
+            term.grid_mut().scroll_to_top();
+            assert!(matches!(
+                term.grid().visible_row_view(0),
+                aterm_grid::VisibleRowView::History { .. }
+            ));
+            let history = term.cell_frame(3, 48);
+            assert_eq!(
+                history.cells[0], live.cells[0],
+                "tiered={tiered}: glyphs/flags"
+            );
+            assert_eq!(
+                history.clusters[0], live.clusters[0],
+                "tiered={tiered}: clusters"
+            );
+            assert_eq!(
+                history.combining[0], live.combining[0],
+                "tiered={tiered}: marks"
+            );
+            // Cells-only extraction also reads the borrowed marks for VS15,
+            // without requesting owned cluster or overlay output.
+            assert_eq!(term.render_row(0), live.cells[0]);
+            term.grid_mut().scroll_to_bottom();
+            assert_ne!(
+                term.render_row(0),
+                live.cells[0],
+                "the history read was not live data"
+            );
+        }
     }
 
     /// DMG-1 differential oracle: the damage-scoped extraction must be

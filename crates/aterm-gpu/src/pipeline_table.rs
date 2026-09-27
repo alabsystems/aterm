@@ -79,13 +79,9 @@ pub(crate) enum ShaderLibrary {
 }
 
 impl ShaderLibrary {
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
     /// The library's short name — the `.metal` file stem, and the key
     /// `crate::metal::shaders::libraries` reports under.
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Cell => "cell",
@@ -98,6 +94,7 @@ impl ShaderLibrary {
     }
 
     /// Every library, in declaration order.
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 6] = [
         Self::Cell,
         Self::Blit,
@@ -142,12 +139,8 @@ impl Factor {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
     /// A short stable name, for the table listing the golden test pins.
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Zero => "Zero",
@@ -176,12 +169,8 @@ impl BlendOp {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
     /// A short stable name, for the golden listing.
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Add => "Add",
@@ -292,6 +281,7 @@ impl Blend {
 
     /// Whether this state is fixed-function REPLACE — i.e. `src*1 + dst*0` on
     /// both halves, which is arithmetically identical to no blending at all.
+    #[cfg(target_os = "macos")]
     pub(crate) const fn is_replace(self) -> bool {
         matches!(
             (
@@ -347,12 +337,8 @@ impl WriteMask {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
     /// A short stable name, for the golden listing.
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Color => "COLOR",
@@ -431,6 +417,7 @@ impl TargetFormats {
 
 /// The primitive topology. Every aterm draw is a triangle list except the
 /// four-vertex tray strip.
+#[cfg(any(wgpu_arm, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Topology {
     /// `wgpu::PrimitiveTopology::TriangleList` — `wgpu`'s default.
@@ -439,6 +426,7 @@ pub(crate) enum Topology {
     TriangleStrip,
 }
 
+#[cfg(any(wgpu_arm, test))]
 impl Topology {
     /// The `wgpu` spelling.
     #[cfg(wgpu_arm)]
@@ -449,12 +437,8 @@ impl Topology {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
     /// A short stable name, for the golden listing.
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::TriangleList => "TriangleList",
@@ -510,12 +494,8 @@ impl AttrFormat {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
-    /// A short stable name, for the golden listing.
+    /// A short stable name, for the Metal vertex-format test's messages.
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Uint16x4 => "Uint16x4",
@@ -532,12 +512,8 @@ impl AttrFormat {
 /// step mode is per-instance for all of them and is not a field.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VertexLayoutSpec {
-    /// The instance struct's name, for diagnostics and the golden listing.
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
+    /// The instance struct's name, for the golden listing.
+    #[cfg(test)]
     pub(crate) name: &'static str,
     /// `size_of` the instance struct. Pinned to the Rust type by a
     /// `const _: () = assert!(...)` beside each struct in `renderer.rs`.
@@ -571,6 +547,7 @@ pub(crate) enum VertexLayout {
 
 /// `BgInstance`: `[u16;4]` rect + `[u8;4]` colour.
 pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    #[cfg(test)]
     name: "BgInstance",
     stride: 12,
     attrs: &[
@@ -593,6 +570,7 @@ pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 /// 255 itself, which is what keeps it byte-exact with the CPU rasterizer (the
 /// rasterizer's float interpolant would not be).
 pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    #[cfg(test)]
     name: "GlowInstance",
     stride: 16,
     attrs: &[
@@ -616,6 +594,7 @@ pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 /// `GlyphInstance`: `f32x4` rect + `f32x4` uv + `[u8;4]` colour + `[u8;4]` aux.
 pub(crate) const GLYPH_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    #[cfg(test)]
     name: "GlyphInstance",
     stride: 40,
     attrs: &[
@@ -644,6 +623,7 @@ pub(crate) const GLYPH_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 /// `RainGlowInstance`: the bg pair plus the elliptical falloff basis.
 pub(crate) const RAIN_GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    #[cfg(test)]
     name: "RainGlowInstance",
     stride: 20,
     attrs: &[
@@ -668,6 +648,7 @@ pub(crate) const RAIN_GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 /// `FireInstance`: rect + geometry + churn phase + the four packed field bytes.
 /// The widest layout: four attributes over three distinct integer formats.
 pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    #[cfg(test)]
     name: "FireInstance",
     stride: 24,
     attrs: &[
@@ -696,6 +677,7 @@ pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 impl VertexLayout {
     /// The layout's stride + attributes, or `None` for a vertex-id-only pass.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) const fn spec(self) -> Option<VertexLayoutSpec> {
         match self {
             Self::None => None,
@@ -707,12 +689,8 @@ impl VertexLayout {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
     /// A short stable name, for the golden listing.
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self.spec() {
             None => "-",
@@ -848,6 +826,7 @@ static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBuffe
 ///   that map is invisible to this crate and free to differ. This column names
 ///   the FIRST-PARTY MSL slots only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct BindSpec {
     /// The VERTEX-stage uniform block's `[[buffer(n)]]` index, or `None` for a
     /// `[[vertex_id]]`-only vertex function that reads no uniform (`vs_fs`,
@@ -867,6 +846,7 @@ pub(crate) struct BindSpec {
     pub(crate) fragment_buffers: &'static [u32],
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl BindSpec {
     /// The flat cell rows (bg / cursor / glow / rain / fire): `Uniforms` at
     /// vertex `[[buffer(0)]]`, nothing in the fragment stage.
@@ -921,11 +901,7 @@ impl BindSpec {
 
     /// One stable text form for the golden listing: `vu(n|-) ft(..|-)
     /// fsamp(..|-) fb(..|-)`.
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
+    #[cfg(test)]
     pub(crate) fn listing(&self) -> String {
         fn slots(s: &[u32]) -> String {
             if s.is_empty() {
@@ -944,53 +920,6 @@ impl BindSpec {
             slots(self.fragment_samplers),
             slots(self.fragment_buffers),
         )
-    }
-}
-
-/// The LOAD-OP CONVENTION of the pass a row draws in — the second half of the
-/// map's per-row PASS metadata (the first, the target role, is
-/// [`PipelineSpec::target`]). DECLARATIVE ONLY, on purpose: W4 ports the
-/// encode ladder and the pass coalescer, and that machinery will READ this
-/// column; nothing consumes it yet beyond the golden listing, because
-/// inventing pass-descriptor plumbing one wave early is exactly what W2's
-/// brief forbids.
-///
-/// A row PINS a load op only when every production pass it draws in opens the
-/// same way (site audit, renderer.rs 2026-08-31): the blit pass always Clears
-/// (`:8512`, the swapchain/virtual attach), and the bloom composite
-/// (`:9405`), shimmer (`:10026`) and both tray passes (`:11342`, `:11446`)
-/// always Load — including through the in-place twins, which reuse the same
-/// pass-opening functions (`encode_bloom_halo`, `encode_shimmer`). Everything
-/// else is [`Self::Dynamic`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PassLoad {
-    /// The row's pass always opens with a Clear (the clear COLOUR stays the
-    /// call site's: theme background for the blit).
-    Clear,
-    /// The row's pass always opens with Load.
-    Load,
-    /// Not this row's to pin: the twelve cell rows ride the coalesced frame
-    /// plan's Clear-or-Load (pass 0 clears-or-loads per damage, later passes
-    /// Load — `coalesce_frame_passes` decides); `glow_add` ADDITIONALLY opens
-    /// the bloom-extract pass with Clear(TRANSPARENT) on bloom frames, which
-    /// is precisely why it cannot pin either; the two crowns never open a
-    /// pass at all (they draw inside the blit's).
-    Dynamic,
-}
-
-impl PassLoad {
-    /// A short stable name, for the golden listing.
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Clear => "Clear",
-            Self::Load => "Load",
-            Self::Dynamic => "dyn",
-        }
     }
 }
 
@@ -1015,12 +944,15 @@ pub(crate) struct PipelineSpec {
     pub(crate) write_mask: WriteMask,
     /// Which instance stream feeds the vertex stage.
     pub(crate) vertex: VertexLayout,
-    /// The primitive topology.
+    /// The primitive topology. The wgpu arm builds its pipeline with it; the
+    /// Metal arm names the primitive at each draw call instead (triangles for
+    /// the instanced rows and the fullscreen passes, `draw_strip_quad` for the
+    /// tray), so only the tests hold this column against it.
+    #[cfg(any(wgpu_arm, test))]
     pub(crate) topology: Topology,
     /// Where the row's resources bind on the Metal side — see [`BindSpec`].
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) binds: BindSpec,
-    /// The load-op convention of the pass this row draws in — see [`PassLoad`].
-    pub(crate) pass_load: PassLoad,
 }
 
 impl PipelineSpec {
@@ -1061,11 +993,7 @@ impl PipelineSpec {
 
     /// One line of the golden listing — every field that decides a pixel, in a
     /// stable textual form. See [`listing`].
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
+    #[cfg(test)]
     pub(crate) fn listing(&self, name: &str) -> String {
         let blend = match self.blend {
             None => "none".to_owned(),
@@ -1080,7 +1008,7 @@ impl PipelineSpec {
             ),
         };
         format!(
-            "{name} lib={} vs={} fs={} target={:?} blend={blend} mask={} vertex={} topology={} binds={} load={}",
+            "{name} lib={} vs={} fs={} target={:?} blend={blend} mask={} vertex={} topology={} binds={}",
             self.library.name(),
             self.vs,
             self.fs,
@@ -1089,7 +1017,6 @@ impl PipelineSpec {
             self.vertex.name(),
             self.topology.name(),
             self.binds.listing(),
-            self.pass_load.name(),
         )
     }
 }
@@ -1109,9 +1036,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::REPLACE),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Bg,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu glyph pipeline",
@@ -1123,9 +1051,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_GLYPH_TEXT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu colour-glyph pipeline",
@@ -1137,9 +1066,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_ATLAS,
-        pass_load: PassLoad::Dynamic,
     },
     // --- the nine demand-built EFFECT pipelines ----------------------------
     PipelineSpec {
@@ -1151,9 +1081,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Bg,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu glow additive pipeline",
@@ -1168,9 +1099,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu rain halo pipeline",
@@ -1181,9 +1113,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::RainGlow,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu rain halo over pipeline",
@@ -1194,9 +1127,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::RainGlow,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu fire add pipeline",
@@ -1207,9 +1141,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fire,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu fire over pipeline",
@@ -1220,9 +1155,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fire,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_FLAT,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu deco-over pipeline",
@@ -1233,9 +1169,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_ATLAS,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu deco-add pipeline",
@@ -1246,9 +1183,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glyph,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_ATLAS,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu scene-over pipeline",
@@ -1259,9 +1197,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CELL_ATLAS,
-        pass_load: PassLoad::Dynamic,
     },
     // --- the two lazily-built post passes over the offscreen ---------------
     PipelineSpec {
@@ -1275,9 +1214,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::POST_FS,
-        pass_load: PassLoad::Load,
     },
     PipelineSpec {
         label: "aterm-gpu shimmer pipeline",
@@ -1296,9 +1236,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // offscreen alpha inside the grid).
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::POST_FS,
-        pass_load: PassLoad::Load,
     },
     // --- the glow-boost pair: ONE construction site, TWO pipelines ---------
     PipelineSpec {
@@ -1314,9 +1255,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // The crown reads the SAME `GlowInstance` stream the bloom extract
         // does, so a gradient quad ramps in the crown as it does on the glass.
         vertex: VertexLayout::Glow,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CROWN,
-        pass_load: PassLoad::Dynamic,
     },
     PipelineSpec {
         label: "aterm-gpu sdr-glow pipeline",
@@ -1328,9 +1270,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::CROWN,
-        pass_load: PassLoad::Dynamic,
     },
     // --- the two swapchain passes ------------------------------------------
     PipelineSpec {
@@ -1344,9 +1287,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // pipelines were careful not to disturb.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::POST_FS,
-        pass_load: PassLoad::Clear,
     },
     PipelineSpec {
         label: "aterm-gpu tray pipeline",
@@ -1358,9 +1302,10 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
+        #[cfg(any(wgpu_arm, test))]
         topology: Topology::TriangleStrip,
+        #[cfg(any(target_os = "macos", test))]
         binds: BindSpec::TRAY,
-        pass_load: PassLoad::Load,
     },
 ];
 
@@ -1411,6 +1356,7 @@ pub(crate) enum Pipeline {
 }
 
 /// Every [`Pipeline`], in row order — the single enumeration a sweep walks.
+#[cfg(test)]
 pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Bg,
     Pipeline::Glyph,
@@ -1446,11 +1392,7 @@ impl Pipeline {
 
     /// The row's stable name — the enum variant, snake-cased. Used by the
     /// golden listing and by test failure messages.
-    #[allow(
-        dead_code,
-        reason = "the table's stable NAMES exist for the golden listing and for \
-                  test diagnostics; a non-test build has no reader for them"
-    )]
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Bg => "bg",
@@ -1482,6 +1424,7 @@ impl Pipeline {
 /// the exact structural hole that let `vs_fs` be renamed to `vs_fs_bloom` in
 /// the MSL while `renderer.rs` went on asking for `vs_fs`, with a
 /// self-consistent roster test that could not see it.
+#[cfg(test)]
 pub(crate) fn entry_points(library: ShaderLibrary) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for p in ALL_PIPELINES {
@@ -1502,12 +1445,7 @@ pub(crate) fn entry_points(library: ShaderLibrary) -> Vec<&'static str> {
 /// listing `renderer::pipeline_table_tests::the_pipeline_table_is_what_it_says`
 /// pins, so that changing any blend factor, write mask, entry point, target
 /// role, vertex layout or topology is a REVIEWED diff instead of a silent one.
-#[allow(
-    dead_code,
-    reason = "the golden listing and its checked-in twin exist for \
-              `tests::the_pipeline_table_is_what_it_says`; a non-test build has \
-              no reader for them"
-)]
+#[cfg(test)]
 pub(crate) fn listing() -> String {
     let mut s = String::new();
     for p in ALL_PIPELINES {
@@ -1523,12 +1461,7 @@ pub(crate) fn listing() -> String {
 /// purpose: a blend factor or a write mask cannot then be edited in the same
 /// hunk as the assertion that was supposed to notice. Comment lines (`#`) and
 /// blank lines are stripped before comparison so the file can explain itself.
-#[allow(
-    dead_code,
-    reason = "the golden listing and its checked-in twin exist for \
-              `tests::the_pipeline_table_is_what_it_says`; a non-test build has \
-              no reader for them"
-)]
+#[cfg(test)]
 const GOLDEN: &str = include_str!("../pipeline-table.txt");
 
 #[cfg(test)]
@@ -1734,39 +1667,6 @@ mod tests {
                 "{}: every fragment texture slot pairs with a sampler slot",
                 p.name()
             );
-        }
-    }
-
-    /// The load-convention partition is structural, not editorial: a row pins
-    /// its pass's load op IFF it is a `[[vertex_id]]` whole-pass operator
-    /// (`VertexLayout::None` — the blit, the bloom composite, the shimmer,
-    /// the tray), because those are the rows that OPEN a dedicated pass in
-    /// the production graph. Every instanced row is a batch citizen of a
-    /// shared pass (the coalesced frame plan, the bloom extract, the blit
-    /// pass the crowns ride) and must stay [`PassLoad::Dynamic`] — pinning
-    /// one would declare a convention no pass site owns, which is exactly the
-    /// drift this column exists to make reviewable.
-    #[test]
-    fn only_whole_pass_rows_pin_a_load_op() {
-        for p in ALL_PIPELINES {
-            let spec = p.spec();
-            let pinned = spec.pass_load != PassLoad::Dynamic;
-            assert_eq!(
-                pinned,
-                spec.vertex == VertexLayout::None,
-                "{}: load convention {:?} vs vertex layout {:?} — pinned iff \
-                 the row is a whole-pass [[vertex_id]] operator",
-                p.name(),
-                spec.pass_load,
-                spec.vertex
-            );
-        }
-        // And the pinned values themselves are the audited site facts: the
-        // blit CLEARS (it repaints the whole drawable), the three
-        // compose-over passes LOAD (they refine a frame that already exists).
-        assert_eq!(Pipeline::Blit.spec().pass_load, PassLoad::Clear);
-        for p in [Pipeline::Bloom, Pipeline::Shimmer, Pipeline::Tray] {
-            assert_eq!(p.spec().pass_load, PassLoad::Load, "{}", p.name());
         }
     }
 }

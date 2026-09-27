@@ -486,22 +486,65 @@ fn build_retired() -> BrainRig {
     r
 }
 
+/// How long the deep-sleep evidence must HOLD before the fixture is believed.
+///
+/// Load-bearing, and the reason it is a derived expression rather than a round
+/// number: the four instantaneous predicates below are ALL true at the moment
+/// the pet falls asleep, which is the start of the breath window — a ~10 s span
+/// (`BREATH_WINDOW`) over which it drifts light-sleep z's at `ZEE_EVERY`
+/// cadence. So an instantaneous reading cannot tell sleep ONSET from the idle
+/// floor, and this fixture used to take the first one it saw: the loop below
+/// exited on its very first iteration, handing `verify_sleeper` a pet that was
+/// about to spend the next 600 frames animating. The z's it then measured
+/// (492 mote frames, 792 live-mote readings) are almost exactly the span the
+/// `pet_cursor_draw` group captures ON PURPOSE as its zee fixture — the two
+/// were sampling the same seconds while one of them called it deep sleep.
+///
+/// A window strictly LONGER than the z cadence cannot fall inside a gap
+/// between two z's, so holding the evidence for it is what separates the two
+/// states. One extra second of margin over that bound, in frames.
+const SETTLED_FRAMES: usize = (ZEE_EVERY_SECS * 60.0) as usize + 60;
+/// The z cadence this fixture must outlast, mirrored from the engine's
+/// `ZEE_EVERY` (private). `verify_sleeper`'s own assertions are what catch a
+/// drift between the two: a longer cadence upstream re-admits z's into the
+/// sampled window and fails the byte-stable claim rather than passing quietly.
+const ZEE_EVERY_SECS: f32 = 1.2;
+
 /// The ON floor: a fully settled deep sleeper — visible, byte-stable, not
-/// asking for frames. Driven until the public predicates say so.
+/// asking for frames. Driven until the public predicates say so, and then
+/// until they KEEP saying so for [`SETTLED_FRAMES`] (see there for why an
+/// instant is not evidence).
 fn build_sleeper() -> BrainRig {
     let mut r = BrainRig::new(blank_ink(), None);
     let mut k = 0usize;
+    let mut held = 0usize;
+    let mut last_fp = 0u64;
     loop {
         let f = step(&mut r, arm_still);
+        let fp = f.fp();
         let deep = r.brain.is_active()
             && r.brain.action() == PetAction::Sleep
             && !r.brain.needs_frames()
             && live_motes(&f) == 0;
-        if deep {
+        // The fingerprint term is what makes this the IDLE FLOOR rather than
+        // merely a quiet lane: a breathing sleeper draws a different body from
+        // frame to frame with no mote in sight.
+        held = if deep && held > 0 && fp == last_fp {
+            held + 1
+        } else {
+            usize::from(deep)
+        };
+        last_fp = fp;
+        if held >= SETTLED_FRAMES {
             break;
         }
         k += 1;
-        assert!(k < 5_000, "sleeper build: never reached still deep sleep");
+        assert!(
+            k < 5_000,
+            "sleeper build: never held still deep sleep for {SETTLED_FRAMES} \
+             frames (best run {held}) — the pet has no idle floor, which is a \
+             finding about the engine, not about this fixture"
+        );
     }
     r
 }
@@ -618,13 +661,29 @@ fn verify_bound(r: &mut BrainRig) -> BrainSampled {
         s.lit, SAMPLE_FRAMES,
         "screen_bound_flights: pet not visible"
     );
-    // Measured: 180 airborne and 70 dust frames per 600 (5 teleports) —
-    // 36 flight + 14 dust frames per bound, every bound.
+    // Measured: 255 airborne and 70 dust frames per 600 (5 teleports) — 51
+    // flight + 14 dust frames per bound, every bound.
+    //
+    // The 51 is DERIVED, not observed: a 100-column bound takes the
+    // screen-crossing jump, whose span is `BIG_FLIGHT_BASE + 100 *
+    // BIG_FLIGHT_PER_CELL` = 1.05 s, clamped by `BIG_FLIGHT_MAX` to 0.85 s —
+    // and 0.85 s at this rig's 60 fps is 51 frames exactly. So every long
+    // bound in this script flies at the cap, and 5 x 51 = 255 is the whole
+    // number. Stating the arithmetic is the point: a future change to
+    // `BIG_FLIGHT_MAX` moves this count by a computable amount and must be
+    // re-derived here, rather than absorbed by widening the band.
+    //
+    // This row read 180 until 2026-09-24, from before the screen-crossing
+    // jump existed. It survived that long because the fixture AHEAD of it
+    // (`build_sleeper`) failed first and this assertion was never reached —
+    // confirmed by running the corrected fixture at `b473a0197^` as well as
+    // at HEAD: both report 255 airborne and 70 dust, so the number is not a
+    // consequence of the pet-following fix that sits between them.
     assert!(
-        (150..=210).contains(&s.airborne),
+        (230..=275).contains(&s.airborne),
         "screen_bound_flights: {} airborne frames of {} — outside the \
-         measured band (180): the teleports are not launching the flight \
-         choreography they did",
+         measured band (255 = 5 bounds x BIG_FLIGHT_MAX): the teleports are \
+         not launching the flight choreography they did",
         s.airborne,
         s.frames
     );

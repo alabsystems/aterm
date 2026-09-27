@@ -351,6 +351,57 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
         "protocol-oversize projection is rejected"
     );
     assert_eq!(oversize_rejected.get("rejected"), Some(&1));
+
+    // Negative control: the pre-`46fc93f5a` restore body, replayed on a real
+    // destination as narrow as the model's (`cols == Narrow`, 40 real columns)
+    // beside the shipping restore on an identical one. The old body admitted a
+    // vector of any length and copied whatever prefix overlapped the
+    // destination's own stops; the shipping one refuses both invalid sizes.
+    // Projected onto the admission fields — did the destination take the
+    // vector, and did it keep its own width (`restored_len == cols`) — the
+    // pre-fix grid is exactly the model's `Buggy=1` admission, which the
+    // covering/bounded window rejects.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    for (stops, invalid, reject) in [
+        (vec![false; 39], &undersize, "RejectUndersizeProjection"),
+        (
+            vec![false; usize::from(crate::MAX_GRID_COLS) + 1],
+            &oversize,
+            "RejectOversizeProjection",
+        ),
+    ] {
+        let mut shipping = Grid::new(6, 40);
+        let defaults = shipping.tab_stops().to_vec();
+        shipping.restore_tab_stops(&stops, false);
+        assert_eq!(shipping.tab_stops(), defaults, "{reject}: shipping refuses");
+
+        let mut pre_fix = Grid::new(6, 40);
+        let len = stops.len().min(pre_fix.storage.tab_stops.len());
+        pre_fix.storage.tab_stops[..len].copy_from_slice(&stops[..len]);
+        let took = pre_fix.tab_stops() != defaults;
+        assert!(
+            took,
+            "{reject}: the pre-fix restore took the invalid vector"
+        );
+        let kept_width = pre_fix.tab_stops().len() == usize::from(pre_fix.cols());
+        let mut projected = invalid.clone();
+        projected.insert("phase", 10);
+        projected.insert("admitted", i64::from(took));
+        projected.insert("rejected", i64::from(!took));
+        if kept_width {
+            projected.insert("restored_len", invalid["cols"]);
+        }
+        assert_eq!(
+            buggy.successors(reject, invalid),
+            vec![projected.clone()],
+            "{reject}"
+        );
+        assert!(!model.check_invariant("AdmissionIsCoveringAndBounded", &projected));
+        assert!(
+            model.successors(reject, invalid) != vec![projected],
+            "{reject}"
+        );
+    }
 }
 
 #[test]

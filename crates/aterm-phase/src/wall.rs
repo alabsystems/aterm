@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The WALL a worker's turn ended on, by kind: a usage window, a model
-//! bucket, spend, a full context, an expired login, an API error, overload.
+//! bucket, spend, a full context, an expired login, an API error, overload
+//! — and the one wall that is no turn's end, Claude Code's critical-memory
+//! banner ([`memory_wall`], placed by position rather than by [`PHRASES`]).
 //!
 //! [`crate::phase::worker_phase`] has one word for a wall, `limited`, and
 //! only for the usage kinds; a turn that ended on `API Error: 529
@@ -76,6 +78,14 @@ pub enum WallKind {
     /// server-side issue, usually temporary — try again in a moment.`,
     /// `Repeated 529 Overloaded errors`, `Opus is experiencing high load`).
     Overloaded,
+    /// Claude Code's critical-memory banner: the vendor's own word that its
+    /// process is past saving and must be restarted (resumed with
+    /// [`crate::reader::resume_hint`]). Not a turn's end at all — measured
+    /// 2026-09-24 on a worker whose spinner still ran 36 minutes into a turn
+    /// while it read no input for 2h41m — so it is read by position
+    /// ([`memory_wall`]), and the reader keeps it under a hard busy, where it
+    /// drops every other wall. Never waited out, retried or typed at.
+    Memory,
 }
 
 impl WallKind {
@@ -91,6 +101,7 @@ impl WallKind {
             WallKind::Auth => "auth",
             WallKind::ApiError { .. } => "api-error",
             WallKind::Overloaded => "overloaded",
+            WallKind::Memory => "memory",
         }
     }
 
@@ -106,7 +117,7 @@ impl WallKind {
             | WallKind::ModelBucket { .. }
             | WallKind::Spend => true,
             WallKind::ApiError { code, .. } => *code == Some(429),
-            WallKind::Context | WallKind::Auth | WallKind::Overloaded => false,
+            WallKind::Context | WallKind::Auth | WallKind::Overloaded | WallKind::Memory => false,
         }
     }
 }
@@ -325,14 +336,136 @@ fn api_error(head: &str) -> WallKind {
     WallKind::ApiError { code, retryable }
 }
 
-/// The wall the worker's last turn ended on, if any: [`classify_wall`] over
-/// the rows [`crate::phase::limit_notice`] reads, every kind. It does not ask
-/// whether the worker is busy — a notice stays on the screen while the vendor
-/// retries under it — so read it beside [`crate::phase::busy_signal`], as
-/// [`crate::reader::read`] does.
+/// The wall the worker's last turn ended on, if any: Claude Code's
+/// critical-memory banner first ([`memory_wall`]), then [`classify_wall`]
+/// over the rows [`crate::phase::limit_notice`] reads, every kind. It does
+/// not ask whether the worker is busy — a notice stays on the screen while
+/// the vendor retries under it — so read it beside
+/// [`crate::phase::busy_signal`], as [`crate::reader::read`] does.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
-    crate::phase::notice(rows, &classify_wall)
+    memory_wall(rows).or_else(|| crate::phase::notice(rows, &classify_wall))
+}
+
+/// How far above the composer's top rule [`memory_wall`] looks: the live
+/// zone's parked rows (a spinner, its `⎿  Tip:` or todo rows, the context
+/// indicator, a hint), never the transcript above them.
+const MEMORY_ROWS: usize = 6;
+
+/// Claude Code's critical-memory banner, as a [`WallKind::Memory`] wall.
+///
+/// The 2026-09-24 incident: a worker's spinner read `· Gesticulating… (36m
+/// 1s)` while the process sat at 38.8 GiB resident and had read no input for
+/// 2h41m, and the ONLY thing on the screen that said so was the vendor's
+/// banner — `<anchor> (140.4GB) — restart and resume with claude
+/// --continue`, where `<anchor>` is [`crate::anchors`]' `wall.memory` —
+/// right-aligned and alone on the row between the spinner and the
+/// composer's top rule (it starts at column 67 and ends two columns short of
+/// the 144-column rule). Five rows under it the composer held a human's
+/// draft that QUOTED the banner word for word. So the banner is read by
+/// PLACE, as [`crate::phase::context_left`] reads the context indicator:
+///
+/// * the screen has the composer frame, `width` being its rule's width;
+/// * the row lies between the status row (or, with none, the row under the
+///   last transcript row) and the top rule, and among the [`MEMORY_ROWS`]
+///   rows right above that rule — never inside the composer or under it,
+///   where the draft is, and never up in the transcript;
+/// * the row ends against the right edge (within three columns of `width`),
+///   and its RIGHT SEGMENT is the text after its last run of two or more
+///   spaces: the whole row when the banner is alone on it, its tail when it
+///   shares the status row with the spinner, as the first report of the
+///   incident placed it;
+/// * a row UNDER the status row is the live zone — no transcript row is
+///   drawn there — so any such row will do, whatever column it starts at,
+///   except a row of a message a person queued there
+///   ([`in_queued_message`]). Every other row — the status row itself, and
+///   with no status row every row, where the last transcript block runs
+///   down to the rule — must start its segment at the hint column or later,
+///   or be a hint against the edge
+///   ([`crate::phase::is_against_right_edge`]);
+/// * that segment opens with the anchor followed by ` (` (the size).
+///
+/// The column rule is not asked under a status row because the banner is 75
+/// columns wide: at aterm's default 80 columns it starts at column 3, left
+/// of both the hint column and a hint's column-6 floor, and the first cut
+/// of this reader, which asked it everywhere, read nothing at 82 columns or
+/// fewer, under the very spinner the incident had (review of 2026-09-24).
+///
+/// A transcript row quoting the banner starts at the transcript's columns,
+/// not the hint column, a draft quoting it is under the top rule, and a
+/// queued message quoting it is a `❯` block; all read `None`. The copies
+/// this cannot tell from the banner: with no status row, a row of the last
+/// transcript block that ends against this very edge with the banner as its
+/// right segment from column 6 on; under a status row, a paragraph of a
+/// queued message after a blank row inside it (whether Claude Code draws
+/// one is not measured). And the banner it misses: with no status row (an
+/// idle screen without a done row) in a window of 82 columns or fewer, and
+/// at those widths right under a queued message. The layout was measured
+/// busy at 144 columns; narrower and idle it is SYNTHETIC and unconfirmed,
+/// and under a box it is not read at all
+/// ([`crate::reader::ScreenReader::read`]).
+#[must_use]
+pub fn memory_wall(rows: &[String]) -> Option<Wall> {
+    use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge, status_block};
+    let anchor = crate::anchors::anchor_text("wall.memory");
+    let frame = composer_frame(rows)?;
+    let width = rows[frame.bottom].trim_end().chars().count();
+    let block = status_block(rows, frame.top);
+    let from = block
+        .status
+        .unwrap_or(block.from)
+        .max(frame.top.saturating_sub(MEMORY_ROWS));
+    (from..frame.top).rev().find_map(|i| {
+        let row = rows[i].trim_end();
+        if row.chars().count() + 3 < width {
+            return None;
+        }
+        let (column, segment) = right_segment(row);
+        let live = block
+            .status
+            .is_some_and(|s| s < i && !in_queued_message(rows, s, i));
+        if !live && column < HINT_COLUMN && !is_against_right_edge(row, width) {
+            return None;
+        }
+        segment
+            .strip_prefix(anchor)
+            .is_some_and(|rest| rest.starts_with(" ("))
+            .then(|| Wall {
+                kind: WallKind::Memory,
+                message: segment.to_string(),
+                reset: None,
+                row: i,
+                placement: Placement::Banner,
+            })
+    })
+}
+
+/// Whether row `i`, under the status row `status`, belongs to a message a
+/// person queued in the live zone — `❯ …`, then its wrapped rows indented
+/// under the caret's text: the nearest row at or above `i` and under the
+/// status row that is blank or starts in column 0 is a `❯` row. The
+/// person's words are the one text the live zone holds that can quote the
+/// banner (the 2026-09-24 incident's draft quoted it word for word), so
+/// they are never read as it, however narrow the window.
+fn in_queued_message(rows: &[String], status: usize, i: usize) -> bool {
+    (status + 1..=i)
+        .rev()
+        .map(|j| rows[j].as_str())
+        .find(|row| row.trim().is_empty() || !row.starts_with(char::is_whitespace))
+        .is_some_and(|row| row.starts_with('❯'))
+}
+
+/// A row's right segment and the column it starts at: the text after its
+/// last run of two or more spaces, or the whole row (its indent skipped)
+/// when it has none. `row` is trimmed at the end.
+fn right_segment(row: &str) -> (usize, &str) {
+    match row.rfind("  ") {
+        Some(gap) => (row[..gap + 2].chars().count(), &row[gap + 2..]),
+        None => {
+            let t = row.trim_start();
+            (row.chars().count() - t.chars().count(), t)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -669,6 +802,235 @@ mod tests {
         assert_eq!(worker_phase(&update), Phase::Idle);
     }
 
+    /// The banner as the incident drew it, and as it would be drawn beside
+    /// the spinner: a memory wall read from the banner row, its message the
+    /// banner's whole text. The draft quoting it five rows lower is inside
+    /// the composer and never read.
+    #[test]
+    fn the_memory_banner_is_read_by_its_place() {
+        use crate::anchors::anchor_text;
+        use crate::prompt::fixtures::{MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE};
+        let r = screen(MEMORY_BANNER_BUSY);
+        let w = memory_wall(&r).expect("the banner");
+        assert_eq!(w.kind, WallKind::Memory);
+        assert_eq!(w.placement, Placement::Banner);
+        assert_eq!(w.reset, None);
+        assert!(w.message.starts_with(anchor_text("wall.memory")));
+        assert!(w.message.ends_with("claude --continue"), "{}", w.message);
+        assert_eq!(r[w.row].trim_start(), w.message);
+        assert_eq!(crate::phase::leading_spaces(&r[w.row]), 67);
+        assert!(
+            r[w.row + 1].starts_with('─'),
+            "the row right above the rule"
+        );
+        // The same banner sharing the spinner's row reads the same.
+        let mut shared = r.clone();
+        let spinner = w.row - 1;
+        let pad = 142 - shared[spinner].chars().count() - w.message.chars().count();
+        shared[spinner] = format!("{}{}{}", shared[spinner], " ".repeat(pad), w.message);
+        shared[w.row] = String::new();
+        let s = memory_wall(&shared).expect("beside the spinner");
+        assert_eq!((s.row, s.message.as_str()), (spinner, w.message.as_str()));
+        // And the idle layout (synthetic, unconfirmed).
+        let idle = memory_wall(&screen(MEMORY_BANNER_IDLE)).expect("idle");
+        assert_eq!(idle.message, w.message);
+        // `wall` asks it first.
+        assert_eq!(wall(&r).map(|w| w.kind), Some(WallKind::Memory));
+    }
+
+    /// The busy fixture at `width` columns: its rules that wide, every other
+    /// row cut to it, and row `at` the banner right-aligned two columns
+    /// short of the edge, as it was measured at 144.
+    fn narrowed(rows: &[String], at: usize, width: usize, banner: &str) -> Vec<String> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| {
+                if i == at {
+                    format!("{banner:>w$}", w = width - 2)
+                } else if row.starts_with('─') {
+                    "─".repeat(width)
+                } else {
+                    row.chars().take(width).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// `text`, then words, to two columns short of `width`: a quote that
+    /// runs on to the banner's own edge.
+    fn to_edge(text: &str, width: usize) -> String {
+        let mut row = format!("{text}, it said, so the run stops here");
+        while row.chars().count() < width - 2 {
+            row.push_str(" and");
+        }
+        row.chars().take(width - 2).collect()
+    }
+
+    /// The banner is 75 columns wide, so a narrow window starts it left of
+    /// the hint column: at aterm's default 80 columns it starts at column 3.
+    /// Under a status row every row down to the top rule is the live zone —
+    /// no transcript row sits there — so there it is read at every width it
+    /// fits, 80 included, where the first cut of this reader read nothing
+    /// (the review of 2026-09-24: `None` at 82 columns or fewer, however
+    /// busy the spinner over it).
+    #[test]
+    fn the_memory_banner_reads_at_every_width_under_a_spinner() {
+        use crate::prompt::fixtures::MEMORY_BANNER_BUSY;
+        let wide = screen(MEMORY_BANNER_BUSY);
+        let at = memory_wall(&wide).expect("the control").row;
+        let banner = wide[at].trim_start().to_string();
+        assert_eq!(banner.chars().count(), 75);
+        for width in 77..=144 {
+            let r = narrowed(&wide, at, width, &banner);
+            let w = memory_wall(&r).unwrap_or_else(|| panic!("{width} columns"));
+            assert_eq!((w.row, w.message.as_str()), (at, banner.as_str()));
+            let reading = crate::reader::read(Some("claude"), &r, None);
+            assert_eq!(reading.phase, Phase::Busy, "{width} columns");
+            assert_eq!(
+                reading.wall.map(|w| w.kind),
+                Some(WallKind::Memory),
+                "{width} columns"
+            );
+        }
+        let at_80 = narrowed(&wide, at, 80, &banner);
+        assert_eq!(crate::phase::leading_spaces(&at_80[at]), 3);
+    }
+
+    /// NEGATIVE CONTROL under the spinner: the one person's text the live
+    /// zone holds is a message queued there — `❯ …`, its wrapped rows
+    /// indented under the caret's text. One that quotes the banner (the
+    /// incident's draft, submitted), wrapped so a row opens with it and
+    /// runs to the edge, is no wall at 80 columns or at 144, two rows under
+    /// its `❯` or one. CONTROL: the banner itself right above that message
+    /// is still read.
+    #[test]
+    fn a_queued_message_quoting_the_memory_banner_is_not_a_wall() {
+        use crate::prompt::fixtures::MEMORY_BANNER_BUSY;
+        let wide = screen(MEMORY_BANNER_BUSY);
+        let at = memory_wall(&wide).expect("the control").row;
+        let banner = wide[at].trim_start().to_string();
+        for width in [80, 144] {
+            let r = narrowed(&wide, at, width, &banner);
+            let quote = to_edge(&format!("  {banner}"), width);
+            for message in [
+                vec!["❯ the tab above says".to_string(), quote.clone()],
+                vec![
+                    "❯ the tab above has said for an hour now that it will not".to_string(),
+                    "  read a key, and the banner under its spinner says".to_string(),
+                    quote.clone(),
+                ],
+            ] {
+                let mut queued = r.clone();
+                queued.splice(at..=at, message.iter().cloned());
+                assert_eq!(memory_wall(&queued), None, "{width}: {message:?}");
+                let reading = crate::reader::read(Some("claude"), &queued, None);
+                assert_eq!(reading.phase, Phase::Busy, "{width}");
+                assert_eq!(reading.wall, None, "{width}: {message:?}");
+                let mut both = r.clone();
+                both.splice(at + 1..at + 1, message.iter().cloned());
+                assert_eq!(
+                    memory_wall(&both).map(|w| w.row),
+                    Some(at),
+                    "{width}: the banner over it"
+                );
+            }
+        }
+    }
+
+    /// NEGATIVE CONTROLS: every copy of the banner that is not the vendor's
+    /// banner row reads `None` — the composer draft alone (the incident's
+    /// own quote), a copy ending short of the edge, one up in the transcript
+    /// beyond the live zone, the anchor with no size after it, and a screen
+    /// with no composer frame; and, where the transcript meets the live zone
+    /// — at idle, with no status row, the last transcript block runs down
+    /// to the rows the banner is parked in — the words in the worker's
+    /// message, in a paragraph of it, in a tool's output and in that
+    /// output's continuation row, each running to the edge. (The first cut
+    /// of these placed the transcript's copies between the spinner and the
+    /// rule, where no transcript row is ever drawn.)
+    #[test]
+    fn a_quoted_memory_banner_is_not_a_wall() {
+        use crate::anchors::anchor_text;
+        use crate::prompt::fixtures::{MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE};
+        let r = screen(MEMORY_BANNER_BUSY);
+        let at = memory_wall(&r).expect("the control").row;
+        let banner = r[at].trim_start().to_string();
+        let with = |row: String| {
+            let mut v = r.clone();
+            v[at] = row;
+            v
+        };
+        // Right-aligned as the banner is, ending two columns short of the
+        // 144-column rule.
+        let right_aligned = |text: &str| format!("{text:>142}");
+        let no_size = format!("{} is back to normal", anchor_text("wall.memory"));
+        assert_eq!(
+            memory_wall(&with(right_aligned(&banner))).map(|w| w.row),
+            Some(at)
+        );
+        let blank = with(String::new());
+        assert!(
+            blank.iter().any(|row| row.contains(&banner[..40])),
+            "the draft still quotes it"
+        );
+        let idle = screen(MEMORY_BANNER_IDLE);
+        let at_idle = memory_wall(&idle).expect("the idle control").row;
+        // The banner row replaced by the last rows of a transcript block.
+        let ending = |tail: &[&str]| {
+            let mut v = idle.clone();
+            v.splice(at_idle..=at_idle, tail.iter().map(|row| row.to_string()));
+            v
+        };
+        let edge = |text: String| to_edge(&text, 144);
+        let (message, paragraph, output, continued) = (
+            edge(format!("⏺ {banner}")),
+            edge(format!("  {banner}")),
+            edge(format!("  ⎿  {banner}")),
+            edge(format!("     {banner}")),
+        );
+        let cases = [
+            ("blanked: only the draft's quote", blank),
+            (
+                "indented, ending short of the edge",
+                with(format!("{}{banner}", " ".repeat(40))),
+            ),
+            ("the words with no size", with(right_aligned(&no_size))),
+            ("idle: the worker's message", ending(&[&message])),
+            (
+                "idle: a paragraph of the worker's message",
+                ending(&["⏺ The banner said:", "", &paragraph]),
+            ),
+            (
+                "idle: a tool's output",
+                ending(&["⏺ Bash(tail -1 run.log)", &output]),
+            ),
+            (
+                "idle: a tool output's continuation row",
+                ending(&[
+                    "⏺ Bash(tail -2 run.log)",
+                    "  ⎿  the run stopped:",
+                    &continued,
+                ]),
+            ),
+        ];
+        for (name, v) in &cases {
+            assert_eq!(memory_wall(v), None, "{name}");
+            assert_eq!(wall(v), None, "{name}");
+        }
+        // Up in the transcript, over the spinner: not the live zone.
+        let mut above = r.clone();
+        above[at] = String::new();
+        above.insert(1, r[at].clone());
+        assert_eq!(memory_wall(&above), None, "above the status row");
+        // No composer frame (the rules gone): nothing is read by place.
+        let unframed: Vec<String> = r
+            .iter()
+            .filter(|row| !row.starts_with('─'))
+            .cloned()
+            .collect();
+        assert_eq!(memory_wall(&unframed), None, "no frame");
+    }
+
     #[test]
     fn only_the_usage_kinds_and_a_rate_limit_read_limited() {
         assert!(WallKind::UsageSession.reads_limited());
@@ -683,6 +1045,8 @@ mod tests {
         assert!(!WallKind::Overloaded.reads_limited());
         assert!(!WallKind::Context.reads_limited());
         assert!(!WallKind::Auth.reads_limited());
+        assert!(!WallKind::Memory.reads_limited());
+        assert_eq!(WallKind::Memory.name(), "memory");
         assert!(
             !WallKind::ApiError {
                 code: Some(500),

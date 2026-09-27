@@ -26,10 +26,10 @@
 //! table is therefore **not** a field sitting next to the engine that callers
 //! must remember to refresh. [`PolicyState`] owns both, its fields are private
 //! to this module, and it exposes exactly two mutators —
-//! [`PolicyState::install`] and [`PolicyState::clear`] — each of which
+//! [`PolicyState::install`] and `PolicyState::clear` — each of which
 //! recompiles the table in the same statement that changes the engine. There is
-//! no way to reach the engine mutably from outside this module (in particular
-//! `PolicyEngine::replace_policy` is unreachable through this type), so "the
+//! no way to reach the engine mutably from outside this module (and
+//! `PolicyEngine` itself has no in-place policy swap), so "the
 //! engine changed but the table did not" is not a representable state. That is
 //! the invariant the tests at the bottom of this file pin from the outside, by
 //! driving a real `Terminal` through every install/replace/clear order.
@@ -203,7 +203,7 @@ pub(super) struct PolicyState {
     /// The installed engine, or `None` when the host has not installed a policy.
     engine: Option<PolicyEngine>,
     /// Gate verdicts compiled from `engine`. Always in sync: the only writers
-    /// are [`Self::install`] and [`Self::clear`].
+    /// are [`Self::install`] and `Self::clear`.
     gates: PolicyGates,
     /// XTWINOPS verdicts for `Ps` 0..=[`XTWINOPS_MAX_PS`], compiled from
     /// `engine` by the same two writers.
@@ -251,6 +251,7 @@ impl PolicyState {
     }
 
     /// Drop the engine, recompiling every gate table back to the legacy posture.
+    #[cfg(test)]
     pub(super) fn clear(&mut self) {
         self.engine = None;
         self.gates = PolicyGates::compile(None);
@@ -286,6 +287,7 @@ impl PolicyState {
 
     /// Borrow the installed engine. Shared borrow only — a caller can read the
     /// policy but cannot swap it behind the compiled table's back.
+    #[cfg(test)]
     pub(super) fn engine(&self) -> Option<&PolicyEngine> {
         self.engine.as_ref()
     }

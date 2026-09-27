@@ -792,7 +792,6 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
             h: card_h + 6.0,
             radius: radius + 3.0,
             fill: rgba([0, 0, 0], 0x2A),
-            blur: false,
         },
         DrawPrim::Panel {
             x: card_x,
@@ -801,7 +800,6 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
             h: card_h,
             radius,
             fill: rgba(r.surface, 0xFF),
-            blur: false,
         },
         DrawPrim::Stroke {
             x: card_x,
@@ -888,7 +886,6 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
                 h,
                 radius: ch * 0.3,
                 fill: rgba(ring, 0x22),
-                blur: false,
             });
             prims.push(DrawPrim::Stroke {
                 x,

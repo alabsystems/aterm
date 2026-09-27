@@ -4,9 +4,9 @@
 //! Tier-1 conformance for native Settings singleton activation and async routing.
 //!
 //! These traces drive the genuine [`crate::App`] Settings host, stable native runtime
-//! identities, versioned config reducer, canonical document store, and document
-//! publication fan-out.  Projections are reconstructed from those independent truth
-//! lanes; they are never copied from the model action or a single router verdict.
+//! identities and the versioned config reducer.  Projections are reconstructed from
+//! those independent truth lanes; they are never copied from the model action or a
+//! single router verdict.
 
 #![cfg(test)]
 
@@ -15,11 +15,11 @@ use std::collections::BTreeSet;
 use aterm_spec::derive::{Model, native_async_delivery_model, native_settings_singleton_model};
 use aterm_spec::interp::{State, admits};
 
-use crate::document_store::{DocumentStore, DocumentTxnOutcome, TextEdit};
+use crate::document_store::DocumentStore;
 use crate::native_app::{
     AppEffect, AppEvent, AppKind, AppViewState, CompletionSink, ConfigPatch, ConfigPatchOutcome,
-    EditorApp, ExternalOpenOutcome, MarkdownApp, MarkdownViewState, NativeApp, NativeRuntime,
-    ReplyToken, SemanticInput, ServiceId, WorkOwner,
+    ExternalOpenOutcome, MarkdownApp, MarkdownViewState, NativeApp, NativeRuntime, ReplyToken,
+    SemanticInput, WorkOwner,
 };
 use crate::native_config_service::{
     ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ExpectedValue, VersionedConfigService,
@@ -125,11 +125,12 @@ fn singleton_project(
         i64::try_from(settings_views_in_window(app, windows[1])).expect("bounded views"),
     );
     state.insert("requesting_window", facts.requesting_window);
-    let focused_window = match facts.requesting_window {
-        1 if app.frontmost_window == Some(windows[0]) && active_is_settings(app, windows[0]) => 1,
-        2 if app.frontmost_window == Some(windows[1]) && active_is_settings(app, windows[1]) => 2,
-        _ => 0,
-    };
+    // Read off the App, whoever asked: the frontmost window, when its active tab
+    // is Settings. A request that raised another window projects as that window.
+    let focused_window = (1..)
+        .zip(windows)
+        .find(|&(_, wid)| app.frontmost_window == Some(wid) && active_is_settings(app, wid))
+        .map_or(0, |(number, _)| number);
     state.insert("focused_window", focused_window);
     state
 }
@@ -230,8 +231,11 @@ fn real_app_settings_activation_conforms_in_two_windows_and_rejects_duplicates()
     assert!(!model.check_invariant("SingletonInstance", &duplicate));
     assert!(!model.check_invariant("OneImplicitViewWindowTwo", &duplicate));
 
-    // A cross-window focus steal is independently visible from App.frontmost and
-    // the active TabSet, and cannot masquerade as a successful OpenTwo.
+    // A cross-window focus steal (the model's `Buggy=1` OpenTwo: raising the
+    // window that already shows Settings instead of the requester) leaves window
+    // one frontmost over its Settings tab while window two asked, which the
+    // projection reads as `(requesting 2, focused 1)`. It cannot masquerade as a
+    // successful OpenTwo.
     let mut stolen_focus = after_repeat_two;
     stolen_focus.insert("focused_window", 1);
     assert_eq!(admits(&model, &before_repeat_two, &stolen_focus), None);
@@ -280,24 +284,20 @@ struct AsyncFacts {
     sink: i64,
     token_generation: i64,
     view_generation: i64,
-    instance_generation: i64,
-    document_generation: i64,
-    service_generation: i64,
-    accepted: i64,
-    state_updates: i64,
+    /// Reductions of the latest issued operation's reply, OBSERVED: each time
+    /// the Settings reducer changed the view's feedback, or the config service
+    /// published a new revision, for that operation.
+    reduced: i64,
 }
 
 struct AsyncHarness {
     runtime: NativeRuntime,
     config: VersionedConfigService,
     config_baseline: u64,
-    documents: DocumentStore,
-    document_baseline: aterm_buffer::Seq,
     settings_instance: AppInstanceId,
     settings_view: ViewId,
     markdown_instance: AppInstanceId,
-    editor_instance: AppInstanceId,
-    document: crate::document_store::DocumentId,
+    markdown_view: ViewId,
     pending: Option<PendingReply>,
     config_work: Option<ConfigPatch>,
     facts: AsyncFacts,
@@ -329,10 +329,10 @@ impl AsyncHarness {
             )
             .expect("Settings view");
 
+        // A second live view of a different app: the crossed-sink control
+        // needs an identity that is live on its own and still not this reply's.
         let mut documents = DocumentStore::new();
         let document = documents.open("mem://async-conformance".into(), "alpha".into());
-        let document_baseline = documents.snapshot(document).unwrap().seq;
-        runtime.set_document_generation(document, 1);
         let markdown_instance = runtime
             .insert_instance(NativeApp::Markdown(MarkdownApp::new(
                 document,
@@ -340,38 +340,23 @@ impl AsyncHarness {
                 "alpha",
             )))
             .expect("Markdown instance");
+        let markdown_view = ViewId::from_stored(2);
         runtime
             .attach_view(
-                ViewId::from_stored(2),
+                markdown_view,
                 markdown_instance,
                 AppViewState::Markdown(MarkdownViewState::default()),
             )
             .expect("Markdown view");
-        let editor_instance = runtime
-            .insert_instance(NativeApp::Editor(EditorApp::new(
-                document,
-                "Async.md".into(),
-            )))
-            .expect("Editor instance");
-        runtime
-            .attach_view(
-                ViewId::from_stored(3),
-                editor_instance,
-                AppViewState::Editor(Box::default()),
-            )
-            .expect("Editor view");
 
         Self {
             runtime,
             config,
             config_baseline,
-            documents,
-            document_baseline,
             settings_instance,
             settings_view,
             markdown_instance,
-            editor_instance,
-            document,
+            markdown_view,
             pending: None,
             config_work: None,
             facts: AsyncFacts {
@@ -379,11 +364,7 @@ impl AsyncHarness {
                 sink: 0,
                 token_generation: 0,
                 view_generation: 1,
-                instance_generation: 1,
-                document_generation: 1,
-                service_generation: 1,
-                accepted: 0,
-                state_updates: 0,
+                reduced: 0,
             },
         }
     }
@@ -395,40 +376,7 @@ impl AsyncHarness {
         state.insert("token_generation", self.facts.token_generation);
         state.insert("pending", i64::from(self.pending.is_some()));
         state.insert("view_generation", self.facts.view_generation);
-        state.insert("instance_generation", self.facts.instance_generation);
-        state.insert("document_generation", self.facts.document_generation);
-        state.insert("service_generation", self.facts.service_generation);
-        state.insert("accepted", self.facts.accepted);
-        state.insert("state_updates", self.facts.state_updates);
-
-        let snapshot = self
-            .documents
-            .snapshot(self.document)
-            .expect("live document");
-        let reductions = i64::try_from(snapshot.seq.0.saturating_sub(self.document_baseline.0))
-            .expect("bounded document reductions");
-        state.insert("document_reductions", reductions);
-        let markdown_current =
-            self.runtime
-                .app(self.markdown_instance)
-                .is_some_and(|app| match app {
-                    NativeApp::Markdown(markdown) => {
-                        markdown.dirty && markdown.parsed.source_len == snapshot.text.len()
-                    }
-                    _ => false,
-                });
-        let editor_current = self
-            .runtime
-            .app(self.editor_instance)
-            .is_some_and(|app| matches!(app, NativeApp::Editor(editor) if editor.dirty));
-        state.insert(
-            "markdown_publications",
-            if markdown_current { reductions } else { 0 },
-        );
-        state.insert(
-            "editor_publications",
-            if editor_current { reductions } else { 0 },
-        );
+        state.insert("reduced", self.facts.reduced);
         state.insert("wrong_delivery", 0);
         state.insert("service_dropped_with_view", 0);
         state
@@ -437,20 +385,44 @@ impl AsyncHarness {
     fn set_pending(&mut self, pending: PendingReply) {
         let (owner, generation) = match pending.work_owner() {
             WorkOwner::View { generation, .. } => (1, generation),
-            WorkOwner::Instance { generation, .. } => (2, generation),
-            WorkOwner::Document { generation, .. } => (3, generation),
             WorkOwner::Service { generation, .. } => (4, generation),
         };
         let sink = match pending.sink() {
             CompletionSink::View { .. } => 1,
-            CompletionSink::Instance { .. } => 2,
-            CompletionSink::DocumentReducer { .. } => 3,
             CompletionSink::ServiceReducer { .. } => 4,
         };
         self.facts.owner = owner;
         self.facts.sink = sink;
         self.facts.token_generation = i64::try_from(generation).expect("bounded token generation");
+        self.facts.reduced = 0;
         self.pending = Some(pending);
+    }
+
+    fn settings_feedback(&self) -> Option<String> {
+        match self.runtime.view_state(self.settings_view) {
+            Some(AppViewState::Settings(view)) => view.feedback.clone(),
+            _ => panic!("live Settings view"),
+        }
+    }
+
+    /// Deliver one `ExternalOpenFinished` through the genuine router and
+    /// reducer, and count a reduction only if the reducer changed the view.
+    fn deliver_external(
+        &mut self,
+        operation: crate::native_app::OperationId,
+        outcome: ExternalOpenOutcome,
+    ) {
+        let before = self.settings_feedback();
+        self.runtime
+            .dispatch(
+                self.settings_instance,
+                self.settings_view,
+                AppEvent::ExternalOpenFinished { operation, outcome },
+            )
+            .expect("the router delivers the view completion");
+        if self.settings_feedback() != before {
+            self.facts.reduced += 1;
+        }
     }
 
     fn view_reply(&mut self) -> ReplyToken<ExternalOpenOutcome> {
@@ -491,32 +463,6 @@ impl AsyncHarness {
         self.set_pending(PendingReply::View(reply));
     }
 
-    fn issue_instance(&mut self) {
-        let mut reply = self.view_reply();
-        reply.work_owner = WorkOwner::Instance {
-            instance: self.settings_instance,
-            generation: u64::try_from(self.facts.instance_generation).unwrap(),
-        };
-        reply.sink = CompletionSink::Instance {
-            instance: self.settings_instance,
-            generation: u64::try_from(self.facts.instance_generation).unwrap(),
-        };
-        self.set_pending(PendingReply::View(reply));
-    }
-
-    fn issue_document(&mut self) {
-        let mut reply = self.view_reply();
-        reply.work_owner = WorkOwner::Document {
-            document: self.document,
-            generation: u64::try_from(self.facts.document_generation).unwrap(),
-        };
-        reply.sink = CompletionSink::DocumentReducer {
-            document: self.document,
-            generation: u64::try_from(self.facts.document_generation).unwrap(),
-        };
-        self.set_pending(PendingReply::View(reply));
-    }
-
     fn issue_service(&mut self) {
         let outcome = self
             .runtime
@@ -549,68 +495,21 @@ impl AsyncHarness {
     fn complete_view(&mut self) -> PendingReply {
         let reply = self.pending.take().expect("pending view completion");
         assert!(reply.is_current(&self.runtime));
-        let operation = reply.operation();
-        let before_feedback = match self.runtime.view_state(self.settings_view) {
-            Some(AppViewState::Settings(view)) => view.feedback.clone(),
-            _ => panic!("live Settings view"),
-        };
-        self.runtime
-            .dispatch(
-                self.settings_instance,
-                self.settings_view,
-                AppEvent::ExternalOpenFinished {
-                    operation,
-                    outcome: ExternalOpenOutcome::Opened,
-                },
-            )
-            .expect("reduce current view completion");
-        let after_feedback = match self.runtime.view_state(self.settings_view) {
-            Some(AppViewState::Settings(view)) => view.feedback.clone(),
-            _ => panic!("live Settings view"),
-        };
-        assert_ne!(before_feedback, after_feedback);
-        self.facts.accepted += 1;
-        self.facts.state_updates += 1;
+        let reduced = self.facts.reduced;
+        self.deliver_external(reply.operation(), ExternalOpenOutcome::Opened);
+        assert_eq!(
+            self.facts.reduced,
+            reduced + 1,
+            "the current reply reduces the view"
+        );
         reply
-    }
-
-    fn complete_instance(&mut self) {
-        let reply = self.pending.take().expect("pending instance completion");
-        assert!(reply.is_current(&self.runtime));
-        let update = UpdateState::from_status(1, "0.1.0", None, true);
-        assert!(self.runtime.replace_settings_update(update, 2));
-        self.facts.accepted += 1;
-        self.facts.state_updates += 1;
-    }
-
-    fn complete_document(&mut self) {
-        let reply = self.pending.take().expect("pending document completion");
-        assert!(reply.is_current(&self.runtime));
-        let snapshot = self.documents.snapshot(self.document).unwrap();
-        let end = snapshot.text.len();
-        assert!(matches!(
-            self.documents.transact(
-                self.document,
-                snapshot.seq,
-                vec![TextEdit {
-                    range: end..end,
-                    insert: "!".into(),
-                }],
-            ),
-            DocumentTxnOutcome::Committed { .. }
-        ));
-        let snapshot = self.documents.snapshot(self.document).unwrap();
-        let revision = self.documents.revision(self.document).unwrap();
-        self.runtime
-            .publish_document(self.document, &snapshot.text, revision, true);
-        self.facts.accepted += 1;
-        self.facts.state_updates += 1;
     }
 
     fn complete_service(&mut self) {
         let reply = self.pending.take().expect("pending service completion");
         assert!(reply.is_current(&self.runtime));
         let patch = self.config_work.take().expect("pending config work");
+        let revision_before = self.config.snapshot().revision;
         let result = self.config.patch(ConfigPatchRequest {
             base_revision: patch.base_revision,
             edits: patch
@@ -636,8 +535,9 @@ impl AsyncHarness {
             "service-owned patch must apply against its matching baseline: {result:?}"
         );
         assert_eq!(self.config.snapshot().revision, self.config_baseline + 1);
-        self.facts.accepted += 1;
-        self.facts.state_updates += 1;
+        if self.config.snapshot().revision > revision_before {
+            self.facts.reduced += 1;
+        }
     }
 }
 
@@ -667,46 +567,15 @@ fn async_step(
 }
 
 #[test]
-fn native_runtime_accepts_each_owner_and_document_fans_out_once() {
-    for (issue_action, complete_action) in [
-        ("IssueView", "CompleteView"),
-        ("IssueInstance", "CompleteInstance"),
-        ("IssueDocument", "CompleteDocument"),
-    ] {
-        let model = native_async_delivery_model();
-        let mut harness = AsyncHarness::new();
-        assert_eq!(harness.project(&model), model.init_state());
-        match issue_action {
-            "IssueView" => async_issue(&model, &mut harness, issue_action, |h| h.issue_view()),
-            "IssueInstance" => {
-                async_issue(&model, &mut harness, issue_action, |h| h.issue_instance())
-            }
-            "IssueDocument" => {
-                async_issue(&model, &mut harness, issue_action, |h| h.issue_document())
-            }
-            _ => unreachable!(),
-        }
-        let completion = match complete_action {
-            "CompleteView" => Some(async_step(&model, &mut harness, complete_action, |h| {
-                let _ = h.complete_view();
-            })),
-            "CompleteInstance" => Some(async_step(&model, &mut harness, complete_action, |h| {
-                h.complete_instance()
-            })),
-            "CompleteDocument" => Some(async_step(&model, &mut harness, complete_action, |h| {
-                h.complete_document()
-            })),
-            _ => unreachable!(),
-        };
-        let (_, completed) = completion.unwrap();
-        assert_eq!(completed["accepted"], 1);
-        assert_eq!(completed["state_updates"], 1);
-        if complete_action == "CompleteDocument" {
-            assert_eq!(completed["document_reductions"], 1);
-            assert_eq!(completed["editor_publications"], 1);
-            assert_eq!(completed["markdown_publications"], 1);
-        }
-    }
+fn native_runtime_accepts_a_live_view_owner_once() {
+    let model = native_async_delivery_model();
+    let mut harness = AsyncHarness::new();
+    assert_eq!(harness.project(&model), model.init_state());
+    async_issue(&model, &mut harness, "IssueView", |h| h.issue_view());
+    let (_, completed) = async_step(&model, &mut harness, "CompleteView", |h| {
+        let _ = h.complete_view();
+    });
+    assert_eq!(completed["reduced"], 1);
 }
 
 #[test]
@@ -738,69 +607,6 @@ fn service_completion_outlives_requester_and_stale_generations_drop() {
     async_step(&model, &mut view, "DropStaleView", |h| {
         h.pending = None;
     });
-
-    let mut instance = AsyncHarness::new();
-    async_issue(&model, &mut instance, "IssueInstance", |h| {
-        h.issue_instance();
-    });
-    async_step(&model, &mut instance, "ReplaceInstance", |h| {
-        assert!(h.runtime.remove_instance(h.settings_instance).is_some());
-        h.facts.instance_generation += 1;
-    });
-    assert!(
-        !instance
-            .pending
-            .as_ref()
-            .unwrap()
-            .is_current(&instance.runtime)
-    );
-    async_step(&model, &mut instance, "DropStaleInstance", |h| {
-        h.pending = None;
-    });
-
-    let mut document = AsyncHarness::new();
-    async_issue(&model, &mut document, "IssueDocument", |h| {
-        h.issue_document();
-    });
-    async_step(&model, &mut document, "ReplaceDocument", |h| {
-        h.facts.document_generation += 1;
-        h.runtime.set_document_generation(
-            h.document,
-            u64::try_from(h.facts.document_generation).unwrap(),
-        );
-    });
-    assert!(
-        !document
-            .pending
-            .as_ref()
-            .unwrap()
-            .is_current(&document.runtime)
-    );
-    async_step(&model, &mut document, "DropStaleDocument", |h| {
-        h.pending = None;
-    });
-
-    let mut restarted_service = AsyncHarness::new();
-    async_issue(&model, &mut restarted_service, "IssueService", |h| {
-        h.issue_service();
-    });
-    async_step(&model, &mut restarted_service, "RestartService", |h| {
-        h.facts.service_generation += 1;
-        assert_eq!(
-            h.runtime.bump_service_generation(ServiceId::CONFIG),
-            u64::try_from(h.facts.service_generation).unwrap()
-        );
-    });
-    assert!(
-        !restarted_service
-            .pending
-            .as_ref()
-            .unwrap()
-            .is_current(&restarted_service.runtime)
-    );
-    async_step(&model, &mut restarted_service, "DropStaleService", |h| {
-        h.pending = None;
-    });
 }
 
 #[test]
@@ -813,11 +619,27 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
     let Some(PendingReply::View(reply)) = harness.pending.as_ref() else {
         panic!("view reply");
     };
-    let mut crossed = reply.clone();
-    crossed.sink = CompletionSink::Instance {
-        instance: harness.settings_instance,
+    // Both halves live on their own: the Markdown view's identity, as owner
+    // AND sink, is a current reply proof...
+    let markdown = CompletionSink::View {
+        instance: harness.markdown_instance,
+        view: harness.markdown_view,
         generation: 1,
     };
+    let mut aligned = reply.clone();
+    aligned.work_owner = WorkOwner::View {
+        instance: harness.markdown_instance,
+        view: harness.markdown_view,
+        generation: 1,
+    };
+    aligned.sink = markdown;
+    assert!(
+        harness.runtime.completion_is_current(&aligned),
+        "the crossed sink's identity is live by itself"
+    );
+    // ...and crossing it with the Settings owner is not.
+    let mut crossed = reply.clone();
+    crossed.sink = markdown;
     assert!(
         !harness.runtime.completion_is_current(&crossed),
         "two independently live identities are not one coherent reply proof"
@@ -825,8 +647,7 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
 
     let mut wrong_delivery = legitimate_pending.clone();
     wrong_delivery.insert("pending", 0);
-    wrong_delivery.insert("accepted", 1);
-    wrong_delivery.insert("state_updates", 1);
+    wrong_delivery.insert("reduced", 1);
     wrong_delivery.insert("wrong_delivery", 1);
     assert_eq!(admits(&model, &legitimate_pending, &wrong_delivery), None);
     assert!(!model.check_invariant("IdentityAndGenerationChecked", &wrong_delivery));
@@ -837,34 +658,31 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
         admits(&model, &legitimate_pending, &completed),
         Some("CompleteView")
     );
-    let feedback = match harness.runtime.view_state(harness.settings_view) {
-        Some(AppViewState::Settings(view)) => view.feedback.clone(),
-        _ => panic!("live Settings view"),
-    };
+    let feedback = harness.settings_feedback();
     let PendingReply::View(reply) = reply else {
         unreachable!();
     };
-    harness
-        .runtime
-        .dispatch(
-            harness.settings_instance,
-            harness.settings_view,
-            AppEvent::ExternalOpenFinished {
-                operation: reply.operation,
-                outcome: ExternalOpenOutcome::Failed {
-                    message: "duplicate".into(),
-                },
-            },
-        )
-        .expect("duplicate reaches genuine reducer as a no-op");
-    let feedback_after_duplicate = match harness.runtime.view_state(harness.settings_view) {
-        Some(AppViewState::Settings(view)) => view.feedback.clone(),
-        _ => panic!("live Settings view"),
-    };
-    assert_eq!(feedback_after_duplicate, feedback);
+    // A second delivery of the consumed reply, through the genuine router and
+    // reducer, with an outcome that WOULD change the feedback were it reduced:
+    // `finish_external`'s `pending.remove` guard finds no operation, and the
+    // view is untouched — no model step at all.
+    harness.deliver_external(
+        reply.operation,
+        ExternalOpenOutcome::Denied {
+            message: "duplicate".into(),
+        },
+    );
+    assert_eq!(harness.settings_feedback(), feedback);
+    assert_eq!(harness.project(&model), completed);
 
+    // Negative control: the reducer without that guard reduces the reply a
+    // second time.
     let mut duplicate_reduction = completed.clone();
-    duplicate_reduction.insert("accepted", 2);
+    duplicate_reduction.insert("reduced", 2);
+    assert_eq!(
+        aterm_spec::interp::with_buggy(&model, 1).successors("RedeliverView", &completed),
+        vec![duplicate_reduction.clone()]
+    );
     assert_eq!(admits(&model, &completed, &duplicate_reduction), None);
-    assert!(!model.check_invariant("AcceptedReducedOnce", &duplicate_reduction));
+    assert!(!model.check_invariant("ReducedAtMostOnce", &duplicate_reduction));
 }

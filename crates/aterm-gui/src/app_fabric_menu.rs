@@ -416,7 +416,7 @@ impl App {
             Ok(()) => self.open_menu_document(wid, path),
             Err(e) => self.menu_failure(
                 "inbox",
-                "Inbox did not open",
+                "Couldn't open the inbox",
                 &[&e.to_string(), &path.display().to_string()],
             ),
         }
@@ -431,7 +431,7 @@ impl App {
             Err(e) => {
                 self.menu_failure(
                     "document",
-                    "Document did not open",
+                    "Couldn't open the document",
                     &[&e.to_string(), &path.display().to_string()],
                 );
                 return;
@@ -442,7 +442,7 @@ impl App {
         {
             self.menu_failure(
                 "document",
-                "Document did not open",
+                "Couldn't open the document",
                 &[&e.to_string(), &path.display().to_string()],
             );
         }
@@ -457,8 +457,8 @@ impl App {
 
     /// Fabric Status… / Turn Fabric On… / Turn Fabric Off…: confirm when the
     /// verb changes something, compose the plan, and — on a real window — run
-    /// `aterm fabric …` as a child on its own thread, pointed at THIS
-    /// instance's control socket, opening its output as a tab when it ends.
+    /// `aterm fabric …` as a child on its own thread (it walks every local
+    /// instance itself), opening its output as a tab when it ends.
     /// Headless composes the plan and runs nothing.
     pub(crate) fn run_fabric_cli(&mut self, wid: WindowId, verb: FabricVerb) {
         let real_window = self
@@ -472,7 +472,7 @@ impl App {
                 None => {
                     self.menu_failure(
                         verb.key(),
-                        &format!("{} did not start", verb.title()),
+                        &format!("Couldn't start {}", verb.title()),
                         &[
                             "no confirmation dialog on this platform",
                             &format!("run `{}` in a shell", verb.words()),
@@ -490,18 +490,17 @@ impl App {
         let Some(proxy) = self.proxy.clone() else {
             return;
         };
-        let sock = crate::proxy::self_sock_path();
         let spawned = std::thread::Builder::new()
             .name("aterm-fabric-menu".to_string())
             .spawn(move || {
                 // Waits on a CLI child the human is not blocked on.
                 crate::qos::set_self(crate::qos::Role::Background);
                 let cli = crate::ledger_key::aterm_cli();
+                // `aterm fabric` reads every local instance itself (the
+                // rendezvous walk `aterm ctl instances` makes), so the child is
+                // handed no socket.
                 let mut cmd = std::process::Command::new(&cli);
                 cmd.args(&plan.argv);
-                if let Some(sock) = sock {
-                    cmd.env("ATERM_CONTROL_SOCK", sock);
-                }
                 let (status, stdout, stderr) = match cmd.output() {
                     Ok(out) => (
                         Ok(out.status.code()),
@@ -528,7 +527,7 @@ impl App {
         if let Err(e) = spawned {
             self.menu_failure(
                 verb.key(),
-                &format!("{} did not start", verb.title()),
+                &format!("Couldn't start {}", verb.title()),
                 &[&e.to_string()],
             );
         }
@@ -544,11 +543,14 @@ impl App {
         // A clean exit is a record in the words it always had (the output tab
         // opens anyway); anything else is the person's command failing: a
         // terse title, the reason, and where the output is (design §10.3 C20).
+        // The record's title is a title (`Fabric On finished`), never the
+        // command's transcript line (`aterm fabric on: done.`, audit
+        // 2026-09-24); that line stays the output tab's own.
         let (title, reason) = if ok {
-            (fabric_status_words(verb, &outcome.status), String::new())
+            (format!("{} finished", verb.title()), String::new())
         } else {
             (
-                format!("{} failed", verb.title()),
+                format!("Couldn't run {}", verb.title()),
                 fabric_failure_reason(&outcome.status),
             )
         };
@@ -665,7 +667,7 @@ mod tests {
         app.menu_hold(wid, false);
         assert!(ctx.fabric.hold().is_some_and(|h| h.origin == "fleet"));
         assert!(
-            app.has_live_message("Hold not lifted"),
+            app.has_live_message("Couldn't release the hold"),
             "the refusal is said, as its outcome"
         );
         assert!(crate::fabric::apply_hold_for_test(&ctx, None));
@@ -839,7 +841,7 @@ mod tests {
 
         // Headless has no event-loop proxy: the durable write cannot be queued
         // and the notice says so; the live flip stands.
-        assert!(app.has_live_message("not saved"));
+        assert!(app.has_live_message("Couldn't save"));
 
         // Back on: the row and the rim return.
         app.user_toggle_presence(MenuAction::TogglePresenceBand);

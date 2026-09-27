@@ -9,15 +9,41 @@
 //!   (`fo*`) are rejected.
 //!
 //! There is intentionally **no** public unchecked constructor on the publish
-//! path (kafka2 exposed `new_unchecked`). Both types require a leading `/` and
-//! non-empty segments.
+//! path. Both types require a leading `/` and non-empty segments.
 
 use std::fmt;
 
-/// Iterate the segments of a `/`-rooted path, dropping the leading empty piece.
-fn segments(path: &str) -> impl Iterator<Item = &str> {
-    // `path` starts with '/', so `split('/')` yields "" first; skip it.
-    path.split('/').skip(1)
+/// Iterate the segments of a `/`-rooted path, dropping the leading empty piece:
+/// exactly `path.split('/').skip(1)`, as a plain byte scan (the matcher's hot
+/// loop re-splits both the filter and the subject on every call).
+fn segments(path: &str) -> Segments<'_> {
+    Segments {
+        rest: path.find('/').map(|i| &path[i + 1..]),
+    }
+}
+
+struct Segments<'a> {
+    /// What follows the last `/` consumed; `None` once the final segment is out.
+    rest: Option<&'a str>,
+}
+
+impl<'a> Iterator for Segments<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let rest = self.rest?;
+        // `/` is ASCII, so both slice points are char boundaries.
+        match rest.bytes().position(|b| b == b'/') {
+            Some(i) => {
+                self.rest = Some(&rest[i + 1..]);
+                Some(&rest[..i])
+            }
+            None => {
+                self.rest = None;
+                Some(rest)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -59,23 +85,7 @@ impl Subject {
     /// Validate and construct, or explain why the input is rejected.
     pub fn new(s: impl Into<String>) -> Result<Self, SubjectError> {
         let s = s.into();
-        if s.is_empty() {
-            return Err(SubjectError::Empty);
-        }
-        if !s.starts_with('/') {
-            return Err(SubjectError::MissingLeadingSlash);
-        }
-        for seg in segments(&s) {
-            if seg.is_empty() {
-                return Err(SubjectError::EmptySegment);
-            }
-            if seg.contains('*') || seg.contains('>') {
-                return Err(SubjectError::ContainsWildcard);
-            }
-            if seg.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                return Err(SubjectError::ControlByte);
-            }
-        }
+        validate_subject(&s)?;
         Ok(Subject(s))
     }
 
@@ -124,20 +134,70 @@ impl fmt::Display for FilterError {
 
 impl std::error::Error for FilterError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Seg {
-    Literal(String),
-    /// `*` — exactly one segment.
-    Single,
-    /// `>` — one or more trailing segments.
-    Multi,
+/// Check every segment of a `/`-rooted pattern, reporting the first failure in
+/// document order.
+/// The [`Subject::new`] grammar, checked in place with no allocation.
+fn validate_subject(s: &str) -> Result<(), SubjectError> {
+    if s.is_empty() {
+        return Err(SubjectError::Empty);
+    }
+    if !s.starts_with('/') {
+        return Err(SubjectError::MissingLeadingSlash);
+    }
+    for seg in segments(s) {
+        if seg.is_empty() {
+            return Err(SubjectError::EmptySegment);
+        }
+        if seg.contains('*') || seg.contains('>') {
+            return Err(SubjectError::ContainsWildcard);
+        }
+        if seg.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(SubjectError::ControlByte);
+        }
+    }
+    Ok(())
 }
 
-/// A validated subscription pattern.
+fn validate_filter_segments(path: &str) -> Result<(), FilterError> {
+    let mut parts = segments(path).peekable();
+    while let Some(part) = parts.next() {
+        if part.is_empty() {
+            return Err(FilterError::EmptySegment);
+        }
+        match part {
+            SINGLE => {}
+            MULTI => {
+                if parts.peek().is_some() {
+                    return Err(FilterError::MultiNotLast);
+                }
+            }
+            lit => {
+                if lit.contains('*') || lit.contains('>') {
+                    return Err(FilterError::PartialWildcard);
+                }
+                if lit.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                    return Err(FilterError::ControlByte);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `*` — exactly one segment.
+const SINGLE: &str = "*";
+/// `>` — one or more trailing segments.
+const MULTI: &str = ">";
+
+/// A validated subscription pattern. It stores only the pattern string, so a
+/// filter parsed from untrusted input costs its own length and nothing per
+/// segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
+    // Segments are re-split on use. Every segment of a validated filter is
+    // exactly `*`, exactly `>` (last only), or a literal containing neither
+    // character, so comparing a segment against SINGLE/MULTI classifies it.
     raw: String,
-    segs: Vec<Seg>,
 }
 
 impl Filter {
@@ -150,33 +210,8 @@ impl Filter {
         if !s.starts_with('/') {
             return Err(FilterError::MissingLeadingSlash);
         }
-        let parts: Vec<&str> = segments(&s).collect();
-        let mut segs = Vec::with_capacity(parts.len());
-        let last = parts.len().saturating_sub(1);
-        for (i, part) in parts.iter().enumerate() {
-            if part.is_empty() {
-                return Err(FilterError::EmptySegment);
-            }
-            match *part {
-                "*" => segs.push(Seg::Single),
-                ">" => {
-                    if i != last {
-                        return Err(FilterError::MultiNotLast);
-                    }
-                    segs.push(Seg::Multi);
-                }
-                lit => {
-                    if lit.contains('*') || lit.contains('>') {
-                        return Err(FilterError::PartialWildcard);
-                    }
-                    if lit.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                        return Err(FilterError::ControlByte);
-                    }
-                    segs.push(Seg::Literal(lit.to_string()));
-                }
-            }
-        }
-        Ok(Filter { raw: s, segs })
+        validate_filter_segments(&s)?;
+        Ok(Filter { raw: s })
     }
 
     /// The original pattern string.
@@ -186,32 +221,42 @@ impl Filter {
 
     /// Does this filter match the given subject?
     ///
-    /// Iterative matcher. (`tests/router_differential.rs` checks it against an
-    /// independently-coded recursive oracle over generated well-formed filters and
-    /// subjects; the malformed and edge inputs go to the *validators*
+    /// Iterative, allocation-free matcher: it walks the filter and the
+    /// subject's segments in lockstep. (`tests/router_differential.rs` checks it
+    /// against an independently-coded recursive oracle over generated well-formed
+    /// filters and subjects; the malformed and edge inputs go to the *validators*
     /// [`Filter::new`]/[`Subject::new`], whose every error variant that test
     /// reaches by construction.)
     pub fn matches(&self, subject: &Subject) -> bool {
-        let subj: Vec<&str> = subject.segments().collect();
-        let mut i = 0usize;
-        loop {
-            match self.segs.get(i) {
+        self.matches_segments(subject.segments())
+    }
+
+    /// Whether `subject` is a well-formed subject this filter matches: exactly
+    /// `Subject::new(subject).is_ok_and(|s| self.matches(&s))`, without allocating
+    /// a [`Subject`]. For scanning stored subject strings under a lock.
+    pub fn matches_str(&self, subject: &str) -> bool {
+        validate_subject(subject).is_ok() && self.matches_segments(segments(subject))
+    }
+
+    fn matches_segments<'a>(&self, mut subj: impl Iterator<Item = &'a str>) -> bool {
+        for seg in segments(&self.raw) {
+            match seg {
                 // `>` matches one or more remaining segments: require at least one.
-                Some(Seg::Multi) => return subj.len() > i,
-                Some(Seg::Single) => {
-                    if i >= subj.len() {
+                MULTI => return subj.next().is_some(),
+                SINGLE => {
+                    if subj.next().is_none() {
                         return false;
                     }
                 }
-                Some(Seg::Literal(lit)) => match subj.get(i) {
-                    Some(seg) if seg == lit => {}
-                    _ => return false,
-                },
-                // Filter exhausted: match iff subject is exhausted too.
-                None => return i == subj.len(),
+                lit => {
+                    if subj.next() != Some(lit) {
+                        return false;
+                    }
+                }
             }
-            i += 1;
         }
+        // Filter exhausted: match iff the subject is exhausted too.
+        subj.next().is_none()
     }
 
     /// Whether this filter **contains** `other`: every subject matching `other`
@@ -224,27 +269,29 @@ impl Filter {
     /// contains only the identical literal.
     #[must_use]
     pub fn contains(&self, other: &Filter) -> bool {
-        let (a, b) = (&self.segs, &other.segs);
-        let mut i = 0usize;
-        loop {
-            match a.get(i) {
-                // `>` accepts every subject with >= i+1 segments; every subject
-                // matching `b` has that iff `b` still has a segment at i.
-                Some(Seg::Multi) => return b.len() > i,
-                Some(Seg::Single) => match b.get(i) {
-                    // `b` could match a longer, variable tail here — not contained.
-                    None | Some(Seg::Multi) => return false,
-                    Some(Seg::Single | Seg::Literal(_)) => {}
+        let mut b = segments(&other.raw);
+        for sa in segments(&self.raw) {
+            let sb = b.next();
+            match sa {
+                // `>` accepts every subject with at least one more segment; every
+                // subject matching `other` has that iff `other` has a segment here.
+                MULTI => return sb.is_some(),
+                SINGLE => match sb {
+                    // `other` could match a longer, variable tail here — not contained.
+                    None | Some(MULTI) => return false,
+                    Some(_) => {}
                 },
-                Some(Seg::Literal(la)) => match b.get(i) {
-                    Some(Seg::Literal(lb)) if lb == la => {}
-                    _ => return false,
-                },
-                // `a` exhausted (no trailing `>`): contained iff `b` ends here too.
-                None => return b.len() == i,
+                // A literal contains only the identical literal (never `*`/`>`,
+                // which no literal equals).
+                la => {
+                    if sb != Some(la) {
+                        return false;
+                    }
+                }
             }
-            i += 1;
         }
+        // `self` exhausted (no trailing `>`): contained iff `other` ends here too.
+        b.next().is_none()
     }
 }
 
@@ -309,6 +356,73 @@ mod tests {
         assert_eq!(Filter::new("/a/\u{1f}b"), Err(FilterError::ControlByte));
         // wildcard-structure errors keep precedence over the control-byte check
         assert_eq!(Filter::new("/a/fo*"), Err(FilterError::PartialWildcard));
+    }
+
+    #[test]
+    fn segments_is_split_on_slash_skipping_the_first_piece() {
+        for path in [
+            "", "/", "//", "/a", "/a/", "a", "a/b", "/a//b", "/ab/c/>", "/é/ü/*", "/a/b/c/d",
+        ] {
+            let ours: Vec<&str> = segments(path).collect();
+            let std: Vec<&str> = path.split('/').skip(1).collect();
+            assert_eq!(ours, std, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn matches_str_is_new_then_matches_without_the_allocation() {
+        let filters = ["/a/>", "/a/*", "/a/b", "/*/b/>", "/a/*/c", "/>"];
+        let subjects = [
+            "/a",
+            "/a/b",
+            "/a/b/c",
+            "/a/x/c",
+            "/b/b/z",
+            "/a/b/",
+            "",
+            "a/b",
+            "//",
+            "/a//b",
+            "/a/*",
+            "/a/>",
+            "/a/b\u{7f}",
+            "/a/\u{1}",
+            "/\u{e9}/b/c",
+        ];
+        for f in filters {
+            let filter = Filter::new(f).unwrap();
+            for s in subjects {
+                let slow = Subject::new(s).is_ok_and(|subj| filter.matches(&subj));
+                assert_eq!(filter.matches_str(s), slow, "filter {f:?}, subject {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_filter_costs_its_pattern_and_nothing_per_segment() {
+        // A filter is parsed from untrusted input (a Subscribe, a capability
+        // grant) up to the 16 MiB frame cap. Its footprint must be the pattern
+        // string alone: no per-segment vector entry or heap string, which for
+        // `/a/a/a...` would multiply the input many times over.
+        assert_eq!(std::mem::size_of::<Filter>(), std::mem::size_of::<String>());
+        assert_eq!(
+            std::mem::size_of::<Subject>(),
+            std::mem::size_of::<String>()
+        );
+
+        let pattern = "/a".repeat(1 << 20); // a million one-byte segments
+        let f = Filter::new(pattern.clone()).unwrap();
+        assert_eq!(
+            f.raw.capacity(),
+            pattern.len(),
+            "the input is kept, not grown"
+        );
+        // ... and it still matches exactly its own subject, and nothing shorter.
+        assert!(f.matches(&Subject::new(pattern.clone()).unwrap()));
+        assert!(!f.matches(&Subject::new(&pattern[..pattern.len() - 2]).unwrap()));
+        let wide = Filter::new(format!("{}/>", &pattern[..pattern.len() - 2])).unwrap();
+        assert!(wide.contains(&f));
+        assert!(!f.contains(&wide));
     }
 
     #[test]

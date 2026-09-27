@@ -18,14 +18,9 @@
 //! safety directly: a conflicted transaction applies nothing. Pure Rust + real
 //! code, so it always runs.
 
-use aterm_buffer::{Edit, Surface, SurfaceId, TxnOutcome, WriteCap};
+use aterm_buffer::{Edit, Surface, TxnOutcome, WriteCap};
 use aterm_spec::derive::transact_model;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
-
-fn surface(id: u64) -> Surface {
-    Surface::new(SurfaceId(NonZeroU64::new(id).unwrap()))
-}
 
 /// Project the optimistic-CC state the model reasons about, for a txn attempting
 /// to commit (`active = 1`) against base version `tbase`, with no loss yet.
@@ -45,7 +40,7 @@ fn attempting(seq: u64, tbase: u64) -> BTreeMap<&'static str, i64> {
 #[test]
 fn real_transact_clean_commit_matches_model() {
     let m = transact_model();
-    let mut s = surface(1);
+    let mut s = Surface::new();
     let base = s.seq(); // read the head; no concurrent write follows
     let st = attempting(s.seq().0, base.0); // seq == tbase
 
@@ -68,7 +63,7 @@ fn real_transact_clean_commit_matches_model() {
 #[test]
 fn real_transact_conflict_aborts_no_lost_update() {
     let m = transact_model();
-    let mut s = surface(2);
+    let mut s = Surface::new();
     let base = s.seq(); // txn reads the head at base
     // A concurrent write advances the head past `base`.
     s.apply(&WriteCap, Edit::AppendLine("concurrent".into()));

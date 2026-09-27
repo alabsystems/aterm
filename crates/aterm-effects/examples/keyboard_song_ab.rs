@@ -18,7 +18,12 @@
 //!       [--tag <name>] [--voice <name>] [--style <name>]
 //!       [--cps <rate>] [--jitter <pct>] [--seed <n>] [--bed on|off]
 //!       [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]
-//!       [--census] [--probes]
+//!       [--census] [--probes] [--scripts] [--text "<s>"]
+//!
+//! `--scripts` renders THE LISTENING REEL's fixed scripts (see [`SCRIPTS`]) and
+//! `--text "<s>"` renders one line of the caller's own, both through the
+//! product's own key path — a bare Shift ahead of every shifted run, a keyed
+//! Return as [`SoundKind::Enter`] — and writes one TSV row per take.
 //!
 //! `--metronome` types the prose scene as a STRICT metronome — no sentence
 //! rest, no line-ending beat, no paragraph think — the way the census types
@@ -651,6 +656,298 @@ fn scenario_pathological() -> Scenario {
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE LISTENING REEL — `--scripts` / `--text`, the product's own key path
+// ---------------------------------------------------------------------------
+//
+// 2026-09-20. The owner re-ruled the instrument by ear — "the shift key tone
+// is harsh and doesn't sound musical. I want the shift key press to sound
+// like a high "ting" like how the space bar is a low tone and it needs to
+// sound musical. I want shifted characters to sound more like FORTE in a
+// piano versus just a higher tone. I want some kind of musically matching
+// yet distict sound for numbers and symbols, and I want musical phrasing to
+// organically feel like it comes from punctuation choice." — and an ear
+// needs a BEFORE and an AFTER of one fixed text, typed the way the product
+// hears it. No scenario above is that: `type_text` sets `shifted` on a
+// capital and cues NO bare Shift (only `shift_census` ever did), and it
+// plays a newline as the PTY's [`SoundKind::Jump`] where a person's Return
+// is the keyed [`SoundKind::Enter`]. So the reel has its own typist, and the
+// shipped scenarios keep theirs byte for byte.
+
+/// One fixed script of the reel.
+struct Script {
+    name: &'static str,
+    text: &'static str,
+}
+
+/// The reel's sentence: every phrase mark, a word-head capital after each
+/// kind of cadence, a decimal, a parenthesis and a hyphen.
+const SCRIPT_PROSE: &str =
+    "Hello, World! Is this it? Yes; it is: 3.14 (roughly) - well-known, done.\n";
+
+/// THE FIXED SCRIPTS. `shift-space` and `prose-lower` are not text constants
+/// and are built in [`script_scenario`].
+const SCRIPTS: [Script; 4] = [
+    Script {
+        name: "prose",
+        text: SCRIPT_PROSE,
+    },
+    Script {
+        name: "code",
+        text: "let v = self.v2.walk(x[0], &y) + foo::bar(42); // ok\n\
+               if (a != b) { return f(a, b)?; }\n",
+    },
+    Script {
+        name: "caps",
+        text: "the quick BROWN FOX Jumps Over THE LAZY DOG",
+    },
+    Script {
+        name: "digits",
+        text: "0123456789 2026 42 3.14159 10,000 v0.88.0",
+    },
+];
+
+/// The two rates every script is typed at: an unhurried hand and a fast one.
+const SCRIPT_CPS: [f32; 2] = [6.0, 10.0];
+
+/// How long a take runs past its last key, so the longest tail in it (the
+/// Enter's bell, a ting) has rung out before the file ends.
+const SCRIPT_TAIL_S: f32 = 2.5;
+
+/// `prose-lower`: the reel's sentence lowercased with its marks stripped and
+/// the spaces that leaves doubled collapsed — the plain-typing reference the
+/// code script's loudness is read against (spec C1).
+fn prose_lower() -> String {
+    let mut out = String::new();
+    for ch in SCRIPT_PROSE.chars() {
+        let ch = ch.to_ascii_lowercase();
+        let keep = ch.is_ascii_alphanumeric() || ch == '\n' || ch == ' ';
+        if keep && !(ch == ' ' && out.ends_with(' ')) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// A script as cues, plus the windows its TING + WORD-HEAD CAPITAL pairs
+/// sound in (the Shift's press to [`CREST_AFTER_CAPITAL_S`] past the letter)
+/// — the one place two of the loudest voices in the instrument stack.
+struct ScriptTake {
+    scenario: Scenario,
+    crest_windows: Vec<(f32, f32)>,
+}
+
+/// How far past the capital the crest window runs: the strike's own peak and
+/// the ring that swells 60 ms behind it.
+const CREST_AFTER_CAPITAL_S: f32 = 0.150;
+
+/// TYPE `text` THE WAY THE PRODUCT HEARS IT:
+///
+/// - one bare [`SoundKind::Shift`] cue [`CAPITAL_SHIFT_LEAD_MS`] before each
+///   MAXIMAL run of [`needs_shift`] characters — the hand holds Shift across
+///   a run and lets go for anything unshifted, the Space included (the
+///   `shift_census` precedent, which is how the host mints a capital);
+/// - `\n` is a keyed Return: [`SoundKind::Enter`] with the column as its
+///   flight distance, never the PTY's Jump;
+/// - every cue stamped through [`Cue::meta`], so `at_ms >= 1` and the class
+///   and rank are the engine's own.
+///
+/// A sentence rests only where a sentence ENDS — a `.` `!` `?` with
+/// whitespace or the end of the text behind it. [`type_text`] rests after
+/// every `.`, which is right for its prose corpus and wrong here: it would
+/// put half a second inside `3.14` and `self.v2.walk`, and no hand does.
+fn type_script(name: String, text: &str, cps: f32, seed: u32) -> ScriptTake {
+    let mut cues = Vec::new();
+    let mut crest_windows = Vec::new();
+    let mut hand = Hand::new(cps, 0.0, seed);
+    let chars: Vec<char> = text.chars().collect();
+    let lead = CAPITAL_SHIFT_LEAD_MS as f32 / 1000.0;
+    let mut t = 0.5f32;
+    let mut col = 0u16;
+    let mut in_run = false;
+    for (i, &ch) in chars.iter().enumerate() {
+        let pan = (f32::from(col) / 68.0).clamp(0.0, 1.0) * 1.8 - 0.9;
+        let shifted = needs_shift(ch);
+        if shifted && !in_run {
+            cues.push(Cue {
+                t: t - lead,
+                gesture: SoundGesture::Trail(SoundKind::Shift),
+                pan,
+                heat: 0.5,
+                shifted: false,
+                ch: '\0',
+            });
+            let word_head = i == 0 || chars[i - 1].is_whitespace();
+            if ch.is_uppercase() && word_head {
+                crest_windows.push((t - lead, t + CREST_AFTER_CAPITAL_S));
+            }
+        }
+        in_run = shifted;
+        let (kind, glyph) = match ch {
+            ' ' => (SoundKind::Space, ch),
+            // No glyph backs a Return.
+            '\n' => (SoundKind::Enter { cells: col }, '\0'),
+            _ => (SoundKind::Typed, ch),
+        };
+        cues.push(Cue {
+            t,
+            gesture: SoundGesture::Trail(kind),
+            pan,
+            heat: 0.5,
+            shifted,
+            ch: glyph,
+        });
+        t += hand.dt();
+        if ch == '\n' {
+            col = 0;
+            t += 0.35; // a line ending is a beat of thought, as in `type_text`
+        } else {
+            col += 1;
+        }
+        let ends = chars.get(i + 1).is_none_or(|c| c.is_whitespace());
+        if matches!(ch, '.' | '!' | '?') && ends {
+            t += 0.55; // sentence rest
+        }
+    }
+    // A Shift's lead can put it before the key ahead of it in time only if
+    // the hand were faster than the lead; sort anyway (stable), so the cue
+    // list is in press order whatever the rate.
+    cues.sort_by(|a, b| a.t.partial_cmp(&b.t).expect("finite cue times"));
+    ScriptTake {
+        scenario: Scenario {
+            name,
+            cues,
+            seconds: t + SCRIPT_TAIL_S,
+            window: (0.4, t + 1.0),
+        },
+        crest_windows,
+    }
+}
+
+/// `shift-space`: sixteen alternating bare Shift / Space cues 0.45 s apart.
+/// Eight Spaces walk the whole chord loop, so every ting is heard against
+/// the low tone it is supposed to answer.
+fn script_shift_space(name: String) -> ScriptTake {
+    let mut cues = Vec::new();
+    let mut t = 0.5f32;
+    for i in 0..16 {
+        let (kind, ch) = if i % 2 == 0 {
+            (SoundKind::Shift, '\0')
+        } else {
+            (SoundKind::Space, ' ')
+        };
+        cues.push(Cue {
+            t,
+            gesture: SoundGesture::Trail(kind),
+            pan: 0.0,
+            heat: 0.5,
+            shifted: false,
+            ch,
+        });
+        t += 0.45;
+    }
+    ScriptTake {
+        scenario: Scenario {
+            name,
+            cues,
+            seconds: t + SCRIPT_TAIL_S,
+            window: (0.4, t + 1.0),
+        },
+        crest_windows: Vec::new(),
+    }
+}
+
+/// THE REEL: every script at every rate and both volumes, one WAV and one
+/// TSV row per take. `text` is `--text`'s one line, rendered INSTEAD of the
+/// fixed scripts; `rates` is [`SCRIPT_CPS`] unless `--cps` named one.
+#[allow(clippy::too_many_arguments)]
+fn script_reel(
+    out: &std::path::Path,
+    tag: &str,
+    text: Option<&str>,
+    rates: &[f32],
+    voice: SoundVoice,
+    style: GlowStyle,
+    fix: BlockFix,
+    bed: bool,
+    seed: u32,
+    timbre: Timbre,
+) {
+    let mut tsv = String::from(
+        "script\tcps\tvol\tkeys\tpeak_dbfs\trms_db\tcentroid_hz\tfrac_gt_2k\tfrac_gt_6k\t\
+         band_2k8_5k6_db\tmax_voices\tsteals\tting_capital_crest_dbfs\tdegrees\n",
+    );
+    let lower = prose_lower();
+    for &cps in rates {
+        let label = |name: &str| format!("script-{name}-{cps}cps");
+        let takes: Vec<ScriptTake> = match text {
+            Some(text) => vec![type_script(label("text"), text, cps, seed)],
+            None => SCRIPTS
+                .iter()
+                .map(|s| type_script(label(s.name), s.text, cps, seed))
+                // The rate does not reach `shift-space` (its cues are 0.45 s
+                // apart by definition); it is rendered under both so the
+                // reel is one grid of files.
+                .chain([script_shift_space(label("shift-space"))])
+                .chain([type_script(label("prose-lower"), &lower, cps, seed)])
+                .collect(),
+        };
+        for take in &takes {
+            let sc = &take.scenario;
+            let click = click_track(
+                &sc.cues,
+                (sc.seconds * SR as f32) as usize + PRE_ROLL_FRAMES,
+            );
+            for volume in [0.4f32, 1.0] {
+                let r = render(sc, voice, style, volume, fix, bed, seed, timbre);
+                let path = out.join(format!("{tag}-{}-v{volume:.1}.wav", sc.name));
+                std::fs::File::create(&path)
+                    .and_then(|mut f| f.write_all(&wav_bytes(&r.mono, &click)))
+                    .expect("script wav");
+                let from = (sc.window.0 * SR as f32) as usize;
+                let to = ((sc.window.1 * SR as f32) as usize).min(r.mono.len());
+                let seg = &r.mono[from..to];
+                let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let rms_v = rms(seg);
+                let bands = spectrum_bands(&r.mono, from, to);
+                // THE CREST: the loudest sample inside any ting + word-head
+                // capital window, on the shipping bus (spec F16).
+                let crest = take
+                    .crest_windows
+                    .iter()
+                    .map(|&(a, b)| {
+                        let a = ((a * SR as f32) as usize).min(r.mono.len());
+                        // One block on: J1 lands every onset a block late.
+                        let b = ((b * SR as f32) as usize + BLOCK).min(r.mono.len());
+                        r.mono[a..b].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+                    })
+                    .fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v))));
+                let degrees: Vec<String> = r.degrees.iter().map(i8::to_string).collect();
+                tsv.push_str(&format!(
+                    "{}\t{cps}\t{volume:.1}\t{}\t{:.2}\t{:.2}\t{:.0}\t{:.4}\t{:.4}\t{:.2}\t{}\t{}\t{}\t{}\n",
+                    sc.name,
+                    sc.cues.len(),
+                    db(f64::from(peak)),
+                    db(rms_v),
+                    bands.centroid_hz,
+                    bands.hi2,
+                    bands.hi6,
+                    band_db(rms_v, bands.presence),
+                    r.max_voices,
+                    r.steals,
+                    crest.map_or_else(|| "-".to_string(), |c| format!("{:.2}", db(f64::from(c)))),
+                    degrees.join(" "),
+                ));
+                println!("wrote {}", path.display());
+            }
+        }
+    }
+    let path = out.join(format!("{tag}-scripts.tsv"));
+    std::fs::write(&path, &tsv).expect("scripts tsv");
+    println!("wrote {}\n", path.display());
+    print!("{tsv}");
+}
+
 struct Scenario {
     name: String,
     cues: Vec<Cue>,
@@ -1108,27 +1405,74 @@ fn peak_hz(mag: &[f32], lo: f32, hi: f32) -> f64 {
     (best as f64 + d) * hz_per_bin
 }
 
-/// Spectral centroid + fraction of energy over 2 kHz, over `from..to`.
-fn spectrum(x: &[f32], from: usize, to: usize) -> (f64, f64) {
+/// What [`spectrum_bands`] reads off a span: the centroid and three energy
+/// shares, each a fraction of the span's total spectral energy.
+struct Bands {
+    centroid_hz: f64,
+    /// Over 2 kHz.
+    hi2: f64,
+    /// Over 6 kHz — the "harsh" band of the 2026-09-20 ruling (spec F9/C2).
+    hi6: f64,
+    /// 2.8–5.6 kHz, the ear's most sensitive octave (spec F13).
+    presence: f64,
+}
+
+/// The 2.8–5.6 kHz octave F13 is stated on.
+const PRESENCE_BAND_HZ: (f64, f64) = (2800.0, 5600.0);
+
+/// Spectral centroid and the band shares, over `from..to`.
+fn spectrum_bands(x: &[f32], from: usize, to: usize) -> Bands {
     let hz_per_bin = f64::from(SR) / FFT_N as f64;
     let (mut num, mut den, mut hi) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut hi6, mut presence) = (0.0f64, 0.0f64);
     let mut s = from;
     while s + FFT_N <= to {
         for (k, &m) in mag_at(x, s).iter().enumerate() {
             let e = f64::from(m) * f64::from(m);
+            let hz = k as f64 * hz_per_bin;
+            // The original operand order, so the centroid column is the
+            // number it always was.
             num += e * k as f64 * hz_per_bin;
             den += e;
-            if k as f64 * hz_per_bin > 2000.0 {
+            if hz > 2000.0 {
                 hi += e;
+            }
+            if hz > 6000.0 {
+                hi6 += e;
+            }
+            if (PRESENCE_BAND_HZ.0..=PRESENCE_BAND_HZ.1).contains(&hz) {
+                presence += e;
             }
         }
         s += FFT_N / 2;
     }
     if den < 1e-15 {
-        (0.0, 0.0)
+        Bands {
+            centroid_hz: 0.0,
+            hi2: 0.0,
+            hi6: 0.0,
+            presence: 0.0,
+        }
     } else {
-        (num / den, hi / den)
+        Bands {
+            centroid_hz: num / den,
+            hi2: hi / den,
+            hi6: hi6 / den,
+            presence: presence / den,
+        }
     }
+}
+
+/// Spectral centroid + fraction of energy over 2 kHz, over `from..to`.
+fn spectrum(x: &[f32], from: usize, to: usize) -> (f64, f64) {
+    let b = spectrum_bands(x, from, to);
+    (b.centroid_hz, b.hi2)
+}
+
+/// A band's own LEVEL in dB: the span's RMS scaled by the band's energy
+/// share. Absolute, so a BEFORE reading and an AFTER reading compare.
+fn band_db(rms_v: f64, share: f64) -> f64 {
+    db(rms_v * share.max(0.0).sqrt())
 }
 
 struct Row {
@@ -1247,6 +1591,12 @@ struct ProbeRow {
     /// three sounds — the lift, the letter, an octave echo 25 ms behind it;
     /// it must read ONE.
     fine: Option<usize>,
+    /// The [`EventMeta::glyph_class`] the row's key was stamped with.
+    class: u8,
+    /// Energy share over 6 kHz, and the 2.8–5.6 kHz octave's own level —
+    /// the two readings the 2026-09-20 ruling's "harsh" is measured on.
+    hi6_frac: f64,
+    presence_db: f64,
 }
 
 /// One gesture of the probe table.
@@ -1273,6 +1623,19 @@ struct Probe {
     /// tail (the indent steps of 2026-09-16) is measured beside its head.
     /// 1 everywhere else.
     run: u8,
+    /// THE CHARACTER THE KEY PUT ON SCREEN (2026-09-20), so the row stamps
+    /// the real [`EventMeta::glyph_class`] and [`EventMeta::rank`] through
+    /// the engine's own producers. `None` is the old row: class 0, rank 0 —
+    /// "a letter, no key" — which is why a digit or a mark could never be
+    /// probed before this field existed.
+    ch: Option<char>,
+    /// KEYS TYPED INTO THE SETTLED STATE before the gesture, in BOTH takes —
+    /// so they cancel in the difference and only set the context the gesture
+    /// lands in: `"A"` makes the row the INTERIOR of a shifted run, `" "` a
+    /// word head. Each is a real key (its own class, rank and shiftedness),
+    /// one settle interval apart; a letter here takes the place of one
+    /// settling keystroke so the row still lands on the bar's accent.
+    prefix: &'static str,
 }
 
 /// The tap rate of a multi-press probe row: 100 ms, a hand tapping space
@@ -1374,10 +1737,12 @@ fn probe(
         bed: false,
         shifted,
     };
-    let stamp = |frame: usize| EventMeta {
+    // The class and the rank through the engine's own producers, exactly as
+    // [`Cue::meta`] stamps them; `None` is `0`/`0`, the row as it always was.
+    let stamp = |frame: usize, ch: Option<char>| EventMeta {
         at_ms: ((frame as f64 * 1000.0 / f64::from(SR)) as u32).max(1),
-        glyph_class: 0,
-        rank: 0,
+        glyph_class: aterm_effects::trail_sound::typed_glyph_class(ch),
+        rank: aterm_effects::trail_sound::typed_glyph_rank(ch),
         pan_from: 0.0,
         block_lead_s: 0.0,
         // §22's FLOW HEAT. The bench plays the COLD box: flow is a
@@ -1398,13 +1763,30 @@ fn probe(
     // settling keys are three unhurried notes — but only if the engine is
     // reading a real clock. Unstamped they collapse onto the block clock and
     // the probe is measured from a state the shipping engine never reaches.
+    // A letter in the prefix takes one settling keystroke's place, so the
+    // row still lands on the accent; a Space is not a keystroke of the bar.
+    let settle = settle.saturating_sub(p.prefix.chars().filter(|c| *c != ' ').count());
     let settled = |limiter: bool| {
         let mut synth = TrailSynth::new(SR as f32, seed);
         synth.set_v2_timbre_stops(timbre.stops());
         synth.set_bus_limiter(limiter);
         let mut warm = vec![0.0f32; 16_384 * CHANNELS];
         for i in 0..settle {
-            synth.push_meta(ev(SoundKind::Typed, false), stamp(i * 16_384));
+            synth.push_meta(ev(SoundKind::Typed, false), stamp(i * 16_384, None));
+            synth.render(&mut warm);
+        }
+        // THE CONTEXT KEYS ([`Probe::prefix`]), one settle interval apart,
+        // each a real key with its own class, rank and shiftedness.
+        for (i, ch) in p.prefix.chars().enumerate() {
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            synth.push_meta(
+                ev(kind, needs_shift(ch)),
+                stamp((settle + i) * 16_384, Some(ch)),
+            );
             synth.render(&mut warm);
         }
         synth
@@ -1424,14 +1806,14 @@ fn probe(
         // later, exactly as two host pushes would arrive.
         let mut synth = settled(limiter);
         let mut stereo = vec![0.0f32; frames * CHANNELS];
-        let t0 = settle * 16_384;
+        let t0 = (settle + p.prefix.chars().count()) * 16_384;
         let mut at = 0usize;
         if p.lift {
-            synth.push_meta(ev(SoundKind::Shift, false), stamp(t0));
+            synth.push_meta(ev(SoundKind::Shift, false), stamp(t0, None));
             at = SR as usize * CAPITAL_SHIFT_LEAD_MS / 1000;
             synth.render(&mut stereo[..at * CHANNELS]);
         }
-        synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + at));
+        synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + at, p.ch));
         let voices = synth.live_voices();
         // A multi-press row: the later presses land RUN_TAP_MS apart, each
         // stamped at its own time, the audio rendered between them exactly
@@ -1440,7 +1822,7 @@ fn probe(
         for _ in 1..p.run.max(1) {
             let next = cursor + SR as usize * RUN_TAP_MS / 1000;
             synth.render(&mut stereo[cursor * CHANNELS..next * CHANNELS]);
-            synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + next));
+            synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + next, p.ch));
             cursor = next;
         }
         synth.render(&mut stereo[cursor * CHANNELS..]);
@@ -1463,7 +1845,9 @@ fn probe(
     // Score the gesture's own body: onset to 250 ms past it.
     let start = mono.iter().position(|v| v.abs() > peak * 0.05).unwrap_or(0);
     let end = (start + SR as usize / 4).min(mono.len());
-    let (centroid, hi) = spectrum(&mono, start, end);
+    let bands = spectrum_bands(&mono, start, end);
+    let (centroid, hi) = (bands.centroid_hz, bands.hi2);
+    let body_rms = rms(&mono[start..end]);
     // The onset census over the whole half second: a second sound anywhere
     // behind the key — an echo, a lift, a tap — counts against the gesture.
     // Counted BEFORE the bus limiter (see above): events, not the ceiling.
@@ -1471,13 +1855,16 @@ fn probe(
     let row = ProbeRow {
         name: p.label.to_string(),
         peak_db: db(f64::from(peak)),
-        rms_db: db(rms(&mono[start..end])),
+        rms_db: db(body_rms),
         centroid_hz: centroid,
         hi_frac: hi,
         tonality: tonality(&mag_at(&mono, start)),
         voices,
         onsets: count(SCENE_ONSET),
         fine: p.census.then(|| count(FINE_ONSET)),
+        class: aterm_effects::trail_sound::typed_glyph_class(p.ch),
+        hi6_frac: bands.hi6,
+        presence_db: band_db(body_rms, bands.presence),
     };
     Take {
         row,
@@ -1533,7 +1920,7 @@ fn probe_reel(
 /// is the host's whole gesture — the bare Shift's cue, then the shifted
 /// `Typed` 60 ms on — and it is in the table because §8 step 4's proof is
 /// stated on it: under the shipped engine that pair was THREE onsets.
-const PROBES: [Probe; 11] = [
+const PROBES: [Probe; 28] = [
     Probe {
         label: "Typed",
         kind: SoundKind::Typed,
@@ -1542,6 +1929,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: true,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Typed@cyan",
@@ -1551,6 +1940,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: true,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Capital",
@@ -1560,6 +1951,8 @@ const PROBES: [Probe; 11] = [
         lift: true,
         census: true,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Space",
@@ -1569,6 +1962,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Space×4",
@@ -1578,6 +1973,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 4,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Backspace",
@@ -1587,6 +1984,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "KillWord",
@@ -1596,6 +1995,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Shift",
@@ -1605,6 +2006,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: true,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Kill",
@@ -1614,6 +2017,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Land",
@@ -1623,6 +2028,8 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 1,
+        ch: None,
+        prefix: "",
     },
     Probe {
         label: "Jump",
@@ -1632,6 +2039,206 @@ const PROBES: [Probe; 11] = [
         lift: false,
         census: false,
         run: 1,
+        ch: None,
+        prefix: "",
+    },
+    // THE CHAR-CARRYING ROWS (2026-09-20, for the owner's re-ruling of that
+    // day: "the shift key tone is harsh … shifted characters to sound more
+    // like FORTE … some kind of musically matching yet distict sound for
+    // numbers and symbols … phrasing … from punctuation choice"). Every row
+    // above stamps class 0 / rank 0, so no digit, no mark and no capital in
+    // a known CONTEXT had ever been probed. A mark's row is the mark's own
+    // voice: `shifted` is what a US layout needs for the glyph, and there is
+    // no lift, so the ting is not in the difference. The three capitals are
+    // the three contexts a capital can land in — a word head (the Shift's
+    // ting, then `B` after a Space), mid-word (the same after a letter) and
+    // the interior of a shifted run (`B` after a shifted `A`, no new Shift).
+    Probe {
+        label: "Digit1",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('1'),
+        prefix: "",
+    },
+    Probe {
+        label: "Digit5",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('5'),
+        prefix: "",
+    },
+    Probe {
+        label: "Digit9",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('9'),
+        prefix: "",
+    },
+    Probe {
+        label: "Comma",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some(','),
+        prefix: "",
+    },
+    Probe {
+        label: "Period",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('.'),
+        prefix: "",
+    },
+    Probe {
+        label: "Qmark",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('?'),
+        prefix: "",
+    },
+    Probe {
+        label: "Bang",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('!'),
+        prefix: "",
+    },
+    Probe {
+        label: "Semi",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some(';'),
+        prefix: "",
+    },
+    Probe {
+        label: "Colon",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some(':'),
+        prefix: "",
+    },
+    Probe {
+        label: "Dash",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('-'),
+        prefix: "",
+    },
+    Probe {
+        label: "Open",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('('),
+        prefix: "",
+    },
+    Probe {
+        label: "Close",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some(')'),
+        prefix: "",
+    },
+    Probe {
+        label: "Sigil",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('$'),
+        prefix: "",
+    },
+    Probe {
+        label: "Math",
+        kind: SoundKind::Typed,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('='),
+        prefix: "",
+    },
+    Probe {
+        label: "Capital-head",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: true,
+        census: false,
+        run: 1,
+        ch: Some('B'),
+        prefix: " ",
+    },
+    Probe {
+        label: "Capital-midword",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: true,
+        census: false,
+        run: 1,
+        ch: Some('B'),
+        prefix: "",
+    },
+    Probe {
+        label: "Capital-run-interior",
+        kind: SoundKind::Typed,
+        shifted: true,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 1,
+        ch: Some('B'),
+        prefix: "A",
     },
 ];
 
@@ -1892,6 +2499,14 @@ struct CensusRow {
     /// subject ever written); what it is NOT entitled to is a unison it never
     /// heard, which is what the session's first key used to hand it.
     subj: usize,
+    /// `phr` — THE MARK PHRASED IT (2026-09-21; owner, 2026-09-20: "I want
+    /// musical phrasing to organically feel like it comes from punctuation
+    /// choice"). A dash is a TIE and repeats by definition; the token's
+    /// steering mark may arrive on the cadence degree the line already
+    /// stands on (a full stop on the C it had reached); a closing bracket may
+    /// already be where its opener was. All three are the TEXT's doing — the
+    /// mark was typed — and before that ruling all three read as `stall`.
+    phr: usize,
     /// `stall` — a repeat with no cause the design names: gravity cancelling
     /// a real stride, a fold sending a real distance to zero, a reflection
     /// landing back on the note it left. Every one of these is the engine
@@ -1984,6 +2599,7 @@ fn census_row(
     // The repeat ledger, and the previous TYPED key's rank it is kept
     // against. `0` is "no key behind this cue", which is never a repeat.
     let (mut dbl, mut head, mut subj, mut stall) = (0usize, 0usize, 0usize, 0usize);
+    let mut phr = 0usize;
     let mut prev_rank: u8 = 0;
     let mut algn_ms: u32 = 0;
     // FNV-1a, 64-bit — small, dependency-free, and order-sensitive, which is
@@ -2004,6 +2620,9 @@ fn census_row(
             // `!word_head && motif_play > 0`. A word head is never a replay —
             // it is the chord tone the subject is answered ONTO.
             let was_answer = !was_head && m.motif_answering();
+            // The token's steering budget, read before the push: a key that
+            // takes it false → true IS the steering mark.
+            let was_marked = m.token_marked();
             let rank =
                 aterm_effects::trail_sound::typed_glyph_rank((cue.ch != '\0').then_some(cue.ch));
             let ev = SoundEvent {
@@ -2048,7 +2667,17 @@ fn census_row(
                     // the first plausible story: an answered interval never
                     // consulted the alphabet, so it cannot be charged to a
                     // doubled letter even when the text happens to have one.
-                    if was_answer {
+                    // The mark's override runs LAST in the engine, so where
+                    // it fired it is the branch that produced the degree.
+                    let class = aterm_effects::trail_sound::typed_glyph_class(
+                        (cue.ch != '\0').then_some(cue.ch),
+                    );
+                    let phrased = class == aterm_effects::trail_sound::glyph_class::DASH
+                        || class == aterm_effects::trail_sound::glyph_class::CLOSE
+                        || (!was_marked && m.token_marked());
+                    if phrased {
+                        phr += 1;
+                    } else if was_answer {
                         subj += 1;
                     } else if rank != 0 && rank == prev_rank {
                         dbl += 1;
@@ -2090,6 +2719,7 @@ fn census_row(
         dbl,
         head,
         subj,
+        phr,
         stall,
         silent,
         algn_ms,
@@ -2351,9 +2981,16 @@ fn census(
     // `letters` while the stamp is perfectly sound. The census says so on
     // stdout when the spawn is not Ship.
     let letters: String = PROSE.chars().filter(|c| !c.is_whitespace()).collect();
-    let corpora: [(&'static str, &str, bool); 3] = [
+    // `phrase` (2026-09-21): the reel's own sentence and its line of code,
+    // three times over — every phrase mark, capitals, a decimal, a bracket
+    // pair, a tie, `::` and a dotted path — so the ledger and R1 are read on
+    // the keys the phrasing acts on, at every rate and under the jittered
+    // hand. (`prose` has only `.` and `,`.)
+    let phrase: String = [SCRIPTS[0].text, SCRIPTS[1].text].concat().repeat(3);
+    let corpora: [(&'static str, &str, bool); 4] = [
         ("letters", &letters, true),
         ("prose", PROSE, true),
+        ("phrase", &phrase, true),
         ("blockclk", &letters, false),
     ];
 
@@ -2364,7 +3001,7 @@ fn census(
         if bed { "on" } else { "off" }
     );
     println!(
-        "{:<8} {:>5} {:>5} {:>6} {:>6} {:>7} {:>8} {:>7} {:>4} {:>5} {:>5} {:>6} {:>5}  {:<16}",
+        "{:<8} {:>5} {:>5} {:>6} {:>6} {:>7} {:>8} {:>7} {:>4} {:>5} {:>5} {:>4} {:>6} {:>5}  {:<16}",
         "corpus",
         "cps",
         "jit%",
@@ -2376,6 +3013,7 @@ fn census(
         "dbl",
         "head",
         "subj",
+        "phr",
         "stall",
         "algn",
         "seq"
@@ -2394,7 +3032,7 @@ fn census(
                 // cause the census cannot name, and every percentage below it
                 // is describing something other than what happened.
                 assert_eq!(
-                    r.distinct + r.dbl + r.head + r.subj + r.stall,
+                    r.distinct + r.dbl + r.head + r.subj + r.phr + r.stall,
                     r.keys,
                     "the repeat ledger does not account for every key on \
                      {corpus} {cps} cps {:.0}% jitter",
@@ -2421,7 +3059,7 @@ fn census(
                     rows_off_r1 += 1;
                 }
                 println!(
-                    "{:<8} {:>5.1} {:>5.0} {:>6} {:>6} {:>7.1} {:>8.2} {:>7} {:>4} {:>5} {:>5} {:>6} {:>5}  {:016x}",
+                    "{:<8} {:>5.1} {:>5.0} {:>6} {:>6} {:>7.1} {:>8.2} {:>7} {:>4} {:>5} {:>5} {:>4} {:>6} {:>5}  {:016x}",
                     r.corpus,
                     r.cps,
                     r.jitter * 100.0,
@@ -2433,6 +3071,7 @@ fn census(
                     r.dbl,
                     r.head,
                     r.subj,
+                    r.phr,
                     r.stall,
                     r.algn_ms,
                     r.seq
@@ -2465,8 +3104,10 @@ fn census(
          dist%: it is the LEDGER. Every key that repeated is charged to a cause the\n\
          design names — `dbl` (the text asked), `head` (a common tone held across a\n\
          chord change at a word boundary), `subj` (the line answering its own\n\
-         latched subject) — and `stall`, the residual, is the engine standing still\n\
-         while the hand moved. `distinct + dbl + head + subj + stall` is asserted\n\
+         latched subject), `phr` (a MARK phrased it: a dash's tie, a bracket's\n\
+         return, a steering mark arriving on the cadence degree it stood on) —\n\
+         and `stall`, the residual, is the engine standing still while the hand\n\
+         moved. `distinct + dbl + head + subj + phr + stall` is asserted\n\
          equal to `keys` on every row, so nothing can hide outside it.\n\
          \n\
          THE §8 PROOF IS DISCHARGED WHEN `stall` IS 0 ON EVERY ROW. That is\n\
@@ -2558,7 +3199,8 @@ fn usage() -> ! {
         "keyboard_song_ab <out_dir> [--tag <name>] [--voice <name>] [--style <name>]\n\
         \x20   [--cps <rate>] [--jitter <pct>] [--seed <n>] [--bed on|off]\n\
         \x20   [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]\n\
-        \x20   [--census] [--space-census] [--shift-census] [--probes] [--dump-probes]"
+        \x20   [--census] [--space-census] [--shift-census] [--probes] [--dump-probes]\n\
+        \x20   [--scripts] [--text \"<s>\"]"
     );
     std::process::exit(2)
 }
@@ -2595,6 +3237,9 @@ fn main() {
     let mut want_space_census = false;
     let mut want_shift_census = false;
     let mut metronome = false;
+    let mut want_scripts = false;
+    let mut script_text: Option<String> = None;
+    let mut cps_named = false;
     while let Some(a) = args.next() {
         let mut val = |what: &str| {
             args.next().unwrap_or_else(|| {
@@ -2629,6 +3274,7 @@ fn main() {
             // scripted cadence — the burst is a burst at any setting.
             "--cps" => {
                 let v = val("--cps");
+                cps_named = true;
                 cps = v
                     .parse::<f32>()
                     .ok()
@@ -2698,6 +3344,10 @@ fn main() {
             "--probes" => want_probes = true,
             "--dump-probes" => dump_probes = true,
             "--metronome" => metronome = true,
+            "--scripts" => want_scripts = true,
+            // One line of the caller's own, typed by the reel's typist. A
+            // literal `\n` in the argument is a Return.
+            "--text" => script_text = Some(val("--text").replace("\\n", "\n")),
             "-h" | "--help" => usage(),
             other if other.starts_with("--") => {
                 eprintln!("unknown flag {other:?}");
@@ -2748,6 +3398,23 @@ fn main() {
     std::fs::create_dir_all(&out).expect("out dir");
     if want_probes {
         probe_tables(&out, &tag, voice, style, seed, timbre, dump_probes);
+        return;
+    }
+    if want_scripts || script_text.is_some() {
+        // The reel's two rates, unless `--cps` named one.
+        let rates: &[f32] = if cps_named { &[cps] } else { &SCRIPT_CPS };
+        script_reel(
+            &out,
+            &tag,
+            script_text.as_deref(),
+            rates,
+            voice,
+            style,
+            fix,
+            bed,
+            seed,
+            timbre,
+        );
         return;
     }
 
@@ -2949,13 +3616,19 @@ fn probe_tables(
 ) {
     for volume in [0.4f32, 1.0] {
         println!("\n== gesture probes (isolated, vol {volume}) ==");
+        // `class` is the stamped [`EventMeta::glyph_class`] (0 on every row
+        // that carries no char); `hi>6k` and `2.8-5.6k` are the two readings
+        // the 2026-09-20 ruling's "harsh" is measured on.
         println!(
-            "{:<12} {:>8} {:>8} {:>9} {:>8} {:>9} {:>6} {:>6} {:>5}",
+            "{:<20} {:>5} {:>8} {:>8} {:>9} {:>8} {:>8} {:>9} {:>9} {:>6} {:>6} {:>5}",
             "gesture",
+            "class",
             "peak dB",
             "rms dB",
             "centroid",
             "hi>2k",
+            "hi>6k",
+            "2.8-5.6k",
             "tonality",
             "voices",
             "onsets",
@@ -2965,12 +3638,15 @@ fn probe_tables(
         let probes: Vec<&ProbeRow> = takes.iter().map(|t| &t.row).collect();
         for p in &probes {
             println!(
-                "{:<12} {:>8.2} {:>8.2} {:>9.0} {:>8.3} {:>9.1} {:>6} {:>6} {:>5}",
+                "{:<20} {:>5} {:>8.2} {:>8.2} {:>9.0} {:>8.3} {:>8.4} {:>9.2} {:>9.1} {:>6} {:>6} {:>5}",
                 p.name,
+                p.class,
                 p.peak_db,
                 p.rms_db,
                 p.centroid_hz,
                 p.hi_frac,
+                p.hi6_frac,
+                p.presence_db,
                 p.tonality,
                 p.voices,
                 p.onsets,
@@ -3032,8 +3708,28 @@ fn probe_tables(
         // since the same day's review (`typed_walk_db` above): against the
         // one row Comet read −7.16 dB and passed nothing, and the number
         // was the row's degree, not the ting.
-        const SHIFT_RE_TYPED_TARGET_DB: f64 = -3.0;
-        const SHIFT_RE_TYPED_TOL_DB: f64 = 1.5;
+        //
+        // RE-RULED 2026-09-20 FOR THE MUSIC BOX (the owner: "the shift key
+        // tone is harsh and doesn't sound musical. I want the shift key press
+        // to sound like a high "ting" like how the space bar is a low tone
+        // and it needs to sound musical"): its ting is a 200 ms FM-free bell
+        // on a tone of the live chord, and a note that rings 2.4× as long is
+        // as present 1.5 dB lower — −4.5 ± 1.0 dB re the walk-mean Typed. The
+        // v1 palettes keep the 85 ms ting and the 2026-09-16 window with it
+        // (Lumen reads −2.33, which the music box's window would call red).
+        let music_box = match voice {
+            SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty) => true,
+            SoundVoice::Style => style == GlowStyle::RainbowKitty,
+            _ => false,
+        };
+        #[allow(non_snake_case)]
+        let (SHIFT_RE_TYPED_TARGET_DB, SHIFT_RE_TYPED_TOL_DB): (f64, f64) =
+            if music_box { (-4.5, 1.0) } else { (-3.0, 1.5) };
+        let ruled = if music_box {
+            "2026-09-20"
+        } else {
+            "2026-09-16"
+        };
         let shift_level_ok =
             (shift_re_typed - SHIFT_RE_TYPED_TARGET_DB).abs() <= SHIFT_RE_TYPED_TOL_DB;
         let caps_lock_ok = caps_lock.is_none_or(|n| n == 1);
@@ -3044,15 +3740,16 @@ fn probe_tables(
         // its own, where a v1 run can read it green (Lumen after the
         // 2026-09-16 refit: −2.33 dB re Typed, under its own Space's peak).
         println!(
-            "ting (2026-09-16): Shift {shift_re_typed:+.2} dB re the walk-mean Typed \
+            "ting ({ruled}): Shift {shift_re_typed:+.2} dB re the walk-mean Typed \
              ({typed_walk_db:.2} dBFS over settle {PROBE_WALK_SETTLES:?}; the row's own \
-             degree reads {:.2}), tonality {shift_tonality:.1} ({}) — {}",
+             degree reads {:.2}), tonality {shift_tonality:.1} ({}) — {} the \
+             {SHIFT_RE_TYPED_TARGET_DB:+.1} ± {SHIFT_RE_TYPED_TOL_DB} dB window",
             find("Typed").map_or(f64::NAN, |t| t.peak_db),
             if shift_pitched { "pitched" } else { "FELT" },
             if shift_pitched && shift_level_ok {
-                "at the Space's tier, inside the −3 ± 1.5 dB window"
+                "a note beside the key, inside"
             } else {
-                "OFF ITS −3 ± 1.5 dB WINDOW"
+                "OFF"
             }
         );
         println!(
@@ -3060,7 +3757,7 @@ fn probe_tables(
              {CAPITAL_SHIFT_LEAD_MS} ms on, on the scene census): Typed {typed}, Capital \
              {capital}{}, Shift tonality \
              {shift_tonality:.1} ({}) at {shift_re_typed:+.2} dB re the walk-mean Typed (target \
-             {SHIFT_RE_TYPED_TARGET_DB:+.1} ± {SHIFT_RE_TYPED_TOL_DB}, the 2026-09-16 ting) — {}",
+             {SHIFT_RE_TYPED_TARGET_DB:+.1} ± {SHIFT_RE_TYPED_TOL_DB}, the {ruled} ting) — {}",
             FINE_ONSET.0,
             FINE_ONSET.1,
             caps_lock.map_or(String::new(), |n| format!(", CapsLockA {n}")),
@@ -3071,13 +3768,62 @@ fn probe_tables(
             } else if !shift_pitched {
                 "§8 STEP 4 (2026-09-10) FAILS: the bare Shift does not sing"
             } else if !shift_level_ok {
-                "§8 STEP 4 (2026-09-16) FAILS: the ting is off its −3 dB window"
+                "§8 STEP 4 (2026-09-16 / 2026-09-20) FAILS: the ting is off its window"
             } else if capital != 2 {
                 "§8 STEP 4 (2026-09-10) FAILS: Shift then a capital is not two onsets"
             } else {
                 "§8 STEP 4 (2026-09-10) FAILS: a keystroke is not one onset"
             }
         );
+        // FORTE, NOT HIGHER (RE-RULED 2026-09-20 — the owner: "I want
+        // shifted characters to sound more like FORTE in a piano versus just
+        // a higher tone"). The SAME-PITCH CHECK: the `Capital-run-interior`
+        // row's key (`B` after a shifted `A` — inside a shifted run, so the
+        // walk's own accent does not fire) against its lowercase twin from
+        // the same settled state (`b` after that `A`). The two derive ONE
+        // degree, so since this ruling they must read ONE note: on the
+        // 2026-09-19 tree the capital struck an octave over it and this line
+        // read +1200 cents. Read 25 ms past the onset,
+        // like every pitch in this bench (past the ~12 ms contour settle); the
+        // `Capital` census above is
+        // unmoved by the ruling and still reads 2 (the ting, then the key).
+        if let Some(interior) = PROBES.iter().find(|p| p.label == "Capital-run-interior") {
+            let twin = Probe {
+                label: "run-interior twin",
+                kind: interior.kind,
+                shifted: false,
+                hue: interior.hue,
+                lift: interior.lift,
+                census: false,
+                run: interior.run,
+                ch: Some('b'),
+                prefix: interior.prefix,
+            };
+            let struck_hz = |p: &Probe| -> f64 {
+                let t = probe(p, voice, style, volume, seed, timbre, PROBE_SETTLE);
+                let mono: Vec<f32> = t
+                    .bus_with
+                    .iter()
+                    .zip(&t.bus_alone)
+                    .map(|(a, b)| a - b)
+                    .collect();
+                let peak = mono.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let start = mono.iter().position(|v| v.abs() > peak * 0.05).unwrap_or(0);
+                let at = (start + SR as usize / 40).min(mono.len().saturating_sub(FFT_N + 1));
+                peak_hz(&mag_at(&mono, at), 120.0, 6000.0)
+            };
+            let (cap_hz, twin_hz) = (struck_hz(interior), struck_hz(&twin));
+            let cents = 1200.0 * (cap_hz / twin_hz).log2();
+            println!(
+                "forte (2026-09-20): a run-interior capital strikes {cap_hz:.1} Hz against its \
+                 lowercase twin's {twin_hz:.1} ({cents:+.0} cents) — {}",
+                if cents.abs() <= SAME_NOTE_CENTS {
+                    "the line's own degree, struck harder: not higher"
+                } else {
+                    "NOT THE LINE'S DEGREE: a shifted key is sounding a different note"
+                }
+            );
+        }
         // THE SPACE HEAD IS HEARD (RE-RULED 2026-09-16 — the owner: "i
         // don't always hear the space bar?"). The 2026-09-10 fit ("felt,
         // not heard") measured on this row, music box, vol 0.4: Space

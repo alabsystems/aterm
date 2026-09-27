@@ -24,10 +24,6 @@ fn sixel_stream_strategy() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(sixel_protocol_byte(), 0..500)
 }
 
-fn hook_params_strategy() -> impl Strategy<Value = Vec<u16>> {
-    prop::collection::vec(0u16..=20u16, 0..=3)
-}
-
 // Sixel decoder tests: 128 cases is sufficient for crash-safety and
 // dimension-bound checking on structured protocol byte streams.
 proptest! {
@@ -36,13 +32,10 @@ proptest! {
     /// Arbitrary byte sequences through the decoder must never panic.
     #[test]
     fn sixel_decoder_no_panic_arbitrary_input(
-        params in hook_params_strategy(),
         data in sixel_stream_strategy(),
-        cursor_row in any::<u16>(),
-        cursor_col in any::<u16>(),
     ) {
         let mut decoder = SixelDecoder::new();
-        decoder.hook(&params, cursor_row, cursor_col);
+        decoder.hook();
         for &byte in &data {
             decoder.put(byte);
         }
@@ -53,11 +46,10 @@ proptest! {
     /// and its pixel buffer must have exactly width * height elements.
     #[test]
     fn sixel_image_dimensions_bounded(
-        params in hook_params_strategy(),
         data in sixel_stream_strategy(),
     ) {
         let mut decoder = SixelDecoder::new();
-        decoder.hook(&params, 0, 0);
+        decoder.hook();
         for &byte in &data {
             decoder.put(byte);
         }
@@ -97,12 +89,11 @@ proptest! {
     #[test]
     fn sixel_decoder_reuse_across_cycles(
         cycle_count in 1usize..=5usize,
-        params in hook_params_strategy(),
         data in prop::collection::vec(sixel_protocol_byte(), 0..200),
     ) {
         let mut decoder = SixelDecoder::new();
         for _ in 0..cycle_count {
-            decoder.hook(&params, 0, 0);
+            decoder.hook();
             for &byte in &data {
                 decoder.put(byte);
             }
@@ -126,7 +117,7 @@ proptest! {
         // (`?` (0x3F) paints nothing ⇒ unhook() returns None ⇒ the `if let Some`
         // body never ran and this test verified nothing.)
         let mut decoder = SixelDecoder::new();
-        decoder.hook(&[0], 0, 0);
+        decoder.hook();
         decoder.put(b'@');
         let image = decoder
             .unhook()

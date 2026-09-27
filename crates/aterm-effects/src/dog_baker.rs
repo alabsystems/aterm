@@ -194,17 +194,14 @@ impl DogBaker {
     }
 
     /// Resident tile count (`≤ MAX_SLOTS`).
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.slots.len()
-    }
-
-    /// Whether the cache holds no tiles.
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
     }
 
     /// Resident texel bytes (`≤ MAX_ATLAS_BYTES`).
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn resident_bytes(&self) -> usize {
         self.bytes
     }

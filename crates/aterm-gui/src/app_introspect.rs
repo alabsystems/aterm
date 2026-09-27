@@ -27,9 +27,11 @@ use crate::app_render::{
 };
 use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
+#[cfg(unix)]
+use crate::snapshot_path;
 #[cfg(test)]
 use crate::term_lock;
-use crate::{App, accessibility, control_auth, snapshot_path};
+use crate::{App, accessibility, control_auth};
 
 const DEFERRED_GPU_CAPTURE_LIMIT: usize = 8;
 const GPU_CAPTURE_PENDING: &str = "capture pending: waiting for the requested GPU drawable";
@@ -421,7 +423,9 @@ struct RecordingPresentedDestination {
 /// transaction: the serial proves ordering, while `client` is the exact raw
 /// destination copied from that same CPU softbuffer or GPU swapchain present.
 struct PresentedWindowCapture {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Re-checked against the window's live present serial by the macOS and
+    /// Windows photograph paths; Linux has no platform photograph.
+    #[cfg(any(target_os = "macos", windows))]
     serial: u64,
     client: crate::PresentedClientFrame,
     frame: PresentedFrameCapture,
@@ -1295,7 +1299,7 @@ impl VideoPublication {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn publish_marker_with_test_hook(
         &mut self,
         after_publish: impl FnOnce(),
@@ -1306,7 +1310,7 @@ impl VideoPublication {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn is_published(&self) -> bool {
         self.dir.is_published()
     }
@@ -1475,7 +1479,33 @@ fn reject_pending_capture_reply<T>(
     false
 }
 
+/// Queue one authorized capture exactly as the encode worker does:
+/// `send_capture_reply_after_validation` revalidates the written file and
+/// either hands its guarded reply over or aborts it. The
+/// `ArtifactReplyPublication` Tier-1 bind drives the rest through the control
+/// writer and ACK wait.
 #[cfg(test)]
+pub(crate) fn queue_capture_reply_for_test(
+    target: crate::control_auth::ConfinedImage,
+    file: crate::pinned_dir::PinnedFile,
+    lease: Option<crate::control_auth::ArtifactPathLease>,
+) -> Result<crate::control::Retained<()>, String> {
+    let (reply, result) = std::sync::mpsc::channel();
+    send_capture_reply_after_validation(
+        PendingCaptureReply {
+            target,
+            file,
+            lease,
+            permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+        },
+        &reply,
+        (),
+        "image",
+    );
+    result.recv().expect("the capture worker always answers")
+}
+
+#[cfg(all(test, unix))]
 fn send_capture_reply_after_validation_with_hook<T: Send>(
     pending: PendingCaptureReply,
     reply: &std::sync::mpsc::Sender<Result<crate::control::Retained<T>, String>>,
@@ -2128,6 +2158,7 @@ fn observe_capture_pet_world(
         PetPane::full(input),
         &exclusions[..count],
     );
+    crate::metrics::note_pet_world_observation(ws.cursor_pet.observed_cells());
 }
 
 /// Advance the visual half of the sing-along only when the explicit capture
@@ -2525,7 +2556,7 @@ impl App {
     /// pad / font were actually derived from is that window's — recoverable rather
     /// than unknowable. In order:
     ///
-    /// 1. A force pin (`--scale` / `$ATERM_FORCE_SCALE`) overrides every window's
+    /// 1. A force pin (`--scale`) overrides every window's
     ///    real factor, and is the only scale a headless boot ever has.
     /// 2. The window whose metric record the backend currently carries (the same
     ///    equality `apply_window_scale` guards its re-tune with), so the reported
@@ -4649,7 +4680,7 @@ impl App {
                 // a windowed present would.
                 ws.cursor_glow
                     .observe_ribbon_row(cpos.row, &ws.poof_row_buf);
-                let mut ribbon_rows = [0u16; aterm_effects::rainbow_kitty::witness::WITNESS_ROWS];
+                let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
                 let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
                 for &r in &ribbon_rows[..n] {
                     if usize::from(r) < rows && r != cpos.row {
@@ -4769,8 +4800,7 @@ impl App {
     /// transaction, so its PNG is explicitly the semantic renderer output and may
     /// omit present-only passes. The parallel `.txt` is projected from the same
     /// successful-present serial when windowed. Triggered by SIGUSR1. The files
-    /// are written 0600 into the per-user 0700 control dir;
-    /// $ATERM_SNAPSHOT_PATH overrides only into a safe dir (see `snapshot_path`).
+    /// are written 0600 into the per-user 0700 control dir (see `snapshot_path`).
     fn snapshot_visible_text(
         &self,
         wid: WindowId,
@@ -4845,6 +4875,7 @@ impl App {
         visible
     }
 
+    #[cfg(unix)]
     pub(crate) fn snapshot(&mut self) {
         let Some(path) = snapshot_path::resolve() else {
             return; // refusal already logged by resolve()
@@ -5058,6 +5089,11 @@ impl App {
                         return;
                     }
                 }
+            }
+            // The Claude Code footer, as on the presentation routes: `image`
+            // must show the row the window shows (`crate::claude_footer`).
+            if let Some(plan) = frame_plan.as_ref() {
+                self.splice_claude_footer(front, plan, route);
             }
             self.splice_paste_banner(front);
             // A capture that omitted the link caption would tell a driving AI a
@@ -5374,6 +5410,9 @@ impl App {
             }
             // Native preparation leaves the semantic surface in the tray. Paint
             // the paste question afterward, exactly like the application-present path.
+            if let Some((plan, route)) = resolved_layout.as_ref() {
+                self.splice_claude_footer(front, plan, *route);
+            }
             self.splice_paste_banner(front);
             if let Some((plan, _)) = resolved_layout.as_ref() {
                 self.splice_link_target_from_plan(front, plan);
@@ -6271,6 +6310,13 @@ impl App {
             self.splice_settings_panel(front);
             self.splice_build_badge(front);
             self.splice_robi_bubble(front);
+            self.splice_claude_footer(
+                front,
+                &capture_plan,
+                crate::VisibleContentRoute::Terminal {
+                    composed: capture_grid.composed,
+                },
+            );
             self.splice_paste_banner(front);
             self.splice_link_target_from_plan(front, &capture_plan);
             // C5 — topmost chrome; see the `chrome`-capture route above.
@@ -6525,6 +6571,20 @@ impl App {
     /// Off macOS there is no native chrome, so it returns a single explanatory line.
     #[cfg(target_os = "macos")]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
+        /// A menu item the menu does not show: `-isHidden`, or an
+        /// `-isAlternate` item standing in for its neighbour only while a
+        /// modifier is held. Both are `-(BOOL)` getters with no side effect.
+        fn menu_item_unshown(item: aterm_objc::Id) -> bool {
+            use aterm_objc::sel;
+            // SAFETY: `item` is a live `NSMenuItem` borrowed from its menu's
+            // `itemArray` inside the caller's pool, on the main thread; both
+            // getters are `-(BOOL)` accessors with no preconditions.
+            unsafe {
+                crate::appkit::send_bool(item, sel!(isHidden))
+                    || crate::appkit::send_bool(item, sel!(isAlternate))
+            }
+        }
+
         use aterm_objc::{Id, autoreleasepool, class, sel};
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -6722,8 +6782,12 @@ impl App {
                             }
                             let name = appkit::nsstring_to_rust(appkit::send_id(kid, sel!(title)));
                             // Skip separators (empty title) so the listing reads as
-                            // the command set, not the dividers.
-                            if name.is_empty() {
+                            // the command set, not the dividers — and what the
+                            // menu does not SHOW (ruling 267): AppKit keeps hidden
+                            // items and Option-key alternates in `itemArray`
+                            // (the Edit menu's dictation and emoji entries read
+                            // two and three times over).
+                            if name.is_empty() || menu_item_unshown(kid) {
                                 continue;
                             }
                             let sub = appkit::send_id(kid, sel!(submenu));
@@ -6743,7 +6807,7 @@ impl App {
                                 .map(|g| {
                                     let item =
                                         appkit::send_id_usize(grand, sel!(objectAtIndex:), g);
-                                    if item.is_null() {
+                                    if item.is_null() || menu_item_unshown(item) {
                                         String::new()
                                     } else {
                                         appkit::nsstring_to_rust(appkit::send_id(item, sel!(title)))
@@ -6771,22 +6835,18 @@ impl App {
     /// handler is platform-independent.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
-        // Only the Windows arm below pushes; the mut is platform-conditional.
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut out: Vec<String> = Vec::new();
         // Windows: report the REAL native chrome the `AppRtWindows` backend applied,
         // read back from the live HWND via DwmGetWindowAttribute (dark-mode / corner
         // preference / system backdrop) — the W0 acceptance surface, ground truth not
         // intent. Off Windows there is no native window chrome to read.
         #[cfg(windows)]
-        {
-            let window = self.front().and_then(|ws| ws.os_window.as_deref());
-            out.extend(crate::platform_win::read_chrome_lines(
-                window,
-                self.window_theme,
-                self.render_knobs.background_material,
-            ));
-        }
+        let out: Vec<String> = crate::platform_win::read_chrome_lines(
+            self.front().and_then(|ws| ws.os_window.as_deref()),
+            self.window_theme,
+            self.render_knobs.background_material,
+        );
+        #[cfg(not(windows))]
+        let out: Vec<String> = Vec::new();
         // Off macOS the host keeps the title/tab model in memory even where no native
         // header-bar widget exists yet. Read it through the same AppRt seam as macOS so
         // Settings identity, route tooltip, selection, state, and the terminal-no-icon
@@ -7027,6 +7087,7 @@ impl App {
                             return false;
                         }
                         captured = Some(PresentedWindowCapture {
+                            #[cfg(any(target_os = "macos", windows))]
                             serial,
                             client,
                             frame,
@@ -10080,8 +10141,8 @@ mod chrome_output_tests {
         );
 
         let ffi = include_str!("lib.rs");
-        assert!(ffi.contains("pub fn CGColorSpaceCreateWithName"));
-        assert!(!ffi.contains("pub fn CGColorSpaceCreateDeviceRGB"));
+        assert!(ffi.contains("fn CGColorSpaceCreateWithName("));
+        assert!(!ffi.contains("fn CGColorSpaceCreateDeviceRGB("));
     }
 }
 

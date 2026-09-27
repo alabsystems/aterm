@@ -195,7 +195,7 @@ impl ApplicationDelegate {
             is_running: Cell::new(false),
             exit: Cell::new(false),
             control_flow: Cell::new(ControlFlow::default()),
-            waker: RefCell::new(EventLoopWaker::new()),
+            waker: RefCell::new(EventLoopWaker::new(mtm)),
             start_time: Cell::new(None),
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
@@ -565,6 +565,23 @@ impl ApplicationDelegate {
         self.handle_event(Event::Resumed);
     }
 
+    /// LOCAL PATCH (aterm): a NESTED run loop inside the handler (an
+    /// app-modal `NSAlert runModal`) turns the observers with the handler
+    /// borrowed, so nothing re-arms the waker, and a past-due `WaitUntil` left
+    /// it firing at its 0.1 µs interval in every common mode: 88 % CPU for as
+    /// long as the dialog stood. A due timer keeps that loop from ever
+    /// sleeping, so `cleared` may never run in it; `wakeup` does. Both stop
+    /// the waker: the handler cannot run until the dialog returns, and the
+    /// outer turn's own `cleared` re-arms it then. (Since 2026-09-26 the
+    /// waker repeats once a year — `observer.rs`'s `EventLoopWaker` — so a
+    /// fired timer is spent and cannot keep a nested loop awake by itself;
+    /// this still parks one that was armed and never fired.)
+    fn stop_waker_in_nested_loop(&self) {
+        if self.ivars().event_handler.in_use() {
+            self.ivars().waker.borrow_mut().stop();
+        }
+    }
+
     // Called by RunLoopObserver after finishing waiting for new events
     pub fn wakeup(&self, panic_info: Weak<PanicInfo>) {
         let _ = self.mtm();
@@ -574,6 +591,7 @@ impl ApplicationDelegate {
 
         // Return when in event handler due to https://github.com/rust-windowing/winit/issues/1779
         if panic_info.is_panicking() || !self.ivars().event_handler.ready() || !self.is_running() {
+            self.stop_waker_in_nested_loop();
             return;
         }
 
@@ -609,6 +627,7 @@ impl ApplicationDelegate {
         // XXX: how does it make sense that `event_handler.ready()` can ever return `false` here if
         // we're about to return to the `CFRunLoop` to poll for new events?
         if panic_info.is_panicking() || !self.ivars().event_handler.ready() || !self.is_running() {
+            self.stop_waker_in_nested_loop();
             return;
         }
 

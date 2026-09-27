@@ -90,12 +90,14 @@ impl StreamingSearch {
 
     /// Get the current filter mode.
     #[must_use]
+    #[cfg(test)]
     pub fn filter_mode(&self) -> FilterMode {
         self.filter_mode
     }
 
     /// Get the current pattern.
     #[must_use]
+    #[cfg(any(test, kani))]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
@@ -114,6 +116,7 @@ impl StreamingSearch {
 
     /// Get the currently highlighted match.
     #[must_use]
+    #[cfg(test)]
     pub fn current_match(&self) -> Option<&StreamingMatch> {
         if self.current_index > 0 && self.current_index <= self.results.len() {
             Some(&self.results[self.current_index - 1])
@@ -142,18 +145,21 @@ impl StreamingSearch {
 
     /// Check if wrap-around navigation is enabled.
     #[must_use]
+    #[cfg(test)]
     pub fn wrap_enabled(&self) -> bool {
         self.config.wrap_enabled
     }
 
     /// Check if case-sensitive matching is enabled.
     #[must_use]
+    #[cfg(test)]
     pub fn case_sensitive(&self) -> bool {
         self.config.case_sensitive
     }
 
     /// Check if all matches should be highlighted.
     #[must_use]
+    #[cfg(test)]
     pub fn highlight_all(&self) -> bool {
         self.config.highlight_all
     }
@@ -165,6 +171,7 @@ impl StreamingSearch {
     /// coordinates when the generation changes (#7271).
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
     }

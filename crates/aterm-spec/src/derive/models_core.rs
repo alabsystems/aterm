@@ -8,35 +8,43 @@
 
 use super::*;
 
-/// TERMINAL MODES — the DEC/ANSI/keyboard mode-flag state machine that the VT
-/// handler maintains (TRUST_NATIVE_TLA, Phase 0: resolves the dangling
-/// `terminal_modes` machine the `#[refines]` anchors in
-/// `aterm-core/src/terminal/handler_{dec,esc,state,report}*.rs` point at).
+/// TERMINAL MODES — the DEC/ANSI mode-flag state machine the VT handler
+/// maintains, and the reset discipline over it. The 28 actions are exactly the
+/// `#[refines(machine="terminal_modes", action=…)]` set in
+/// `aterm-core/src/terminal/handler_{dec,dec_refinement,esc,state,report}.rs`:
+/// thirteen `Set*`/`Reset*` toggle pairs and the two resets (`SoftReset` =
+/// DECSTR, `FullReset` = RIS). The DEC modes the handler does NOT model (VT52,
+/// 132-column, reverse video, BiDi, …) are `#[spec_unmodeled(reason=…)]`
+/// waivers, not actions here.
 ///
-/// Each modelled mode is a bounded scalar (booleans as `{0,1}`; the multi-valued
-/// `mouse_mode`/`mouse_encoding`/`cursor_style` as small bounded ints). The 26
-/// actions are exactly the `#[refines(machine="terminal_modes", action=…)]` set:
-/// the `Set*`/`Reset*` toggle pairs, the multi-valued setters
-/// (`SetMouseMode`/`SetSgrMouseEncoding`/`SetCursorStyle`), and the two reset
-/// actions (`SoftReset` = DECSTR, `FullReset` = RIS) which return the modes to
-/// known defaults. (The DEC modes the handler explicitly does NOT model —
-/// VT52/132-col/reverse-video/BiDi/… — are `#[spec_unmodeled(reason=…)]` waivers,
-/// not actions here; that is the deliberate "modelled vs. waived" split.)
+/// Every variable is a boolean FACT about a mode, and every action sets its own
+/// variable to an exact value, which is what makes the projection from the real
+/// `TerminalModes` exact rather than a witness. Three of them abstract a
+/// multi-valued mode: `mouse_mode` is "some mouse tracking is on"
+/// (`SetMouseMode` is X10/1000/1002/1003, `ResetMouseMode` tracking-off),
+/// `sgr_mouse` is "the SGR 1006 encoding is in force" (the encodings that
+/// replace it are `ResetSgrMouseEncoding` sites), and `cursor_style` is "the
+/// cursor shape differs from the HOST's default" — `SetCursorStyle` lands on a
+/// shape other than the host's, `RestoreCursorStyle` on the host's own, and
+/// DECSCUSR and mode 12 (the blink bit of the shape) are sites of both, the
+/// bytes deciding which. Both resets restore the host-configured shape, not
+/// `CursorStyle::default()`.
 ///
-/// **Invariant `ModesValid`.** Every mode stays inside its valid domain under ANY
-/// interleaving of the 26 actions: the booleans never leave `{0,1}`, and the
-/// multi-valued modes never leave their enum range. This is the contract the
-/// handler genuinely maintains — `TerminalModes` fields are `bool`/small `enum`,
-/// so a mode is never an out-of-range / torn value, and a reset always lands on a
-/// valid default. It is non-vacuous: `ty` enumerates the full action fan-out from
-/// `Init`, so a setter that pushed a mode out of range (or a reset that left a
-/// stale out-of-range value) would be caught.
+/// **Invariant `ResetRestoresDefaults`.** Immediately after either reset
+/// (`reset = 1`, a history variable every other action clears) the terminal is
+/// usable again: cursor shown in the host shape, autowrap on, no insert /
+/// origin / newline mode, no application cursor keys, no mouse capture or SGR
+/// encoding, no focus or bracketed-paste reports, and NO synchronized-output
+/// hold. `alt_screen` is deliberately outside it — DECSTR keeps the current
+/// screen, RIS leaves the alternate one. `Buggy = 1` is a DECSTR that forgets
+/// the synchronized-output hold: a program that soft-resets mid-frame then
+/// leaves the host's present-hold armed and the screen frozen. `ty` proves the
+/// invariant at `Buggy = 0` and catches that at `Buggy = 1`.
 ///
-/// SCOPE: this scalar model captures mode *validity* and the reset discipline (the
-/// set/reset/RIS/DECSTR contract), not per-mode rendering semantics — those live in
-/// the engine and, where bounded, in the other derived models. It exists so the
-/// `terminal_modes` anchors RESOLVE (obligation 4) and are fully bound-or-waived
-/// (obligation 3): the smallest sound model that makes the cross-reference real.
+/// Tier-1: `aterm-core/src/terminal/terminal_modes_conformance.rs` drives every
+/// anchored action through real `Terminal::process` bytes, projects the real
+/// `TerminalModes` with `project_modes`, validates each step against this model,
+/// and audits (per step) that the window entered the action's own anchor.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — nested
 // `vec!`/struct literals whose aggregate-operand count exceeds the
 // VC-generation work budget, so its obligations are left Unknown
@@ -44,96 +52,121 @@ use super::*;
 // the idiomatic allocs; the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn terminal_modes_model() -> Model {
-    crate::ty_model! {
-        TerminalModes {
-            // Boolean modes (0/1). DECSTR (SoftReset) / RIS (FullReset) defaults
-            // are encoded in the two reset actions below.
-            var app_cursor_keys = 0;
-            var origin_mode = 0;
-            var auto_wrap = 1;          // DECAWM defaults ON
-            var cursor_visible = 1;     // DECTCEM defaults ON
-            var focus_reporting = 0;
-            var sync_output = 0;
-            var insert_mode = 0;
-            var new_line_mode = 0;
-            var alt_screen = 0;
-            var bracketed_paste = 0;
-            // Multi-valued modes (small bounded enums). mouse_mode: 0=off..4; the
-            // mouse coordinate encoding sgr flag: 0/1; cursor_style: 0..6 (DECSCUSR).
-            var mouse_mode = 0;
-            var sgr_mouse = 0;
-            var cursor_style = 0;
-
-            action SetApplicationCursorKeys { app_cursor_keys = 1; }
-            action ResetApplicationCursorKeys { app_cursor_keys = 0; }
-            action SetOriginMode { origin_mode = 1; }
-            action ResetOriginMode { origin_mode = 0; }
-            action SetAutoWrap { auto_wrap = 1; }
-            action ResetAutoWrap { auto_wrap = 0; }
-            action SetCursorVisible { cursor_visible = 1; }
-            action ResetCursorVisible { cursor_visible = 0; }
-            action SetFocusReporting { focus_reporting = 1; }
-            action ResetFocusReporting { focus_reporting = 0; }
-            action SetSynchronizedOutput { sync_output = 1; }
-            action ResetSynchronizedOutput { sync_output = 0; }
-            action SetInsertMode { insert_mode = 1; }
-            action ResetInsertMode { insert_mode = 0; }
-            action SetNewLineMode { new_line_mode = 1; }
-            action ResetNewLineMode { new_line_mode = 0; }
-            action SetAlternateScreen { alt_screen = 1; }
-            action ResetAlternateScreen { alt_screen = 0; }
-            action SetBracketedPaste { bracketed_paste = 1; }
-            action ResetBracketedPaste { bracketed_paste = 0; }
-            // Multi-valued setters: enter a representative valid value in range.
-            // (The real handler picks among X10/Normal/ButtonEvent/AnyEvent etc;
-            // the bounded abstraction is "any in-range mode", here a fixed witness.)
-            action SetMouseMode { mouse_mode = 1; }
-            action SetSgrMouseEncoding { sgr_mouse = 1; }
-            action ResetSgrMouseEncoding { sgr_mouse = 0; }
-            action SetCursorStyle { cursor_style = 6; }
-
-            // SoftReset (DECSTR): return modes to their soft defaults — cursor
-            // visible, autowrap on, everything else off; mouse/encoding/style cleared.
-            action SoftReset {
-                app_cursor_keys = 0;
-                origin_mode = 0;
-                auto_wrap = 1;
-                cursor_visible = 1;
-                focus_reporting = 0;
-                sync_output = 0;
-                insert_mode = 0;
-                new_line_mode = 0;
-                bracketed_paste = 0;
-                mouse_mode = 0;
-                sgr_mouse = 0;
-                cursor_style = 0;
-            }
-            // FullReset (RIS): hard reset — everything to power-on defaults
-            // (including leaving the alternate screen).
-            action FullReset {
-                app_cursor_keys = 0;
-                origin_mode = 0;
-                auto_wrap = 1;
-                cursor_visible = 1;
-                focus_reporting = 0;
-                sync_output = 0;
-                insert_mode = 0;
-                new_line_mode = 0;
-                alt_screen = 0;
-                bracketed_paste = 0;
-                mouse_mode = 0;
-                sgr_mouse = 0;
-                cursor_style = 0;
-            }
-
-            // Every mode stays in its valid domain under any action interleaving.
-            invariant ModesValid:
-                app_cursor_keys <= 1 && origin_mode <= 1 && auto_wrap <= 1
-                && cursor_visible <= 1 && focus_reporting <= 1 && sync_output <= 1
-                && insert_mode <= 1 && new_line_mode <= 1 && alt_screen <= 1
-                && bracketed_paste <= 1 && mouse_mode <= 4 && sgr_mouse <= 1
-                && cursor_style <= 6;
+    // (Set action, Reset action, mode) for every boolean toggle pair.
+    const TOGGLES: [(&str, &str, &str); 13] = [
+        (
+            "SetApplicationCursorKeys",
+            "ResetApplicationCursorKeys",
+            "app_cursor_keys",
+        ),
+        ("SetOriginMode", "ResetOriginMode", "origin_mode"),
+        ("SetAutoWrap", "ResetAutoWrap", "auto_wrap"),
+        ("SetCursorVisible", "ResetCursorVisible", "cursor_visible"),
+        (
+            "SetFocusReporting",
+            "ResetFocusReporting",
+            "focus_reporting",
+        ),
+        (
+            "SetSynchronizedOutput",
+            "ResetSynchronizedOutput",
+            "sync_output",
+        ),
+        ("SetInsertMode", "ResetInsertMode", "insert_mode"),
+        ("SetNewLineMode", "ResetNewLineMode", "new_line_mode"),
+        ("SetAlternateScreen", "ResetAlternateScreen", "alt_screen"),
+        (
+            "SetBracketedPaste",
+            "ResetBracketedPaste",
+            "bracketed_paste",
+        ),
+        ("SetSgrMouseEncoding", "ResetSgrMouseEncoding", "sgr_mouse"),
+        ("SetMouseMode", "ResetMouseMode", "mouse_mode"),
+        ("SetCursorStyle", "RestoreCursorStyle", "cursor_style"),
+    ];
+    // Every mode a reset restores, with its default (alt_screen is RIS-only).
+    const RESET_DEFAULTS: [(&str, i64); 12] = [
+        ("app_cursor_keys", 0),
+        ("origin_mode", 0),
+        ("auto_wrap", 1),
+        ("cursor_visible", 1),
+        ("focus_reporting", 0),
+        ("sync_output", 0),
+        ("insert_mode", 0),
+        ("new_line_mode", 0),
+        ("bracketed_paste", 0),
+        ("mouse_mode", 0),
+        ("sgr_mouse", 0),
+        ("cursor_style", 0),
+    ];
+    let set = |mode: &'static str, expr: Expr| Update { var: mode, expr };
+    // Any non-reset action ends the "just reset" window.
+    let plain = |name: &'static str, mode: &'static str, expr: Expr| Action {
+        name,
+        guard: None,
+        updates: vec![set(mode, expr), set("reset", int(0))],
+    };
+    let reset = |name: &'static str, leave_alt: bool| {
+        let mut updates: Vec<Update> = RESET_DEFAULTS
+            .iter()
+            .map(|&(mode, default)| {
+                // Buggy: DECSTR forgets the synchronized-output hold.
+                if mode == "sync_output" && name == "SoftReset" {
+                    set(mode, if_(eq(cst("Buggy"), int(1)), var(mode), int(default)))
+                } else {
+                    set(mode, int(default))
+                }
+            })
+            .collect();
+        if leave_alt {
+            updates.push(set("alt_screen", int(0)));
         }
+        updates.push(set("reset", int(1)));
+        Action {
+            name,
+            guard: None,
+            updates,
+        }
+    };
+
+    let mut actions = Vec::new();
+    for (on, off, mode) in TOGGLES {
+        actions.push(plain(on, mode, int(1)));
+        actions.push(plain(off, mode, int(0)));
+    }
+    actions.push(reset("SoftReset", false));
+    actions.push(reset("FullReset", true));
+
+    let mut vars: Vec<StateVar> = TOGGLES
+        .iter()
+        .map(|&(_, _, name)| StateVar {
+            name,
+            init: RESET_DEFAULTS
+                .iter()
+                .find(|(mode, _)| *mode == name)
+                .map_or(0, |&(_, default)| default),
+        })
+        .collect();
+    vars.push(StateVar {
+        name: "reset",
+        init: 0,
+    });
+
+    let restored = RESET_DEFAULTS
+        .iter()
+        .map(|&(mode, default)| eq(var(mode), int(default)))
+        .reduce(and_)
+        .unwrap_or_else(|| bool_lit(true));
+    Model {
+        name: "TerminalModes",
+        consts: vec![("Buggy", 0)],
+        vars,
+        fn_vars: vec![],
+        actions,
+        invariants: vec![Invariant {
+            name: "ResetRestoresDefaults",
+            expr: or_(eq(var("reset"), int(0)), restored),
+        }],
     }
 }
 
@@ -143,13 +176,19 @@ pub fn terminal_modes_model() -> Model {
 /// would exceed `Cap`. `MaxSeq` bounds the state space so `ty check` is
 /// exhaustive + terminating; `Cap` is the ring capacity. Action name is `Push`
 /// (not `Append`, which clashes with ty's Sequences builtin).
+///
+/// `Buggy = 1` evicts one push late, so the ring holds `Cap + 1` live events —
+/// the shape of the alt-screen archive undercharge (`a4c4d3eaa`: a row charged
+/// as `len + 32` let a 4 MiB budget hold 5.23 MiB, and admitted a fourth row into
+/// a three-row budget, the negative control `alt_archive_tests.rs` binds against
+/// this model). `LenBounded` is its counterexample.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ring_model() -> Model {
     Model {
         name: "Ring",
-        consts: vec![("MaxSeq", 6), ("Cap", 3)],
+        consts: vec![("MaxSeq", 6), ("Cap", 3), ("Buggy", 0)],
         vars: vec![
             StateVar {
                 name: "seq",
@@ -171,11 +210,11 @@ pub fn ring_model() -> Model {
                 },
                 Update {
                     var: "lo",
-                    // IF (seq + 1) - lo + 1 > Cap THEN lo + 1 ELSE lo
+                    // IF (seq + 1) - lo + 1 > Cap + Buggy THEN lo + 1 ELSE lo
                     expr: if_(
                         gt(
                             add(sub(add(var("seq"), int(1)), var("lo")), int(1)),
-                            cst("Cap"),
+                            add(cst("Cap"), cst("Buggy")),
                         ),
                         add(var("lo"), int(1)),
                         var("lo"),
@@ -198,13 +237,23 @@ pub fn ring_model() -> Model {
 /// catches the reader `cursor` up to `seq`. Invariant: the reader never passes the
 /// writer (`cursor <= seq`). This is the Subscribe/Kernel family in miniature, and
 /// it proves the derivation engine generalizes beyond the single-action ring.
+///
+/// `Buggy = 1` is the off-by-one class a subscriber cursor can ship with (the
+/// non-vacuity witness for `CursorBounded`, not a defect the code is known to have
+/// had): a `Deliver` that parks the cursor one PAST the head it delivered, so the
+/// next event written is silently skipped. `CursorBounded` catches it on the first
+/// delivery. Tier-1: aterm-buffer's `tests/conformance_cursor.rs` drives the real
+/// `Surface::subscribe`/`poll` — the library's read face, which no product crate
+/// calls today — and reads the cursor's position back through the real `poll`
+/// itself, which is what catches an overshoot `subscribe_model`'s bind (a
+/// caller-tracked cursor) cannot see.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_model() -> Model {
     Model {
         name: "Cursor",
-        consts: vec![("MaxSeq", 4)],
+        consts: vec![("MaxSeq", 4), ("Buggy", 0)],
         vars: vec![
             StateVar {
                 name: "seq",
@@ -228,9 +277,14 @@ pub fn cursor_model() -> Model {
             Action {
                 name: "Deliver", // reader catches up; seq is UNCHANGED
                 guard: Some(gt(var("seq"), var("cursor"))),
+                // cursor' = IF Buggy = 1 THEN seq + 1 ELSE seq  (Buggy overshoots)
                 updates: vec![Update {
                     var: "cursor",
-                    expr: var("seq"),
+                    expr: if_(
+                        eq(cst("Buggy"), int(1)),
+                        add(var("seq"), int(1)),
+                        var("seq"),
+                    ),
                 }],
             },
         ],
@@ -1003,9 +1057,46 @@ pub fn gpu_loss_route_model() -> Model {
 /// retry train is allowed to park until the separately-modelled external
 /// `PresentRetry::Stimulus` transition.
 ///
-/// Correct (`Buggy=0`) covers fresh, fuelled, and exhausted entry paths. The
-/// historical mutant leaves a GPU recording alive, omits the fresh retry, and
-/// double-counts the failed-present path; each defect is independently rejected.
+/// Correct (`Buggy=0`) covers fresh, fuelled, and exhausted entry paths.
+/// `Buggy=1` enables eight dead negative controls, one slip of the transaction
+/// each, and each the first thing its own law sees. Three are the historical
+/// mutant's defects:
+/// * the fallback installed but the GPU recording left alive
+///   (`LossStopsGpuRecording`);
+/// * the failed-present path parks instead of arming its fresh retry
+///   (`UnexhaustedFailureOwnsRetryOrDeliveredAttempt`);
+/// * a failed-present entry that counts its frame again although the source
+///   drop already did (`OneDropCountPerFrame`).
+///
+/// Five more are one line of the shipping transaction written wrong:
+/// * the fuelled failed-present path refines its drop's accounting but keeps
+///   the source surface's reason instead of `CpuAcquire`
+///   (`FailedFallbackIsDiagnosed`);
+/// * the exhausted path treats the failure as a fresh drop and arms a retry
+///   past the fuel cap — a retry train with no end (`ExhaustedFailureIsParked`);
+/// * `PresentRetry::take_due` hands the wake over without clearing the consumed
+///   deadline, which then re-arms turn after turn (`DeliveredRetryHasNoDeadline`);
+/// * the dropped-frame success path is classified `SourceReadyRequested`
+///   without its `request_redraw`, freezing the window on the dead GPU's last
+///   frame (`ReadyCpuOwnsRedrawUntilPresent`);
+/// * the delivered retry wake is taken as the acknowledging present — the
+///   acknowledgement-on-stimulus defect `RecoveryRedraw` pins, here before the
+///   CPU target is even built (`CpuPresentWasReady`).
+///
+/// Why dead actions and not `Buggy` arms inside the entry actions: an inline
+/// arm makes its slip on EVERY firing, so at `Buggy = 1` the correct fresh
+/// retry would never exist and the wake-side slips could only fire after the
+/// entry slip had already broken a law. No separate "a CPU present completes
+/// the failure" law either. `fallback_failed` is a record only this model keeps
+/// — nothing in aterm-gui is projected onto it — and only the `Succeed*`
+/// entries and `BuildCpuAfterWake` clear it, the same steps that set the
+/// `requested` every `PresentCpu` needs; so no modelled present can land over a
+/// live record, and a law saying so would judge the model's own bookkeeping.
+/// The one path that could, a parked failure presenting after the external
+/// `PresentRetry::Stimulus`, is outside this model. The shipping reset is
+/// `PresentRetry::on_presented`, and aterm-gui's success bind
+/// (`successful_gpu_recovery_classifies_source_ready_only_after_redraw_request`)
+/// asserts it leaves the default retry state after the acknowledging present.
 pub fn gpu_loss_recovery_model() -> Model {
     crate::ty_model! {
         GpuLossRecovery {
@@ -1026,30 +1117,30 @@ pub fn gpu_loss_recovery_model() -> Model {
             action FailFallbackAfterPresent {
                 path = 1;
                 fallback_failed = 1;
-                retry = if Buggy == 1 { 0 } else { 1 };
+                retry = 1;
                 delivered = 0;
                 exhausted = 0;
-                parked = if Buggy == 1 { 1 } else { 0 };
+                parked = 0;
                 cpu_ready = 0;
                 requested = 0;
                 cpu_presented = 0;
                 drops = 1;
                 reason = 2;
-                recording = if Buggy == 1 { 1 } else { 0 };
+                recording = 0;
             }
             action FailFallbackAfterDropWithFuel {
                 path = 2;
                 fallback_failed = 1;
-                retry = if Buggy == 1 { 0 } else { 1 };
+                retry = 1;
                 delivered = 0;
                 exhausted = 0;
-                parked = if Buggy == 1 { 1 } else { 0 };
+                parked = 0;
                 cpu_ready = 0;
                 requested = 0;
                 cpu_presented = 0;
-                drops = if Buggy == 1 { 2 } else { 1 };
+                drops = 1;
                 reason = 2;
-                recording = if Buggy == 1 { 1 } else { 0 };
+                recording = 0;
             }
             action FailFallbackAfterDropExhausted {
                 path = 2;
@@ -1061,9 +1152,9 @@ pub fn gpu_loss_recovery_model() -> Model {
                 cpu_ready = 0;
                 requested = 0;
                 cpu_presented = 0;
-                drops = if Buggy == 1 { 2 } else { 1 };
+                drops = 1;
                 reason = 2;
-                recording = if Buggy == 1 { 1 } else { 0 };
+                recording = 0;
             }
             action SucceedFallbackAfterPresent {
                 path = 1;
@@ -1077,7 +1168,7 @@ pub fn gpu_loss_recovery_model() -> Model {
                 cpu_presented = 0;
                 drops = 0;
                 reason = 0;
-                recording = if Buggy == 1 { 1 } else { 0 };
+                recording = 0;
             }
             action SucceedFallbackAfterDrop {
                 path = 2;
@@ -1091,7 +1182,7 @@ pub fn gpu_loss_recovery_model() -> Model {
                 cpu_presented = 0;
                 drops = 1;
                 reason = 1;
-                recording = if Buggy == 1 { 1 } else { 0 };
+                recording = 0;
             }
             action Wake when (retry == 1) {
                 retry = 0;
@@ -1104,6 +1195,100 @@ pub fn gpu_loss_recovery_model() -> Model {
                 requested = 1;
             }
             action PresentCpu when (requested == 1) {
+                requested = 0;
+                cpu_presented = 1;
+            }
+            action BuggyLossKeepsRecording when (Buggy == 1) {
+                path = 1;
+                fallback_failed = 0;
+                retry = 0;
+                delivered = 0;
+                exhausted = 0;
+                parked = 0;
+                cpu_ready = 1;
+                requested = 1;
+                cpu_presented = 0;
+                drops = 0;
+                reason = 0;
+                recording = 1;
+            }
+            action BuggyFailedPresentOmitsRetry when (Buggy == 1) {
+                path = 1;
+                fallback_failed = 1;
+                retry = 0;
+                delivered = 0;
+                exhausted = 0;
+                parked = 1;
+                cpu_ready = 0;
+                requested = 0;
+                cpu_presented = 0;
+                drops = 1;
+                reason = 2;
+                recording = 0;
+            }
+            action BuggyDropCountedTwice when (Buggy == 1) {
+                path = 2;
+                fallback_failed = 1;
+                retry = 1;
+                delivered = 0;
+                exhausted = 0;
+                parked = 0;
+                cpu_ready = 0;
+                requested = 0;
+                cpu_presented = 0;
+                drops = 2;
+                reason = 2;
+                recording = 0;
+            }
+            action BuggyFuelledDropKeepsSourceReason when (Buggy == 1) {
+                path = 2;
+                fallback_failed = 1;
+                retry = 1;
+                delivered = 0;
+                exhausted = 0;
+                parked = 0;
+                cpu_ready = 0;
+                requested = 0;
+                cpu_presented = 0;
+                drops = 1;
+                reason = 1;
+                recording = 0;
+            }
+            action BuggyExhaustedArmsRetry when (Buggy == 1) {
+                path = 2;
+                fallback_failed = 1;
+                retry = 1;
+                delivered = 0;
+                exhausted = 1;
+                parked = 0;
+                cpu_ready = 0;
+                requested = 0;
+                cpu_presented = 0;
+                drops = 1;
+                reason = 2;
+                recording = 0;
+            }
+            action BuggyWakeKeepsDeadline when (Buggy == 1 && retry == 1) {
+                retry = 1;
+                delivered = 1;
+            }
+            action BuggyReadyWithoutRedraw when (Buggy == 1) {
+                path = 2;
+                fallback_failed = 0;
+                retry = 0;
+                delivered = 0;
+                exhausted = 0;
+                parked = 0;
+                cpu_ready = 1;
+                requested = 0;
+                cpu_presented = 0;
+                drops = 1;
+                reason = 1;
+                recording = 0;
+            }
+            action BuggyPresentOnWake when (
+                Buggy == 1 && delivered == 1 && requested == 0
+            ) {
                 requested = 0;
                 cpu_presented = 1;
             }
@@ -1130,8 +1315,6 @@ pub fn gpu_loss_recovery_model() -> Model {
                 if cpu_ready == 1 && cpu_presented == 0 { requested == 1 } else { 1 == 1 };
             invariant CpuPresentWasReady:
                 if cpu_presented == 1 { cpu_ready == 1 } else { 1 == 1 };
-            invariant CpuPresentCompletesFailure:
-                if cpu_presented == 1 { fallback_failed == 0 } else { 1 == 1 };
         }
     }
 }
@@ -1143,8 +1326,21 @@ pub fn gpu_loss_recovery_model() -> Model {
 /// deadline, including the first CPU-fallback redraw.
 ///
 /// Correct (`Buggy=0`) retains the acknowledgement bit across every replacement
-/// request. The historical mutant clears it on the first stimulus, reproducing
-/// the frozen no-echo/app-owned-input window after a second suppressed edge.
+/// request. `Buggy=1` enables two dead mutants, the two historical halves of the
+/// frozen no-echo/app-owned-input window:
+/// * `BuggyStimulusAcknowledges` clears the bit on the first stimulus, so a
+///   second suppressed edge is never replaced (`OnlyPresentAcknowledgesRecovery`);
+/// * `BuggyStimulusWithoutRedraw` reopens the gate without a `request_redraw`,
+///   the gate-open/no-redraw reset (`RecoveryStimulusRequestsRedraw`).
+///
+/// Why dead actions, not a `Buggy` arm inside `Stimulus`: one arm can make only
+/// one of the two slips, and a stimulus that both acknowledges and requests
+/// nothing would leave no suppressed edge for the first slip to be caught on.
+///
+/// "A suppressed request leaves the episode unresolved" is not a separate law.
+/// A present clears suppression, so a suppressed edge over a resolved episode
+/// needs an acknowledgement without a present first — which
+/// `OnlyPresentAcknowledgesRecovery` refuses at that step.
 pub fn recovery_redraw_model() -> Model {
     crate::ty_model! {
         RecoveryRedraw {
@@ -1156,9 +1352,23 @@ pub fn recovery_redraw_model() -> Model {
             var presented = 0;
 
             action Stimulus when (unresolved == 1) {
-                unresolved = if Buggy == 1 { 0 } else { 1 };
                 stimulated = 1;
                 requested = 1;
+                suppressed = 0;
+            }
+            action BuggyStimulusAcknowledges when (
+                Buggy == 1 && unresolved == 1
+            ) {
+                unresolved = 0;
+                stimulated = 1;
+                requested = 1;
+                suppressed = 0;
+            }
+            action BuggyStimulusWithoutRedraw when (
+                Buggy == 1 && unresolved == 1
+            ) {
+                stimulated = 1;
+                requested = 0;
                 suppressed = 0;
             }
             action Suppress when (requested == 1) {
@@ -1179,8 +1389,6 @@ pub fn recovery_redraw_model() -> Model {
                 suppressed <= 1 && presented <= 1;
             invariant RecoveryStimulusRequestsRedraw:
                 if stimulated == 1 { requested == 1 } else { 1 == 1 };
-            invariant SuppressedRequestRemainsUnresolved:
-                if suppressed == 1 { unresolved == 1 } else { 1 == 1 };
             invariant OnlyPresentAcknowledgesRecovery:
                 if unresolved == 0 { presented == 1 } else { 1 == 1 };
         }
@@ -1506,10 +1714,10 @@ pub fn inject_floor_model() -> Model {
     }
 }
 
-/// **No-mint-reachability** (`ATERM_DESIGN §5.4`, `AUDIT.md:186-201`). An UNTRUSTED
-/// actor — a parser / control handler / extension reached from a PTY, socket, or
-/// extension boundary — must never reach `Top` authority; i.e. NO path from
-/// untrusted input reaches a capability MINT. The trusted launcher mints `Top`
+/// **No-mint-reachability** (`ATERM_DESIGN §5.4`, `docs/AUDIT.md` §1 "Capability MINT
+/// soundness"). An UNTRUSTED actor — a parser / control handler / extension reached
+/// from a PTY, socket, or extension boundary — must never reach `Top` authority; i.e.
+/// NO path from untrusted input reaches a capability MINT. The trusted launcher mints `Top`
 /// exactly once at process entry; untrusted code may only `Receive` an explicitly
 /// delegated, scoped capability STRICTLY BELOW `Top` (a grant, never the mint).
 ///
@@ -1663,9 +1871,16 @@ pub fn net_capability_grant_model() -> Model {
 /// `accept_and_relay`: `verify_capability(...)?` runs to a grant BEFORE
 /// `connect_local()`). So a denied dialer NEVER reaches the local socket — the
 /// confused-deputy boundary at the network edge, the network twin of
-/// [`no_transitive_authority_model`]. The real-code binding is aterm-net's
-/// `a_denied_capability_never_reaches_the_local_socket` test (a forged capability
-/// is rejected AND `connect_local` is never called).
+/// [`no_transitive_authority_model`].
+///
+/// Tier-1 binding: aterm-net's
+/// `drive::tests::accept_and_relay_conforms_to_net_dial_after_grant` drives the
+/// real `accept_and_relay` with a valid and a forged presentation, observes the
+/// grant as the verdict the dialer was sent and the dial as `connect_local`
+/// being called (recording what the dialer had been told at that moment), and
+/// validates every observed step against this model — a dial that races ahead
+/// of the grant is a `DialLocal` from `granted = 0`, which only `Buggy = 1`
+/// admits.
 ///
 /// Modeled as a [`props::happens_before`] latch pair: `granted` (set by `Verify`)
 /// must precede `local_dialed` (set by `DialLocal`, guarded on `granted`). `Buggy`
@@ -1853,9 +2068,13 @@ pub fn alt_archive_pool_model() -> Model {
 /// is the one above, and it is the load-bearing half anyway: a join that never
 /// goes backwards is what MAKES the ledgers converge.
 ///
-/// Tier-1 binding: aterm-gui's
-/// `a_wear_reaches_the_delta_or_it_does_not_survive_a_restart` drives the real
-/// `KittyLogHost::wear` and `adopt_wear` through the delta this model flushes.
+/// Tier-1 binding: aterm-gui's `wear_and_merge_conform_to_the_kitty_pin_merge_model`
+/// (`kitty_log.rs`) walks this model's whole reachable space on two REAL
+/// `KittyLog` replicas — `KittyLog::wear` at each clock stamp, `merge_from` for
+/// each flush — reading every stamp back out of the rows, and rejects the
+/// assignment merge injected after the same real fold.
+/// `a_wear_reaches_the_delta_or_it_does_not_survive_a_restart` pins the other
+/// half: a wear reaches the delta this model flushes.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
 // returns is what `ty` machine-checks.

@@ -381,6 +381,14 @@ impl TerminalHandler<'_> {
 
     /// Enter alternate screen for mode 47/1047 — buffer swap only, no cursor
     /// save, no clear.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetAlternateScreen",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
+        )
+    )]
     fn enter_alternate_screen_raw(&mut self) {
         if self.modes.alternate_screen {
             return;
@@ -430,9 +438,6 @@ impl TerminalHandler<'_> {
         // outgoing screen's selection — `post_process` parks it — and the `All` this
         // used to record would clear it on the way back in.
         self.grid.invalidate_host_coordinates();
-        if let Some(cb) = self.buffer_activation_callback {
-            cb(true);
-        }
     }
 
     /// Copy the scroll region and horizontal margins from one grid to
@@ -448,6 +453,14 @@ impl TerminalHandler<'_> {
 
     /// Exit alternate screen for mode 47 — buffer swap only, no cursor
     /// restore, no clear.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetAlternateScreen",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
+        )
+    )]
     fn exit_alternate_screen_raw(&mut self) {
         if !self.modes.alternate_screen {
             return;
@@ -491,13 +504,18 @@ impl TerminalHandler<'_> {
         // outgoing screen's selection — `post_process` parks it — and the `All` this
         // used to record would clear it on the way back in.
         self.grid.invalidate_host_coordinates();
-        if let Some(cb) = self.buffer_activation_callback {
-            cb(false);
-        }
     }
 
     /// Exit alternate screen for mode 1047 — clear alt screen before switching
     /// back. No cursor restore.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetAlternateScreen",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
+        )
+    )]
     fn exit_alternate_screen_1047(&mut self) {
         if !self.modes.alternate_screen {
             return;
@@ -531,7 +549,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetAlternateScreen",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `conformance_altscreen.rs`
@@ -632,9 +650,6 @@ impl TerminalHandler<'_> {
         // outgoing screen's selection — `post_process` parks it — and the `All` this
         // used to record would clear it on the way back in.
         self.grid.invalidate_host_coordinates();
-        if let Some(cb) = self.buffer_activation_callback {
-            cb(true);
-        }
     }
 
     /// Exit alternate screen for mode 1049 — restore cursor on exit.
@@ -650,7 +665,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetAlternateScreen",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): the same `Terminal` →
@@ -706,9 +721,6 @@ impl TerminalHandler<'_> {
         // outgoing screen's selection — `post_process` parks it — and the `All` this
         // used to record would clear it on the way back in.
         self.grid.invalidate_host_coordinates();
-        if let Some(cb) = self.buffer_activation_callback {
-            cb(false);
-        }
     }
 
     #[cfg_attr(
@@ -716,7 +728,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetBracketedPaste",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_bracketed_paste(&mut self) {
@@ -728,7 +740,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetBracketedPaste",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_bracketed_paste(&mut self) {
@@ -740,7 +752,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_mouse_x10_tracking(&mut self) {
@@ -752,7 +764,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_mouse_normal_tracking(&mut self) {
@@ -764,7 +776,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_mouse_button_event_tracking(&mut self) {
@@ -776,7 +788,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetMouseMode",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_mouse_any_event_tracking(&mut self) {
@@ -787,8 +799,8 @@ impl TerminalHandler<'_> {
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
             machine = "terminal_modes",
-            action = "SetMouseMode",
-            project = "aterm_core::terminal::project_modes"
+            action = "ResetMouseMode",
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_mouse_tracking(&mut self) {
@@ -800,7 +812,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SetSgrMouseEncoding",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn enable_sgr_mouse_encoding(&mut self) {
@@ -812,7 +824,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "ResetSgrMouseEncoding",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn disable_sgr_mouse_encoding(&mut self) {

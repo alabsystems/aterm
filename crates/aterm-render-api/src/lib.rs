@@ -40,19 +40,6 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The framebuffer as tightly packed RGB bytes (3 per pixel, row-major),
-    /// intentionally discarding the packed transmittance byte.
-    #[must_use]
-    pub fn rgb_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.pixels.len() * 3);
-        for &p in &self.pixels {
-            out.push((p >> 16) as u8);
-            out.push((p >> 8) as u8);
-            out.push(p as u8);
-        }
-        out
-    }
-
     /// The framebuffer as tightly packed straight-alpha RGBA bytes (4 per
     /// pixel, row-major).
     ///

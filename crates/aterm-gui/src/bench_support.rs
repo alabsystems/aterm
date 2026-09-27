@@ -149,7 +149,7 @@ impl BenchApp {
     /// makes the fixture's base-clear/cell-colour relationship the opposite of
     /// every shipping frame's. Pricing a background pass against it prices a
     /// colour arrangement the product never renders.
-    pub fn pin_theme_defaults(&mut self) {
+    pub(crate) fn pin_theme_defaults(&mut self) {
         let theme = aterm_render::Theme::default();
         let rgb = |c: u32| {
             aterm_core::terminal::Rgb::new(
@@ -462,7 +462,7 @@ impl BenchApp {
     /// The session the active tab's layout tree has FOCUSED — the pane whose
     /// extraction the compose path runs at LOCK A.
     #[must_use]
-    pub fn focus_session(&self) -> u64 {
+    pub(crate) fn focus_session(&self) -> u64 {
         let ws = self.ws();
         ws.layouts[ws.tabs.active].focus()
     }
@@ -961,13 +961,6 @@ impl BenchApp {
             .iter()
             .map(|tab| tab.root.len())
             .sum()
-    }
-
-    /// Make tab `i` the active one, through the shipping switch
-    /// (`App::switch_tab_in`) — the seam the deferred-resize flush and the
-    /// strip refresh both hang off.
-    pub fn switch_tab(&mut self, i: usize) {
-        self.app.switch_tab_in(self.wid, i);
     }
 
     /// Set the window's CELL grid — the rectangle `resize_panes_scoped` lays

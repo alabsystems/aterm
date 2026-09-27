@@ -91,8 +91,8 @@ fn encode_sun_path(path: &Path) -> io::Result<(ffi::SockaddrUn, i32)> {
         io::ErrorKind::InvalidInput,
         format!(
             "control-socket path {} does not fit AF_UNIX sun_path \
-             (at most 107 bytes as UTF-8); set ATERM_CONTROL_SOCK \
-             to a shorter path",
+             (at most 107 bytes as UTF-8); pass a shorter --control-sock \
+             path",
             path.display()
         ),
     ))

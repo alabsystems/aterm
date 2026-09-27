@@ -15,13 +15,14 @@
 
 use super::TaskbarProgress;
 use super::shell::{ANNOTATIONS_MAX, TERMINAL_MARKS_MAX};
-use super::{Annotation, CommandMark, ShellEvent, ShellState, Terminal, TerminalMark};
+use super::{Annotation, CommandMark, ShellState, Terminal, TerminalMark};
 
 /// Maximum number of OSC 1337 user variables retained per terminal.
 ///
 /// When the map is full, inserting a new key evicts the oldest entry
 /// (FIFO). Updates to existing keys never evict. Mirrors the cap that
 /// previously lived in the now-removed OSC 1337 handler module.
+#[cfg(test)]
 const USER_VARS_MAX: usize = 256;
 
 impl Terminal {
@@ -51,73 +52,6 @@ impl Terminal {
         self.shell.command_marks.as_slices().0
     }
 
-    /// Get the current (in-progress) command mark, if any.
-    ///
-    /// Returns `Some` if a command is currently being entered or executed,
-    /// `None` if in ground state or no mark has been started.
-    #[must_use]
-    pub fn current_mark(&self) -> Option<&CommandMark> {
-        self.shell.current_mark.as_ref()
-    }
-
-    /// Clear all command marks.
-    ///
-    /// This does not affect the current shell state, only clears the history
-    /// of completed commands.
-    pub fn clear_command_marks(&mut self) {
-        self.shell.command_marks.clear();
-    }
-
-    /// Set shell integration callback.
-    ///
-    /// The callback is invoked when OSC 133 sequences transition the shell state.
-    /// This can be used to:
-    /// - Highlight prompts differently from output
-    /// - Track command history with exit codes
-    /// - Implement "jump to previous/next command" features
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use aterm_core::terminal::{ShellEvent, Terminal};
-    /// # let mut terminal = Terminal::new(24, 80);
-    /// terminal.set_shell_callback(|event| {
-    ///     match event {
-    ///         ShellEvent::PromptStart { row, col } => {
-    ///             println!("Prompt starting at row {row}, col {col}");
-    ///         }
-    ///         ShellEvent::CommandFinished { exit_code } => {
-    ///             if exit_code != 0 {
-    ///                 println!("Command failed with exit code {exit_code}");
-    ///             }
-    ///         }
-    ///         _ => {}
-    ///     }
-    /// });
-    /// ```
-    pub fn set_shell_callback<F: FnMut(ShellEvent) + Send + 'static>(&mut self, callback: F) {
-        self.shell.callback = Some(Box::new(callback));
-    }
-
-    /// Clear shell integration callback.
-    #[allow(
-        dead_code,
-        reason = "cleared via the FFI app-callback layer (ffi_bridge/)"
-    )]
-    pub(crate) fn clear_shell_callback(&mut self) {
-        self.shell.callback = None;
-    }
-
-    /// Get the most recent command mark that succeeded (exit code 0).
-    #[must_use]
-    pub fn last_successful_command(&self) -> Option<&CommandMark> {
-        self.shell
-            .command_marks
-            .iter()
-            .rev()
-            .find(|m| m.succeeded())
-    }
-
     /// Monotonic count of completed commands (OSC 133;D). Strictly increases
     /// once per completion — pair with [`Self::last_completed_command`] for an
     /// unambiguous "a NEW command just finished" edge (same-millisecond
@@ -125,6 +59,19 @@ impl Terminal {
     #[must_use]
     pub fn completed_command_seq(&self) -> u64 {
         self.shell.completed_seq
+    }
+
+    /// Which integration BODY the shell signs that it runs (the LOADER / BODY
+    /// split, 2026-09-26): the 16-hex address of the script folder its body came
+    /// from, from the last SIGNED `633;P;AtermIntegration=` mark — or carried
+    /// across a seamless update from the engine before this one. `None` until
+    /// one arrives: a shell whose script predates loaders never sends one.
+    #[must_use]
+    pub fn shell_integration_rev(&self) -> Option<&str> {
+        self.shell
+            .integration_rev
+            .as_ref()
+            .and_then(|rev| std::str::from_utf8(rev).ok())
     }
 
     /// Get the most recent COMPLETED command mark (exit code recorded),
@@ -139,16 +86,6 @@ impl Terminal {
             .find(|m| m.is_complete())
     }
 
-    /// Get the most recent command mark that failed (exit code != 0).
-    #[must_use]
-    pub fn last_failed_command(&self) -> Option<&CommandMark> {
-        self.shell
-            .command_marks
-            .iter()
-            .rev()
-            .find(|m| !m.succeeded() && m.is_complete())
-    }
-
     // =========================================================================
     // Terminal Extensions (OSC 1337)
     // =========================================================================
@@ -161,24 +98,6 @@ impl Terminal {
     #[must_use]
     pub fn terminal_marks(&self) -> &[TerminalMark] {
         self.marks_state.marks.as_slices().0
-    }
-
-    /// Add a terminal mark at the current cursor position.
-    ///
-    /// This is equivalent to receiving `OSC 1337 ; SetMark ST`.
-    pub fn add_mark(&mut self) -> u64 {
-        let cursor = self.grid.cursor();
-        let id = self.marks_state.next_mark_id;
-        self.marks_state.next_mark_id += 1;
-        let row = self.grid.visible_to_absolute(cursor.row);
-        let mark = TerminalMark::new(id, row, cursor.col);
-        // FIFO eviction if at capacity
-        if self.marks_state.marks.len() >= TERMINAL_MARKS_MAX {
-            self.marks_state.marks.pop_front();
-        }
-        self.marks_state.marks.push_back(mark);
-        self.marks_state.marks.make_contiguous();
-        id
     }
 
     /// Add a named terminal mark at the current cursor position.
@@ -198,11 +117,6 @@ impl Terminal {
         id
     }
 
-    /// Clear all terminal marks.
-    pub fn clear_terminal_marks(&mut self) {
-        self.marks_state.marks.clear();
-    }
-
     /// Get all annotations (OSC 1337 AddAnnotation).
     ///
     /// Annotations are metadata/notes attached to specific regions of
@@ -210,24 +124,6 @@ impl Terminal {
     #[must_use]
     pub fn annotations(&self) -> &[Annotation] {
         self.marks_state.annotations.as_slices().0
-    }
-
-    /// Get visible annotations only.
-    pub fn visible_annotations(&self) -> impl Iterator<Item = &Annotation> {
-        self.marks_state.annotations.iter().filter(|a| !a.hidden)
-    }
-
-    /// Get annotations at a specific row.
-    ///
-    /// # Arguments
-    ///
-    /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert
-    ///   screen-relative row coordinates)
-    pub fn annotations_at_row(&self, row: u64) -> impl Iterator<Item = &Annotation> {
-        self.marks_state
-            .annotations
-            .iter()
-            .filter(move |a| a.row == row)
     }
 
     /// Add a visible annotation at the current cursor position.
@@ -244,27 +140,6 @@ impl Terminal {
         self.marks_state.annotations.push_back(annotation);
         self.marks_state.annotations.make_contiguous();
         id
-    }
-
-    /// Add a hidden annotation at the current cursor position.
-    pub fn add_hidden_annotation(&mut self, message: &str) -> u64 {
-        let cursor = self.grid.cursor();
-        let id = self.marks_state.next_annotation_id;
-        self.marks_state.next_annotation_id += 1;
-        let row = self.grid.visible_to_absolute(cursor.row);
-        let annotation = Annotation::new_hidden(id, row, cursor.col, message.to_string());
-        // FIFO eviction if at capacity
-        if self.marks_state.annotations.len() >= ANNOTATIONS_MAX {
-            self.marks_state.annotations.pop_front();
-        }
-        self.marks_state.annotations.push_back(annotation);
-        self.marks_state.annotations.make_contiguous();
-        id
-    }
-
-    /// Clear all annotations.
-    pub fn clear_annotations(&mut self) {
-        self.marks_state.annotations.clear();
     }
 
     /// Set the cell pixel size `(width, height)` used to convert pixel/auto
@@ -317,12 +192,14 @@ impl Terminal {
     /// User variables are key-value pairs set by applications for
     /// shell integration and customization purposes.
     #[must_use]
+    #[cfg(test)]
     pub fn user_vars(&self) -> &super::UserVarsMap {
         &self.iterm2.user_vars
     }
 
     /// A specific user variable by key.
     #[must_use]
+    #[cfg(test)]
     pub fn user_var(&self, key: &str) -> Option<&String> {
         self.iterm2.user_vars.get(key)
     }
@@ -334,6 +211,7 @@ impl Terminal {
     /// evicts the oldest entry first (deterministic FIFO order, tracked in
     /// `user_vars_order`) — the backing `HashMap`'s iteration order is
     /// non-deterministic and must not be used for eviction.
+    #[cfg(test)]
     pub fn set_user_var(&mut self, key: &str, value: &str) {
         if self.iterm2.user_vars.contains_key(key) {
             // Update in place; insertion order is unchanged.
@@ -358,18 +236,13 @@ impl Terminal {
     }
 
     /// Remove a user variable.
+    #[cfg(test)]
     pub fn remove_user_var(&mut self, key: &str) -> Option<String> {
         let removed = self.iterm2.user_vars.remove(key);
         if removed.is_some() {
             self.iterm2.user_vars_order.retain(|k| k != key);
         }
         removed
-    }
-
-    /// Clear all user variables.
-    pub fn clear_user_vars(&mut self) {
-        self.iterm2.user_vars.clear();
-        self.iterm2.user_vars_order.clear();
     }
 
     /// Get the current taskbar progress state (ConEmu OSC 9;4).

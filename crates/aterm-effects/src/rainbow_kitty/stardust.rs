@@ -470,6 +470,7 @@ pub const SCINT_F_MAX: f32 = 12.0;
 /// bbox is at or under this may scintillate in SIZE at 8-12 Hz, because a
 /// general-flash threshold is an AREA threshold. LUMINANCE of every mark, at
 /// every size, stays on `twinkle_env`'s 2.86 Hz clock — no exemption there.
+#[cfg(test)]
 pub const SCINT_BBOX_MAX_PX: i32 = 10;
 
 /// The m2's INTEGER ARM FLOOR, px (§5.2: `star_arm(ch, 1.0) = 2.5 → 2 px`;
@@ -1400,22 +1401,6 @@ impl StarClass {
         }
     }
 
-    /// The composited centre this class reaches at full envelope and full
-    /// twinkle (§5.2, §3.2 rank 4). The tests measure against §5.2's OWN
-    /// literals, not against this — this is what the code claims, and a claim
-    /// cannot be its own oracle.
-    #[must_use]
-    pub fn centre(self, lane: StarLane) -> f32 {
-        match (self, lane.is_sky()) {
-            (Self::M1, true) => CENTRE_M1_SKY,
-            (Self::M1, false) => CENTRE_M1_TRANSIENT,
-            (Self::M2, true) => CENTRE_M2_SKY,
-            (Self::M2, false) => CENTRE_M2_TRANSIENT,
-            (Self::M3, true) => CENTRE_M3_SKY,
-            (Self::M3, false) => CENTRE_M3_TRANSIENT,
-        }
-    }
-
     /// This class's rung on the family's ONE arm ladder
     /// (`effect_util::STAR_ARM_*`), so a star's size can only ever be one of
     /// the named sizes (`star_arm`'s own law: "the only way an emitter is
@@ -1557,13 +1542,6 @@ impl StarLane {
     #[must_use]
     pub fn is_transient(self) -> bool {
         !self.is_sky()
-    }
-
-    /// True for the METEOR lanes, which are **exempt from the typing glint
-    /// bucket entirely** (§8.1 no. 2, §13).
-    #[must_use]
-    pub fn is_meteor(self) -> bool {
-        matches!(self, Self::Shed | Self::Fan)
     }
 
     /// True where a star may cue a glint at all (§13): erase-born stardust
@@ -2682,6 +2660,7 @@ impl GlyphProbe {
 
     /// True when the probe has no rows at all.
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.live == 0
     }
@@ -2942,12 +2921,6 @@ impl Stardust {
         }
     }
 
-    /// The aurora's live cells — what is in the veil pool, finishing ones
-    /// included (they are still on glass).
-    pub fn veil_iter(&self) -> impl Iterator<Item = &Veil> {
-        self.veil.iter()
-    }
-
     /// The frame's glyph truth, for the host to write before the deal pass
     /// (§5.4). Until it is written every in-grid cell is UNKNOWN and no sky
     /// star is born — the law, stated as a default.
@@ -2975,6 +2948,7 @@ impl Stardust {
     /// silently dropped — the same contract `Engine::drain_sound_cues`
     /// carries one level up. The one thing that does drop them is
     /// [`Stardust::reset`], which is a new session.
+    #[cfg(test)]
     pub fn take_glints(&mut self) -> std::vec::Drain<'_, Glint> {
         self.glints.drain(..)
     }
@@ -3035,7 +3009,11 @@ impl Stardust {
             Event::Rewrite { row, col, cells } => {
                 self.finish_field((row, col), kill_span_ms(cells), at, ctx.geom);
             }
-            Event::Move { .. } | Event::Return | Event::Sweep { .. } => {}
+            Event::Move { .. }
+            | Event::Return
+            | Event::ComposerNewline
+            | Event::CancelComposerNewline
+            | Event::Sweep { .. } => {}
             Event::Focus(false) => self.ember(at),
             Event::Focus(true) | Event::ReducedMotion(_) => {}
         }
@@ -3381,6 +3359,7 @@ impl Stardust {
     /// True when the sky is empty — one of the three pools
     /// `Engine::next_change_deadline` folds (§18).
     #[must_use]
+    #[cfg(test)]
     pub fn at_rest(&self) -> bool {
         self.stars.is_empty() && self.veil.is_empty()
     }

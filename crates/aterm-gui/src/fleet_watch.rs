@@ -21,7 +21,7 @@
 //! is untrusted. Dialing it presents only THAT PEER's own token (read from
 //! beside its socket, the `aterm-ctl` discovery contract) — no authority of
 //! ours crosses — and everything read back is bounded, so out-of-dir
-//! explicit-`$ATERM_CONTROL_SOCK` instances are summarized just like
+//! explicit-`--control-sock` instances are summarized just like
 //! `aterm-ctl instances` lists them. (Contrast `resolve_sibling`, which
 //! CONFINES paths because it relays a client's bytes onward.)
 
@@ -119,7 +119,7 @@ fn scan_siblings() -> Vec<InstanceRow> {
             }
         }
     }
-    // Pass 2: explicit-$ATERM_CONTROL_SOCK instances via graph/<sid> entries —
+    // Pass 2: instances on an explicit `--control-sock`, via graph/<sid> entries —
     // these live OUTSIDE the shared dir by definition (that is the whole point
     // of the pass), so the path is accepted un-confined, absolute-only: the
     // `aterm-ctl instances` contract. Safe because the dial presents only the
@@ -253,6 +253,8 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
             // and notifications carry it; this row only counts `⚠`s.
             agent: None,
             supervised: false,
+            // Likewise its input stall: the sibling's own menu raises it.
+            input_stall: None,
         };
         if meta_alive && s.has_meta && lookups < MAX_META_LOOKUPS {
             lookups += 1;

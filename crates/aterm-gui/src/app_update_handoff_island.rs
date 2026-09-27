@@ -12,12 +12,13 @@
 // .cargo/config.toml, because an island carries its own authority.
 //
 // WHAT IT PROVES, and what it does not: this is a theorem about the model below,
-// not about the Rust in this file. The bind that makes it a statement about the
-// CODE is Tier-1 conformance -- see derived_seamless_handoff_ownership_* in
-// aterm-spec, which drives the real decision functions over their bounded input
-// space and checks the model admits exactly what the code decides. A green
-// island with no bind proves a property of a description. Both halves are load
-// bearing, and AGENTS.md says so in the same words.
+// not about the Rust in this file. The code-bound half is the derived twin,
+// aterm_spec::derive::native_update_seamless_handoff_ownership_model (Tier-0:
+// derived_seamless_handoff_ownership_* in aterm-spec), whose Tier-1 conformance
+// -- `ownership_conformance` in app_update_handoff.rs -- drives the real Commit
+// admission over its bounded input space and checks the model admits exactly
+// what the code decides. A green island with no bind proves a property of a
+// description. Both halves are load bearing, and AGENTS.md says so.
 //
 // The lost phase is deliberately REPRESENTABLE. Without it in the type the
 // theorem would hold by construction and be worth nothing; with it, the theorem

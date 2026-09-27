@@ -22,7 +22,9 @@
 //!    grid-mappable forms (1:1, or N:1 with `N>=2` behind the flag) and rejects
 //!    everything else; with the flag off it is byte-identical to the legacy
 //!    `accept iff n_out == n_in`. This is the SAME invariant the `gate_*` kani
-//!    proofs and the `LigatureGate` derived ty model carry (Tier-1 binding).
+//!    proofs carry, and `classify_shape_conforms_to_ligature_gate_model` is the
+//!    Tier-1 bind to the `LigatureGate` derived ty model: the model's own
+//!    `Classify` rule judges every real verdict.
 
 use aterm_render::ligature_shaping::{
     ShapeVerdict, TileBand, classify_shape, extract_tile, slice_tile_bands,
@@ -293,6 +295,108 @@ fn classify_shape_lattice() {
     // becomes admissible when the flag is set.
     assert_eq!(classify_shape(3, 1, false), ShapeVerdict::Reject);
     assert_eq!(classify_shape(3, 1, true), ShapeVerdict::Collapsed);
+}
+
+/// Project one shape decision onto `LigatureGate`'s variables. `accept` is the
+/// REAL verdict's admission (`Reject` is the only refusal); `phase` is the model's
+/// Pick/Classify alternation.
+fn gate_state(phase: i64, n_in: usize, n_out: usize, admit: bool, accept: bool) -> GateState {
+    [
+        ("phase", phase),
+        ("n_in", i64::try_from(n_in).expect("small lattice count")),
+        ("n_out", i64::try_from(n_out).expect("small lattice count")),
+        ("admit", i64::from(admit)),
+        ("accept", i64::from(accept)),
+    ]
+    .into_iter()
+    .collect()
+}
+
+type GateState = std::collections::BTreeMap<&'static str, i64>;
+
+/// Tier-1 bind of `aterm_spec::derive::ligature_gate_model()` to the SHIPPING
+/// `classify_shape`. For every `(n_in, n_out, admit)` in `0..=8 × 0..=8 × {off,
+/// on}`, the model's `Classify` step is replayed with `accept'` taken from the real
+/// verdict, and the step must be one `LigatureGate.Next` admits at the committed
+/// `Buggy = 0` — so the model's OWN accept rule, not a restatement of it, judges
+/// the shipping gate. The `Pick` half is checked over the model's `0..=4` pick
+/// range (every real shape there is a state the model can reach), and
+/// `ConservativeAccept` is evaluated on every real post-state.
+///
+/// NEGATIVE CONTROL: the model's defect is "admit a collapse without the flag".
+/// A classifier with exactly that defect — the real verdict with the flag check
+/// dropped — must produce a step the committed model REJECTS and the `Buggy = 1`
+/// model ADMITS, so a pass here is never vacuous: this bind distinguishes the
+/// shipping gate from the one the model was written to catch.
+#[test]
+fn classify_shape_conforms_to_ligature_gate_model() {
+    use aterm_spec::derive::ligature_gate_model;
+    use aterm_spec::{interp, verify};
+
+    let m = ligature_gate_model();
+    let init = m.init_state();
+    let mut classified = 0usize;
+    for n_in in 0..=8usize {
+        for n_out in 0..=8usize {
+            for admit in [false, true] {
+                let picked = gate_state(1, n_in, n_out, admit, false);
+                if n_in <= 4 && n_out <= 4 {
+                    assert!(
+                        m.successors("Pick", &init).contains(&picked),
+                        "Pick must reach the real shape ({n_in}, {n_out}, {admit})"
+                    );
+                }
+                let real = classify_shape(n_in, n_out, admit) != ShapeVerdict::Reject;
+                let decided = gate_state(0, n_in, n_out, admit, real);
+                let (ok, why) = verify::validate_transition_tiered(
+                    &m,
+                    &[],
+                    &picked,
+                    &decided,
+                    Some("Classify"),
+                    "ligature gate conformance",
+                );
+                assert!(
+                    ok,
+                    "classify_shape({n_in}, {n_out}, {admit}) accept={real} is not the \
+                     model's Classify step\n{why}"
+                );
+                assert!(
+                    m.check_invariant("ConservativeAccept", &decided),
+                    "real verdict for ({n_in}, {n_out}, {admit}) breaks ConservativeAccept"
+                );
+                classified += 1;
+            }
+        }
+    }
+    assert_eq!(classified, 9 * 9 * 2, "the whole lattice was classified");
+
+    // NEGATIVE CONTROL — the modelled defect on a real shape: a 3:1 collapse with
+    // the flag OFF. The shipping gate refuses it; a flag-blind gate would accept.
+    assert_eq!(classify_shape(3, 1, false), ShapeVerdict::Reject);
+    let picked = gate_state(1, 3, 1, false, false);
+    let flag_blind = gate_state(0, 3, 1, false, true);
+    let (committed_ok, _) = verify::validate_transition_tiered(
+        &m,
+        &[],
+        &picked,
+        &flag_blind,
+        Some("Classify"),
+        "ligature gate negative control",
+    );
+    assert!(
+        !committed_ok,
+        "the committed model must REJECT an unflagged collapse being accepted"
+    );
+    let buggy = interp::with_buggy(&m, 1);
+    assert!(
+        buggy.successors("Classify", &picked).contains(&flag_blind),
+        "the Buggy = 1 model must ADMIT the flag-blind accept — the defect this bind catches"
+    );
+    assert!(
+        !m.check_invariant("ConservativeAccept", &flag_blind),
+        "the flag-blind accept is exactly what ConservativeAccept forbids"
+    );
 }
 
 // ---------------------------------------------------------------------------

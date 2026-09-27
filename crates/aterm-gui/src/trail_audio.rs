@@ -25,8 +25,6 @@
 //! pure and portable, so a WASAPI/ALSA twin can land behind this seam
 //! without touching any call site.
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
@@ -44,12 +42,15 @@ pub(crate) const fn output_available() -> bool {
 
 /// Output sample rate. 48 kHz is the native rate of every modern Mac output
 /// path; the hardware resampler handles the rest.
+#[cfg(target_os = "macos")]
 const SAMPLE_RATE: f64 = 48_000.0;
 
 /// Frames per queue buffer (~10.7 ms at 48 kHz) × 3 buffers in flight. Start
 /// latency is bounded by ONE such buffer; the other two are post-cue audio,
 /// never silent priming ahead of it.
+#[cfg(target_os = "macos")]
 const BUFFER_FRAMES: usize = 512;
+#[cfg(target_os = "macos")]
 const BUFFER_COUNT: usize = 3;
 
 /// Consecutive silent buffers before the queue pauses: 140 buffers ≈ 1.5 s
@@ -65,12 +66,14 @@ const BUFFER_COUNT: usize = 3;
 /// parks the device hard when the typing has really stopped. It trades a
 /// little idle power for alignment and ships behind its own measurement
 /// (§7 step 6): revert if the idle census shows a wake cost.
+#[cfg(target_os = "macos")]
 const PAUSE_AFTER_SILENT: u32 = 140;
 
 /// Event-loop housekeeping cadence while the AudioQueue is running. The queue
 /// callback already does the sample work; this low-rate one-shot only observes
 /// its exact-silence counter and pauses the device. It is armed only while audio
 /// is live and self-disarms after a successful pause.
+#[cfg(target_os = "macos")]
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 
 /// UI-side staleness threshold for the worker's platform-busy stamp. A healthy
@@ -82,22 +85,144 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 /// `recv()` looks like. The stamp makes the next occurrence decide it: a
 /// worker stuck inside a platform call reads `audio=wedged`, a parked one
 /// reads `live` with `dropped=0`.
+#[cfg(target_os = "macos")]
 const WEDGE_AFTER_MS: u64 = 3_000;
 
 /// How long teardown waits for a live worker to finish before detaching it.
 /// Covers the honest worst case — one housekeeping interval plus a healthy
 /// platform call — so an ordinary drop stays effectively synchronous while a
 /// wedge can never carry itself onto the event-loop thread.
+#[cfg(target_os = "macos")]
 const DETACH_DEADLINE: Duration = Duration::from_millis(600);
 
 /// Poll cadence while waiting out [`DETACH_DEADLINE`].
+#[cfg(target_os = "macos")]
 const DETACH_POLL: Duration = Duration::from_millis(5);
+
+/// What a [`TrailAudio`] drop did with its worker, recorded (test-only) on
+/// the dropping thread so the teardown tests assert the join/detach decision
+/// itself instead of a stopwatch around it (the load-sensitive test audit of
+/// 2026-09-27).
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerTeardown {
+    /// The worker finished inside the deadline and was joined.
+    Joined,
+    /// A wedged worker, detached without waiting.
+    DetachedWedged,
+    /// A worker that outlived the whole deadline, detached after it.
+    DetachedAtDeadline,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    /// The last teardown a drop on this thread performed.
+    static LAST_TEARDOWN: std::cell::Cell<Option<WorkerTeardown>> =
+        const { std::cell::Cell::new(None) };
+    /// A stretched [`DETACH_DEADLINE`] for drops on this thread, so a test
+    /// that asserts a healthy worker is JOINED cannot have a slow scheduler
+    /// turn the join into a detach.
+    static DETACH_DEADLINE_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    /// Whether the last drop on this thread had already closed the cue channel
+    /// when it began waiting for its worker — the wake a parked worker needs.
+    static CLOSED_BEFORE_WAIT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: the workers, named as in [`PARKED_WORKERS`], that exited because
+/// their idle `recv()` answered `Disconnected` — woken by the closing channel,
+/// which wakes a parked `recv()` at once, rather than by a timer or a later
+/// `shutdown` check. With [`CLOSED_BEFORE_WAIT`] it proves a healthy teardown
+/// prompt by its mechanism, where a stopwatch could only time it.
+#[cfg(all(test, target_os = "macos"))]
+static DISCONNECT_EXITS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Record that the worker owning `state` left its idle `recv()` on
+/// `Disconnected` ([`DISCONNECT_EXITS`]).
+#[cfg(all(test, target_os = "macos"))]
+fn note_disconnect_exit(state: &std::sync::atomic::AtomicU8) {
+    DISCONNECT_EXITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(std::ptr::from_ref(state) as usize);
+}
+
+/// Whether the worker owning `state` left on `Disconnected`, consuming the
+/// record ([`DISCONNECT_EXITS`]).
+#[cfg(all(test, target_os = "macos"))]
+fn took_disconnect_exit(state: &std::sync::atomic::AtomicU8) -> bool {
+    let key = std::ptr::from_ref(state) as usize;
+    let mut exits = DISCONNECT_EXITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    exits
+        .iter()
+        .position(|at| *at == key)
+        .map(|at| exits.swap_remove(at))
+        .is_some()
+}
+
+/// Test-only: the workers, named by the address of their state word, that
+/// are past their last `shutdown` check and committed to the idle `recv()`,
+/// so a teardown test can drop a worker that is really PARKED. A worker that
+/// has not yet reached its loop top exits on `shutdown` alone and never needs
+/// the closing channel to wake it.
+#[cfg(all(test, target_os = "macos"))]
+static PARKED_WORKERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// One worker's entry in [`PARKED_WORKERS`], held across its idle `recv()`.
+#[cfg(all(test, target_os = "macos"))]
+struct ParkedMark(usize);
+
+#[cfg(all(test, target_os = "macos"))]
+impl ParkedMark {
+    fn new(state: &std::sync::atomic::AtomicU8) -> Self {
+        let key = std::ptr::from_ref(state) as usize;
+        PARKED_WORKERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(key);
+        Self(key)
+    }
+
+    fn holds(state: &std::sync::atomic::AtomicU8) -> bool {
+        let key = std::ptr::from_ref(state) as usize;
+        PARKED_WORKERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for ParkedMark {
+    fn drop(&mut self) {
+        let mut parked = PARKED_WORKERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = parked.iter().position(|key| *key == self.0) {
+            parked.swap_remove(at);
+        }
+    }
+}
+
+/// [`DETACH_DEADLINE`], unless a test stretched it on this thread.
+#[cfg(target_os = "macos")]
+fn detach_deadline() -> Duration {
+    #[cfg(test)]
+    if let Some(stretched) = DETACH_DEADLINE_OVERRIDE.with(std::cell::Cell::get) {
+        return stretched;
+    }
+    DETACH_DEADLINE
+}
 
 /// Lifetime budget of worker revivals after wedge detection. Each revival
 /// abandons one blocked thread and its queue by design (a thread stuck inside
 /// a platform call cannot be cancelled; it disposes its own queue if the call
 /// ever returns); the budget bounds that leak, and an exhausted budget seals
 /// ingress so the host reads honestly inert instead of wedging forever.
+#[cfg(target_os = "macos")]
 const WEDGE_REVIVES: u8 = 3;
 
 /// How long a DEVICE OPEN may run before it is judged a wedge.
@@ -962,7 +1087,7 @@ mod mac {
         }
     }
 
-    pub struct MacOut {
+    pub(crate) struct MacOut {
         /// The queue, its `IsRunning` listener and the callbacks' userdata
         /// refcount, owned as ONE value whose `Drop` removes the listener,
         /// disposes the queue and only then releases the refcount — the
@@ -1000,7 +1125,7 @@ mod mac {
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
             )
         )]
-        pub fn new(seed: u32) -> Option<Self> {
+        pub(crate) fn new(seed: u32) -> Option<Self> {
             let shared = Arc::new(Shared::new(seed));
             let fmt = AudioStreamBasicDescription {
                 m_sample_rate: SAMPLE_RATE,
@@ -1131,7 +1256,7 @@ mod mac {
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
             )
         )]
-        pub fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> Delivery {
+        pub(crate) fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> Delivery {
             // THE KEY PATH DISCOVERS THE FAULT (D7). The death verdict was
             // previously read only by `on_tick`, which runs only after the
             // worker's 250 ms receive timeout expires — i.e. only while
@@ -1202,7 +1327,7 @@ mod mac {
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
             )
         )]
-        pub fn on_tick(&mut self) -> Service {
+        pub(crate) fn on_tick(&mut self) -> Service {
             // A faulted, stalled or stopped-under-us queue must REOPEN, never
             // "pause": asking the death verdict FIRST is what keeps a dead
             // device from being mistaken for an idle one.
@@ -1234,7 +1359,7 @@ mod mac {
             }
         }
 
-        pub fn is_running(&self) -> bool {
+        pub(crate) fn is_running(&self) -> bool {
             self.shared.running.load(Ordering::Acquire)
         }
 
@@ -1335,6 +1460,7 @@ mod mac {
 /// Bounded cue ingress. Eight cues can be emitted by one visual frame; 64 keeps
 /// several burst frames without making producer work depend on the callback. A
 /// full queue drops newest sound only — visual/input correctness always wins.
+#[cfg(target_os = "macos")]
 const COMMAND_CAPACITY: usize = 64;
 
 /// ONE QUEUED CUE: the gesture and its side-car (`RAINBOW-KITTY-V2.md` §16
@@ -1343,11 +1469,13 @@ const COMMAND_CAPACITY: usize = 64;
 /// with nothing to stamp pushes the identity side-car ([`EventMeta::default`])
 /// through [`TrailAudio::push`], which is byte-for-byte the pre-v2 path.
 #[derive(Clone, Copy, Debug)]
+#[cfg(target_os = "macos")]
 struct Cue {
     ev: SoundEvent,
     meta: EventMeta,
 }
 
+#[cfg(target_os = "macos")]
 impl From<SoundEvent> for Cue {
     fn from(ev: SoundEvent) -> Self {
         Self {
@@ -1655,9 +1783,13 @@ fn worker_loop<Output, Open>(
         } else {
             // Before the first cue and after an idle pause, sleep indefinitely:
             // no timer, callback, run-loop wake, or polling CPU remains armed.
+            #[cfg(test)]
+            let _parked = ParkedMark::new(state);
             match rx.recv() {
                 Ok(cue) => cue,
                 Err(_) => {
+                    #[cfg(test)]
+                    note_disconnect_exit(state);
                     state.store(STATE_STOPPED, Ordering::Release);
                     return;
                 }
@@ -1975,6 +2107,7 @@ const STATE_REOPENING: u8 = 5;
 /// carry only the ingress-full case, so a cue lost to a sealed host or to a
 /// reopen wait was invisible and `dropped=0` read as "nothing was lost".
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[cfg(target_os = "macos")]
 pub(crate) struct DroppedCues {
     /// The ingress FIFO was full.
     pub(crate) full: u64,
@@ -2004,24 +2137,30 @@ pub(crate) enum HostState {
     /// Ingress is open and no device has been opened yet — the queue opens
     /// LAZILY on the first cue. NOT a fault, and the state every process is
     /// in before it makes its first sound.
+    #[cfg(any(target_os = "macos", test))]
     Opening,
     /// `AudioQueueStart` returned OK and the callback is being served.
     Running,
     /// The queue is open and started but parked at idle; the next cue resumes
     /// it.
+    #[cfg(any(target_os = "macos", test))]
     Paused,
     /// A platform call failed; ingress is not sealed yet.
+    #[cfg(any(target_os = "macos", test))]
     Failed,
     /// A fault was seen and the worker is inside its bounded reopen schedule
     /// — the next cue (or the next one past the backoff window) opens a fresh
     /// device. Recoverable, and the state a transient CoreAudio hiccup used
     /// to skip straight past into permanent silence.
+    #[cfg(any(target_os = "macos", test))]
     Reopening,
     /// The queue was stopped.
+    #[cfg(any(target_os = "macos", test))]
     Stopped,
     /// Ingress is open but the worker has been stuck inside ONE platform call
     /// past [`WEDGE_AFTER_MS`], so cues are being dropped. Outranks the state
     /// word: a RUNNING worker stuck in a call is wedged, not running.
+    #[cfg(any(target_os = "macos", test))]
     Wedged,
 }
 
@@ -2039,6 +2178,29 @@ impl HostState {
         Self::Stopped,
         Self::Wedged,
     ];
+
+    /// The wire word `tone` and `trail status` print. `live` means a PLATFORM
+    /// CALL SUCCEEDED — `AudioQueueStart` returned OK — never merely that an
+    /// ingress channel exists, which is all it meant until 2026-09-22 (the
+    /// 2026-08 field incident printed `live` over a silent synth for hours).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Inert => "inert",
+            Self::Running => "live",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Opening => "opening",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Paused => "paused",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Failed => "failed",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Reopening => "reopening",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Stopped => "stopped",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Wedged => "wedged",
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2066,7 +2228,7 @@ fn worker_main(rx: std::sync::mpsc::Receiver<Cue>, flags: WorkerFlags<'_>, seed:
 /// synth mutex, allocates, sleeps, or logs. A dormant worker owns the platform
 /// queue and blocks with zero wakeups until the first cue; headless/test apps can
 /// construct the inert form and create no thread at all.
-pub struct TrailAudio {
+pub(crate) struct TrailAudio {
     #[cfg(target_os = "macos")]
     tx: Option<std::sync::mpsc::SyncSender<Cue>>,
     #[cfg(target_os = "macos")]
@@ -2121,7 +2283,7 @@ pub struct TrailAudio {
 
 impl TrailAudio {
     /// `active=false` is the sealed headless/test path: no channel or worker.
-    pub fn new(active: bool) -> Self {
+    pub(crate) fn new(active: bool) -> Self {
         #[cfg(target_os = "macos")]
         {
             use std::sync::Arc;
@@ -2246,7 +2408,7 @@ impl TrailAudio {
     /// self-terminates instead of freezing this thread), and lets the platform
     /// output dispose its queue. This is the serious-mode edge seam; no
     /// already-playing decorative tail survives a healthy teardown returning.
-    pub fn replace(&mut self, active: bool) {
+    pub(crate) fn replace(&mut self, active: bool) {
         // Nothing AUDIBLE to carry across (§17.3 phase 7): the music box is
         // named on each event's voice, so a fresh worker's synth needs no
         // latch. THE COUNTERS ARE A DIFFERENT MATTER (D8): they are
@@ -2279,7 +2441,7 @@ impl TrailAudio {
     /// past [`WEDGE_AFTER_MS`]) additionally spends one revival — see
     /// [`Self::revive_or_seal`] — so a stuck device costs seconds of silence,
     /// not the rest of the session.
-    pub fn push(&mut self, ev: SoundEvent) {
+    pub(crate) fn push(&mut self, ev: SoundEvent) {
         self.push_meta(ev, EventMeta::default());
     }
 
@@ -2288,7 +2450,7 @@ impl TrailAudio {
     /// delivery paths (the keyed seam and the frame drain). Same nonblocking
     /// ingress, same drop policy; `push` is exactly this with the identity
     /// side-car.
-    pub fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
+    pub(crate) fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
         #[cfg(test)]
         if let Some(captured) = self.capture.as_mut() {
             captured.push((ev, meta));
@@ -2385,7 +2547,7 @@ impl TrailAudio {
     /// status` printed `audio=live` over a dead-silent synth for hours, and
     /// this verdict is what would have told the two apart. `None` on the
     /// healthy, sealed, and non-macOS forms.
-    pub fn wedged_for(&self) -> Option<Duration> {
+    pub(crate) fn wedged_for(&self) -> Option<Duration> {
         #[cfg(test)]
         if self.capture.is_some() {
             return None;
@@ -2452,19 +2614,13 @@ impl TrailAudio {
     /// The three losses, named apart. `dropped_cues()` is their sum, so the
     /// `dropped=` field keeps its exact prior meaning while a driver that
     /// wants to know WHICH loss happened can now ask.
+    #[cfg(target_os = "macos")]
     pub(crate) fn dropped_breakdown(&self) -> DroppedCues {
-        #[cfg(target_os = "macos")]
-        {
-            use std::sync::atomic::Ordering;
-            DroppedCues {
-                full: self.dropped_full.load(Ordering::Relaxed),
-                sealed: self.dropped_sealed.load(Ordering::Relaxed),
-                backoff: self.dropped_backoff.load(Ordering::Relaxed),
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            DroppedCues::default()
+        use std::sync::atomic::Ordering;
+        DroppedCues {
+            full: self.dropped_full.load(Ordering::Relaxed),
+            sealed: self.dropped_sealed.load(Ordering::Relaxed),
+            backoff: self.dropped_backoff.load(Ordering::Relaxed),
         }
     }
 
@@ -2498,7 +2654,7 @@ impl TrailAudio {
     /// Saturating count of cues dropped on a full ingress channel — the loss
     /// the wedge (or a plain burst) actually cost, surfaced so status verbs
     /// can print it instead of keeping it a private counter.
-    pub fn dropped_cues(&self) -> u64 {
+    pub(crate) fn dropped_cues(&self) -> u64 {
         #[cfg(target_os = "macos")]
         {
             let b = self.dropped_breakdown();
@@ -2598,6 +2754,8 @@ impl Drop for TrailAudio {
             // returns it sees `shutdown` at the loop top, exits, and its
             // `MacOut` disposes the queue.
             if self.busy_stale_ms().is_some() {
+                #[cfg(test)]
+                LAST_TEARDOWN.with(|last| last.set(Some(WorkerTeardown::DetachedWedged)));
                 drop(worker);
                 return;
             }
@@ -2606,13 +2764,24 @@ impl Drop for TrailAudio {
             // within a housekeeping interval — both land well inside the
             // deadline. Only a platform call slower than the deadline is
             // detached, and it still self-terminates as above.
-            let deadline = std::time::Instant::now() + DETACH_DEADLINE;
+            #[cfg(test)]
+            CLOSED_BEFORE_WAIT.with(|closed| closed.set(Some(self.tx.is_none())));
+            let deadline = std::time::Instant::now() + detach_deadline();
             while !worker.is_finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(DETACH_POLL);
             }
-            if worker.is_finished() {
+            let joined = worker.is_finished();
+            if joined {
                 let _ = worker.join();
             }
+            #[cfg(test)]
+            LAST_TEARDOWN.with(|last| {
+                last.set(Some(if joined {
+                    WorkerTeardown::Joined
+                } else {
+                    WorkerTeardown::DetachedAtDeadline
+                }));
+            });
         }
     }
 }
@@ -2674,7 +2843,6 @@ pub(crate) mod trail_audio_conformance {
         running: bool,
         audible_buffer: usize,
         unsafe_writes: usize,
-        idle_wakes: usize,
         generation: u64,
         callback_generation: u64,
         stale_enqueues: usize,
@@ -2689,7 +2857,6 @@ pub(crate) mod trail_audio_conformance {
             ("running", i64::from(running)),
             ("audible_buffer", audible_buffer as i64),
             ("unsafe_writes", unsafe_writes.min(1) as i64),
-            ("idle_wakes", idle_wakes.min(1) as i64),
             ("generation", generation as i64),
             ("callback_generation", callback_generation as i64),
             ("stale_enqueue", stale_enqueues.min(1) as i64),
@@ -2717,9 +2884,10 @@ mod tests {
         stop_and_reclaim,
     };
     use super::{
-        AudioWorkerOutput, COMMAND_CAPACITY, Cue, DETACH_DEADLINE, HostState, REOPEN_BUDGET,
-        STATE_DORMANT, STATE_FAILED, STATE_PAUSED, STATE_REOPENING, STATE_RUNNING, STATE_STOPPED,
-        TrailAudio, WEDGE_REVIVES, WorkerFlags, cue_channel, monotonic_ms, worker_loop,
+        AudioWorkerOutput, CLOSED_BEFORE_WAIT, COMMAND_CAPACITY, Cue, DETACH_DEADLINE_OVERRIDE,
+        HostState, LAST_TEARDOWN, ParkedMark, REOPEN_BUDGET, STATE_DORMANT, STATE_FAILED,
+        STATE_PAUSED, STATE_REOPENING, STATE_RUNNING, STATE_STOPPED, TrailAudio, WEDGE_REVIVES,
+        WorkerFlags, WorkerTeardown, cue_channel, monotonic_ms, worker_loop,
     };
 
     /// D6 — THE STATE WORD REACHES THE WIRE. Until 2026-09-22 the one atomic
@@ -2761,11 +2929,10 @@ mod tests {
 
     /// Every state has its own wire word, so a seventh one a future worker
     /// adds cannot reach a status row as a silent fallback to `live`.
-    /// The wire word a `HostState` reaches `tone` as — through the SAME
-    /// conversion the row uses, so this test cannot pass over a `From` arm
-    /// the row would get wrong.
+    /// The wire word a `HostState` reaches `tone` as — the SAME spelling the
+    /// row prints.
     fn wire(s: HostState) -> &'static str {
-        crate::tone_infer::AudioHost::from(s).label()
+        s.label()
     }
 
     #[test]
@@ -2932,11 +3099,17 @@ mod tests {
         );
     }
 
+    /// Wait for the worker thread to reach a state. Every predicate is an
+    /// "eventually", so the deadline is a HANG DISCRIMINATOR, 10 s like the
+    /// repo's other thread handoffs: a correct run leaves as soon as the state
+    /// holds, and a wedged worker still fails. It was 500 ms spun on
+    /// `yield_now`, which kept the waiter runnable and competing for the core
+    /// the worker needed (the load-sensitive test audit of 2026-09-27).
     fn wait_until(label: &str, pred: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !pred() {
             assert!(std::time::Instant::now() < deadline, "timed out: {label}");
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -3148,7 +3321,6 @@ mod tests {
                 queue.running,
                 audible_buffer,
                 queue.unsafe_writes,
-                0,
                 queue.recycle_epoch,
                 queue.callback_epoch,
                 queue.stale_enqueues,
@@ -3215,7 +3387,6 @@ mod tests {
             "WritesRequireAvailableOwnership",
             "StaleCallbackCannotReenqueue",
             "StopNeverOverlapsEnqueue",
-            "IdleIsCallbackAndWakeFree",
         ] {
             assert!(model.check_invariant(invariant, &state), "{invariant}");
         }
@@ -3252,6 +3423,21 @@ mod tests {
         assert!(buggy.fire("StopIdle", &mut bad));
         assert_eq!(retained.stop_overlaps, 1);
         assert!(!buggy.check_invariant("StopNeverOverlapsEnqueue", &bad));
+        // The shipping helper refuses that stop: with a callback mid-enqueue,
+        // `stop_and_reclaim` reports `false` and all three buffers stay queued.
+        // The mutant's books ignore the refusal and free them anyway, which
+        // `BufferOwnershipConserved` rejects.
+        let mut refused = CallbackFreeQueue::new();
+        refused.apply_audible_cue();
+        prime_and_start(&mut refused).expect("prime/start before the refused stop");
+        refused.callback_enqueue_begins();
+        assert!(!stop_and_reclaim(&mut refused));
+        assert_eq!((refused.available(), refused.queued()), (0, 3));
+        assert_eq!(
+            (bad["available"], bad["queued"]),
+            (3, refused.queued() as i64)
+        );
+        assert!(!buggy.check_invariant("BufferOwnershipConserved", &bad));
         retained.apply_audible_cue();
         assert!(buggy.fire("CueResume", &mut bad));
         assert!(!retained.render_post_cue(0));
@@ -3663,15 +3849,22 @@ mod tests {
         wait_until("idle pause", || {
             state.load(Ordering::Acquire) == STATE_PAUSED
         });
+        // The deadline bits are measured: the running worker ticked its way
+        // into the pause (it owned a housekeeping timeout), and the paused one
+        // does not tick at all.
         let ticks_at_pause = shared.ticks.load(Ordering::Relaxed);
+        let running_deadline = ticks_at_pause > 0;
+        assert!(running_deadline, "the running worker services a deadline");
         std::thread::sleep(std::time::Duration::from_millis(12));
-        assert_eq!(
-            shared.ticks.load(Ordering::Relaxed),
-            ticks_at_pause,
+        let paused_deadline = shared.ticks.load(Ordering::Relaxed) != ticks_at_pause;
+        assert!(
+            !paused_deadline,
             "paused worker blocks on recv instead of polling a timeout"
         );
-        let before_pause = project_worker(0, 0, false, true, 2, true, false, false, false);
-        let after_pause = project_worker(0, 0, false, false, 2, false, false, false, true);
+        let before_pause =
+            project_worker(0, 0, false, true, 2, running_deadline, false, false, false);
+        let after_pause =
+            project_worker(0, 0, false, false, 2, paused_deadline, false, false, true);
         assert!(
             model
                 .successors("PauseIdle", &before_pause)
@@ -3682,6 +3875,26 @@ mod tests {
                 .successors("ParkIdle", &after_pause)
                 .contains(&after_pause)
         );
+        // Negative control, at the projection (the shipping loop cannot be
+        // made to poll): a pause that kept its housekeeping timeout
+        // (`recv_timeout` chosen on `output.is_some()`, not `is_running()`) is
+        // the paused worker still owning the deadline the running one was
+        // measured to own. That is the model's `Buggy=1` PauseIdle — no
+        // healthy successor, and `RunningOwnsOneDeadline` rejects the stopped
+        // device still owning a deadline.
+        let polling_pause =
+            project_worker(0, 0, false, false, 2, running_deadline, false, false, true);
+        assert!(
+            !model
+                .successors("PauseIdle", &before_pause)
+                .contains(&polling_pause)
+        );
+        assert!(
+            aterm_spec::interp::with_buggy(&model, 1)
+                .successors("PauseIdle", &before_pause)
+                .contains(&polling_pause)
+        );
+        assert!(!model.check_invariant("RunningOwnsOneDeadline", &polling_pause));
 
         shared.pause_on_tick.store(false, Ordering::Release);
         tx.send(cue().into()).unwrap();
@@ -4199,37 +4412,96 @@ mod tests {
     /// (event-loop) thread: the stuck worker is detached, not joined. The
     /// regression this pins: the former unconditional `join()` would have
     /// frozen the UI forever on the serious-mode toggle and on quit.
+    ///
+    /// The drop's own decision is asserted, not a stopwatch around it (the
+    /// load-sensitive test audit of 2026-09-27): the old `< DETACH_DEADLINE`
+    /// bound around a few atomic stores failed on any 600 ms stall of this
+    /// thread. `DetachedWedged` is recorded only by the branch that detaches
+    /// without waiting, so a drop that waited the deadline out and then
+    /// detached still fails here. The drop runs on a helper whose 10 s answer
+    /// deadline turns a forever-join into a failure instead of a hung test.
     #[test]
     fn dropping_a_wedged_host_detaches_instead_of_freezing() {
         let (mut audio, _rx) = TrailAudio::test_ingress();
         // Stand-in for a thread stuck in a platform call: parked until the
-        // keeper is dropped, which this test does only AFTER the drop returns.
+        // keeper is dropped, which this test does only AFTER the drop answers.
         let (keeper_tx, keeper_rx) = std::sync::mpsc::channel::<()>();
         audio.worker = Some(std::thread::spawn(move || {
             let _ = keeper_rx.recv();
         }));
         audio.busy.store(1, std::sync::atomic::Ordering::Release);
 
-        let begun = std::time::Instant::now();
-        drop(audio);
-        assert!(
-            begun.elapsed() < DETACH_DEADLINE,
-            "a wedged worker is detached immediately, never joined"
-        );
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(audio);
+            let _ = answer_tx.send(LAST_TEARDOWN.with(std::cell::Cell::get));
+        });
+        let teardown = answer_rx.recv_timeout(std::time::Duration::from_secs(10));
+        // Released only now, so a drop that joined the stand-in was parked on
+        // it for the whole deadline, and can finish once the verdict is in.
         drop(keeper_tx);
+        dropper.join().expect("the drop does not panic");
+        assert_eq!(
+            teardown,
+            Ok(Some(WorkerTeardown::DetachedWedged)),
+            "a wedged worker is detached immediately, never joined or waited out"
+        );
     }
 
     /// The healthy teardown contract survives the bounded join: a parked
-    /// shipping worker is woken by the closing channel and joined well inside
-    /// the deadline.
+    /// shipping worker is woken by the closing channel and JOINED.
+    ///
+    /// The join itself is asserted, under a deadline stretched to 10 s (the
+    /// load-sensitive test audit of 2026-09-27). The old `< DETACH_DEADLINE`
+    /// stopwatch failed whenever the woken worker was not scheduled within
+    /// 600 ms, and it passed a drop that detached a healthy worker at once.
+    /// A drop that never wakes the worker still waits the whole stretched
+    /// deadline out and records `DetachedAtDeadline`.
+    ///
+    /// The stretch alone would admit a drop that woke the worker some slower
+    /// way inside 10 s (a timed idle wait, a channel closed only after the
+    /// wait), which production detaches at 600 ms. So the MECHANISM is asserted
+    /// too: the channel was closed before the drop began waiting, and the
+    /// worker left through its idle `recv()` answering `Disconnected` — the
+    /// one wake that is immediate by construction.
+    ///
+    /// The drop waits for the worker to be PARKED. Dropped straight after
+    /// `new`, the worker usually had not reached its loop top, saw `shutdown`
+    /// there and exited without the closing channel, so a drop that never
+    /// closed the channel passed too (the audit's negative control).
     #[test]
     fn dropping_a_healthy_host_stays_synchronous() {
         let audio = TrailAudio::new(true);
-        let begun = std::time::Instant::now();
+        let parked_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ParkedMark::holds(&audio.state) {
+            assert!(
+                std::time::Instant::now() < parked_by,
+                "the idle worker never parked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        LAST_TEARDOWN.with(|last| last.set(None));
+        DETACH_DEADLINE_OVERRIDE
+            .with(|stretch| stretch.set(Some(std::time::Duration::from_secs(10))));
+        // Held across the drop, so the state word's address — the worker's
+        // name in the census — cannot be reused before it is read.
+        let state = std::sync::Arc::clone(&audio.state);
+        CLOSED_BEFORE_WAIT.with(|closed| closed.set(None));
         drop(audio);
+        DETACH_DEADLINE_OVERRIDE.with(|stretch| stretch.set(None));
+        assert_eq!(
+            LAST_TEARDOWN.with(std::cell::Cell::get),
+            Some(WorkerTeardown::Joined),
+            "a parked worker is woken by the closing channel and joined on teardown"
+        );
+        assert_eq!(
+            CLOSED_BEFORE_WAIT.with(std::cell::Cell::get),
+            Some(true),
+            "the drop waited for its worker before closing the channel that wakes it"
+        );
         assert!(
-            begun.elapsed() < DETACH_DEADLINE,
-            "a parked worker joins promptly on teardown"
+            super::took_disconnect_exit(&state),
+            "the parked worker left some other way than its idle recv() disconnecting"
         );
     }
 
@@ -4862,10 +5134,7 @@ mod tests {
         });
         assert_eq!(dev.drops.load(Ordering::Acquire), 1);
         assert_eq!(reopens_left.load(Ordering::Acquire), REOPEN_BUDGET - 1);
-        assert_eq!(
-            crate::tone_infer::AudioHost::from(HostState::Reopening).label(),
-            "reopening"
-        );
+        assert_eq!(HostState::Reopening.label(), "reopening");
 
         // Reopens are cue-driven: the next key opens a fresh device.
         tx.send(cue().into()).unwrap();

@@ -268,7 +268,16 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// plus 128 bytes, about one more row. Same accounting as the seven raises
 /// above, and the shape is unchanged: one summary row per verb under
 /// [`SUMMARY_MAX_CHARS`].
-pub const SHORT_CATALOG_MAX_BYTES: usize = 10720;
+///
+/// RAISED AGAIN FROM 10 720 on 2026-09-26, for the audit of what aterm prints at a
+/// person: seven summaries that ended on a colon, a semicolon or a flourish
+/// (`update`, `flows`, `connect`, `who`, `spawn`, `subscribe`, and `offscreen`'s
+/// detail) now carry the reply shape they answer with, trimmed to the shortest
+/// wording that still says it. With main's rows of the same day, the short `help`
+/// MEASURES 10 764 B in `help_short_form_is_bounded_and_is_the_summary_catalog`;
+/// the cap is that plus 84 bytes, about one more row. Same accounting as the
+/// eight raises above, and the shape is unchanged.
+pub const SHORT_CATALOG_MAX_BYTES: usize = 10848;
 
 /// THE ONE `subscribe` STREAM VOCABULARY.
 ///
@@ -430,8 +439,29 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         AnyScopeMeta,
-        "self-updater [status|check|apply]: status and checks; platform-specific application",
-        "On macOS, Apply requests the seamless handoff, preserving live shells after validation and preflight. On Linux, CLI `aterm update apply` and owner-only socket `update apply` synchronously re-verify and replace the on-disk executable; neither requests a live handoff. Linux status reports `linux_installed_build`, `linux_staged_build`, `linux_trial`, `linux_trial_starts`, and `linux_trial_healthy`; an enrolled local baseline has no trial. Check synchronously uses the current GUI release source and notifies its reducer after completion. The historical macOS `relaunch_ready=true` means a newer stage exists; `apply_posture` reports live policy and scheduling: automatic, automatic-idle, manual-config, disabled-env, retry-wait, manual-only, handoff-unavailable, applying, unreconciled, none, disabled, or unknown. While the posture is automatic, `apply_phase` names where the lane is on its ladder — prefer-idle, prefer-output-gap, keys-only, land — which ends with the build applied no later than a minute after it was armed, whatever the terminal is doing. `apply_policy_reason` names a current policy block when known. It is not a preflight guarantee.",
+        "self-updater [status|check|apply]: OK current_build= staged_build= outcome=",
+        "Every line: enabled= current_build= commit= staged_build= staged_version= staged_commit= \
+         staged_is_same_commit= (the stage is the running commit: a churn relaunch, not a source \
+         change) relaunch_ready= (a newer stage exists) apply_posture= failing=<n>:<kind> \
+         failing_applies= rescues= persistent= outcome=\"…\". Only when true: \
+         stale_check=<rfc3339> or check_unrecorded=true (no completed check in 4 h / none \
+         recorded), apply_phase= (automatic postures only), apply_policy_reason=, \
+         delivery=deferred|blocked, installable=false (a disk-image, translocated or dev copy \
+         never updates), apply_refusal= apply_refusal_at= apply_failure=, changelog=, and on \
+         macOS freeze_seed_ms= handoff_capture_ms= (once a seamless handoff has timed its \
+         capture: the first freeze rung the last dry run seeded, and the capture it timed) and \
+         handoff_park_ms= (once a park has landed: what it really cost, readers stopped to \
+         capture done — the floor the next first rung is budgeted from) — prose values \
+         pct-encoded. apply_posture: automatic, automatic-idle, manual-config, \
+         disabled-env, retry-wait, manual-only, handoff-unavailable, applying, unreconciled, \
+         none, disabled, unknown. apply_phase: prefer-idle, prefer-output-gap, keys-only, land \
+         — the build is running within a minute of being armed, whatever the terminal is \
+         doing. Linux adds linux_installed_build= linux_staged_build= linux_trial=<phase|none> \
+         (an enrolled local baseline has no trial) linux_trial_starts= linux_trial_healthy=. \
+         check = one synchronous check of the channel \
+         now, then the same line. apply (Owner-only) = press the staged build: macOS answers OK \
+         once the request is queued and the live-session handoff keeps the shells; Linux \
+         re-verifies and replaces the on-disk executable in place, no handoff.",
     ),
     va(
         "help",
@@ -555,7 +585,9 @@ pub const VERBS: &[VerbSpec] = &[
          [tail=<n>|rows=<a>-<b>]` — nothing is silently ignored. `--json` always carries \
          \"gen\":\"<epoch>.<seq>\" after seq: the screen generation of the rows sent, read \
          under the same lock (`status gen=`), which a fenced `key if-gen=` names — so a press \
-         is bound to the read it was decided on, not to a later one",
+         is bound to the read it was decided on, not to a later one — and \"human_ms\":<ms|null> \
+         after gen (`status human_ms=`: how long ago a person last gave the session input, \
+         null for never), before trimmed and first, which stay last",
     ),
     v(
         "screen",
@@ -592,8 +624,9 @@ pub const VERBS: &[VerbSpec] = &[
         "offscreen [since=<i>] [tail=<n>] [max=<n>] [screen=1]: rows a TUI scrolled off",
         "— Claude Code and other fullscreen apps repaint the ALTERNATE screen in place, so \
          `lines` stays 0 and a row that leaves the top is gone from the grid; aterm keeps those \
-         rows per session, in memory (4 MiB, on unless ATERM_ALT_ARCHIVE=0), by comparing \
-         each committed frame (a DEC 2026 close; at most one per 16 ms for an app that sends \
+         rows in memory, always on (4 MiB shared by every session of the process, at least \
+         256 KiB each), by comparing each committed frame (a DEC 2026 close; at most one per \
+         16 ms for an app that sends \
          none) with the one before. Reply `OK <n> first=<i> last=<j> lost=<k> breaks=<b> back=<d> \
          [back_at=<i> pin=<p>] epoch=<e> origin=<o> alt=<0|1> seq=<s> [enabled=0] [more=1] \
          [screen_rows=<m>]` then n lines, oldest first: line m is archived row first+m, and last= \
@@ -645,7 +678,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "DEC modes: alt_screen=, cursor_visible=, ...",
+        "DEC modes: alt_screen=, cursor_visible=, ..., focus_reporting=, sync_output= (14 keys)",
         "",
     ),
     v(
@@ -878,27 +911,38 @@ pub const VERBS: &[VerbSpec] = &[
     // decision, told to the session's window. Owner-only (a child edge must not
     // write `✓ approved` onto a band it does not drive), Write op-class because it
     // mutates App state, Session target because it names the session it is about.
+    // `chose` (2026-09-24, the question-policy contract v3) joined the set for the
+    // in-window supervisor answering Claude Code's question box; the eight words
+    // no longer fit the summary cap, so the summary names the slot and the detail
+    // leads with the set.
     va(
         "story",
         Write,
         Status,
         Session,
         OwnerOnly,
-        "story <approved|dismissed|reconnected|timeout|exit|compacted|warned> [<text>]: tell the \
-         window",
-        "Tell the session's window what the watcher decided. The presence band under the tab bar \
-         says who is driving a session and what happened while the human was away; a watcher's decisions (`aterm drive watch`: an approved \
-         read, a dismissed survey, an outage ridden out, its TIMEOUT or EXIT, the worker's \
-         compaction and the context warning before it) live in another process and reach the \
-         band only here. `aterm drive watch` posts one per journaled decision by itself. The \
-         verb is the CLOSED SET above — anything else is `ERR usage` — and the text is \
-         optional, at most 96 bytes, no control byte. The point takes the phase slot for three \
-         seconds (`✓ approved`, then back to the phase), is spoken to a screen reader as \
-         `approved by watcher`, and is a story point: the tab's violet dot until the human \
-         looks, and an approval is counted in the `◇ quiet` summary. Never send the command: \
-         the band carries no command text, and the watcher tells an approval bare. Reply `OK \
-         story=<n>`, the point's seq (`status story=` reports it). Takes the ordinary \
-         `@<sid>` selector; bare, it is the connection's own session. Owner-only.",
+        "story <verb> [<text>]: tell the window what a watcher decided or the harness chose",
+        "The verb is the CLOSED SET \
+         `approved|dismissed|reconnected|timeout|exit|compacted|warned|chose` — anything else \
+         is `ERR usage` — and the text is optional, at most 96 bytes, no control byte. The \
+         presence band under the tab bar says who is driving a session and what happened while \
+         the human was away; a watcher's decisions (`aterm drive watch`: an approved read, a \
+         dismissed survey, an outage ridden out, its TIMEOUT or EXIT, the worker's compaction \
+         and the context warning before it) live in another process and reach the band only \
+         here. `aterm drive watch` posts one per journaled decision by itself. The point takes \
+         the phase slot for three seconds (`✓ approved`, then back to the phase), is spoken to \
+         a screen reader as `approved by watcher`, and is a story point: the tab's violet dot \
+         until the human looks, and approvals and choices are counted in the `◇ quiet` \
+         summary. `chose` is the harness's supervisor answering Claude Code's question dialog \
+         by policy (`[harness] answer_questions`, or the session's `meta set questions`), its \
+         text the policy word (`◆ chose recommended`, spoken `chose by harness, recommended`): it also \
+         plays one short quiet chime (`choice_sound`, under the Music effects master, silent \
+         in serious mode, at most one per 2 s, a background tab's too) and pulses the rim of \
+         each window whose front tab is that session once (none under reduced motion or with \
+         the presence rim off). Never send the command: the band carries no command text, and \
+         the watcher tells an approval bare. Reply `OK story=<n>`, the point's seq (`status \
+         story=` reports it). Takes the ordinary `@<sid>` selector; bare, it is the \
+         connection's own session. Owner-only.",
     ),
     v(
         "chrome",
@@ -986,8 +1030,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "meta -> OK title= user_title= description= icon= role= attention= cwd= state=",
-        "attention_owner= attention_owners= supervisor= (pct-encoded; '-' = unset). `meta set <title|description|icon|role|attention> <text...>` \
-         / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks \
+        "attention_owner= attention_owners= supervisor= questions= agent_cwd= (pct-encoded; '-' = unset; \
+         read fields by key). `meta set <title|description|icon|role|attention|questions> \
+         <text...>` / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks \
          the OSC title in tab labels; `role operator` names the fleet operator and a non-empty \
          `attention` is the typed needs-human escalation the menu-bar status item badges; caps: \
          title 120B, description 1024B, icon 64B, role 64B, attention 256B). KEYED ATTENTION: \
@@ -1013,7 +1058,17 @@ pub const VERBS: &[VerbSpec] = &[
          claim is `ERR busy supervisor=<holder>`; the same holder renews. A bare unset clears \
          whichever holder's claim stands; `holder=<holder>` clears it only while that holder \
          holds it (`OK` either way), so a supervisor giving its own claim back never clears \
-         another's. No `window=` here, \
+         another's. QUESTIONS: `meta set questions ask|recommended` / `meta unset questions` \
+         (Owner-only; an edge gets `ERR denied`) set how the in-window supervisor treats this \
+         session's Claude Code question dialog, over the `[harness] answer_questions` switch: \
+         `ask` leaves it to a person (how a controlling session takes a worker's questions), \
+         `recommended` answers it with its recommended option. A closed set, case-folded and \
+         stored lowercase — any other value is `ERR usage: meta set questions \
+         ask|recommended`; `questions=-` is unset (the switch decides); it counts toward `sessions meta=1` and survives a \
+         restore and an update's handoff. AGENT_CWD: the foreground program's own working \
+         directory as the OS reports it (`-` with no foreground program or none readable) — \
+         where an agent was launched, which a shell with no OSC 7 leaves `cwd=` without. \
+         No `window=` here, \
          for the reason `status` gives: `meta` is polled and the window lives on the main thread \
          — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
     ),
@@ -1040,8 +1095,17 @@ pub const VERBS: &[VerbSpec] = &[
          agent=<busy|prompt|question|wall:<kind>|idle|survey|unknown|-> agent_detail=<pct|-> \
          agent_rev=<n> \
          agent_since_ms=<ms> agent_gen=<e.s|-> agent_fp=<hex16|-> \
-         integration=<on|off|degraded|-> supervisor=<pct|-> gen=<e.s|-> \
-         seq=<n|-> hash=<hex16|->. `seq=`/`hash=` STAMP THE LIVE SCREEN: the terminal's \
+         integration=<on|off|degraded|-> \
+         input=<-|clear|pending|typeahead|stalled|stopped> input_bytes=<n|-> \
+         input_wait_ms=<ms|-> fg_rss_mb=<n|-> supervisor=<pct|-> human_ms=<ms|-> \
+         path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> \
+         upgrade=<-|<state>/<to>/<why>/<age>> history_lost=<n> \
+         integration_rev=<current|stale:<hex16>|frozen|-> gen=<e.s|-> \
+         seq=<n|-> hash=<hex16|->. `history_lost=` is how many scrollback lines this \
+         session's in-session updates could NOT carry, summed over every update it crossed: \
+         an update carries a tab's whole history, and a history that changed under its \
+         export or outran it keeps only the newest lines, counted here (and said once on \
+         the band) — `0` when every line crossed. `seq=`/`hash=` STAMP THE LIVE SCREEN: the terminal's \
          content_seq and FNV-1a-64 of the UNTRIMMED visible screen, the same pair `turn` \
          returns and `history` keeps per turn id, so work built from a screen read can be \
          matched against the ledger rather than believed (a stamped report carries them). \
@@ -1067,9 +1131,12 @@ pub const VERBS: &[VerbSpec] = &[
          shell-integration block executes, `-` otherwise or \
          when the terminal lock was contended: how an agent tells that a peer is another \
          agent before typing into it. \
-         `hold=1` means a fleet halt is in force for this session, so every PTY-reaching verb \
-         answers `ERR halted` — read the reason from `inbox`. `fabric=` is INSTANCE state, not \
-         this session's, and it is the BRIDGE'S BROKER LINK, not the bridge process: `absent` = \
+         `hold=1` means a drive halt stands on this session, local or fleet: every PTY-reaching \
+         verb answers `ERR halted reason=<r> origin=<local|fleet>` (the reason is on that line \
+         and on the `hold` record in `events`); an `origin=local` hold is the owner's own and \
+         `hold <sid> off` lifts it, a fleet hold only the bridge lifts. \
+         `fabric=` is INSTANCE state, not this session's, and it is the BRIDGE'S BROKER LINK, not \
+         the bridge process: `absent` = \
          no bridge was ever launched; `connected` = a bridge is attached AND its last exchange \
          with the broker was acknowledged; `stalled` = a bridge is attached but its link is down \
          (the dial failed — no socket, connection refused — the broker closed the connection, or \
@@ -1116,10 +1183,12 @@ pub const VERBS: &[VerbSpec] = &[
          task/ask with no hand on the session); `-` at any other level. \
          `path=<frozen|live>`, after `why=` and before the stamp (which stays last): whether \
          this session's shell fronts aterm's managed \
-         `agents/` on PATH — the same registry mark the `sessions` roster carries (`frozen` = \
-         a shell adopted from a build before 2026-09-16 that never sourced the atpkg hook, so \
-         `claude`/`codex` typed in it run the foreign copies; an upper bound: sourcing the \
-         hook is not reported back). \
+         `agents/` on PATH — the same value the `sessions` roster carries (`frozen` = \
+         `claude`/`codex` typed at its prompt resolve to a foreign copy), MEASURED from the \
+         environment of a program the shell started where one has been read, else the \
+         mark the shell was adopted with; `path_evidence=`, `copy=` and `upgrade=` (after \
+         `supervisor=`, before the stamp) are the `sessions` roster's owner columns — see \
+         `help sessions`. \
          `program=` is the argv[0] basename of the PTY's FOREGROUND process-group leader \
          (`zsh` at a prompt, `sleep`, `claude` — argv[0], never the executable path, which for \
          a self-updated agent is a version number; a shell interpreter running atpkg's own shim \
@@ -1133,11 +1202,18 @@ pub const VERBS: &[VerbSpec] = &[
          on the screen, read by that program's own screen reader (aterm-phase): applied only \
          when the foreground program is an identified agent (`claude`, `codex`) or the screen \
          shows Claude Code's composer frame or one of its boxes, and re-read \
-         whenever the content moved and the live zone (the last 40 rows) changed, at most 4 Hz \
+         whenever the content moved and the live zone (the last 40 rows of the screen's \
+         content) changed, at most 4 Hz \
          — never gated on `revision=`; anything else reads `-` (a shell whose last line ends in \
          `?` is not a question). `wall:<kind>` is the WALL the last turn ended on, one of \
          `usage-session`, `usage-weekly`, `model-bucket`, `spend`, `context`, `auth`, \
-         `api-error`, `overloaded` (a 529 reads `wall:overloaded`, never `idle`); `unknown` is \
+         `api-error`, `overloaded` (a 529 reads `wall:overloaded`, never `idle`), `memory` \
+         (Claude Code's critical-memory banner, read by its place right above the composer's \
+         frame, never from a quote of it: restart it, then `claude --continue`), or \
+         the SERVER'S OWN `unresponsive` — the program has stopped reading its input (see \
+         `input=` below), whatever its screen still shows, with `agent_detail=stopped` for a \
+         stopped job; it is published and cleared by aterm in step with `input=`, and the \
+         screen's verdict returns when the program reads again; `unknown` is \
          an identified agent whose reader has no evidence for a phase (a Codex screen outside \
          its choice box) — never act on it as idle. \
          `agent_detail=` is a prompt's `<kind>[:<verdict>]` (`bash:not-read-only`, \
@@ -1154,10 +1230,55 @@ pub const VERBS: &[VerbSpec] = &[
          applies while the program is unresolved or `node`/`bun`/`deno`, never to a shell or \
          pager showing a captured screen. `integration=` is whether this \
          session's OSC 133/633 marks reach aterm: `on`, `off` (not required), or `degraded` — \
-         a nonce is required and none is authorized (an adopted shell whose update did not \
-         carry it), so `detail=` and blocks stay dark while `program=` still names it; `-` \
-         when the terminal lock was contended. `supervisor=` is the live `meta set supervisor` \
+         a nonce is required and none is in use (an adopted shell whose update did not \
+         carry it, or one re-keyed through its channel that has not reached its next prompt \
+         yet), so `detail=` and blocks stay dark while `program=` still names it; `-` \
+         when the terminal lock was contended. `integration_rev=` (after `history_lost=`, \
+         before the stamp) is WHICH shell integration the session's shell runs, against the \
+         one this build ships: `current` (its last SIGNED `633;P;AtermIntegration=<rev>` — \
+         the script folder its integration body came from — is this build's), \
+         `stale:<rev>` (another build's: a shell adopted across an update runs the old \
+         build's until its next prompt, when it takes this build's body through its \
+         pointer and the word reads `current`), `frozen` (adopted with an integration from \
+         before loaders, fixed at spawn: no pointer reaches it, so a fix to its marks \
+         reaches it only in a new tab — or when the live agent upgrade types its relaunch \
+         line there, which also sources this build's loader), `-` (no integrated shell, one \
+         before its first prompt, or the lock was contended). \
+         `input=` is whether the program is READING ITS INPUT, probed live from the kernel \
+         (macOS; `-` elsewhere and off a tty): `clear` nothing unread; `pending` raw-mode \
+         input unread and not (yet) judged a stall; `typeahead` complete lines a canonical \
+         (line-mode) reader has not asked for yet — a shell's ordinary type-ahead, never \
+         flagged; `stalled` raw-mode input unread for 10 s or more by a program that has \
+         drawn nothing since and is burning CPU (or has sat asleep for 5 min — a pager on a \
+         slow pipe or a shell inside a slow completion sleeps too, and a program that keeps \
+         drawing is never stalled), entered only while aterm has read all the program's \
+         output, so a program waiting on aterm is not blamed; `stopped` input queued under a \
+         stopped job. `input_bytes=` counts every unread byte (the \
+         kernel's queue plus aterm's own spill behind it) and `input_wait_ms=` is a LOWER \
+         BOUND on how long the oldest has waited; `fg_rss_mb=` is the foreground program's \
+         resident size in MiB while `stalled`/`stopped`, `-` otherwise. A frozen program's \
+         screen never moves, so no screen fence sees this: an input-writing verb into a \
+         session whose raw input has waited a second answers `ERR busy input-unread` (see \
+         `key`). While `stalled`/`stopped` aterm also raises the session's attention itself, \
+         as owner `aterm` (`meta attention_owner=aterm`: `<program> is frozen: not reading \
+         input since <HH:MM> … — restart it: aterm ctl @<sid> signal term`), over any older \
+         badge, and clears it when the program reads again; nothing is armed while no input \
+         is unread. The queue `signal term` drops is not read: a program that lives through \
+         it stays `stalled` (`input_bytes=0`) until it ends or shows it is alive — it draws, \
+         reads a key sent since, or stops spinning with nothing left unread — and after 5 s \
+         the line reads `… is still running after its restart signal … — end it: aterm ctl \
+         @<sid> signal kill`. `supervisor=` is the live `meta set supervisor` \
          claim — who is answering this session's prompts — `-` when none. \
+         `human_ms=` is how long ago a PERSON last gave this session input — a key (an arrow, \
+         a digit, Enter and Esc included), text, a paste, a click, a drag, a wheel notch or a \
+         scroll of the view, from the window (a hover does not count), never a control verb \
+         (`key`/`send`/`paste`/`turn`/`mouse`/`feed-bin`) — in ms, `-` when no person has since \
+         the session started. An automatic supervisor keeps its hands off while it is under \
+         `[harness] human_grace_s`, and waits on it before it keys a dialog a person may be \
+         navigating (`text --json` carries it too, as \"human_ms\"; every `sessions` row as \
+         `human_ms=`); `subscribe … events` pushes `EVENT <local> human` when a person starts \
+         after 30 s without. The stamp lives in this instance, so a session carried across an \
+         update starts at `-` again. \
          No `window=` here: `status` is \
          polled, and the window lives on the main thread, so a per-poll hop would be a \
          latency regression — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
@@ -1169,7 +1290,10 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "timeline [<n>] [since=<id>]: the session EVENT TIMELINE",
         "- one `event <id> t=<ms> kind=<k> ...` line per recorded event: the lifecycle kinds \
-         (spawned/state-change/title-change/cwd-change/meta-change/agent-change) AND the fabric/messaging \
+         (spawned/state-change/title-change/cwd-change/meta-change/agent-change/human/modes-restored \
+         — the last is the PTY reader handing the terminal back after a foreground program lost it \
+         with modes armed: `from=<pgid> to=<pgid> program=<name|-> reverted=<csv> bytes=<n>`) AND \
+         the fabric/messaging \
          kinds the same ring records (hold/inbox/inbox-seen/post/fetch/post-landed/topic), monotonic ids, \
          drop-oldest \
          ring. The two rows a session records as it is retired — `closing reason= by=` and the \
@@ -1214,7 +1338,11 @@ pub const VERBS: &[VerbSpec] = &[
          max_redraw_total_ms), then the STRAIN engine's strain=calm|suspect|open|off (off = config \
          explain_heavy_load = false) with strain_probe_us_max=/strain_scan_us_max= (the probe \
          thread's slowest machine reading and process sweep since reset; 0 until an episode \
-         first samples). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
+         first samples), and last the self-update's pre-Commit input: input_dropped= \
+         (keystrokes typed into an updated window before Commit that its bounded queue \
+         refused — lost) and input_incoherent= (replays that had to disarm the held \
+         modifiers: a drop, or a window losing focus with input already queued for it), both \
+         cumulative for the process and kept across `metrics reset`. IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
          is behind (a TUI sharing its scheduling band with a build has been measured echoing at \
          p99 150ms while aterm wrote every key at p99 6.29ms), the reverse means aterm is; a \
          lone max_present_latency_ms is not evidence of either. READ THE SLICES HONESTLY: present_* and input_* are OPEN INTERVALS closed by the next qualifying present, so any stretch in which nothing presented is INSIDE the number (only a 5 s discard bounds it) — a multi-second present_latency means \"nothing presented for that long\", not \"a frame took that long\"; input_* closes on the next CONTENT present, which under concurrent streaming output may be a log-line frame rather than the key's echo, so it reads LOW rather than high. Quote n_* with the percentiles, never a lone last_/max_, and note both stop at application-present return (no compositor selection, scanout or photons)",
@@ -1231,7 +1359,7 @@ pub const VERBS: &[VerbSpec] = &[
          idle=<ms>, cap timeout=<ms>), return the settled screen. Options: [idle=<ms>] \
          [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] \
          [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] \
-         [cadence=<ms>] [yield=<floor>]. settle=match:<re> keys \
+         [cadence=<ms>] [yield=<floor>] [if-gen=<epoch>.<seq>]. settle=match:<re> keys \
          the settle on a visible row matching <re> instead of global idle; settle=gone:<re> on \
          <re> LEAVING the screen (an agent's busy footer) — and that one is TWO waits: the \
          pattern must APPEAR within submit_window after the verified submit (the `await gone` \
@@ -1265,6 +1393,12 @@ pub const VERBS: &[VerbSpec] = &[
          timer per reading, no polling; the human's typing is never blocked (the agent yields, \
          the human never waits) — then adds yielded_ms=<n>; a yield that outlives timeout= types \
          NOTHING and answers `ERR yield timeout momentum=<v>`. \
+         if-gen=<epoch>.<seq> (the `gen=` a read returned — `status`, `text --json`) types ONLY \
+         while the screen is still that generation, checked under the terminal lock after the \
+         yield and immediately before the paste goes to the input seam: any output since — a \
+         person's keystroke echoed, a box, a repaint — types NOTHING and answers `OK 0 turn \
+         skipped reason=changed submitted=0 seq=<n> id=<n>`, so a driver that judged a screen \
+         (an empty composer) never pastes into another one; read again and decide again. \
          EXACTLY-ONCE: a leading id=<epoch>:<producer>:<seq> makes the turn replay-safe — see \
          `send`'s entry for the key, which exactly `send`, `key`, `feed-bin` and `turn` take. \
          The OTHER input verbs (`paste`, `ctrl`, `feed`, `paste-bin`, `mouse`, `pointer`, \
@@ -1272,7 +1406,11 @@ pub const VERBS: &[VerbSpec] = &[
          crash-safe driver retries only through the four keyed verbs. A DUPLICATE answers `OK 0 \
          dup=1` (this verb is Lines-framed) and carries NONE of the verdict fields above, id= \
          included: nothing was typed, so there is no verdict to report. The reply's own id= is \
-         the TURN id and is unrelated to the key you sent",
+         the TURN id and is unrelated to the key you sent. UNREAD INPUT: a turn into a program \
+         that has left input unread is refused `ERR busy input-unread …` before it types \
+         anything — asked when it arrives and again after its yield= (see `key`; turn takes \
+         no unread=ok) — and it never RE-presses while an earlier byte is still unread: its \
+         one Enter waits in the queue and the verdict says submitted=0",
     ),
     v(
         "lease",
@@ -1312,7 +1450,9 @@ pub const VERBS: &[VerbSpec] = &[
          carries the contract; `send` and `key` are the two verbs that take it, in either \
          order beside id=, and the two that take the if-gen=/if-fp= fences `key` describes. \
          An aterm older than the fences types a leading if-gen= into `send`'s body as TEXT \
-         (`key` answers it ERR usage), so fence a press with `key`",
+         (`key` answers it ERR usage), so fence a press with `key`. UNREAD INPUT: while the \
+         program has left earlier input unread, `send` is refused `ERR busy input-unread …` \
+         and writes nothing — see `key`; a leading unread=ok queues anyway",
     ),
     v(
         "paste",
@@ -1356,9 +1496,28 @@ pub const VERBS: &[VerbSpec] = &[
          `key if='Do you want' 1` (that arms `Do` and presses `you`). Composes with id= in \
          EITHER order (`key id=… if=… 1` and `key if=… id=… 1` are one request); a skipped \
          guard gives its id= sequence back, so the retry is re-evaluated against the live \
-         screen rather than answered `dup=1`. ORDER OF REFUSALS: a halted session is `ERR \
-         halted` whatever the guard says, and busy/rate refusals come before the guard is \
-         even compiled. The guarded press is delivered on the control thread against the \
+         screen rather than answered `dup=1`. ORDER OF REFUSALS: `ERR halted`, `ERR rate`, \
+         `ERR busy turn=`, `ERR usage`, `ERR busy input-unread`, `ERR badregex`, then the \
+         guard and fences, then the id= claim — so a halted session is `ERR halted` whatever \
+         the guard says, and no refusal spends an id= sequence. UNREAD INPUT (macOS; never \
+         refused elsewhere): when the program has left input unread in its tty — raw-mode \
+         bytes at least a second old, or any bytes while its job is stopped — every \
+         input-writing verb (send key ctrl feed feed-bin paste paste-bin mouse focus turn \
+         hwkey pointer, invoke Paste, operator-propose-bin) writes NOTHING and answers `ERR \
+         busy input-unread bytes=<n> wait_ms=<ms> input=<pending|stalled|stopped> (<why and \
+         the remedy>)`: a key sent now would be read AFTER those bytes, against a screen the \
+         program has not drawn. A screen fence cannot see it — a frozen screen always passes \
+         if=, if-gen= and if-fp=. It is `ERR busy`, so a back-off retries it; a human's \
+         window keyboard is never refused; `signal` (int interrupts, term restarts a frozen \
+         program, cont resumes a stopped one), `close`, `resize`, `pane` and `tab` stay open; \
+         a canonical reader's queued lines (a shell's type-ahead) never refuse; and nor does \
+         a lone signal character (key ctrl+c, ctrl c, feed 03 — the tty's own intr, quit and \
+         susp) while the tty has ISIG on (a cbreak program) and the kernel can take it now \
+         (no spill ahead of it, room in the queue), because the line discipline turns it \
+         into a signal as it is written and it never queues — in raw mode it is a byte like \
+         any other, refused, and `signal int` is the interrupt. A leading \
+         unread=ok (send and key only, in any order beside the other options) queues \
+         anyway; any other value, or a second one, is `ERR usage`. The guarded press is delivered on the control thread against the \
          target's own terminal and PTY (like every `@<sid>` input verb), so for the tab on \
          screen it skips the App seam's cosmetic side effects; a press that must ride the \
          seam is a plain `key`. `send if=<re> <text>` is the same guard on a raw write. \
@@ -1485,8 +1644,28 @@ pub const VERBS: &[VerbSpec] = &[
         Signal,
         Status,
         Session,
-        "signal <sig>: send a signal to the foreground process group",
-        "",
+        "signal <sig> [pid=<n>]: send a signal to the foreground process group",
+        "- <sig> is int|quit|tstp|hup|term|kill|cont (c, z and the sig-prefixed names too). \
+         `pid=<n>` sends it to exactly that process, and only while it leads the \
+         foreground process group (else ERR, nothing sent); refused under a hold \
+         like every form. cont resumes a stopped job, the remedy `ERR busy input-unread … \
+         input=stopped` names; term is the restart for a program that has stopped reading \
+         its input, and int interrupts one whose tty is raw (where `key ctrl+c` is a byte \
+         queued behind the unread input). Never refused by the unread-input gate. term, \
+         kill, hup and quit first DISCARD the input a raw-mode (or stopped) job left unread \
+         — keys typed at a frozen program outlive it, and the shell that takes the tty back \
+         would run them as commands — and say so: `OK signalled pgrp <n> discarded=<bytes>` \
+         (`pid <n>` with pid=), counting the kernel's queue and what aterm itself still held \
+         behind a full one (a paste's tail), both dropped. Canonical (line-mode) type-ahead \
+         is the shell's and is kept; int, tstp and cont discard nothing (macOS; elsewhere \
+         nothing is discarded). A dropped queue is not a read: a program published \
+         `input=stalled` that lives through term, hup or quit (a Node program's SIGTERM \
+         listener never runs while its JS thread spins) stays published, with `status \
+         input=stalled input_bytes=0` and every input verb refused, until it ends, draws, \
+         reads a key sent since, or stops spinning, and after 5 s its attention names `signal \
+         kill`. The reply does not wait for the \
+         program to end. POSIX only: Windows answers `ERR signal unsupported on this \
+         platform`",
     ),
     // app / GUI drive (selector routes to the instance's front window)
     v(
@@ -1802,8 +1981,9 @@ pub const VERBS: &[VerbSpec] = &[
          driver that reads `flow=1.00` is looking at a human mid-flow and can hold its \
          turn. The three are 0 on every style but rainbow kitty, whose spine prices them. \
          While rainbow kitty owns the frame the row ends with `v2_quads= v2_halos= v2_stars= \
-         v2_meteors= v2_bridged= ribbon_retired= ribbon_followed=` — the frame's quads, halos, \
-         live stars and meteors; `v2_bridged=`, the cells the engine's echo ledger relit for a \
+         v2_meteors= v2_bridged= ribbon_retired= ribbon_followed= ribbon_follow_missed=` — the \
+         frame's quads, halos, live stars and meteors; `v2_bridged=`, the cells the engine's \
+         echo ledger relit for a \
          late echo the ring scored `declined`; `ribbon_retired=`, the window's cumulative count \
          of ribbon cells taken off by CONTENT: the host saw the glyph under a cell change (a row \
          rewritten with other text — the band melts in 120 ms) or go (a submit that cleared \
@@ -1811,13 +1991,22 @@ pub const VERBS: &[VerbSpec] = &[
          swoosh, drawn into the hand over 0.64 s) — the number that says a band went out \
          because its text moved out from under it or went, as against expiring (a redraw that \
          puts the same text back counts nothing, and a caret relocation the gate declined \
-         over a row whose text still stands retires nothing: only the mirror moves); and \
+         over a row whose text still stands retires nothing: only the mirror moves); \
          `ribbon_followed=`, its twin: the cumulative count of ribbon cells the FOLLOW PASS \
          carried to another row WITH their text (an input box re-laid one or two rows up or \
          down with the same glyphs at the same columns — Claude Code's bottom-anchored \
          composer growing a row without a scroll), clocks intact, nothing melted; a run \
          carried off the caret's row (the box grew under a typing hand) then flows into the \
-         fold and is gone 1.34 s after the fold. \
+         fold and is gone 1.50 s after the fold; and `ribbon_follow_missed=`, the cumulative \
+         count of ribbon cells whose glyphs left their row while their run's text ARRIVED on a \
+         neighbouring row (two or more of its glyphs, and no fewer than half of those neither \
+         already standing there when they were typed nor carried by a wrap to the start of \
+         their own row, now at their own columns) and the \
+         follow pass still did not carry it, because the arrivals were not one block — each \
+         such cell is left to the content witness where it stood, which melts it (or, for a \
+         run with glyphs still standing, releases it) instead of the band going with its \
+         text, so `0` is the healthy reading and a climbing count over a growing composer is \
+         the band vanishing in a blink. \
          In a `--headless` instance the engine ticks only while a capture drives its clock (`image` \
          after each key, or a `video`), and a caret on ROW 0 has no sky band there (no chrome \
          head band above the grid), so `v2_stars=0` on row 0 is the geometry, not a dark trail \
@@ -1869,8 +2058,8 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [connected=…]:",
-        "mint a new session (a tab, or split the focused pane), reply OK <sid> - immediately \
+        "spawn [window=] [raise=<t|f>] [cwd=] [split=<v|h>] [identity=<name>|-] [connected=…]: OK <sid>",
+        "mints a session: a tab, or `split=v|h` divides the focused pane; the sid is immediately \
          addressable. AIM it with window=<id> (an id from `inspect app/v1 tabs`) or `@<sid> \
          spawn` (the window hosting <sid>; window= wins); split= then divides THAT window's \
          focused pane. raise= defaults to true when no window was named (the `aterm new-tab` \
@@ -1969,8 +2158,7 @@ pub const VERBS: &[VerbSpec] = &[
          (`ack … verdict=`), the asker's own bridge's `expired` — and `since=` may then be \
          omitted. `await agent <word>[,<word>…]` — the SERVER'S agent verdict (`status agent=`, \
          words busy|prompt|question|idle|survey|unknown|-, and `wall` for any wall or \
-         `wall:<kind>` for one; `limited`, DEPRECATED, is any limit wall — usage-session, \
-         usage-weekly, model-bucket, spend — the word it named before the walls were): LATCHED, so a verdict already in \
+         `wall:<kind>` for one): LATCHED, so a verdict already in \
          the set answers at once, else it parks until the status sweep publishes one (no \
          watcher armed, no screen read by the waiter); answers `OK agent <word> rev=<n>`, and \
          an unknown word is `ERR usage`. And `await consent` \
@@ -2005,12 +2193,14 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Push,
         Session,
-        "subscribe @<sel>[,...]|@* <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES;",
+        "subscribe @<sel>[,...]|@* <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES/MAIL;",
         "streams=screen,cursor,cells,bytes,events,mail,sessions, at least one of them (a modifier-only \
          list is `ERR usage`); events = the per-target digest (`EVENT <local> turn|block-complete|\
          meta|title|bell …`, `EVENT <local> agent <word> rev=<n> gen=<e.s> fp=<hex16>` each \
          time the server's agent \
-         verdict moves (`status agent=`), then, as the session is retired, `EVENT <local> closing reason= by=` \
+         verdict moves (`status agent=`), `EVENT <local> human` when a person starts typing, \
+         clicking or scrolling in it through a window after 30 s without (`status human_ms=`), then, as the \
+         session is retired, `EVENT <local> closing reason= by=` \
          — the `exits` row, and this watch is the only wire path that carries it — before its \
          one `EVENT <local> exited`, not necessarily adjacent: a title or bell frame of the same \
          watch can land between the two — and `GAP <local> events-dropped=<n>` first when the \
@@ -2018,7 +2208,14 @@ pub const VERBS: &[VerbSpec] = &[
          session-created <sid>` / \
          `EVENT * session-exited <sid> reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|\
          unknown>` for sibling spawns/exits, no `ls` polling — the reason is the `exits` ledger's, \
-         a trailing additive token; `app-quit` is reserved, not produced today; and `EVENT * \
+         a trailing additive token; `app-quit` is reserved, not produced today; on `@*`, which \
+         watches up to 256 sessions, adopts every other one — left over at the handshake or \
+         created later — once the cap has room, and writes each watch's `sub <local> <sid>` ack \
+         only after that watch is seeded, a session's `session-created` comes after its ack (or, \
+         for one already gone, beside its `session-exited`), except that one the 256-target cap \
+         leaves unwatched is announced at once as `session-created <sid> watch=deferred` and, if a \
+         slot frees, acked with no second announcement — the marker rides that one line, so a \
+         reader that must know what it does not watch goes by the acks it holds; and `EVENT * \
          fabric-retire <sid>` for a `fabric retire` request the bridge is to act on) and is OWNER-ONLY \
          because it reports \
          the whole roster, not just your targets — a scoped edge asking for it gets `ERR denied`; \
@@ -2029,7 +2226,8 @@ pub const VERBS: &[VerbSpec] = &[
          add `trim` INSIDE <streams> too (`screen,trim`; trailing is `ERR unknown subscribe arg`) \
          to stop each screen DELTA after its last non-blank row — `screen <nrows>` is then the \
          count sent (inert without screen); mail = one `MAIL <local> id=<n> off=<n> from=<p> \
-         kind=<k>[ re=<n>]` line per row DELIVERED into that session's inbox, METADATA ONLY (no \
+         kind=<k>[ re=<n>][ topic=<t>]` line per row DELIVERED into that session's inbox, \
+         METADATA ONLY (no \
          body, ever — read the words with `inbox get`), preceded by `GAP <local> mail-dropped=<n>` \
          when the ring evicted rows the subscriber had not been shown; it is a LIVE stream seeded \
          to the ring's high, so it replays no backlog (`await inbox` is what reads history), and \
@@ -2059,9 +2257,14 @@ pub const VERBS: &[VerbSpec] = &[
          EMPTY by default and an empty set receives nothing. `ls` (and the bare form) answers `OK <n>` then one \
          `topic <t> since=<head|@<off>>` row each; `add` and `drop` answer ONE STATUS LINE \
          (see `framing_of`) and each pushes `EVENT <local> topic add|drop …` on the `events` \
-         digest, which is how this session's bridge learns of the change AT ONCE — a `drop` then \
-         an `add` are two events in order, so the second's `since=` is read. `add` answers `OK <t> since=<head|@<off>> added=<0|1>` — \
-         `since=head` (the default) takes only records published from now on, `since=@<off>` \
+         digest, which is how this session's bridge learns of the change AT ONCE (a session its \
+         push lane does not watch, past the 256-target cap, has no watch to push it; the bridge \
+         reads the `topic ls` of every session whose watch it holds no ack for on every 2 s \
+         roster round). On a watched session a `drop` then an `add` are two events in order, \
+         so the second's `since=` is read; a polled session is read as its final set, so a \
+         drop and re-add between two rounds keeps the topic's first `since=`, and its \
+         `since=head` resolves when the round reads it. `add` answers `OK <t> since=<head|@<off>> added=<0|1>` — \
+         `since=head` (the default) takes only records published from then on, `since=@<off>` \
          replays the topic from that broker offset so a session joining late can read what \
          it missed. `drop` answers `OK <t> dropped=<0|1>`. The topic is \
          `[a-z0-9][a-z0-9._-]{0,31}`; anything else is `ERR usage`. A delivered broadcast is \
@@ -2070,6 +2273,45 @@ pub const VERBS: &[VerbSpec] = &[
          pushed on `subscribe … mail` with `topic=<t>` too. OWNER, not Read: adding a topic \
          changes what reaches an agent's inbox, which is the halt's authority class rather \
          than a read's. The set survives a bridge restart and a seamless update.",
+    ),
+    // The TYPED RE-KEY (2026-09-26, aterm-gui `shell_rekey::typed`): the live agent
+    // upgrade heals a shell whose integration is degraded in the relaunch line it
+    // types at that shell's prompt. Owner-only because it hands out a key that
+    // lets a session's OSC 133/633 marks through; Session target because it names
+    // the tab; `Owner` op because no fine op authorizes minting mark authority.
+    va(
+        "rekey",
+        Owner,
+        Status,
+        Session,
+        OwnerOnly,
+        "rekey shell=<pid> | withdraw: re-key a degraded tab",
+        "For a tab whose `status integration=` reads `degraded` — its shell signs its OSC \
+         133/633 marks with a nonce this window does not hold, and its script predates the \
+         re-key channel — while `<pid>` leads the tab's foreground process group (its SHELL \
+         holds the terminal, not a program): a fresh key is written to a one-use file \
+         (`0600`, created exclusively, never through a symlink, in the private control dir) \
+         and authorized as one the shell has not taken, and the reply is `OK rekey ttl=<s> \
+         path=<path>` — the PATH, never the key, the path last and whole. A line typed at the \
+         shell's prompt then reads the file into the script's globals and removes it (the \
+         harness's relaunch line does — the live agent upgrade's, a restart in place's and a \
+         relaunch on exit's); `integration=` reads `on` from the first \
+         mark signed with the key, not before. THE TYPED UPGRADE (2026-09-26): for a tab \
+         whose shell runs an integration from before LOADERS (`status \
+         integration_rev=frozen`, or no loader known for it), the file also names this \
+         build's script folder and the session's body pointer, and the line sources this \
+         build's loader, upgrading the shell in place — issued for such a tab when its \
+         integration is `on` too, with the key it already signs with in the file (no key \
+         moves, and nothing is authorized). Refused, nothing written: `ERR rekey \
+         integration=on` (a working key is never moved: a shell with a loader, whose next \
+         integration arrives through its pointer), `integration=off`, `pending` (the \
+         re-key channel's own key waits for the shell's next prompt), `ERR pid <n> is not the \
+         foreground process group`. `rekey withdraw` settles the waiting key by its file: \
+         still there, the file is removed and the authorization the key replaced restored \
+         (`OK rekey withdrawn`); gone, the shell read it and the key stays (`OK rekey \
+         taken`); `OK rekey none` when nothing waits. The window settles every key itself \
+         `ttl=` seconds after issuing it, and when the session closes. Needs an `@<sid>`. \
+         POSIX only",
     ),
     v(
         "inbox",
@@ -2457,8 +2699,8 @@ pub const VERBS: &[VerbSpec] = &[
          whether a supervisor is armed in this process (the latch that flips `post`'s refusal \
          from `no-bridge=1` to `queued=1`), `command=` the argv it runs — or, unarmed, the one \
          the instance was launched with. `fabric attach [<command...>]` arms the supervisor NOW, \
-         without a relaunch: with no argument it uses the `[fabric] command` / \
-         `$ATERM_FABRIC_COMMAND` the instance was LAUNCHED with (`ERR fabric no command` when \
+         without a relaunch: with no argument it uses the `[fabric] command` the instance was \
+         LAUNCHED with (`ERR fabric no command` when \
          there was none — a command added to the config after launch is not re-read; pass it), \
          otherwise the given words are the argv, split on whitespace exactly like the config \
          string and never through a shell. `OK attached command=<pct>` means the supervisor \
@@ -2513,19 +2755,40 @@ pub const VERBS: &[VerbSpec] = &[
          identity=<name>` - the directory its agents keep their login in; `identities` lists \
          them), `-` for the human's own agent config - and for a shell adopted from a build \
          without the field, which keeps its env and drops the label. `path=<frozen|live>`: \
-         whether the session's shell fronts aterm's managed `agents/` on PATH - \
-         `frozen` is a shell spawned by a build before the self-healing sessions \
-         (2026-09-16) and adopted across every update since, so `claude`/`codex` typed in \
-         it run the FOREIGN copies (a native install, a brew cask) until \
-         `. ~/.aterm/shell.d/00-atpkg.zsh` is typed there; an upper bound (sourcing the hook \
-         is not reported back, so the mark leaves with the tab), the same one the \
-         managed-current row's \"N tab(s) from before this update\" count is - this column \
-         names the tab. After it (2026-09-23): `program=<name|-> agent=<word|-> \
+         whether the session's shell fronts aterm's managed `agents/` on PATH, so \
+         `claude`/`codex` typed at its prompt run the managed build - `frozen` = they \
+         resolve to a FOREIGN copy (a native install, a brew cask). MEASURED where it can \
+         be (2026-09-24): the environment of a program the shell itself started names the \
+         PATH the shell exports. A live reading wins and lowers the adoption mark; a frozen \
+         one is the shell's only once a SECOND job agrees (one job's `PATH=... cmd` \
+         override reads frozen too) and never raises the mark; a shell whose children have \
+         not been read keeps the mark it was adopted with (a shell spawned by a build before \
+         the self-healing sessions, 2026-09-16, is carried as `frozen`). \
+         `path_evidence=` (below) says which. A tab whose foreground is an agent is \
+         never the place to type a shell line into. After it (2026-09-23): \
+         `program=<name|-> agent=<word|-> \
          agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> \
          agent_fp=<hex16|->`, the foreground program and \
          the server's agent verdict exactly as `status` prints them, read from the session \
          (no lock, no hop), so one read names every agent tab and what it waits on. Then \
-         `supervisor=<pct|->`, the live `meta set supervisor` claim, last. One main-thread hop per call, not per session; the client `ls` \
+         `human_ms=<ms|->` (since a person last typed, clicked or scrolled in it through a \
+         window, as \
+         `status` prints it) and \
+         `supervisor=<pct|->`, the live `meta set supervisor` claim. Then the OWNER'S \
+         COLUMNS (2026-09-24), last: `path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->` \
+         - how `path=` was learned (read that many ms ago from a child of the shell; \
+         `unconfirmed` = one job read frozen, which is not yet taken as the shell's; the \
+         adoption mark, never measured; `-` = a shell a self-healing build spawned); \
+         `copy=<managed|foreign|->` - for `claude`/`codex` in front, whether the build it \
+         runs is aterm's managed one (from the store) or a foreign copy (the native \
+         installer's `~/.local/share/claude/versions/<v>`, a brew cask); \
+         `upgrade=<-|<state>/<to>/<why>/<age>>` - the live agent upgrade of the \
+         conversation in the tab (`aterm harness upgrade --status` has the rest): state \
+         `pending`, `announced`, `restarting`, `deferred`, `skipped`, `stalled` or `done`, \
+         the target version, the wait or stall (`settling`, `attended`, `awaiting-ready`, \
+         `gave-up`, `overdue` ...), and how long the session has been behind (for `done`, \
+         how long ago it finished). One main-thread hop per call, not per session; the \
+         client `ls` \
          relays these lines verbatim and `windows` folds them per window. The menu-bar \
          status item's fleet scan reads this on every open under a 2 s per-peer budget, so \
          a peer whose main thread cannot answer inside it drops out of that menu rather \
@@ -2545,7 +2808,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "PRESENCE: per session driving= watchers=<n> turns=<n> - the hand + the eye.",
+        "OK <n> local sid driving= watchers= turns= state nonce= fgpgid=",
         "Owner-only. Each row has `nonce=<hex32>`, the session's public launch nonce, \
          and ends in `fgpgid=<pid|->`, the PTY's current foreground process group \
          (`-` when the kernel cannot read it). Both are read without the `sessions` \
@@ -2685,9 +2948,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "connect dst=<sid> src=<sid> [kind=pull|push|both]:",
-        "declaratively SET the session connection src->dst (mint the missing ops, revoke the \
-         excess, so the rows equal exactly kind; default both), reply `OK read-screen=<hex> \
+        "connect dst=<sid> src=<sid> [kind=pull|push|both]: set the src->dst session connection",
+        "(declarative: mint the missing ops, revoke the excess, so the rows equal exactly kind; \
+         default both), reply `OK read-screen=<hex> \
          write-input=<hex> signal=<hex>` with only the minted ops present (Owner only)",
     ),
     va(
@@ -2706,8 +2969,8 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "the instance's aggregated session-connection graph:",
-        "OK <n> + one `<src> <dst> <op>` row per live edge across EVERY session's table (--json \
+        "the instance's session-connection graph: OK <n> + `<src> <dst> <op>` per live edge",
+        "across EVERY session's table (--json \
          groups per pair: {\"flows\":[{src,dst,ops:[..]}]}). Owner-only",
     ),
     va(
@@ -2793,6 +3056,64 @@ pub const ARTIFACT_REPLY_ACK_PREFIX: &str = "ACK ";
 /// payloads use the same ceiling so they never emit a reply their own client
 /// must reject.
 pub const MAX_CONTROL_REPLY_LINE_BYTES: usize = 8 << 20;
+
+/// THE SCREEN'S GENERATION: `(invalidation epoch, content seq)`, spelled
+/// `<epoch>.<seq>` on the wire — `status gen=`, `text --json`'s `"gen"`,
+/// `agent_gen=`, and the `if-gen=` fence a typed act (`key`, `send`) names.
+///
+/// ONE READER for both ends: the server parses `if-gen=` with
+/// [`ScreenGen::parse`] and a client deciding whether a read's `gen` can be
+/// sent back as a fence asks the same function, so a client never sends a
+/// fence the server answers with `ERR usage` (the supervisor's own digits-only
+/// check, which this replaced, passed an epoch past `u64::MAX`).
+///
+/// WHY NOT `seq=` ALONE. The content seq is the ACTIVE grid's counter, and
+/// every alternate-screen entry installs a fresh grid whose counter starts
+/// again at 1 — so a TUI that leaves and re-enters the alternate screen and
+/// draws a second dialog with the same number of writes shows the first
+/// dialog's `seq=` over a different screen (measured on a private headless
+/// aterm: box A `ls -la /tmp/work` and box B `rm -rf /tmp/work` both read
+/// `seq=15`, and a fence on that value pressed into B). The epoch is the
+/// terminal's invalidation epoch, monotonic for the terminal's life and
+/// advanced by every screen switch and by RIS, so within one epoch the grid is
+/// one grid and its seq only grows: the pair names a screen generation that
+/// never repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenGen {
+    /// The terminal-wide invalidation epoch.
+    pub epoch: u64,
+    /// The active grid's content seq within that epoch.
+    pub seq: u64,
+}
+
+impl ScreenGen {
+    /// Parse the wire spelling `<epoch>.<seq>` (two unsigned decimals, each
+    /// fitting a `u64`); any other shape — one number, a sign, a third part,
+    /// an overflow — is `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let (epoch, seq) = value.split_once('.')?;
+        let decimal = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
+        Some(Self {
+            epoch: decimal(epoch)?,
+            seq: decimal(seq)?,
+        })
+    }
+}
+
+impl core::fmt::Display for ScreenGen {
+    // Plain `write_str`s, not `write!`: see `crate::trust_fmt` for why this
+    // crate builds no runtime-argument `format_args!`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.epoch.to_string())?;
+        f.write_str(".")?;
+        f.write_str(&self.seq.to_string())
+    }
+}
 
 /// Validate the fixed-width lowercase/uppercase hexadecimal nonce grammar used
 /// by guarded artifact acknowledgement frames.
@@ -2968,6 +3289,37 @@ pub fn catalog_lines_full() -> impl Iterator<Item = String> {
 mod tests {
     use super::*;
 
+    /// The wire spelling round-trips, and every other shape — including a part
+    /// that overflows `u64` — is refused, so a client that asks this reader
+    /// never sends a fence the server refuses.
+    #[test]
+    fn screen_gen_parses_exactly_the_wire_spelling() {
+        let g = ScreenGen::parse("3.15").expect("canonical spelling");
+        assert_eq!(g, ScreenGen { epoch: 3, seq: 15 });
+        assert_eq!(g.to_string(), "3.15");
+        let max = ScreenGen {
+            epoch: u64::MAX,
+            seq: 0,
+        };
+        assert_eq!(ScreenGen::parse(&max.to_string()), Some(max));
+        for bad in [
+            "15",
+            "3.",
+            ".15",
+            "3.15.1",
+            "-3.15",
+            "3.+15",
+            "+3.15",
+            "x.1",
+            " 3.15",
+            "",
+            "18446744073709551616.1",
+            "1.18446744073709551616",
+        ] {
+            assert_eq!(ScreenGen::parse(bad), None, "{bad:?}");
+        }
+    }
+
     /// Every json-capable verb must be a REAL table row, and a `Read` one — a
     /// typo or a removed verb would otherwise sit here silently doing nothing.
     #[test]
@@ -3031,6 +3383,8 @@ mod tests {
         // + rows); its `forget` sub-form answers one status line.
         assert_eq!(framing_of("identities", "identities"), Lines);
         assert_eq!(framing_of("identities", "identities worker"), Lines);
+        // A roster of the whole instance: answered before any session resolves.
+        assert_eq!(spec("identities").map(|s| s.target), Some(Target::Meta));
         assert_eq!(framing_of("identities", "identities forget worker"), Status);
         assert_eq!(
             framing_of("identities", "identities forget worker confirm=worker"),
@@ -3091,27 +3445,6 @@ mod tests {
         assert!(!artifact_reply_requires_ack("text", "text"));
         assert!(valid_artifact_ack_nonce("00112233445566778899aabbccddeeff"));
         assert!(!valid_artifact_ack_nonce("artifact"));
-    }
-
-    /// `search` matches whole soft-wrapped runs, so two things about a match are
-    /// not what a row-at-a-time reader would assume: a hit can run past the grid
-    /// width, and `^`/`$` bind to the reader's logical line rather than to a grid
-    /// row. A client that knows neither reads the wrong cells and calls find
-    /// broken, so the help line has to carry both — this is the seam that keeps
-    /// the catalog honest about the semantics the engine actually implements.
-    #[test]
-    fn search_help_states_where_a_wrapped_match_runs_and_where_anchors_bind() {
-        // `help_line()` is summary + detail: the soft-wrap semantics live in the
-        // detail half, which `help --full` and `help search` both render.
-        let help = spec("search").unwrap().help_line();
-        assert!(
-            help.contains("SOFT WRAP") && help.contains("col+len"),
-            "the help must say a straddling hit's col+len runs past the width"
-        );
-        assert!(
-            help.contains("^") && help.contains("$") && help.contains("LOGICAL"),
-            "the help must say regex anchors bind to the logical line"
-        );
     }
 
     #[test]
@@ -3351,195 +3684,6 @@ mod tests {
         assert!(spec("image").unwrap().entry_lines().len() > 5);
     }
 
-    /// The §6 terminology rule: the catalog uses "connection" for BOTH network
-    /// dials and session fabric, so the connection-grain verbs must say
-    /// "session connection" and the dial rows "network-drive connection" —
-    /// one help catalog never overloads the bare word.
-    #[test]
-    fn connection_help_terminology_never_overloads_the_bare_word() {
-        for v in ["connect", "disconnect", "flows", "raise", "spawn"] {
-            let help = spec(v).unwrap().help_line();
-            assert!(
-                help.contains("session connection") || help.contains("session-connection"),
-                "{v} help must say \"session connection\""
-            );
-        }
-        for v in ["dial-list", "dial-token"] {
-            assert!(
-                spec(v)
-                    .unwrap()
-                    .help_line()
-                    .contains("network-drive connection"),
-                "{v} help must say \"network-drive connection\""
-            );
-        }
-    }
-
-    /// Session identities (phase 1) are documented where the wire is: the
-    /// `identities` row spells every reply of its table (list, one, forget
-    /// unconfirmed, in use, removed, unknown, usage) and the keychain rule the
-    /// review bound (`present` = a non-empty subdirectory, bytes never opened;
-    /// `left=keychain`, sign out in the agent first); `spawn` documents
-    /// `identity=` (fold, create-once, inherit, `-`, Owner-only, `meta set`
-    /// refused); `sessions` and `status` both carry `identity=<name|->` after
-    /// their last column. Pinned so the help a reader is handed cannot drift
-    /// from what the verbs do.
-    #[test]
-    fn session_identities_are_documented_on_spawn_sessions_status_and_identities() {
-        let identities = spec("identities").expect("identities is in the table");
-        assert_eq!(identities.access, Access::OwnerOnly);
-        assert_eq!(identities.framing, Lines);
-        assert_eq!(identities.target, Target::Meta);
-        assert!(
-            identities
-                .summary
-                .starts_with("identities [<name>|forget <name> [confirm=<name>]]:"),
-            "{}",
-            identities.summary
-        );
-        for phrase in [
-            "`OK <n>` then one `<name> dir=<pct> sessions=<n> agents=<prog>:present|absent,...` line",
-            "`present` means the agent's subdirectory is NON-EMPTY",
-            "bytes never opened",
-            "`agent=<prog> var=<VAR> home=<pct> files=present|absent`",
-            "`ERR confirm: identities forget <name> confirm=<name> removes <pct>`",
-            "`ERR identity in use sessions=<sid>,...`",
-            "`OK removed=<pct> left=keychain`",
-            "sign out in the agent first (`/logout`)",
-            "aterm never reads, names or deletes a keychain item it did not create",
-            "`ERR no such identity <name>`",
-            "`ERR usage: identities [<name>|forget <name> [confirm=<name>]]`",
-        ] {
-            assert!(
-                identities.detail.contains(phrase),
-                "identities detail lacks {phrase:?}"
-            );
-        }
-        let spawn = spec("spawn").expect("spawn is in the table");
-        assert!(
-            spawn.summary.contains("[identity=<name>|-]"),
-            "{}",
-            spawn.summary
-        );
-        for phrase in [
-            "`identity=<name>` (session identities)",
-            "set AFTER the env strip",
-            "folds to lowercase",
-            "this verb is the only create path",
-            "`ERR identity <name>: <why>`",
-            "INHERITS the aimed session's identity",
-            "`identity=-` opts out",
-            "`meta set identity` is refused",
-            "Owner-only like connected=",
-        ] {
-            assert!(
-                spawn.detail.contains(phrase),
-                "spawn detail lacks {phrase:?}"
-            );
-        }
-        let sessions = spec("sessions").expect("sessions is in the table");
-        assert!(
-            sessions
-                .detail
-                .contains("`identity=<name|->`: the agent identity the session was spawned under"),
-            "{}",
-            sessions.detail
-        );
-        let status = spec("status").expect("status is in the table");
-        // `identity=` follows the fabric tail; round 19's presence tail
-        // (`hand= level= story=`) follows IT, the same additive way.
-        assert!(
-            status
-                .detail
-                .contains("fabric_link_age_ms=<n|-> identity=<name|-> hand="),
-            "{}",
-            status.detail
-        );
-        assert!(
-            status.detail.contains(
-                "`identity=<name|->` is the agent identity the session was spawned under"
-            ),
-            "{}",
-            status.detail
-        );
-    }
-
-    /// The placement columns are documented where the wire is (F2/F5): `sessions`
-    /// spells every `window=` value, says a headless instance is `window=0` (it
-    /// owns logical window 0, the one `dims` names) and NOT `none`, and names
-    /// the sanitized `detail=`; `status` says why it carries no `window=` (it is
-    /// polled, and the window lives on the main thread). Pinned so the help a
-    /// reader is handed cannot drift from what the verbs do.
-    #[test]
-    fn placement_columns_are_documented_on_the_roster_and_not_on_status() {
-        let sessions = spec("sessions").expect("sessions is in the table");
-        assert!(
-            sessions
-                .summary
-                .ends_with("meta= nonce= window= active= wfocus= detail= identity= path="),
-            "{}",
-            sessions.summary
-        );
-        for phrase in [
-            "`nonce=<hex32>` is the session's PUBLIC launch nonce",
-            "`window=<id|none|->`",
-            "`none` = a session no window holds",
-            "`-` = the main thread could not be asked",
-            "A `--headless` instance owns one logical window, id 0",
-            "`window=0 geometry=headless`",
-            "so its sessions read `window=0`, never `none`",
-            "`active=<1|0|->`",
-            "`wfocus=<1|0|->`",
-            "`detail=<pct|->`",
-            "never an argument",
-            "a COMPOUND line reads the segment that RUNS",
-        ] {
-            assert!(
-                sessions.detail.contains(phrase),
-                "sessions detail lacks {phrase:?}"
-            );
-        }
-        let status = spec("status").expect("status is in the table");
-        assert!(
-            status
-                .detail
-                .contains("No `window=` here: `status` is polled"),
-            "status must say why it carries no window="
-        );
-        assert!(
-            status
-                .detail
-                .contains("`detail=` is the sanitized RUNNING command"),
-            "status documents the populated detail="
-        );
-        // Honesty (Phase 4, revised): `detail=` names the program of the
-        // segment that RUNS — measured `cd ~/ay && exec claude` → `claude`,
-        // where the first-word reading answered `cd` in exactly the launch
-        // shape the supervise-agent skill recommends — and a line that OPENS
-        // with a shell keyword still reads the keyword: `for i in 1 2 3; do
-        // ...; done` → `detail=for`. Both entries must say both rules, or the
-        // help promises a reading the reducer never produces.
-        for entry in [sessions, status] {
-            for phrase in [
-                "a COMPOUND line reads the segment that RUNS",
-                "the last of an `&&`/`;` chain, the first of an `||` chain",
-                "one wrapper (`sudo`, `env`, `exec`, ...) unwrapped",
-                "`cd ~/ay && exec claude`",
-                "a line that OPENS with a shell keyword",
-                "`for i in 1 2 3; do ...; done`",
-                "a keyword opening a LATER segment reads the same way",
-                "`cd x && for ...; done`",
-                "never its closer `done`",
-            ] {
-                assert!(
-                    entry.detail.contains(phrase),
-                    "{} must name the measured compound-command reading {phrase:?}",
-                    entry.name
-                );
-            }
-        }
-    }
-
     /// The `Access` exceptions are the single source of truth for the scope gate the
     /// dispatch used to hardcode. Pin BOTH sets exactly so the table↔dispatch binding
     /// is total: a verb cannot become owner-only / any-scope-meta without being
@@ -3565,6 +3709,9 @@ mod tests {
                 // changes what lands in a session's inbox — the halt's authority
                 // class, not a read's.
                 "topic",
+                // The typed re-key: it hands out a key that lets a session's marks
+                // through, so a child edge may not mint one.
+                "rekey",
                 // The drive halt. Owner-class so the LOCAL owner can halt its own
                 // drivers; the handler keeps the FLEET hold (set, replace, lift)
                 // bridge-issued only — see `Access::OwnerOnly`'s doc.
@@ -3714,202 +3861,6 @@ mod tests {
         assert_eq!(framing_of("outbox", "outbox sent s-a 3 off=91"), Status);
     }
 
-    /// `hold` and `deliver` are the fabric's whole safety story, so the catalog an
-    /// agent (or a human at `help hold`) reads must state it: which verbs the halt
-    /// refuses, which stay answerable, that the physical keyboard is untouched, and
-    /// that a dead bridge is itself a halt. Help that omits the exemptions invites a
-    /// driver to treat `ERR halted` as fatal and stop escalating.
-    #[test]
-    fn hold_help_states_the_halt_surface_and_its_exemptions() {
-        let hold = spec("hold").expect("hold ships").help_line();
-        for phrase in [
-            "ERR halted",
-            "from ANY scope",
-            "operator-propose-bin",
-            // `tab close [N]` RETIRES a session, which is the third act §5.3 says
-            // a halt refuses — and the one a driver refused `close` substituted.
-            "close invoke hwkey pane tab operator-propose-bin",
-            "`tab` is, because `tab close [N]` RETIRES a session",
-            "`post`, `inbox seen`, `meta set`, `lease` and every read verb stay answerable",
-            "physical keyboard is untouched",
-            "reason=fabric-lost",
-            "must not depend on a killable process staying alive",
-            // The LOCAL halt: which connection gets which origin, and the one act
-            // the Owner token can never perform — touching a fleet hold.
-            "From the Owner token",
-            "`origin=local` is the default and the only origin accepted",
-            "an Owner-issued act against a standing `origin=fleet` hold, `on` or `off`, is `ERR \
-             denied`",
-            // And what the local halt is NOT, stated where an agent reads it: the
-            // token that sets it is the one the halted agent holds too.
-            "NOT a containment stop",
-            "the halted session's own agent can lift a local hold",
-            "only a reconnecting bridge's `hold off` lifts it",
-        ] {
-            assert!(hold.contains(phrase), "hold help lacks {phrase:?}");
-        }
-        // `deliver` says WHY it is not an Owner verb, and `hold` says why its FLEET
-        // form is not, in the table that gates them — the reasoning has to live
-        // where the classification does.
-        let deliver = spec("deliver").expect("deliver ships").help_line();
-        assert!(deliver.contains("BRIDGE-ONLY") && deliver.contains("Idempotent on `off=`"));
-        assert!(deliver.contains("ERR quota") && deliver.contains("64 unread rows"));
-        assert!(hold.contains("Owner scope is what every"));
-        // `post` documents the edge refusal, which is a per-handler check no class
-        // in this table expresses.
-        assert!(
-            spec("post")
-                .expect("post ships")
-                .help_line()
-                .contains("REFUSED to an edge-token connection"),
-            "post help must state the Edge refusal"
-        );
-    }
-
-    /// EVERY FABRIC ROW STATES THE BOUND IT IS ACTUALLY HELD TO.
-    ///
-    /// aterm ships no evidence manifest, so these rows ARE its claims — and the
-    /// help an agent reads with `help <verb>` is the only place a driver can learn
-    /// a contract. Each assertion below replaced a sentence that promised more
-    /// than the code delivered, and each promise had a reachable failure:
-    ///
-    /// * `inbox get` said "the FULL body" while the bridge had begun delivering
-    ///   over-budget bodies TRUNCATED, so the answer has to say so, and the row
-    ///   has to say that it does. (Round 15 then made the rest recoverable —
-    ///   `inbox get @<off>` fetches the record whole from the bus — and the row
-    ///   that said "NOT recoverable by any verb" would now send an agent away
-    ///   from the one verb that recovers it; so it must say where the rest IS.)
-    /// * `deliver` said "exactly-once at the endpoint" with no qualifier over a
-    ///   1024-offset dedup window that ordinary refills reach, and stated its
-    ///   quota per `from=` when `from=`'s first half is the sending node's own
-    ///   word.
-    /// * `post` answered a still-queued message with a bare `ERR fabric
-    ///   disconnected`, which reads as "not sent" — and the remedy for "not sent"
-    ///   is to send again, into an inbox with no idempotency key. The `queued=1`
-    ///   that fixed it was then stated UNCONDITIONALLY, over a `fabric absent`
-    ///   that on an instance with no `[fabric] command` is permanent: the row told
-    ///   an agent not to re-post and to wait for a bridge that would never exist,
-    ///   which is why the two states now carry different tokens.
-    /// * `inbox seen` moves the LISTED state as well as the handled watermark,
-    ///   which is what releases a sender's quota; the two rows read as if the
-    ///   watermarks were independently controlled.
-    /// * `send`'s duplicate reply is framed per verb (`OK 0 dup=1` for a
-    ///   Lines/Bytes verb), and `turn`'s duplicate carries none of the verdict
-    ///   fields its own row promises.
-    /// * `outbox` is bounded in bytes across all sessions, not only by `<max>`.
-    #[test]
-    fn the_fabric_rows_state_the_bounds_they_are_held_to() {
-        let help = |verb: &str| {
-            spec(verb)
-                .unwrap_or_else(|| panic!("{verb} ships"))
-                .help_line()
-        };
-
-        let get = help("inbox get");
-        assert!(
-            !get.contains("FULL body"),
-            "`inbox get` cannot promise a body the bridge may have cut"
-        );
-        assert!(get.contains("truncated=1") && get.contains("len=<true-size>"));
-        assert!(
-            !get.contains("NOT recoverable") && get.contains("`inbox get @<off>` fetches them"),
-            "the row must say where the rest is and which verb fetches it, not merely \
-             that it is missing"
-        );
-        assert!(
-            get.contains("whole up to 256 KiB"),
-            "a fetch by offset answers the WHOLE body, in chunks, up to the endpoint's bound"
-        );
-        assert!(
-            !help("inbox").contains("NOT recoverable"),
-            "the `inbox` row must not contradict `inbox get @<off>`"
-        );
-
-        let inbox = help("inbox");
-        assert!(
-            inbox.contains("[truncated=1]"),
-            "the row grammar omits the marker"
-        );
-        assert!(inbox.contains("also LISTS every row at or below"));
-        assert!(
-            inbox.contains("counts UNHANDLED rows"),
-            "`dropped=` counts past the HANDLED watermark, not the listed one"
-        );
-
-        assert!(help("inbox seen").contains("RELEASES the sender's per-peer quota"));
-
-        let deliver = help("deliver");
-        assert!(
-            deliver.contains("over the last 1024 delivered offsets"),
-            "the exactly-once claim must carry its window"
-        );
-        assert!(deliver.contains("reappears as a FRESH row"));
-        assert!(
-            deliver.contains("ATTESTED PEER") && deliver.contains("cap-forced `<src>`"),
-            "the quota is per peer, not per `from=` string"
-        );
-
-        assert!(
-            help("post").contains("queued=1"),
-            "a `--wait` refused for want of a link must not read as `not sent`"
-        );
-        assert!(
-            help("post").contains("no-bridge=1")
-                && help("post").contains("none is coming ON ITS OWN")
-                // The THIRD outcome. It was missing entirely, and it means QUEUED:
-                // an agent that reads a timeout as a failure re-posts, and `post`
-                // has no idempotency key, so the peer gets the task twice.
-                && help("post").contains("ERR timeout id=<n>")
-                // The retired verdict is the one outcome that is NOT queued, and the
-                // row claimed there were three. An agent that believed it reported a
-                // post nothing will ever publish as queued.
-                && help("post").contains("ERR <reason> id=<n>")
-                && help("post").contains("unroutable"),
-            "…and the state where nothing WILL publish it must not read as \
-             `queued=1` either: on an instance with no `[fabric] command` the \
-             row's own advice (do not re-post, a replacement bridge will publish \
-             it) is advice to wait forever"
-        );
-
-        assert!(help("outbox").contains("BOUNDED IN BYTES"));
-        // ROUND 15: the idempotency key exists now, and the row says what it
-        // costs to leave it off rather than claiming none exists.
-        assert!(
-            help("post").contains("key=<token>")
-                && help("post").contains("dup=1")
-                && help("post").contains("without `key=`")
-                && help("post").contains("kind=expired re=<off>")
-                && help("post").contains("late=1"),
-            "the post row names the key, the dup reply, and the deadline verdict"
-        );
-        assert!(help("outbox").contains("[key=<token>]"));
-        assert!(help("outbox sent").contains("dup=1"));
-        // AS REVIEWED: a receipt is owed until it is on the bus (it rides the
-        // `outbox` peek, retired by `deliver … receipt=`), and a bare
-        // `--wait-ack` waits past `dl=` for the verdict to come back.
-        assert!(
-            help("inbox seen").contains("OWED until it is on the bus")
-                && help("outbox").contains("receipt sid=<s> rid=<n>")
-                && help("deliver").contains("receipt=<rid> off=<n|->"),
-            "the receipt's durability is stated on the three rows it spans"
-        );
-        assert!(
-            help("post").contains("else `dl=` plus 5 s"),
-            "the --wait-ack bound names the grace the verdict needs"
-        );
-
-        let send = help("send");
-        assert!(
-            send.contains("`OK dup=1` for a `Status`-framed verb") && send.contains("`OK 0 dup=1`"),
-            "the duplicate reply is framed per verb, and `send`'s row is where the \
-             key's contract is written"
-        );
-        assert!(
-            help("turn").contains("carries NONE of the verdict fields"),
-            "a duplicate `turn` answers a marker, not the verdict line its row promises"
-        );
-    }
-
     /// `copy` is the clipboard-exfil boundary and `settings` rewrites durable config
     /// — each split OUT of the coarse Read/Write class into its own op-class, so a
     /// read-only / keystroke-only edge can no longer reach them.
@@ -3928,12 +3879,17 @@ mod tests {
     /// the caller it exists for); `Meta` rejects a selector; `Read` because every
     /// fact it aggregates is one `status` already exposes a session at a time, so
     /// the verb introduces no new authority; `Lines` because it replies `OK <n>`
-    /// plus n rows. The help is the wire documentation an agent reads after an
-    /// EPERM, so it must also carry the three things that are otherwise guessed
-    /// wrong: reading it raises no dialog, per-folder state is `unknown` by
-    /// construction, and `unavailable` is a third value, not `false`.
+    /// plus n rows.
+    ///
+    /// And its help obeys the scope ruling (design §7 S4): a grant mitigates a
+    /// class of interruption for the folders it covers, and which services those
+    /// are is unmeasured, so the wire help may never say the grant ends
+    /// prompting. No grep_guard rule reads these words, and the help golden
+    /// stops only an accidental change, not a deliberate re-record. "restart" is
+    /// deliberately not in the list: the help truthfully says a per-process
+    /// grant "cannot hold across a restart".
     #[test]
-    fn privacy_is_a_headless_answerable_meta_read_that_documents_its_unknowns() {
+    fn privacy_is_a_headless_answerable_meta_read() {
         let s = spec("privacy").expect("privacy is in the table");
         assert_eq!(
             s.op, Read,
@@ -3956,28 +3912,7 @@ mod tests {
         assert_eq!(framing_of("privacy", "privacy --json"), Lines);
         assert_eq!(framing_of("privacy", "privacy"), Lines);
 
-        let help = s.help_line();
-        for phrase in [
-            "no `@<sel>`",
-            "`--headless`",
-            "raises NO dialog",
-            "`unknown` BY CONSTRUCTION",
-            "THIRD value",
-            "distinct from `off` and from `false`",
-            "`fda_scope=this_process`",
-            "`covers=app-data`",
-            "`sessions_total=` always equals the number of `session` lines",
-        ] {
-            assert!(help.contains(phrase), "privacy help lacks {phrase:?}");
-        }
-        // The scope ruling: a grant MITIGATES a class of interruption for the
-        // folders it covers. Beyond app-data (Apple's documented rule, claimed
-        // for the observing host only) which services those are is unmeasured,
-        // so the help may never say the grant ends prompting.
-        assert!(
-            help.contains("removes this class of interruption for the folders that grant covers"),
-            "the Full Disk Access claim must stay scoped to a class and to covered folders"
-        );
+        let help = s.help_line().to_ascii_lowercase();
         for overclaim in [
             "all prompts",
             "every prompt",
@@ -3987,177 +3922,8 @@ mod tests {
         ] {
             assert!(
                 !help.contains(overclaim),
-                "privacy help overclaims what a grant does: {overclaim:?}"
+                "privacy help overclaims what a grant does: {overclaim:?}\n{help}"
             );
         }
-    }
-
-    /// `await consent` starts its finite deadline at the request, while the
-    /// first completed asynchronous observation establishes its baseline. Cold
-    /// pending cannot establish that baseline; a pending refresh cannot latch.
-    /// A later completed change can latch, without claiming to see a human's
-    /// dialog answer. The handler's real ConsentWait conformance binds these
-    /// same cold/warm/pending/deadline cases to its shipping decisions.
-    #[test]
-    fn await_declares_the_consent_predicate_its_arm_point_and_a_finite_timeout() {
-        let s = spec("await").expect("await is in the table");
-        assert!(
-            // The token, not its POSITION: `consent` was the last predicate
-            // when this was written and `momentum` now follows it (the
-            // agent's yield, 2026-09-10). What the law wants is that the
-            // grammar row names consent at all.
-            s.summary.contains("|consent|") || s.summary.contains("|consent>"),
-            "the grammar row must list the consent token: {:?}",
-            s.summary
-        );
-        let help = s.help_line();
-        for phrase in [
-            "Its deadline starts when the request arrives",
-            "The first completed observation establishes the baseline",
-            "a cold pending check cannot establish it",
-            "It latches on the first completed observation that differs from that baseline",
-            "a refresh still pending cannot latch",
-            "`timeout=300000`",
-            "finite on purpose",
-            "an ordinary timeout reply, not an error",
-        ] {
-            assert!(help.contains(phrase), "await help lacks {phrase:?}");
-        }
-        assert!(
-            help.contains("not that a human answered a dialog"),
-            "await must not claim it observes the human's answer"
-        );
-    }
-
-    /// `await gone` is the inverse of `await match`, and the help has to say the
-    /// three things an agent needs before it can replace its poll-text-then-await-seq
-    /// loop with one blocking call: the grammar token, that it latches when NO row
-    /// matches (a row LEAVING is the signal), and that it is level-triggered — an
-    /// already-clear surface latches at arm, never on the next unrelated batch.
-    #[test]
-    fn await_declares_the_gone_predicate_as_the_level_triggered_inverse_of_match() {
-        let s = spec("await").expect("await is in the table");
-        assert!(
-            s.summary.contains("|match|gone|"),
-            "the grammar row must list gone beside match: {:?}",
-            s.summary
-        );
-        let help = s.help_line();
-        for phrase in [
-            "`await gone <re> [rows <a> <b>]`",
-            "NO visible row matches",
-            "the inverse of match",
-            "a row LEAVING",
-            "`await gone esc.to.interrupt`",
-            "ONE whitespace-free token",
-            "level-triggered like match/seq",
-            "already clear of the pattern latches at arm",
-            "(idle/seq/match/gone/block)",
-            // A `rows <a> <b>` span that meets no grid row is the one input on
-            // which `gone` would be vacuously true; the help must say it is
-            // refused, not silently "clear".
-            "`ERR bad rows`",
-            "nothing-scanned is never \"clear\"",
-        ] {
-            assert!(help.contains(phrase), "await help lacks {phrase:?}");
-        }
-        // `turn settle=gone:` inherits the level-trigger, and the footer can
-        // land a frame AFTER the submit verified — so the help must say the
-        // pattern is waited for FIRST, what bounds that wait, and what a never-
-        // seen pattern degrades to. Without those three facts a driver reads a
-        // `status=settled` over the pre-response screen as a finished turn.
-        let turn = spec("turn").expect("turn is in the table").help_line();
-        for phrase in [
-            "[settle=match:<re>|gone:<re>]",
-            "TWO waits",
-            "must APPEAR within submit_window",
-            "level-triggered",
-            "PRE-response screen",
-            "falls back to the idle settle",
-        ] {
-            assert!(turn.contains(phrase), "turn help lacks {phrase:?}");
-        }
-    }
-
-    #[test]
-    fn update_help_distinguishes_linux_disk_apply_from_macos_handoff() {
-        let help = spec("update").expect("update is in the table").help_line();
-        for phrase in [
-            "On macOS, Apply requests the seamless handoff",
-            "CLI `aterm update apply` and owner-only socket `update apply`",
-            "synchronously re-verify and replace the on-disk executable",
-            "neither requests a live handoff",
-            "linux_installed_build",
-            "linux_staged_build",
-            "linux_trial_healthy",
-            "an enrolled local baseline has no trial",
-        ] {
-            assert!(help.contains(phrase), "update help lacks {phrase:?}");
-        }
-        assert!(
-            !spec("update")
-                .unwrap()
-                .summary
-                .contains("in-session handoff")
-        );
-    }
-
-    /// The FULL catalog is a wire surface (`help --full`, `aterm help introspection`),
-    /// pinned byte-for-byte to a GENERATED fixture. The fixture was first captured
-    /// from the one-string `help` field before it was split into `summary` + `detail`,
-    /// then regenerated ON PURPOSE once the split reworded six rows (`help`, `verbs`,
-    /// `status`, `turn`, `lease`, `trail`) whose first sentence ran past the summary
-    /// cap; every other row is that capture verbatim, so the pin is the proof that the
-    /// split lost nothing anywhere else. Regenerate ONLY after a deliberate wording
-    /// change, with the `#[ignore]`d writer below.
-    const HELP_CATALOG_FULL_GOLDEN: &str = include_str!("../tests/fixtures/help_catalog_full.txt");
-
-    /// The fixture's exact shape: every full catalog line, `\n`-terminated.
-    fn rendered_full_catalog() -> String {
-        let mut s = String::new();
-        for line in catalog_lines_full() {
-            s.push_str(&line);
-            s.push('\n');
-        }
-        s
-    }
-
-    #[test]
-    fn full_catalog_matches_the_generated_golden() {
-        let got = rendered_full_catalog();
-        assert!(
-            !HELP_CATALOG_FULL_GOLDEN.is_empty(),
-            "the golden fixture is empty — it was never generated"
-        );
-        // Name the first differing line so a failure reads as a diff, not a wall.
-        for (i, (g, w)) in got
-            .lines()
-            .zip(HELP_CATALOG_FULL_GOLDEN.lines())
-            .enumerate()
-        {
-            assert_eq!(
-                g,
-                w,
-                "full catalog line {} drifted from the golden (regenerate on purpose with \
-                 `targo --unverified test -p aterm-types --lib -- --ignored regen_help_catalog_golden`)",
-                i + 1
-            );
-        }
-        assert_eq!(
-            got, HELP_CATALOG_FULL_GOLDEN,
-            "full catalog and the golden differ in length"
-        );
-    }
-
-    /// Writes the golden. Ignored so a routine test run can never rewrite the pin;
-    /// run it by name after a DELIBERATE change to a verb's wording.
-    #[test]
-    #[ignore = "rewrites tests/fixtures/help_catalog_full.txt; run by name on purpose"]
-    fn regen_help_catalog_golden() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/help_catalog_full.txt"
-        );
-        std::fs::write(path, rendered_full_catalog()).expect("write the golden fixture");
     }
 }

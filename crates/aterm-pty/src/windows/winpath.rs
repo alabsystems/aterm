@@ -14,7 +14,9 @@
 //! [`refresh_child_path`] reads the authoritative Machine + User `Path` values
 //! straight from the registry (auto-expanding `%VAR%` references), unions them with
 //! whatever `PATH` was inherited (so a session-specific addition is never LOST), and
-//! sets that as the child shell's `PATH`. Opt out with `ATERM_NO_PATH_REFRESH`.
+//! sets that as the child shell's `PATH`. Always on: it only ever adds what the
+//! registry says is on `PATH` and loses nothing inherited (the
+//! `ATERM_NO_PATH_REFRESH` opt-out is gone, 2026-09-24).
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -154,12 +156,9 @@ fn union_paths(first: &OsString, extra: Option<&OsString>) -> OsString {
 
 /// Overwrite the child env's `PATH` with the union of the live registry PATH and the
 /// inherited PATH (registry first, inherited extras kept). No-op when the registry is
-/// unreadable or `ATERM_NO_PATH_REFRESH` is set. `PATH` lookup is case-insensitive
+/// unreadable. `PATH` lookup is case-insensitive
 /// (Windows env names are), so the single canonical `PATH` entry is updated in place.
 pub(crate) fn refresh_child_path(env_pairs: &mut Vec<(OsString, OsString)>) {
-    if std::env::var_os("ATERM_NO_PATH_REFRESH").is_some() {
-        return;
-    }
     let Some(reg) = registry_path() else {
         return;
     };

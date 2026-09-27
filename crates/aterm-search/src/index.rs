@@ -14,7 +14,9 @@ use super::bloom::BloomFilter;
 use super::iterators::{
     CandidateSource, SearchMatchIterator, SearchMatchReverseIterator, next_literal_match,
 };
-use super::types::{DirectedFind, SearchDirection, SearchMatch, SearchResult, SearchResults};
+#[cfg(any(test, kani))]
+use super::types::SearchResult;
+use super::types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
 use crate::grapheme::{
     ColumnMap, LowerByteMap, LowerNeed, lower_fold, lower_fold_char, lower_fold_into, lower_need,
 };
@@ -24,8 +26,8 @@ use crate::literal::AsciiCaseInsensitiveMatches;
 /// Eviction triggers when cache exceeds this limit, removing the oldest 25%.
 ///
 /// This is the *default* only; callers that need a different bound should use
-/// [`SearchIndex::with_max_cached_lines`] (or
-/// [`SearchIndex::set_max_cached_lines`]). The default value is unchanged from
+/// `SearchIndex::with_max_cached_lines` (or
+/// `SearchIndex::set_max_cached_lines`). The default value is unchanged from
 /// the original hard-coded constant — behavior is preserved; the cap is now
 /// configurable and eviction is now observable (see
 /// [`SearchIndex::results_may_be_incomplete`]).
@@ -222,6 +224,7 @@ fn line_as_u32(n: usize) -> u32 {
 /// intersection uses `&a & &b` (borrowed on both sides) which constructs the
 /// result directly. Only when there is exactly one list does a clone occur,
 /// because we need an owned bitmap for downstream consumers (#7375).
+#[cfg(any(test, kani))]
 fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
     #[cfg(test)]
     OWNED_INTERSECTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
@@ -503,7 +506,7 @@ impl SearchIndex {
     /// Create a new search index with expected capacity.
     ///
     /// Uses the default cache cap ([`DEFAULT_MAX_CACHED_LINES`]); pair with
-    /// [`set_max_cached_lines`](Self::set_max_cached_lines) or use
+    /// `set_max_cached_lines` or use
     /// [`with_capacity_and_max`](Self::with_capacity_and_max) to override it.
     #[must_use]
     pub fn with_capacity(expected_lines: usize) -> Self {
@@ -518,6 +521,7 @@ impl SearchIndex {
     /// [`results_may_be_incomplete`](Self::results_may_be_incomplete) for the
     /// eviction signal.
     #[must_use]
+    #[cfg(test)]
     pub fn with_max_cached_lines(max_cached_lines: usize) -> Self {
         let mut index = Self::new();
         index.set_max_cached_lines(max_cached_lines);
@@ -1105,6 +1109,7 @@ impl SearchIndex {
     /// Returns `None` when no matches are possible (a trigram is missing or the
     /// query yields no posting lists), and `Some(bitmap)` with the intersection
     /// otherwise. Caller is responsible for ensuring `query` has 3+ bytes.
+    #[cfg(any(test, kani))]
     fn intersect_trigrams(&self, query: &str) -> Option<SparseBitmap> {
         let mut posting_lists = self.posting_lists(query)?;
         if posting_lists.is_empty() {
@@ -1180,6 +1185,7 @@ impl SearchIndex {
     ///
     /// Returns line numbers that might contain the query.
     /// Results may include false positives but never false negatives.
+    #[cfg(any(test, kani))]
     pub fn search(&self, query: &str) -> impl Iterator<Item = u32> + '_ + use<'_> {
         let bytes = query.as_bytes();
 
@@ -1220,6 +1226,7 @@ impl SearchIndex {
     /// Search and return matches in the specified direction.
     ///
     /// Returns an iterator over matches sorted by line number.
+    #[cfg(test)]
     pub fn search_ordered(&self, query: &str, direction: SearchDirection) -> Vec<SearchMatch> {
         let mut matches = self.search_with_positions(query);
 
@@ -1305,6 +1312,7 @@ impl SearchIndex {
     /// exceeds the new cap.
     ///
     /// [`index_line`]: Self::index_line
+    #[cfg(any(test, kani))]
     pub fn set_max_cached_lines(&mut self, max: usize) {
         self.max_cached_lines = max.max(1);
     }
@@ -1355,6 +1363,7 @@ impl SearchIndex {
     /// Drop cached absolute rows below a newly-retained history boundary.
     /// Small ordinary scroll deltas walk only the removed numeric prefix; a
     /// sparse/large jump switches to one bounded cache scan.
+    #[cfg(test)]
     pub(crate) fn retain_history_from(&mut self, first_retained_line: usize) {
         let old_first = self.first_cached_line.min(first_retained_line);
         if first_retained_line <= old_first {
@@ -1389,9 +1398,9 @@ impl SearchIndex {
     }
 
     /// Drop cached absolute rows below `first_retained_line` WITHOUT recording
-    /// an eviction — the complete-retention twin of [`retain_history_from`].
+    /// an eviction — the complete-retention twin of `retain_history_from`.
     ///
-    /// [`retain_history_from`] models "rows the INDEX can no longer serve": an
+    /// `retain_history_from` models "rows the INDEX can no longer serve": an
     /// honesty event (results become incomplete, the retained watermark
     /// advances). This models "rows the TERMINAL no longer retains at all":
     /// after grid retention advances (a full ring evicting one line per
@@ -1407,9 +1416,8 @@ impl SearchIndex {
     ///
     /// Callers must only use this when the dropped rows are really gone from
     /// the source buffer; for index-side capacity trimming keep
-    /// [`retain_history_from`], which reports honestly.
+    /// `retain_history_from`, which reports honestly.
     ///
-    /// [`retain_history_from`]: Self::retain_history_from
     /// [`results_may_be_incomplete`]: Self::results_may_be_incomplete
     /// [`lowest_retained_line`]: Self::lowest_retained_line
     pub fn drop_history_below(&mut self, first_retained_line: usize) {
@@ -1454,6 +1462,7 @@ impl SearchIndex {
 
     /// Current maximum cached-lines cap.
     #[must_use]
+    #[cfg(test)]
     pub fn max_cached_lines(&self) -> usize {
         self.max_cached_lines
     }
@@ -1597,7 +1606,7 @@ impl SearchIndex {
 ///
 /// Matches the streaming engine's default `max_pattern_len` (1024). Patterns
 /// beyond this limit are rejected before compilation to bound CPU cost.
-#[allow(dead_code)]
+#[cfg(feature = "regex")]
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`.
@@ -1688,6 +1697,7 @@ impl SearchIndex {
     /// When `case_sensitive` is true and `is_regex` is false, this delegates to
     /// the trigram-accelerated `search_with_positions`. Otherwise, it scans all
     /// cached lines directly.
+    #[cfg(test)]
     pub fn search_with_positions_opts(
         &self,
         query: &str,
@@ -1745,14 +1755,13 @@ impl SearchIndex {
 
     /// Search with options, returning matches bundled with the eviction signal.
     ///
-    /// Identical matching to [`search_with_positions_opts`], but wraps the
+    /// Identical matching to `search_with_positions_opts`, but wraps the
     /// result in [`SearchResults`] so the caller learns whether eviction may
     /// have dropped matches ([`results_may_be_incomplete`]) and which line is
     /// the oldest still searchable ([`lowest_retained_line`]). This is the
     /// entry point intended for `cmd_search`, which must tell the AI when
     /// results are truncated.
     ///
-    /// [`search_with_positions_opts`]: Self::search_with_positions_opts
     /// [`results_may_be_incomplete`]: Self::results_may_be_incomplete
     /// [`lowest_retained_line`]: Self::lowest_retained_line
     pub fn search_results_opts(

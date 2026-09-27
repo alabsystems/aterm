@@ -8,10 +8,8 @@
 // backends share via the atlas). aterm bundles no merged-ligature font, so this
 // DISCOVERS one (any font with the classic Latin `f_i`/`f_l`/`ffi` ligatures
 // collapses `fi`/`fl`/`ffi` N:1) and SKIPs cleanly when none is present or no GPU
-// is available. Its OWN test binary so the $ATERM_FONT it sets never races the
-// other parity suites; within this binary the set is hoisted behind a OnceLock
-// (see merged_ligature_font) so the parallel #[test] threads never race it
-// either.
+// is available. The discovered file is handed to both renderers as their FAMILY
+// (the window's `--font` seam), so nothing here writes the environment.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
@@ -59,27 +57,11 @@ fn merged_ligature_font_path() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| collapses(p))
 }
 
-/// Discovery + the SINGLE point where $ATERM_FONT is exported to both renderers.
-/// Both #[test] fns in this binary want the SAME discovered font, but libtest
-/// runs them on PARALLEL threads — a per-test set_var would race the sibling
-/// test's renderer construction (C-side getenv/setenv under concurrent mutation
-/// is dangling-pointer UB). `get_or_init` parks every caller until the closure
-/// returns, so the ONE write is complete before any renderer in this process is
-/// built — the same guarantee glow_parity.rs gets from its Once. (Bonus: the
-/// shape-probing discovery scan now runs once, not once per test.) `None` -> the
-/// caller SKIPs.
+/// Discovery, once per process: both #[test] fns want the SAME discovered font,
+/// and the shape-probing scan is not free. `None` -> the caller SKIPs.
 fn merged_ligature_font() -> Option<&'static std::path::Path> {
     static FONT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    FONT.get_or_init(|| {
-        let found = merged_ligature_font_path()?;
-        // Set exactly once per process (OnceLock init), before any renderer is
-        // constructed — every concurrent caller is parked in get_or_init until this
-        // write completes, so no getenv can observe it mid-mutation — and routed
-        // through the workspace's one lock-scoped env helper.
-        aterm_log::env::set("ATERM_FONT", &found);
-        Some(found)
-    })
-    .as_deref()
+    FONT.get_or_init(merged_ligature_font_path).as_deref()
 }
 
 fn shaping(admit: bool) -> TextShapingConfig {
@@ -95,27 +77,27 @@ fn merged_ligature_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Discovers the font AND points BOTH renderers at it via $ATERM_FONT, once
-    // per process (see merged_ligature_font).
-    if merged_ligature_font().is_none() {
+    // Discovers the font once per process (see merged_ligature_font) and builds
+    // BOTH renderers on it.
+    let Some(font) = merged_ligature_font().and_then(std::path::Path::to_str) else {
         eprintln!("SKIP: no merged-ligature font (set ATERM_MERGED_FONT)");
         return;
-    }
+    };
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+    let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(Some(font), px, theme) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("SKIP: no GPU/font available: {e}");
             return;
         }
     };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+    let Some(mut cpu) = Renderer::from_system_with_family(Some(font), px, theme) else {
         eprintln!("SKIP: no system font");
         return;
     };
     // A CPU renderer with the merge DECLINED, to prove the sliced frame is not
     // vacuously equal (the font really collapses `fi`/`fl`/`ffi`).
-    let Some(mut cpu_off) = Renderer::from_system(px, theme) else {
+    let Some(mut cpu_off) = Renderer::from_system_with_family(Some(font), px, theme) else {
         return;
     };
     gpu.set_text_shaping(shaping(true));
@@ -164,19 +146,19 @@ fn merged_ligature_cursor_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Same once-per-process discovery + $ATERM_FONT export as the sibling test.
-    if merged_ligature_font().is_none() {
+    // Same once-per-process discovery as the sibling test.
+    let Some(font) = merged_ligature_font().and_then(std::path::Path::to_str) else {
         eprintln!("SKIP: no merged-ligature font");
         return;
-    }
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+    };
+    let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(Some(font), px, theme) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("SKIP: no GPU/font available: {e}");
             return;
         }
     };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+    let Some(mut cpu) = Renderer::from_system_with_family(Some(font), px, theme) else {
         eprintln!("SKIP: no system font");
         return;
     };

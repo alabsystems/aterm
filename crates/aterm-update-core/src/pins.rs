@@ -242,7 +242,7 @@ pub const fn roster_tier_armed() -> bool {
 ///    ship). This step was taken on 2026-08-15, and taking it DELETED the tripwire
 ///    assertion this checklist used to send the operator to remove
 ///    (`the_shipped_anchor_is_unset_so_the_tier_is_inert`, in
-///    `crates/aterm-release/tests/apple_tier.rs`) — the instruction outlived the test it
+///    `crates/aterm-release/tests/it/apple_tier.rs`) — the instruction outlived the test it
 ///    named, which is now defined nowhere in the tree. Its replacement,
 ///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, asserts the
 ///    ARMED value directly, so a fork re-arming this anchor updates that assertion rather
@@ -303,6 +303,9 @@ pub const fn anchor_active(anchor: &str) -> bool {
     !anchor.is_empty()
 }
 
+// Fail-closed, checked at compile time: an empty anchor is never active.
+const _: () = assert!(!anchor_active("") && anchor_active("any-nonempty-value"));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,12 +324,6 @@ mod tests {
                 "non-base64 character: {k}"
             );
         }
-    }
-
-    #[test]
-    fn empty_anchor_is_never_active() {
-        assert!(!anchor_active(""));
-        assert!(anchor_active("any-nonempty-value"));
     }
 
     /// The Windows anchor is the leaf certificate's subject CN exactly as
@@ -372,12 +369,5 @@ mod tests {
             "master keyset has {} members; a rotation window holds at most two",
             PAPER_MASTER_PUBKEYS.len()
         );
-    }
-
-    /// `roster_tier_armed()` is derived from the anchor, never separately edited — the
-    /// drift that a second constant would allow is unrepresentable.
-    #[test]
-    fn the_tier_switch_is_the_anchor_itself() {
-        assert_eq!(roster_tier_armed(), !PAPER_MASTER_PUBKEYS.is_empty());
     }
 }

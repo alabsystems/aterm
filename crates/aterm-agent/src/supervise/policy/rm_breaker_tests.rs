@@ -141,6 +141,16 @@ fn where_an_operand_may_point() {
     assert!(escalates("rm -rf \"$HOME/x\"").contains("$HOME"));
     assert!(escalates("rm -rf ~/x").contains("~"));
     assert!(escalates("rm -rf /").contains("filesystem root"));
+    assert!(escalates("rm -rf /Users/_owner").contains("home"));
+    assert!(escalates("rm -rf /Users/_owner/*").contains("home"));
+    assert!(escalates("rm -rf /USERS/someone").contains("/Users"));
+    assert!(escalates("rm -rf /t*/x").contains("glob at root"));
+    assert!(escalates("rm -rf /tmp/w/a/.GIT/x").contains(".git"));
+    assert!(escalates("rm -rf --no-preserve-root /tmp/w/a").contains("--no-preserve-root"));
+    assert!(escalates("rm -W /tmp/w/a").contains("does not know: -W"));
+    // Controls: past every critical path, and flags that only say how.
+    approves("rm -rf /tmp/w/a/.gitignore");
+    approves("rm -fv --one-file-system /tmp/w/a");
     // A scratch cwd is still not removable, nor its parent.
     let cwd = "/private/tmp/claude-502/w/sub";
     assert!(

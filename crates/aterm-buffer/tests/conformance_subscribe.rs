@@ -9,26 +9,22 @@
 //! encoded as the model's `PollGap` guard `lo > cursor + 1` (and proven by `ty`,
 //! with a `Buggy=1` counterexample, in `aterm-spec/tests/derived_ring_ty.rs`).
 //!
-//! This binds that model to the CODE THAT ACTUALLY RUNS: it drives the genuine
-//! shipping `Surface::subscribe`/`poll`, projects each state onto the model
+//! This binds that model to the CODE THAT ACTUALLY RUNS: it drives the real
+//! `Surface::subscribe`/`poll` (aterm-buffer's library read face; no product
+//! crate calls it today), projects each state onto the model
 //! variables `<<seq, lo, cursor, lost>>`, and asserts the real gap-vs-deliver
 //! decision equals `Model::action_enabled("PollGap", state)` — the model's own
 //! guard, not a re-stated predicate. So if `poll()` ever silently delivered to a
 //! behind reader (a silent loss), this test catches it. Unlike the `ty` tests,
 //! this is pure Rust (the model interpreter) + real code, so it always runs.
 
-use aterm_buffer::{Edit, ReadCap, SubUpdate, Surface, SurfaceId, WriteCap};
+use aterm_buffer::{Edit, ReadCap, SubUpdate, Surface, WriteCap};
 use aterm_spec::derive::subscribe_model;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 
 /// The real ring cap (mirrors `aterm_buffer::MAX_LOG_EVENTS = 1<<16`); a cursor
 /// only falls behind once eviction passes it, i.e. after > CAP appends.
 const CAP: u64 = 1 << 16;
-
-fn surface(id: u64) -> Surface {
-    Surface::new(SurfaceId(NonZeroU64::new(id).unwrap()))
-}
 
 /// The oldest still-live seq (the ring head `lo`); 1 when empty — the same
 /// projection the ring conformance uses.
@@ -53,7 +49,7 @@ fn state(s: &Surface, cursor_at: u64) -> BTreeMap<&'static str, i64> {
 #[test]
 fn real_poll_not_behind_delivers_matching_model() {
     let m = subscribe_model();
-    let mut s = surface(1);
+    let mut s = Surface::new();
     let cur = s.subscribe(&ReadCap); // at = current head = 0
     let cursor_at = s.seq().0;
     for i in 0..3 {
@@ -81,7 +77,7 @@ fn real_poll_not_behind_delivers_matching_model() {
 #[test]
 fn real_poll_behind_gaps_no_silent_loss() {
     let m = subscribe_model();
-    let mut s = surface(2);
+    let mut s = Surface::new();
     let cur = s.subscribe(&ReadCap); // at = 0
     let cursor_at = s.seq().0; // 0
     // Drive past the cap so eviction passes the cursor (oldest live > cursor + 1).

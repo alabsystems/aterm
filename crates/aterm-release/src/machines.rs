@@ -60,7 +60,7 @@
 //!
 //! `pins::PAPER_MASTER_PUBKEYS` names the paper master, so every cut from this tree runs
 //! [`authorize_cut`] — v0.21.0 was the first, signed by m3's rostered key. Everything
-//! below is ALSO exercised by `tests/machine_roster.rs` with synthetic masters, so the
+//! below is ALSO exercised by `tests/it/machine_roster.rs` with synthetic masters, so the
 //! rule set stays proven independently of the tree's own arming state.
 
 use std::path::{Path, PathBuf};

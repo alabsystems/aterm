@@ -21,7 +21,10 @@
 //   * dirty gate: settled rain gate-hits with a byte-stable framebuffer; the
 //     per-row sorted-slice merge-diff marks ONLY the rows whose slice differs
 //     (prev∪cur); an atlas-version bump alone marks all quad rows; a moved
-//     halo marks its prev∪cur rows.
+//     halo marks its prev∪cur rows;
+//   * Tier-1 of `RainBandContainment`: the merge-diff's verdict on every row of
+//     one column's band, step and mutation ticks alike, is the model's `Mark`
+//     — and on the real engine's own emission no changed row goes unmarked.
 
 use std::sync::Arc;
 
@@ -595,4 +598,183 @@ fn unchanged_rain_gate_hits_with_byte_stable_framebuffer() {
         "unchanged rain (no other damage) must dirty-gate: zero repaint work"
     );
     assert_eq!(first, second, "a gate-hit frame must be byte-stable");
+}
+
+/// The rows of `quads`, grouped as the frame emitted them — the harness's own
+/// reading of what a tick changed, independent of the renderer's merge walk.
+fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQuad>> {
+    let mut rows = std::collections::BTreeMap::<u16, Vec<SpriteQuad>>::new();
+    for q in quads {
+        rows.entry(q.row).or_default().push(*q);
+    }
+    rows
+}
+
+/// Tier-1 conformance for `RainBandContainment`
+/// (`aterm_spec::derive::rain_band_containment_model`). For every point of the
+/// model's lattice — a head anywhere from row 2 to two rows past the bottom of
+/// the `Viewport`-row window, every trail length that keeps the tail on screen,
+/// step or mutation tick — one column's band is laid down twice, the tick moves
+/// it a row (and on a mutation tick rolls every lit cell's glyph), rows past the
+/// bottom are dropped exactly as the engine drops them, and the SHIPPING
+/// `compute_dirty_rows` is asked which rows to repaint. For every visible probe
+/// row of the band, expired tail included, the harness's reading of what
+/// changed and the marker's real verdict — merge-diff and scissor-band fill
+/// together — must be exactly the model's one `Mark` successor.
+///
+/// NON-VACUITY: the lattice must reach rows where the `Buggy = 1` marker (a
+/// merge-diff blind to the glyph swap) decides differently — the interior rows
+/// of a mutation tick under an off-screen head — and there the real marker
+/// sides with the healthy model.
+#[test]
+fn rain_marking_conforms_to_the_rain_band_containment_model() {
+    const COLS: usize = 4;
+    let model = aterm_spec::derive::rain_band_containment_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let viewport = model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "Viewport")
+        .map(|&(_, rows)| rows)
+        .expect("the model names its viewport");
+    let rows = viewport as usize;
+    let pick = |state: &aterm_spec::interp::State, action: &str, var: &str, value: i64| {
+        aterm_spec::interp::pick(&model, state, action, var, value)
+    };
+    let mut term = Terminal::new(rows as u16, COLS as u16);
+    term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
+    // A glyph per (row, hash window): the mutation tick rolls the window, and
+    // this choice differs across the two windows on every row.
+    let glyph = |row: i64, window: i64| ((row * 3 + window * 5) % 8) as u16;
+    let mut column = |lit: std::ops::RangeInclusive<i64>, window: i64| {
+        let mut input = term.cell_frame(rows, COLS);
+        input.rain_quads = lit
+            .filter(|&r| r < viewport)
+            .map(|r| band_quad(r as u16, 8, 8, 16, glyph(r, window) * 8, 0))
+            .collect();
+        input
+    };
+    let (mut marked_rows, mut separating) = (0usize, 0usize);
+    for head in 2..=viewport + 2 {
+        let headed = pick(&model.init_state(), "PickHead", "head", head)
+            .unwrap_or_else(|| panic!("PickHead cannot reach head = {head}"));
+        for l in 2..=head {
+            let Some(trailed) = pick(&headed, "PickTrail", "l", l) else {
+                assert!(head - l >= viewport, "only an off-screen tail is refused");
+                continue;
+            };
+            for mt in 0..=1i64 {
+                let ticked = pick(&trailed, "PickTick", "mt", mt).expect("both ticks");
+                let prev = column(head - l..=head - 1, 0);
+                let cur = column(head - l + 1..=head, mt);
+                let mut dirty = Vec::new();
+                let DirtyDecision::Rows(_) =
+                    compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+                else {
+                    panic!("identical-geometry frames must take the row-damage path");
+                };
+                let (was, now) = (rows_of(&prev.rain_quads), rows_of(&cur.rain_quads));
+                for r in head - l..=head.min(viewport - 1) {
+                    let probed = pick(&ticked, "PickRow", "r", r).expect("a visible band row");
+                    let row = r as u16;
+                    let mut after = probed.clone();
+                    after.insert("changed", i64::from(was.get(&row) != now.get(&row)));
+                    after.insert("marked", i64::from(dirty[r as usize]));
+                    after.insert("phase", 5);
+                    assert_eq!(
+                        model.successors("Mark", &probed),
+                        vec![after.clone()],
+                        "row {r} of head={head} l={l} mt={mt}: the real verdict is not the \
+                         model's Mark (dirty={dirty:?})"
+                    );
+                    if buggy.successors("Mark", &probed) != vec![after] {
+                        separating += 1;
+                    }
+                    marked_rows += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        marked_rows > 100,
+        "the lattice must be walked ({marked_rows} rows)"
+    );
+    assert!(
+        separating > 0,
+        "the lattice must reach rows the Buggy = 1 marker decides differently"
+    );
+}
+
+/// The theorem the model states, on the REAL engine's emission: across a
+/// settled downpour of `MatrixRain` ticks — its fading trails, stepped heads,
+/// mutation ticks and progressive atlas bake — every row whose quads changed
+/// (or whose atlas was re-published under it) is a row the merge-diff marks.
+/// Real emission changes more than the model's one-column lattice does (a
+/// fading trail re-tints its whole band every tick); the marker has to cover
+/// all of it.
+#[test]
+fn real_rain_emission_leaves_no_changed_row_unmarked() {
+    use aterm_effects::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainTickInput};
+    const ROWS: usize = 12;
+    const COLS: usize = 16;
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"\x1b[?25l");
+    let base = term.cell_frame(ROWS, COLS);
+    let geom = EffectGeom {
+        cell_w: 8,
+        cell_h: 16,
+        rows: ROWS as u16,
+        cols: COLS as u16,
+    };
+    let mut engine = MatrixRain::new(RainConfig {
+        enabled: true,
+        density: 12,
+        // The decorative ROM path: literal mode needs sampled output material.
+        output_material: false,
+        seed: 7,
+        ..RainConfig::default()
+    });
+    engine.rescan_from_cells(
+        &base.cells,
+        &base.line_sizes,
+        &base.images,
+        ROWS,
+        COLS,
+        base.default_bg,
+        1,
+    );
+    let (mut prev, mut changed_total, mut row_frames) = (base.clone(), 0usize, 0usize);
+    for tick in 0..240u64 {
+        engine.note_activity(tick + 1);
+        engine.advance_ms(33);
+        let mut cur = base.clone();
+        engine.emit(
+            geom,
+            &RainTickInput::default(),
+            &mut cur.rain_quads,
+            &mut cur.rain_add,
+        );
+        cur.rain_atlas = engine.rain_atlas();
+        let mut dirty = Vec::new();
+        if let DirtyDecision::Rows(_) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        {
+            row_frames += 1;
+            let rebaked = prev.rain_atlas.as_ref().map(Arc::as_ptr)
+                != cur.rain_atlas.as_ref().map(Arc::as_ptr);
+            let (was, now) = (rows_of(&prev.rain_quads), rows_of(&cur.rain_quads));
+            for row in was.keys().chain(now.keys()) {
+                if rebaked || was.get(row) != now.get(row) {
+                    changed_total += 1;
+                    assert!(
+                        dirty[usize::from(*row)],
+                        "tick {tick}: rain row {row} changed but was not marked"
+                    );
+                }
+            }
+        }
+        prev = cur;
+    }
+    assert!(row_frames > 0, "the downpour must take the row-damage path");
+    assert!(changed_total > 0, "the downpour must actually change rows");
 }

@@ -881,8 +881,8 @@ fn resolve_forced_chrome(high_contrast: bool) -> Option<crate::chrome_band::Forc
 }
 
 /// `ATERM_FORCE_HC_CHROME=1` — force the chrome onto the OS system palette WITHOUT a
-/// High-Contrast scheme. A diagnostic knob in the same spirit as `ATERM_FORCE_SCALE`,
-/// and it exists because the alternative way to see this code path is to turn High
+/// High-Contrast scheme. A development seam ([`aterm_types::dev_seam!`]: a shipped
+/// binary never reads it) for a reviewer, and it exists because the alternative way to see this code path is to turn High
 /// Contrast on for the whole desktop, which is a hostile thing to ask of a reviewer
 /// (and impossible for an automated check to do without changing the machine).
 ///
@@ -898,7 +898,7 @@ fn resolve_forced_chrome(high_contrast: bool) -> Option<crate::chrome_band::Forc
 /// and reading it live means the knob can be checked by a reviewer's `set` without
 /// wondering whether a `OnceLock` beat them to it.
 fn force_hc_chrome_env() -> bool {
-    std::env::var_os("ATERM_FORCE_HC_CHROME").is_some_and(|v| v != "0" && !v.is_empty())
+    aterm_types::dev_seam!("ATERM_FORCE_HC_CHROME").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
 /// Re-read High Contrast and republish the forced chrome palette; `true` when the
@@ -2257,10 +2257,6 @@ impl AppRt for AppRtWindows {
             active,
         } = tabs;
         toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
-    }
-
-    fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool) {
-        toolbar::set_update_available(handle, available);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {

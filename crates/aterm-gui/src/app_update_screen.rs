@@ -103,6 +103,9 @@ impl App {
         // name whatever row the next test posts under it.
         self.update_flow = None;
         self.staged_said = None;
+        // Who is waiting on the update is the scene's to say again.
+        self.update_ctl_checks = 0;
+        self.update_quiet = None;
         // The committed count mirrors the center's; a fresh center commits
         // nothing, so the geometry gives its rows back at once.
         if self.message_band_rows != 0 {
@@ -161,8 +164,18 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
 /// nothing will switch to it by itself: the reducer imports it as an ACTIVATION
 /// stage, and policy requires a person's request. (With a retry scheduled the
 /// flow row says the lane is still on it, and no outcome is posted.)
-pub(crate) const UPDATE_INSTALLED_TITLE: &str = "Update installed";
-pub(crate) const UPDATE_INSTALLED_DETAIL: &str = "finish it from the Version menu";
+/// ONE install verb (audit 2026-09-24): the row the `Install now` capsule
+/// stands on says the ready row's own words (`aterm vX is ready`), never
+/// "installed" beside a press that installs, nor "finish".
+#[cfg(any(unix, test))]
+pub(crate) fn update_installed_title(version: Option<&str>) -> String {
+    version.map_or_else(
+        || "Update is ready".to_string(),
+        crate::update_words::staged_title,
+    )
+}
+#[cfg(any(unix, test))]
+pub(crate) const UPDATE_INSTALLED_DETAIL: &str = crate::update_words::INSTALL_FROM_MENU;
 /// An update the lane has stopped trying by itself: the person's next step is
 /// the Version menu's "Install aterm vX now" — the row's `Install now`.
 pub(crate) const UPDATE_DIDNT_INSTALL: &str = "Update didn't install";
@@ -220,10 +233,100 @@ impl App {
         // and the answer is half of what a person needs from a failed apply ("wait" vs
         // "press this").
         let retry = self.apply_retry_for(snapshot.staged.as_ref().map(|staged| staged.build));
-        UpdateState::from_service(snapshot, checking, retry).with_automatic_checks(
-            self.update_checks_running,
-            crate::app_config::update_checks_automatic(&self.config),
-        )
+        UpdateState::from_service(snapshot, checking, retry)
+            .with_automatic_checks(
+                self.update_checks_running,
+                crate::app_config::update_checks_automatic(&self.config),
+            )
+            .with_download(self.update_quiet.clone())
+            .with_dev_build(self.dev_build.clone())
+    }
+
+    /// Whether a PERSON is waiting on the update's work right now (design ruling
+    /// 220): a check they started from Settings ▸ Software Update, the Version
+    /// menu or Check for Updates… (the updater service's live ticket, which only
+    /// [`Self::start_native_update_check`] mints), or an `aterm ctl update check`
+    /// in flight (`Wake::UpdateCheckAsked`). The background loop's checks are
+    /// neither: what they download is nobody's wait.
+    pub(crate) fn update_awaited(&self) -> bool {
+        self.native_updater_service.snapshot().active.is_some() || self.update_ctl_checks > 0
+    }
+
+    /// A person's `aterm ctl update check` began or ended (`Wake::UpdateCheckAsked`).
+    pub(crate) fn note_update_check_asked(&mut self, begun: bool) {
+        self.update_ctl_checks = if begun {
+            self.update_ctl_checks.saturating_add(1)
+        } else {
+            self.update_ctl_checks.saturating_sub(1)
+        };
+    }
+
+    /// THE UNATTENDED DOWNLOAD IS SILENT (design ruling 220; the owner's R3,
+    /// "seamless, non-interrupting (ideally silent)"): a download or check the
+    /// background loop runs, with no person waiting on it and no flow row already
+    /// up, raises no row and re-grids nothing. Settings ▸ Software Update shows
+    /// it ([`crate::update_screen::QuietDownload`]): its words count whole MB
+    /// ([`quiet_bytes`]), they are republished only when they change, and only
+    /// to the Settings views ([`Self::publish_quiet_update_words`]) — no menu,
+    /// palette, tab or every-window repaint for a download nobody waits on. How
+    /// it ends is the record the lane already writes. `true` when the report
+    /// was taken here.
+    fn note_quiet_update_progress(&mut self, progress: &aterm_update::Progress) -> bool {
+        use aterm_update::Progress as P;
+        let quiet = match progress {
+            P::Downloading {
+                version,
+                bytes_done,
+                bytes_total,
+            } => crate::update_screen::QuietDownload {
+                version: version.clone(),
+                title: crate::update_words::flow_title("Downloading", version),
+                progress: if *bytes_total > 0 {
+                    format!(
+                        "{} / {}",
+                        quiet_bytes((*bytes_done).min(*bytes_total)),
+                        crate::toolchain_words::fmt_bytes(*bytes_total)
+                    )
+                } else {
+                    quiet_bytes(*bytes_done)
+                },
+            },
+            // Still the download's headline: the detail alone says it is
+            // checked ("Checking the download."), so the page never reads as
+            // a check for updates.
+            P::Verifying { version } => crate::update_screen::QuietDownload {
+                version: version.clone(),
+                title: crate::update_words::flow_title("Downloading", version),
+                progress: String::new(),
+            },
+            P::Staged { .. } | P::Failed { .. } | P::Deferred { .. } => {
+                // Over: the page reads the stage (or the ledger) from here on.
+                if self.update_quiet.take().is_some() {
+                    self.publish_native_update_state();
+                }
+                return false;
+            }
+        };
+        let flow_up = self.live_update_flow().is_some_and(|flow| {
+            matches!(
+                flow.phase,
+                crate::messages_host::FlowPhase::Downloading
+                    | crate::messages_host::FlowPhase::Checking
+            )
+        });
+        if self.update_awaited() || flow_up {
+            // A person is waiting, or the row is already theirs: it keeps moving
+            // to its end, so its Complete echo and the records stay one story.
+            if self.update_quiet.take().is_some() {
+                self.publish_native_update_state();
+            }
+            return false;
+        }
+        if self.update_quiet.as_ref() != Some(&quiet) {
+            self.update_quiet = Some(quiet);
+            self.publish_quiet_update_words();
+        }
+        true
     }
 
     /// Whether the automatic apply lane still INTENDS this exact staged build — the
@@ -403,12 +506,17 @@ impl App {
             aterm_update::Progress::Deferred { .. } | aterm_update::Progress::Failed { .. } => {}
         }
         // The version a failed or postponed report does not carry: the live
-        // download's.
+        // download's, else the quiet one's (read before the quiet lane clears it).
+        let quiet_version = self.update_quiet.as_ref().map(|q| q.version.clone());
+        if self.note_quiet_update_progress(progress) {
+            return;
+        }
         let downloading = self
             .live_update_flow()
             .filter(|flow| matches!(flow.phase, FlowPhase::Downloading | FlowPhase::Checking));
         let flow_version = downloading
             .map(|flow| flow.version.clone())
+            .or(quiet_version)
             .unwrap_or_default();
         let downloading = downloading.map(|flow| flow.id);
         let msg = crate::update_words::progress(progress, posture, &flow_version);
@@ -851,11 +959,12 @@ impl App {
             crate::native_app::UpdateOutcome::Accepted => {
                 aterm_log::info!("update apply ({source}): accepted");
             }
+            #[cfg(any(unix, test))]
             crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { build, message } => {
                 let retry_scheduled = self.automatic_apply_retry_scheduled(build);
                 aterm_log::warn!(
-                    "update apply ({source}): build {build} is installed on disk; activation \
-                     pending (automatic retry scheduled={retry_scheduled}): {message}"
+                    "update apply ({source}): {message} (build {build}; retry scheduled: \
+                     {retry_scheduled})"
                 );
                 if open_details {
                     let _ = self
@@ -867,8 +976,12 @@ impl App {
                     // are installed; the switch is the person's to request, and
                     // the decision says so with its press.
                     self.retire_staged_update_row(true);
+                    let version = staged
+                        .as_ref()
+                        .filter(|(staged_build, _)| *staged_build == build)
+                        .map(|(_, version)| version.as_str());
                     self.note_update_outcome(crate::update_words::needs_install(
-                        UPDATE_INSTALLED_TITLE,
+                        &update_installed_title(version),
                         UPDATE_INSTALLED_DETAIL,
                         aterm_messages::Severity::Info,
                         build,
@@ -904,6 +1017,7 @@ impl App {
                     self.note_update_blockers(&reasons, retry_scheduled);
                 }
             }
+            #[cfg(any(unix, test))]
             crate::native_app::UpdateOutcome::CaptureRefused { message } => {
                 // NOT "you were using the terminal" (the v0.91 wording for this
                 // very fact) and not "Update paused" either: the lane is still
@@ -924,7 +1038,8 @@ impl App {
                     self.note_update_outcome(crate::update_words::outcome(
                         '\u{21bb}',
                         "Update waiting",
-                        "a tab could not be carried \u{b7} retries when it changes",
+                        "one tab couldn't move to the new version \u{b7} tries again when \
+                         that tab changes",
                         aterm_messages::Severity::Info,
                     ));
                 } else {
@@ -961,13 +1076,16 @@ impl App {
                             self.note_update_outcome(crate::update_words::outcome(
                                 '\u{21bb}',
                                 &format!("Couldn't install aterm v{version}"),
-                                "will try again by itself",
+                                crate::update_words::TRIES_AGAIN,
                                 aterm_messages::Severity::Info,
                             ));
                         }
                     } else {
-                        self.note_update_outcome(crate::update_words::needs_install(
+                        // The failure's few words, where they change what the
+                        // person does before `Install now` (ruling 246).
+                        self.note_update_outcome(crate::update_words::needs_install_because(
                             &format!("Couldn't install aterm v{version}"),
+                            crate::update_words::short_cause(&message),
                             crate::update_words::INSTALL_FROM_MENU,
                             aterm_messages::Severity::Warn,
                             staged_build,
@@ -979,11 +1097,25 @@ impl App {
                     // Warn row's `Software Update` capsule and its `Details ›`
                     // (R37: the "click for details" clause became those capsules),
                     // so the row carries no excerpt.
-                    self.note_update_outcome(crate::update_words::failed(
-                        UPDATE_DIDNT_FINISH,
-                        "",
-                        false,
-                    ));
+                    // An UNATTENDED attempt is a record (audit 2026-09-24, as
+                    // §10.3 U14): the artifact is gone, nothing can be pressed,
+                    // the next check re-stages it, and the health lane raises
+                    // `aterm can't install updates` if it keeps failing. A
+                    // person's own press is told.
+                    if source_is_automatic(source) {
+                        self.note_update_outcome(crate::update_words::outcome(
+                            '\u{26a0}',
+                            UPDATE_DIDNT_FINISH,
+                            &format!("the next check downloads it again \u{b7} {message}"),
+                            aterm_messages::Severity::Warn,
+                        ));
+                    } else {
+                        self.note_update_outcome(crate::update_words::failed(
+                            UPDATE_DIDNT_FINISH,
+                            "",
+                            false,
+                        ));
+                    }
                     // …and the ready row does not stand beside it: the
                     // artifact this row was offering is the one that is gone,
                     // so it is WITHDRAWN — resolved `Ok` it would claim a
@@ -1131,6 +1263,7 @@ impl App {
 
     /// THE UPGRADE RIM (`crate::level_up`): start charging for `build` under
     /// the amplitude [`Self::upgrade_rim_motion`] resolves.
+    #[cfg(any(unix, test))]
     pub(crate) fn spawn_upgrade_surge(&mut self, build: u64) {
         self.level_up = Some(crate::level_up::LevelUp::charging(
             build,
@@ -1170,6 +1303,7 @@ impl App {
     /// activity and stands down — and there the surge alone explains the frozen
     /// frame. What the row said before is kept so a refusal can put it back
     /// (`retire_update_installing`).
+    #[cfg(any(unix, test))]
     pub(crate) fn begin_update_installing(&mut self, build: u64, explicit: bool) {
         use crate::messages_host::FlowPhase;
         let version = self
@@ -1280,6 +1414,18 @@ impl App {
     }
 }
 
+/// The quiet download's bytes as Settings ▸ Software Update says them (design
+/// ruling 220): whole MB, so the page's words — and its republish — change at
+/// most once per MB (per 100 MB past 1 GB), never per 10 Hz poll; and unpadded,
+/// since they sit in a sentence (`5 MB / 1.2 GB downloaded.`), not a band cell.
+fn quiet_bytes(n: u64) -> String {
+    const MB: u64 = 1_000_000;
+    match n - n % MB {
+        0 => "0 MB".to_string(),
+        whole => crate::toolchain_words::fmt_bytes(whole),
+    }
+}
+
 /// What one apply outcome must write to the DURABLE health ledger.
 ///
 /// Split out of [`App::surface_update_apply_outcome`]'s UI reaction because the write
@@ -1322,14 +1468,14 @@ fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
         // A capture refusal is RECORDED as a failure (plan P0-3): the v0.91 shape
         // filed it in the non-streak refusal slot, so `failing_applies` stayed 0
         // across a whole day of refused attempts.
-        UpdateOutcome::Failed { message } | UpdateOutcome::CaptureRefused { message } => {
-            ApplyLedgerVerdict::Failed(message.clone())
-        }
+        UpdateOutcome::Failed { message } => ApplyLedgerVerdict::Failed(message.clone()),
+        #[cfg(any(unix, test))]
+        UpdateOutcome::CaptureRefused { message } => ApplyLedgerVerdict::Failed(message.clone()),
         UpdateOutcome::Blocked { reasons } => ApplyLedgerVerdict::Refused(reasons.join(" · ")),
         UpdateOutcome::Deferred { reason } => ApplyLedgerVerdict::Refused(reason.clone()),
-        UpdateOutcome::Accepted | UpdateOutcome::InstalledNeedsRelaunch { .. } => {
-            ApplyLedgerVerdict::Silent
-        }
+        UpdateOutcome::Accepted => ApplyLedgerVerdict::Silent,
+        #[cfg(any(unix, test))]
+        UpdateOutcome::InstalledNeedsRelaunch { .. } => ApplyLedgerVerdict::Silent,
     }
 }
 
@@ -1713,8 +1859,8 @@ pub(crate) mod tests {
     #[test]
     fn returned_failure_ledger_conforms_to_attempt_target_after_stage_replacement() {
         use crate::native_updater_service::{
-            ApplyDecision, ApplyMode, ApplyPreflightStart, ClosePreflight,
-            ReturnedApplyDisposition, ReturnedApplyFacts,
+            ApplyDecision, ApplyPreflightStart, ClosePreflight, ReturnedApplyDisposition,
+            ReturnedApplyFacts,
         };
         let _ledger = super::hold_update_ledger_for_test();
         let model = aterm_spec::derive::native_update_failure_target_model();
@@ -1724,9 +1870,8 @@ pub(crate) mod tests {
             let original = running + 65_101 + u64::from(replaced) * 2;
             let replacement = original + 1;
             stage_build_with_ledger(&mut app, original);
-            let ApplyPreflightStart::Inspect(preflight) = app
-                .native_updater_service
-                .begin_apply_preflight(ApplyMode::Immediate)
+            let ApplyPreflightStart::Inspect(preflight) =
+                app.native_updater_service.begin_apply_preflight()
             else {
                 panic!("the original stage must admit preflight");
             };
@@ -1838,9 +1983,19 @@ pub(crate) mod tests {
             if scheduled {
                 assert_eq!(installed, None, "no row for a retry that happens by itself");
             } else {
+                let version = app
+                    .native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .map(|stage| stage.version.clone());
                 assert_eq!(
-                    installed.as_deref(),
-                    Some("Update installed \u{2014} finish it from the Version menu")
+                    installed,
+                    Some(format!(
+                        "{} \u{2014} install it from the Version menu",
+                        crate::app_update_screen::update_installed_title(version.as_deref())
+                    )),
+                    "one install verb: the ready row's words beside Install now"
                 );
             }
 
@@ -1887,7 +2042,7 @@ pub(crate) mod tests {
         assert!(
             crate::app_config::update_auto_apply(&app.config)
                 && !App::relaunch_nudge_seam_suppresses_auto_apply()
-                && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
+                && crate::cli::launch_flags().control_sock.is_none(),
             "PRECONDITION: no update veto may be set in the test environment"
         );
         let build = stage_one_build(&mut app);
@@ -2084,7 +2239,7 @@ pub(crate) mod tests {
         assert!(
             crate::app_config::update_auto_apply(&app.config)
                 && !App::relaunch_nudge_seam_suppresses_auto_apply()
-                && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
+                && crate::cli::launch_flags().control_sock.is_none(),
             "PRECONDITION: no update veto may be set in the test environment"
         );
         let build = stage_one_build(&mut app);
@@ -2781,7 +2936,7 @@ pub(crate) mod tests {
         assert_eq!(
             app.update_record_text(),
             Some(format!(
-                "Couldn't install aterm v{asked} \u{2014} will try again by itself"
+                "Couldn't install aterm v{asked} \u{2014} tries again by itself"
             )),
             "whoever just asked for the update finds it did not happen, on record"
         );
@@ -2821,6 +2976,7 @@ pub(crate) mod tests {
         use crate::messages_host::FlowPhase;
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
+        app.note_update_check_asked(true);
         let mut said: Vec<String> = Vec::new();
         let look = |app: &App, said: &mut Vec<String>| {
             said.push(app.update_row_text().expect("the flow row is up"));
@@ -2896,6 +3052,12 @@ pub(crate) mod tests {
     /// lane will try again, and a stopped lane points at the Version menu.
     #[test]
     fn only_a_blocker_a_person_can_clear_is_named_on_the_row() {
+        // An automatic `Blocked` books a refusal in the one per-process ledger:
+        // held, so it cannot land between a sibling's booking and its read
+        // (measured 2026-09-25: `a_fork_lane_park_miss_is_booked_as_a_refusal_
+        // not_a_failure` read this test's "Updating after session restore
+        // finishes" as its own last refusal, one full-suite run in one).
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let blocked = |reasons: &[&str]| UpdateOutcome::Blocked {
             reasons: reasons.iter().map(|r| (*r).to_string()).collect(),
@@ -3028,6 +3190,140 @@ pub(crate) mod tests {
             }),
             ApplyLedgerVerdict::Silent
         );
+    }
+
+    /// WHO IS WAITING (design ruling 220): the updater service's live ticket —
+    /// minted only by a person's Check for Updates, Software Update's button or
+    /// the Version menu — and a person's `aterm ctl update check` in flight
+    /// each make the download theirs, with its animated row; the background
+    /// loop's is nobody's, and silent. The check ending while the row is up
+    /// leaves the row to its end.
+    #[test]
+    fn a_download_is_the_persons_while_their_check_runs() {
+        let download = |done: u64| aterm_update::Progress::Downloading {
+            version: "0.79.0".into(),
+            bytes_done: done,
+            bytes_total: 90,
+        };
+        // Nobody asked: silent, and Software Update says it.
+        let mut app = App::headless_for_test();
+        assert!(!app.update_awaited());
+        app.note_update_progress(&download(45));
+        assert_eq!(
+            app.update_row_text(),
+            None,
+            "the background loop's is silent"
+        );
+        assert_eq!(
+            app.update_quiet.as_ref().map(|q| q.title.as_str()),
+            Some("Downloading aterm v0.79.0")
+        );
+        // A person's check from the menu: the ticket makes it theirs.
+        let CheckStart::Start(_) = app.native_updater_service.request_check() else {
+            panic!("a check starts");
+        };
+        assert!(app.update_awaited());
+        app.note_update_progress(&download(60));
+        assert!(
+            app.update_row_text().is_some(),
+            "the row is up for the person"
+        );
+        assert!(
+            app.update_quiet.is_none(),
+            "and the page's quiet line is gone"
+        );
+        // `aterm ctl update check`: bracketed by its wakes, nested safely.
+        let mut ctl = App::headless_for_test();
+        ctl.note_update_check_asked(true);
+        ctl.note_update_check_asked(true);
+        ctl.note_update_check_asked(false);
+        assert!(ctl.update_awaited(), "one of two still runs");
+        ctl.note_update_progress(&download(10));
+        assert!(ctl.update_row_text().is_some());
+        ctl.note_update_check_asked(false);
+        ctl.note_update_check_asked(false);
+        assert!(!ctl.update_awaited(), "never below zero");
+        ctl.note_update_progress(&download(80));
+        assert!(
+            ctl.update_row_text().is_some(),
+            "the row already up keeps moving to its end"
+        );
+    }
+
+    /// THE SILENT DOWNLOAD STAYS CHEAP (design ruling 220, R3's "efficient"):
+    /// the quiet lane's words count whole MB, unpadded in the page's sentence;
+    /// a 10 Hz poll inside one MB republishes nothing; a new MB reaches the open
+    /// Settings view alone (its presentation moves) with no full host publish
+    /// (Version menu, palette, tabs, every window); and only its end publishes
+    /// in full.
+    #[test]
+    fn the_quiet_download_republishes_only_to_settings_per_whole_mb() {
+        use crate::app_native::{FULL_UPDATE_PUBLISHES, QUIET_WORD_PUBLISHES};
+        let download = |done: u64| aterm_update::Progress::Downloading {
+            version: "0.92.0".into(),
+            bytes_done: done,
+            bytes_total: 1_200_000_000,
+        };
+        let mut app = App::headless_for_test();
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate));
+        let (_, view) = app
+            .active_native_view(WindowId(0))
+            .expect("active Settings view");
+        let presentation = |app: &App| match app.native_runtime.view_state(view) {
+            Some(AppViewState::Settings(state)) => state.common.presentation_revision,
+            _ => panic!("Settings view state"),
+        };
+        let counts = || {
+            (
+                FULL_UPDATE_PUBLISHES.with(std::cell::Cell::get),
+                QUIET_WORD_PUBLISHES.with(std::cell::Cell::get),
+            )
+        };
+        let (full, quiet) = counts();
+        let before = presentation(&app);
+        app.note_update_progress(&download(5_400_000));
+        assert_eq!(app.update_row_text(), None, "silent");
+        assert_eq!(
+            app.update_snapshot(false).projection().detail.as_deref(),
+            Some("5 MB / 1.2 GB downloaded."),
+            "whole MB, no padding in a sentence"
+        );
+        assert_eq!(counts(), (full, quiet + 1), "the Settings views alone");
+        let first = presentation(&app);
+        assert!(first > before, "the open page repaints");
+        // Polls inside the same MB: nothing is republished.
+        for done in [5_500_000, 5_700_000, 5_999_999] {
+            app.note_update_progress(&download(done));
+        }
+        assert_eq!(counts(), (full, quiet + 1));
+        assert_eq!(presentation(&app), first);
+        // The next MB: the page again, still no full publish.
+        app.note_update_progress(&download(6_100_000));
+        assert_eq!(counts(), (full, quiet + 2));
+        assert!(presentation(&app) > first);
+        // Under 1 MB with no total: whole MB too, never a KB tick per poll.
+        let mut fresh = App::headless_for_test();
+        let (_, quiet) = counts();
+        for done in [0, 40_000, 400_000, 999_999] {
+            fresh.note_update_progress(&aterm_update::Progress::Downloading {
+                version: "0.92.0".into(),
+                bytes_done: done,
+                bytes_total: 0,
+            });
+        }
+        assert_eq!(
+            fresh.update_quiet.as_ref().map(|q| q.progress.as_str()),
+            Some("0 MB")
+        );
+        assert_eq!(counts().1, quiet + 1, "one word, one publish");
+        // Its end is the full publish: the page reads the stage from here.
+        let (full, _) = counts();
+        app.note_update_progress(&aterm_update::Progress::Staged {
+            version: "0.92.0".into(),
+            build: 41,
+        });
+        assert!(app.update_quiet.is_none());
+        assert!(counts().0 > full, "the end publishes in full");
     }
 
     #[test]
@@ -3209,6 +3505,40 @@ pub(crate) mod tests {
             assert_eq!(app.message_band_rows, 1, "one row for one fact");
         }
     }
+    /// AN UNATTENDED FAILURE WITH NO STAGE IS A RECORD (audit 2026-09-24,
+    /// design ruling 213): the artifact is gone, nothing can be pressed, and
+    /// the next check re-stages it — so the automatic lane writes one record
+    /// and posts no row; a person's own press still gets `Update didn't
+    /// finish` on the glass.
+    #[test]
+    fn an_automatic_failure_with_no_stage_is_a_record_and_a_press_is_a_row() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let failed = || UpdateOutcome::Failed {
+            message: "the staged artifact was retired".to_string(),
+        };
+        let mut app = App::headless_for_test();
+        assert!(app.native_updater_service.snapshot().staged.is_none());
+        let before = app.messages.log().len();
+        app.react_to_update_apply_outcome("automatic handoff", failed(), false);
+        assert_eq!(
+            app.update_row_text(),
+            None,
+            "no row for an unattended attempt"
+        );
+        assert_eq!(app.messages.log().len(), before + 1, "one record");
+        let said = app.update_record_text().expect("on record");
+        assert!(said.starts_with("Update didn't finish \u{2014} "), "{said}");
+        assert!(said.contains("the staged artifact was retired"), "{said}");
+
+        let mut pressed = App::headless_for_test();
+        pressed.react_to_update_apply_outcome("manual", failed(), false);
+        assert_eq!(
+            pressed.update_row_text().as_deref(),
+            Some("Update didn't finish \u{2014} "),
+            "a person's press is told on the glass"
+        );
+    }
+
     /// NO ✓ BESIDE A FAILURE (ruling 159). The staged row leaves resolved `Ok`
     /// once the bytes are installed (`InstalledNeedsRelaunch`) — true — and
     /// WITHDRAWN when the artifact is gone (`Failed` with no staged build),

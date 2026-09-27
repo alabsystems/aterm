@@ -399,8 +399,7 @@ const GUARD_HELPERS: &[GuardHelper] = &[
 ///     contain the bare-`self` acquisition — a moved/renamed/rewired fn makes
 ///     the entry STALE and FAILS the census until re-audited;
 ///   * only bare-`self` receivers qualify: a `self.<field>` delegation is
-///     nameable (name the field — see aterm-types/src/sync.rs `raw`), so it
-///     never lands here.
+///     nameable (name the field), so it never lands here.
 struct VocabularyInterior {
     /// The implementing fn (must be one of [`STANDARD_METHOD_NAMES`]).
     symbol: &'static str,
@@ -1978,7 +1977,12 @@ fn takes_self(body: &[String]) -> bool {
             break;
         }
     }
-    let Some(open) = sig.find('(') else {
+    // The parameter list opens at the first `(` AFTER `fn `: a restricted
+    // visibility (`pub(crate) fn lock(&self)`) opens one of its own first.
+    let Some(open) = sig
+        .find("fn ")
+        .and_then(|at| sig[at..].find('(').map(|p| at + p))
+    else {
         return false;
     };
     let after = sig[open + 1..].trim_start();
@@ -4600,6 +4604,18 @@ mod tests {
             "a METHOD named `lock` is token-captured at its call sites:\n{}",
             out.log
         );
+        // The same method behind a restricted visibility: `pub(crate)` opens a
+        // parenthesis before the parameter list does, and must not hide `self`.
+        let out = run_synth(
+            "cratelock",
+            "impl Wrapper {\n    pub(crate) fn lock(&self) -> MutexGuard<'_, u32> {\n        \
+             self.raw.lock().unwrap()\n    }\n}\n",
+        );
+        assert!(
+            out.ok,
+            "a `pub(crate)` METHOD named `lock` is token-captured too:\n{}",
+            out.log
+        );
     }
 
     // ------------------------------------------------------------------
@@ -5171,19 +5187,40 @@ mod tests {
         // `open_store_lock` site into them. The census, not the notes, says
         // eight.
         //
-        // NOTE (2026-09-24, origin/main merged into fix/main-reds-0924): NINE —
-        // main's 9f5922003 added update-core's `FileLock::lock_open` (the
-        // roster's read-only claim on a file the caller opened its own way,
-        // blocking `lock()`) without moving this count, so main's gate went red
-        // here. Cross-process by purpose; a `File` by its binding's ascription.
+        // NOTE (2026-09-24, `9f5922003`): NINE — the eight above plus
+        // update-core's THIRD site, `FileLock::lock_open`
+        // (crates/aterm-update-core/src/sys.rs), a blocking `LOCK_EX` on a
+        // file the CALLER opened. It exists because the roster's read-only
+        // claim (atpkg-keys `provision.rs`) must take the rendezvous without
+        // ever creating it, which `acquire` cannot express — it opens the path
+        // itself. Same class as `acquire` in every other respect: blocking,
+        // cross-process by purpose, released by `LOCK_UN` on drop, and a
+        // `File` by the load-bearing ascription that commit deliberately
+        // re-states. That commit did not move this count, so main's gate went
+        // red here until two sessions fixed it the same afternoon — this note
+        // is both of their readings, which agreed. The census, not the notes,
+        // says nine.
+        //
+        // NOTE (2026-09-26, the toolchain leases `52bf9f6bc`): FOURTEEN — the
+        // nine above plus atpkg's `lease.rs`, five non-blocking `try_lock`s:
+        // `take` (a holder's own lease, held exclusive for its run), `probe_file`
+        // (is a lease's holder alive), and `reclaim`, `sweep` and `reap_taking`
+        // (gc's exclusive take of a subject's `.gate` before it deletes, so a
+        // holder arriving mid-delete waits for nothing and finds nothing half
+        // gone). Cross-process by purpose — a lease exists so gc and the trust
+        // flip in ANOTHER process see a run's toolchain in use — and a `File`
+        // by each binding. The leases landed with `gate lockorder` green and
+        // this pin red, because the gate counts and this test pins; the census,
+        // not the notes, says fourteen.
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log.contains("9 OS file-advisory"),
+            out.log.contains("14 OS file-advisory"),
             "expected exactly the restore-manifest flock, update-core's three \
-             sites (blocking acquire, the caller-opened lock_open and the \
+             sites (blocking acquire, the caller-opened `lock_open`, and the \
              bounded-wait try_lock loop), atpkg's machine-apply queue, the log \
-             rotation's try_lock, the harness's upgrade sweep lock and atpkg's \
-             two Flock acquisitions in the advisory category:\n{}",
+             rotation's try_lock, the harness's upgrade sweep lock, atpkg's \
+             two Flock acquisitions and its five lease sites in the advisory \
+             category:\n{}",
             out.log
         );
         assert!(
@@ -5200,6 +5237,9 @@ mod tests {
                 && out.log.contains("fn `sweep_lock`")
                 && out.log.contains("crates/atpkg/src/lock.rs")
                 && out.log.contains("fn `lock_within`")
+                && out.log.contains("crates/atpkg/src/lease.rs")
+                && out.log.contains("fn `take`")
+                && out.log.contains("fn `reclaim`")
                 && out.log.contains("proven std::fs::File by its binding at"),
             "each advisory listing must carry its audit evidence:\n{}",
             out.log
@@ -5207,26 +5247,22 @@ mod tests {
     }
 
     #[test]
-    fn lz4_raw_pointer_reads_are_categorized_on_this_tree() {
-        // The four real `core::ptr::read` sites — three in the upstream-derived
-        // lz4 block codec (kept close to lz4_flex for reviewability, so receiver
-        // renames are off the table there; the never-compiled raw-pointer
-        // decoder `block/decompress.rs` and its two sites were deleted) plus the vendored
-        // indexmap `extract.rs` site (categorized by the PROPAGATED evidence:
+    fn raw_pointer_reads_are_categorized_on_this_tree() {
+        // The one real `core::ptr::read` site — the vendored indexmap
+        // `extract.rs` walk (categorized by the PROPAGATED evidence:
         // `entries.as_mut_ptr()` seeds `base`, `base.add(current)` extends to
         // `item`) — must be classified by raw-pointer EVIDENCE, listed, and
-        // excluded from the mutex graph — never UNKNOWN, never misread as
-        // RwLock identities.
+        // excluded from the mutex graph — never UNKNOWN, never misread as an
+        // RwLock identity. The lz4 block codec's three sites went with its
+        // never-built unsafe encoder/sink paths (the crate forbids `unsafe`).
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log.contains("4 raw-pointer ptr::read"),
-            "expected exactly the three vendored-lz4 + one indexmap ptr::read sites:\n{}",
+            out.log.contains("1 raw-pointer ptr::read"),
+            "expected exactly the one indexmap ptr::read site:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("crates/aterm-lz4/src/block/compress.rs")
-                && out.log.contains("crates/aterm-lz4/src/sink.rs")
-                && out.log.contains("vendor/indexmap/src/inner/extract.rs"),
+            out.log.contains("vendor/indexmap/src/inner/extract.rs"),
             "each raw-pointer listing must name its site:\n{}",
             out.log
         );

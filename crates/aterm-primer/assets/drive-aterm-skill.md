@@ -64,8 +64,13 @@ The other tabs on this machine are often other agents mid-task. Before any `turn
    executing block's `cmdline=`. `program=` names the foreground program even where
    `detail=` is dark, `agent=` is the server's verdict on an agent's screen (`prompt`,
    `question`, `wall:<kind>`, …), and `supervisor=` other than `-` means a supervisor —
-   `aterm-harness@<pid>` is the window's own, on by default for every Claude Code session
-   — is already answering its prompts: leave its boxes to it and the human.
+   `aterm-harness@<pid>` is the window's own, on by default and fully automatic for every
+   Claude Code and Codex session — is already answering its prompts: leave its boxes to it and the
+   human.
+   `input=` is whether it is READING its input (macOS; `-` elsewhere): `stalled` or
+   `stopped` is a frozen or stopped program whose screen still looks live, and a key into
+   it is refused `ERR busy input-unread …` — a fact about the peer, not a flaky tool:
+   never retry it in a loop (`aterm help introspection` has the remedies).
 2. `aterm ctl "@$SID" meta` — `role=` is whatever its owner stamped (`-` = unset).
 3. **Never type into another agent's prompt unless the human named the session AND the
    message.** Reading (`text`, `image`, `status`, `blocks`) is always fine.
@@ -73,23 +78,23 @@ The other tabs on this machine are often other agents mid-task. Before any `turn
 Stamp yourself on arrival so peers can tell the same about you:
 `aterm ctl @self meta set role agent:<your-name>`.
 
-## Environment
+## Flags and environment
 
-| Var | Read by | Meaning |
+No environment variable changes what aterm does: the launch choices are FLAGS.
+
+| Spelling | On | Meaning |
 |---|---|---|
-| `ATERM_CONTROL_SOCK` | server **and** client | Server: bind this exact path. Client: default socket. `0`/`off` disables. |
-| `ATERM_NO_CONTROL_SOCK` | server | Anything but `0`/empty disables the socket; wins over an explicit path. |
+| `--headless` | server | No window; engine + PTY + socket only. The launch says so on stderr. |
+| `--control-sock <path>` | server | Bind this exact path (`0`/`off` disables); `--no-control-sock` disables. |
+| `--columns <n>` / `--lines <n>` | server | Initial grid (20..=500 / 5..=300). |
+| `-e <cmd> [args…]` | server | Run this in the PTY instead of the shell — deterministic paint instead of a host-specific prompt (the window closes when it exits; put launch flags BEFORE `-e`). |
+| `--sock <path>` / `--pid <n>` | `aterm ctl` | Dial this socket / instance. `aterm drive` spells it `--socket`. |
 | `ATERM_PARENT_SESSION_ID` | **client** | Injected into every child shell. Powers `@self`, the ` *` marker in `ls`, and flagless socket resolution to *your own* instance. |
 | `XDG_RUNTIME_DIR` | both | Rendezvous dir is `$XDG_RUNTIME_DIR/aterm`, else `~/Library/Application Support/aterm`. **Client needs the same value as the server** or discovery looks in the wrong place. |
-| `ATERM_HEADLESS=1` | server | No window; engine + PTY + socket only. Exactly `--headless` (prefer the flag). `0`/`off`/empty do NOT arm it and say so on stderr. |
-| `ATERM_COLUMNS` / `ATERM_LINES` | server | Initial grid (clamped 20..=500 / 5..=300). |
-| `ATERM_EXEC` | server | Run this in the PTY then exec `$SHELL` — deterministic paint instead of a host-specific prompt. |
-| `ATERM_CTL` | `drive`, `fleet` | Path to the `aterm-ctl` client they shell out to (`fleet` uses it for the `events` streamers and `exec`; its fleet **discovery** is in-process). |
-| `ATERM_CONTROL_TOKEN` | `aterm drive` (whenever a socket is configured — `--dial` *and* the local `prompt` fast path) | Not read by `aterm ctl` — that reads the sibling token *file*, and `drive` falls back to the same file. |
 
 Auth is automatic: a per-launch 32-byte token file sits beside the socket —
 `aterm-<pid>.token` for a default socket, and for an explicit
-`$ATERM_CONTROL_SOCK` path a token named after that socket (`x.sock` →
+`--control-sock` path a token named after that socket (`x.sock` →
 `x.sock.token`). Socket and token are 0600, same-uid only. The per-socket name
 is what lets **two private instances share one directory**: they used to both
 write `aterm.token`, so the second to start silently took the first's
@@ -100,16 +105,15 @@ that was still listening.
 
 ```sh
 RUN=$(mktemp -d); SOCK="$RUN/c.sock"
-ATERM_CONTROL_SOCK="$SOCK" XDG_RUNTIME_DIR="$RUN" \
-  ATERM_COLUMNS=100 ATERM_LINES=30 SHELL=/bin/sh \
-  aterm-gui --headless >"$RUN/gui.log" 2>&1 &
+HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN" SHELL=/bin/sh \
+  aterm --headless --control-sock "$SOCK" --columns 100 --lines 30 >"$RUN/gui.log" 2>&1 &
 for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 ```
 
 Server announces on stderr: `aterm-gui: control socket listening at <PATH> (token-gated, same-uid only)`.
 
-For a screen with no prompt noise:
-`ATERM_EXEC='printf "\033[2J\033[H"; printf "READY\r\n"; exec sleep 86400'`
+For a screen with no prompt noise, end the launch with
+`-e /bin/sh -c 'printf "\033[2J\033[H"; printf "READY\r\n"; exec sleep 86400'`
 
 ## Discover windows and sessions
 
@@ -136,7 +140,7 @@ the server's. *(`--sock`/`--pid` used to be silently ignored here, so a scoped `
 the user's real terminals. Fixed 2026-07-26; a stale build still has the old behavior.)*
 
 Line shapes:
-- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|-> identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=… agent_rev=<n> agent_since_ms=<ms> agent_gen=… agent_fp=… supervisor=<holder|->[ *]` (an older build ends earlier: parse by key)
+- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|-> identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=… agent_rev=<n> agent_since_ms=<ms> agent_gen=… agent_fp=… human_ms=<ms|-> supervisor=<holder|->[ *]` (an older build ends earlier: parse by key)
 - `sessions` → the same without the leading pid
 - `windows` → `<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]` (`active=-`
   when nothing is on the active tab), then
@@ -159,8 +163,10 @@ the keyword; older builds read the first word, `cd`); `identity=` the agent iden
 session was spawned under (`spawn identity=<name>`), `-` for the human's own config. `program=`
 the foreground program (argv0's basename: `claude`, `codex`, `zsh`); `agent=` the server's
 own verdict on an identified agent's screen (`busy|prompt|question|idle|survey|unknown|
-wall:<kind>`, `-` for anything else — `aterm ctl help sessions` has the rest); `supervisor=`
-who answers its prompts (`aterm-harness@<pid>` is the window's own host), `-` for nobody.
+wall:<kind>`, `-` for anything else — `aterm ctl help sessions` has the rest); `human_ms=`
+how long since a PERSON last typed, clicked or scrolled in it through a window (`-`: never;
+your control writes never set it); `supervisor=` who answers its prompts (`aterm-harness@<pid>` is the window's
+own host), `-` for nobody.
 
 `*` / `self` mark the caller's own session/instance. **Parse by key, not by column:** the
 title is percent-encoded, **may be empty** (two consecutive spaces), and any program can set
@@ -561,7 +567,9 @@ silently matches nothing, and the refusal prints the whole vocabulary on its sec
 addressed message: the session asked for the topic with `aterm ctl @<sid> topic add <t>`
 (Owner-only; `topic ls`/`topic drop <t>`), and a session that asked for nothing receives
 no broadcast at all. Each add or drop is pushed as `EVENT <local> topic add|drop …` on the
-`events` digest, which is how the session's bridge learns of it at once.
+`events` digest, which is how the session's bridge learns of it at once — or, for a session
+its push lane does not watch (past the 256-target cap), from the `topic ls` it reads on every
+2 s roster round.
 
 After the ack the connection is **push-only forever**.
 
@@ -581,7 +589,10 @@ After the ack the connection is **push-only forever**.
   `events-dropped=<n>` (the session's timeline evicted records this watch had not been shown)
 - `EVENT * session-created <sid>` / `EVENT * session-exited <sid> reason=<…>` / `EVENT *
   fabric-retire <sid>` — `sessions` only; `*` is the instance tag, not a `<local>`, so it
-  resolves against no `sub` map entry.
+  resolves against no `sub` map entry. On `@*` (up to 256 watches; the rest adopted as slots
+  free, each with its own `sub` line, written once its watch is seeded) a session the cap
+  leaves unwatched is announced once as `session-created <sid> watch=deferred`: to know what
+  you do not watch, go by the `sub` lines you hold, not by that one line.
 - `T <tag> <t_us>` — `ts` only, once per channel per wake, immediately before that
   channel's frames. `<tag>` is a `<local>` for session frames and `*` for `EVENT *`, so
   **do not parse the second token as a number**.
@@ -611,8 +622,8 @@ aterm drive --dial <name> prompt 'run the tests'
 
 - **`dial <name>` with no verb is rejected** — a bare dial would deadlock a one-shot client.
 - Dialing out is owner-only. Use `image --bytes` remotely (a path names the server's disk).
-- `aterm drive --dial` authenticates the way `aterm ctl` does: `$ATERM_CONTROL_TOKEN` if set,
-  else the sibling token file by the SHARED convention. *(It used to derive `<sock without
+- `aterm drive --dial` authenticates the way `aterm ctl` does: the sibling token file by the
+  SHARED convention. *(It used to derive `<sock without
   .sock>.token`, a name the server never writes, so `--dial` silently failed to authenticate
   where `aterm ctl` worked. Fixed — a stale build still has the old behavior.)*
 
@@ -660,8 +671,8 @@ aterm drive --socket "$SOCK" shot out.png
 aterm drive classify 'git status --short && git pull | tail'  # read-only (exit 0) | not-read-only <reason> (exit 1) — pure, no host needed
 aterm drive phase "@$SID"                                     # busy | prompt | limited | idle | question, then the parsed prompt box
 aterm drive await-turn "@$SID" --timeout 600000               # block until not busy, print the phase; exit 124 = still busy
-aterm drive supervise "@$SID" --auto-reads --max-s 1800 --notes notes.txt   # the manager loop; see the supervise-agent skill (the window's host already supervises by default)
-aterm drive watch "@$SID" --auto-reads --notes notes.txt      # the same loop under a background monitor: one line per decision
+aterm drive supervise "@$SID" --approve safe --max-s 1800 --notes notes.txt   # the manager loop; see the supervise-agent skill (the window's host already supervises, fully automatic)
+aterm drive watch "@$SID" --notes notes.txt                   # the same loop under a background monitor: one line per decision
 aterm drive report "@$SID"                                    # what the worker said since your turn, what scrolled off included
 aterm drive report "@$SID" --final                            # only its LAST message block (no tool rows, no ⎿ output); --messages for every one
 aterm drive watch "@$SID" --journal j.jsonl                   # …and one JSON object per line it prints, for the ledger below
@@ -683,18 +694,31 @@ costs a bounded extra wait, never a failed turn.
 
 Everything from `classify` down is the `supervise-agent` skill's loop (`aterm drive
 --help`, *SUPERVISING A WORKER*): `classify` is the read-only judgment, `phase` one read →
-one word, `await-turn` the wait that never sleeps, `supervise` the loop that (with
-`--auto-reads`) presses only what the approval policy proves safe, guarded on the judged
-row, and stops at everything else, `watch` that loop printing one `EVENT` line per review
+one word, `await-turn` the wait that never sleeps, `supervise` the loop that answers each box
+under the `[harness]` `approve` level (every box by default; `--approve safe` only what
+the approval policy proves safe), guarded on the judged row, and stops at everything else, `watch` that loop printing one `EVENT` line per review
 point and keeping on, `task` the work sent by mail, `report` what the worker said since
 your turn (`--final` its last message block alone), `ledger` how the whole loop ran.
 `--timeout` is milliseconds; `--max-s` is seconds.
 
-**Every Claude Code session in an aterm window is already supervised** by the window's
-own host, by default (aterm.toml `[harness]`; `enabled = false` or Settings ▸ Harness
-turns it off; a headless instance only with `headless = true`). It answers the boxes it
-proves safe, continues a turn that ended after real work, and escalates the rest to the
-menu bar (the session's `attention`, `owner=supervisor`). `status`/`ls` name it —
+**Every agent session aterm hosts is already supervised** by the window's own host, by
+default and FULLY AUTOMATIC (aterm.toml `[harness]`, whose every key only takes power
+away; `enabled = false` or the Harness switch in Settings (search "harness") turns it
+off). It answers every box — a permission box its one-shot `Yes`, vendor notes and rm
+circuit breakers included, and the folder-trust dialog, even the form whose Yes makes the
+folder's pre-approved permissions apply without asking in every later session there;
+a plan its yes that grants no standing mode (`Yes, manually approve edits`, never auto
+mode, bypass or a cleared context) (owner, 2026-09-24; `approve = "safe"`, or "Approve
+permission boxes" set to `safe` in Settings — search "approve" — limits it to the boxes
+it proves safe) — answers a question dialog with its recommended option whatever
+`approve` says (Enter on the `(Recommended)` one, option 1 when none is marked, never a
+digit; `answer_questions = false`, or "Answer questions with the recommended option" off
+in Settings — search "question" — hands every question over), continues a turn that
+ended, relaunches a Claude Code that crashed, holds off while a person types or another
+driver holds a lease or a named turn on the session (`hand=`), and escalates only what the
+table limited or nothing can answer — a question a person has begun answering or it
+cannot read whole among them — to the menu bar (the session's
+`attention`, `owner=supervisor`). `status`/`ls` name it —
 `supervisor=aterm-harness@<pid>` — beside `program=` and the server's `agent=` verdict.
 A `watch` you start on such a session watches only; the `supervise-agent` skill has the
 rules.
@@ -715,10 +739,11 @@ hash=<hex16>[ busy=1]` stamp line (not counted by `rows=`), so you can hold it a
 try and the stamp will NOT match the ledger. The rows are from the last `⏺` row down to
 the live zone, or the last six non-blank rows above it, trimmed to 4 KiB, posted once per
 screen. An idle whose report never came within
-`--idle-grace` (180 s) is `EVENT idle-no-report …` — and so is one a prompt or a new turn
+`--idle-grace` (default 5 s) is `EVENT idle-no-report …` — and so is one a prompt or a new turn
 superseded under the hold (the screen is read once a step there). A report is the turn's
 when it came after the worker was read busy for the turn, or after the point; one from
-before the last point handed over never is; `--report-window` (120 s) bounds only a report
+before the last point handed over never is. A late report still prints `MAIL` and remains
+readable from the inbox; `--report-window` (120 s) bounds only a report
 from before the turn was seen to begin. `task` posts `kind=task` from your session and, only
 when the worker is idle, types the one-line nudge `Inbox: task @<off>` as a turn — nothing
 wakes a worker for mail; it is typed to, as you would type to it.
@@ -730,9 +755,10 @@ rating. `aterm drive phase` (and `await-turn`) ends with `survey 0` while it is 
 dismiss it with `aterm ctl "@$SID" key 'if=^●.How.is.Claude.doing' 0` — `0`, guarded on
 the survey's own row (a copy quoted in the transcript or in a tool's output matches
 nothing), quoted for zsh — before you type. `watch` prints `EVENT survey seq=<n> dismiss
-with: …` once when it appears, and `watch --dismiss-surveys` presses the `0` itself and
-prints `DISMISSED survey seq=<n>` once the survey has gone (still open, it prints the
-`EVENT survey` line for you instead); a monitor that filters `watch`'s lines keeps it:
+with: …` once when it appears under `[harness] dismiss_surveys = false`; otherwise
+`watch` presses the `0` itself and prints `DISMISSED survey seq=<n>` once the survey has
+gone (still open, it prints the `EVENT survey` line and presses the `0` again on a growing
+back-off, badging the session from the second miss); a monitor that filters `watch`'s lines keeps it:
 `grep --line-buffered -E '^(EVENT|APPROVED|DISMISSED|TIMEOUT|EXIT)'`.
 
 **A worker running out of context is a decision point too.** Claude Code parks `1% until
@@ -787,8 +813,8 @@ are placed by the birth time of its control socket; anything that cannot be
 placed is marked `~` and no latency is claimed. Reads only.
 
 `drive` **shells out** to `aterm-ctl`, so through a bare symlink with no sibling client it
-fails with `could not run aterm-ctl`. Set `$ATERM_CTL`, or just use `aterm ctl` — that path
-is in-process.
+fails with `could not run aterm-ctl`. Put the `aterm-ctl` alias beside it (or on PATH), or just
+use `aterm ctl` — that path is in-process.
 
 ## Gotchas (quick reference)
 

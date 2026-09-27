@@ -72,7 +72,9 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(run() as u8)
 }
 
+#[cfg(target_os = "macos")]
 const PASS: i32 = 0;
+#[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
 const NOT_RUN: i32 = 2;
 

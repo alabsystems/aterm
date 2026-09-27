@@ -1073,6 +1073,11 @@ pub(crate) const UNSERVED_HEADLINE: &str = "ALab tools aren\u{2019}t available f
 pub(crate) const IGNORED_PREFIX_HEADLINE: &str =
     "Automatic installs are paused — [packages] prefix is set";
 
+/// The card's detail while a verb runs (design ruling 265): where its
+/// progress is. CONDITIONAL (ruling 266): work that ends inside the band's
+/// progress grace never reaches the glass, so the card promises no row.
+const BUSY_DETAIL: &str = "If it takes a while, its progress shows at the top of the window.";
+
 /// Which command result a Packages headline PRESENTS, as the `NativePackagesWorker`
 /// model counts it (`presented_result`: 0 none, 1 success, 2 failure): an attention
 /// headline presents none, whatever words it ends on.
@@ -1501,6 +1506,10 @@ pub(crate) struct PackagesService {
     /// [`Self::finish`]). One half of the Packages badge; the recorded rows are the
     /// other ([`attention_items`]).
     pass_trouble: Option<PassTrouble>,
+    /// How many programs the last check or install moved to a new build
+    /// (design ruling 265): the card says `2 programs updated` rather than a
+    /// bare "completed". Cleared when a verb begins.
+    updated: usize,
 }
 
 /// The `[machine]` host settings as the window CONFIRMED them: the record bare
@@ -1574,6 +1583,7 @@ impl PackagesService {
             last_command: None,
             machine: MachinePosture::default(),
             pass_trouble: None,
+            updated: 0,
         }
     }
 
@@ -1790,13 +1800,16 @@ impl PackagesService {
 
     #[cfg(test)]
     pub(crate) fn model_state(&self) -> PackagesModelState {
+        // `busy` is read on its own, not through `inflight`: they are separate
+        // fields, and a settle that clears one but not the other is exactly what
+        // `SingleFlightHasOneKind` exists to catch.
         let operation = match (self.inflight, self.busy) {
-            (false, _) => 0,
+            (false, None) => 0,
             (true, None) => 1,
-            (true, Some(PackagesBusy::Check)) => 2,
-            (true, Some(PackagesBusy::Install)) => 3,
-            (true, Some(PackagesBusy::Uninstall)) => 4,
-            (true, Some(PackagesBusy::MachineApply)) => 5,
+            (_, Some(PackagesBusy::Check)) => 2,
+            (_, Some(PackagesBusy::Install)) => 3,
+            (_, Some(PackagesBusy::Uninstall)) => 4,
+            (_, Some(PackagesBusy::MachineApply)) => 5,
         };
         let (last_operation, last_result) = match self.last_command.as_ref() {
             None => (0, 0),
@@ -1847,6 +1860,7 @@ impl PackagesService {
             // The in-flight headline is now authoritative. Never leave the
             // previous verb's result attached to a new attempt.
             self.last_command = None;
+            self.updated = 0;
         }
         self.revision = self.revision.saturating_add(1);
         Some(self.sequence)
@@ -1871,6 +1885,12 @@ impl PackagesService {
         self.busy = None;
         if self.completion_clears_trouble(&completion) {
             self.pass_trouble = None;
+        }
+        if let Some(PackagesCommandOutcome::Succeeded {
+            operation: PackagesBusy::Check | PackagesBusy::Install,
+        }) = completion.command
+        {
+            self.updated = updated_programs(self.report.as_ref(), &completion.report);
         }
         self.report = Some(completion.report);
         if completion.command.is_some() {
@@ -1942,8 +1962,25 @@ impl PackagesService {
             saved_spotlight_noindex: true,
             pass_trouble: self.pass_trouble.clone(),
             retired_switch_note: None,
+            updated: self.updated,
         }
     }
+}
+
+/// How many programs `after` holds at a different installed build than
+/// `before` did (a program new to the report with a build counts): what a
+/// check or an install changed.
+fn updated_programs(before: Option<&PackagesStatusReport>, after: &PackagesStatusReport) -> usize {
+    after
+        .programs
+        .iter()
+        .filter(|row| row.installed_build.is_some())
+        .filter(|row| {
+            before
+                .and_then(|b| b.programs.iter().find(|old| old.name == row.name))
+                .is_none_or(|old| old.installed_build != row.installed_build)
+        })
+        .count()
 }
 
 /// The snapshot a [`crate::native_settings::SettingsApp`] holds (the
@@ -1986,6 +2023,8 @@ pub(crate) struct PackagesState {
     /// and the config editor say) — the WHY of an off [`Self::master_enabled`], never a
     /// second switch: the effective state is `master_enabled` alone.
     retired_switch_note: Option<String>,
+    /// Programs the last check or install moved ([`PackagesService`]'s count).
+    updated: usize,
 }
 
 impl PackagesState {
@@ -2025,6 +2064,7 @@ impl PackagesState {
             saved_spotlight_noindex: true,
             pass_trouble: None,
             retired_switch_note: None,
+            updated: 0,
         }
     }
 
@@ -2150,6 +2190,37 @@ impl PackagesState {
         };
         let mut detail = if !self.observed {
             None
+        } else if let Some(busy) = self.busy {
+            // While the verb runs (ruling 265) the card says where its
+            // progress is — never `Click Check & Update Now to check.` under
+            // a disabled button. The machine apply has no band row (a local
+            // edit well under a second): its headline says it all (ruling
+            // 266).
+            (busy != PackagesBusy::MachineApply).then(|| BUSY_DETAIL.to_string())
+        } else if let Some(PackagesCommandOutcome::Succeeded { operation }) =
+            self.last_command.as_ref().filter(|c| {
+                !matches!(
+                    c,
+                    PackagesCommandOutcome::Succeeded {
+                        operation: PackagesBusy::MachineApply
+                    }
+                )
+            })
+        {
+            // A verb that SUCCEEDED (ruling 265): the headline already says
+            // so; the detail says what it changed, what still needs
+            // attention, and when it checked — never the headline again.
+            let mut parts: Vec<String> = Vec::new();
+            if matches!(operation, PackagesBusy::Check | PackagesBusy::Install) && self.updated > 0
+            {
+                parts.push(match self.updated {
+                    1 => "1 program updated".to_string(),
+                    n => format!("{n} programs updated"),
+                });
+            }
+            parts.extend(attention_line.clone());
+            parts.extend(recorded_detail(false));
+            (!parts.is_empty()).then(|| parts.join("  \u{b7}  "))
         } else if let Some(command) = self.last_command.as_ref() {
             let mut detail = command_feedback
                 .clone()
@@ -2243,13 +2314,13 @@ impl PackagesState {
         // The line says what runs; when the last full check completed is the headline's
         // detail ("Checked 3 min ago").
         let loop_status = if !self.loop_running {
-            "Not running in this window — Update Now still works".to_string()
+            "Not running in this window — Check & Update Now still works".to_string()
         } else if !self.master_enabled && self.retired_switch_note.is_some() {
-            "Off — the retired [packages] auto_update = false holds it off (turning Automatic \
-             updates on removes it); Update Now still works"
+            "Off — [packages] auto_update = false holds it off (turning Automatic updates \
+             on removes it); Check & Update Now still works"
                 .to_string()
         } else if !self.master_enabled {
-            "Off — nothing updates by itself; Update Now still works".to_string()
+            "Off — nothing updates by itself; Check & Update Now still works".to_string()
         } else {
             "On — updates arrive in the background, without interrupting".to_string()
         };
@@ -2294,7 +2365,6 @@ impl PackagesState {
             actions_enabled,
             headline,
             detail,
-            command_feedback,
             attention,
         }
     }
@@ -2600,9 +2670,6 @@ pub(crate) struct PackagesProjection {
     pub(crate) actions_enabled: bool,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
-    /// Final result text for replacing the initiating view's temporary
-    /// synchronous “request accepted” feedback.
-    pub(crate) command_feedback: Option<String>,
     /// What failed, named ([`attention_items`]): the Settings rail's Packages
     /// badge is up while this is non-empty, and [`attention_headline`] of it is
     /// the headline whenever nothing more urgent holds that.
@@ -2707,6 +2774,10 @@ pub(crate) fn activity_sentences(
                 ),
                 false,
             ),
+            kind::SEAM => (
+                seam_activity(get("seam"), get("from"), get("why"), get("undo")),
+                false,
+            ),
             _ => continue,
         };
         out.push((entry, text, trouble));
@@ -2772,6 +2843,29 @@ fn program_activity(
             (text, matches!(result, "failed" | "refused" | "disabled"))
         }
     }
+}
+
+/// A rustup seam that replaced a stale link, as the Activity says it (2026-09-26): the one
+/// change a pass makes to `~/.rustup` that nobody laid there for it — atpkg re-points
+/// rustup's `trust` away from an older live build tree by itself — so the sentence names
+/// what it named, why, and the command that puts it back. Not trouble: the channel now
+/// runs the managed toolchain.
+fn seam_activity(seam: &str, from: &str, why: &str, undo: &str) -> String {
+    let name = seam.strip_prefix("rustup:").unwrap_or(seam);
+    let mut text = format!("rustup `{name}` re-pointed at the managed toolchain");
+    if !from.is_empty() {
+        text.push_str(" \u{b7} was ");
+        text.push_str(from);
+        if !why.is_empty() {
+            text.push_str(", ");
+            text.push_str(why);
+        }
+    }
+    if !undo.is_empty() {
+        text.push_str(" \u{b7} ");
+        text.push_str(undo);
+    }
+    text
 }
 
 /// A pass's verb as the Activity names it.
@@ -2891,9 +2985,14 @@ mod tests {
         assert_eq!(projection.programs[0].installed_build, Some(1971));
         assert!(projection.actions_enabled);
         assert_eq!(projection.headline, "Package check completed");
-        assert_eq!(
-            projection.command_feedback.as_deref(),
-            Some("Package check completed")
+        // The detail never repeats the headline (ruling 265).
+        assert!(
+            !projection
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("Package check completed")),
+            "{:?}",
+            projection.detail
         );
     }
 
@@ -3106,8 +3205,8 @@ mod tests {
                 .collect()
         };
         let note = atpkg::config::auto_update_note(false, Some(true));
-        let service = "Off \u{2014} the retired [packages] auto_update = false holds it off \
-                       (turning Automatic updates on removes it); Update Now still works \
+        let service = "Off \u{2014} [packages] auto_update = false holds it off \
+                       (turning Automatic updates on removes it); Check & Update Now still works \
                        \u{b7} last full check 3 h ago";
         for text in [note.as_str(), service] {
             for width in [MIN_REASON_WIDTH, 36, 56] {
@@ -3176,7 +3275,7 @@ mod tests {
         );
         assert!(
             projection
-                .command_feedback
+                .detail
                 .as_deref()
                 .unwrap()
                 .starts_with("Package check failed")
@@ -3236,6 +3335,59 @@ mod tests {
 
     fn projection(service: &PackagesService) -> PackagesProjection {
         service.state(true, true, true).projection()
+    }
+
+    /// THE CARD SAYS EACH THING ONCE (design ruling 265): while a check runs
+    /// its detail says where the progress is (never `Click Check & Update Now
+    /// to check.` under the disabled button), and after it the headline says
+    /// it completed, the detail how many programs it moved — never the
+    /// headline three times over.
+    #[test]
+    fn the_card_says_where_a_check_is_and_what_it_changed() {
+        let mut before = status("up to date (index build 44)");
+        before.programs.insert(
+            "targo".to_string(),
+            atpkg::ProgramStatus {
+                installed_build: Some(40),
+                state: "active".to_string(),
+                tree_root: String::new(),
+            },
+        );
+        let mut after = before.clone();
+        for (name, build) in [("ay", 2000), ("targo", 44)] {
+            after.programs.get_mut(name).unwrap().installed_build = Some(build);
+        }
+        let report = |s: &atpkg::Status| {
+            PackagesStatusReport::from_parts(true, true, "fp".into(), Some(s), &[])
+        };
+        let mut service = PackagesService::new();
+        observe(&mut service, report(&before));
+        let sequence = service.begin(Some(PackagesBusy::Check)).unwrap();
+        let p = projection(&service);
+        assert_eq!(p.headline, "Checking for package updates\u{2026}");
+        assert_eq!(p.detail.as_deref(), Some(BUSY_DETAIL));
+        assert!(service.finish(sequence, succeeded(report(&after), PackagesBusy::Check)));
+        let p = projection(&service);
+        assert_eq!(p.headline, "Package check completed");
+        let detail = p.detail.expect("what it changed");
+        assert!(detail.starts_with("2 programs updated"), "{detail}");
+        assert!(!detail.contains("completed"), "{detail}");
+        // A check that moved nothing says only when it checked.
+        let sequence = service.begin(Some(PackagesBusy::Check)).unwrap();
+        assert!(service.finish(sequence, succeeded(report(&after), PackagesBusy::Check)));
+        let detail = projection(&service).detail.unwrap_or_default();
+        assert!(!detail.contains("updated"), "{detail}");
+        // The machine apply has no band row: the card points at none (ruling
+        // 266), and the pointer it gives a verb promises no row either — a
+        // quick check ends inside the progress grace, off the glass.
+        let sequence = service.begin(Some(PackagesBusy::MachineApply)).unwrap();
+        let p = projection(&service);
+        assert_eq!(p.headline, "Applying the machine settings\u{2026}");
+        assert_eq!(p.detail, None, "no row to point at");
+        assert!(service.finish(
+            sequence,
+            succeeded(report(&after), PackagesBusy::MachineApply)
+        ));
     }
 
     /// A REFUSED VENDOR PROGRAM IS THE BADGE AND THE HEADLINE, UNTIL ITS ROW HEALS
@@ -3613,8 +3765,7 @@ mod tests {
         assert!(
             p.detail
                 .as_deref()
-                .is_some_and(|d| d
-                    .starts_with("Package check completed  \u{b7}  Needs attention: codex failed")),
+                .is_some_and(|d| d.starts_with("Needs attention: codex failed")),
             "{:?}",
             p.detail
         );
@@ -4282,9 +4433,12 @@ mod tests {
             Some("applied — universal-control disabled")
         );
         assert_eq!(changed.headline, "Machine settings applied");
-        assert_eq!(
-            changed.command_feedback.as_deref(),
-            Some("Machine settings: applied — universal-control disabled")
+        assert!(
+            changed.detail.as_deref().is_some_and(
+                |d| d.starts_with("Machine settings: applied — universal-control disabled")
+            ),
+            "{:?}",
+            changed.detail
         );
 
         // Nothing left to do: the button is off and the card says so.
@@ -5696,6 +5850,41 @@ mod tests {
             ]
         );
         assert!(activity_lines(&[], NOW, LocalClock::fixed(0)).is_empty());
+        // A rustup seam atpkg re-pointed away from a stale toolchain: what it named, why,
+        // and the way back — the line atpkg writes, read back through the log's grammar.
+        let line = atpkg::packages_log::render(
+            NOW - 120,
+            8,
+            &atpkg::packages_log::Event::Seam {
+                seam: "rustup:trust",
+                from: "/h/trust/build/host/stage2",
+                to: "/p/rustup/trust",
+                why: "a toolchain from 2026-08-20, older than the store's 2026-09-17; it is \
+                      left where it is",
+                undo: "to put it back: ln -sfn '/h/trust/build/host/stage2' \
+                       '/h/.rustup/toolchains/trust' (no unattended pass re-points it again; \
+                       `aterm pkg repair` does)",
+            },
+        );
+        let seam = atpkg::packages_log::parse_line(&line).expect("the log's own kind");
+        let said = activity_lines(&[seam], NOW, LocalClock::fixed(PDT));
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            (
+                said[0].when.as_str(),
+                said[0].text.as_str(),
+                said[0].trouble
+            ),
+            (
+                "2 min ago",
+                "rustup `trust` re-pointed at the managed toolchain \u{b7} was \
+                 /h/trust/build/host/stage2, a toolchain from 2026-08-20, older than the \
+                 store's 2026-09-17; it is left where it is \u{b7} to put it back: ln -sfn \
+                 '/h/trust/build/host/stage2' '/h/.rustup/toolchains/trust' (no unattended \
+                 pass re-points it again; `aterm pkg repair` does)",
+                false
+            )
+        );
         // A reason that opens with its result is the sentence itself.
         assert_eq!(
             program_activity(

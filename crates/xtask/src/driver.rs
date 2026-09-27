@@ -621,6 +621,7 @@ mod tests {
             tippy: None,
             refused: None,
             store_bin: None,
+            demoted: None,
         };
         assert!(accepted.have_targo());
         assert_eq!(

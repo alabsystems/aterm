@@ -31,7 +31,7 @@ const MAX_TEXT: usize = 512;
 
 /// One completed turn, in the order `cmd_turn` finished it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TurnRecord {
+pub(crate) struct TurnRecord {
     /// The turn id (the `id=` the `turn` reply prints, and the id the events
     /// digest and `ERR busy turn=<id>` refusals name): unique in the process,
     /// and still rising after a self-update handoff, which carries the counter.
@@ -73,7 +73,7 @@ pub struct TurnRecord {
 /// another origin (a restart, a handoff that could not carry the archive)
 /// reads from the start of the new archive instead of from an unrelated index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ArchMark {
+pub(crate) struct ArchMark {
     /// The archive's origin (unique per aterm process that started an archive,
     /// and kept by a handoff that carries it; 0 when the host never set one).
     pub origin: u64,
@@ -100,7 +100,7 @@ impl std::fmt::Display for ArchMark {
 
 /// A session's bounded turn history, newest-last, drop-oldest at [`LEDGER_CAP`].
 #[derive(Default)]
-pub struct TurnLedger {
+pub(crate) struct TurnLedger {
     records: VecDeque<TurnRecord>,
     /// Turn ids below this may have named records of this session that the
     /// ledger never got: a self-update handoff could not carry the ledger
@@ -147,12 +147,14 @@ impl TurnLedger {
     }
 
     /// Every retained record, oldest first (the handoff's export).
+    #[cfg(any(unix, test))]
     pub(crate) fn records(&self) -> impl Iterator<Item = &TurnRecord> {
         self.records.iter()
     }
 
     /// Turn ids below this may have named records the ledger never got (see
     /// the field); 0: none. The handoff's export carries it on.
+    #[cfg(any(unix, test))]
     pub(crate) const fn unheld_below(&self) -> u64 {
         self.unheld_below
     }

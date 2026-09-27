@@ -166,6 +166,17 @@ impl Terminal {
     )]
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
+        aterm_spec::spec_unmodeled(
+            machine = "budgeted_search_resume",
+            action = "BuggyScanOnlyCompletion",
+            reason = "Buggy=1 negative control only: a step is complete only once every match \
+                      delta is delivered (`&& emitted_matches >= result_count`), so the dense \
+                      scan turn never reports complete with its backlog held; the Tier-1 replays \
+                      the slipped step and the healthy model rejects it"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
         aterm_spec::refines(
             machine = "budgeted_search_resume",
             action = "StartComplete",
@@ -800,14 +811,26 @@ mod tests {
     /// Spec-link lock: activating one refinement makes coverage all-or-nothing.
     /// Compare inventory, not source text, so a misspelled/stripped attribute is
     /// caught by the same compiled registry the global closure gate consumes.
+    /// The one `Buggy`-only action is waived, never refined: no shipping step
+    /// implements it.
     #[test]
     fn budgeted_resume_refinement_actions_are_complete() {
-        let model_actions: std::collections::BTreeSet<_> =
+        let mut model_actions: std::collections::BTreeSet<_> =
             aterm_spec::derive::budgeted_search_resume_model()
                 .actions
                 .into_iter()
                 .map(|action| action.name)
                 .collect();
+        let waived: std::collections::BTreeSet<_> = aterm_spec::xref::waivers()
+            .filter(|waiver| waiver.machine == "budgeted_search_resume")
+            .map(|waiver| waiver.action)
+            .collect();
+        assert_eq!(
+            waived,
+            std::collections::BTreeSet::from(["BuggyScanOnlyCompletion"]),
+            "only the Buggy=1 negative-control action is waived"
+        );
+        assert!(model_actions.remove("BuggyScanOnlyCompletion"));
         let anchors: Vec<_> = aterm_spec::xref::refinements()
             .filter(|anchor| anchor.machine == "budgeted_search_resume")
             .collect();
@@ -815,7 +838,7 @@ mod tests {
             anchors.iter().map(|anchor| anchor.action).collect();
         assert_eq!(
             anchored_actions, model_actions,
-            "every BudgetedSearchResume action must have a compiled #[refines] anchor"
+            "every public BudgetedSearchResume action must have a compiled #[refines] anchor"
         );
         assert_eq!(
             anchors.len(),

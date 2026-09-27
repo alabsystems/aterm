@@ -77,15 +77,33 @@ fn present(c: &MessageCenter, cols: usize) -> Presentation {
 /// What a frame DRAWS: the row's surface at its cells (the engine's
 /// cell-resolution reading, [`aterm_messages::Surface::cells`] — the
 /// fractions the host maps onto its window's pixels, design ruling 140),
-/// the two time slots, the fade and the glyph — `RowMotion` without its
-/// `anim` descriptor.
-type Drawn = Vec<(Vec<Tone>, Option<String>, Option<String>, u8, Option<char>)>;
+/// its fill's EDGE to a sixteenth of a cell (the host rasters it to the
+/// pixel, ruling 242), the two time slots, the fade and the glyph —
+/// `RowMotion` without its `anim` descriptor.
+type Drawn = Vec<(
+    Vec<Tone>,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    u8,
+    Option<char>,
+)>;
 
 fn drawn(c: &MessageCenter, p: &Presentation, t: Instant, look: Look) -> Drawn {
+    let sixteenths = |e: u32| u64::from(e) * p.cols as u64 * 16 / u64::from(aterm_messages::ROW);
     c.motion(p, t, look)
         .rows
         .into_iter()
-        .map(|r| (r.surface.cells(p.cols), r.readout, r.eta, r.fade, r.glyph))
+        .map(|r| {
+            (
+                r.surface.cells(p.cols),
+                r.surface.edge.map(sixteenths),
+                r.readout,
+                r.eta,
+                r.fade,
+                r.glyph,
+            )
+        })
         .collect()
 }
 
@@ -234,11 +252,13 @@ fn same_painted_progress_can_move_the_next_eta_boundary() {
 /// elapsed words included), a download through its latched ETA, its glint
 /// and its stall where the width lays out the ETA slot, a data glide, and
 /// every echo kind for both fills — each walked frame by frame between its
-/// deadlines. And the CADENCE: a moving comet wakes on the grid, at most
-/// `SPIN_FRAMES` steps apart (the spinner turns at least that often), and
-/// never wastes a wake — the frames where a crossing's faint last sliver
-/// and the hand-over round to the same cells are skipped, not drawn twice
-/// (design ruling 140); a still look wakes at most once a second, and a
+/// deadlines. And the CADENCE: a moving comet wakes on the grid exactly at
+/// the frames it draws something new — none missed, none wasted (the braille
+/// spinner that once woke it every four steps whatever the comet drew went
+/// with ruling 251, so a flat comet's hand-over now sleeps through its blank
+/// frames): the frames where a crossing's faint last sliver and the
+/// hand-over round to the same cells are skipped, not drawn twice (design
+/// ruling 140); a still look wakes at most once a second, and a
 /// still echo asks no frame at all.
 #[test]
 fn deadlines_never_miss_a_change_the_motion_draws() {
@@ -255,10 +275,7 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
             for w in a.wakes.windows(2) {
                 let gap = w[1] - w[0];
                 match look.pace {
-                    Pace::Moving => assert!(
-                        gap >= ANIM_FRAME && gap <= ANIM_FRAME * aterm_messages::SPIN_FRAMES,
-                        "comet {cols} {look:?}: {gap:?}"
-                    ),
+                    Pace::Moving => assert!(gap >= ANIM_FRAME, "comet {cols} {look:?}: {gap:?}"),
                     Pace::Still => assert!(gap >= ms(990), "comet {cols} {look:?}: {gap:?}"),
                 }
             }
@@ -452,7 +469,8 @@ fn stream(seed: u64, n: usize) -> Vec<(u64, Amount)> {
 /// only after at least five readings spanning at least five seconds since
 /// the estimator last started over (three samples for the first secant over
 /// `RATE_MIN_SPAN`, then three agreeing projections over `STABLE_MIN`); it
-/// is at most 48 h; its words are `<5 s left` or `~… left`, never zero; and between
+/// is at most 48 h; its words are `<5 s left` or `N … left` — no `~`, since
+/// `left` already says it is an estimate (ruling 241) — never zero; and between
 /// two readings it never grows.
 #[test]
 fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
@@ -484,8 +502,11 @@ fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
                     );
                     assert!(left <= Duration::from_hours(48), "seed {seed}: {left:?}");
                     if let Some(w) = eta_words(left) {
-                        assert!(w == "<5 s left" || w.starts_with('~'), "seed {seed}: {w:?}");
-                        assert!(!w.starts_with("~0 "), "seed {seed}: {w:?}");
+                        assert!(
+                            w == "<5 s left" || (w.ends_with(" left") && !w.contains('~')),
+                            "seed {seed}: {w:?}"
+                        );
+                        assert!(!w.starts_with("0 "), "seed {seed}: {w:?}");
                     }
                     if let Some(prev) = last_left {
                         assert!(left <= prev, "seed {seed}: the ETA grew between readings");
@@ -611,10 +632,67 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
     let after = c.motion(&p, now + ms(35_000), Look::MOVING).rows[0]
         .readout
         .clone();
-    // The frame grid floors 35 s to 34.98 s: `0:34` is the running clock.
+    // The frame grid floors 35 s to 34.98 s: `for 34 s` is the running
+    // time (labelled, never a bare clock: ruling 241).
     assert_eq!(
         after.as_deref(),
-        Some("0:34"),
+        Some("for 34 s"),
         "the clock read {before:?} at 30 s"
     );
+}
+
+/// A FAULT ECHO'S HOLD ASKS NO FRAME (review round 12, ruling 245): a bar's
+/// warn wash stands still from `ECHO_FAULT_CROSS` to `ECHO_FAULT_FLASH`, a
+/// busy row's drain from `ECHO_DRAIN` — no display frame there draws
+/// anything new, so none wakes; the fade's first frame is the next wake, and
+/// nothing is missed. Fourteen to sixteen empty wakes per Fault before.
+#[test]
+fn a_fault_echo_never_wakes_through_its_hold() {
+    for indeterminate in [false, true] {
+        for cols in [60usize, 80, 120] {
+            let now = Instant::now();
+            let mut c = MessageCenter::new(MessageLog::empty(), now);
+            let msg = if indeterminate {
+                busy("Installing Homebrew")
+            } else {
+                download(30_000_000)
+            };
+            let id = c.post(msg, stamp(), now).id;
+            c.commit_rows(now, 3);
+            let at = now + ms(5000);
+            assert!(c.resolve(id, Outcome::Warn, at));
+            let p = present(&c, cols);
+            let (started, until) = {
+                let e = c.echoes().first().expect("an echo");
+                (e.started, e.until)
+            };
+            let a = audit(&c, &p, Look::MOVING, at, until);
+            assert!(
+                a.missed.is_empty(),
+                "{indeterminate}/{cols}: {:?}",
+                a.missed
+            );
+            let settled = if indeterminate {
+                aterm_messages::ECHO_DRAIN
+            } else {
+                aterm_messages::ECHO_FAULT_CROSS
+            };
+            let in_hold: Vec<_> = a
+                .wakes
+                .iter()
+                .map(|w| w.duration_since(started))
+                .filter(|t| *t > settled + c.refresh() && *t <= aterm_messages::ECHO_FAULT_FLASH)
+                .collect();
+            assert!(
+                in_hold.is_empty(),
+                "{indeterminate}/{cols}: woke in the hold at {in_hold:?}"
+            );
+            assert!(
+                a.wasted <= 1,
+                "{indeterminate}/{cols}: {} wakes drew nothing of {}",
+                a.wasted,
+                a.wakes.len()
+            );
+        }
+    }
 }

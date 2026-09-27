@@ -41,7 +41,7 @@
 //! * **[`Rule::Path`]** — a backticked repo path ([`PATH_ROOTS`], or a
 //!   `crates/`-relative spelling like `aterm-release/src/sign.rs`) must resolve
 //!   in the tree. For a `.rs` file, a citation is also tried relative to the
-//!   citing crate, so `tests/plist_stamp.rs` in `crates/aterm-release/src`
+//!   citing crate, so `tests/it/plist_stamp.rs` in `crates/aterm-release/src`
 //!   resolves.
 //! * **[`Rule::Name`]** — a backticked identifier of at least
 //!   [`NAME_MIN_SEGMENTS`] snake_case segments — the shape of a test name, which
@@ -112,7 +112,12 @@ const ROSTER_DIRS: &[&str] = &[
 ];
 
 /// Individual rostered files outside [`ROSTER_DIRS`].
+///
+/// `AGENTS.md` is here because every agent reads it before every task, so a path
+/// or test it names that no longer exists misleads on every run, not just during
+/// a failing release.
 const ROSTER_FILES: &[&str] = &[
+    "AGENTS.md",
     "docs/RELEASING.md",
     ".cargo/config.toml",
     "tools/check-release-shape.sh",
@@ -423,13 +428,26 @@ fn has_marker(ctx: &str, markers: &[&str]) -> bool {
 }
 
 /// Every `` `token` `` on the line.
+///
+/// A SHELL-ESCAPED PAIR (`` \`token\` ``) is read as the pair it renders to.
+/// An unquoted heredoc that interpolates a variable must escape its backticks,
+/// so the text a script writes carries `\`` on both sides of a code span, and
+/// read literally the token keeps the closing escape's backslash:
+/// `publish/transforms.sh` cited `crates/aterm-link\`, which resolves to
+/// nothing, and failed a merge-contract run on 2026-09-24 about a path that
+/// exists. When the opening backtick is escaped, one trailing backslash is
+/// dropped from the token.
 fn backticked(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;
     while let Some(open) = rest.find('`') {
+        let escaped = rest[..open].ends_with('\\');
         let after = &rest[open + 1..];
         let Some(close) = after.find('`') else { break };
-        let tok = &after[..close];
+        let mut tok = &after[..close];
+        if escaped {
+            tok = tok.strip_suffix('\\').unwrap_or(tok);
+        }
         if !tok.is_empty() && !tok.contains(' ') {
             out.push(tok.to_string());
         }
@@ -944,6 +962,31 @@ mod tests {
     /// Two-word names are NOT checked, and that bound is the reason this gate can
     /// run without a waiver file: `build_app` and `last_seen` are English as
     /// often as they are items.
+    /// A shell-escaped code span is read as the span it renders to, so a script
+    /// citing a real path through an unquoted heredoc is not a false finding —
+    /// and an unescaped span keeps every character, backslash included.
+    #[test]
+    fn a_shell_escaped_code_span_cites_the_path_it_renders() {
+        assert_eq!(
+            backticked(r"fabric bridge (\`crates/aterm-link\`) builds against —"),
+            vec!["crates/aterm-link".to_string()]
+        );
+        assert_eq!(
+            backticked(r"\`astream-wire\`, \`astream-cap\` and \`Cargo.toml\`"),
+            vec![
+                "astream-wire".to_string(),
+                "astream-cap".to_string(),
+                "Cargo.toml".to_string()
+            ]
+        );
+        assert_eq!(backticked("`crates/x`"), vec!["crates/x".to_string()]);
+        assert_eq!(
+            backticked(r"`a\`"),
+            vec![r"a\".to_string()],
+            "an unescaped opener keeps the token as written"
+        );
+    }
+
     #[test]
     fn classify_checks_only_test_shaped_names_and_repo_rooted_paths() {
         assert_eq!(classify("crates/atpkg/src/sig.rs"), Some(Rule::Path));

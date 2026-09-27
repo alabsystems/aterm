@@ -28,9 +28,9 @@
 //!
 //! * [`line_cells_tail`] — the canonical bounded Bresenham sweep (tail→head),
 //!   forward-byte-identical and O(limit) whatever the jump distance.
-//! * [`row_sweep_cells`] — a same-row typed-coalesce sweep: the cells a
+//! * `row_sweep_cells` — a same-row typed-coalesce sweep: the cells a
 //!   batched echo skipped between two observations.
-//! * [`wrap_fold_cells`] — the typewriter fold: a typing wrap finishes the old
+//! * `wrap_fold_cells` — the typewriter fold: a typing wrap finishes the old
 //!   row and continues from the new row's start, never sweeping a diagonal
 //!   across cells the cursor didn't visit.
 
@@ -93,6 +93,7 @@ pub fn line_cells_tail(
 /// tail→head. Appends to `out` (the fold primitive chains it). A batched echo
 /// that advanced the cursor `k` columns lays exactly the `k` cells a per-key
 /// observer would have lit — the fast-typing hole this closes.
+#[cfg(test)]
 pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_col: i32) {
     if to_col > from_col {
         out.extend((from_col + 1..=to_col).map(|c| (row, c)));
@@ -108,6 +109,7 @@ pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_co
 /// `prev` must be at/near the right edge and `cur` at/near the new row's start
 /// (the wrap SHAPE the caller already classified); `cols` is the grid width.
 /// Ordered tail→head, origin excluded, destination included.
+#[cfg(test)]
 pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i32), cols: i32) {
     wrap_fold_cells_in_pane(out, prev, cur, 0, cols);
 }
@@ -116,6 +118,7 @@ pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i
 /// composed window grid. The old row finishes at `col0 + cols`; the new row
 /// begins at `col0`. Keeping the offset explicit prevents a right-hand split's
 /// physical margin from being mistaken for the whole window's margin.
+#[cfg(test)]
 pub fn wrap_fold_cells_in_pane(
     out: &mut Vec<(i32, i32)>,
     prev: (i32, i32),

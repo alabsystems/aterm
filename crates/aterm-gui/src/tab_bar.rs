@@ -230,7 +230,7 @@ pub(crate) enum TabIconPrimitive {
 pub(crate) const TAB_ICON_DESIGN_SIZE: f32 = 16.0;
 /// Native toolbar icon size in logical points. The primitive design box is scaled
 /// uniformly into this square, keeping a crisp, restrained ~16 px optical mark.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const TAB_ICON_NATIVE_SIZE: f64 = 14.0;
 
 const SETTINGS_ICON: &[TabIconPrimitive] = &[
@@ -362,7 +362,7 @@ pub(crate) const fn tab_icon_primitives(kind: TabIconKind) -> &'static [TabIconP
 
 /// What clicking a strip column does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TabHit {
+pub(crate) enum TabHit {
     /// Switch the window to this tab index (a click anywhere on the segment that
     /// is NOT the close `x`).
     Select(usize),
@@ -389,7 +389,7 @@ pub enum TabHit {
 /// tab), and what a plain click on the segment does. Caching these per frame lets a
 /// mouse click in the strip map back to a tab in O(segments).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TabSegment {
+pub(crate) struct TabSegment {
     /// First column of this segment (inclusive).
     pub start_col: u16,
     /// One past the last column of this segment (exclusive).
@@ -612,7 +612,7 @@ const ICON_GAP: u16 = 1;
 /// the leading slot and the status canvas the trailing one, and each is admitted
 /// only while the resulting symmetric label still clears the legibility floor.
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct NativeTabContentLayout {
     pub(crate) close: [f64; 4],
     pub(crate) close_available: bool,
@@ -660,7 +660,7 @@ pub(crate) fn solo_subtitle(title: &str, tooltip: Option<&str>) -> Option<String
 /// from that one number, so the chips, the ✕, the icon, the status dots, and the
 /// trailing "+" all sit on the stoplights' optical centre line.
 #[must_use]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_tab_content_layout(
     width: f64,
     center_y: f64,
@@ -990,12 +990,13 @@ fn strip_seat_cols(tab_count: usize, metadata: &[TabStripMetadata]) -> u16 {
 /// else. The shipping strip goes through [`layout_segments_with_metadata`],
 /// which measures it against the chrome its tabs actually wear
 /// ([`strip_seat_cols`]) — the two agree exactly wherever every tab is plain.
+///
+/// The metadata-free entry the ~40 layout tests hold the pure-geometry contract
+/// against; the shipping strip reaches the same code through the metadata-aware
+/// door.
+#[cfg(test)]
 #[must_use]
-// The metadata-free entry: the pure-geometry contract this module states (and
-// the ~40 layout tests that hold it) is written against THIS signature, and the
-// shipping strip now reaches the same code through the metadata-aware door.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn layout_segments(
+pub(crate) fn layout_segments(
     cols: u16,
     tab_count: usize,
     active: usize,
@@ -1251,7 +1252,7 @@ pub(crate) fn layout_segments_with_metadata(
 /// [`TabHit::Connector`] (the status-mark cell — design §3.1 [v5]); any other
 /// column of a tab segment selects it; the `+` segment opens a tab.
 #[must_use]
-pub fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
+pub(crate) fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
     for seg in segments {
         if col >= seg.start_col && col < seg.end_col {
             if let (Some(cx), TabHit::Select(i)) = (seg.close_col, seg.kind)
@@ -1931,7 +1932,7 @@ pub(crate) fn strip_hover_bg_for_test(theme: Theme) -> [u8; 3] {
 /// [`paint_strip`] overwrites the tab segments, and to fill upper rows of a multi-row
 /// strip. (Recomputes the tones; only used outside the hot per-cell loop.)
 #[must_use]
-pub fn blank_cell(theme: Theme) -> RenderCell {
+pub(crate) fn blank_cell(theme: Theme) -> RenderCell {
     strip_cell(' ', &strip_colors(theme), StripRole::Inactive)
 }
 
@@ -2174,7 +2175,7 @@ fn strip_separates(index: usize, active: usize, hovered: Option<usize>) -> bool 
 /// (title truncated with `…`), the `+` draws ` + `. Bounds-checked against `row`'s
 /// length so a degenerate tiny strip can never write past it.
 #[cfg(test)]
-pub fn paint_strip(
+pub(crate) fn paint_strip(
     row: &mut [RenderCell],
     segments: &[TabSegment],
     titles: &[String],
@@ -4227,7 +4228,6 @@ pub(crate) mod pixel_band {
             h: img_h as f32,
             radius: 0.0,
             fill: rgba(colors.band_bg, 255),
-            blur: false,
         });
 
         // EVERY BAND: the distinct pass resolves all chip labels in ONE look at
@@ -4319,7 +4319,6 @@ pub(crate) mod pixel_band {
                                     h: design.card_bot - design.card_top,
                                     radius: design.radius,
                                     fill: rgba(bg, 255),
-                                    blur: false,
                                 });
                             }
                         }
@@ -4519,7 +4518,6 @@ pub(crate) mod pixel_band {
                                 h: side,
                                 radius: design.radius.min(side * 0.5),
                                 fill: rgba(if hot { colors.hover_bg } else { colors.chip_bg }, 255),
-                                blur: false,
                             });
                         }
                         let ink = match (design.quiet_button, hot) {
@@ -4567,7 +4565,6 @@ pub(crate) mod pixel_band {
                                 h: design.card_bot - design.card_top,
                                 radius: design.radius,
                                 fill: rgba(colors.update_bg, 255),
-                                blur: false,
                             });
                         }
                     }
@@ -5509,7 +5506,6 @@ pub(crate) mod pixel_band {
                         cy: center[1].mul_add(k, oy),
                         r: (radius * k).max(1.0),
                         color: ink,
-                        breathe: false,
                     });
                 }
             }

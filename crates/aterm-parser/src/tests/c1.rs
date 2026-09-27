@@ -244,26 +244,6 @@ fn parse_c1_osc_with_c1_st_advance_fast() {
     assert_eq!(parser.state(), State::Ground);
 }
 
-#[test]
-fn c1_can_be_enabled_at_runtime() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Initially disabled - C1 becomes replacement char
-    parser.advance(b"\x9b", &mut sink);
-    assert_eq!(sink.prints.len(), 1);
-    assert_eq!(sink.csi_dispatches.len(), 0);
-
-    // Enable C1 controls
-    sink.prints.clear();
-    parser.set_c1_controls_enabled(true);
-
-    // Now C1 should be interpreted
-    parser.advance(b"\x9b31m", &mut sink);
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.prints.len(), 0);
-}
-
 /// Regression test for #7556: C1 control bytes must not introduce new
 /// sequences when C1 controls are disabled and the parser is mid-sequence.
 ///

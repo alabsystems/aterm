@@ -16,6 +16,7 @@ impl Row {
     ///
     /// Cells that would be shifted past the end of the row are discarded.
     /// This implements the ICH (Insert Character) operation.
+    #[cfg(any(test, kani))]
     pub fn insert_chars(&mut self, col: u16, count: u16) {
         self.insert_chars_fill(col, count, Cell::EMPTY);
     }
@@ -109,6 +110,7 @@ impl Row {
     ///
     /// Empty cells are inserted at the end of the row.
     /// This implements the DCH (Delete Character) operation.
+    #[cfg(test)]
     pub fn delete_chars(&mut self, col: u16, count: u16) {
         self.delete_chars_fill(col, count, Cell::EMPTY);
     }
@@ -212,16 +214,9 @@ impl Row {
         }
     }
 
-    /// Insert `count` blank cells at `col`, shifting cells right up to `right_bound`.
-    ///
-    /// Only cells in [col, right_bound) are affected. Cells shifted past
-    /// `right_bound` are discarded. Used when DECLRMM horizontal margins
-    /// restrict the shift region (#7320).
-    pub fn insert_chars_bounded(&mut self, col: u16, count: u16, right_bound: u16) {
-        self.insert_chars_bounded_fill(col, count, right_bound, Cell::EMPTY);
-    }
-
-    /// Insert with BCE fill. See `insert_chars_bounded` (#7522).
+    /// Insert `count` cells at `col`, shifting cells right up to `right_bound`,
+    /// with BCE fill (#7522). Cells shifted past `right_bound` are discarded;
+    /// used when DECLRMM horizontal margins restrict the shift region (#7320).
     pub fn insert_chars_bounded_fill(
         &mut self,
         col: u16,
@@ -287,16 +282,8 @@ impl Row {
         self.recalculate_len_up_to(self.cells.len());
     }
 
-    /// Delete `count` cells at `col`, shifting cells left up to `right_bound`.
-    ///
-    /// Only cells in [col, right_bound) are affected. Blank cells are
-    /// inserted at the right end of the bounded region. Used when DECLRMM
-    /// horizontal margins restrict the shift region (#7320).
-    pub fn delete_chars_bounded(&mut self, col: u16, count: u16, right_bound: u16) {
-        self.delete_chars_bounded_fill(col, count, right_bound, Cell::EMPTY);
-    }
-
-    /// Delete with BCE fill. See `delete_chars_bounded` (#7522).
+    /// Delete `count` cells at `col`, shifting cells left within `right_bound`,
+    /// with BCE fill (#7522).
     pub fn delete_chars_bounded_fill(
         &mut self,
         col: u16,
@@ -366,6 +353,7 @@ impl Row {
     /// Cells are replaced with blanks in place. This differs from `delete_chars`
     /// which shifts remaining cells left.
     /// This implements the ECH (Erase Character) operation.
+    #[cfg(test)]
     pub fn erase_chars(&mut self, col: u16, count: u16) {
         self.erase_chars_with(col, count, Cell::EMPTY);
     }
@@ -433,6 +421,7 @@ impl Row {
     ///
     /// Uses the context-aware [`is_cell_protected`](Self::is_cell_protected)
     /// check to correctly handle wide characters.
+    #[cfg(test)]
     pub fn selective_erase_chars(&mut self, col: u16, count: u16, fill: Cell) {
         if count == 0 || col >= self.cols() {
             return;

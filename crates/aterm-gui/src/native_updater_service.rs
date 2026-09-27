@@ -191,6 +191,14 @@ pub(crate) fn installed_activation_digest(build: u64, commit: &str) -> String {
     hex
 }
 
+/// The outcome for a newer build already installed under the executable, whose
+/// version this reducer does not hold: word for word the App's
+/// `INSTALLED_ACTIVATES_IN_PLACE`, the same state's sentence on the apply lane. It
+/// promises no timing: the switch runs by itself only where a retry is scheduled, and
+/// otherwise waits for the person's Install, which this reducer cannot tell apart.
+const INSTALLED_SWITCHES_IN_PLACE: &str =
+    "The update is installed; switching to it keeps your shells running";
+
 /// Compare one durable marker to an already-canonical artifact identity.
 ///
 /// SHA-1/SHA-256 hex has a single byte meaning but two textual letter cases.
@@ -236,6 +244,12 @@ pub(crate) struct InstalledUpdate {
     pub(crate) version: Option<String>,
     pub(crate) receipt_build: Option<u64>,
     pub(crate) receipt_dmg_sha256: Option<String>,
+    /// Launches the boot sentinel has counted against a trial of THIS build
+    /// (0 when none is armed for it), read beside the rest of these facts on
+    /// the updater facts worker. A structural latch reads it before it spends
+    /// a launch of the build: past the sentinel's threshold the launch is the
+    /// one that reverts it (gap 14, 2026-09-26).
+    pub(crate) trial_launches: u32,
 }
 
 impl InstalledUpdate {
@@ -309,7 +323,6 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) staged: Option<StagedUpdate>,
     pub(crate) outcome: String,
     pub(crate) error: Option<String>,
-    pub(crate) install_on_clean_quit: bool,
     pub(crate) attention_revision: Option<u64>,
     pub(crate) acknowledged_attention_revision: Option<u64>,
     pub(crate) ignored_completions: u64,
@@ -406,7 +419,6 @@ pub(crate) enum ApplyMode {
     AutomaticPastGrace,
     /// Explicit user/control apply: bypasses only the idle delay, never safety.
     Immediate,
-    CleanQuit,
 }
 
 impl ApplyMode {
@@ -433,7 +445,6 @@ pub(crate) enum ApplyPreflightStart {
     Joined(ApplyPreflightTicket),
     Disabled,
     NotStaged,
-    NotDeferred,
     Applying,
     GenerationExhausted,
 }
@@ -554,6 +565,7 @@ impl ApplyAttemptTicket {
     /// Whether this attempt activates the INSTALLED bundle at the executable's path
     /// (see [`installed_activation_digest`]) rather than swapping in a staged download.
     #[must_use]
+    #[cfg(any(unix, test))]
     pub(crate) fn is_installed_activation(&self) -> bool {
         installed_activation_digest(self.artifact_build, &self.artifact_commit)
             == self.artifact_dmg_sha256
@@ -568,6 +580,7 @@ pub(crate) enum ApplyDecision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 pub(crate) enum ReturnedApplyDisposition {
     /// The exact verified artifact still exists durably and was re-armed.
     Rearmed,
@@ -586,6 +599,7 @@ pub(crate) enum ReturnedApplyDisposition {
 /// accidentally pairing a stage identity with an installed receipt from another
 /// observation.
 #[derive(Clone, Copy, Debug)]
+#[cfg(any(unix, test))]
 pub(crate) struct ReturnedApplyFacts<'a> {
     durable_enabled: bool,
     durable_staged_build: Option<u64>,
@@ -594,7 +608,9 @@ pub(crate) struct ReturnedApplyFacts<'a> {
     installed: Option<&'a InstalledUpdate>,
 }
 
+#[cfg(any(unix, test))]
 impl<'a> ReturnedApplyFacts<'a> {
+    #[cfg(any(unix, test))]
     pub(crate) const fn new(
         durable_enabled: bool,
         durable_staged_build: Option<u64>,
@@ -631,7 +647,6 @@ pub(crate) struct UpdaterModelState {
     pub(crate) stale_completion_pending: bool,
     pub(crate) verified: bool,
     pub(crate) close_preflight: bool,
-    pub(crate) install_on_clean_quit: bool,
     pub(crate) reexec_count: u64,
     pub(crate) stale_staged: bool,
 }
@@ -646,9 +661,9 @@ pub(crate) enum UpdaterTransitionAction {
     StartDownload,
     CompleteDownload,
     MarkCloseReady,
-    InstallOnCleanQuit,
     Apply,
     AbortApply,
+    #[cfg(any(unix, test))]
     RetireApply,
     RetireStage,
     CheckUpToDate,
@@ -670,7 +685,6 @@ impl UpdaterTransitionAction {
             Self::StartDownload => Some("StartDownload"),
             Self::CompleteDownload => Some("CompleteDownload"),
             Self::MarkCloseReady => Some("MarkCloseReady"),
-            Self::InstallOnCleanQuit => Some("InstallOnCleanQuit"),
             Self::Apply => Some("Apply"),
             Self::AbortApply => Some("AbortApply"),
             Self::RetireApply => Some("RetireApply"),
@@ -723,7 +737,6 @@ impl NativeUpdaterService {
                 staged: None,
                 outcome: String::new(),
                 error: None,
-                install_on_clean_quit: false,
                 attention_revision: None,
                 acknowledged_attention_revision: None,
                 ignored_completions: 0,
@@ -817,7 +830,6 @@ impl NativeUpdaterService {
             stale_completion_pending: false,
             verified: self.snapshot.staged.is_some(),
             close_preflight: self.close_preflight_ready,
-            install_on_clean_quit: self.snapshot.install_on_clean_quit,
             reexec_count: self.snapshot.reexec_count,
             stale_staged: false,
         }
@@ -863,7 +875,6 @@ impl NativeUpdaterService {
         self.snapshot.error = None;
         self.snapshot.outcome = "Checking for updates".to_string();
         self.snapshot.staged = None;
-        self.snapshot.install_on_clean_quit = false;
         self.close_preflight_ready = false;
         self.pending_preflight = None;
         self.active_apply = None;
@@ -1054,7 +1065,6 @@ impl NativeUpdaterService {
             self.snapshot.active = None;
             self.snapshot.phase = UpdaterPhase::Disabled;
             self.snapshot.staged = None;
-            self.snapshot.install_on_clean_quit = false;
             self.snapshot.attention_revision = None;
             self.snapshot.acknowledged_attention_revision = None;
             self.snapshot.reexec_count = 0;
@@ -1088,7 +1098,6 @@ impl NativeUpdaterService {
             self.snapshot.phase = UpdaterPhase::Staged;
             self.snapshot.staged = Some(artifact);
             self.snapshot.error = None;
-            self.snapshot.install_on_clean_quit = false;
             self.close_preflight_ready = false;
             self.record(UpdaterTransitionAction::CompleteDownload, before_staged);
         } else if status.failing_checks > 0 {
@@ -1130,23 +1139,6 @@ impl NativeUpdaterService {
         true
     }
 
-    /// Mark the current artifact for the normal clean-quit lane.  This is policy only;
-    /// it never emits a re-exec command by itself.
-    pub(crate) fn install_when_safe(&mut self) -> bool {
-        self.last_transitions.clear();
-        if !self.snapshot.enabled
-            || self.snapshot.phase != UpdaterPhase::Staged
-            || self.snapshot.install_on_clean_quit
-        {
-            return false;
-        }
-        let before = self.model_state();
-        self.snapshot.install_on_clean_quit = true;
-        self.record(UpdaterTransitionAction::InstallOnCleanQuit, before);
-        self.publish();
-        true
-    }
-
     /// Retire a staged DOWNLOAD so an installed-bundle ACTIVATION can be imported in
     /// its place: once the bundle under the executable is newer than the running
     /// process, a swap-apply of any downloaded stage can no longer proceed (its
@@ -1166,29 +1158,23 @@ impl NativeUpdaterService {
         self.snapshot.phase = UpdaterPhase::Idle;
         self.snapshot.staged = None;
         self.snapshot.error = None;
-        self.snapshot.install_on_clean_quit = false;
         self.snapshot.attention_revision = None;
         self.snapshot.acknowledged_attention_revision = None;
         self.snapshot.reexec_count = 0;
         self.close_preflight_ready = false;
         self.pending_preflight = None;
         self.active_apply = None;
-        self.snapshot.outcome =
-            "A newer build is already installed at this bundle's path; activation is pending"
-                .to_string();
+        self.snapshot.outcome = INSTALLED_SWITCHES_IN_PLACE.to_string();
         self.record(UpdaterTransitionAction::RetireStage, before);
         self.publish();
         true
     }
 
     /// Bind a quit-readiness request to the exact current artifact generation.
-    pub(crate) fn begin_apply_preflight(&mut self, mode: ApplyMode) -> ApplyPreflightStart {
+    pub(crate) fn begin_apply_preflight(&mut self) -> ApplyPreflightStart {
         self.last_transitions.clear();
         if !self.snapshot.enabled {
             return ApplyPreflightStart::Disabled;
-        }
-        if mode == ApplyMode::CleanQuit && !self.snapshot.install_on_clean_quit {
-            return ApplyPreflightStart::NotDeferred;
         }
         if self.snapshot.phase == UpdaterPhase::Applying {
             return ApplyPreflightStart::Applying;
@@ -1294,17 +1280,24 @@ impl NativeUpdaterService {
     /// The outcome sentence for a build whose bundle is already installed at the
     /// canonical app path. The App imports an ACTIVATION stage; its policy and
     /// safety gates still decide when activation runs. Shared by the consumed-stage
-    /// and the returned-apply paths.
+    /// and the returned-apply paths. Names the installed bundle's version, the fact a
+    /// person reads, and says it like the version-less sentence when it is unread.
     #[must_use]
-    pub(crate) fn installed_activation_outcome(build: u64) -> String {
-        format!("Update build {build} is installed; activation is pending")
+    pub(crate) fn installed_activation_outcome(version: Option<&str>) -> String {
+        match version.map(str::trim).filter(|version| !version.is_empty()) {
+            Some(version) => format!(
+                "{} is installed; switching to it keeps your shells running",
+                crate::update_words::aterm_v(version)
+            ),
+            None => INSTALLED_SWITCHES_IN_PLACE.to_string(),
+        }
     }
 
     /// The outcome sentence for a physical apply attempt that returned safely:
     /// the stage is still ready and the lane's budget decides the retry.
     #[must_use]
     pub(crate) fn apply_attempt_stopped_outcome(message: &str) -> String {
-        format!("Update remains ready; the last apply attempt stopped safely: {message}")
+        format!("The update is still ready; the install stopped: {message}")
     }
 
     /// Re-arm an authorized artifact when process replacement left this process alive.
@@ -1327,11 +1320,7 @@ impl NativeUpdaterService {
         let message = bounded(message.into(), MAX_MESSAGE_BYTES);
         self.snapshot.phase = UpdaterPhase::Staged;
         self.snapshot.reexec_count = 0;
-        // A physical replacement attempt that returned must never be retried by
-        // the same quit gesture (or by a replayed teardown intent). The artifact
-        // remains staged for an explicit fresh request, but clean-quit authority
-        // is consumed by this failed attempt.
-        self.snapshot.install_on_clean_quit = false;
+        // The artifact remains staged for an explicit fresh request.
         self.snapshot.error = Some(message.clone());
         self.snapshot.outcome = bounded(
             Self::apply_attempt_stopped_outcome(&message),
@@ -1350,6 +1339,7 @@ impl NativeUpdaterService {
     /// A same-build durable marker is retryable and takes the ordinary `AbortApply`
     /// transition. A missing or changed marker can never revive the in-memory artifact:
     /// retire it, then let the host import any different durable stage as a new generation.
+    #[cfg(any(unix, test))]
     pub(crate) fn finish_returned_apply(
         &mut self,
         ticket: &ApplyAttemptTicket,
@@ -1390,14 +1380,11 @@ impl NativeUpdaterService {
             self.snapshot.phase = UpdaterPhase::Idle;
             self.snapshot.staged = None;
             self.snapshot.reexec_count = 0;
-            self.snapshot.install_on_clean_quit = false;
             self.snapshot.attention_revision = None;
             self.snapshot.acknowledged_attention_revision = None;
             self.snapshot.error = None;
             self.snapshot.outcome = bounded(
-                format!(
-                    "Returned activation attempt was retired because the installed bundle changed: {message}"
-                ),
+                format!("The install stopped: {message}; aterm on disk has since changed"),
                 MAX_MESSAGE_BYTES,
             );
             self.close_preflight_ready = false;
@@ -1437,20 +1424,17 @@ impl NativeUpdaterService {
         self.snapshot.phase = UpdaterPhase::Idle;
         self.snapshot.staged = None;
         self.snapshot.reexec_count = 0;
-        self.snapshot.install_on_clean_quit = false;
         self.snapshot.attention_revision = None;
         self.snapshot.acknowledged_attention_revision = None;
         self.snapshot.error = None;
         self.snapshot.outcome = if let Some(installed) = installed {
             bounded(
-                Self::installed_activation_outcome(installed.build),
+                Self::installed_activation_outcome(installed.version.as_deref()),
                 MAX_MESSAGE_BYTES,
             )
         } else {
             bounded(
-                format!(
-                    "Returned update attempt was retired because its durable stage changed: {message}"
-                ),
+                format!("The install stopped: {message}; the download on disk has since changed"),
                 MAX_MESSAGE_BYTES,
             )
         };
@@ -1515,15 +1499,13 @@ impl NativeUpdaterService {
             self.snapshot.phase = UpdaterPhase::Idle;
             self.snapshot.staged = None;
             self.snapshot.error = None;
-            self.snapshot.install_on_clean_quit = false;
             self.snapshot.attention_revision = None;
             self.snapshot.acknowledged_attention_revision = None;
             self.snapshot.reexec_count = 0;
             self.close_preflight_ready = false;
             self.pending_preflight = None;
             self.active_apply = None;
-            self.snapshot.outcome =
-                "The installed bundle changed under this process; re-observing".to_string();
+            self.snapshot.outcome = "aterm on disk changed; reading it again".to_string();
             self.record(UpdaterTransitionAction::RetireStage, before);
             self.publish();
             return DurableStageDisposition::Retired;
@@ -1552,7 +1534,6 @@ impl NativeUpdaterService {
         self.snapshot.phase = UpdaterPhase::Idle;
         self.snapshot.staged = None;
         self.snapshot.error = None;
-        self.snapshot.install_on_clean_quit = false;
         self.snapshot.attention_revision = None;
         self.snapshot.acknowledged_attention_revision = None;
         self.snapshot.reexec_count = 0;
@@ -1561,7 +1542,7 @@ impl NativeUpdaterService {
         self.active_apply = None;
         self.snapshot.outcome = installed.map_or_else(
             || "Previously staged update is no longer available on disk".to_string(),
-            |installed| Self::installed_activation_outcome(installed.build),
+            |installed| Self::installed_activation_outcome(installed.version.as_deref()),
         );
         self.record(UpdaterTransitionAction::RetireStage, before);
         self.publish();
@@ -1650,6 +1631,21 @@ fn bounded_linux_status(
             .map(|value| bounded(value, MAX_SHORT_TEXT_BYTES));
         status
     })
+}
+
+/// The build of the VERIFIED DOWNLOAD a durable observation names, when it is
+/// strictly newer than `running_build`: exactly what the stage import would
+/// accept ([`staged_from_status`]) and never an activation, so a structural
+/// latch counts as a newer release only bytes the reducer itself would stage
+/// (gap 14, 2026-09-26).
+#[must_use]
+pub(crate) fn verified_download_build(
+    running_build: u64,
+    status: &DurableUpdateStatus,
+) -> Option<u64> {
+    staged_from_status(running_build, 0, status)
+        .filter(|stage| !stage.is_installed_activation())
+        .map(|stage| stage.build)
 }
 
 fn staged_from_status(
@@ -1870,7 +1866,6 @@ mod tests {
         assert_eq!(service.snapshot().linux, durable.linux);
         assert!(service.snapshot().linux_host);
         assert!(service.snapshot().staged.is_none());
-        assert!(!service.install_when_safe());
         assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
     }
 
@@ -1886,6 +1881,7 @@ mod tests {
             version: None,
             receipt_build,
             receipt_dmg_sha256: receipt_digest.map(str::to_string),
+            trial_launches: 0,
         }
     }
 
@@ -2012,9 +2008,8 @@ mod tests {
     fn apply_is_safe_current_and_at_most_once() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
-        assert!(service.install_when_safe());
 
-        let blocked_ticket = match service.begin_apply_preflight(ApplyMode::CleanQuit) {
+        let blocked_ticket = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2028,7 +2023,7 @@ mod tests {
         assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
         assert_eq!(service.snapshot().reexec_count, 0);
 
-        let ready_ticket = match service.begin_apply_preflight(ApplyMode::CleanQuit) {
+        let ready_ticket = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected second preflight, got {other:?}"),
         };
@@ -2044,7 +2039,7 @@ mod tests {
             ApplyDecision::Ignored
         ));
         assert_eq!(
-            service.begin_apply_preflight(ApplyMode::Immediate),
+            service.begin_apply_preflight(),
             ApplyPreflightStart::Applying
         );
 
@@ -2057,7 +2052,7 @@ mod tests {
     fn failed_reexec_rearms_only_the_exact_verified_stage() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2081,7 +2076,7 @@ mod tests {
                 .is_some_and(|error| error.contains("EIO"))
         );
 
-        let retry = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let retry = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("failed attempt must stay retryable, got {other:?}"),
         };
@@ -2187,6 +2182,7 @@ mod tests {
             version: Some("0.27.0".to_string()),
             receipt_build: None,
             receipt_dmg_sha256: None,
+            trial_launches: 0,
         };
         let stage = installed
             .activation_stage(11, 0)
@@ -2369,8 +2365,7 @@ mod tests {
                 }
                 if returned {
                     before = model.successors("Return", &before).remove(0);
-                    let ApplyPreflightStart::Inspect(ticket) =
-                        service.begin_apply_preflight(ApplyMode::Automatic)
+                    let ApplyPreflightStart::Inspect(ticket) = service.begin_apply_preflight()
                     else {
                         panic!("activation must enter preflight");
                     };
@@ -2456,7 +2451,7 @@ mod tests {
     fn a_returned_activation_rearms_while_backed_and_retires_when_the_bundle_moves_on() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage_activation(&mut service, 11);
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2486,7 +2481,7 @@ mod tests {
         );
 
         // Second attempt, but by the time it returns the bundle moved on: retire.
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2532,7 +2527,7 @@ mod tests {
             "an activation stays"
         );
         assert!(service.snapshot().staged.is_some());
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2551,7 +2546,7 @@ mod tests {
     fn consumed_durable_stage_retires_memory_and_reports_installed_activation() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2575,9 +2570,12 @@ mod tests {
         assert_eq!(service.snapshot().reexec_count, 0);
         assert!(service.snapshot().outcome.contains("installed"));
         assert!(
-            service.snapshot().outcome.contains("activation is pending")
+            service
+                .snapshot()
+                .outcome
+                .contains("switching to it keeps your shells running")
                 && !service.snapshot().outcome.contains("relaunch"),
-            "an installed bundle is activated in place, never left for a relaunch: {:?}",
+            "an installed bundle is switched to in place, never left for a relaunch: {:?}",
             service.snapshot().outcome
         );
         assert_eq!(
@@ -2591,7 +2589,7 @@ mod tests {
     fn returned_apply_rearms_only_while_exact_durable_stage_survives() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2693,7 +2691,7 @@ mod tests {
     fn applying_attempt() -> (NativeUpdaterService, ApplyAttemptTicket) {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
-        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let preflight = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };
@@ -2868,9 +2866,8 @@ mod tests {
         assert!(!service.snapshot().enabled);
         assert_eq!(service.snapshot().phase, UpdaterPhase::Disabled);
         assert!(service.snapshot().staged.is_none());
-        assert!(!service.install_when_safe());
         assert_eq!(
-            service.begin_apply_preflight(ApplyMode::Immediate),
+            service.begin_apply_preflight(),
             ApplyPreflightStart::Disabled
         );
 
@@ -2890,7 +2887,7 @@ mod tests {
             CheckStart::Rejected(CheckBlock::Disabled)
         );
         assert_eq!(
-            service.begin_apply_preflight(ApplyMode::Immediate),
+            service.begin_apply_preflight(),
             ApplyPreflightStart::Disabled
         );
     }
@@ -2924,7 +2921,7 @@ mod tests {
     fn wrong_preflight_identity_cannot_authorize_reexec() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
-        let ticket = match service.begin_apply_preflight(ApplyMode::Immediate) {
+        let ticket = match service.begin_apply_preflight() {
             ApplyPreflightStart::Inspect(ticket) => ticket,
             other => panic!("expected preflight, got {other:?}"),
         };

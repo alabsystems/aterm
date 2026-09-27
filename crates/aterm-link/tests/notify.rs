@@ -24,6 +24,7 @@ mod harness;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use aterm_spec::derive::notify_follow_checkpoint_model;
 use harness::{until, Fleet, FLEET};
 
 /// A `notify` run's captured output.
@@ -122,11 +123,15 @@ impl Watch {
 
     /// Spawn the binary in FOLLOW mode, killed on every exit path.
     fn follow(&self, on: &str) -> Follower {
+        self.follow_with(on, &self.appender(), &[])
+    }
+
+    fn follow_with(&self, on: &str, exec: &str, extra: &[&str]) -> Follower {
         let out = std::fs::File::create(self.state.join("follow.out")).expect("stdio");
         let err = out.try_clone().expect("stdio clone");
         Follower(Some(
             Command::new(env!("CARGO_BIN_EXE_aterm-link"))
-                .args(self.argv(on, &self.appender(), &[]))
+                .args(self.argv(on, exec, extra))
                 .stdin(Stdio::null())
                 .stdout(out)
                 .stderr(err)
@@ -460,6 +465,168 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
         fired[1].contains("dup=0"),
         "an offset that was never in doubt is not a duplicate: {fired:?}"
     );
+}
+
+/// A follow-mode reader may have a deep, slow backlog while another selector
+/// has a fresh halt. Catching up all selectors serially before starting their
+/// subscriptions put the halt behind every attention command; each reader now
+/// pages independently and hands records to the one serial executor.
+#[test]
+fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
+    let fleet = Fleet::boot("notify-parallel-catchup");
+    let w = Watch::new(
+        &fleet,
+        "parallel-catchup",
+        &[
+            format!("ro:/f/{FLEET}/pub/>"),
+            format!("ro:/f/{FLEET}/fleet/>"),
+        ],
+    );
+    let attention: Vec<u64> = (1..=16)
+        .map(|seq| raise_attention(&fleet, "s-one", seq, "needs a response"))
+        .collect();
+    let halt = fleet
+        .god()
+        .publish(
+            9_300,
+            1,
+            &format!("/f/{FLEET}/fleet/h-andrew/halt"),
+            b"v=1 t=1 state=on reason=blocked",
+        )
+        .expect("publish halt")
+        .0;
+    // The first attention is real work that gives both readers time to start.
+    // The wait is part of the operator command, not test synchronisation.
+    let exec = format!(
+        "if [ \"$ATERM_NOTIFY_OFFSET\" = \"{}\" ]; then sleep 1; fi; {}",
+        attention[0],
+        w.appender()
+    );
+    let _daemon = w.follow_with("attention,halt", &exec, &["--rate", "100/1m"]);
+    until("the halt notification to fire", || {
+        w.fired()
+            .iter()
+            .any(|line| offset_of(line) == halt)
+            .then_some(())
+    });
+    let fired = w.fired();
+    assert!(
+        !fired.iter().any(|line| offset_of(line) == attention[15]),
+        "halt must not wait for the whole attention backlog: {fired:?}"
+    );
+}
+
+/// `--since=head` is an initial cut, not a fresh cut on every restart. Follow
+/// mode persists that first head before subscribing, even when the log is idle.
+#[test]
+fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
+    let fleet = Fleet::boot("notify-head-restart");
+    let w = Watch::attention(&fleet, "head-restart");
+    let mut daemon = w.follow_with("attention", &w.appender(), &["--since", "head"]);
+    until("the head cursor to be persisted", || {
+        w.state.join("notify/cur/attention").exists().then_some(())
+    });
+    daemon.kill();
+    let off = raise_attention(&fleet, "s-one", 1, "arrived while offline");
+    let _restarted = w.follow_with("attention", &w.appender(), &["--since", "head"]);
+    until("the previously unwatched attention to fire", || {
+        w.fired()
+            .iter()
+            .any(|line| offset_of(line) == off)
+            .then_some(())
+    });
+}
+
+/// Tier-1 for `NotifyFollowCheckpoint`: the reader can offer a page mark after
+/// handing its last record to the executor, while that record's command is
+/// still running. The durable cursor must stop before that record until its
+/// command and journal verdict complete. A premature page checkpoint would
+/// skip it after a crash.
+#[test]
+fn a_page_checkpoint_waits_for_the_last_notification_command() {
+    let fleet = Fleet::boot("notify-page-checkpoint");
+    let w = Watch::attention(&fleet, "page-checkpoint");
+    let first = raise_attention(&fleet, "s-one", 1, "first");
+    let second = raise_attention(&fleet, "s-one", 2, "second");
+    let after_page = fleet
+        .god()
+        .publish(
+            9_301,
+            1,
+            &format!("/f/{FLEET}/fleet/h-andrew/halt"),
+            b"v=1 t=1 state=off",
+        )
+        .expect("publish filtered-out row")
+        .0;
+    let entered = w.state.join("second-entered");
+    let gate = w.state.join("release-second.fifo");
+    assert!(Command::new("mkfifo")
+        .arg(&gate)
+        .status()
+        .expect("mkfifo")
+        .success());
+    let exec = format!(
+        "if [ \"$ATERM_NOTIFY_OFFSET\" = \"{second}\" ]; then : > {}; read _ < {}; fi; {}",
+        entered.display(),
+        gate.display(),
+        w.appender()
+    );
+    let _daemon = w.follow_with("attention", &exec, &[]);
+    until("the second notification command to block", || {
+        entered.exists().then_some(())
+    });
+    let cursor_path = w.state.join("notify/cur/attention");
+    let cursor: u64 = std::fs::read_to_string(&cursor_path)
+        .expect("first record cursor")
+        .trim()
+        .parse()
+        .expect("numeric cursor");
+    assert_eq!(
+        cursor,
+        first + 1,
+        "the unfinished second row is not skipped"
+    );
+    assert!(
+        w.journal()
+            .iter()
+            .any(|line| line == &format!("{second} firing on=attention")),
+        "the second command is in doubt until released"
+    );
+
+    let model = notify_follow_checkpoint_model();
+    let mut state = model.init_state();
+    assert!(model.fire("ReceiveRecord", &mut state));
+    assert!(model.fire("HandleRecord", &mut state));
+    assert!(model.fire("ReceiveRecord", &mut state));
+    let before_offer = state.clone();
+    assert!(model.fire("OfferCheckpoint", &mut state));
+    assert_eq!(cursor - first, state["cursor"] as u64);
+    assert!(model.check_invariant("CursorNeverSkipsUnfinishedRecord", &state));
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut premature = before_offer;
+    assert!(buggy.fire("OfferCheckpoint", &mut premature));
+    assert!(
+        !buggy.check_invariant("CursorNeverSkipsUnfinishedRecord", &premature),
+        "a cursor written on checkpoint offer would skip the blocked command"
+    );
+
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&gate)
+        .expect("release the command")
+        .write_all(b"go\n")
+        .expect("write release");
+    until("the page checkpoint to persist after the command", || {
+        std::fs::read_to_string(&cursor_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|cursor| *cursor > after_page)
+    });
+    assert!(w.fired().iter().any(|line| offset_of(line) == second));
+    assert!(model.fire("HandleRecord", &mut state));
+    assert!(model.fire("PersistCheckpoint", &mut state));
+    assert!(model.check_invariant("CursorNeverSkipsUnfinishedRecord", &state));
 }
 
 /// **Every selector is a real broker filter.** `ask:<p>` and `halt` are matched

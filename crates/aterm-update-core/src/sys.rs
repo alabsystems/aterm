@@ -272,25 +272,49 @@ mod bounded_lock_tests {
             "waited {waited:?}: it blocked"
         );
 
-        // And once the holder goes, the same call succeeds immediately.
+        // And once the holder goes, the same call succeeds immediately: with a
+        // ZERO budget only the very first `try_lock` can win, so this demands the
+        // drop released the lock synchronously. It replaces a `< 1 s` stopwatch
+        // around a 5 s budget (the load-sensitive test audit of 2026-09-27),
+        // which a descheduled thread could fail and a late release could pass.
         drop(held);
-        let reacquired = Instant::now();
-        FileLock::acquire_within(&path, Duration::from_secs(5)).expect("free lock is takeable");
-        assert!(reacquired.elapsed() < Duration::from_secs(1));
+        FileLock::acquire_within(&path, Duration::ZERO)
+            .expect("the dropped lock must be free at the first try");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An UNCONTENDED lock must cost essentially nothing — the bounded path must
     /// not introduce a poll-interval floor on the common case.
+    ///
+    /// The FASTEST of five fresh acquisitions must beat one `LOCK_POLL`. A poll
+    /// floor (a sleep before the first try) puts every sample at or above it, so
+    /// the minimum still catches it; one descheduling of this thread under a
+    /// loaded gate inflates only the sample it lands in. A single sample was
+    /// timed until the load-sensitive test audit of 2026-09-27, against a bound
+    /// that IS the regression's size, so any 50 ms stall read as the defect.
     #[test]
     fn acquire_within_is_immediate_when_the_lock_is_free() {
         let dir =
             std::env::temp_dir().join(format!("aterm-bounded-lock-free-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("apply.lock");
-        let started = Instant::now();
-        let _lock = FileLock::acquire_within(&path, Duration::from_secs(10)).expect("free lock");
-        assert!(started.elapsed() < Duration::from_millis(50));
+        let fastest = (0..5)
+            .map(|sample| {
+                // A fresh file each time: every sample pays the create, as the
+                // first acquisition on a machine does.
+                let path = dir.join(format!("apply-{sample}.lock"));
+                let started = Instant::now();
+                let lock =
+                    FileLock::acquire_within(&path, Duration::from_secs(10)).expect("free lock");
+                let took = started.elapsed();
+                drop(lock);
+                took
+            })
+            .min()
+            .expect("five samples");
+        assert!(
+            fastest < super::LOCK_POLL,
+            "the fastest of five free acquisitions took {fastest:?}: a poll floor"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -37,8 +37,83 @@
 
 use std::process::Command;
 
-use aterm_spec::derive::rainbow_jump_burst_lifecycle_model;
+use aterm_spec::derive::Model;
 use aterm_spec::{interp, verify};
+
+/// THE FIXTURE: the retired v1 rainbow jump-burst ring, `RainbowJumpBurstLifecycle`.
+///
+/// It no longer describes any code — the burst ring it modelled was deleted with
+/// the v1 rainbow kitty (`48ea44608`), and the model left the registry with it —
+/// so it lives here and only here, as a CHECKER fixture: its shape (a stutter
+/// action, `SlowJump`, beside a violation three steps from `Init`) is the one
+/// that exposed the unsound reduction, and the incident histories in
+/// `aterm_spec::verify` name it by this module name.
+fn unsound_reduction_fixture() -> Model {
+    aterm_spec::ty_model! {
+        RainbowJumpBurstLifecycle {
+            const BurstCap = 3;
+            const TotalCap = 6;
+            const MaxIssued = 6;
+            const Buggy = 0;
+            var resident = 0;
+            var newest = 0;
+            var ghost = 0;
+            var ghost_newest = 0;
+            var issued = 0;
+            var wake = 0;
+            var lost = 0;
+
+            action FastJump when (issued <= MaxIssued - 1) {
+                resident = if resident + 1 > BurstCap { BurstCap } else { resident + 1 };
+                newest = if Buggy == 1 && resident + 1 > BurstCap {
+                    newest
+                } else {
+                    issued + 1
+                };
+                issued = issued + 1;
+                wake = 1;
+            }
+            action SlowJump { resident = resident; }
+            action ExpireOne when (resident > 0) {
+                resident = resident - 1;
+                newest = if resident > 1 { newest } else { 0 };
+                wake = if resident - 1 + ghost > 0 { 1 } else { 0 };
+            }
+            action BeginFade when (resident > 0) {
+                ghost = if Buggy == 1 { 0 } else { resident };
+                ghost_newest = if Buggy == 1 { 0 } else { newest };
+                resident = 0;
+                newest = 0;
+                wake = if Buggy == 1 { 0 } else { 1 };
+                lost = if Buggy == 1 { 1 } else { 0 };
+            }
+            action FinishFade when (ghost > 0) {
+                ghost = 0;
+                ghost_newest = 0;
+                wake = if resident > 0 { 1 } else { 0 };
+            }
+            action Reset when (resident + ghost > 0) {
+                resident = 0;
+                newest = 0;
+                ghost = 0;
+                ghost_newest = 0;
+                wake = 0;
+            }
+
+            invariant ResidentBounded: resident <= BurstCap;
+            invariant GhostBounded: ghost <= BurstCap;
+            invariant TotalBounded: resident + ghost <= TotalCap;
+            invariant NewestRetained:
+                if resident > 0 { newest == issued } else { newest == 0 };
+            invariant GhostIdentityBounded: ghost_newest <= issued;
+            invariant NoLostFadePayload: lost == 0;
+            invariant WakeMatchesResidents:
+                wake == if resident + ghost > 0 { 1 } else { 0 };
+            invariant IssuedBounded: issued <= MaxIssued;
+            invariant WakeBounded: wake <= 1;
+        }
+    }
+}
 
 #[test]
 fn discovered_ty_finds_a_counterexample_under_its_own_reductions() {
@@ -47,7 +122,7 @@ fn discovered_ty_finds_a_counterexample_under_its_own_reductions() {
     };
     // A model with a REAL violation close to Init: `Buggy = 1` makes `BeginFade`
     // drop the fade payload, violating `NoLostFadePayload` at depth 3.
-    let m = interp::with_buggy(&rainbow_jump_burst_lifecycle_model(), 1);
+    let m = interp::with_buggy(&unsound_reduction_fixture(), 1);
     assert!(
         interp::bmc(&m).is_err(),
         "canary fixture must actually be violated at Buggy = 1 — if this fires, the model \

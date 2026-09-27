@@ -12,60 +12,35 @@
 //! printed `grid` for the identical fact, and nothing in the type system
 //! noticed.
 //!
-//! This is the one vocabulary. [`Source`] names every input the harness reads
-//! a fact from. Each POSITION admits a subset — a window figure is never a
-//! `StopFailure` — and the producer for that position is what enforces it;
-//! nothing here pretends every variant is admissible everywhere. What IS
-//! shared is the spelling: one [`Source::as_str`], so `harness usage --json`
-//! and `harness limits --json` print the same word for the same input.
+//! This is the one vocabulary. [`Source`] names every input a harness read
+//! view takes a fact from, and one [`Source::as_str`] spells it, so `harness
+//! usage --json` and `harness limits --json` print the same word for the same
+//! input.
 //!
-//! `SourceSet` (a bit-set of these, for an observe event read from more than
-//! one place) went with `harness::observe` on 2026-09-23: the grid spine it
-//! served was the second harness stack, deleted in favour of the one engine
-//! in `supervise`. The vendor HOOK variants stay because
-//! [`super::limits`]' pair rule still names them; since decision "B" nothing
-//! produces one.
+//! What went, and why nothing names it any more: `SourceSet` and the
+//! `status`/`offscreen`/`search` reads with `harness::observe` (2026-09-23,
+//! the second harness stack), and the vendor HOOK variants (`hook`,
+//! `StopFailure`, `Notification`, `PostModelSwitch`) with the pair rule and
+//! independence channels of `harness::limits` (2026-09-25) — since decision
+//! "B" nothing produced one.
 //!
-//! Two orderings live here and they point opposite ways, which is why both
-//! are named rather than folded:
-//!
-//! * [`Source::rank`] is authority over a NUMBER. A figure the vendor
-//!   COMPUTED (its statusLine, its cache, its transcript) beats one read back
-//!   off the frame it PAINTED, so [`Source::Grid`] is the floor.
-//! * ADMISSIBILITY runs the other way (design §5.8.1, inverted 2026-09-19):
-//!   aterm drew the frame, so the grid survives `--bare`, a user statusLine,
-//!   a hook rename and a program with no hooks at all, and it is rank 1.
-//!
+//! [`Source::figure_authority`] is authority over a NUMBER: a figure the
+//! vendor COMPUTED (its statusLine, its cache, its transcript) beats one read
+//! back off the frame it PAINTED, so [`Source::Grid`] is the floor. That is
+//! not design §5.8.1's evidence order, which runs the other way: aterm drew
+//! the frame, so the grid survives `--bare`, a user statusLine and a program
+//! with no hooks at all, and it is rank 1 there.
 
 use std::fmt;
 
-/// One input the harness reads a fact from.
-///
-/// The spelling of each is [`Source::as_str`], and it is the word every
-/// surface prints. The three vendor hook events keep the vendor's own
-/// CamelCase names, because a reason line that says `StopFailure` is naming
-/// the hook the vendor documents and a kebab-case rendering of it would name
-/// nothing.
+/// One input the harness reads a fact from. The spelling of each is
+/// [`Source::as_str`], and it is the word every surface prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Source {
     /// Nothing reported it. The absence, not a place.
     None,
-    /// aterm's own `status` classification.
-    Status,
     /// aterm's own parsed grid (`text --json`) — what the vendor PAINTED.
     Grid,
-    /// Rows a full-screen program scrolled past (`offscreen`).
-    Offscreen,
-    /// The full-scrollback sweep (`search`).
-    Search,
-    /// A vendor hook fired, event unspecified.
-    Hook,
-    /// The `StopFailure` hook.
-    StopFailure,
-    /// The `Notification` hook.
-    Notification,
-    /// The `PostModelSwitch` hook.
-    PostModelSwitch,
     /// The vendor's live statusLine input.
     StatusLine,
     /// The vendor's on-disk utilization cache (`~/.claude.json`).
@@ -84,16 +59,10 @@ pub enum Source {
 
 impl Source {
     /// Every source, in the order this module declares them.
-    pub const ALL: [Source; 13] = [
+    #[cfg(test)]
+    pub(crate) const ALL: [Source; 6] = [
         Source::None,
-        Source::Status,
         Source::Grid,
-        Source::Offscreen,
-        Source::Search,
-        Source::Hook,
-        Source::StopFailure,
-        Source::Notification,
-        Source::PostModelSwitch,
         Source::StatusLine,
         Source::Cache,
         Source::Transcript,
@@ -105,14 +74,7 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Source::None => "none",
-            Source::Status => "status",
             Source::Grid => "grid",
-            Source::Offscreen => "offscreen",
-            Source::Search => "search",
-            Source::Hook => "hook",
-            Source::StopFailure => "StopFailure",
-            Source::Notification => "Notification",
-            Source::PostModelSwitch => "PostModelSwitch",
             Source::StatusLine => "statusline",
             Source::Cache => "cache",
             Source::Transcript => "transcript",
@@ -122,8 +84,9 @@ impl Source {
 
     /// Read back [`Source::as_str`]. An unknown word is `None`, never a
     /// guess — a renamed source must fail closed, not fold into a neighbour.
+    #[cfg(test)]
     #[must_use]
-    pub fn parse(s: &str) -> Option<Source> {
+    pub(crate) fn parse(s: &str) -> Option<Source> {
         Source::ALL.into_iter().find(|k| k.as_str() == s)
     }
 
@@ -131,18 +94,14 @@ impl Source {
     /// window.
     ///
     /// NOT design §5.8.1's ordinal. Renamed from `rank` 2026-09-22 because
-    /// the one word meant two opposite things in one module: here 1 was the
-    /// WEAKEST source that carries a figure (the painted grid) and 4 the
-    /// strongest, while `limits`, `usage`, `profile` and `watch` all spell
-    /// "rank 1" for §5.8.1's FIRST row — the spine, the top of the evidence
-    /// order. A ledger reason an operator reads carried both in one sentence.
-    /// One vocabulary, which is what this module exists for.
+    /// the one word meant two opposite things: here 1 is the WEAKEST source
+    /// that carries a figure (the painted grid) and 4 the strongest, while
+    /// §5.8.1's "rank 1" is its FIRST row — the grid, the top of the
+    /// evidence order.
     ///
     /// The statusLine, the cache and the transcript each carry a figure the
     /// vendor COMPUTED; the grid carries one it PAINTED, and a reading of a
-    /// painted number is the weaker of the two. Everything that never
-    /// carries a figure ranks with the absence, because for this question it
-    /// IS the absence.
+    /// painted number is the weaker of the two. The absence ranks lowest.
     #[must_use]
     pub fn figure_authority(self) -> u8 {
         match self {
@@ -150,43 +109,8 @@ impl Source {
             Source::Cache => 3,
             Source::Transcript | Source::TranscriptNewest => 2,
             Source::Grid => 1,
-            _ => 0,
+            Source::None => 0,
         }
-    }
-
-    /// The independent CHANNEL this source arrives on (design §5.8.2).
-    ///
-    /// **Independence is by channel, not by reading**: two readings of the
-    /// SAME grid frame are one source, so a `limit_notice` banner and a
-    /// window figure read back off the same frame both answer
-    /// [`Source::Grid`] and together are still one. A figure the vendor
-    /// COMPUTED answers [`Source::StatusLine`] whether it came from the
-    /// statusLine or its on-disk cache: one vendor computation, delivered
-    /// twice, is one channel.
-    #[must_use]
-    pub fn channel(self) -> Source {
-        match self {
-            Source::Status | Source::Grid | Source::Offscreen | Source::Search => Source::Grid,
-            Source::StatusLine | Source::Cache => Source::StatusLine,
-            other => other,
-        }
-    }
-
-    /// Whether this channel NAMES a failure rather than corroborating one
-    /// somebody else named.
-    ///
-    /// A pair needs one of these. The grid is one because it carries the
-    /// vendor's own words (design §5.8.1 rank 1); `StopFailure` and
-    /// `Notification` are, because each is a vendor VALUE for this failure.
-    /// A `PostModelSwitch` is a switch that names no failure, and a window
-    /// figure is a percentage, so two corroborators are not a pair however
-    /// well they agree.
-    #[must_use]
-    pub fn names_the_failure(self) -> bool {
-        matches!(
-            self.channel(),
-            Source::Grid | Source::StopFailure | Source::Notification
-        )
     }
 }
 
@@ -213,55 +137,21 @@ mod tests {
         // NEGATIVE CONTROL: a renamed source fails closed rather than
         // folding into a neighbour. `spine` is here on purpose — it was the
         // FOURTH spelling of `grid` before this module existed, and nothing
-        // may quietly accept it again.
-        for unknown in ["spine", "window", "Grid", "", "statusline "] {
+        // may quietly accept it again; `StopFailure` went with the hooks.
+        for unknown in ["spine", "window", "Grid", "", "statusline ", "StopFailure"] {
             assert_eq!(Source::parse(unknown), None, "{unknown}");
         }
     }
 
     #[test]
-    fn authority_and_admissibility_point_opposite_ways() {
-        // Authority over a number: the vendor's own computation wins.
+    fn a_computed_figure_outranks_a_painted_one() {
         assert!(Source::StatusLine.figure_authority() > Source::Cache.figure_authority());
         assert!(Source::Cache.figure_authority() > Source::Transcript.figure_authority());
+        assert_eq!(
+            Source::Transcript.figure_authority(),
+            Source::TranscriptNewest.figure_authority()
+        );
         assert!(Source::Transcript.figure_authority() > Source::Grid.figure_authority());
         assert!(Source::Grid.figure_authority() > Source::None.figure_authority());
-        // A source that carries no figure ranks with the absence.
-        for s in [Source::Status, Source::StopFailure, Source::Hook] {
-            assert_eq!(s.figure_authority(), 0, "{s}");
-        }
-        // Admissibility: the grid NAMES a failure; a computed figure does
-        // not, however high its authority over the number.
-        assert!(Source::Grid.names_the_failure());
-        assert!(!Source::StatusLine.names_the_failure());
-        assert!(!Source::Cache.names_the_failure());
-    }
-
-    #[test]
-    fn two_readings_of_one_frame_are_one_channel() {
-        for s in [
-            Source::Status,
-            Source::Grid,
-            Source::Offscreen,
-            Source::Search,
-        ] {
-            assert_eq!(s.channel(), Source::Grid, "{s}");
-        }
-        // One vendor computation delivered twice is one channel.
-        assert_eq!(Source::Cache.channel(), Source::StatusLine);
-        assert_eq!(Source::StatusLine.channel(), Source::StatusLine);
-        // NEGATIVE CONTROL: the hook events stay distinct channels, or the
-        // pair rule would accept a storm of one hook as two sources.
-        for s in [
-            Source::StopFailure,
-            Source::Notification,
-            Source::PostModelSwitch,
-        ] {
-            assert_eq!(s.channel(), s, "{s}");
-        }
-        assert_ne!(
-            Source::StopFailure.channel(),
-            Source::Notification.channel()
-        );
     }
 }

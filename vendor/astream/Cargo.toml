@@ -37,10 +37,8 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 astream-wire = { path = "crates/astream-wire" }
-astream-aead = { path = "crates/astream-aead" }
 # Third-party (crates.io only — no git, no path-to-private):
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 toml = "0.8"
 sha2 = "0.10"
 proptest = "1.5"

@@ -100,8 +100,8 @@
 //! it. N panes DO multiply the flashing AREA, and the amplitude arm depends on
 //! the ground a comet is composited over — neither arm supplies the margin the
 //! earlier prose implied. The measurements behind that sentence are in
-//! `docs/SESSION-gates-and-prism-wake-2026-09-01.md` §2 and are deliberately
-//! not restated here: a figure belongs beside the harness that pins it.
+//! `docs/DESIGN-output-streak-2026-08-30.md` §7 and are deliberately not
+//! restated here: a figure belongs beside the harness that pins it.
 //!
 //! ## Contract
 //!

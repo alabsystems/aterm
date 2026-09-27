@@ -567,17 +567,13 @@ pub fn builtin_themes() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// Error from parsing a disk theme definition ([`parse_scheme_str`]) or loading a
-/// theme by name ([`load`]). Stringly-typed line context so a bad user theme file
-/// produces an actionable diagnostic rather than a silent fallback.
+/// Error from parsing a disk theme definition ([`parse_scheme_str`]).
+/// Stringly-typed line context so a bad user theme file produces an actionable
+/// diagnostic rather than a silent fallback. (Its not-found and I/O variants
+/// belonged to the by-name file loader, which had no caller and was deleted on
+/// 2026-09-25; the GUI reads theme files through its own bounded catalog.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeError {
-    /// `load(name)`: neither a built-in nor a file at any candidate path matched.
-    /// Carries the name the user asked for.
-    NotFound(String),
-    /// The file existed but could not be read (permissions, I/O). Carries the
-    /// `Display` of the underlying error.
-    Io(String),
     /// A line was syntactically malformed (no `=`, bad colour, unknown key), or a
     /// required key was missing.
     Parse {
@@ -596,15 +592,6 @@ impl core::fmt::Display for ThemeError {
         // `{…}` always formats with default options, exactly like
         // `to_string`/`debug_string`.
         match self {
-            ThemeError::NotFound(name) => {
-                f.write_str("theme ")?;
-                f.write_str(&crate::trust_fmt::debug_string(name))?;
-                f.write_str(" not found (no built-in and no theme file)")
-            }
-            ThemeError::Io(e) => {
-                f.write_str("theme file read error: ")?;
-                f.write_str(e)
-            }
             ThemeError::Parse { line, reason } => {
                 f.write_str("theme parse error on line ")?;
                 f.write_str(&line.to_string())?;
@@ -834,70 +821,6 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
-/// Resolve a theme by NAME: a built-in (via [`builtin`]) wins; otherwise a user
-/// theme file is loaded and parsed via [`parse_scheme_str`].
-///
-/// FILE LOCATION — a `<name>.conf` file under the user theme directory, which
-/// mirrors the GUI config convention (`app_config`): `$XDG_CONFIG_HOME/aterm/themes/`
-/// when `XDG_CONFIG_HOME` is set, else `~/.config/aterm/themes/`. (We intentionally
-/// use the same `~/.config/aterm` root as `aterm.toml` rather than the platform
-/// `dirs::config_dir`, so themes sit beside the config the user already edits.) The
-/// name is matched VERBATIM as the file stem, so `load("My Theme")` reads
-/// `…/themes/My Theme.conf`. Theme PACKS (e.g. a checkout of
-/// github.com/mbadolato/iTerm2-Color-Schemes converted to this format) drop their
-/// `*.conf` files straight into that directory.
-///
-/// # Errors
-/// [`ThemeError::NotFound`] if neither a built-in nor a file matched;
-/// [`ThemeError::Io`] if the file existed but could not be read;
-/// [`ThemeError::Parse`] (via [`parse_scheme_str`]) for a malformed file.
-// Skip: fs read + parse (absent std bodies); every failure returns Err (fail-closed).
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn load(name: &str) -> Result<ColorScheme, ThemeError> {
-    if let Err(reason) = validate_user_theme_name(name) {
-        return Err(ThemeError::Parse {
-            line: 0,
-            reason: reason.to_string(),
-        });
-    }
-    if let Some(s) = builtin(name) {
-        return Ok(s);
-    }
-    let Some(path) = user_theme_path(name) else {
-        return Err(ThemeError::NotFound(name.to_string()));
-    };
-    let read = || -> Result<Vec<u8>, std::io::Error> {
-        use std::io::Read as _;
-        let file = std::fs::File::open(&path)?;
-        let mut bytes = Vec::with_capacity(MAX_USER_THEME_FILE_BYTES.min(16 * 1024));
-        file.take((MAX_USER_THEME_FILE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    };
-    match read() {
-        // Explicit strict UTF-8 decode (`String::from_utf8`, not
-        // `read_to_string`'s implicit validation) so the hardened gate sees
-        // the reject path. Behavior-identical: valid UTF-8 decodes to the
-        // same string, and on invalid UTF-8 `read_to_string` fails with an
-        // `ErrorKind::InvalidData` error whose `to_string()` is exactly this
-        // message — the only thing callers ever observed through
-        // `ThemeError::Io`.
-        Ok(bytes) if bytes.len() > MAX_USER_THEME_FILE_BYTES => Err(ThemeError::Io(format!(
-            "theme file exceeds the {MAX_USER_THEME_FILE_BYTES}-byte limit"
-        ))),
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => parse_scheme_str(&text),
-            Err(_) => Err(ThemeError::Io(
-                "stream did not contain valid UTF-8".to_string(),
-            )),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(ThemeError::NotFound(name.to_string()))
-        }
-        Err(e) => Err(ThemeError::Io(e.to_string())),
-    }
-}
-
 /// The user theme directory (`<config>/aterm/themes`), or `None` when no config
 /// home can be resolved (no `XDG_CONFIG_HOME` and no `HOME`). Public so a packaging
 /// / `--list-themes` caller can tell users exactly where to drop theme packs.
@@ -910,22 +833,9 @@ pub fn user_theme_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/aterm/themes"))
 }
 
-/// The candidate file path for a named user theme (`<theme dir>/<name>.conf`), or
-/// `None` if no config home is resolvable.
-fn user_theme_path(name: &str) -> Option<std::path::PathBuf> {
-    validate_user_theme_name(name).ok()?;
-    // Trust gate: concatenation instead of `format!`; byte-identical.
-    user_theme_dir().map(|d| {
-        let mut file = String::from(name);
-        file.push_str(".conf");
-        d.join(file)
-    })
-}
-
 /// Validate the literal grammar shared by direct loading and the GUI's bounded
 /// theme catalog. Theme names are file stems, never paths or OS-split syntax.
-/// Keeping this at the lowest layer makes `load` traversal-safe even for callers
-/// outside the GUI.
+/// Keeping this at the lowest layer makes every loader traversal-safe.
 pub fn validate_user_theme_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("theme name is empty");
@@ -1005,10 +915,6 @@ mod tests {
             assert!(
                 validate_user_theme_name(unsafe_name).is_err(),
                 "unsafe theme name accepted: {unsafe_name:?}"
-            );
-            assert!(
-                matches!(load(unsafe_name), Err(ThemeError::Parse { line: 0, .. })),
-                "direct loader must reject before forming a path: {unsafe_name:?}"
             );
         }
         for safe_name in ["Nord", "My Theme", "Tokyo-Night_2", "work:blue"] {
@@ -1263,21 +1169,6 @@ color15 = #c0caf5
             "{e:?}"
         );
     }
-
-    /// `load` resolves a built-in by name without ever touching the filesystem.
-    #[test]
-    fn load_resolves_builtin_first() {
-        assert_eq!(load("Default").unwrap(), ColorScheme::default());
-        assert_eq!(load("dracula").unwrap().name, "Dracula");
-    }
-
-    // The user-theme disk path (`load` reading a file under a scoped
-    // `XDG_CONFIG_HOME` override) is covered by `tests/user_theme_env.rs`, NOT
-    // here: libtest runs this unit binary's tests in parallel, and
-    // `user_theme_dir()` reads the environment on every `load()` call, so an
-    // env override in this mod would race every sibling test that calls
-    // `load()`. A single `#[test]` alone in its own integration binary owns
-    // the process environment legitimately.
 
     /// Inline comments after a value are stripped; a leading `#` hex value is kept.
     #[test]

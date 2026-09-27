@@ -9,8 +9,10 @@
 //! installs one writing to `~/Library/Logs/aterm/aterm.log` on macOS
 //! (Console.app's convention) and `~/.local/state/aterm/logs/aterm.log`
 //! elsewhere (XDG state): a `0600` file in a `0700` dir, same posture as the control
-//! socket. The level comes from `$ATERM_LOG` (`off|error|warn|info|debug|
-//! trace`), default `info`. Every line carries its time, the writing process's
+//! socket. The level is `info` — the one level a shipped binary logs at; a
+//! development build may set another through the `ATERM_LOG` seam
+//! (`off|error|warn|info|debug|trace`, [`aterm_types::dev_seam!`]). Every line
+//! carries its time, the writing process's
 //! pid and the level. The file is kept small by [`RotatingFile`]: past
 //! [`aterm_log::MAX_LOG_BYTES`] it becomes `aterm.log.1` and a fresh one starts,
 //! at startup and while running, so the two together stay near 8 MiB.
@@ -54,24 +56,29 @@ pub(crate) use stderr_line;
 
 use aterm_log::{LevelFilter, Log, Metadata, Record};
 
-/// Install the panic hook and file logger, level from `$ATERM_LOG`.
+/// Install the panic hook and file logger (at `info`; see the module docs).
 ///
 /// Called first thing in `main`, before any thread spawns. Failures are
 /// non-fatal (the terminal must still come up): they leave the facade in its
-/// discard-everything default and say why on stderr.
-pub fn init() {
+/// discard-everything default and say why on stderr. `arming` says what kind of
+/// start this is, for the crash marker ([`crate::crash_signal::Arming`]).
+pub(crate) fn init(arming: crate::crash_signal::Arming) {
     let Some(dir) = log_dir() else {
+        // `logs_dir` resolves nothing when HOME is unset or ATERM_STATE_HOME
+        // is set to something that is not an absolute path (empty included):
+        // name both, so a refused state root is not a silently lost log.
         crate::logging::stderr_line!(
-            "aterm-gui: no private log dir (set HOME); logging + crash reports disabled"
+            "aterm-gui: no private log dir (HOME unset, ATERM_STATE_HOME not an absolute \
+             path, or the dir cannot be made private); logging + crash reports disabled"
         );
         return;
     };
-    // Crash reporting is independent of $ATERM_LOG — panics are always worth
+    // Crash reporting is independent of the log level — panics are always worth
     // an artifact, even with routine logging off. Arm BOTH crash paths: the Rust
     // panic hook (unwinds) and the async-signal-safe fatal-signal handler
     // (SIGSEGV/SIGABRT/… which bypass the panic machinery entirely, M6 CRASH-CORE).
     install_panic_hook(dir.clone());
-    crate::crash_signal::install_signal_handlers();
+    crate::crash_signal::install_signal_handlers_as(arming);
     if let Err((path, e)) = install_file_logger(&dir) {
         crate::logging::stderr_line!(
             "aterm-gui: cannot open {}: {e}; logging disabled",
@@ -84,18 +91,18 @@ pub fn init() {
 /// beside a live shell, so what they have to say goes to `aterm.log`, never stderr. No
 /// panic hook and no crash-signal handlers — the session's crash story is unchanged — and
 /// silent when the log cannot be opened: the session's only other surface is that shell.
-pub fn init_session() {
+pub(crate) fn init_session() {
     if let Some(dir) = log_dir() {
         let _ = install_file_logger(&dir);
     }
 }
 
-/// Install the `aterm.log` logger in `dir` at `$ATERM_LOG`'s level (default `info`;
-/// `off` installs nothing). `Err` names the file that could not be opened.
+/// Install the `aterm.log` logger in `dir` at `info` (a development build's
+/// `ATERM_LOG` seam may pick another level; `off` installs nothing). `Err` names
+/// the file that could not be opened.
 fn install_file_logger(dir: &Path) -> Result<(), (PathBuf, std::io::Error)> {
-    let level = std::env::var("ATERM_LOG")
-        .ok()
-        .and_then(|s| LevelFilter::parse(&s))
+    let level = aterm_types::dev_seam!("ATERM_LOG")
+        .and_then(|s| LevelFilter::parse(&s.to_string_lossy()))
         .unwrap_or(LevelFilter::Info);
     if level == LevelFilter::Off {
         return Ok(());
@@ -119,7 +126,8 @@ fn install_file_logger(dir: &Path) -> Result<(), (PathBuf, std::io::Error)> {
 /// override) that `aterm_objc::exception` caught instead of letting it abort
 /// the process. Each one is an ERROR record naming the method, the
 /// exception's class, name and reason, and its call stack on one line —
-/// and, because the file logger may be off (`ATERM_LOG=off`) or not yet up,
+/// and, because the file logger may be off (a development build's `ATERM_LOG=off`)
+/// or not yet up,
 /// the same line still goes to stderr through the crate's default sink.
 ///
 /// Installed right after [`init`], before any window exists, so the first
@@ -127,7 +135,7 @@ fn install_file_logger(dir: &Path) -> Result<(), (PathBuf, std::io::Error)> {
 /// every turn and treats a change as an event (a redraw, the modifier state
 /// re-read).
 #[cfg(target_os = "macos")]
-pub fn install_objc_containment_sink() {
+pub(crate) fn install_objc_containment_sink() {
     aterm_objc::exception::set_sink(objc_containment_sink);
 }
 
@@ -157,6 +165,13 @@ fn objc_containment_sink(e: &aterm_objc::ContainedException<'_>) {
 fn install_panic_hook(dir: PathBuf) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside the screen reader's fence is caught and degraded by
+        // its caller, and warned once per session per location
+        // (`reader_guard`): no crash report, no stderr — the screen that
+        // raised it is read again every frame.
+        if crate::reader_guard::absorb(info) {
+            return;
+        }
         // The report path is the routing's testable answer; the hook has no further
         // use for it once the artifact is on disk.
         let _report = file_panic_report(
@@ -210,8 +225,8 @@ fn file_panic_report(
         return None;
     }
     // THE SUPERVISOR HOST'S THREADS are the other panic that is not a crash:
-    // each run is caught, restarted within its budget, and at worst the one
-    // session's supervisor goes off (faulted) — the terminal keeps running.
+    // each run is caught and restarted — past its budget on a pause that
+    // grows to an hour, the session badged — and the terminal keeps running.
     // Filed as a harness fault record, never as `crash-<pid>.log` (the next
     // launch would banner a crash that never happened).
     if is_harness_thread(thread_name) {
@@ -312,8 +327,10 @@ fn write_crash_report(
 /// file really is the only trace):
 ///
 ///   * `crash-<pid>.log` — the panic hook's report ([`install_panic_hook`]);
-///   * `crash-signal-<pid>-<nanos>.log` — a NON-EMPTY fatal-signal/-exception
-///     marker (`crate::crash_signal`). Empty ones are clean-run leftovers — the
+///   * `crash-marker-<pid>-<nanos>-<owner>.log` (unix; a build before
+///     2026-09-24, and Windows, spell it `crash-signal-<pid>-<nanos>.log`) — a
+///     NON-EMPTY fatal-signal/-exception marker (`crate::crash_signal`). An EMPTY
+///     one is a clean run's (or [`take_kill_evidence`]'s business) — the
 ///     current launch's own freshly-created marker included — which is why the
 ///     `len() == 0` skip below is correct even though this runs AFTER
 ///     `install_signal_handlers` created ours (and after its sweep, which only
@@ -427,6 +444,88 @@ fn take_crash_evidence_in(dir: &Path) -> Option<CrashEvidence> {
     let (_, path) = newest?;
     let head = crash_head(&path);
     Some(CrashEvidence { path, head })
+}
+
+/// One-shot startup scan for evidence that the installed app's PREVIOUS run was
+/// KILLED — ended with no fatal signal and no exit path at all (Force Quit,
+/// SIGKILL, jetsam, a watchdog, power loss): an empty
+/// `crash-marker-*-app.log` whose owner's lock is free
+/// (`crash_signal::markers::dead_app_markers`). Before the marker lifecycle
+/// such a death was indistinguishable from a clean quit, because a clean run
+/// never removed its own marker.
+///
+/// Only the installed app's markers count (`crash_signal::MarkerOwner`): test,
+/// tool, dev and headless starts share this dir and are SIGKILLed by harnesses
+/// routinely, and are not news. CONSUMING, like [`take_crash_evidence`]: every
+/// marker found is renamed to `.seen` (kept under the same pruning), and the
+/// evidence names the newest. `None` off unix, where markers carry no owner lock.
+pub(crate) fn take_kill_evidence() -> Option<KillEvidence> {
+    #[cfg(unix)]
+    {
+        take_kill_evidence_in(&log_dir()?, std::process::id())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// What a killed run left behind: its consumed marker (named in the detail so a
+/// person can find it; it is empty) and the log whose last lines are what the
+/// run said before it went.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the unix marker lifecycle finds a killed run"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KillEvidence {
+    /// The consumed marker, absolute.
+    pub(crate) marker: PathBuf,
+    /// `aterm.log` beside it — the `Open log` target.
+    pub(crate) log: PathBuf,
+}
+
+impl KillEvidence {
+    /// The console's line, the killed twin of [`CrashEvidence::sentence`].
+    pub(crate) fn sentence(&self) -> String {
+        format!(
+            "aterm was stopped last time (no crash signal, no clean exit) \u{2014} its last \
+             lines are in {}",
+            self.log.display()
+        )
+    }
+}
+
+/// [`take_kill_evidence`] against an explicit directory and pid (unit-testable).
+#[cfg(unix)]
+fn take_kill_evidence_in(dir: &Path, own_pid: u32) -> Option<KillEvidence> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for path in crate::crash_signal::markers::dead_app_markers(dir, own_pid) {
+        let modified = std::fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let seen = path.with_file_name(format!("{name}.seen"));
+        let path = if std::fs::rename(&path, &seen).is_ok() {
+            seen
+        } else {
+            path
+        };
+        if newest.as_ref().is_none_or(|(t, _)| modified >= *t) {
+            newest = Some((modified, path));
+        }
+    }
+    prune_seen_crash_reports(dir, newest.as_ref().map(|(_, path)| path.as_path()));
+    let (_, marker) = newest?;
+    Some(KillEvidence {
+        marker,
+        log: dir.join("aterm.log"),
+    })
 }
 
 /// Delete consumed crash reports (`crash-….log.seen`) beyond the newest
@@ -778,7 +877,7 @@ impl FileLogger {
 }
 
 impl Log for FileLogger {
-    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
         true // level gating already happened against the max-level atomic
     }
 
@@ -1277,6 +1376,61 @@ mod tests {
         std::fs::write(dir.join("crash-signal-1234-5.log"), b"").unwrap();
         std::fs::write(dir.join("aterm.log"), b"routine line").unwrap();
         assert!(take_crash_evidence_in(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE KILLED RUN, reported once: an empty, unlocked `app` marker of another
+    /// pid is consumed (renamed `.seen`) and named with `aterm.log` beside it;
+    /// the same scan never counts an `other` marker (a test or headless start's
+    /// corpse), a LIVE `app` marker (locked by its owner — here through
+    /// `create_locked` in this process), this process's own previous image, or
+    /// a non-empty marker (that one is crash evidence). NEGATIVE CONTROL: before
+    /// the lifecycle there was no killed report at all — the crash scan, which
+    /// is all there was, finds nothing in this dir.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_app_run_is_reported_once_and_nothing_else_is() {
+        use crate::crash_signal::{MarkerOwner, markers};
+        let dir = std::env::temp_dir().join(format!("aterm-log-killed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let own = std::process::id();
+        let gone = own.wrapping_add(1_000_000);
+        let killed = dir.join(markers::file_name(gone, 5, MarkerOwner::App));
+        std::fs::write(&killed, b"").unwrap();
+        std::fs::write(
+            dir.join(markers::file_name(gone, 6, MarkerOwner::Other)),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(dir.join(markers::file_name(own, 7, MarkerOwner::App)), b"").unwrap();
+        let (fd, live) =
+            markers::create_locked(&dir, &markers::file_name(gone + 1, 8, MarkerOwner::App))
+                .unwrap();
+        std::fs::write(dir.join("aterm.log"), b"last line before the kill\n").unwrap();
+
+        assert!(
+            take_crash_evidence_in(&dir).is_none(),
+            "control: the crash scan alone never saw a killed run"
+        );
+        let evidence = take_kill_evidence_in(&dir, own).expect("the killed run posts");
+        assert_eq!(
+            evidence.marker,
+            killed.with_file_name(format!(
+                "{}.seen",
+                killed.file_name().unwrap().to_str().unwrap()
+            ))
+        );
+        assert!(evidence.marker.exists() && !killed.exists());
+        assert_eq!(evidence.log, dir.join("aterm.log"));
+        assert!(evidence.sentence().contains("killed"));
+        assert!(
+            take_kill_evidence_in(&dir, own).is_none(),
+            "consumed: it posts exactly once"
+        );
+        assert!(live.exists(), "a live owner's marker is not evidence");
+        // SAFETY: closes the descriptor `create_locked` returned, once.
+        unsafe { libc::close(fd) };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

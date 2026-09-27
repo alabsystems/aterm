@@ -165,7 +165,7 @@ fn clear_range_clamps_end_to_cols() {
     }
 
     // End past row width — should clamp
-    row.clear_range(8, 100);
+    row.clear_range_with(8, 100, Cell::EMPTY);
     assert_eq!(row.get(7).unwrap().char(), 'H');
     assert_eq!(row.get(8).unwrap().char(), ' ');
     assert_eq!(row.get(9).unwrap().char(), ' ');
@@ -177,7 +177,7 @@ fn clear_range_no_op_when_start_equals_end() {
     let (_pages, mut row) = make_row(10);
     row.write_char(5, 'X');
 
-    row.clear_range(5, 5);
+    row.clear_range_with(5, 5, Cell::EMPTY);
     assert_eq!(row.get(5).unwrap().char(), 'X');
 }
 

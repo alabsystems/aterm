@@ -36,8 +36,10 @@ pub const MIN_FREE_DISK_GIB: u64 = 10;
 /// mirrored here because this crate does not depend on that one):
 /// `$TRUST_STAGE2_BIN` (an explicit development override, never fallen back from) →
 /// the rustup `trust` toolchain → the atpkg store's `store/trust/current/bin` →
-/// `PATH`. A candidate must carry `targo` AND `trustc`. No build tree is probed: the
-/// `$HOME/trust/build/host/stage2/bin` fallback was deleted 2026-09-24 (retired from the
+/// `PATH`, the rustup entry ranked BELOW the store when it is older than the store's
+/// build (`discovery_order`). A candidate must carry `targo` AND `trustc`. No build
+/// tree is probed: the `$HOME/trust/build/host/stage2/bin` fallback was deleted 2026-09-24
+/// (a hand-made rustup link can still NAME one — the exception above; retired from the
 /// delivery 2026-08-29); a from-source toolchain is reached SEALED, through the rustup
 /// entry Trust's `scripts/promote-toolchain.sh` flips onto the seal.
 /// Resolved to the PHYSICAL path — the protected Trust drivers refuse a symlinked
@@ -69,7 +71,73 @@ pub fn trust_stage2_bin() -> Result<PathBuf> {
     // outlive an install the operator performs on the advice of this very
     // error.
     static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    pin_first_success(&PINNED, resolve_trust_stage2_bin)
+    let pinned = pin_first_success(&PINNED, resolve_trust_stage2_bin)?;
+    if LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        hold_toolchain_lease(&pinned);
+    }
+    Ok(pinned)
+}
+
+/// Whether this process is a CUT ([`arm_toolchain_lease`]): only a cut leases the
+/// toolchain it pins. The tests resolve the machine's real toolchain through
+/// [`trust_stage2_bin`] too, and must never write into the machine's package store.
+static LEASE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm [`hold_toolchain_lease`]: the next [`trust_stage2_bin`] leases the toolchain it
+/// answers with. Called once, at the top of a cut (`publish::run_cut`).
+pub fn arm_toolchain_lease() {
+    LEASE_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// THE CUT'S LEASE on the toolchain it pinned (2026-09-26, [`atpkg::lease`]), taken once,
+/// at the first pin after [`arm_toolchain_lease`], and held for the life of the process —
+/// the cut. The pin makes a
+/// concurrent seal unable to reach a running cut; the lease makes the package manager
+/// unable to take the pinned build away under it: atpkg's gc keeps a leased build, the
+/// seam never re-lays a leased rustup view, and an unattended trust update waits while
+/// the live toolchain is leased (four hours at the most). Between two of the cut's steps
+/// no process runs from the directory, so without the lease nothing said it was in use.
+///
+/// A toolchain outside the atpkg prefix takes none (nothing of atpkg's reclaims it), and
+/// one that cannot be taken is said and never stops the cut — which is then exactly as
+/// exposed as it was before leases. Held in a static, so it is never dropped: the kernel
+/// releases the lock when the cutter exits, and atpkg reaps the file of a holder that is
+/// gone at its next reading.
+fn hold_toolchain_lease(dir: &Path) {
+    static LEASE: std::sync::OnceLock<Option<atpkg::lease::Lease>> = std::sync::OnceLock::new();
+    LEASE.get_or_init(|| {
+        let home = aterm_types::dirs::home_dir();
+        let configured = atpkg::config::load().prefix_path(home.as_deref());
+        let layout = atpkg::store::resolve(configured.as_deref())?;
+        take_cut_lease(&layout.prefix, dir)
+    });
+}
+
+/// [`hold_toolchain_lease`]'s lease under `prefix`, said on stderr either way it goes.
+fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
+    let who = format!(
+        "aterm-release (pid {}) \u{2014} a release cut",
+        std::process::id()
+    );
+    match atpkg::lease::take_for_dir(prefix, dir, &who) {
+        Ok(Some(lease)) => {
+            eprintln!(
+                "release: toolchain lease held on {} for this cut \u{2014} atpkg keeps it and an \
+                 unattended trust update waits for it",
+                lease.subject().describe()
+            );
+            Some(lease)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!(
+                "release: warn \u{2014} the toolchain lease was NOT taken ({e}); this cut goes on \
+                 unprotected: an update landing mid-cut can reclaim or re-lay {}",
+                dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Return the cell's value, resolving it exactly once and only on success.
@@ -144,18 +212,77 @@ fn trust_stage2_candidates() -> (bool, Vec<PathBuf>) {
     let home = aterm_types::dirs::home_dir();
     let configured = atpkg::config::load().prefix_path(home.as_deref());
     let layout = atpkg::store::resolve(configured.as_deref());
+    let entry = atpkg::seam::rustup_home()
+        .map(|rustup| atpkg::seam::seam_path(&rustup, atpkg::seam::DEFAULT_SEAM));
+    let path = env::var_os("PATH");
+    (
+        false,
+        discovery_order(entry.as_deref(), layout.as_ref(), path.as_deref()),
+    )
+}
+
+/// The walk below the override: the rustup `trust` entry, the store's
+/// `store/trust/current/bin`, then `path` — EXCEPT that a rustup entry OLDER than the
+/// store's build ranks BELOW the store (`aterm_verify::toolchain::Demoted` is the same
+/// exception, mirrored there). The rule is atpkg's own, called here rather than copied:
+/// [`atpkg::seam::stale_against_store`], the one `aterm pkg doctor` warns by and `aterm
+/// pkg repair` re-points by, so the cutter never ranks a toolchain differently from the
+/// verb that names the fix.
+///
+/// WHY (measured 2026-09-24 on the owner's Mac): `~/.rustup/toolchains/trust` was a
+/// hand-made link to `$HOME/trust/build/host/stage2`, a 2026-08-20 stage2, while the store
+/// held build 9192 (2026-09-17). atpkg's unattended pass refused to touch a link it did
+/// not lay, so this walk handed that stage2 to every cut on the machine and no toolchain
+/// update reached it. (Since 2026-09-26 that pass re-points an older live build tree by
+/// itself — [`atpkg::seam::live_build_tree`] — but a seal, a link put back after it and
+/// one a build runs through still reach this walk.) Demoted, not dropped: a store that is
+/// not there still leaves the entry ahead of PATH, which is what the walk did before.
+/// Only an entry outside atpkg's views is weighed — a view already answers with the
+/// store's live build (or the dev-linked checkout, which
+/// [`atpkg::seam::stale_against_store`] never calls stale).
+fn discovery_order(
+    entry: Option<&Path>,
+    layout: Option<&atpkg::store::Layout>,
+    path: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let rustup = entry.and_then(|e| rustup_entry_source(e, layout));
+    let store = layout.map(|l| l.program_current("trust").join("bin"));
+    let stale = match (&rustup, layout) {
+        (Some(RustupSource::Foreign(sysroot)), Some(layout)) => {
+            atpkg::seam::stale_against_store(layout, sysroot)
+        }
+        _ => None,
+    };
+    let rustup = rustup.map(|s| s.sysroot().join("bin"));
     let mut out = Vec::new();
-    if let Some(rustup) = atpkg::seam::rustup_home() {
-        let entry = atpkg::seam::seam_path(&rustup, atpkg::seam::DEFAULT_SEAM);
-        out.extend(rustup_entry_source(&entry, layout.as_ref()).map(|d| d.join("bin")));
+    if stale.is_some() {
+        out.extend(store);
+        out.extend(rustup);
+    } else {
+        out.extend(rustup);
+        out.extend(store);
     }
-    if let Some(layout) = &layout {
-        out.push(layout.program_current("trust").join("bin"));
+    if let Some(path) = path {
+        out.extend(env::split_paths(path));
     }
-    if let Some(path) = env::var_os("PATH") {
-        out.extend(env::split_paths(&path));
+    out
+}
+
+/// What the rustup `trust` entry stands for ([`rustup_entry_source`]).
+#[derive(Debug, PartialEq, Eq)]
+enum RustupSource {
+    /// atpkg's VIEW, answered with the sysroot it presents.
+    View(PathBuf),
+    /// Any other entry — a hand link, the store itself — as its own physical sysroot.
+    Foreign(PathBuf),
+}
+
+impl RustupSource {
+    fn sysroot(&self) -> &Path {
+        match self {
+            RustupSource::View(p) | RustupSource::Foreign(p) => p,
+        }
     }
-    (false, out)
 }
 
 /// The sysroot the rustup `trust` entry stands for. atpkg's VIEW (`<prefix>/rustup/…`)
@@ -163,18 +290,23 @@ fn trust_stage2_candidates() -> (bool, Vec<PathBuf>) {
 /// the store's live build, or the dev-linked checkout — whose physical path cannot
 /// change under a running cut; any other entry (a hand link, the store itself) is
 /// itself. `None` when the view presents nothing atpkg can use.
-fn rustup_entry_source(entry: &Path, layout: Option<&atpkg::store::Layout>) -> Option<PathBuf> {
+fn rustup_entry_source(
+    entry: &Path,
+    layout: Option<&atpkg::store::Layout>,
+) -> Option<RustupSource> {
     let resolved = fs::canonicalize(entry).ok()?;
     let Some(layout) = layout else {
-        return Some(resolved);
+        return Some(RustupSource::Foreign(resolved));
     };
     let views = fs::canonicalize(atpkg::seam::views_root(layout)).ok();
     if !views.is_some_and(|v| resolved.starts_with(v)) {
-        return Some(resolved);
+        return Some(RustupSource::Foreign(resolved));
     }
     match atpkg::seam::view_source(layout) {
-        atpkg::seam::ViewSource::Store => Some(atpkg::seam::store_current(layout)),
-        atpkg::seam::ViewSource::Linked(checkout) => Some(checkout),
+        atpkg::seam::ViewSource::Store => {
+            Some(RustupSource::View(atpkg::seam::store_current(layout)))
+        }
+        atpkg::seam::ViewSource::Linked(checkout) => Some(RustupSource::View(checkout)),
         atpkg::seam::ViewSource::LinkedNoSysroot(_) => None,
     }
 }
@@ -728,7 +860,7 @@ fn checked_head(path: &Path, commit: &str) -> Result<PathBuf> {
 /// required (see [`receipt_report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptReport {
-    /// The newest first-parent commit the push gate's predicate admits as gated, as
+    /// The newest first-parent commit [`receipt_report`]'s predicate counts as gated, as
     /// `(short sha, subject)`; `None` when none was found within the scan.
     pub newest_gated: Option<(String, String)>,
     /// The first-parent commits above it, newest first, as `short subject`.
@@ -771,28 +903,36 @@ fn receipt_store(git: &dyn GitRunner) -> Result<std::path::PathBuf> {
     Ok(std::path::Path::new(common.trim()).join("aterm-verify/receipts"))
 }
 
-/// The push gate's `full_pass`: a receipt (the gate writes one only for a clean
-/// tree) that discharged the whole merge contract (`.githooks/pre-push`). An
-/// unreadable file is not a pass.
+/// A full pass: a receipt (the gate writes one only for a clean tree) that
+/// discharged the whole merge contract. An unreadable file is not a pass.
 fn receipt_full_pass(receipts: &Path, sha: &str) -> bool {
     fs::read_to_string(receipts.join(sha))
         .is_ok_and(|text| receipt_field(&text, "merge-contract").as_deref() == Some("yes"))
 }
 
 /// THE UNGATED RANGE, STATED (2026-09-23). Walks HEAD's first-parent history to the
-/// newest commit the push gate's own predicate admits as gated — a passing receipt
-/// (merge contract discharged), or a clean automatic merge of a receipted
-/// side (two parents, one of them receipted, and the tree byte-equal to
-/// `git merge-tree --write-tree` of the two) — and reports how many commits sit
-/// above it. The same predicate `.githooks/pre-push` applies, so "gated" means here
-/// what it means at push time.
+/// newest commit a gate receipt vouches for — a passing receipt (merge contract
+/// discharged), or a clean automatic merge of a receipted side (two parents, one
+/// of them receipted, and the tree byte-equal to `git merge-tree --write-tree` of
+/// the two) — and reports how many commits sit above it.
+///
+/// THIS IS THE RECEIPT CHECK, AND IT IS INLINE (2026-09-25). It reads the store
+/// `tools/verify.sh` writes (`crates/aterm-verify/src/receipt.rs`) itself, in the
+/// cutter's preflight, before the ledger claim. No git hook reads receipts any
+/// more: the `.githooks/pre-push` that applied the same full-pass and clean-merge
+/// predicate at push time was deleted under the owner's standing mandate ("I DONT
+/// WANT HOOKS! NO HOOKS NO CI", 2026-07-06), and nothing here depended on it — this
+/// walk never asked the hook anything, and the cut's claim pushes owed it nothing.
 ///
 /// STATED, NOT REQUIRED. A receipt for the exact HEAD is a race the gate loses by
-/// construction (it takes an hour, peers push every few minutes — pre-push's own
-/// header), so demanding one would refuse every cut. What this buys is that the
-/// number is on the transcript: 0.91 was cut 136 commits past the newest receipt
-/// and nothing said so. On a real cut HEAD is the published commit, so the count
-/// is the published commit's.
+/// construction (it takes an hour, peers push every few minutes), so demanding one
+/// would refuse every cut. What this buys is that the number is on the transcript:
+/// 0.91 was cut 136 commits past the newest receipt and nothing said so. On a real
+/// cut HEAD is the published commit, so the count is the published commit's. A
+/// receipt on HEAD that did NOT pass is louder: the transcript warns
+/// (`publish::ungated_range_lines`). What IS required on every cut is the L0
+/// freeze-safety gate (`publish::run_freeze_safety_gate`), which runs itself rather
+/// than trusting any record.
 ///
 /// # Errors
 /// A git failure (a history that cannot be read is not an empty one).
@@ -853,7 +993,7 @@ pub fn receipt_report(git: &dyn GitRunner, receipts: &Path) -> Result<ReceiptRep
 }
 
 /// Whether `merge`'s tree is git's own clean merge of its two parents — nothing
-/// resolved or added by hand (pre-push's `gated_merge`).
+/// resolved or added by hand.
 fn clean_automatic_merge(git: &dyn GitRunner, merge: &str, p1: &str, p2: &str) -> Result<bool> {
     let auto = git.git(&["merge-tree", "--write-tree", p1, p2])?;
     match auto.status {
@@ -1430,17 +1570,15 @@ pub fn gh_auth() -> Result<Option<String>> {
 }
 
 /// The `[target.…]` tables in `.cargo/config.toml` that can carry the native
-/// Trust lane's rustflags, in lookup order. The live one is FIRST and is not a
-/// triple: ecb1d6691 (2026-08-30) replaced the two per-triple copies with one
+/// Trust lane's rustflags, in lookup order. The one table is not a triple:
+/// ecb1d6691 (2026-08-30) replaced the two per-triple copies with one
 /// `[target.'cfg(trust_verify)']` table scoped to the COMPILER that understands
-/// the flag rather than to a host, so the single table now reaches every Trust
-/// lane on every target. The two retired triples stay behind it only so an older
-/// checkout still reads its own config.
-const TRUST_LANE_TABLES: [&str; 3] = [
-    "cfg(trust_verify)",
-    "aarch64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-];
+/// the flag rather than to a host, so the single table reaches every Trust lane
+/// on every target. The per-triple names are retired with them: the cutter
+/// keeps no reader for a config shape this tree no longer carries, and
+/// `the_gate_knows_the_name_of_the_table_the_config_actually_carries` goes red
+/// the day the table moves again.
+const TRUST_LANE_TABLES: [&str; 1] = ["cfg(trust_verify)"];
 
 /// trustc's own words for "the off-switch took effect".
 ///
@@ -2036,11 +2174,13 @@ pub fn x86_target_probe() -> Result<()> {
         .map_err(|e| {
             // Name the escape hatch. rustup is NOT this repo's toolchain — THE
             // toolchain is the Trust stage2 tree — and it is wanted here for
-            // exactly one thing: upstream stable's x86_64-apple-darwin std, which
-            // Trust does not have. So on a Trust-only machine this is not a broken
-            // setup to go fix; it is a choice about what to ship, and the operator
-            // needs to be told that rather than sent to install a toolchain manager
-            // the repo otherwise refuses. Its twin in buildplan.rs already says so.
+            // exactly one thing: upstream stable's x86_64-apple-darwin std. The
+            // installed host Trust sysroot carries only its host std
+            // (rust-toolchain.toml; buildplan.rs says why the compat slice rides
+            // stable). So on a Trust-only machine this is not a broken setup to go
+            // fix; it is a choice about what to ship, and the operator needs to be
+            // told that rather than sent to install a toolchain manager the repo
+            // otherwise refuses.
             Error::new(format!(
                 "failed to run rustup ({e}). The x86_64 compat slice needs upstream \
                  stable's std for that target (Trust has none — the one documented \
@@ -2100,6 +2240,45 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
         )));
     }
     Ok(free_gib)
+}
+
+#[cfg(test)]
+mod cut_lease_tests {
+    use super::*;
+
+    /// A CUT LEASES THE TOOLCHAIN IT PINNED (2026-09-26): under the store's prefix, a
+    /// lease atpkg's gc and flip gate read, naming the cutter; a toolchain outside the
+    /// prefix takes none. And only a cut: nothing arms the lease unless `run_cut` does,
+    /// so the tests that resolve this machine's real toolchain write nothing into its
+    /// package store.
+    #[test]
+    fn a_cut_leases_the_toolchain_it_pinned_and_nothing_else_does() {
+        assert!(
+            !LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed),
+            "no test arms the cut's lease"
+        );
+        let prefix =
+            std::env::temp_dir().join(format!("aterm-release-cut-lease-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&prefix);
+        let bin = prefix.join("store/trust/9192/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let lease = take_cut_lease(&prefix, &bin).expect("a store toolchain is leased");
+        let subject = atpkg::lease::Subject::build("trust", 9192).unwrap();
+        assert_eq!(lease.subject(), &subject);
+        let atpkg::lease::Holders::Held(who) = atpkg::lease::holders(&prefix, &subject) else {
+            panic!("atpkg reads the cut's lease");
+        };
+        assert_eq!(
+            who,
+            [format!(
+                "aterm-release (pid {}) \u{2014} a release cut",
+                std::process::id()
+            )]
+        );
+        drop(lease);
+        assert!(take_cut_lease(&prefix, &std::env::temp_dir()).is_none());
+        let _ = fs::remove_dir_all(&prefix);
+    }
 }
 
 #[cfg(test)]
@@ -2574,6 +2753,97 @@ mod toolchain_pin_tests {
         let after = pin_first_success(&cell, || Ok(PathBuf::from("/seal/beta/bin")))
             .expect("the retry resolves");
         assert_eq!(after, Path::new("/seal/beta/bin"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod discovery_order_tests {
+    //! THE STALE RUSTUP LINK, for the cutter (measured 2026-09-24 on the owner's Mac:
+    //! `~/.rustup/toolchains/trust` -> `$HOME/trust/build/host/stage2`, 2026-08-20, the store
+    //! at 9192, 2026-09-17). Driven through [`discovery_order`] with the real
+    //! [`atpkg::seam::stale_against_store`] against a temp layout — nothing here reads
+    //! this machine's rustup, store or PATH.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A sysroot at `dir` whose `bin/trustc` answers `-vV` with `commit-date: <date>`,
+    /// beside an executable `targo`. Every `trustc` is a HARD LINK to one script run once
+    /// here, unbounded: macOS assesses a new executable on its first exec (measured ~20 s
+    /// on a loaded m7, 2026-09-24 — past atpkg's 5 s probe bound), and a link to an
+    /// assessed file is not new.
+    fn dated(root: &Path, dir: &Path, date: &str) {
+        let script = root.join("dated-trustc");
+        if !script.is_file() {
+            fs::write(
+                &script,
+                "#!/bin/sh\nd=$(cat \"$(dirname \"$0\")/../commit-date\")\n\
+                 echo \"rustc 1.99.0-dev (0000000 $d)\"\necho \"commit-date: $d\"\n",
+            )
+            .expect("write");
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+            let _ = Command::new(&script).output();
+        }
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).expect("mkdir");
+        let _ = fs::remove_file(bin.join("trustc"));
+        fs::hard_link(&script, bin.join("trustc")).expect("link");
+        fs::write(bin.join("targo"), "#!/bin/sh\n").expect("targo");
+        fs::set_permissions(bin.join("targo"), fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::write(dir.join("commit-date"), date).expect("date");
+    }
+
+    #[test]
+    fn a_rustup_trust_older_than_the_store_ranks_below_it() {
+        let root = fs::canonicalize(env::temp_dir())
+            .expect("tmp")
+            .join(format!("aterm-release-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let layout = atpkg::store::Layout {
+            prefix: root.join("prefix"),
+        };
+        let build = layout.build_dir("trust", 9192);
+        dated(&root, &build, "2026-09-17");
+        std::os::unix::fs::symlink(&build, atpkg::seam::store_current(&layout)).expect("ln");
+        let stage2 = root.join("trust/build/aarch64-apple-darwin/stage2");
+        dated(&root, &stage2, "2026-08-20");
+        let entry = root.join("rustup/toolchains/trust");
+        fs::create_dir_all(entry.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&stage2, &entry).expect("ln rustup");
+        let store_bin = layout.program_current("trust").join("bin");
+        let order = || discovery_order(Some(&entry), Some(&layout), Some("/on/path".as_ref()));
+
+        assert_eq!(
+            order(),
+            vec![
+                store_bin.clone(),
+                stage2.join("bin"),
+                PathBuf::from("/on/path")
+            ],
+            "an older rustup entry ranks below the store, still ahead of PATH"
+        );
+
+        // Negative controls: newer, same day, undated — the entry keeps its rank.
+        for (date, why) in [
+            ("2026-09-18", "newer"),
+            ("2026-09-17", "same day"),
+            ("unknown", "undated"),
+        ] {
+            fs::write(stage2.join("commit-date"), date).expect("date");
+            assert_eq!(
+                order()[..2],
+                [stage2.join("bin"), store_bin.clone()],
+                "{why}"
+            );
+        }
+        // No store at all: nothing to be older than.
+        fs::write(stage2.join("commit-date"), "2026-08-20").expect("date");
+        assert_eq!(
+            discovery_order(Some(&entry), None, None),
+            vec![stage2.join("bin")]
+        );
+        fs::remove_dir_all(&root).ok();
     }
 }
 
@@ -3076,40 +3346,6 @@ mod native_lane_flag_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An older checkout still reads its own config: the retired per-triple
-    /// names stay in the list behind the live one.
-    #[test]
-    fn a_retired_per_triple_table_is_still_read() {
-        let config: aterm_toml::Value =
-            "[target.aarch64-apple-darwin]\nrustflags = [\"-Ztrust-verify=off\"]\n"
-                .parse()
-                .unwrap();
-        assert_eq!(
-            trust_lane_rustflags(&config),
-            Some(vec!["-Ztrust-verify=off".to_string()])
-        );
-    }
-
-    /// …but where both exist the LIVE table wins, because that is the one cargo
-    /// applies on a Trust compiler.
-    #[test]
-    fn the_live_table_wins_over_a_retired_one() {
-        let config: aterm_toml::Value = "[target.'cfg(trust_verify)']\n\
-             rustflags = [\"-Ztrust-verify=off\", \"--cfg\", \"clean_islands\"]\n\
-             [target.aarch64-apple-darwin]\n\
-             rustflags = [\"-Zstale\"]\n"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            trust_lane_rustflags(&config),
-            Some(vec![
-                "-Ztrust-verify=off".to_string(),
-                "--cfg".to_string(),
-                "clean_islands".to_string(),
-            ])
-        );
-    }
-
     /// A table with no `rustflags` is not a Trust-lane table, whatever its name.
     #[test]
     fn a_table_without_rustflags_is_not_a_carrier() {
@@ -3276,7 +3512,7 @@ mod published_commit_tests {
     //! THE CUT BUILDS THE PUBLISHED COMMIT (2026-09-23), against real git: the cut
     //! tree goes to the commit `pub publish` recorded whatever main's tip is, the
     //! operator's checkout never moves, and the transcript states how far that commit is past the newest gate
-    //! receipt, by the push gate's own predicate.
+    //! receipt, by [`receipt_report`]'s predicate.
 
     use super::*;
     use crate::ledger::GitCli;
@@ -3559,7 +3795,7 @@ mod published_commit_tests {
         assert!(newest_published_source("not json").is_err());
     }
 
-    /// A NARROWED PASS IS NOT A GATE, as the push gate reads it: a clean, unskipped
+    /// A NARROWED PASS IS NOT A GATE, as the receipt report reads it: a clean, unskipped
     /// `--changed` PASS on HEAD over a fully receipted parent leaves HEAD ungated, and
     /// the walk stops at the parent. The store is the git common dir's, which every
     /// worktree shares.
@@ -3600,13 +3836,12 @@ mod published_commit_tests {
     }
 
     #[test]
-    fn the_receipt_report_counts_to_the_newest_gated_commit_by_the_push_predicate() {
+    fn the_receipt_report_counts_to_the_newest_gated_commit_by_the_gated_predicate() {
         let repo = Repo::new("receipts");
         let gated = repo.commit("gated", &[("a", "1")]);
         repo.receipt(&gated, "PASS", "yes");
         let b = repo.commit("ungated one", &[("a", "2")]);
-        // An older gate's receipt, and a narrowed run, do not admit a push — nor
-        // count here.
+        // An older gate's receipt, and a narrowed run, do not count as gated.
         fs::write(
             repo.receipts().join(&b),
             format!(

@@ -14,10 +14,16 @@ pub const BREC_VERSION: u8 = 2;
 /// Fixed header: version(1) + seq(8) + producer_id(8) + producer_seq(8).
 const HEADER: usize = 25;
 /// The largest record payload the log accepts: the frame cap minus a margin, so a
-/// stored record ALWAYS also fits inside a `Replicate` request (whose envelope is a
-/// few bytes larger than the record's own) — a record at the cap could otherwise be
-/// committed on a leader yet never be shippable to a follower.
-pub const MAX_RECORD_PAYLOAD: usize = MAX_PAYLOAD_LEN - 16;
+/// stored record ALWAYS also fits the frame wherever it is re-framed — inside a
+/// `Replicate` request (whose envelope is a few bytes larger than the record's own),
+/// and sealed at rest on an encrypted log (a 24-byte nonce and a 16-byte tag). A
+/// record at the cap could otherwise be committed on a leader yet never be
+/// shippable to, or storable on, a follower.
+pub const MAX_RECORD_PAYLOAD: usize = MAX_PAYLOAD_LEN - RECORD_MARGIN;
+/// The larger of the two re-framing overheads above: the at-rest seal's 40 bytes.
+const RECORD_MARGIN: usize = 40;
+#[cfg(feature = "aead")]
+const _: () = assert!(RECORD_MARGIN >= astream_aead::OVERHEAD);
 
 /// One durable message on the broker log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +67,12 @@ impl BrokerRecord {
     /// [`MAX_RECORD_PAYLOAD`] cap is enforced here so it holds for both the plaintext
     /// and the sealed path.
     pub(crate) fn encode_payload(&self) -> Result<Vec<u8>, FrameError> {
-        let mut p = Vec::with_capacity(HEADER + 8 + self.subject.len() + self.body.len());
+        // Sized exactly (header, two length-prefixed fields, the commit tag and its
+        // body), so a large body is copied once and never reallocated.
+        let commit_len = self.commit.as_ref().map_or(0, |c| 4 + c.group.len() + 8);
+        let mut p = Vec::with_capacity(
+            HEADER + 4 + self.subject.len() + 4 + self.body.len() + 1 + commit_len,
+        );
         p.push(BREC_VERSION);
         p.extend_from_slice(&self.seq.0.to_le_bytes());
         p.extend_from_slice(&self.producer_id.to_le_bytes());
@@ -195,6 +206,30 @@ mod tests {
             ..at_cap
         };
         assert_eq!(over.encode(), Err(FrameError::TooLarge));
+    }
+
+    /// The payload buffer is sized exactly, with or without a commit, so encoding
+    /// never grows (reallocates and copies) it.
+    #[test]
+    fn encode_payload_sizes_its_buffer_exactly() {
+        for commit in [
+            None,
+            Some(GroupCommit {
+                group: "g1".to_string(),
+                upto: 9,
+            }),
+        ] {
+            let r = BrokerRecord {
+                seq: Offset(1),
+                producer_id: 1,
+                producer_seq: 1,
+                subject: "/a/x".to_string(),
+                body: vec![7u8; 1000],
+                commit,
+            };
+            let p = r.encode_payload().unwrap();
+            assert_eq!(p.capacity(), p.len());
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //! 2. [`shaders`] — all six of aterm's shaders ported from WGSL to MSL, so that
 //!    `naga` (212,320 of the lines this row exists to remove) is not needed to
 //!    reach Metal.
-//! 3. [`blit`] — the present-path blit, end to end on Metal: pipeline, sampler,
+//! 3. `blit` — the present-path blit, end to end on Metal: pipeline, sampler,
 //!    uniform, render pass and readback. This is the ONE experiment
 //!    `docs/measured/wgpu-metal-decision-2026-08-30.md` §8 makes the whole row
 //!    conditional on, and it is GREEN — see below.
@@ -141,16 +141,15 @@
 //! `i32 >>` as arithmetic and MSL pins the same for signed types, so the twins
 //! agree; this is NOT the C++ implementation-defined case.
 
-// This module is deliberately not reachable from `renderer` yet (see the docs
-// above), so every binding in it is "dead" until the plumbing phase wires it
-// up. The alternative — deleting the unused half of the FFI — would mean the
-// pipeline/format tests below could not exist, and those tests are the entire
-// reason the shader port is trustworthy. Scoped to this module only.
-#![allow(dead_code)]
+// The armed renderer reaches this module on macOS. The parts only the
+// verification ladder uses — the `blit` experiment, the compute/parity
+// kernels, the read-back getters — are `#[cfg(test)]`, so they stay in the
+// tests that make the shader port trustworthy without shipping.
 
 #[cfg(feature = "acquire-conformance")]
 pub(crate) mod acquire_probe;
 pub(crate) mod acquire_worker;
+#[cfg(test)]
 pub(crate) mod blit;
 pub(crate) mod encoder;
 pub(crate) mod ffi;
@@ -2847,7 +2846,7 @@ mod tests {
 
     /// W6a — THE ARMED-PRODUCTION DIFFERENTIAL: `render_input` through TWO
     /// renderers on identical input — one on the shipped wgpu arm, one ARMED
-    /// (`arm_metal_for_test`, the in-process spelling of `ATERM_METAL=1`) so
+    /// (`arm_metal_for_test`, the in-process arming hook) so
     /// its `encode_frame` tail runs the PRODUCTION Metal path end to end:
     /// the lazy arm mint on this thread, the arm-side stream/atlas/PSO
     /// caches, the one shared ladder, and `metal_try_read_back` — not the W4
@@ -4798,14 +4797,15 @@ mod tests {
                  (got {} passes)",
                 gpu.last_frame_passes()
             );
-            let actual = match gpu.metal_replay_recorded_plan_for_test(&b, (w, h), Some(&seed)) {
-                Ok(None) => {
-                    crate::stderr_line!("SKIP: no Metal device");
-                    return;
-                }
-                Err(e) => panic!("run {run}: {e}"),
-                Ok(Some(f)) => f,
-            };
+            let actual =
+                match gpu.metal_replay_recorded_plan_for_test(&win, &b, (w, h), Some(&seed)) {
+                    Ok(None) => {
+                        crate::stderr_line!("SKIP: no Metal device");
+                        return;
+                    }
+                    Err(e) => panic!("run {run}: {e}"),
+                    Ok(Some(f)) => f,
+                };
             assert_eq!(
                 (expected.width, expected.height),
                 (actual.width, actual.height)

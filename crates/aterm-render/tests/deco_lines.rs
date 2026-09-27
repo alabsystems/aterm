@@ -22,9 +22,14 @@
 //!   cells produces the IDENTICAL pixel coverage as the whole run
 //!   (`pattern_rects_are_partition_invariant`), with non-vacuity controls.
 //!
-//! The rounding/clamping laws (`resolve_deco_metrics`, `undercurl_coverage`)
-//! use integer division and f32 rounding, which the ty `Expr` language cannot
-//! express (no mul/div — see the box-drawing precedent at
+//! The band CLAMP's order (thickness into `[1, cell_h]` first, then the top
+//! against `cell_h − t`) is purely additive, so it IS a model:
+//! `DecoBandContainment` (`aterm_spec::derive::deco_band_containment_model`),
+//! and `resolved_bands_conform_to_the_deco_band_containment_model` binds the
+//! shipping resolver to it over the model's whole lattice. The per-em SCALING
+//! and rounding around that clamp (`resolve_deco_metrics`, `undercurl_coverage`)
+//! use multiplication, division and f32 rounding, which the ty `Expr` language
+//! cannot express (no mul/div — see the box-drawing precedent at
 //! `procedural.rs`); per that precedent they are machine-checked here by
 //! exhaustive lattice enumeration instead of a model.
 
@@ -136,6 +141,111 @@ fn font_tables_actually_drive_the_bands() {
         (d.underline_y, d.underline_t),
         (legacy.underline_y, legacy.underline_t),
         "table-driven band must differ from the heuristic here"
+    );
+}
+
+/// One settled band of the `DecoBandContainment` model's lattice, driven
+/// through the SHIPPING resolver: `(y, t)` for a `cell_h`-tall cell asked for a
+/// raw `(raw_top, raw_t)` band.
+///
+/// Both bands reach the clamp through their own real entry. The UNDERLINE takes
+/// the heuristic path (`baseline = 0`, so its raw band is `(1, 1)` for every
+/// cell of five rows or fewer) and is moved onto the lattice point by the
+/// `adjust_underline_position` / `adjust_underline_thickness` escape hatches —
+/// which is how a user's config reaches it. The STRIKE takes the OS/2 table
+/// path at `px = 1`, which lands exactly on the point for any `raw_t >= 1` (a
+/// zero-thickness table entry is not a table entry, so `raw_t = 0` is the
+/// underline's alone).
+fn real_bands(cell_h: i64, raw_t: i64, raw_top: i64) -> [Option<(i64, i64)>; 2] {
+    let tables = (raw_t >= 1).then_some(DecoTables {
+        underline: None,
+        strikeout: Some((-(raw_top as f32), raw_t as f32)),
+    });
+    let d = resolve_deco_metrics(
+        cell_h as usize,
+        0,
+        1.0,
+        tables,
+        (raw_top - 1) as i32,
+        (raw_t - 1) as i32,
+    );
+    [
+        Some((d.underline_y as i64, d.underline_t as i64)),
+        tables.map(|_| (d.strike_y as i64, d.strike_t as i64)),
+    ]
+}
+
+/// Tier-1 conformance for `DecoBandContainment`
+/// (`aterm_spec::derive::deco_band_containment_model`). Over the model's WHOLE
+/// lattice — every `cell_h` 1..=5, raw thickness 0..=7 and raw top 0..=7 —
+/// the shipping resolver's settled thickness and top must each be exactly the
+/// model's one successor of its `SettleThick` and `SettleTop` step, for both
+/// the underline and the strikethrough.
+///
+/// NON-VACUITY: the same lattice must separate the model's two dials — at some
+/// points the `Buggy = 1` settle (the top clamped against the whole cell, the
+/// thickness floor dropped) differs from the healthy one, and there the real
+/// resolver sides with the healthy model. So a resolver regressed either way
+/// fails this test at a named point rather than passing it.
+#[test]
+fn resolved_bands_conform_to_the_deco_band_containment_model() {
+    let model = aterm_spec::derive::deco_band_containment_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let pick = |state: &aterm_spec::interp::State, action: &str, var: &str, value: i64| {
+        aterm_spec::interp::pick(&model, state, action, var, value)
+            .unwrap_or_else(|| panic!("{action} cannot pick {var} = {value} from {state:?}"))
+    };
+    let (mut settled, mut separating) = (0usize, 0usize);
+    for cell_h in 1..=5 {
+        let cell = pick(&model.init_state(), "PickCell", "cell_h", cell_h);
+        for raw_t in 0..=7 {
+            let thick = pick(&cell, "PickThick", "raw_t", raw_t);
+            for raw_top in 0..=7 {
+                let raw = pick(&thick, "PickTop", "raw_top", raw_top);
+                for (band, real) in ["underline", "strike"]
+                    .into_iter()
+                    .zip(real_bands(cell_h, raw_t, raw_top))
+                {
+                    let Some((y, t)) = real else { continue };
+                    let at = format!("{band} at cell_h={cell_h} raw_t={raw_t} raw_top={raw_top}");
+                    let mut after_thick = raw.clone();
+                    after_thick.insert("t", t);
+                    after_thick.insert("phase", 4);
+                    assert_eq!(
+                        model.successors("SettleThick", &raw),
+                        vec![after_thick.clone()],
+                        "{at}: the real thickness is not the model's SettleThick"
+                    );
+                    let mut after_top = after_thick.clone();
+                    after_top.insert("y", y);
+                    after_top.insert("phase", 5);
+                    assert_eq!(
+                        model.successors("SettleTop", &after_thick),
+                        vec![after_top.clone()],
+                        "{at}: the real top is not the model's SettleTop"
+                    );
+                    let pre_fix = buggy
+                        .successors("SettleThick", &raw)
+                        .into_iter()
+                        .flat_map(|s| buggy.successors("SettleTop", &s))
+                        .collect::<Vec<_>>();
+                    if pre_fix != vec![after_top] {
+                        separating += 1;
+                    }
+                    settled += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        settled,
+        5 * 8 * 8 + 5 * 7 * 8,
+        "every lattice point, both bands"
+    );
+    assert!(
+        separating > 0,
+        "the lattice must reach points where the Buggy = 1 settle differs, or \
+         this conformance could not tell a regressed resolver from the shipped one"
     );
 }
 

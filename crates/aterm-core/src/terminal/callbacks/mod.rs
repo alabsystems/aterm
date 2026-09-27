@@ -17,12 +17,7 @@ pub use aterm_types::callback_events::{SshConductorCallbackEvent, TmuxCallbackEv
 // ----------------------------------------------------------------------------
 
 pub(super) use aterm_types::{
-    AdvancedNotificationCallback, BufferActivationCallback, ClipboardCallback,
-    CopyToClipboardCallback, DcsCallback, HighlightCursorLineCallback, KvpCallback,
-    NotificationCallback, RemoteHostCallback, ReportCellSizeCallback, ReportVariableCallback,
-    SemanticBlockCallback, SemanticButtonCallback, SetBadgeFormatCallback, SetColorsCallback,
-    SetProfileCallback, ShellIntegrationVersionCallback, TextSizingCallback, TitleCallback,
-    TitleEventCallback, WindowCallback,
+    AdvancedNotificationCallback, ClipboardCallback, NotificationCallback, WindowCallback,
 };
 
 // ----------------------------------------------------------------------------
@@ -50,35 +45,6 @@ pub enum ColorTarget {
     SelectionForeground,
 }
 
-impl ColorTarget {
-    /// Convert from legacy `u8` index (0=fg, 1=bg, 2=cursor, 3=palette, 4=sel_bg, 5=sel_fg).
-    #[must_use]
-    pub fn from_u8(index: u8) -> Option<Self> {
-        Some(match index {
-            0 => Self::Foreground,
-            1 => Self::Background,
-            2 => Self::Cursor,
-            3 => Self::Palette,
-            4 => Self::SelectionBackground,
-            5 => Self::SelectionForeground,
-            _ => return None,
-        })
-    }
-
-    /// Convert to legacy `u8` index for FFI compatibility.
-    #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        match self {
-            Self::Foreground => 0,
-            Self::Background => 1,
-            Self::Cursor => 2,
-            Self::Palette => 3,
-            Self::SelectionBackground => 4,
-            Self::SelectionForeground => 5,
-        }
-    }
-}
-
 /// Callback type for explicit, reset, and dynamic color changes (OSC 4, 10-21,
 /// 104, 110-112, 117, and 119).
 pub(super) type ColorChangeCallback = Box<dyn FnMut(ColorTarget, Rgb, ColorChangeOp) + Send>;
@@ -95,14 +61,11 @@ pub(super) type ColorQueryCallback = Box<dyn FnMut(ColorTarget) -> Option<Rgb> +
 // Constants
 // ----------------------------------------------------------------------------
 
-/// Maximum bytes per DCS callback invocation.
-pub(super) const MAX_DCS_CALLBACK_BYTES: usize = 1_048_576;
-
 /// Global maximum DCS memory budget (10 MB).
 ///
 /// This limits total memory used by all active DCS operations across the terminal.
 /// If exceeded, new DCS data is silently dropped until existing operations complete.
-/// Enforced in handler.rs via dcs_total_bytes tracking.
+/// Enforced in `handler_dcs.rs` via `dcs.total_bytes` tracking.
 pub(super) const MAX_DCS_GLOBAL_BUDGET: usize = 10 * 1024 * 1024;
 
 /// Maximum depth of the title stack.

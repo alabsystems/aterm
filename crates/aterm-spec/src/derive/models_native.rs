@@ -10,9 +10,14 @@ use super::*;
 
 /// Lane-exact admission for the fixed control-socket worker pool. The listener
 /// may admit exactly `LaneCap` queued-or-running connections and rejects an
-/// arrival when every lane is owned; every arrival is accounted exactly once and
-/// accepted work remains outstanding until its worker completes. `Buggy=1`
-/// restores over-admission at full capacity, which `LaneBounded` catches.
+/// arrival when every lane is owned; accepted work remains outstanding until its
+/// worker completes, and completion releases exactly the lane it held. `Buggy=1`
+/// restores over-admission at full capacity, which `LaneBounded` catches, and a
+/// worker that returns without releasing its lane, as a panicking handler would
+/// without `DispatchCompletion`'s drop guard, which `AcceptedWorkAccounted`
+/// catches; `BoundedDispatch::serve_next` holds that guard for every worker.
+/// `arrivals` counts `try_submit` calls, which return either `Ok` or the stream,
+/// so accepted plus rejected arrivals always equal it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn control_connection_admission_model() -> Model {
@@ -41,25 +46,31 @@ pub fn control_connection_admission_model() -> Model {
                 arrivals = arrivals + 1;
                 rejected = rejected + 1;
             }
-            action Complete when (outstanding > 0) {
-                outstanding = outstanding - 1;
+            // `completed <= accepted - 1` caps the leak mutant's completions: a
+            // leaked lane keeps `outstanding > 0`, so without the cap Buggy=1
+            // would complete forever. It is inert at Buggy=0, where
+            // AcceptedWorkAccounted implies it.
+            action Complete when (outstanding > 0 && completed <= accepted - 1) {
+                outstanding = if Buggy == 1 { outstanding } else { outstanding - 1 };
                 completed = completed + 1;
             }
             invariant LaneBounded: outstanding <= LaneCap;
             invariant ArrivalsBounded: arrivals <= MaxArrivals;
-            invariant EveryArrivalAccounted: arrivals == accepted + rejected;
             invariant AcceptedWorkAccounted: accepted == outstanding + completed;
-            invariant CompletedWasAccepted: completed <= accepted;
         }
     }
 }
 
 /// Request classification when the focused content may be native rather than a
-/// terminal. Owner App/Meta authority is independent of a PTY; a bare Session
+/// terminal. Owner App authority is independent of a PTY; a bare Session
 /// request is valid exactly when the front view is terminal; an explicit live
 /// session remains addressable behind native focus; and an Edge can never use an
-/// App/Meta route. `Buggy=1` admits the two historical failure classes: retaining
-/// a hidden terminal as the bare target, and bypassing Owner-only App/Meta gates.
+/// App route. `Buggy=1` admits the two historical failure classes: retaining a
+/// hidden terminal as the bare target, and bypassing the Owner-only App gate.
+/// It also passes `native_control_decision` its two liveness bools swapped when
+/// the explicit session retires or returns, so the bare route follows the
+/// explicit session and the explicit route follows the front terminal
+/// (`BareSessionIffFrontTerminal`, `ExplicitSessionIffLive`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_control_routing_model() -> Model {
@@ -71,22 +82,18 @@ pub fn native_control_routing_model() -> Model {
             var active_terminal = 1;
             var explicit_session_live = 1;
             var owner_app_allowed = 1;
-            var owner_meta_allowed = 1;
             var bare_session_allowed = 1;
             var explicit_session_allowed = 1;
             var edge_app_allowed = 0;
-            var edge_meta_allowed = 0;
             var hidden_terminal_fallback = 0;
             var session_without_target = 0;
             action FocusNative {
                 front_kind = 2;
                 active_terminal = if Buggy == 1 { 1 } else { 0 };
                 owner_app_allowed = if Buggy == 1 { 0 } else { 1 };
-                owner_meta_allowed = if Buggy == 1 { 0 } else { 1 };
                 bare_session_allowed = if Buggy == 1 { 1 } else { 0 };
                 explicit_session_allowed = explicit_session_live;
                 edge_app_allowed = 0;
-                edge_meta_allowed = 0;
                 hidden_terminal_fallback = if Buggy == 1 { 1 } else { 0 };
                 session_without_target = if Buggy == 1 { 1 } else { 0 };
             }
@@ -94,21 +101,21 @@ pub fn native_control_routing_model() -> Model {
                 front_kind = 1;
                 active_terminal = 1;
                 owner_app_allowed = 1;
-                owner_meta_allowed = 1;
                 bare_session_allowed = 1;
                 explicit_session_allowed = explicit_session_live;
                 edge_app_allowed = if Buggy == 1 { 1 } else { 0 };
-                edge_meta_allowed = if Buggy == 1 { 1 } else { 0 };
                 hidden_terminal_fallback = 0;
                 session_without_target = 0;
             }
             action RetireExplicitSession {
                 explicit_session_live = 0;
-                explicit_session_allowed = 0;
+                explicit_session_allowed = if Buggy == 1 { active_terminal } else { 0 };
+                bare_session_allowed = if Buggy == 1 { 0 } else { bare_session_allowed };
             }
             action RestoreExplicitSession {
                 explicit_session_live = 1;
-                explicit_session_allowed = 1;
+                explicit_session_allowed = if Buggy == 1 { active_terminal } else { 1 };
+                bare_session_allowed = if Buggy == 1 { 1 } else { bare_session_allowed };
             }
             invariant FrontKindBounded: front_kind > 0 && front_kind <= 2;
             invariant FrontKindMatchesTerminalMirror:
@@ -118,13 +125,11 @@ pub fn native_control_routing_model() -> Model {
                     active_terminal == 0
                 };
             invariant OwnerAppAlwaysAllowed: owner_app_allowed == 1;
-            invariant OwnerMetaAlwaysAllowed: owner_meta_allowed == 1;
             invariant BareSessionIffFrontTerminal:
                 bare_session_allowed == active_terminal;
             invariant ExplicitSessionIffLive:
                 explicit_session_allowed == explicit_session_live;
             invariant EdgeAppDenied: edge_app_allowed == 0;
-            invariant EdgeMetaDenied: edge_meta_allowed == 0;
             invariant NoHiddenTerminalFallback: hidden_terminal_fallback == 0;
             invariant NoSessionWithoutTarget: session_without_target == 0;
         }
@@ -466,7 +471,9 @@ pub fn native_tab_identity_model() -> Model {
 /// most `Cap` descriptors, a failed reopen consumes nothing, and a successful reopen
 /// mints a fresh identity before consuming exactly one descriptor. `Buggy=1` models both
 /// dangerous shortcuts: consuming the record on failed file grant and aliasing the
-/// retired tab identity on success.
+/// retired tab identity on success. It also evicts one too few when a close meets
+/// a full ledger (`RecoveryLedger::push` testing `len > capacity`), which
+/// `LedgerBounded` catches.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_reopen_ledger_model() -> Model {
@@ -493,7 +500,11 @@ pub fn native_reopen_ledger_model() -> Model {
                 next_id = next_id + 1;
             }
             action Close when (native_live > 0) {
-                ledger = if ledger <= Cap - 1 { ledger + 1 } else { Cap };
+                ledger = if ledger <= Cap - 1 {
+                    ledger + 1
+                } else {
+                    if Buggy == 1 { Cap + 1 } else { Cap }
+                };
                 native_live = native_live - 1;
                 retired_id = opened_id;
             }
@@ -527,7 +538,9 @@ pub fn native_reopen_ledger_model() -> Model {
 /// Closing the only leaf records exactly one `ClosedTab`; closing a non-last leaf records
 /// exactly one `ClosedView`. Failed reconstruction consumes neither ledger. `Buggy=1`
 /// reproduces the two destructive implementation shortcuts: double-recording one close in
-/// both ledgers and consuming a recovery record before reconstruction succeeds.
+/// both ledgers and consuming a recovery record before reconstruction succeeds. Every
+/// Buggy push also evicts one too few from a full ledger (`RecoveryLedger::push`
+/// testing `len > capacity`), which the two ledger bounds catch.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn closed_recovery_ledgers_model() -> Model {
@@ -549,10 +562,10 @@ pub fn closed_recovery_ledgers_model() -> Model {
                 view_ledger = if view_ledger <= ViewCap - 1 {
                     view_ledger + 1
                 } else {
-                    ViewCap
+                    if Buggy == 1 { ViewCap + 1 } else { ViewCap }
                 };
                 tab_ledger = if Buggy == 1 {
-                    if tab_ledger <= TabCap - 1 { tab_ledger + 1 } else { TabCap }
+                    if tab_ledger <= TabCap - 1 { tab_ledger + 1 } else { TabCap + 1 }
                 } else {
                     tab_ledger
                 };
@@ -563,10 +576,10 @@ pub fn closed_recovery_ledgers_model() -> Model {
                 tab_ledger = if tab_ledger <= TabCap - 1 {
                     tab_ledger + 1
                 } else {
-                    TabCap
+                    if Buggy == 1 { TabCap + 1 } else { TabCap }
                 };
                 view_ledger = if Buggy == 1 {
-                    if view_ledger <= ViewCap - 1 { view_ledger + 1 } else { ViewCap }
+                    if view_ledger <= ViewCap - 1 { view_ledger + 1 } else { ViewCap + 1 }
                 } else {
                     view_ledger
                 };
@@ -618,7 +631,11 @@ pub fn closed_recovery_ledgers_model() -> Model {
 /// the capacity is full; back/forward keep the cursor inside the retained
 /// entries. `Buggy=1` reproduces an uncapped append (and, after branching, the
 /// failure to truncate the abandoned future), violating both the capacity and
-/// branch-length contracts.
+/// branch-length contracts. It also reproduces the two off-by-one edges of
+/// `MarkdownHistory`'s cursor: `forward` testing `next > len` steps past the
+/// newest entry (`CursorWithinHistory`), and `back` written as
+/// `cursor.checked_sub(1)` steps off the oldest one, leaving entries with no
+/// cursor (`EmptyIffNoCursor`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_markdown_history_model() -> Model {
@@ -662,11 +679,11 @@ pub fn native_markdown_history_model() -> Model {
                 };
                 visits = visits + 1;
             }
-            action Back when (cursor > 1) {
+            action Back when (cursor > 1 || (Buggy == 1 && cursor == 1)) {
                 cursor = cursor - 1;
                 last_visit_was_branch = 0;
             }
-            action Forward when (len > cursor) {
+            action Forward when (len > cursor || (Buggy == 1 && len == cursor && len > 0)) {
                 cursor = cursor + 1;
                 last_visit_was_branch = 0;
             }
@@ -1214,8 +1231,15 @@ pub fn manual_config_handoff_model() -> Model {
 /// user verb owns the current sequence; only a matching completion may settle
 /// it. Starting a new verb clears the prior result, while a silent refresh
 /// preserves it. Most importantly, the presented result is the current
-/// process result—not an older successful `status.toml`. `Buggy=1` reproduces
-/// the stale-success presentation after a failed command.
+/// process result—not an older successful `status.toml`.
+///
+/// `operation` projects `PackagesService::busy` (a refresh has none) and
+/// `inflight` its separate flag; `expected_result` is the outcome the last verb's
+/// worker reported, which a refresh leaves alone. `Buggy=1` reproduces the
+/// stale-success presentation after a failed command, an `abort` that clears
+/// `inflight` but not `busy` (`SingleFlightHasOneKind`), and a `finish` that
+/// assigns a refresh's absent command over the last verb result
+/// (`RefreshKeepsVerbResult`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_packages_worker_model() -> Model {
@@ -1232,6 +1256,7 @@ pub fn native_packages_worker_model() -> Model {
             var last_operation = 0;
             var last_result = 0;
             var presented_result = 0;
+            var expected_result = 0;
 
             action BeginRefresh when (inflight == 0 && sequence <= MaxSequence - 1) {
                 sequence = sequence + 1;
@@ -1241,6 +1266,7 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = last_operation;
                 last_result = last_result;
                 presented_result = presented_result;
+                expected_result = expected_result;
             }
             action BeginCheck when (inflight == 0 && sequence <= MaxSequence - 1) {
                 sequence = sequence + 1;
@@ -1250,6 +1276,7 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = 0;
                 last_result = 0;
                 presented_result = 0;
+                expected_result = 0;
             }
             action BeginInstall when (inflight == 0 && sequence <= MaxSequence - 1) {
                 sequence = sequence + 1;
@@ -1259,15 +1286,17 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = 0;
                 last_result = 0;
                 presented_result = 0;
+                expected_result = 0;
             }
             action FinishRefresh when (inflight == 1 && operation == 1) {
                 sequence = sequence;
                 inflight = 0;
                 operation = 0;
                 observed = 1;
-                last_operation = last_operation;
-                last_result = last_result;
-                presented_result = presented_result;
+                last_operation = if Buggy == 1 { 0 } else { last_operation };
+                last_result = if Buggy == 1 { 0 } else { last_result };
+                presented_result = if Buggy == 1 { 0 } else { presented_result };
+                expected_result = expected_result;
             }
             action FinishCheckSuccess when (inflight == 1 && operation == 2) {
                 sequence = sequence;
@@ -1277,6 +1306,7 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = 2;
                 last_result = 1;
                 presented_result = 1;
+                expected_result = 1;
             }
             action FinishCheckFailure when (inflight == 1 && operation == 2) {
                 sequence = sequence;
@@ -1286,6 +1316,7 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = 2;
                 last_result = 2;
                 presented_result = if Buggy == 1 { 1 } else { 2 };
+                expected_result = 2;
             }
             action FinishInstallSuccess when (inflight == 1 && operation == 3) {
                 sequence = sequence;
@@ -1295,6 +1326,7 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = 3;
                 last_result = 1;
                 presented_result = 1;
+                expected_result = 1;
             }
             action FinishInstallFailure when (inflight == 1 && operation == 3) {
                 sequence = sequence;
@@ -1304,26 +1336,25 @@ pub fn native_packages_worker_model() -> Model {
                 last_operation = 3;
                 last_result = 2;
                 presented_result = if Buggy == 1 { 1 } else { 2 };
+                expected_result = 2;
             }
             action Abort when (inflight == 1) {
                 sequence = sequence;
                 inflight = 0;
-                operation = 0;
+                operation = if Buggy == 1 && operation > 1 { operation } else { 0 };
                 observed = observed;
                 last_operation = last_operation;
                 last_result = last_result;
                 presented_result = presented_result;
+                expected_result = expected_result;
             }
 
             invariant SingleFlightHasOneKind:
                 if inflight == 1 {
                     operation > 0 && operation <= 3
                 } else { operation == 0 };
-            invariant CommandResultHasOrigin:
-                if last_result > 0 {
-                    last_operation == 2 || last_operation == 3
-                } else { last_operation == 0 };
             invariant FinalResultIsPresented: presented_result == last_result;
+            invariant RefreshKeepsVerbResult: last_result == expected_result;
             invariant StateIsBounded:
                 sequence <= MaxSequence && inflight <= 1 && operation <= 3 &&
                 observed <= 1 && last_operation <= 3 && last_result <= 2 &&
@@ -1408,9 +1439,15 @@ pub fn native_recovery_interaction_model() -> Model {
 /// across ordinary motion until a region edit or abort, while Command/Search/
 /// Buffer/Goto minibuffers exclusively consume query input. Search/Goto abort
 /// restores its captured origin and only an explicitly authorized region edit may advance the
-/// abstract document revision. `Buggy=1` reproduces both acceptance defects this
-/// model guards: motion collapses an active mark and minibuffer typing leaks into
-/// the document mutation lane.
+/// abstract document revision. `Cap` is the document's length (the Tier-1 bind
+/// opens a three-character document): the caret and the anchor stay inside it
+/// (`CaretBounded`, `AnchorBounded`), and an incremental search whose match would
+/// run past the end parks the caret at the end, the clamp
+/// `update_incremental_search` makes with `origin.min(len)`. `Buggy=1`
+/// reproduces the acceptance defects this model guards: motion collapses an
+/// active mark, minibuffer typing leaks into the document mutation lane, and the
+/// search clamp is off by one, so the caret lands one past the document end and
+/// a mark set there pins an anchor past it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_editor_modal_model() -> Model {
@@ -1484,6 +1521,8 @@ pub fn native_editor_modal_model() -> Model {
                 caret = if mode == 2 {
                     if search_origin + query <= Cap - 1 {
                         search_origin + query + 1
+                    } else if Buggy == 1 {
+                        Cap + 1
                     } else {
                         Cap
                     }
@@ -1553,8 +1592,6 @@ pub fn native_editor_modal_model() -> Model {
             invariant MinibufferCannotEditDocument: document_edits == authorized_edits;
             invariant DocumentEditsBounded: document_edits <= Cap;
             invariant ExitKindBounded: last_exit <= 1;
-            invariant QueryOnlyWhileModal:
-                if mode == 0 { query == 0 } else { query <= Cap };
         }
     }
 }
@@ -1563,7 +1600,10 @@ pub fn native_editor_modal_model() -> Model {
 /// window-local. Ordinary activation may create the singleton instance once and
 /// at most one implicit view in each window; every request focuses the requesting
 /// window. `Buggy=1` models the historical "open means allocate" implementation:
-/// a repeated activation allocates another instance and implicit view.
+/// a repeated activation allocates another instance and implicit view. It also
+/// steals focus: activating from window two while window one already shows
+/// Settings raises window one, the singleton's first home, instead of the
+/// requester (`RequestingWindowFocused`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_settings_singleton_model() -> Model {
@@ -1605,7 +1645,7 @@ pub fn native_settings_singleton_model() -> Model {
                     if Buggy == 1 { window_two_implicit + 1 } else { window_two_implicit }
                 };
                 requesting_window = 2;
-                focused_window = 2;
+                focused_window = if Buggy == 1 && window_one_implicit > 0 { 1 } else { 2 };
             }
             invariant SingletonInstance: settings_instances <= 1;
             invariant OneImplicitViewWindowOne: window_one_implicit <= 1;
@@ -1704,7 +1744,23 @@ pub fn native_settings_draft_close_model() -> Model {
 /// Versioned preference patches use touched-key expectations rather than blind
 /// whole-file overwrite. A stale patch may cross an unrelated-key edit, but a
 /// same-key patch or conditional undo conflicts. Reset All is one atomic action.
-/// The mutants either overwrite a conflicting key or expose a half-reset state.
+/// Every revision is exactly one write: an accepted patch, undo or reset, or one
+/// admitted external edit (`RevisionCountsWrites`).
+///
+/// `Buggy = 1` carries one slip per law:
+/// * a patch or undo overwrites a conflicting key (`NoBlindOverwrite`), or Reset
+///   All exposes a half-reset state (`AtomicResetVisibility`);
+/// * the one revision bump every accepted write shares is skipped — the one in
+///   `VersionedConfigService::patch`, which `undo` and Reset All reach through
+///   `patch` — so an accepted write publishes under the revision it found. Every
+///   open Settings view discards that snapshot as one it already holds
+///   (`snapshot.revision == view.snapshot_revision`) and never shows the write
+///   (`RevisionCountsWrites`).
+///
+/// No law says a patch's base is never ahead of the service. The controller copies
+/// its base from the snapshot it holds and the revision only grows, so nothing in
+/// the design produces a future base; `VersionedConfigService::patch` refuses one
+/// anyway (`invalid base revision`, pinned by its own unit test).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_config_transaction_model() -> Model {
@@ -1716,17 +1772,16 @@ pub fn native_config_transaction_model() -> Model {
             var key_a = 1;
             var key_b = 1;
             var patch_active = 0;
-            var patch_base = 0;
             var expected_a = 0;
             var undo_ready = 0;
             var undo_before_a = 0;
             var undo_expected_a = 0;
             var accepted = 0;
+            var external_edits = 0;
             var stale_overwrite = 0;
             var partial_reset = 0;
             action BeginPatchA when (patch_active == 0) {
                 patch_active = 1;
-                patch_base = revision;
                 expected_a = key_a;
             }
             action ExternalAFromOne when (
@@ -1734,27 +1789,33 @@ pub fn native_config_transaction_model() -> Model {
             ) {
                 key_a = 2;
                 revision = revision + 1;
+                external_edits = external_edits + 1;
             }
             action ExternalAFromZero when (
                 key_a == 0 && revision <= MaxRevision - 1
             ) {
                 key_a = 2;
                 revision = revision + 1;
+                external_edits = external_edits + 1;
             }
             action ExternalB when (
                 key_b == 1 && revision <= MaxRevision - 1
             ) {
                 key_b = 2;
                 revision = revision + 1;
+                external_edits = external_edits + 1;
             }
+            // `accepted <= MaxRevision - 1`, here and in `UndoPatchA` and
+            // `ResetAll`, is implied by the revision guard in the healthy
+            // machine; it bounds the mutant, whose writes mint no revision.
             action CommitPatchA when (
                 patch_active == 1 && expected_a <= key_a &&
                 key_a <= if Buggy == 1 { 2 } else { expected_a } &&
-                revision <= MaxRevision - 1
+                revision <= MaxRevision - 1 && accepted <= MaxRevision - 1
             ) {
                 key_a = 0;
                 patch_active = 0;
-                revision = revision + 1;
+                revision = if Buggy == 1 { revision } else { revision + 1 };
                 undo_ready = if Buggy == 1 && key_a > expected_a {
                     undo_ready
                 } else { 1 };
@@ -1764,9 +1825,7 @@ pub fn native_config_transaction_model() -> Model {
                 undo_expected_a = if Buggy == 1 && key_a > expected_a {
                     undo_expected_a
                 } else { 0 };
-                accepted = if Buggy == 1 && key_a > expected_a {
-                    accepted
-                } else { accepted + 1 };
+                accepted = accepted + 1;
                 stale_overwrite = if Buggy == 1 && key_a > expected_a {
                     1
                 } else { stale_overwrite };
@@ -1779,14 +1838,12 @@ pub fn native_config_transaction_model() -> Model {
             action UndoPatchA when (
                 undo_ready == 1 && undo_expected_a <= key_a &&
                 key_a <= if Buggy == 1 { 2 } else { undo_expected_a } &&
-                revision <= MaxRevision - 1
+                revision <= MaxRevision - 1 && accepted <= MaxRevision - 1
             ) {
                 key_a = undo_before_a;
                 undo_ready = 0;
-                revision = revision + 1;
-                accepted = if Buggy == 1 && key_a > undo_expected_a {
-                    accepted
-                } else { accepted + 1 };
+                revision = if Buggy == 1 { revision } else { revision + 1 };
+                accepted = accepted + 1;
                 stale_overwrite = if Buggy == 1 && key_a > undo_expected_a {
                     1
                 } else { stale_overwrite };
@@ -1797,20 +1854,20 @@ pub fn native_config_transaction_model() -> Model {
                 undo_ready = 0;
             }
             action ResetAll when (
-                patch_active == 0 && revision <= MaxRevision - 1
+                patch_active == 0 && revision <= MaxRevision - 1 &&
+                accepted <= MaxRevision - 1
             ) {
                 key_a = 0;
                 key_b = if Buggy == 1 { key_b } else { 0 };
-                revision = revision + 1;
+                revision = if Buggy == 1 { revision } else { revision + 1 };
                 undo_ready = if Buggy == 1 { undo_ready } else { 0 };
-                accepted = if Buggy == 1 { accepted } else { accepted + 1 };
+                accepted = accepted + 1;
                 partial_reset = if Buggy == 1 { 1 } else { partial_reset };
             }
             invariant NoBlindOverwrite: stale_overwrite == 0;
             invariant AtomicResetVisibility: partial_reset == 0;
+            invariant RevisionCountsWrites: accepted + external_edits == revision;
             invariant KeysBounded: key_a <= 2 && key_b <= 2;
-            invariant PatchBaseNotFuture: patch_base <= revision;
-            invariant AcceptedHasRevision: accepted <= revision;
             invariant RevisionBounded: revision <= MaxRevision;
         }
     }
@@ -1957,7 +2014,11 @@ pub fn native_config_observation_handoff_model() -> Model {
 /// against the service's current optimistic revision/value before it reduces;
 /// live policy changes only at durable completion. The mutant captures the
 /// expected value at enqueue time, reproducing the stale third toggle in an
-/// ON→OFF→ON burst.
+/// ON→OFF→ON burst. It also recomputes the projection at a completion from the
+/// OLDEST pending intent — `refresh_serious_mode_queued_projection` without its
+/// `.rev()` — so mid-burst the checkmark shows the second click's value while
+/// the third is queued, and the next click composes against it
+/// (`ProjectionTracksLatestIntent`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serious_mode_intent_queue_model() -> Model {
@@ -2084,7 +2145,14 @@ pub fn serious_mode_intent_queue_model() -> Model {
                 q1_expected = if queue_count <= 1 { 0 } else { q2_expected };
                 q2_expected = 0;
                 queue_count = if queue_count == 0 { 0 } else { queue_count - 1 };
-                projection = if queue_count == 0 { current_desired } else { projection };
+                // The completion re-reads the pending queue (`q1` is its oldest
+                // entry, still queued when the refresh runs). The newest intent
+                // wins; the mutant reads the queue front-first.
+                projection = if queue_count == 0 {
+                    current_desired
+                } else {
+                    if Buggy == 1 { q1 } else { projection }
+                };
                 completed = completed + 1;
                 conflict = if (
                     queue_count > 0 && Buggy == 1 &&
@@ -2096,7 +2164,10 @@ pub fn serious_mode_intent_queue_model() -> Model {
                 if inflight == 0 { live == service && live == projection } else { live <= 1 };
             invariant ProjectionTracksLatestIntent: projection == last_desired;
             invariant QueueBounded: queue_count <= 2;
-            invariant CompletionBounded: completed <= issued;
+            // No accounting law `completed <= issued`: `Complete` needs an
+            // in-flight write, and the shipping origin moves into its worker job
+            // and back, so one request cannot complete twice — the type rules it
+            // out. `IssuedBounded` and that guard bound `completed` too.
             invariant IssuedBounded: issued <= MaxIssued;
             invariant ValuesBoolean:
                 live <= 1 && service <= 1 && projection <= 1 && current_desired <= 1 &&
@@ -2116,7 +2187,10 @@ pub fn serious_mode_intent_queue_model() -> Model {
 /// fails enters an explicit reconcile-required phase and may not retry against its
 /// old baseline. `Buggy=1` admits blind second winners, split-target/changed-link
 /// writes, delayed Manual synchronization, and blind retry after indeterminate
-/// publication.
+/// publication. It also books Manual's published-but-unverified save as
+/// committed — `SaveReducer` folding `PublishedUnverified { observed: Some(_) }`
+/// into its success arm, adopting the visible bytes as a durable baseline the
+/// failed directory sync never proved (`IndeterminateDoesNotClaimDurability`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn config_file_commit_cas_model() -> Model {
@@ -2274,6 +2348,7 @@ pub fn config_file_commit_cas_model() -> Model {
                 disk = 1;
                 manual_phase = 5;
                 manual_indeterminate = 1;
+                manual_committed = if Buggy == 1 { 1 } else { manual_committed };
                 lock_owner = 0;
             }
             action ResolveSettingsIndeterminate when (
@@ -2327,8 +2402,9 @@ pub fn config_file_commit_cas_model() -> Model {
                     } else { manual_indeterminate + settings_indeterminate == 0 }
                 };
             invariant ReconcileBeforeRetry: blind_retry == 0;
-            invariant OneSerializedCommitOwner: lock_owner <= 2;
+            // One commit owner is the type: `lock_owner` is a single variable.
             invariant Bounded:
+                lock_owner <= 2 &&
                 disk <= 2 && service <= 2 && target <= 1 && link <= 1 &&
                 manual_phase <= 5 && settings_phase <= 5 &&
                 manual_link <= 1 && settings_link <= 1 &&
@@ -2346,7 +2422,12 @@ pub fn config_file_commit_cas_model() -> Model {
 /// the live host, and capture may observe a generation only after every
 /// payload reaches it. Explicit mutant actions
 /// independently retain each stale asset generation, proving no member is
-/// accidentally protected only by another.
+/// accidentally protected only by another. One more, `PublishLiveUnadmitted`,
+/// installs a worker-prepared generation on the live host before the service
+/// admits it — `finish_native_config_write` scheduling its runtime observation
+/// ahead of `synchronize_prepared_observation` instead of on its `Ok` arm — so
+/// when admission fails the host runs a config the service never published
+/// (`ViewsNeverAhead`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn config_catalog_snapshot_model() -> Model {
@@ -2446,6 +2527,11 @@ pub fn config_catalog_snapshot_model() -> Model {
                 sparkle_generation = sparkle_generation;
                 asset_refresh = 0;
             }
+            action PublishLiveUnadmitted when (
+                Buggy == 1 && revision <= MaxRevision - 1
+            ) {
+                live_generation = revision + 1;
+            }
             action PublishOne when (
                 text_generation == revision && trail_generation == revision &&
                 kitty_generation == revision && theme_generation == revision &&
@@ -2481,27 +2567,9 @@ pub fn config_catalog_snapshot_model() -> Model {
             invariant ViewsNeverAhead:
                 view_one_generation <= revision && view_two_generation <= revision &&
                 live_generation <= revision && capture_generation <= revision;
-            invariant ConsumersUseCompleteSnapshot:
-                view_one_generation <= text_generation &&
-                view_one_generation <= trail_generation &&
-                view_one_generation <= kitty_generation &&
-                view_one_generation <= theme_generation &&
-                view_one_generation <= sparkle_generation &&
-                view_two_generation <= text_generation &&
-                view_two_generation <= trail_generation &&
-                view_two_generation <= kitty_generation &&
-                view_two_generation <= theme_generation &&
-                view_two_generation <= sparkle_generation &&
-                live_generation <= text_generation &&
-                live_generation <= trail_generation &&
-                live_generation <= kitty_generation &&
-                live_generation <= theme_generation &&
-                live_generation <= sparkle_generation &&
-                capture_generation <= text_generation &&
-                capture_generation <= trail_generation &&
-                capture_generation <= kitty_generation &&
-                capture_generation <= theme_generation &&
-                capture_generation <= sparkle_generation;
+            // Consumers receive the one immutable snapshot `Arc` — text and every
+            // asset together — so a consumer's generation is complete whenever the
+            // snapshot is (`SnapshotAtomic`) and not ahead of it (`ViewsNeverAhead`).
             invariant RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;
         }
     }
@@ -2601,8 +2669,12 @@ pub fn composite_accessibility_route_model() -> Model {
 /// Two controllers share one document sequence. A clean transaction advances
 /// canonical text, immutable snapshot, both view observations, and the selection
 /// anchor version in one transition. Concurrent publication makes an older base
-/// stale; rejecting it is a no-op. The mutants accept the stale base or publish
-/// only to the editor controller.
+/// stale; rejecting it is a no-op. The mutants accept the stale base, or publish a
+/// commit only to its author: the shared snapshot — the immutable projection
+/// cache `DocumentStore::transact` republishes beside the Surface commit since
+/// 3a30b2ed6 split the two — stays at the old text, and the other controller
+/// misses it: Markdown its observed sequence, the Editor its observed sequence and
+/// the rebase of its selection anchor through the commit's deltas.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_document_publication_model() -> Model {
@@ -2623,12 +2695,15 @@ pub fn native_document_publication_model() -> Model {
                 txn_active = 1;
                 txn_base = edit_seq;
             }
+            // The other controller's commit. Buggy publishes it only to its
+            // author, as `CommitClean` does in the other direction.
             action OtherCommit when (edit_seq <= MaxSeq - 1) {
                 edit_seq = edit_seq + 1;
-                snapshot_seq = snapshot_seq + 1;
-                editor_seen = editor_seen + 1;
+                snapshot_seq = if Buggy == 1 { snapshot_seq } else { snapshot_seq + 1 };
+                editor_seen = if Buggy == 1 { editor_seen } else { editor_seen + 1 };
                 markdown_seen = markdown_seen + 1;
-                anchor_seq = anchor_seq + 1;
+                anchor_seq = if Buggy == 1 { anchor_seq } else { anchor_seq + 1 };
+                partial_publish = if Buggy == 1 { 1 } else { partial_publish };
             }
             action CommitClean when (
                 txn_active == 1 && txn_base <= edit_seq &&
@@ -2636,7 +2711,11 @@ pub fn native_document_publication_model() -> Model {
                 edit_seq <= MaxSeq - 1
             ) {
                 edit_seq = edit_seq + 1;
-                snapshot_seq = snapshot_seq + 1;
+                snapshot_seq = if Buggy == 1 && txn_base == edit_seq {
+                    snapshot_seq
+                } else {
+                    snapshot_seq + 1
+                };
                 editor_seen = editor_seen + 1;
                 markdown_seen = if Buggy == 1 && txn_base == edit_seq {
                     markdown_seen
@@ -2993,8 +3072,17 @@ pub fn native_draft_journal_model() -> Model {
 /// Durable restore-manifest publication and single-use consumption. Writers
 /// serialize a unique temporary publication under the same process-shared lock
 /// used by takers. A taker atomically claims the visible name, synchronizes that
-/// removal, and only then may return a manifest. The mutant returns before the
-/// claim is durable or reuses a fixed temporary alias.
+/// removal, and only then may return a manifest.
+///
+/// Every mutant is its own action, dead at `Buggy = 0`, so the strict-vacuity
+/// audit credits each as an independently caught negative control: a taker
+/// returns before its claim is durable (`ReturnUnsynced`); a writer reuses the
+/// fixed temporary alias (`ReuseFixedTemporary`); and a taker takes the way
+/// `take_from` did before 3473ced57 (`HistoricalTakeA`, `HistoricalTakeB`) —
+/// with no lock, read the manifest, then remove it and return what it read.
+/// Between a taker's read and its remove the name is still visible
+/// (`ClaimRemovesVisibleName`), and a second taker that reads in that window
+/// returns the same manifest (`AtMostOneConsumer`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn restore_manifest_single_use_model() -> Model {
@@ -3011,6 +3099,10 @@ pub fn restore_manifest_single_use_model() -> Model {
             var unique_temporary = 0;
             var unsafe_return = 0;
             var fixed_alias_corrupted = 0;
+            // Each historical taker's progress: 0 idle, 1 read with the name
+            // still visible, 2 removed and returned. Always 0 when healthy.
+            var historical_a = 0;
+            var historical_b = 0;
 
             action LockTakeA when (lock_owner == 0) {
                 lock_owner = 1;
@@ -3018,6 +3110,7 @@ pub fn restore_manifest_single_use_model() -> Model {
             action LockTakeB when (lock_owner == 0) {
                 lock_owner = 2;
             }
+            // The claim is one `rename` off the public name.
             action ClaimA when (lock_owner == 1 && visible == 1) {
                 visible = 0;
                 claim_owner = 1;
@@ -3030,23 +3123,30 @@ pub fn restore_manifest_single_use_model() -> Model {
                 claim_synced = 1;
             }
             action ReturnA when (
-                lock_owner == 1 && claim_owner == 1 &&
-                (claim_synced == 1 || Buggy == 1)
+                lock_owner == 1 && claim_owner == 1 && claim_synced == 1
             ) {
                 returned = returned + 1;
-                unsafe_return = if claim_synced == 0 { 1 } else { unsafe_return };
                 claim_owner = 0;
                 claim_synced = 0;
                 lock_owner = 0;
             }
             action ReturnB when (
-                lock_owner == 2 && claim_owner == 2 &&
-                (claim_synced == 1 || Buggy == 1)
+                lock_owner == 2 && claim_owner == 2 && claim_synced == 1
             ) {
                 returned = returned + 1;
-                unsafe_return = if claim_synced == 0 { 1 } else { unsafe_return };
                 claim_owner = 0;
                 claim_synced = 0;
+                lock_owner = 0;
+            }
+            // Mutant: the claimant returns before the directory sync has made
+            // the claim's removal durable.
+            action ReturnUnsynced when (
+                Buggy == 1 && claim_owner > 0 && lock_owner == claim_owner &&
+                claim_synced == 0
+            ) {
+                returned = returned + 1;
+                unsafe_return = 1;
+                claim_owner = 0;
                 lock_owner = 0;
             }
             action ObserveAbsentA when (
@@ -3074,23 +3174,43 @@ pub fn restore_manifest_single_use_model() -> Model {
                 unique_temporary = 0;
                 lock_owner = 0;
             }
-            // A fixed-alias attempt is an explicit rejected input in the safe
-            // machine. Keeping the rejection reachable makes strict vacuity
-            // distinguish this mutation from the independent early-return
-            // mutation that shares the model's Buggy switch.
-            action ReuseFixedTemporary when (lock_owner == 3) {
-                fixed_alias_corrupted =
-                    if Buggy == 1 { 1 } else { fixed_alias_corrupted };
+            // Mutant: the writer publishes through the fixed `toml.tmp` alias
+            // the pre-3473ced57 `write_to` used.
+            action ReuseFixedTemporary when (Buggy == 1 && lock_owner == 3) {
+                fixed_alias_corrupted = 1;
+            }
+            // Mutant: the pre-3473ced57 take, one action per taker, each firing
+            // its next step — `read_to_string(path)` with no lock held, then
+            // `remove_file(path)` (its failure ignored) and return what was read.
+            action HistoricalTakeA when (
+                Buggy == 1 &&
+                ((historical_a == 0 && visible == 1) || historical_a == 1)
+            ) {
+                historical_a = historical_a + 1;
+                visible = if historical_a == 1 { 0 } else { visible };
+                returned = if historical_a == 1 { returned + 1 } else { returned };
+            }
+            action HistoricalTakeB when (
+                Buggy == 1 &&
+                ((historical_b == 0 && visible == 1) || historical_b == 1)
+            ) {
+                historical_b = historical_b + 1;
+                visible = if historical_b == 1 { 0 } else { visible };
+                returned = if historical_b == 1 { returned + 1 } else { returned };
             }
 
             invariant AtMostOneConsumer: returned <= 1;
             invariant ReturnOnlyAfterDurableClaim: unsafe_return == 0;
             invariant ClaimRemovesVisibleName:
-                if claim_owner > 0 { visible == 0 } else { visible <= 1 };
+                if claim_owner > 0 || historical_a == 1 || historical_b == 1 {
+                    visible == 0
+                } else {
+                    visible <= 1
+                };
             invariant UniqueTemporaryNeverAliases: fixed_alias_corrupted == 0;
             invariant OwnerBounded: lock_owner <= 3 && claim_owner <= 2;
             invariant FlagsBounded:
-                visible <= 1 && claim_synced <= 1 && returned <= 1 &&
+                visible <= 1 && claim_synced <= 1 &&
                 unique_temporary <= 1 && unsafe_return <= 1 &&
                 fixed_alias_corrupted <= 1;
         }
@@ -3100,7 +3220,18 @@ pub fn restore_manifest_single_use_model() -> Model {
 /// Atomic close planning freezes the final document sequence, waits for a
 /// durable acknowledgement and every leaf's readiness, and only then detaches
 /// the tree. Failure leaves every leaf attached and Retry requires a later real
-/// acknowledgement. The mutant detaches one leaf before the plan is ready.
+/// acknowledgement. `Buggy = 1` carries one slip per law: a leaf detaches before
+/// the plan is ready (`AtomicTreeClose`); `transact` admits an edit while the
+/// document is Closing, moving the head past the frozen request
+/// (`FrozenFinalSequence`); and the acknowledgement of an OLDER save — a
+/// generation already in flight when the close froze its sequence — is read as
+/// covering the request, so the plan closes below it (`NoSilentLoss`).
+///
+/// `FrozenFinalSequence` follows from `Edit`'s `phase == 0` guard, and stays: that
+/// guard is a check the shipping code makes (`transact` refuses a Closing
+/// document with `DocumentError::Closing`), its mutant drops the check, and a
+/// real-store control drives the refusal. A law that restates a captured copy or
+/// a variable only the law reads has no such check behind it and is not kept.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_close_plan_model() -> Model {
@@ -3118,7 +3249,9 @@ pub fn native_close_plan_model() -> Model {
             var document_ready = 0;
             var other_leaf_ready = 0;
             var any_leaf_detached = 0;
-            action Edit when (phase == 0 && edit_seq <= MaxSeq - 1) {
+            action Edit when (
+                (phase == 0 || (Buggy == 1 && phase == 1)) && edit_seq <= MaxSeq - 1
+            ) {
                 edit_seq = edit_seq + 1;
             }
             action CloseMarkdownNonFinal when (
@@ -3145,7 +3278,7 @@ pub fn native_close_plan_model() -> Model {
             action AckCheckpoint when (
                 phase == 1 && document_ready == 0
             ) {
-                checkpoint_seq = requested_seq;
+                checkpoint_seq = if Buggy == 1 { checkpoint_seq } else { requested_seq };
                 document_ready = 1;
             }
             action FailCheckpoint when (
@@ -3179,12 +3312,9 @@ pub fn native_close_plan_model() -> Model {
                 };
             invariant FrozenFinalSequence:
                 if phase == 0 { edit_seq <= MaxSeq } else { requested_seq == edit_seq };
-            invariant ClosedHasNoViews:
-                if phase == 3 {
-                    markdown_views + editor_views == 0
-                } else {
-                    edit_seq <= MaxSeq
-                };
+            // Closed has no views by construction: the store derives `Suspended`
+            // from an empty view map (`commit_detach`), and `CommitClose` empties
+            // both counts in the transition that closes.
             invariant SequenceBounded: edit_seq <= MaxSeq;
         }
     }
@@ -3196,6 +3326,17 @@ pub fn native_close_plan_model() -> Model {
 /// requested sequence is durable. A close may commit only after its frozen
 /// sequence is covered. The mutant drops the latch at the first completion,
 /// reproducing both a false "Saved" publication and a wedged close/Quit plan.
+/// It also commits a close the moment it is armed, without waiting for the
+/// checkpoint to cover the frozen sequence — the check
+/// `document_close_plan_ready` makes through `DocumentStore::prepare_close`, the
+/// class of d74148b8a, where a window close detached a document no checkpoint
+/// had covered (`ClosedSequenceIsDurable`).
+///
+/// No law says `durable`, `target` or `requested` is never ahead of `head`: each
+/// is a captured past head (an acknowledged plan, a plan's snapshot seq,
+/// `PendingDocumentSaveIntent::seq`), so nothing in the design produces a future
+/// one, and `DocumentStore::checkpoint_ack` refuses an ack past head anyway
+/// (pinned by its own unit test).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_save_intent_latch_model() -> Model {
@@ -3276,7 +3417,8 @@ pub fn native_save_intent_latch_model() -> Model {
                 settled = 1;
             }
             action CommitClose when (
-                close_waiting == 1 && inflight == 0 && close_seq <= durable
+                close_waiting == 1 &&
+                (Buggy == 1 || (inflight == 0 && close_seq <= durable))
             ) {
                 close_waiting = 0;
                 closed = 1;
@@ -3287,20 +3429,29 @@ pub fn native_save_intent_latch_model() -> Model {
                 if close_waiting == 1 && inflight == 0 { close_seq <= durable }
                 else { close_seq <= head };
             invariant ClosedSequenceIsDurable:
-                if closed == 1 { close_seq <= durable } else { durable <= head };
-            invariant DurableNotFuture: durable <= head;
-            invariant TargetNotFuture: target <= head;
-            invariant RequestedNotFuture: requested <= head;
+                if closed == 1 { close_seq <= durable } else { head <= MaxSeq };
             invariant SequenceBounded: head <= MaxSeq;
         }
     }
 }
 
 /// Async work is routed by owner identity and generation, not current focus or
-/// operation number. Replacing an owner makes its token stale; a service result
-/// survives requester-view navigation. Document completion reduces once and is
-/// published to both current controllers. Mutants focus-route a completion or
-/// cancel service-owned work with its initiating view.
+/// operation number. Replacing the owning view makes its token stale; a service
+/// result survives requester-view navigation, and a reply is reduced at most once
+/// (`ReducedAtMostOnce`). Each mutant is its own action, dead at `Buggy = 0`, so
+/// the strict-vacuity audit credits each as an independently caught negative
+/// control: a stale view reply is delivered to whatever view now holds focus
+/// (`DeliverStaleView`); navigating away cancels service-owned work with its
+/// initiating view (`NavigateCancelsService`); and a reply its first delivery
+/// consumed is reduced again (`RedeliverView`) — `SettingsApp::finish_external`
+/// without its `pending.remove` guard, which lets a second `ExternalOpenFinished`
+/// for the same operation overwrite the feedback the first one set.
+///
+/// The two owners here are the two the shipping runtime mints: a view's
+/// external-open reply and the config service's patch. The instance- and
+/// document-owned kinds (and a service restart) had no shipping producer and
+/// were retired 2026-09-25, rather than kept as test-only router arms for this
+/// model to bind.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_async_delivery_model() -> Model {
@@ -3308,21 +3459,17 @@ pub fn native_async_delivery_model() -> Model {
         NativeAsyncDelivery {
             const Buggy = 0;
             const MaxGeneration = 3;
-            const MaxAccepted = 4;
-            // owner/sink: 0 None, 1 View, 2 Instance, 3 Document, 4 Service.
+            // owner/sink: 0 None, 1 View, 4 Service (2 and 3 were the retired
+            // Instance and Document kinds). The service generation never moves
+            // in a shipping process, so a service token carries generation 1.
             var owner = 0;
             var sink = 0;
             var token_generation = 0;
             var pending = 0;
             var view_generation = 1;
-            var instance_generation = 1;
-            var document_generation = 1;
-            var service_generation = 1;
-            var accepted = 0;
-            var state_updates = 0;
-            var document_reductions = 0;
-            var editor_publications = 0;
-            var markdown_publications = 0;
+            // How many times the latest issued operation's reply has been
+            // reduced: the view's feedback, or the service's revision, changed.
+            var reduced = 0;
             var wrong_delivery = 0;
             var service_dropped_with_view = 0;
             action IssueView when (pending == 0) {
@@ -3330,138 +3477,65 @@ pub fn native_async_delivery_model() -> Model {
                 sink = 1;
                 token_generation = view_generation;
                 pending = 1;
-            }
-            action IssueInstance when (pending == 0) {
-                owner = 2;
-                sink = 2;
-                token_generation = instance_generation;
-                pending = 1;
-            }
-            action IssueDocument when (pending == 0) {
-                owner = 3;
-                sink = 3;
-                token_generation = document_generation;
-                pending = 1;
+                reduced = 0;
             }
             action IssueService when (pending == 0) {
                 owner = 4;
                 sink = 4;
-                token_generation = service_generation;
+                token_generation = 1;
                 pending = 1;
+                reduced = 0;
             }
             action NavigateView when (view_generation <= MaxGeneration - 1) {
                 view_generation = view_generation + 1;
-                pending = if Buggy == 1 && pending == 1 && owner == 4 {
-                    0
-                } else {
-                    pending
-                };
-                service_dropped_with_view =
-                    if Buggy == 1 && pending == 1 && owner == 4 {
-                        1
-                    } else {
-                        service_dropped_with_view
-                    };
             }
-            action ReplaceInstance when (
-                instance_generation <= MaxGeneration - 1
+            action NavigateCancelsService when (
+                Buggy == 1 && view_generation <= MaxGeneration - 1 &&
+                pending == 1 && owner == 4
             ) {
-                instance_generation = instance_generation + 1;
-            }
-            action ReplaceDocument when (
-                document_generation <= MaxGeneration - 1
-            ) {
-                document_generation = document_generation + 1;
-            }
-            action RestartService when (
-                service_generation <= MaxGeneration - 1
-            ) {
-                service_generation = service_generation + 1;
+                view_generation = view_generation + 1;
+                pending = 0;
+                service_dropped_with_view = 1;
             }
             action CompleteView when (
                 pending == 1 && owner == 1 && sink == 1 &&
-                token_generation == view_generation &&
-                accepted <= MaxAccepted - 1
+                token_generation == view_generation
             ) {
                 pending = 0;
-                accepted = accepted + 1;
-                state_updates = state_updates + 1;
-            }
-            action CompleteInstance when (
-                pending == 1 && owner == 2 && sink == 2 &&
-                token_generation == instance_generation &&
-                accepted <= MaxAccepted - 1
-            ) {
-                pending = 0;
-                accepted = accepted + 1;
-                state_updates = state_updates + 1;
-            }
-            action CompleteDocument when (
-                pending == 1 && owner == 3 && sink == 3 &&
-                token_generation == document_generation &&
-                accepted <= MaxAccepted - 1
-            ) {
-                pending = 0;
-                accepted = accepted + 1;
-                state_updates = state_updates + 1;
-                document_reductions = document_reductions + 1;
-                editor_publications = editor_publications + 1;
-                markdown_publications = markdown_publications + 1;
+                reduced = reduced + 1;
             }
             action CompleteService when (
-                pending == 1 && owner == 4 && sink == 4 &&
-                token_generation == service_generation &&
-                accepted <= MaxAccepted - 1
+                pending == 1 && owner == 4 && sink == 4
             ) {
                 pending = 0;
-                accepted = accepted + 1;
-                state_updates = state_updates + 1;
+                reduced = reduced + 1;
             }
             action DropStaleView when (
                 pending == 1 && owner == 1 &&
-                view_generation > token_generation &&
-                accepted <= if Buggy == 1 { MaxAccepted - 1 } else { MaxAccepted }
-            ) {
-                pending = 0;
-                accepted = if Buggy == 1 { accepted + 1 } else { accepted };
-                state_updates = if Buggy == 1 {
-                    state_updates + 1
-                } else {
-                    state_updates
-                };
-                wrong_delivery = if Buggy == 1 { 1 } else { wrong_delivery };
-            }
-            action DropStaleInstance when (
-                pending == 1 && owner == 2 &&
-                instance_generation > token_generation
+                view_generation > token_generation
             ) {
                 pending = 0;
             }
-            action DropStaleDocument when (
-                pending == 1 && owner == 3 &&
-                document_generation > token_generation
+            action DeliverStaleView when (
+                Buggy == 1 && pending == 1 && owner == 1 &&
+                view_generation > token_generation
             ) {
                 pending = 0;
+                reduced = reduced + 1;
+                wrong_delivery = 1;
             }
-            action DropStaleService when (
-                pending == 1 && owner == 4 &&
-                service_generation > token_generation
+            // A second delivery of a view reply its first delivery consumed. The
+            // healthy reducer finds no pending operation and changes nothing, so
+            // the healthy model has no such step; the mutant reduces it again.
+            action RedeliverView when (
+                Buggy == 1 && pending == 0 && owner == 1 && reduced == 1
             ) {
-                pending = 0;
+                reduced = reduced + 1;
             }
             invariant IdentityAndGenerationChecked: wrong_delivery == 0;
             invariant ServiceOutlivesRequester: service_dropped_with_view == 0;
-            invariant AcceptedReducedOnce: accepted == state_updates;
-            invariant DocumentPublishedToEditor:
-                document_reductions == editor_publications;
-            invariant DocumentPublishedToMarkdown:
-                document_reductions == markdown_publications;
-            invariant GenerationsBounded:
-                view_generation <= MaxGeneration &&
-                instance_generation <= MaxGeneration &&
-                document_generation <= MaxGeneration &&
-                service_generation <= MaxGeneration;
-            invariant AcceptedBounded: accepted <= MaxAccepted;
+            invariant ReducedAtMostOnce: reduced <= 1;
+            invariant GenerationsBounded: view_generation <= MaxGeneration;
         }
     }
 }

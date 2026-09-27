@@ -500,8 +500,8 @@ struct Landing<'a> {
 /// tree with the same ledger line and the shipped notes moved out of
 /// `[Unreleased]`, and two parents — the tip, so the push fast-forwards it, and
 /// the release commit, so main's history records exactly which commit shipped.
-/// Against the tip it moves only `CHANGELOG.md` and `RELEASES.ledger`: the shape
-/// `.githooks/pre-push` admits as a release claim.
+/// Against the tip it moves only `CHANGELOG.md` and `RELEASES.ledger`: bookkeeping,
+/// no code, so main gains nothing the published commit's own gating did not see.
 ///
 /// Built from blobs and a scratch index: the two files are hashed out of the
 /// worktree and restored, the index is loaded with the tip's tree, the two blobs

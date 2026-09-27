@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 /// Where vendored machine-local shared libraries are copied, relative to the
@@ -86,9 +87,6 @@ pub trait Backend {
     /// arm64; Linux: no-op). `sign_id` = Developer-ID identity or ad-hoc when
     /// `None`.
     fn resign(&self, path: &Path, sign_id: Option<&str>) -> Result<(), String>;
-    /// How this object references a vendored dependency by basename in its
-    /// `needed` list (Mach-O: `@rpath/<base>`; ELF: the bare `<base>` soname).
-    fn portable_dep_ref(&self, basename: &str) -> String;
     /// The relative-origin token for this platform (`@loader_path` / `$ORIGIN`).
     fn origin_token(&self) -> &'static str;
 }
@@ -528,6 +526,7 @@ pub fn magic4(path: &Path) -> Option<[u8; 4]> {
     Some(m)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(tool: &str, args: &[&str], file: &Path) -> Result<std::process::Output, String> {
     Command::new(tool)
         .args(args)
@@ -541,8 +540,10 @@ fn run(tool: &str, args: &[&str], file: &Path) -> Result<std::process::Output, S
 // `trust-mc-compiler --version` runs with HOME hidden).
 // ---------------------------------------------------------------------------
 pub mod macho {
+    #[cfg(any(target_os = "macos", test))]
     use super::*;
 
+    #[cfg(target_os = "macos")]
     pub struct MachoBackend;
 
     /// Mach-O magic (thin arm64/x86_64 little-endian + universal).
@@ -557,6 +558,7 @@ pub mod macho {
     }
 
     /// Pure parser over `otool -l <file>` output.
+    #[cfg(any(target_os = "macos", test))]
     pub fn parse_otool(otool_l: &str) -> ObjectRefs {
         let mut r = ObjectRefs::default();
         let mut section: Option<&str> = None;
@@ -596,10 +598,12 @@ pub mod macho {
         r
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn strip_offset(s: &str) -> String {
         s.split(" (offset").next().unwrap_or(s).trim().to_string()
     }
 
+    #[cfg(target_os = "macos")]
     fn install_name_tool(args: &[&str], file: &Path) -> Result<(), String> {
         let out = run("/usr/bin/install_name_tool", args, file)?;
         if out.status.success() {
@@ -614,6 +618,7 @@ pub mod macho {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Backend for MachoBackend {
         fn is_native_object(&self, path: &Path) -> bool {
             magic4(path).is_some_and(|m| is_macho_magic(&m))
@@ -693,9 +698,6 @@ pub mod macho {
                 ))
             }
         }
-        fn portable_dep_ref(&self, basename: &str) -> String {
-            format!("@rpath/{basename}")
-        }
         fn origin_token(&self) -> &'static str {
             "@loader_path"
         }
@@ -708,8 +710,10 @@ pub mod macho {
 // needs a Linux validation run with `patchelf` present).
 // ---------------------------------------------------------------------------
 pub mod elf {
+    #[cfg(any(target_os = "linux", test))]
     use super::*;
 
+    #[cfg(target_os = "linux")]
     pub struct ElfBackend;
 
     /// ELF magic (`\x7fELF`).
@@ -718,6 +722,7 @@ pub mod elf {
     }
 
     /// Split a `patchelf --print-rpath` value (`:`-separated) into entries.
+    #[cfg(any(target_os = "linux", test))]
     pub fn parse_rpath(value: &str) -> Vec<String> {
         value
             .split(':')
@@ -728,6 +733,7 @@ pub mod elf {
     }
 
     /// Parse `patchelf --print-needed` (one soname per line).
+    #[cfg(any(target_os = "linux", test))]
     pub fn parse_needed(text: &str) -> Vec<String> {
         text.lines()
             .map(str::trim)
@@ -739,6 +745,7 @@ pub mod elf {
     /// The `patchelf --set-rpath` value making an object search the vendored dir
     /// (relative, `$ORIGIN`-based) plus any portable rpaths it already had —
     /// machine-local entries dropped. Deterministic order, deduped.
+    #[cfg(any(target_os = "linux", test))]
     pub fn combined_rpath(rel_origin: &str, keep: &[String]) -> String {
         let mut out: Vec<String> = vec![rel_origin.to_string()];
         for k in keep {
@@ -749,6 +756,7 @@ pub mod elf {
         out.join(":")
     }
 
+    #[cfg(target_os = "linux")]
     fn patchelf(args: &[&str], file: &Path) -> Result<(), String> {
         let out = run("patchelf", args, file)
             .map_err(|e| format!("{e} (install patchelf on the Linux build box)"))?;
@@ -764,6 +772,7 @@ pub mod elf {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn patchelf_out(args: &[&str], file: &Path) -> Result<String, String> {
         let out = run("patchelf", args, file)
             .map_err(|e| format!("{e} (install patchelf on the Linux build box)"))?;
@@ -779,6 +788,7 @@ pub mod elf {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl Backend for ElfBackend {
         fn is_native_object(&self, path: &Path) -> bool {
             magic4(path).is_some_and(|m| is_elf_magic(&m))
@@ -817,9 +827,6 @@ pub mod elf {
         }
         fn resign(&self, _path: &Path, _sign_id: Option<&str>) -> Result<(), String> {
             Ok(()) // ELF has no code signature; the Ed25519 tarball anchor covers integrity
-        }
-        fn portable_dep_ref(&self, basename: &str) -> String {
-            basename.to_string()
         }
         fn origin_token(&self) -> &'static str {
             "$ORIGIN"
@@ -955,10 +962,12 @@ mod tests {
     /// ad-hoc identifier is `<file name>-<uuid>`. Objects are the files starting `OBJ`;
     /// each carries one machine-local rpath and no deps, so every object needs exactly
     /// the rpath rewrite plus a re-sign, and nothing is vendored.
+    #[cfg(unix)]
     struct ReplacingBackend {
         log: std::cell::RefCell<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl ReplacingBackend {
         fn rewrite(&self, path: &Path, what: &str) -> Result<(), String> {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -973,6 +982,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Backend for ReplacingBackend {
         fn is_native_object(&self, path: &Path) -> bool {
             std::fs::read(path).is_ok_and(|b| b.starts_with(b"OBJ"))
@@ -1002,9 +1012,6 @@ mod tests {
         fn resign(&self, path: &Path, _sign_id: Option<&str>) -> Result<(), String> {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
             self.rewrite(path, &format!("sig={}", name.unwrap_or_default()))
-        }
-        fn portable_dep_ref(&self, basename: &str) -> String {
-            format!("@rpath/{basename}")
         }
         fn origin_token(&self) -> &'static str {
             "@loader_path"

@@ -400,6 +400,7 @@ impl DiskColdTier {
 
     /// Get the total compressed size on disk (live pages only).
     #[must_use]
+    #[cfg(test)]
     pub fn compressed_size(&self) -> usize {
         self.live_index()
             .iter()

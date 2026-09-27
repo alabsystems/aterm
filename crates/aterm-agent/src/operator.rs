@@ -710,65 +710,18 @@ impl From<io::Error> for OperatorError {
     }
 }
 
-/// Locate aterm's durable per-user state root.
-///
-/// `ATERM_STATE_HOME` is a test/deployment override. The returned directory is
-/// the aterm root itself; callers append `operator/<fleet-id>`.
+/// Locate aterm's durable per-user state root — the ONE rule
+/// ([`aterm_types::dirs::state_dir`]) the journal and the session identities use
+/// too. The returned directory is the aterm root itself; callers append
+/// `operator/<fleet-id>`.
 pub fn default_state_root() -> Result<PathBuf, OperatorError> {
-    if let Some(root) = std::env::var_os("ATERM_STATE_HOME") {
-        let root = PathBuf::from(root);
-        if !root.is_absolute() {
-            return Err(OperatorError::InvalidInput(
-                "ATERM_STATE_HOME must be absolute".into(),
-            ));
-        }
-        return Ok(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        home_dir()
-            .map(|home| home.join("Library/Application Support/aterm"))
-            .ok_or_else(|| {
-                OperatorError::InvalidInput("HOME is unavailable or not absolute".into())
-            })
-    }
-
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .filter(|root| root.is_absolute())
-            .map(|root| root.join("aterm"))
-            .ok_or_else(|| {
-                OperatorError::InvalidInput("LOCALAPPDATA is unavailable or not absolute".into())
-            })
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(root) = std::env::var_os("XDG_STATE_HOME") {
-            let root = PathBuf::from(root);
-            if !root.is_absolute() {
-                return Err(OperatorError::InvalidInput(
-                    "XDG_STATE_HOME must be absolute".into(),
-                ));
-            }
-            return Ok(root.join("aterm"));
-        }
-        home_dir()
-            .map(|home| home.join(".local/state/aterm"))
-            .ok_or_else(|| {
-                OperatorError::InvalidInput("HOME is unavailable or not absolute".into())
-            })
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        Err(OperatorError::InvalidInput(
-            "this platform has no durable state-directory convention".into(),
-        ))
-    }
+    aterm_types::dirs::state_dir().ok_or_else(|| {
+        OperatorError::InvalidInput(
+            "no durable state root resolves (HOME, XDG_STATE_HOME or LOCALAPPDATA is \
+             unavailable or not absolute)"
+                .into(),
+        )
+    })
 }
 
 /// Resolve and create the private directory for one fleet.
@@ -827,20 +780,6 @@ fn ensure_shared_root(root: &Path) -> Result<(), OperatorError> {
         }
         Err(error) => Err(OperatorError::Io(error)),
     }
-}
-
-#[cfg(unix)]
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-}
-
-#[cfg(windows)]
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
 }
 
 fn validate_fleet_id(fleet_id: &str) -> Result<(), OperatorError> {
@@ -990,6 +929,8 @@ fn harden_new_directory(path: &Path) -> Result<(), OperatorError> {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -4571,12 +4512,6 @@ impl DurableQueue {
         }
     }
 
-    /// Directory containing the private lock and WAL files.
-    #[must_use]
-    pub fn directory(&self) -> &Path {
-        &self.shared.directory
-    }
-
     /// Recovery facts from this handle's open operation.
     #[must_use]
     pub fn recovery_report(&self) -> RecoveryReport {
@@ -5664,11 +5599,6 @@ impl DurableQueue {
             .filter(|event| matches!(event.status, StoredStatus::Queued))
             .count())
     }
-
-    /// Whether no unresolved event remains.
-    pub fn is_empty(&self) -> Result<bool, OperatorError> {
-        Ok(self.unresolved_len()? == 0)
-    }
 }
 
 fn status_claim_error(event_id: EventId, status: &StoredStatus) -> OperatorError {
@@ -6327,6 +6257,21 @@ mod tests {
         ));
     }
 
+    /// The marker is written while another thread HOLDS the live-state mutex,
+    /// and the lock is let go only after the writer reports: a writer that
+    /// finishes at all proves it never waited on that mutex, and the pass
+    /// ends at that completion, not on a clock.
+    ///
+    /// THE BOUND IS A HANG DETECTOR, NOT A LATENCY CLAIM (2026-09-25). The
+    /// write is a create, a truncating write and two `sync_all`s (file, then
+    /// directory), which on macOS are `F_FULLFSYNC` drive-cache flushes. The
+    /// same call measured 2.9-5.2 s on a contended disk in aterm-gui's
+    /// shutdown-timeout test (72cbf0601), and here it also runs beside this
+    /// module's durable-queue tests flushing their WALs in parallel, so the
+    /// old 2 s bound could fail a correct product. No observable tells a
+    /// writer parked on the mutex from one parked in the flush, so the bound
+    /// can only name the deadlock a regression makes; 60 s names it as surely
+    /// as 2 s did, and a pass never waits for it.
     #[test]
     fn operator_fault_marker_bypasses_held_live_mutex() {
         let directory = TestDir::new("fault-marker-with-held-live");
@@ -6343,7 +6288,7 @@ mod tests {
                 writer_queue.latch_fault_marker_without_live(FleetFaultReason::ObserverPanicked);
             let _ = tx.send(result);
         });
-        let result = rx.recv_timeout(Duration::from_secs(2));
+        let result = rx.recv_timeout(Duration::from_secs(60));
         drop(held);
         writer.join().unwrap();
         assert_eq!(
@@ -7494,5 +7439,227 @@ mod tests {
         );
         assert!(!root.join("operator").exists());
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A slipped API arm is not the last check between a call and a durable
+    /// record: `commit_record` applies every record to a clone first, and each
+    /// apply re-checks the status it transitions from. The `OperatorWalActuator`
+    /// and `OperatorFleetFault` models fold those checks into one guard with the
+    /// API's (their docs say so); these tests commit the record a slipped arm
+    /// would commit and pin the check behind it.
+    mod wal_apply_backstops {
+        use super::*;
+
+        struct InFlight {
+            directory: TestDir,
+            queue: DurableQueue,
+            id: EventId,
+            token: ClaimToken,
+            hash: String,
+        }
+
+        fn in_flight(label: &str) -> InFlight {
+            let directory = TestDir::new(label);
+            let queue = DurableQueue::open(&directory.0, 1, fast_config()).unwrap();
+            queue.manage_sid("a").unwrap();
+            let id = enqueued_id(
+                queue
+                    .enqueue(event("a", 1, AttentionCondition::Ready))
+                    .unwrap(),
+            );
+            let claim = queue.claim_at(1).unwrap().unwrap();
+            let hash = "ab".repeat(32);
+            queue
+                .begin_action_at(id, &claim.token, "turn", &hash, 2)
+                .unwrap();
+            InFlight {
+                directory,
+                queue,
+                id,
+                token: claim.token,
+                hash,
+            }
+        }
+
+        /// Commit `record` straight through `commit_record`, as an API arm that
+        /// skipped its own status check would.
+        fn commit_past_the_api(
+            queue: &DurableQueue,
+            record: &WalRecord,
+        ) -> Result<(), OperatorError> {
+            let mut live = queue
+                .shared
+                .live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            commit_record(&mut live, &queue.shared.config, record)
+        }
+
+        fn refused_by_apply(result: &Result<(), OperatorError>, why: &str) -> bool {
+            matches!(result, Err(OperatorError::InvariantViolation(found)) if found.contains(why))
+        }
+
+        /// `ack_at` refuses an in-flight action. Without that arm the `Resolve`
+        /// record still needs a `Delivered` event, so the action stays in flight
+        /// with the handle usable, and replay recovers it in-doubt, never
+        /// resolved (`ResolutionHasDurableOutcome`).
+        #[test]
+        fn resolve_refuses_an_in_flight_action() {
+            let run = in_flight("backstop-resolve");
+            let refused = commit_past_the_api(
+                &run.queue,
+                &WalRecord::Resolve {
+                    event_id: run.id,
+                    token: run.token.clone(),
+                    resolution: Resolution::NoAction,
+                    resolved_at_ms: 3,
+                },
+            );
+            assert!(
+                refused_by_apply(&refused, "is not delivered"),
+                "{refused:?}"
+            );
+            assert!(matches!(
+                run.queue.status(run.id).unwrap().status,
+                EventStatus::ActionInFlight { .. }
+            ));
+            drop(run.queue);
+            let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
+            assert!(matches!(
+                reopened.status(run.id).unwrap().status,
+                EventStatus::InDoubt { .. }
+            ));
+        }
+
+        /// `mark_action_in_doubt_at` refuses a finished action. Without that arm
+        /// the `MarkActionInDoubt` record still needs an `ActionInFlight` event,
+        /// so the result stays the one durable outcome
+        /// (`DurableOutcomesAreExclusive`).
+        #[test]
+        fn mark_in_doubt_refuses_a_finished_action() {
+            let run = in_flight("backstop-mark-finished");
+            run.queue
+                .finish_action_at(
+                    run.id,
+                    &run.token,
+                    &run.hash,
+                    "settled",
+                    Resolution::Acted,
+                    3,
+                )
+                .unwrap();
+            let refused = commit_past_the_api(
+                &run.queue,
+                &WalRecord::MarkActionInDoubt {
+                    event_id: run.id,
+                    token: run.token.clone(),
+                    reason: "late unknown outcome".into(),
+                    at_ms: 4,
+                },
+            );
+            assert!(
+                refused_by_apply(&refused, "has no action intent"),
+                "{refused:?}"
+            );
+            assert!(matches!(
+                run.queue.status(run.id).unwrap().status,
+                EventStatus::Resolved { .. }
+            ));
+            drop(run.queue);
+            let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
+            assert!(matches!(
+                reopened.status(run.id).unwrap().status,
+                EventStatus::Resolved {
+                    resolution: Resolution::Acted,
+                    ..
+                }
+            ));
+        }
+
+        /// Where the unknown-outcome path really follows a landed `FinishAction`
+        /// frame, the caller saw a write fail after the frame reached the disk:
+        /// memory never moved, so both status checks would pass. The failure
+        /// poisoned the handle, and the poison is what refuses the record; replay
+        /// then recovers the landed result.
+        #[test]
+        fn a_poisoned_handle_cannot_mark_a_landed_result_in_doubt() {
+            let run = in_flight("backstop-mark-landed");
+            let (before, before_len) = {
+                let live = run.queue.lock().unwrap();
+                (live.state.clone(), live.wal_len)
+            };
+            run.queue
+                .finish_action_at(
+                    run.id,
+                    &run.token,
+                    &run.hash,
+                    "settled",
+                    Resolution::Acted,
+                    3,
+                )
+                .unwrap();
+            {
+                // What `commit_record` leaves after a failed `sync_data`: the
+                // frame is on disk, the projection and length never moved.
+                let mut live = run.queue.lock().unwrap();
+                live.state = before;
+                live.wal_len = before_len;
+                live.poisoned = true;
+            }
+            assert!(matches!(
+                run.queue
+                    .mark_action_in_doubt_at(run.id, &run.token, "unknown outcome", 4),
+                Err(OperatorError::WalPoisoned)
+            ));
+            drop(run.queue);
+            let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
+            assert!(matches!(
+                reopened.status(run.id).unwrap().status,
+                EventStatus::Resolved {
+                    resolution: Resolution::Acted,
+                    ..
+                }
+            ));
+        }
+
+        /// `complete_fault_clear_at` scans for in-doubt actions before it
+        /// commits. Without that scan, `QueueState::complete_fault_clear` refuses
+        /// the same clear at apply time: the gate stays `RebaselineRequired` and
+        /// the marker stays, live and after reopen (`ClearCommitHasNoAmbiguity`).
+        #[test]
+        fn complete_fault_clear_refuses_an_in_doubt_action() {
+            let run = in_flight("backstop-clear");
+            run.queue
+                .latch_fault_at(FleetFaultReason::ObserverOverflow, 3)
+                .unwrap();
+            assert_eq!(run.queue.begin_fault_clear_at(4).unwrap(), vec!["a"]);
+            run.queue.unmanage_sid_at("a", 5).unwrap();
+            assert!(matches!(
+                run.queue.fleet_gate().unwrap(),
+                FleetGateStatus::RebaselineRequired { ref pending_sids, .. }
+                    if pending_sids.is_empty()
+            ));
+            assert!(matches!(
+                run.queue.status(run.id).unwrap().status,
+                EventStatus::InDoubt { .. }
+            ));
+            let marker = run.directory.0.join(FAULT_MARKER_NAME);
+
+            let refused =
+                commit_past_the_api(&run.queue, &WalRecord::CompleteFaultClear { at_ms: 6 });
+            assert!(refused_by_apply(&refused, "in-doubt"), "{refused:?}");
+            assert!(matches!(
+                run.queue.fleet_gate().unwrap(),
+                FleetGateStatus::RebaselineRequired { .. }
+            ));
+            assert!(marker.is_file());
+            drop(run.queue);
+            let reopened = DurableQueue::open(&run.directory.0, 2, fast_config()).unwrap();
+            assert!(matches!(
+                reopened.fleet_gate().unwrap(),
+                FleetGateStatus::RebaselineRequired { .. }
+            ));
+            assert!(marker.is_file());
+        }
     }
 }

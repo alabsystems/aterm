@@ -13,19 +13,11 @@
 //!   * the exact encoded string for every input, and
 //!   * the exact accept/reject verdict AND decoded bytes for every input string.
 //!
-//! The URL-safe no-pad engine gets the SAME treatment against
-//! `general_purpose::URL_SAFE_NO_PAD`. It had none at all until this file grew
-//! one, and the decoder behind that name turned out to be the lenient body
-//! wearing a strict name — 12,538 disagreements in 200,000 random candidates,
-//! every one of them ours-accepts / oracle-refuses. An entry point nothing
-//! calls yet is exactly where that goes unnoticed.
-//!
 //! `base64` is a `[dev-dependencies]` entry only: it contributes nothing to any
 //! shipped binary, it exists here to be disagreed with.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as ORACLE;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as URL_ORACLE;
 
 /// Assert both directions agree for one byte string.
 fn agree_encode(raw: &[u8]) {
@@ -53,36 +45,6 @@ fn agree_decode(text: &[u8]) {
         _ => panic!(
             "verdict differs for {:?}: ours={:?} oracle={:?}",
             String::from_utf8_lossy(text),
-            ours.as_ref().map(Vec::len),
-            theirs.as_ref().map(Vec::len),
-        ),
-    }
-}
-
-/// Assert both URL-safe directions agree for one byte string.
-fn agree_encode_url(raw: &[u8]) {
-    let ours = aterm_codec::base64::encode_url_safe_no_pad(raw).expect("encode within limit");
-    let theirs = URL_ORACLE.encode(raw);
-    assert_eq!(
-        ours,
-        theirs,
-        "url-safe encode disagreed for {} bytes",
-        raw.len()
-    );
-    let back = aterm_codec::base64::decode_url_safe_no_pad(&theirs)
-        .expect("oracle output must decode strictly");
-    assert_eq!(back, raw, "url-safe round-trip lost bytes");
-}
-
-/// Assert the URL-safe decoders agree on one candidate string.
-fn agree_decode_url(text: &str) {
-    let ours = aterm_codec::base64::decode_url_safe_no_pad(text);
-    let theirs = URL_ORACLE.decode(text);
-    match (&ours, &theirs) {
-        (Ok(a), Ok(b)) => assert_eq!(a, b, "url-safe decoded bytes differ for {text:?}"),
-        (Err(_), Err(_)) => {}
-        _ => panic!(
-            "url-safe verdict differs for {text:?}: ours={:?} oracle={:?}",
             ours.as_ref().map(Vec::len),
             theirs.as_ref().map(Vec::len),
         ),
@@ -191,65 +153,6 @@ fn non_canonical_spellings_are_refused_exactly_as_the_oracle_refuses_them() {
     for interior in ["Zg==Zg==", "Zm9v=Zm9v"] {
         assert!(ORACLE.decode(interior).is_err());
         assert!(aterm_codec::base64::decode_strict(interior.as_bytes()).is_err());
-    }
-}
-
-/// The URL-safe no-pad engine, held to its own oracle: every short length, the
-/// two alphabet-specific symbols, the pad byte that must NOT be accepted, and
-/// the trailing-bit rejections.
-///
-/// The alphabet here is chosen the same way the standard sweep's is: symbols
-/// whose low bits are zero (`A`, `Q`), symbols whose low bits are not (`h`,
-/// `9`), both URL-safe specials (`-`, `_`), the standard specials that must be
-/// REFUSED here (`+`, `/`), the pad byte, and a byte outside every alphabet.
-#[test]
-fn url_safe_no_pad_matches_its_own_oracle() {
-    for len in 0..=200usize {
-        let raw: Vec<u8> = (0..len)
-            .map(|i| (i.wrapping_mul(53) & 0xFF) as u8)
-            .collect();
-        agree_encode_url(&raw);
-    }
-    const ALPHA: &[u8] = b"AQh9-_+/=!";
-    let mut buf = String::new();
-    for len in 0..=4usize {
-        let total = ALPHA.len().pow(len as u32);
-        for n in 0..total {
-            buf.clear();
-            let mut n = n;
-            for _ in 0..len {
-                buf.push(char::from(ALPHA[n % ALPHA.len()]));
-                n /= ALPHA.len();
-            }
-            agree_decode_url(&buf);
-        }
-    }
-    // The named cases that used to split the two decoders: a trailing-bit
-    // violation, any `=` at all, and a bare pad byte.
-    for text in [
-        "B1", "1b=", "=", "==", "A", "AA", "AB", "AAA", "AAB", "Zg==", "Zg",
-    ] {
-        agree_decode_url(text);
-    }
-    // Randomized, weighted toward nearly-valid input.
-    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state >> 32) as u32
-    };
-    const NEAR: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=+/ ";
-    for _ in 0..200_000 {
-        let len = (next() % 24) as usize;
-        buf.clear();
-        for _ in 0..len {
-            buf.push(char::from(NEAR[(next() as usize) % NEAR.len()]));
-        }
-        agree_decode_url(&buf);
-        let raw_len = (next() % 64) as usize;
-        let raw: Vec<u8> = (0..raw_len).map(|_| (next() & 0xFF) as u8).collect();
-        agree_encode_url(&raw);
     }
 }
 

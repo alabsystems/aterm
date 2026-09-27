@@ -406,9 +406,10 @@ pub fn graph_and_paths(
     parse_tree(&text)
 }
 
-/// The contract signature: just the graph. Any retry note goes to stderr,
-/// because a `Result<Graph, _>` has nowhere else to put it — call
-/// [`graph_and_paths`] when the note must be captured into a report.
+/// Test convenience: just the graph. Any retry note goes to stderr, because a
+/// `Result<Graph, _>` has nowhere else to put it — the product calls
+/// [`graph_and_paths`], which captures the note into its report.
+#[cfg(test)]
 pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
     let mut log = String::new();
     let out = graph_and_paths(root, cell, &mut log);

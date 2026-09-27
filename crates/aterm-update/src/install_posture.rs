@@ -36,21 +36,6 @@ pub enum InstallPosture {
 }
 
 impl InstallPosture {
-    /// Whether this copy can replace itself — the updater's question, answered
-    /// from the same classification the human-facing text uses, so the two can
-    /// never drift into disagreeing about the same install.
-    #[must_use]
-    pub fn can_update(self) -> bool {
-        matches!(self, Self::Installed)
-    }
-
-    /// Whether moving the app to `/Applications` is what fixes it. False for a
-    /// dev build, where nothing is broken and the advice would be wrong.
-    #[must_use]
-    pub fn wants_move_to_applications(self) -> bool {
-        matches!(self, Self::MountedImage | Self::Translocated)
-    }
-
     /// One line naming what is true, in the user's terms rather than the
     /// updater's. No trailing period: callers put this in a sentence.
     #[must_use]
@@ -98,8 +83,7 @@ mod tests {
             (InstallPosture::Translocated, false, true),
             (InstallPosture::NotABundle, false, false),
         ] {
-            assert_eq!(posture.can_update(), can_update);
-            assert_eq!(posture.wants_move_to_applications(), move_app);
+            assert_eq!(posture == InstallPosture::Installed, can_update);
             assert_eq!(posture.remedy().is_some(), move_app);
             assert!(!posture.summary().is_empty());
             assert!(!posture.summary().ends_with('.'));

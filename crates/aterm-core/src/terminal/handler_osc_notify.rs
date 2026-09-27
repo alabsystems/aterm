@@ -10,15 +10,12 @@
 //! - OSC 777: rxvt-unicode `notify` notification
 //!
 //! All three paths are gated by the host's notification authorization
-//! ([`Terminal::authorize_notifications`][an] /
-//! [`Terminal::is_notifications_authorized`][ina], mirrored into
+//! (`TerminalConfig::allow_notifications`, applied by
+//! [`Terminal::apply_config`](super::Terminal::apply_config) into
 //! `modes.allow_notifications`). When the host has not authorized
 //! notifications (the post-#7918 default), the parser path cannot reach a
 //! callback. Wiring a callback alone is insufficient — the host must also
 //! authorize dispatch.
-//!
-//! [an]: super::Terminal::authorize_notifications
-//! [ina]: super::Terminal::is_notifications_authorized
 
 use super::handler::TerminalHandler;
 use aterm_types::osc::{Notification, NotificationUrgency, TaskbarProgress};

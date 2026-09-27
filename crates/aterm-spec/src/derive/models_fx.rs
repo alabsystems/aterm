@@ -415,10 +415,14 @@ pub fn rainbow_idle_twinkle_model() -> Model {
 /// callback-relative implementation: it births reach cells and starts the
 /// retract clock at the observation itself, resurrecting visible motion.
 ///
-/// Tier-1 binding:
-/// `cursor_glow::tests::rainbow_single_late_tick_does_not_resurrect_exit_swoosh`
-/// drives the real animator from a live typing ribbon to one five-second-late
-/// tick and projects its fingerprint and scheduler state onto this model.
+/// Tier-1 binding: aterm-effects'
+/// `rainbow_kitty::tests::a_late_tick_samples_the_settled_exit_swoosh` drives
+/// the real rainbow kitty engine from a live ribbon (a single key, a slow word,
+/// a flow run) through a silence of 5 s, 30 s and 10 min to ONE late tick,
+/// projects what that frame put on glass and what the engine then asks the
+/// host for, and refuses the same engine with this `Buggy = 1` injected into
+/// its ribbon (`Ribbon::restart_unobserved_swooshes`: every swoosh that ran out
+/// unobserved restarts at the late observation).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_exit_sampling_model() -> Model {
@@ -743,11 +747,16 @@ pub fn output_streak_episode_delivery_model() -> Model {
 /// real `older < newer` comparison. Timestamp values likewise project to
 /// presence bits; wall-clock arithmetic is outside this ordering contract.
 ///
-/// `Buggy=1` replays both defects independently. `PublishOlderEcho` overwrites a
+/// `Buggy=1` replays three defects independently. `PublishOlderEcho` overwrites a
 /// newer publication, matching the pre-token completion-order race. `Sample`
 /// combines the boundary's publication order with the older echo timestamps,
-/// matching the pre-mutex independent-atomic read. Tier-0 contains an explicit
-/// trace for each mutant so one counterexample cannot mask the other.
+/// matching the pre-mutex independent-atomic read. And `PublishOlderEcho` fires
+/// before the sink accepted the echo — an order minted at the write ATTEMPT
+/// (`InputEpoch`'s shape) instead of at acceptance (`AcceptedOrder`'s), which for a
+/// write that then fails manufactures the post-return echo timestamp
+/// `OutputEchoWrite::finish` refuses by publishing only on
+/// `receipt.accepted_order()` (`PublishFollowsAcceptance`). Tier-0 contains an
+/// explicit trace for each mutant so one counterexample cannot mask another.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn output_echo_receipt_publication_model() -> Model {
@@ -775,7 +784,9 @@ pub fn output_echo_receipt_publication_model() -> Model {
             action AcceptNewerBoundary when (accepted == 1) {
                 accepted = 2;
             }
-            action PublishOlderEcho when (accepted > 0 && older_done == 0) {
+            action PublishOlderEcho when (
+                (accepted > 0 || Buggy == 1) && older_done == 0
+            ) {
                 older_done = 1;
                 published_order = if Buggy == 1 || published_order <= 0 {
                     1
@@ -840,9 +851,11 @@ pub fn output_echo_receipt_publication_model() -> Model {
                     sample_order == 0 && sample_accepted == 0 &&
                     sample_boundary == 0
                 };
+            // The tracker never publishes an order the sink has not accepted.
+            invariant PublishFollowsAcceptance: published_order <= accepted;
             invariant StateBounded:
                 accepted <= 2 && older_done <= 1 && newer_done <= 1 &&
-                published_order <= accepted && accepted_shadow <= 1 &&
+                published_order <= 2 && accepted_shadow <= 1 &&
                 boundary_shadow <= 1 && sampled <= 1 && sample_order <= 2 &&
                 sample_accepted <= 1 && sample_boundary <= 1;
         }
@@ -936,61 +949,80 @@ pub fn rain_lifecycle_model() -> Model {
 }
 
 /// PHOSPHOR rain band containment (docs/matrix-rain-design.md §7/§10) — the
-/// damage law behind `aterm_render::compute_dirty_rows`' per-row merge-diff
-/// for `rain_quads`: EVERY emitted quad whose bytes changed this tick lies in
-/// a marked dirty row, INCLUDING the mutation-tick case where the glyph hash
-/// window rolls and every lit trail cell changes at once (not just the
-/// stepped head/tail edges). Hand-built in the [`deco_band_containment_model`]
-/// shape (nondeterministic `in_range` picks need the `Expr` builders; the
-/// `ty_model!` grammar has none): a phased pick walk chooses a head row, a
-/// trail length, whether this is a mutation tick, and a probe row anywhere in
-/// the lit band (head-inclusive down to the just-expired tail).
+/// damage law behind `aterm_render::compute_dirty_rows` for `rain_quads`:
+/// EVERY emitted quad whose bytes changed this tick lies in a marked dirty row,
+/// INCLUDING the mutation-tick case where the glyph hash window rolls and every
+/// lit trail cell changes at once (not just the stepped head/tail edges).
+/// Hand-built in the [`deco_band_containment_model`] shape (nondeterministic
+/// `in_range` picks need the `Expr` builders; the `ty_model!` grammar has
+/// none): a phased pick walk chooses one column's head row, its trail length,
+/// whether this is a mutation tick, and a probe row anywhere in the band's
+/// visible part (the just-expired tail included); then `Mark` records what the
+/// tick did to that row and what the marker decided.
 ///
-/// `changed(r)`: the head (newly lit), the expired tail (its quad vanished —
-/// the prev∪cur half of the merge-diff), or — on a mutation tick — ANY lit
-/// row (the glyph swap rewrites the whole band). `marked(r)`: head + tail
-/// always; the whole band only when mutation marking is on (`Buggy = 0`).
-/// Safety `Contained`: `changed(r) <= marked(r)` (indicator order, the
-/// [`grid_translate_model`] idiom). `Buggy = 1` skips mutation marking, so a
-/// strictly-interior trail row changes UNMARKED on a mutation tick — the
-/// exact stale-glyph ghost the renderer's no-ghost byte-equality test pins —
-/// and `ty` catches it. `StepEdgesMarked` is the always-true non-vacuity
-/// control (the stepped edges are marked at BOTH `Buggy` values).
+/// The column lives in a `Viewport`-row window and its head may already have
+/// run off the bottom (`head >= Viewport`) — the tail stays on-screen. That is
+/// the case that makes the law non-trivial, because the marker has TWO parts:
 ///
-/// Tier-1 binding: aterm-render's dirty-row merge-diff + cached-vs-fresh
-/// no-ghost byte-equality tests (`tests/rain_render.rs`) drive the shipping
-/// `compute_dirty_rows` over real emission, mutation ticks included.
+/// * the per-row MERGE-DIFF marks every row whose quad slice differs — the
+///   stepped head, the expired tail (its quad vanished: the prev∪cur half), and
+///   on a mutation tick every visible lit row;
+/// * the SCISSOR-BAND FILL then marks every row carrying a current quad inside
+///   the bounding band `[first, last]` of what the merge-diff marked.
+///
+/// So with both edges on screen the fill alone covers the whole band, and a
+/// merge-diff that missed the mutation would still be masked. Once the head
+/// has left the screen, only the tail steps, the fill band collapses onto it,
+/// and the mutation-changed interior rows are marked by the merge-diff or by
+/// nothing. `Buggy = 1` is exactly that merge-diff — it sees the stepped edges
+/// and not the glyph swap — and `ty` catches it: a strictly-interior row of a
+/// mutation tick changes UNMARKED under an off-screen head, the stale-glyph
+/// ghost the renderer's no-ghost byte-equality test pins.
+///
+/// Safety `Contained`: `changed <= marked` once the row is marked (indicator
+/// order, the [`grid_translate_model`] idiom).
+///
+/// Tier-1: `aterm-render/tests/rain_render.rs::rain_marking_conforms_to_the_rain_band_containment_model`
+/// feeds the shipping `compute_dirty_rows` one column's band for every point
+/// of this lattice, step and mutation ticks alike, and requires each row's real
+/// verdict to be the model's one `Mark` successor.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rain_band_containment_model() -> Model {
-    // Indicator that the probe row is a stepped EDGE (head or expired tail).
-    let edge = || {
-        or_(
-            eq(var("r"), var("head")),
-            eq(var("r"), sub(var("head"), var("l"))),
-        )
-    };
+    let tail = || sub(var("head"), var("l"));
+    let head_visible = || le(var("head"), sub(cst("Viewport"), int(1)));
+    // The last visible lit row: the head, or the viewport's bottom row.
+    let last_lit = || if_(head_visible(), var("head"), sub(cst("Viewport"), int(1)));
     // A quad at `r` changed this tick: a stepped edge, or (mutation tick) any
-    // lit row — `r` is picked inside the band, so lit is structural.
-    let changed = || if_(or_(edge(), eq(var("mt"), int(1))), int(1), int(0));
-    // The dirty-row marker: edges always; the whole band only when mutation
-    // marking is on (Buggy = 0 — the merge-diff sees every changed slice).
-    let marked = || {
+    // lit row — `r` is picked inside the visible band, so lit is structural.
+    let changed = || {
         if_(
             or_(
-                edge(),
-                and_(eq(var("mt"), int(1)), eq(cst("Buggy"), int(0))),
+                or_(eq(var("r"), var("head")), eq(var("r"), tail())),
+                eq(var("mt"), int(1)),
             ),
             int(1),
             int(0),
         )
     };
-    let settled_implies = |body: Expr| or_(neq(var("phase"), int(4)), body);
+    // The LAST row the merge-diff marks (its first is always the expired tail):
+    // every visible lit row on a mutation tick — unless Buggy, whose diff sees
+    // the stepped edges only — else the head if it is on screen, else the tail.
+    let diff_last = || {
+        if_(
+            and_(eq(var("mt"), int(1)), eq(cst("Buggy"), int(0))),
+            last_lit(),
+            if_(head_visible(), var("head"), tail()),
+        )
+    };
+    // The merge-diff's own rows plus the scissor-band fill: every row in
+    // `[tail, diff_last]` is either the tail or carries a current quad.
+    let marked = || if_(le(var("r"), diff_last()), int(1), int(0));
     Model {
         name: "RainBandContainment",
-        consts: vec![("Buggy", 0)],
+        consts: vec![("Buggy", 0), ("Viewport", 6)],
         vars: vec![
             StateVar {
                 name: "phase",
@@ -1006,16 +1038,26 @@ pub fn rain_band_containment_model() -> Model {
                 init: 0,
             },
             StateVar { name: "r", init: 0 },
+            StateVar {
+                name: "changed",
+                init: 0,
+            },
+            StateVar {
+                name: "marked",
+                init: 0,
+            },
         ],
         fn_vars: vec![],
         actions: vec![
             Action {
+                // Up to two rows past the viewport's bottom: the head may have
+                // left the screen.
                 name: "PickHead",
                 guard: Some(eq(var("phase"), int(0))),
                 updates: vec![
                     Update {
                         var: "head",
-                        expr: in_range(int(2), int(8)),
+                        expr: in_range(int(2), add(cst("Viewport"), int(2))),
                     },
                     Update {
                         var: "phase",
@@ -1026,13 +1068,21 @@ pub fn rain_band_containment_model() -> Model {
             Action {
                 // Trail length >= 2 so a strictly-interior row exists (the
                 // mutation-only change the Buggy marker misses); <= head keeps
-                // the expired tail on-screen.
+                // the expired tail at or below the top row, and the lower bound
+                // keeps it on screen when the head has left.
                 name: "PickTrail",
                 guard: Some(eq(var("phase"), int(1))),
                 updates: vec![
                     Update {
                         var: "l",
-                        expr: in_range(int(2), var("head")),
+                        expr: in_range(
+                            if_(
+                                gt(sub(var("head"), sub(cst("Viewport"), int(1))), int(2)),
+                                sub(var("head"), sub(cst("Viewport"), int(1))),
+                                int(2),
+                            ),
+                            var("head"),
+                        ),
                     },
                     Update {
                         var: "phase",
@@ -1056,13 +1106,13 @@ pub fn rain_band_containment_model() -> Model {
                 ],
             },
             Action {
-                // The probe: any row of the lit band, expired tail included.
+                // The probe: any visible row of the band, expired tail included.
                 name: "PickRow",
                 guard: Some(eq(var("phase"), int(3))),
                 updates: vec![
                     Update {
                         var: "r",
-                        expr: in_range(sub(var("head"), var("l")), var("head")),
+                        expr: in_range(tail(), last_lit()),
                     },
                     Update {
                         var: "phase",
@@ -1070,22 +1120,32 @@ pub fn rain_band_containment_model() -> Model {
                     },
                 ],
             },
-        ],
-        invariants: vec![
-            Invariant {
-                // THE THEOREM: a changed quad row is always a marked dirty row.
-                // Buggy=1 leaves a mutation-tick interior row unmarked (ghost).
-                name: "Contained",
-                expr: settled_implies(le(changed(), marked())),
+            Action {
+                // What the tick did to the probed row, and the marker's verdict.
+                name: "Mark",
+                guard: Some(eq(var("phase"), int(4))),
+                updates: vec![
+                    Update {
+                        var: "changed",
+                        expr: changed(),
+                    },
+                    Update {
+                        var: "marked",
+                        expr: marked(),
+                    },
+                    Update {
+                        var: "phase",
+                        expr: int(5),
+                    },
+                ],
             },
-            Invariant {
-                // Always-true control (both Buggy values): the stepped edges
-                // are marked — the walk settles and the marker is never empty,
-                // so Contained is not checked vacuously.
-                name: "StepEdgesMarked",
-                expr: settled_implies(le(if_(edge(), int(1), int(0)), marked())),
-            },
         ],
+        invariants: vec![Invariant {
+            // THE THEOREM: a changed quad row is always a marked dirty row.
+            // Buggy=1 leaves a mutation-tick interior row unmarked (ghost).
+            name: "Contained",
+            expr: or_(neq(var("phase"), int(5)), le(var("changed"), var("marked"))),
+        }],
     }
 }
 

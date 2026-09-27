@@ -1,10 +1,8 @@
 #![forbid(unsafe_code)]
-// Load-bearing, not tidiness: the constant-time compares are pinned by tests that
-// call the private `verify_diff` / `verify_attach_diff` helpers, and a rewrite of
-// `verify` / `verify_attach` to compare in the entry point instead would leave the
-// helper it stopped calling unused. Under `deny`, that rewrite is a build failure
-// of `cargo test -p astream-cap` (the lib is compiled without `cfg(test)` for the
-// doctests), so the fold cannot be dropped and leave this crate's claim green.
+// Load-bearing: the constant-time compares are pinned by tests that call the
+// private `verify_diff` / `verify_attach_diff`. If `verify` / `verify_attach`
+// stopped deciding through them, they would be dead outside `cfg(test)`, and this
+// makes that a build failure of `cargo test -p astream-cap` (the doctest build).
 #![deny(dead_code)]
 //! `astream-cap` — the unforgeable capability mint: the capability/ACL half of
 //! "SSH" for untrusted-network use (the doctrine's "sound, unforgeable capability
@@ -14,14 +12,17 @@
 //!
 //! A **capability is a signed grant**. A grant is an [`astream_wire::Filter`] —
 //! the subject subtree its bearer may attach/observe/drive — optionally prefixed
-//! with a *mode* and a *principal*:
+//! with a *mode*, a *principal* and an *expiry*:
 //!
 //! ```text
-//! grant := [ ("rw" | "ro") [ "," "p=" <principal> ] ":" ] <filter>
-//!   /f/F/pub/>            read-write, unbound: every capability minted before this existed
+//! grant := [ ("rw" | "ro") { "," field } ":" ] <filter>
+//! field := "p=" <principal> | "exp=" <unix-ms>     each at most once, either order
+//!   /f/F/pub/>            read-write, unbound, never expires (the bare-filter form)
 //!   ro:/f/F/fleet/>       read-only: subscribe/fetch, never publish or commit
 //!   rw,p=n-a1b2c3d4:/f/F/in/*/*/n-a1b2c3d4/*
 //!                         read-write, and only as producer_id_of("n-a1b2c3d4")
+//!   rw,exp=1700000000000:/f/lab/>
+//!                         read-write until that instant, and nothing from it on
 //! ```
 //!
 //! The prefix is unambiguous *because* [`Filter::new`] rejects any string without
@@ -76,7 +77,10 @@ const PRINCIPAL_NAME_MAX: usize = 32;
 const PRINCIPAL_CLASSES: [&str; 4] = ["s-", "n-", "h-", "a-"];
 
 /// A bearer capability: the granted **grant string** plus its HMAC tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` output names the grant but redacts the tag: the tag IS the bearer
+/// secret, and debug output ends up in logs.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Capability {
     /// The grant this capability seals — a bare `astream_wire` filter string (the
     /// read-write, unbound grant) or a mode/principal-prefixed one ([`Grant`]).
@@ -85,6 +89,15 @@ pub struct Capability {
     /// HMAC-SHA256(secret, grant) — the unforgeable seal, over mode, principal and
     /// filter together.
     pub tag: [u8; TAG],
+}
+
+impl std::fmt::Debug for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Capability")
+            .field("filter", &self.filter)
+            .field("tag", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What a grant authorizes: reads only, or reads and writes.
@@ -116,22 +129,21 @@ pub struct Grant {
     /// for a capability that never expires.
     ///
     /// It rides inside the grant STRING, which is the whole of what the tag is
-    /// computed over, so it needs no new crypto and cannot be stripped, shortened
-    /// or extended: any edit changes the string and the tag no longer verifies.
-    /// That is the same property the mode and the principal already had.
+    /// computed over, so like the mode and the principal it cannot be stripped,
+    /// shortened or extended: any edit changes the string and the tag no longer
+    /// verifies.
     ///
-    /// `None` is not "valid forever by accident" — it is every capability minted
-    /// before this field existed, and the deliberate shape for a fleet root an
-    /// operator rotates by changing the secret.
+    /// `None` is a grant with no `exp=` field — every grant minted before the
+    /// field existed, and the deliberate shape for a fleet root an operator
+    /// rotates by changing the secret.
     pub expires_at: Option<u64>,
 }
 
 impl Grant {
     /// Parse a grant string, or explain why it is not one.
     ///
-    /// A bare filter (leading `/`) is the read-write, unbound grant: every
-    /// capability minted before the prefix existed parses to exactly that, which
-    /// is what keeps those capabilities valid. Otherwise the string is
+    /// A bare filter (leading `/`) is the read-write, unbound grant, which keeps
+    /// capabilities minted as bare filters valid. Otherwise the string is
     /// `<mode>[,<field>]*:<filter>`, split on the FIRST `:` — unambiguous because
     /// no field value may contain one, and a filter that does is only ever
     /// reached after the prefix has been consumed.
@@ -144,79 +156,89 @@ impl Grant {
     /// field silently ignored by an older broker is a capability that means less
     /// than it says.
     pub fn parse(grant: &str) -> Result<Self, String> {
-        if grant.starts_with('/') {
-            Filter::new(grant).map_err(|e| format!("invalid filter: {e}"))?;
-            return Ok(Grant {
-                mode: Mode::ReadWrite,
-                principal: None,
-                filter: grant.to_string(),
-                expires_at: None,
-            });
-        }
-        let Some((prefix, filter)) = grant.split_once(':') else {
-            return Err(format!(
-                "invalid grant {grant:?}: neither a filter (leading '/') nor a \
-                 \"<rw|ro>[,p=<principal>]:<filter>\" prefix"
-            ));
+        parse_grant(grant).map(|(g, _)| g)
+    }
+}
+
+/// [`Grant::parse`], also handing back the validated filter half, so an
+/// authorization check matches against it instead of validating the same
+/// string a second time.
+fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
+    if grant.starts_with('/') {
+        let f = Filter::new(grant).map_err(|e| format!("invalid filter: {e}"))?;
+        let g = Grant {
+            mode: Mode::ReadWrite,
+            principal: None,
+            filter: grant.to_string(),
+            expires_at: None,
         };
-        let mut fields = prefix.split(',');
-        let mode_tok = fields.next().unwrap_or("");
-        let mut principal: Option<String> = None;
-        let mut expires_at: Option<u64> = None;
-        for field in fields {
-            if let Some(p) = field.strip_prefix("p=") {
-                if principal.is_some() {
-                    return Err(format!("invalid grant prefix {prefix:?}: repeated \"p=\""));
-                }
-                if !valid_principal(p) {
-                    return Err(format!(
-                        "invalid principal {p:?}: expected one of {PRINCIPAL_CLASSES:?} \
-                         then 1..={PRINCIPAL_NAME_MAX} of [a-z0-9-]"
-                    ));
-                }
-                principal = Some(p.to_string());
-            } else if let Some(v) = field.strip_prefix("exp=") {
-                if expires_at.is_some() {
-                    return Err(format!(
-                        "invalid grant prefix {prefix:?}: repeated \"exp=\""
-                    ));
-                }
-                // ASCII DIGITS ONLY, then parse. `u64::from_str` accepts a leading
-                // `+`, and a capability whose expiry can be spelled two ways is a
-                // capability with two tags for one authority.
-                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(format!(
-                        "invalid grant expiry {v:?}: expected unix milliseconds as ASCII digits"
-                    ));
-                }
-                let ms = v.parse::<u64>().map_err(|_| {
-                    format!("invalid grant expiry {v:?}: does not fit in u64 milliseconds")
-                })?;
-                expires_at = Some(ms);
-            } else {
+        return Ok((g, f));
+    }
+    let Some((prefix, filter)) = grant.split_once(':') else {
+        return Err(format!(
+            "invalid grant {grant:?}: neither a filter (leading '/') nor a \
+             \"<rw|ro>[,p=<principal>]:<filter>\" prefix"
+        ));
+    };
+    let mut fields = prefix.split(',');
+    let mode_tok = fields.next().unwrap_or("");
+    let mut principal: Option<String> = None;
+    let mut expires_at: Option<u64> = None;
+    for field in fields {
+        if let Some(p) = field.strip_prefix("p=") {
+            if principal.is_some() {
+                return Err(format!("invalid grant prefix {prefix:?}: repeated \"p=\""));
+            }
+            if !valid_principal(p) {
                 return Err(format!(
-                    "invalid grant prefix {prefix:?}: expected \",p=<principal>\" or \
-                     \",exp=<unix-ms>\""
+                    "invalid principal {p:?}: expected one of {PRINCIPAL_CLASSES:?} \
+                     then 1..={PRINCIPAL_NAME_MAX} of [a-z0-9-]"
                 ));
             }
-        }
-        let mode = match mode_tok {
-            "rw" => Mode::ReadWrite,
-            "ro" => Mode::ReadOnly,
-            other => {
+            principal = Some(p.to_string());
+        } else if let Some(v) = field.strip_prefix("exp=") {
+            if expires_at.is_some() {
                 return Err(format!(
-                    "invalid grant mode {other:?}: expected \"rw\" or \"ro\""
-                ))
+                    "invalid grant prefix {prefix:?}: repeated \"exp=\""
+                ));
             }
-        };
-        Filter::new(filter).map_err(|e| format!("invalid filter: {e}"))?;
-        Ok(Grant {
-            mode,
-            principal,
-            filter: filter.to_string(),
-            expires_at,
-        })
+            // ASCII digits only, then parse: `u64::from_str` would also accept a
+            // leading `+`. (Leading zeros still parse, as does either field
+            // order, so one authority can have several spellings and tags;
+            // nothing keys authority on the spelling.)
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "invalid grant expiry {v:?}: expected unix milliseconds as ASCII digits"
+                ));
+            }
+            let ms = v.parse::<u64>().map_err(|_| {
+                format!("invalid grant expiry {v:?}: does not fit in u64 milliseconds")
+            })?;
+            expires_at = Some(ms);
+        } else {
+            return Err(format!(
+                "invalid grant prefix {prefix:?}: expected \",p=<principal>\" or \
+                 \",exp=<unix-ms>\""
+            ));
+        }
     }
+    let mode = match mode_tok {
+        "rw" => Mode::ReadWrite,
+        "ro" => Mode::ReadOnly,
+        other => {
+            return Err(format!(
+                "invalid grant mode {other:?}: expected \"rw\" or \"ro\""
+            ))
+        }
+    };
+    let f = Filter::new(filter).map_err(|e| format!("invalid filter: {e}"))?;
+    let g = Grant {
+        mode,
+        principal,
+        filter: filter.to_string(),
+        expires_at,
+    };
+    Ok((g, f))
 }
 
 /// Whether `p` is a well-formed principal: a class prefix (`s-` session, `n-`
@@ -328,20 +350,14 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
 /// folded whatever the inputs are, so how long the compare runs, and what it
 /// returns, say nothing about WHERE the first difference is.
 ///
-/// The fold is not merely written here, it is *pinned on the path the security
-/// check takes*. [`verify`] and [`verify_attach`] each decide by testing a
-/// `*_diff` helper — `verify_diff`, `verify_attach_diff` — against zero, and
-/// `verify_folds_every_byte_of_the_tag` / `verify_attach_folds_every_byte_of_the_proof`
-/// assert, for every ordered pair of mismatch positions, that what those helpers
-/// return carries the LATER byte's difference as well as the earlier one. So a
-/// rewrite of either compare to `a == b`, or to a loop that breaks at the first
-/// differing byte, fails those tests; and a rewrite that leaves the helper in place
-/// and compares inside the entry point instead leaves the helper uncalled, which
-/// the crate's `deny(dead_code)` turns into a build failure of the same command.
-///
-/// It is a structural property of the code, not a measurement — nothing here
-/// observes a clock, and nothing here says what the compiler, the CPU or the cache
-/// do with the loop.
+/// This is pinned on the path the security check takes: [`verify`] and
+/// [`verify_attach`] each decide by testing `verify_diff` / `verify_attach_diff`
+/// against zero, and the tests assert, for every ordered pair of mismatch
+/// positions, that those helpers carry the LATER byte's difference as well as the
+/// earlier one. A rewrite to `a == b` or to an early-exit loop fails those tests;
+/// one that compares in the entry point instead leaves the helper uncalled, which
+/// `deny(dead_code)` makes a build failure. It is a structural property of the
+/// source, not a timing measurement.
 fn ct_diff(a: &[u8; TAG], b: &[u8; TAG]) -> u8 {
     let mut diff = 0u8;
     for i in 0..TAG {
@@ -352,9 +368,8 @@ fn ct_diff(a: &[u8; TAG], b: &[u8; TAG]) -> u8 {
 
 /// Mint a capability granting `grant`, sealed with `secret`. The grant is parsed —
 /// its filter half validated by `Filter::new` — so an unparseable grant (a bad
-/// mode, a malformed principal, an invalid filter) is rejected up front.
-///
-/// A bare filter mints exactly as it always did: same message, same tag.
+/// mode, a malformed principal, an invalid filter) is rejected up front. The tag
+/// is over the grant string exactly as given.
 pub fn mint(secret: &[u8], grant: &str) -> Result<Capability, String> {
     Grant::parse(grant)?;
     Ok(Capability {
@@ -396,20 +411,25 @@ pub fn attach_proof(tag: &[u8; TAG], nonce: &[u8], grant: &str) -> [u8; TAG] {
 
 /// The fold [`verify_attach`] decides on: [`ct_diff`] between the proof `secret`
 /// would have expected for `grant` over `nonce` and the proof presented. `None`
-/// when there is nothing to fold at all — a grant that does not parse (so no MAC
-/// is trusted), or a proof that is not `TAG` bytes long, refused on the length
-/// alone, which the wire has already revealed. A wrong length is an ordinary
-/// mismatch, never a panic.
+/// for a proof that is not `TAG` bytes long, refused on the length alone (which
+/// the wire has already revealed; never a panic), and for a genuine proof over a
+/// string that is not a grant, so no MAC is trusted for it.
+///
+/// The grant is parsed only once the proof has matched. It arrives from a peer
+/// that has proved nothing yet, and parsing builds a [`Filter`] costing tens of
+/// bytes per segment, so parsing first would let any peer make the broker
+/// allocate ~36x a frame-sized grant; hashing it costs one copy.
 ///
 /// It exists so the no-early-exit shape can be asserted *through the function the
 /// accept path calls* rather than beside it — see `ct_diff`.
 fn verify_attach_diff(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) -> Option<u8> {
-    if Grant::parse(grant).is_err() {
-        return None;
-    }
     let proof = <&[u8; TAG]>::try_from(proof).ok()?;
     let tag = hmac_sha256(secret, grant.as_bytes());
-    Some(ct_diff(&attach_proof(&tag, nonce, grant), proof))
+    let diff = ct_diff(&attach_proof(&tag, nonce, grant), proof);
+    if diff == 0 && Grant::parse(grant).is_err() {
+        return None;
+    }
+    Some(diff)
 }
 
 /// The broker side of the proof of possession: recompute the tag `secret` would
@@ -417,55 +437,55 @@ fn verify_attach_diff(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) ->
 /// the two with `verify_attach_diff` — all 32 bytes folded, no early exit on the
 /// first differing byte, a wrong length an ordinary mismatch.
 ///
-/// The grant is parsed before any MAC is trusted, so a string that carries a
-/// genuine tag but is not a grant authorizes nothing.
+/// A string that is not a grant authorizes nothing, even under a genuine proof.
+/// It is parsed only after the proof has matched, so a peer without one never
+/// gets its grant string parsed at all.
 #[must_use]
 pub fn verify_attach(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) -> bool {
     verify_attach_diff(secret, grant, nonce, proof) == Some(0)
 }
 
-/// The parsed grant of a capability that is genuine under `secret` AND has not
-/// expired at `now_ms`, or `None`.
+/// The parsed grant, and its validated filter, of a capability that is genuine
+/// under `secret` AND has not expired at `now_ms`, or `None`.
 ///
 /// THE ONE PLACE EXPIRY IS DECIDED. Every public predicate in this crate reaches
 /// authority through here or through [`rw_matches`], which itself starts here, so
 /// an expired capability cannot authorize a read, a write, a publish, a commit or
 /// a subscribe — and a future predicate cannot forget the check, because there is
 /// no other way in.
-fn authentic_grant(secret: &[u8], cap: &Capability, now_ms: u64) -> Option<Grant> {
+fn authentic_grant(secret: &[u8], cap: &Capability, now_ms: u64) -> Option<(Grant, Filter)> {
     if !verify(secret, cap) {
         return None;
     }
-    let grant = Grant::parse(cap.filter.as_str()).ok()?;
+    let (grant, filter) = parse_grant(cap.filter.as_str()).ok()?;
     match grant.expires_at {
         Some(exp) if now_ms >= exp => None,
-        _ => Some(grant),
+        _ => Some((grant, filter)),
     }
 }
 
 /// The genuine, read-write grant of `cap` whose filter matches `subject`, if any.
 /// The one place the write half of the §8.2 matrix is decided.
 fn rw_matches(secret: &[u8], cap: &Capability, subject: &str, now_ms: u64) -> Option<Grant> {
-    let grant = authentic_grant(secret, cap, now_ms)?;
+    let (grant, filter) = authentic_grant(secret, cap, now_ms)?;
     if grant.mode != Mode::ReadWrite {
         return None;
     }
-    match (Filter::new(grant.filter.as_str()), Subject::new(subject)) {
-        (Ok(f), Ok(s)) if f.matches(&s) => Some(grant),
+    match Subject::new(subject) {
+        Ok(s) if filter.matches(&s) => Some(grant),
         _ => None,
     }
 }
 
 /// Whether `cap` (verified under `secret`) authorizes `subject` for a WRITE — it is
-/// genuine, read-write, and its granted filter matches the subject. The ACL check
-/// the broker runs before a publish, a read-process-write output, or a commit.
+/// genuine, read-write, and its granted filter matches the subject.
 ///
 /// HONEST BOUNDARY: it does **not** check the producer binding, because it is not
 /// given a producer id — [`grants_publish`] is the check that closes dedup-key
-/// poisoning, and [`grants_commit`] is the same rule named for a group.
+/// poisoning, and [`grants_commit`] is this same rule named for a group.
 ///
 /// `now_ms` is unix milliseconds, and every predicate here takes one: an expired
-/// capability authorizes nothing (see the private `authentic_grant`). Pass the instant the
+/// capability authorizes nothing (see [`Grant::expires_at`]). Pass the instant the
 /// caller already holds — this crate never reads a clock.
 pub fn grants(secret: &[u8], cap: &Capability, subject: &str, now_ms: u64) -> bool {
     rw_matches(secret, cap, subject, now_ms).is_some()
@@ -509,18 +529,24 @@ pub fn grants_commit(secret: &[u8], cap: &Capability, group: &str, now_ms: u64) 
 ///
 /// Mode-agnostic on purpose: a read-only grant is a full *read* grant.
 pub fn grants_filter(secret: &[u8], cap: &Capability, filter: &str, now_ms: u64) -> bool {
-    let Some(grant) = authentic_grant(secret, cap, now_ms) else {
+    let Some((_, granted)) = authentic_grant(secret, cap, now_ms) else {
         return false;
     };
-    match (Filter::new(grant.filter.as_str()), Filter::new(filter)) {
-        (Ok(granted), Ok(requested)) => granted.contains(&requested),
-        _ => false,
-    }
+    Filter::new(filter).is_ok_and(|requested| granted.contains(&requested))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_names_the_grant_but_never_the_tag() {
+        let cap = mint(b"k", "/a/>").unwrap();
+        assert_eq!(
+            format!("{cap:?}"),
+            r#"Capability { filter: "/a/>", tag: "<redacted>" }"#
+        );
+    }
 
     /// A FIXED instant for every authorization call below: this crate reads no
     /// clock, so a test that passed one would be testing the machine.
@@ -895,16 +921,9 @@ mod tests {
     /// fold must carry the LATER byte's difference as well as the earlier one: an
     /// implementation that returned as soon as it found a difference (or delegated
     /// to `a == b`, which is free to) would report only the difference at `i` and
-    /// fail here.
-    ///
-    /// On its own this pins only `ct_diff`. The two tests below pin the same shape
-    /// on the functions the security path actually calls.
-    ///
-    /// This asserts the shape of the compare, not a wall-clock timing property:
-    /// nothing here reads a clock, and a source-level test could not make a
-    /// deterministic timing measurement in CI anyway. What it does establish is
-    /// that the result is a fold over all 32 bytes, which is what a refactor that
-    /// reintroduces a data-dependent exit would break.
+    /// fail here. `verify_folds_every_byte_of_the_tag` and
+    /// `verify_attach_folds_every_byte_of_the_proof` pin the same shape on the
+    /// functions the security path calls. The shape of the compare, not its timing.
     #[test]
     fn ct_diff_folds_every_byte_whatever_the_mismatch() {
         let a = [0u8; TAG];
@@ -928,11 +947,10 @@ mod tests {
         assert_eq!(ct_diff(&a, &a), 0);
     }
 
-    /// The same property at the public entry point: a proof that differs from the
+    /// The behaviour at the public entry point: a proof that differs from the
     /// genuine one in any single byte — first, last, or anywhere between — is
-    /// refused. Flipping the LAST byte is the case an early-exit compare would
-    /// still get right, so this is the behaviour, and `ct_diff_folds_every_byte...`
-    /// above is the reason it holds without reading the tail conditionally.
+    /// refused. (An early-exit compare would pass this too; the fold tests are
+    /// what tell the two apart.)
     #[test]
     fn verify_attach_refuses_a_proof_differing_in_any_single_byte() {
         let secret = b"broker-secret-key";
@@ -956,13 +974,8 @@ mod tests {
     /// `verify_diff` is what the compare behind `verify` does: for every ordered
     /// pair of tampered byte positions the returned fold carries the LATER byte's
     /// difference as well as the earlier one, which a compare that stopped at the
-    /// first difference — `a == b` included — could not report.
-    ///
-    /// The other half of the guard is not in this function: a rewrite that leaves
-    /// `verify_diff` in place and compares inside `verify` instead leaves it
-    /// uncalled outside `cfg(test)`, and the crate's `deny(dead_code)` fails the
-    /// build of this very command. Neither half reads a clock; this is the shape of
-    /// the compare, not its timing.
+    /// first difference — `a == b` included — could not report. (A rewrite that
+    /// bypasses `verify_diff` is caught by `deny(dead_code)` instead.)
     #[test]
     fn verify_folds_every_byte_of_the_tag() {
         let secret = b"broker-secret-key";
@@ -1011,7 +1024,7 @@ mod tests {
                 assert!(!verify_attach(secret, grant, &nonce, &near));
             }
         }
-        // Nothing to fold: a wrong length, and a string that is not a grant.
+        // Nothing to fold: a wrong length.
         assert_eq!(
             verify_attach_diff(secret, grant, &nonce, &proof[..TAG - 1]),
             None
@@ -1019,10 +1032,14 @@ mod tests {
         let mut long = proof.to_vec();
         long.push(0);
         assert_eq!(verify_attach_diff(secret, grant, &nonce, &long), None);
-        assert_eq!(
-            verify_attach_diff(secret, "rwx:/f/F/pub/>", &nonce, &proof),
-            None
-        );
+        // A string that is not a grant: refused as None under a GENUINE proof
+        // (no MAC is trusted for it), and as an ordinary mismatch under any
+        // other, because it is only parsed once its proof has matched.
+        let junk = "rwx:/f/F/pub/>";
+        let junk_proof = attach_proof(&hmac_sha256(secret, junk.as_bytes()), &nonce, junk);
+        assert_eq!(verify_attach_diff(secret, junk, &nonce, &junk_proof), None);
+        assert_ne!(verify_attach_diff(secret, junk, &nonce, &proof), Some(0));
+        assert!(verify_attach_diff(secret, junk, &nonce, &proof).is_some());
     }
 
     /// The grammar: `exp=` is a prefix field beside `p=`, in either order, and

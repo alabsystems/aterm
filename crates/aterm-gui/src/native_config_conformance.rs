@@ -5,8 +5,11 @@
 //!
 //! The test drives the genuine `aterm-toml`-backed service and independently
 //! projects its revisions and semantic values into `NativeConfigTransaction`.
-//! Pending request and undo metadata belong to the controller/test driver; the
-//! canonical key values and revision always come from the shipping service.
+//! Pending request and undo metadata belong to the controller/test driver, and
+//! `accepted`/`external_edits` count the service's `Applied` answers and the
+//! external edits it was handed; the canonical key values and the revision always
+//! come from the shipping service, so `RevisionCountsWrites` checks that the
+//! service mints exactly one revision per write.
 
 #![cfg(test)]
 
@@ -29,12 +32,15 @@ const KEY_B: &str = "cursor_blink";
 struct ControllerProjection {
     baseline_revision: u64,
     patch_active: bool,
+    /// The request's base revision. Not projected: the model has no law about it
+    /// (the service refuses a base it never published — its own unit test).
     patch_base: u64,
     expected_a: i64,
     undo_ready: bool,
     undo_before_a: i64,
     undo_expected_a: i64,
     accepted: u64,
+    external_edits: u64,
 }
 
 impl ControllerProjection {
@@ -48,6 +54,7 @@ impl ControllerProjection {
             undo_before_a: 0,
             undo_expected_a: 0,
             accepted: 0,
+            external_edits: 0,
         }
     }
 }
@@ -82,10 +89,6 @@ fn project(
     state.insert("key_a", key_class(service, KEY_A));
     state.insert("key_b", key_class(service, KEY_B));
     state.insert("patch_active", i64::from(controller.patch_active));
-    state.insert(
-        "patch_base",
-        relative(controller.patch_base, controller.baseline_revision),
-    );
     state.insert("expected_a", controller.expected_a);
     state.insert("undo_ready", i64::from(controller.undo_ready));
     state.insert("undo_before_a", controller.undo_before_a);
@@ -93,6 +96,10 @@ fn project(
     state.insert(
         "accepted",
         i64::try_from(controller.accepted).expect("bounded accepted count"),
+    );
+    state.insert(
+        "external_edits",
+        i64::try_from(controller.external_edits).expect("bounded external edit count"),
     );
     state.insert("stale_overwrite", 0);
     state.insert("partial_reset", 0);
@@ -360,6 +367,7 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     service
         .replace_external("theme = \"Nord\"\ncursor_blink = false\ncustom = \"preserve\"\n".into())
         .expect("valid external config");
+    controller.external_edits += 1;
     let after_external_b = project(&model, &service, controller);
     assert_transition(&model, &before_external_b, &after_external_b, "ExternalB");
 
@@ -372,7 +380,19 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     controller.accepted += 1;
     let after_commit = project(&model, &service, controller);
     assert_transition(&model, &before_commit, &after_commit, "CommitPatchA");
+    assert_eq!(after_commit["revision"], before_commit["revision"] + 1);
     assert_eq!(service.value(KEY_B).unwrap().as_deref(), Some("false"));
+
+    // Negative control: a service that skips the one revision bump every
+    // accepted write shares publishes this commit under the revision it found.
+    let mut unpublished_commit = after_commit.clone();
+    unpublished_commit.insert("revision", before_commit["revision"]);
+    assert_eq!(
+        aterm_spec::interp::with_buggy(&model, 1).successors("CommitPatchA", &before_commit),
+        vec![unpublished_commit.clone()]
+    );
+    assert_eq!(admits(&model, &before_commit, &unpublished_commit), None);
+    assert!(!model.check_invariant("RevisionCountsWrites", &unpublished_commit));
     assert!(service.snapshot().text.contains("custom = \"preserve\""));
 
     // Conditional undo restores only A and preserves the unrelated B change.
@@ -382,6 +402,19 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     controller.accepted += 1;
     let after_undo = project(&model, &service, controller);
     assert_transition(&model, &before_undo, &after_undo, "UndoPatchA");
+    assert_eq!(after_undo["revision"], before_undo["revision"] + 1);
+
+    // Negative control: the undo reaches the same bump through `patch`; skipped,
+    // it publishes under the revision it found — which every open Settings view
+    // would discard as a snapshot it already holds.
+    let mut unpublished_undo = after_undo.clone();
+    unpublished_undo.insert("revision", before_undo["revision"]);
+    assert_eq!(
+        aterm_spec::interp::with_buggy(&model, 1).successors("UndoPatchA", &before_undo),
+        vec![unpublished_undo.clone()]
+    );
+    assert_eq!(admits(&model, &before_undo, &unpublished_undo), None);
+    assert!(!model.check_invariant("RevisionCountsWrites", &unpublished_undo));
     assert_eq!(service.value(KEY_A).unwrap().as_deref(), Some("Nord"));
     assert_eq!(service.value(KEY_B).unwrap().as_deref(), Some("false"));
 
@@ -394,6 +427,7 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
             "theme = \"External\"\ncursor_blink = false\ncustom = \"preserve\"\n".into(),
         )
         .expect("valid external config");
+    controller.external_edits += 1;
     let after_external_a = project(&model, &service, controller);
     assert_transition(
         &model,
@@ -451,6 +485,7 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
             "theme = \"External\"\ncursor_blink = false\ncustom = \"preserve\"\n".into(),
         )
         .expect("valid external config");
+    controller.external_edits += 1;
     let after_external_from_zero = project(&model, &service, controller);
     assert_transition(
         &model,
@@ -1254,6 +1289,19 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         },
     );
     assert_transition(&model, &before_publish, &after_live, "PublishLive");
+
+    // Negative control: a live host installed from a worker-prepared generation
+    // before the service admits it runs a config nobody published — here the
+    // external generation, installed while the service still held the patch.
+    // The genuine host above holds exactly the admitted snapshot's `Arc`.
+    let unadmitted = aterm_spec::interp::with_buggy(&model, 1)
+        .successors("PublishLiveUnadmitted", &patched_state)
+        .into_iter()
+        .next()
+        .expect("the mutant installs the next generation");
+    assert_eq!(unadmitted["live_generation"], external_state["revision"]);
+    assert_eq!(admits(&model, &patched_state, &unadmitted), None);
+    assert!(!model.check_invariant("ViewsNeverAhead", &unadmitted));
 
     // Force the actual capture preparation seam to reinstall. It must land the
     // identical outer catalog and RGBA Arc without resolving any source again.

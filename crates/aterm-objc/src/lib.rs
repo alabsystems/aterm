@@ -55,6 +55,11 @@
 //!    [`MainThread`] witness and [`run_on_main`], which are exactly the two
 //!    pieces such a container is built from, and nothing that put them
 //!    together.
+//! 7. **[The run-loop wake timer](wake_timer)** — the one `CFRunLoopTimer`
+//!    in the tree, `vendor/winit`'s event-loop waker. Its repeat interval is a
+//!    year, not the 0.1 µs winit shipped, because CoreFoundation walks a late
+//!    repeating timer forward one interval at a time with the run-loop lock
+//!    held: the 2026-09-26 freeze was that walk, after a 26.6 h stop.
 //!
 //! # Zero third-party dependencies
 //!
@@ -277,19 +282,20 @@
 
 #![cfg(target_os = "macos")]
 
-pub mod block;
-pub mod class_macro;
-pub mod declare;
-pub mod dispatch;
-pub mod encode;
+pub(crate) mod block;
+pub(crate) mod class_macro;
+pub(crate) mod declare;
+pub(crate) mod dispatch;
+pub(crate) mod encode;
 pub mod exception;
-pub mod main_thread_bound;
-pub mod retained;
-pub mod runtime;
-pub mod sel_cache;
+pub(crate) mod main_thread_bound;
+pub(crate) mod retained;
+pub(crate) mod runtime;
+pub(crate) mod sel_cache;
 pub mod send;
 pub mod swizzle;
-pub mod weak;
+pub mod wake_timer;
+pub(crate) mod weak;
 
 pub use block::{BlockPtr, RcBlock};
 pub use declare::{
@@ -310,7 +316,8 @@ pub use runtime::{
 };
 pub use sel_cache::SelCache;
 pub use swizzle::{Imp, MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_class};
-pub use weak::{Weak, WeakObj, WeakSlot};
+pub use wake_timer::{WakeArm, WakePlan, WakeTarget, WakeTimer};
+pub use weak::{WeakObj, WeakSlot};
 
 /// The uncached selector lookup, under its full name.
 ///

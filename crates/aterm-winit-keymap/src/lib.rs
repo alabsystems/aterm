@@ -66,7 +66,7 @@ pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
 /// Returns `None` for variants with no terminal encoding (TV, IME composition,
 /// launch/browser/phone keys, etc.).
 #[must_use]
-pub fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
+pub(crate) fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
     Some(match named {
         // Navigation
         WinitNamed::ArrowUp => NamedKey::ArrowUp,

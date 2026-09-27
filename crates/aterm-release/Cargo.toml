@@ -10,9 +10,30 @@ repository.workspace = true
 authors.workspace = true
 description = "aterm — the one-command release cutter behind the `cargo ship` alias: ledger claim, universal build, bundle/sign/DMG, draft-first GitHub publish, post-publish verify."
 
+# Binary-only on purpose (no lib.rs; src/main.rs says why): every module is a private
+# `mod` of this binary, so dead_code judges each item against what main() can reach.
+#
+# The integration tests reach the pipeline by `#[path]`-mounting src/ into a test
+# crate, and every mount compiles the whole cutter again and runs all of its inline
+# `#[cfg(test)]` tests again. So the mounts live in ONE test binary, tests/it/main.rs,
+# and this bin has `test = false`: each inline test runs once, in `it`, instead of
+# once here and once per mounting file (14 files mounted all fifteen modules, and a
+# `targo --unverified test -p aterm-release` ran 3,870 tests to check 534 fns).
+# What that costs, on purpose:
+#  - `targo --unverified test --bin aterm-release` runs nothing; the inline tests
+#    are in `it`, which `-p aterm-release` and `--tests` both run.
+#  - tests/changelog.rs keeps its own binary and path, because publish/manifest.txt
+#    withholds it from the public export BY that path. It mounts only changelog.rs
+#    and ledger.rs, so changelog.rs's inline tests run twice.
+#  - `it` reaches `pub(crate)` items through the mounts, which carry
+#    `#[allow(dead_code)]`; the dead-code line is this binary's build, not the tests'.
+# A lib target would run each inline test once without any mounts, but every `pub`
+# item would then be exported and escape dead_code, and any crate could link the
+# cutter. That is a change to the spec's file plan, not to the test layout.
 [[bin]]
 name = "aterm-release"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 # The shared RFC3339 / Howard-Hinnant civil-calendar math (`aterm_types::rfc3339`);

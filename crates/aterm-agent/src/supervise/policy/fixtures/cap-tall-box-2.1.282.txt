@@ -1,0 +1,97 @@
+# claude-code 2.1.282 · MEASURED 2026-09-25 in an isolated headless aterm (48 rows × 160 columns) built from fix/read-the-whole-box, manual mode, while a 74-row here-document box (`cat > …/rows.txt <<'EOF'`, row-01 … row-70, `EOF`) was up: one `offscreen tail=300 screen=1` read — its 47 archived rows above the marker (header `first=1 last=47 lost=0 breaks=1 back=0 alt=1 seq=1589`: a discontinuity after the last), its 48 screen rows below it, equal to the `text --json` read at the same seq
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/ahpW.stnkuL/work
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ Make exactly ONE Bash tool call and nothing else. Its command is exactly 70 lines, verbatim, one per line: echo row-01, then echo row-02, and so on through
+  echo row-70 (always two digits). Do not use a loop or any other command; do not join the lines. After it runs, reply with the one word DONE.
+
+  Ran 1 shell command
+
+⏺ DONE
+
+✻ Churned for 5s · done 5:16 PM
+
+❯ Make exactly ONE Bash tool call and nothing else. Its command is a here-document that writes a file: the first line is  cat > /tmp/ahpW.stnkuL/work/rows.txt
+  <<'EOF'  then exactly 70 lines row-01, row-02, and so on through row-70 (always two digits, one per line), then a final line  EOF . Nothing else in the
+  command, no loop. After it runs, reply with the one word DONE.
+
+  Running 1 shell command…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✢ Befuddling… (3s · ↓ 280 tokens · thought for 1s)
+  ⎿  Tip: Control this session from the Claude mobile app (https://claude.com/download#mobile) · run /remote-control
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents
+# --- screen ---
+   │ row-32
+   │ row-33
+   │ row-34
+   │ row-35
+   │ row-36
+   │ row-37
+   │ row-38
+   │ row-39
+   │ row-40
+   │ row-41
+   │ row-42
+   │ row-43
+   │ row-44
+   │ row-45
+   │ row-46
+   │ row-47
+   │ row-48
+   │ row-49
+   │ row-50
+   │ row-51
+   │ row-52
+   │ row-53
+   │ row-54
+   │ row-55
+   │ row-56
+   │ row-57
+   │ row-58
+   │ row-59
+   │ row-60
+   │ row-61
+   │ row-62
+   │ row-63
+   │ row-64
+   │ row-65
+   │ row-66
+   │ row-67
+   │ row-68
+   │ row-69
+   │ row-70
+   │ EOF
+   Run shell command
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp/ahpW.stnkuL/work from this project
+   3. No
+
+ Esc to cancel · Tab to amend

@@ -57,6 +57,10 @@ pub const TOMBSTONED_PIN: &str = "tombstoned: pin yanked/below floor";
 /// The head of an installed member held on its current build because its coherence
 /// group's new pin is not published for this target: `held: …`.
 pub const HELD_PREFIX: &str = "held: ";
+/// The head of a Trust toolchain member whose new build is STAGED and whose flip waits for
+/// quiet ([`crate::quiet`]): `deferred: …`. The `deferred:` family [`not_current`] already
+/// reads as `deferred` — a state, never a fault: doctor does not count it a problem.
+pub const FLIP_DEFERRED_PREFIX: &str = "deferred: ";
 /// The `*toolset*` row on a machine the signed index serves NOTHING for — an Intel
 /// Mac before x86_64 lands — as the seed and `install
 /// --default-set` record it. `doctor` lists it; it is also the one fault nobody on the
@@ -97,6 +101,20 @@ pub fn managed(build: u64, index_build: u64) -> String {
     s.push_str(&crate::dec_u64(build));
     s.push_str(" — pinned by index ");
     s.push_str(&crate::dec_u64(index_build));
+    s
+}
+
+/// `managed <to> — rolled back from <from>`: an index program a person rolled back — a
+/// managed row ([`is_managed`]) that records what happened and claims no pin
+/// ([`managed_pin`] is `None` for it): the index pins the build the person just left,
+/// and a row saying `pinned by index N` for the one they returned to was a false claim
+/// `which` then repeated (audit, 2026-09-25).
+#[must_use]
+pub fn rolled_back(to: u64, from: u64) -> String {
+    let mut s = String::from(MANAGED_PREFIX);
+    s.push_str(&crate::dec_u64(to));
+    s.push_str(" — rolled back from ");
+    s.push_str(&crate::dec_u64(from));
     s
 }
 
@@ -366,6 +384,38 @@ pub fn unavailable(target: &str, hint: &str) -> String {
     } else {
         hint
     });
+    s
+}
+
+/// `deferred: build <N> is staged and installs when nothing is using the toolchain, by
+/// <time> at the latest while an aterm window or terminal session is open; staying on build
+/// <current>` — the row of a Trust toolchain member whose flip waits for quiet
+/// ([`FLIP_DEFERRED_PREFIX`], [`crate::quiet`]). `to` is the staged build when the record
+/// names it, `current` the build still live. "At the latest" holds while a host looks: an
+/// aterm window's park, or with no window the terminal session in the watch's seat
+/// ([`crate::quiet::Recheck`]). Every interactive session may take that seat, and does at
+/// its next held-move look whether or not a vendor program is there to watch
+/// (2026-09-26 — before, only a round of head checks took it, and on a store
+/// with none these words were untrue); with neither open, no pass runs at all
+/// until one is.
+#[must_use]
+pub fn flip_deferred(to: Option<u64>, current: Option<u64>, until: &str) -> String {
+    let mut s = String::from(FLIP_DEFERRED_PREFIX);
+    match to {
+        Some(to) => {
+            s.push_str("build ");
+            s.push_str(&crate::dec_u64(to));
+            s.push_str(" is staged");
+        }
+        None => s.push_str("the update is staged"),
+    }
+    s.push_str(" and installs when nothing is using the toolchain, by ");
+    s.push_str(until);
+    s.push_str(" at the latest while an aterm window or terminal session is open");
+    if let Some(current) = current {
+        s.push_str("; staying on build ");
+        s.push_str(&crate::dec_u64(current));
+    }
     s
 }
 

@@ -31,20 +31,17 @@
 //! ### Core Engine
 //!
 //! - [`terminal`] - Terminal emulation state machine
-//! - [`checkpoint`] - Crash recovery checkpoints and restore
 //! - [`config`] - Terminal configuration and hot-reload types
+//! - [`render`] - The engine-owned render snapshot a renderer consumes
 //! - [`search`] - Trigram-indexed search (core logic in `aterm-search`)
 //! - [`shell_integration`] - Shell integration injection (zsh, bash, fish)
-//! - [`ui`] - Verified UI bridge state machine
+//! - [`bell`] - Bell presentation state machines
+//! - [`fault`] - Deterministic fault injection for fail-closed-path testing
 //!
-//! ### Perception & AI
-//!
-//! - [`perception`] - Structured screen reading for AI agents
-//! - [`semantic`] - Semantic region detection (prompts, commands, errors)
-//!
-//! ### Graphics
-//!
-//! - `syntax` - Tree-sitter syntax highlighting infrastructure
+//! There is no perception, semantic-region or syntax-highlighting module in
+//! this crate. Semantic state is read by consumers over the engine
+//! (`aterm-gui`'s `session_status`, `aterm-observe`, `aterm-agent`), per the
+//! ROADMAP §5 rule that AI features are consumers, never engine primitives.
 //!
 //! ### Extracted Crates
 //!
@@ -53,21 +50,14 @@
 //! - [`selection`] - Text selection and smart semantic selection (extracted to `aterm-selection`)
 //! - [`scrollback`] - Tiered storage (extracted to `aterm-scrollback`)
 //! - `aterm-vi` - Vi mode keyboard navigation used internally by [`terminal`]
-//! - `aterm-jsonrpc` (`jsonrpc`) - JSON-RPC 2.0 protocol used internally by
-//!   daemon integrations
 //!
 //! ### Internal (`pub(crate)`)
 //!
 //! - `parser` - VT100/ANSI parser (extracted to `aterm-parser`, re-exported)
 //! - `domain` - Domain value types
-//! - `iterm_image` - Terminal inline image protocol
-//! - `platform` - Platform abstraction (fonts, clipboard, notifications)
-//! - `security` - Security primitives for AI agent interaction
-//! - `session` - Terminal session management (test only)
 //! - `sixel` - Sixel graphics decoder (off-by-default `sixel` feature; when
 //!   enabled, decodes a sixel DCS into an inline image via the OSC 1337 path
 //!   and advertises DA1 code 4)
-//! - `text_shaping_config` - Text shaping configuration
 //! - `vt_level` - VT compatibility level tracking
 //!
 //! ## Code Guidelines
@@ -184,22 +174,6 @@
 //   derivable_impls, iter_without_into_iter, elidable_lifetime_names
 // -----------------------------------------------------------------------------
 
-// Used by test code in feature-gated modules (media, gpu).
-#[cfg(test)]
-#[allow(
-    unused_imports,
-    reason = "used by test code in feature-gated modules (media, gpu)"
-)]
-pub(crate) use aterm_ffi_types::MAX_FFI_BUFFER_SIZE;
-
-/// Origin-aware clipboard policy (Phase 3 of #7874 escape-sequence
-/// hardening). Decides whether a clipboard action is allowed, denied,
-/// or requires user confirmation, keyed by the origin of the request
-/// (user-initiated, PTY-origin OSC 52, paste-injection,
-/// checkpoint-restore). Orthogonal to the `ClipboardAuth` capability
-/// tokens in `terminal::clipboard_auth`.
-pub mod clipboard_policy;
-
 /// Bell presentation state: the pure flash/beep decision logic
 /// (timestamps injected) behind a host's BEL handling. The engine fires
 /// [`terminal::Terminal::set_bell_callback`]; the host feeds these state
@@ -218,7 +192,6 @@ pub mod grid;
 pub(crate) use aterm_parser as parser;
 /// Text selection and smart semantic selection (re-exported from `aterm-selection`).
 pub use aterm_selection as selection;
-/// Parser FFI bridge (depends on aterm-core FFI infrastructure).
 /// The engine-owned render snapshot (`read_image` boundary, REARCH A-3):
 /// [`render::RenderInput`] is the `Terminal`-free value a renderer consumes for
 /// one frame; the engine builds it via
@@ -229,30 +202,10 @@ pub mod render;
 pub mod scrollback;
 pub mod search;
 
-// Security primitives for AI agent terminal interaction (defense-in-depth: buffer
-// history tracking for temporal integrity, ANSI sanitization for hidden/deceptive
-// content). #2584 extraction never occurred — narrowed back to crate-internal (#6671).
-
-// AI perception layer for structured terminal screen reading (semantic
-// understanding of terminal content: text mode = raw lines/full text; layout mode
-// = cell positions/styles; semantic mode = typed regions like prompts, commands,
-// errors, code). Crate-internal — these are notes, not item docs.
-
-/// Platform abstraction traits for portable terminal integration.
-///
-/// Defines platform-specific functionality (fonts, clipboard, notifications)
-/// that varies across operating systems. Each platform provides its own
-/// implementation via native Rust code or FFI callbacks.
-///
-/// Public so `aterm-core-ffi` can own the GPU glyph-instance FFI without
-/// duplicating text-shaping types and stub implementations (#6555).
-pub mod platform;
 /// Sixel graphics decoder (extracted to `aterm-sixel` crate).
 #[cfg(feature = "sixel")]
 pub(crate) use aterm_sixel as sixel;
 pub mod terminal;
-pub(crate) mod text_shaping_config;
-pub mod ui;
 /// Vi mode navigation: cursor movement, marks, inline search.
 ///
 /// Re-exported from the `aterm-vi` crate. Provides vim-style keyboard
@@ -265,10 +218,6 @@ pub(crate) use aterm_vi as vi_mode;
 pub use aterm_vi::{InlineSearchKind, ViBoundary, ViMotion, ViPoint, ViVisualType};
 pub(crate) mod vt_level;
 
-/// Test-only helper re-exports for in-crate tests.
-#[cfg(test)]
-pub mod testing;
-
 /// Shell integration injection (zsh, bash, fish).
 ///
 /// Re-exported from the standalone `aterm-shell-integration` crate.
@@ -277,7 +226,3 @@ pub use aterm_shell_integration as shell_integration;
 // Property tests module (only compiled when testing)
 #[cfg(test)]
 mod tests;
-
-// ffi_tests/ fully migrated to aterm-core-ffi (#5760) — module removed.
-
-pub mod prelude;

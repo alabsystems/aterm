@@ -11,7 +11,9 @@
 //! prefix, its reroute stubs and the `Updates/` ledger all live under it), and
 //! `$XDG_CONFIG_HOME/aterm/aterm.toml` switches every automatic lane off —
 //! [`CONFIG_OFF`]. The reroute's escape is the `--no-reroute` FLAG ([`NO_REROUTE`]),
-//! which a caller adds to its window/session argv (before any `-e`/`--` payload).
+//! which a caller adds to its window/session argv (before any `-e`/`--` payload), and a
+//! window's private socket is the `--control-sock` FLAG ([`control_sock`]): no
+//! environment variable selects a socket, the grid or headless mode (2026-09-24).
 
 use std::path::Path;
 use std::process::Command;
@@ -22,13 +24,49 @@ use std::process::Command;
 #[allow(dead_code)]
 pub const NO_REROUTE: &str = "--no-reroute";
 
+/// The window flag that binds its control socket at `<root>/run/aterm/aterm.sock` —
+/// the one path every window test dials (its token is named after it:
+/// `aterm.sock.token`). A WINDOW flag: the session takes no socket.
+#[allow(dead_code)]
+pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
+    [
+        "--control-sock".into(),
+        root.join("run/aterm/aterm.sock").into_os_string(),
+    ]
+}
+
 /// The automatic lanes, switched off the way Settings switches them off: `[update]
 /// enabled = false` (Check for updates automatically) with `auto_apply = false`,
-/// `[packages] enabled = false` (Automatic updates), and the `[machine]` settings left
-/// alone.
+/// `[packages] enabled = false` (Automatic updates), the `[machine]` settings left
+/// alone, and the window's agent supervisor off ([`HARNESS_OFF`]).
 pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
-                              [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+                              [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n\
+                              [harness]\nenabled = false\n";
+
+/// [`CONFIG_OFF`]'s last table: Settings ▸ Harness off. The window supervises every
+/// agent session it hosts by default, a headless instance's included (owner,
+/// 2026-09-24), so a test that drives a fake `claude` would otherwise share the
+/// session with it. A test OF that supervisor takes this table out and writes its own.
+#[allow(dead_code)]
+pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
+
+/// Arm `cmd` — a `--headless` launch — with a LIFELINE (`aterm_uds::lifeline`): the
+/// instance shuts down when this test process goes, however it goes. A `Drop` that
+/// kills the child runs on a panic, but not when the runner is SIGKILLed, a
+/// `timeout` fires or a person presses Ctrl-C twice — and an instance left behind
+/// then runs for days holding a shell (gap #36: eleven days, measured). Call it
+/// after `.stdin(..)` and before any `-e` payload, and keep the value alive as long
+/// as the instance should run (the booted instance holds it).
+///
+/// # Panics
+/// The lifeline's FIFO could not be made in `root`: a scratch world this test
+/// cannot write to is a broken fixture, not a reason to boot an unwatched instance.
+#[allow(dead_code)]
+pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline {
+    aterm_uds::lifeline::Lifeline::arm(cmd, root)
+        .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", root.display()))
+}
 
 /// Whether the control socket at `sock` is LISTENING: a connect the kernel
 /// takes into the backlog, dropped at once (the server's own
@@ -55,6 +93,7 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
         "cache",
         "data",
         "state",
+        "tmp",
     ] {
         let path = root.join(relative);
         std::fs::create_dir_all(&path)?;
@@ -93,7 +132,10 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("state"))
-        .env("ATERM_CONTROL_SOCK", root.join("run/aterm/aterm.sock"))
+        // Control-socket discovery falls back to `$TMPDIR` after `$XDG_RUNTIME_DIR`
+        // (macOS's per-user runtime dir): a live aterm's socket must not be findable.
+        .env("TMPDIR", root.join("tmp"))
+        // A development seam (these are debug builds): nothing to log.
         .env("ATERM_LOG", "off")
         .env("SHELL", "/bin/sh");
 }

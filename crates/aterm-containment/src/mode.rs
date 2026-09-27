@@ -29,16 +29,16 @@ use std::fmt;
 /// - **User**: Normal usage — standard safeguards. Output shadow-scanned.
 /// - **Safety**: Reduced capability — allowlisted operations only.
 /// - **Containment**: Hostile agent — most restrictive POLICY: no network, no
-///   fork, filtered I/O (policy intent only — I/O filtering is NOT yet enforced at
-///   runtime; [`crate::OutputSanitizer`] has no production caller), no MCP, no
+///   fork, filtered I/O (policy intent only — I/O filtering is NOT enforced at
+///   runtime), no MCP, no
 ///   plugins. The NO-NETWORK part AND a conservative
 ///   SECRET-directory read/write deny are OS-enforced on macOS (Seatbelt `deny
 ///   network*` + `deny file-read*/file-write*` over the credential set); the rest
 ///   is the policy data model + the capability gate (GENERAL OS filesystem scoping
 ///   is the deferred follow-up).
 ///
-/// Mode is set ONLY by the launcher (env var `ATERM_CONTAINMENT_MODE` or
-/// CLI `--mode`). aterm cannot upgrade its own mode. Mode is immutable
+/// Mode is set ONLY by the launcher (its `--containment` / `--sandbox` /
+/// `--no-sandbox` flag). aterm cannot upgrade its own mode. Mode is immutable
 /// after initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -63,20 +63,6 @@ impl ContainmentMode {
     #[must_use]
     pub const fn level(self) -> u8 {
         self as u8
-    }
-
-    /// Whether this mode has equal or greater capability than `other`.
-    #[must_use]
-    #[cfg_attr(not(kani), allow(dead_code))]
-    pub(crate) const fn at_least(self, other: Self) -> bool {
-        self as u8 >= other as u8
-    }
-
-    /// Whether this mode has strictly less capability than `other`.
-    #[must_use]
-    #[cfg_attr(not(kani), allow(dead_code))]
-    pub(crate) const fn below(self, other: Self) -> bool {
-        (self as u8) < (other as u8)
     }
 
     /// The variant's canonical name — identical to its `Display` rendering.
@@ -154,14 +140,6 @@ impl std::error::Error for ParseModeError {
     }
 }
 
-impl ParseModeError {
-    /// The rejected input string.
-    #[must_use]
-    pub fn input(&self) -> &str {
-        &self.0
-    }
-}
-
 impl std::str::FromStr for ContainmentMode {
     type Err = ParseModeError;
 
@@ -190,19 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn test_at_least() {
-        assert!(ContainmentMode::Master.at_least(ContainmentMode::Master));
-        assert!(ContainmentMode::Master.at_least(ContainmentMode::Containment));
-        assert!(!ContainmentMode::Containment.at_least(ContainmentMode::User));
-    }
-
-    #[test]
-    fn test_below() {
-        assert!(ContainmentMode::Containment.below(ContainmentMode::Safety));
-        assert!(!ContainmentMode::Master.below(ContainmentMode::Master));
-    }
-
-    #[test]
     fn test_parse() {
         assert_eq!(
             "master".parse::<ContainmentMode>().unwrap(),
@@ -226,7 +191,7 @@ mod tests {
     }
 
     /// Verify parse rejects inputs that could bypass mode selection.
-    /// An attacker controlling ATERM_CONTAINMENT_MODE might try numeric
+    /// An attacker controlling the `--containment` value might try numeric
     /// values, padding, or similar to escalate.
     #[test]
     fn test_parse_rejects_bypass_attempts() {

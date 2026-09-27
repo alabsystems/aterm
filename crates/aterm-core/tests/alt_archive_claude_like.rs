@@ -151,7 +151,7 @@ fn fixed_clock() -> ClockReading {
 
 fn term(layout: &Layout) -> Terminal {
     let mut t = Terminal::new(layout.rows as u16, layout.cols as u16);
-    t.set_alt_archive_enabled(true); // regardless of ATERM_ALT_ARCHIVE
+    t.set_alt_archive_enabled(true); // explicitly, whatever the default
     t
 }
 

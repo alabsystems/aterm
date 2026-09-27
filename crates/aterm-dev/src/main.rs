@@ -207,26 +207,56 @@ fn run_ship(forwarded: &[String]) -> i32 {
 ///   4. `targo` on PATH, accepted ONLY when it lives under that default prefix
 ///      — the managed shim `<prefix>/bin/targo` — never a rustup-linked or
 ///      source-built copy that happens to sort first (the PATH-order hijack the
-///      scripts refuse too, so one release is cut by one toolchain). The shim
-///      is spawned as-is: `ship` is a single spawn that resolves at exec time,
-///      so there is no running-pack window for its body to move under.
+///      scripts refuse too, so one release is cut by one toolchain). The pin is
+///      the shim's EXEC TARGET ([`shim_exec_target`]), the build-numbered store
+///      file, as the scripts pin it — never the shim path, whose body the next
+///      `aterm pkg install trust` rewrites.
 ///   5. bare `cargo` — the documented last resort for a rustup box; the spawn
 ///      failure in `run_ship` names the product's fix first.
+///
+/// EVERY HIT IS RESOLVED BEFORE IT RUNS ([`physical`]). Step 3 used to return
+/// `store/trust/current/bin/targo` as it stood, and targo takes its `trustc`,
+/// `trustdoc` and nested `$CARGO` from its own executable's UNRESOLVED path — so
+/// the build ran `…/current/bin/trustc` for every crate, and an atpkg update
+/// flipping `current` mid-build handed the rest of it to the new compiler:
+/// `error[E0514]: found crate … compiled by an incompatible version of rustc`,
+/// measured end to end on APFS clones of the store (2026-09-24), and the same
+/// flip under the build-numbered path finished clean. A `$CARGO` that names
+/// `current` (an outer targo started that way) is the same hazard, so it is
+/// resolved too.
 fn ship_driver() -> PathBuf {
-    if let Some(cargo) = std::env::var_os("CARGO").filter(|c| !c.is_empty()) {
-        return PathBuf::from(cargo);
+    let which = || {
+        Command::new("aterm")
+            .args(["pkg", "which", "targo"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| which_line_store_path(&out.stdout))
+    };
+    ship_driver_from(
+        std::env::var_os("CARGO"),
+        which,
+        std::env::var_os("HOME"),
+        std::env::var_os("PATH"),
+    )
+}
+
+/// [`ship_driver`] over its four inputs — `$CARGO`, the `aterm pkg which targo`
+/// answer (asked only when `$CARGO` did not answer), `$HOME` and `$PATH` — so the
+/// order and the resolution are tests, not promises.
+fn ship_driver_from(
+    cargo: Option<std::ffi::OsString>,
+    which: impl FnOnce() -> Option<PathBuf>,
+    home: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(cargo) = cargo.filter(|c| !c.is_empty()) {
+        return physical(PathBuf::from(cargo));
     }
-    if let Some(cand) = Command::new("aterm")
-        .args(["pkg", "which", "targo"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| which_line_store_path(&out.stdout))
-        .filter(|cand| is_executable(cand))
-    {
-        return cand;
+    if let Some(cand) = which().filter(|cand| is_executable(cand)) {
+        return physical(cand);
     }
-    let prefix = std::env::var_os("HOME")
+    let prefix = home
         .filter(|h| !h.is_empty())
         .map(|home| store_prefix_under(Path::new(&home)));
     if let Some(prefix) = &prefix {
@@ -237,21 +267,64 @@ fn ship_driver() -> PathBuf {
             .join("bin")
             .join("targo");
         if is_executable(&cand) {
-            return cand;
+            return physical(cand);
         }
     }
-    if let (Some(prefix), Some(path)) = (&prefix, std::env::var_os("PATH")) {
+    if let (Some(prefix), Some(path)) = (&prefix, path) {
         for dir in std::env::split_paths(&path) {
             if dir.as_os_str().is_empty() {
                 continue;
             }
             let cand = dir.join("targo");
             if cand.starts_with(prefix) && is_executable(&cand) {
-                return cand;
+                return physical(shim_exec_target(&cand).unwrap_or(cand));
             }
         }
     }
     PathBuf::from("cargo")
+}
+
+/// `path` with its DIRECTORY resolved to the physical one — the Rust form of
+/// the scripts' `$(cd "$(dirname "$cand")" && pwd -P)/$(basename "$cand")`.
+/// The file name is kept as it is: a driver is told apart by its argv0 (`targo`
+/// refuses a bare verb, `cargo` does not), and resolving a final symlink could
+/// hand it another name. A path whose directory will not resolve is returned
+/// unchanged, and the spawn names the failure.
+fn physical(path: PathBuf) -> PathBuf {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return path;
+    };
+    if dir.as_os_str().is_empty() {
+        return path;
+    }
+    // Via `call1`: the same hardened raw-path dodge as `is_executable`.
+    match call1(std::fs::canonicalize, dir) {
+        Ok(real) => real.join(name),
+        Err(_) => path,
+    }
+}
+
+/// The target an atpkg `sh` exec stub forwards to: the first trimmed line of the
+/// form `exec '<path>' "$@"`, `'\''` unquoted — a mirror of
+/// `atpkg::platform::parse_sh_shim_target` (and of `aterm_spec::verify`'s
+/// copy), since this crate carries no atpkg dependency. `None` for anything
+/// that is not such a stub, a relative target, or one that is not executable.
+fn shim_exec_target(shim: &Path) -> Option<PathBuf> {
+    // A stub is a few hundred bytes (measured 2026-09-18: 167); atpkg caps them
+    // at 64 KiB, and nothing larger is read.
+    let len = call1(std::fs::metadata, shim).ok()?.len();
+    if len > 64 * 1024 {
+        return None;
+    }
+    // Via `call1`: the hardened UTF-8-rejecting read, whose rejection is "not a
+    // stub" here.
+    let text = call1(std::fs::read_to_string, shim).ok()?;
+    let target = text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("exec '")?;
+        let end = rest.rfind("' \"$@\"")?;
+        Some(PathBuf::from(rest[..end].replace("'\\''", "'")))
+    })?;
+    (target.is_absolute() && is_executable(&target)).then_some(target)
 }
 
 /// The store path in one line of `aterm pkg which targo` output: the LAST
@@ -657,6 +730,82 @@ mod tests {
         );
         assert_eq!(which_line_store_path(b""), None);
         assert_eq!(which_line_store_path(b"targo \xe2\x86\x92 /p\xff"), None);
+    }
+
+    /// THE E0514 PATH (measured 2026-09-24 on APFS clones of the store: a build
+    /// started as `store/trust/current/bin/targo` failed E0514 when `current`
+    /// flipped under it; the same flip under `store/trust/9192/bin/targo`
+    /// finished clean). Every rung that can name the store answers the
+    /// BUILD-NUMBERED driver, never a path through `current` — `$CARGO`, the
+    /// `aterm pkg which` answer, the store fallback, and the managed shim on
+    /// PATH (pinned to its exec target, not its rewritable body) — and a
+    /// driver's own name survives the resolution.
+    #[cfg(unix)]
+    #[test]
+    fn every_rung_runs_the_build_numbered_driver_never_current() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("aterm-dev-ship-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("home");
+        let prefix = store_prefix_under(&home);
+        let build = prefix.join("store/trust/9192/bin");
+        std::fs::create_dir_all(&build).expect("mkdir");
+        let exe = |p: &Path, body: &str| {
+            std::fs::write(p, body).expect("write");
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        exe(&build.join("targo"), "#!/bin/sh\n");
+        std::os::unix::fs::symlink("9192", prefix.join("store/trust/current")).expect("ln");
+        let real = std::fs::canonicalize(&build).expect("real").join("targo");
+        let through_current = prefix.join("store/trust/current/bin/targo");
+        let pinned = |got: PathBuf, rung: &str| {
+            assert_eq!(got, real, "{rung}");
+            assert!(
+                !got.components().any(|c| c.as_os_str() == "current"),
+                "{rung}: {}",
+                got.display()
+            );
+        };
+
+        pinned(
+            ship_driver_from(None, || None, Some(home.clone().into()), None),
+            "3: the store fallback",
+        );
+        pinned(
+            ship_driver_from(
+                Some(through_current.clone().into()),
+                || panic!("$CARGO answered: `aterm pkg which` is never asked"),
+                None,
+                None,
+            ),
+            "1: $CARGO naming current",
+        );
+        pinned(
+            ship_driver_from(None, || Some(through_current.clone()), None, None),
+            "2: a which answer through current",
+        );
+
+        // 4: no `current` to fall back on, the managed shim first on PATH.
+        std::fs::remove_file(prefix.join("store/trust/current")).expect("rm current");
+        let shims = prefix.join("bin");
+        std::fs::create_dir_all(&shims).expect("mkdir");
+        exe(
+            &shims.join("targo"),
+            &format!(
+                "#!/bin/sh\nexec '{}' \"$@\"\n",
+                build.join("targo").display()
+            ),
+        );
+        pinned(
+            ship_driver_from(None, || None, Some(home.clone().into()), Some(shims.into())),
+            "4: the managed shim, pinned to its exec target",
+        );
+        // 5: nothing names a driver.
+        assert_eq!(
+            ship_driver_from(None, || None, None, None),
+            PathBuf::from("cargo")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Only the first line is a resolution; a dev-linked second field with

@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use aterm_agent::operator::{
     AckOutcome, AttentionCondition, DurableQueue, EnqueueOutcome, EventGeneration, EventStatus,
-    FaultLatchOutcome, FleetFaultReason, FleetGateStatus, NewEvent, OperatorError, QueueConfig,
-    Resolution,
+    FaultLatchOutcome, FinalActionPermit, FleetFaultReason, FleetGateStatus, NewEvent,
+    OperatorError, QueueConfig, Resolution,
 };
 use aterm_digest::Sha256;
 use aterm_spec::derive::{
@@ -187,6 +187,28 @@ fn operator_event_delivery_real_claim_cas_matches_model() {
         &queued_again,
         "ReclaimForRetry",
         "operator delivery first reclaim",
+    );
+
+    // NEGATIVE CONTROL: an off-by-one cap compare escalates this first expiry.
+    // The real reclaim requeued it (`!reclaimed[0].escalated`); the model must
+    // refuse the early escalation too.
+    let forged_early_escalation = state_after(
+        &expired_first,
+        &[
+            ("phase", 3),
+            ("token", 0),
+            ("stale_token", 1),
+            ("expired", 0),
+            ("redeliveries", 1),
+            ("escalated", 1),
+        ],
+    );
+    assert_rejected(
+        &model,
+        &expired_first,
+        &forged_early_escalation,
+        "ReclaimAsEscalation",
+        "operator delivery escalation below the cap",
     );
 
     let second = queue.claim_at(200).expect("reclaim").expect("redelivery");
@@ -364,16 +386,37 @@ fn operator_event_delivery_real_redelivery_cap_matches_model() {
         EventStatus::InDoubt { token: Some(ref token), .. }
             if token == &final_claim.token
     ));
-    let final_in_doubt = state_after(
-        &escalation_expired,
-        &[("phase", 5), ("expired", 0), ("in_doubt", 1)],
-    );
+    let final_in_doubt = state_after(&escalation_expired, &[("phase", 5), ("expired", 0)]);
     assert_transition(
         &model,
         &escalation_expired,
         &final_in_doubt,
         "ExpiredEscalationInDoubt",
         "operator delivery expired human escalation",
+    );
+
+    // NEGATIVE CONTROL: an in-doubt record without its claimant's token can
+    // never be reconciled. The real one kept the token (asserted above) and a
+    // token-scoped reconciliation resolves it; the tokenless successor is refused.
+    let forged_tokenless = state_after(&final_in_doubt, &[("token", 0)]);
+    assert_rejected(
+        &model,
+        &escalation_expired,
+        &forged_tokenless,
+        "ExpiredEscalationInDoubt",
+        "operator delivery tokenless in-doubt",
+    );
+    assert_eq!(
+        queue
+            .reconcile_in_doubt_at(
+                event_id,
+                &final_claim.token,
+                Resolution::NoAction,
+                "human reviewed the expired escalation",
+                final_claim.expires_at_ms + 1,
+            )
+            .expect("the retained token scopes the reconciliation"),
+        AckOutcome::Resolved
     );
 }
 
@@ -414,6 +457,25 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
         &intent,
         "PersistIntent",
         "operator actuator durable intent",
+    );
+
+    // An ordinary acknowledgement cannot close an event whose action is in
+    // flight: that would resolve it with neither a result nor an in-doubt record.
+    assert!(matches!(
+        queue.ack_at(event_id, &claim.token, Resolution::NoAction, 102),
+        Err(OperatorError::ActionInFlight(found)) if found == event_id
+    ));
+    assert!(matches!(
+        queue.status(event_id).unwrap().status,
+        EventStatus::ActionInFlight { .. }
+    ));
+    let forged_ack = state_after(&intent, &[("phase", 4), ("resolved", 1)]);
+    assert_rejected(
+        &model,
+        &intent,
+        &forged_ack,
+        "ResolveInDoubt",
+        "operator ack of an in-flight action",
     );
 
     // Simulate process loss after intent but before the actuator is known to have
@@ -478,6 +540,38 @@ fn operator_wal_core_orphan_recovery_and_human_reconciliation_match_model() {
     ));
 }
 
+/// Project the real queue onto `OperatorFleetFault`: the durable gate and its
+/// pending roster, the in-doubt scan `complete_fault_clear_at` makes, and the
+/// separately synchronized marker file, read off the disk. `actions` and
+/// `blocked_egress` are the model's egress witnesses, which the queue refuses
+/// before they could exist, so they project as the initial zero.
+fn fleet_fault_project(model: &Model, queue: &DurableQueue, directory: &Path) -> State {
+    let (phase, pending) = match queue.fleet_gate().unwrap() {
+        FleetGateStatus::Healthy => (0, 0),
+        FleetGateStatus::Faulted(_) => (2, 0),
+        FleetGateStatus::RebaselineRequired { pending_sids, .. } => {
+            (3, i64::try_from(pending_sids.len()).unwrap())
+        }
+    };
+    let in_doubt = queue
+        .snapshots()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event.status, EventStatus::InDoubt { .. }));
+    state_after(
+        &model.init_state(),
+        &[
+            ("phase", phase),
+            ("marker", i64::from(directory.join(FAULT_MARKER).exists())),
+            ("pending", pending),
+            ("in_doubt", i64::from(in_doubt)),
+        ],
+    )
+}
+
+/// The queue's fault marker file (`operator.rs`'s `FAULT_MARKER_NAME`).
+const FAULT_MARKER: &str = "operator.fault";
+
 #[test]
 fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
     let directory = TestDir::new("fleet-fault");
@@ -494,24 +588,40 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         .unwrap();
 
     let model = operator_fleet_fault_model();
-    let healthy = model.init_state();
+    let project = || fleet_fault_project(&model, &queue, directory.path());
+    let healthy = project();
+    assert_eq!(healthy, model.init_state());
     assert!(matches!(
         queue
             .latch_fault_at(FleetFaultReason::ObserverOverflow, 102)
             .unwrap(),
         FaultLatchOutcome::Latched(_)
     ));
-    assert!(matches!(
-        queue.fleet_gate().unwrap(),
-        FleetGateStatus::Faulted(_)
-    ));
-    let faulted = state_after(&healthy, &[("phase", 2), ("marker", 1)]);
+    // The fault revokes the in-flight action's final permit; a check that let it
+    // through would be a write after the revocation (`OperatorWalActuator`'s
+    // `AuthorityLossNeverEgresses`).
+    let permit = || {
+        queue
+            .try_validate_action_permit(event_id, &claim.token, "sid-a", "turn", &action_hash)
+            .unwrap()
+    };
+    assert_eq!(permit(), FinalActionPermit::Revoked);
+    let faulted = project();
     assert_transition(
         &model,
         &healthy,
         &faulted,
         "LatchFault",
         "operator durable fleet-fault latch",
+    );
+    // NEGATIVE CONTROL: a fault committed without its marker. The failed-write
+    // path itself is driven by `operator_fleet_fault_failed_marker_write_commits_no_fault`.
+    assert_rejected(
+        &model,
+        &healthy,
+        &state_after(&faulted, &[("marker", 0)]),
+        "LatchFault",
+        "operator fault latched without its marker",
     );
 
     // The real core checks the durable gate before inspecting queue contents.
@@ -524,7 +634,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
     assert_transition(
         &model,
         &faulted,
-        &faulted,
+        &project(),
         "AttemptActuateBlocked",
         "operator faulted claim refusal",
     );
@@ -541,7 +651,12 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         queue.begin_fault_clear_at(104).unwrap(),
         vec!["sid-a".to_string(), "sid-b".to_string()]
     );
-    let reconciling = state_after(&faulted, &[("phase", 3), ("pending", 2), ("in_doubt", 1)]);
+    let reconciling = project();
+    assert_eq!(
+        (reconciling["pending"], reconciling["in_doubt"]),
+        (2, 1),
+        "the clear turned the in-flight intent in-doubt"
+    );
     assert_transition(
         &model,
         &faulted,
@@ -559,7 +674,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
             evidence,
         ))
         .unwrap();
-    let one_pending = state_after(&reconciling, &[("pending", 1)]);
+    let one_pending = project();
     assert_transition(
         &model,
         &reconciling,
@@ -568,7 +683,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         "operator fault clear fresh baseline",
     );
     queue.unmanage_sid_at("sid-b", 105).unwrap();
-    let roster_reconciled = state_after(&one_pending, &[("pending", 0)]);
+    let roster_reconciled = project();
     assert_transition(
         &model,
         &one_pending,
@@ -580,6 +695,22 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         queue.complete_fault_clear_at(106),
         Err(OperatorError::EventInDoubt(found)) if found == event_id
     ));
+    assert_eq!(
+        project(),
+        roster_reconciled,
+        "a refused clear commits nothing and keeps the marker"
+    );
+    // NEGATIVE CONTROL: the clear committed past both in-doubt scans, the API's
+    // and the apply's (`operator.rs`'s `wal_apply_backstops` pins the second).
+    let unscanned = state_after(&roster_reconciled, &[("phase", 4)]);
+    assert_rejected(
+        &model,
+        &roster_reconciled,
+        &unscanned,
+        "CommitClear",
+        "operator fault clear committed over an in-doubt action",
+    );
+    assert!(!model.check_invariant("ClearCommitHasNoAmbiguity", &unscanned));
 
     queue
         .reconcile_in_doubt_at(
@@ -590,7 +721,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
             107,
         )
         .unwrap();
-    let ambiguity_resolved = state_after(&roster_reconciled, &[("in_doubt", 0)]);
+    let ambiguity_resolved = project();
     assert_transition(
         &model,
         &roster_reconciled,
@@ -599,14 +730,68 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
         "operator fault clear human ambiguity reconciliation",
     );
     queue.complete_fault_clear_at(108).unwrap();
-    assert_eq!(queue.fleet_gate().unwrap(), FleetGateStatus::Healthy);
+    let cleared = project();
+    assert_eq!(cleared, healthy, "the clear removed the marker");
+    // The gate is healthy again, but the permit the fault revoked stays revoked:
+    // the clear turned the intent in-doubt and a human resolved it
+    // (`OperatorWalActuator`'s `RevocationIsFinal`).
+    assert_eq!(permit(), FinalActionPermit::Revoked);
     assert_transition(
         &model,
         &ambiguity_resolved,
-        &healthy,
+        &cleared,
         "CompleteClear",
         "operator fault clear durable completion",
     );
+}
+
+/// `latch_fault_at` writes the marker before the WAL record and stops if the
+/// write fails. The marker path is occupied by a directory, so
+/// `ensure_fault_marker` fails before writing anything; the queue must then
+/// commit no fault. A latch that swallowed that error would commit a WAL fault
+/// no marker owns, which this projection shows as `(phase 2, marker 0)`.
+///
+/// `marker` is measured while the directory still blocks the path, as whether a
+/// regular marker file is there. It reads 0 in the healthy run and in the
+/// slipped one alike (the blocked path cannot hold a marker), so `phase`, read
+/// off the reopened WAL, is what tells the two apart.
+#[test]
+fn operator_fleet_fault_failed_marker_write_commits_no_fault() {
+    let directory = TestDir::new("fleet-fault-marker-failure");
+    let queue = DurableQueue::open(directory.path(), 1, wal_config()).unwrap();
+    let model = operator_fleet_fault_model();
+    let healthy = fleet_fault_project(&model, &queue, directory.path());
+    assert_eq!(healthy, model.init_state());
+
+    let marker_path = directory.path().join(FAULT_MARKER);
+    fs::create_dir(&marker_path).unwrap();
+    let latched = queue.latch_fault_at(FleetFaultReason::ObserverOverflow, 100);
+    // Measure before the directory goes, and before reopening: open recreates
+    // the marker for any durable fault record, which would hide an unowned one.
+    let marker = i64::from(fs::symlink_metadata(&marker_path).is_ok_and(|meta| meta.is_file()));
+    drop(queue);
+    fs::remove_dir(&marker_path).unwrap();
+    let reopened = DurableQueue::open(directory.path(), 2, wal_config()).unwrap();
+    let durable = state_after(
+        &fleet_fault_project(&model, &reopened, directory.path()),
+        &[("marker", marker)],
+    );
+    assert_eq!(
+        durable, healthy,
+        "a failed marker write committed a fault no marker owns"
+    );
+    assert!(latched.is_err(), "an unwritable marker must fail the latch");
+
+    // NEGATIVE CONTROL: what the swallowed error would have left durable.
+    let unowned = state_after(&healthy, &[("phase", 2)]);
+    assert_rejected(
+        &model,
+        &healthy,
+        &unowned,
+        "LatchFault",
+        "operator fault committed after a failed marker write",
+    );
+    assert!(!model.check_invariant("MarkerOwnsEveryBlockedPhase", &unowned));
 }
 
 #[test]

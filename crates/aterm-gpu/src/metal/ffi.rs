@@ -15,7 +15,7 @@
 //!
 //! Every destination this file can name is a texture it allocated (or, in
 //! [`super::swapchain`]'s case, a drawable texture that module hands a
-//! [`Pass`]). No `CAMetalLayer` is created in THIS file and nothing is
+//! `Pass`). No `CAMetalLayer` is created in THIS file and nothing is
 //! presented from it; the swapchain lives in `super::swapchain`, which owns
 //! the QuartzCore link and every drawable selector — exactly the "next to the
 //! code that needs it" placement this header promised when it removed the
@@ -493,10 +493,15 @@ pub(crate) struct BlendState {
 pub(crate) struct ColorWriteMask(usize);
 
 impl ColorWriteMask {
+    #[cfg(test)]
     pub(crate) const NONE: Self = Self(0);
+    #[cfg(test)]
     pub(crate) const RED: Self = Self(1 << 3);
+    #[cfg(test)]
     pub(crate) const GREEN: Self = Self(1 << 2);
+    #[cfg(test)]
     pub(crate) const BLUE: Self = Self(1 << 1);
+    #[cfg(test)]
     pub(crate) const ALPHA: Self = Self(1);
     /// `wgpu::ColorWrites::COLOR` — RGB only, alpha left exactly as loaded.
     pub(crate) const COLOR: Self = Self((1 << 3) | (1 << 2) | (1 << 1));
@@ -540,8 +545,6 @@ pub(crate) enum SamplerFilter {
 #[repr(usize)]
 pub(crate) enum SamplerMipFilter {
     NotMipmapped = 0,
-    Nearest = 1,
-    Linear = 2,
 }
 
 /// `MTLSamplerAddressMode`.
@@ -549,11 +552,6 @@ pub(crate) enum SamplerMipFilter {
 #[repr(usize)]
 pub(crate) enum SamplerAddressMode {
     ClampToEdge = 0,
-    MirrorClampToEdge = 1,
-    Repeat = 2,
-    MirrorRepeat = 3,
-    ClampToZero = 4,
-    ClampToBorderColor = 5,
 }
 
 /// Everything [`Device::new_sampler`] sets. A struct rather than four
@@ -602,7 +600,9 @@ impl SamplerDesc {
 #[repr(usize)]
 pub(crate) enum LanguageVersion {
     V2_3 = (2 << 16) | 3,
+    #[cfg(test)]
     V2_4 = (2 << 16) | 4,
+    #[cfg(test)]
     V3_0 = 3 << 16,
 }
 
@@ -619,6 +619,7 @@ pub(crate) const TEXTURE_USAGE_RENDER_TARGET: usize = 4;
 /// Required on any texture that will be reinterpreted through
 /// `newTextureViewWithPixelFormat:` — the Unorm/sRGB pair the base passes rely
 /// on. Metal REFUSES the view without it, so it is not optional.
+#[cfg(test)]
 pub(crate) const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: usize = 16;
 
 // ---------------------------------------------------------------------------
@@ -696,6 +697,7 @@ impl CompileOptions {
 
     /// Read back, so a wrong setter PROTOTYPE (the failure mode `msg` exists to
     /// prevent) is a test failure rather than a silently ignored write.
+    #[cfg(test)]
     pub(crate) fn preserve_invariance(&self) -> bool {
         // SAFETY: `-preserveInvariance` is a `BOOL` getter on a live object.
         unsafe {
@@ -705,6 +707,7 @@ impl CompileOptions {
     }
 
     /// Read back, as [`Self::preserve_invariance`].
+    #[cfg(test)]
     pub(crate) fn language_version(&self) -> usize {
         // SAFETY: `-languageVersion` is an `NSUInteger` getter on a live object.
         unsafe {
@@ -718,6 +721,68 @@ impl CompileOptions {
 #[derive(Debug)]
 pub(crate) struct Device(Obj);
 
+/// The two facts device selection reads off one `MTLCopyAllDevices` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListedGpu {
+    /// `-isLowPower`: the integrated GPU of a dual-GPU Intel Mac. NO on
+    /// Apple silicon (measured: M5 Max).
+    pub(crate) low_power: bool,
+    /// `-isHeadless`: a GPU that cannot drive a display.
+    pub(crate) headless: bool,
+}
+
+/// Which `MTLCopyAllDevices` entry [`Device::preferred`] renders on, and the
+/// word its one-line report uses for why — or `None` when the listing alone
+/// cannot decide and only `MTLCreateSystemDefaultDevice` (a WindowServer call)
+/// can. `None` entries are nil slots in the array and are never picked.
+///
+/// PURE, so every shape is pinned by a test on any machine, including the ones
+/// no machine here has (`listing_decides_every_shape_it_can`):
+///
+/// * not `high`: the first low-power display GPU — the dual-GPU policy that was
+///   already here — else the ONLY display GPU, which is the system default by
+///   construction (a display can only be driven by a display GPU);
+/// * `high` (the development seam): the ONLY display GPU, and nothing more.
+///   `high` asks for the SYSTEM DEFAULT, and on a dual-GPU Mac with automatic
+///   graphics switching that is more than a device: `MTLCreateSystemDefaultDevice`
+///   answers the discrete GPU AND, per the SDK header quoted on
+///   [`Device::preferred`], switches the system to it, where the same chip read
+///   out of `MTLCopyAllDevices` leaves the display on the integrated one. So
+///   wherever the listing shows a second display GPU, `high` is `None` and the
+///   system default is asked, exactly as before 2026-09-26: picking the
+///   discrete GPU from the listing there would render on it with the mux
+///   unswitched — a configuration no aterm build has run — and would leave
+///   no configuration in which today's build makes the call that the
+///   watchdog's record of the 2026-09-06 stall cannot rule out for a mux
+///   stall (`aterm-gui`'s `watchdog.rs`, `Phase::PixelBackendRedeem` and
+///   `Phase::ImageCapture`). With one display GPU there is no mux and no
+///   other default to be, so the listing answers, as it does without `high`;
+/// * anything else — two or more candidates with nothing to tell them apart
+///   (or, under `high`, two or more at all), or no display GPU — is `None`:
+///   which one drives the main display is the display server's fact, not the
+///   listing's.
+pub(crate) fn choose_listed(
+    gpus: &[Option<ListedGpu>],
+    want_high: bool,
+) -> Option<(usize, &'static str)> {
+    /// The index of the one item `it` yields, or `None` for zero or several.
+    fn sole(mut it: impl Iterator<Item = usize>) -> Option<usize> {
+        match (it.next(), it.next()) {
+            (Some(i), None) => Some(i),
+            _ => None,
+        }
+    }
+    let display = || {
+        gpus.iter()
+            .enumerate()
+            .filter_map(|(i, g)| g.filter(|g| !g.headless).map(|g| (i, g)))
+    };
+    if !want_high && let Some((i, _)) = display().find(|(_, g)| g.low_power) {
+        return Some((i, "low-power"));
+    }
+    sole(display().map(|(i, _)| i)).map(|i| (i, "the only display GPU"))
+}
+
 impl Device {
     /// The GPU aterm renders on.
     ///
@@ -727,11 +792,11 @@ impl Device {
     /// 630 beside it (macOS 13.7, measured 2026-09-06), and the renderer
     /// logged that chip; that every window thereby kept it powered (fan,
     /// battery) is inferred, not observed. The wgpu arm always asked for
-    /// `PowerPreference::LowPower` (`power_preference_from_env`) and honoured
-    /// `ATERM_GPU_POWER=low|high`; this is the same policy on the first-party
-    /// arm: the first low-power, non-headless device `MTLCopyAllDevices`
-    /// lists, when there is one and the override does not say `high`, else
-    /// [`Self::system_default`]. A single-GPU machine (every Apple-silicon
+    /// `PowerPreference::LowPower` (`power_preference_from_env`), with a
+    /// development build's `ATERM_GPU_POWER=high` seam for the discrete GPU;
+    /// this is the same policy on the first-party arm: the first low-power,
+    /// non-headless device `MTLCopyAllDevices` lists, when there is one and
+    /// the seam does not say `high`. A single-GPU machine (every Apple-silicon
     /// Mac) has one device either way, so the choice is invisible there.
     ///
     /// The system default is deliberately NOT created when a low-power device
@@ -745,63 +810,120 @@ impl Device {
     /// expectation that no SDK header or Apple page read here states: without
     /// it a switching Mac stays on the discrete GPU for the app's life,
     /// whichever device it picked. Measured: which device each call answers.
+    ///
+    /// # Nor when the listing already names the only GPU (2026-09-26)
+    ///
+    /// `MTLCreateSystemDefaultDevice` is a WINDOWSERVER CALL, and
+    /// `MTLCopyAllDevices` is not. Measured on the owner's M5 Max (macOS
+    /// 26.6.2), two ten-line command-line probes in their own directories,
+    /// read back from tccd's log: the one that called
+    /// `MTLCreateSystemDefaultDevice` made WindowServer (pid 614) ask tccd for
+    /// a synchronous `kTCCServiceListenEvent` preflight of the probe's binary
+    /// — the queue `ws_main_thread` was parked on when WindowServer's watchdog
+    /// killed it on 2026-09-01 — and the one that called only
+    /// `MTLCopyAllDevices` drew no WindowServer request at all. Both answered
+    /// the same object (`MTLCreateSystemDefaultDevice() == MTLCopyAllDevices()[0]`,
+    /// pointer-identical, `isLowPower = 0`). So on an Apple-silicon Mac, whose
+    /// one GPU is not low-power, this function USED to fall through to the
+    /// system default on every call — and every process that built a Metal
+    /// device became a WindowServer client, headless or not: 240 tests in the
+    /// default `aterm-gpu` and `aterm-gui` suites did, each test binary a fresh
+    /// code identity for tccd to evaluate (AGENTS.md, "Concurrent sessions"
+    /// rule 5). When the listing leaves exactly one GPU that can drive a
+    /// display, that GPU IS the system default — there is no other to be — so
+    /// it is returned from the listing, and the display server is not asked.
+    ///
+    /// The system default is created only when the listing cannot decide
+    /// ([`choose_listed`] says why for each shape): two or more display GPUs
+    /// and none of them low-power (a multi-GPU Mac Pro, an iMac with an eGPU),
+    /// no display GPU listed at all, or the `high` seam on any machine that
+    /// lists two or more display GPUs (a dual-GPU laptop: there asking the
+    /// system default, and so switching the mux to the discrete GPU, is what
+    /// `high` means). There the choice is the display server's to make, and
+    /// the process becomes its client;
+    /// `tools/grep_guard.sh` B9d keeps that call in this function and nowhere
+    /// else.
     pub(crate) fn preferred() -> Option<Self> {
-        let want_high = matches!(
-            std::env::var("ATERM_GPU_POWER").as_deref(),
-            Ok(v) if v.eq_ignore_ascii_case("high")
-        );
-        if !want_high && let Some(low) = Self::low_power() {
-            return Some(low);
+        let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
+            .is_some_and(|v| v.eq_ignore_ascii_case("high"));
+        if let Some(listed) = Self::listed(want_high) {
+            return Some(listed);
         }
-        Self::system_default()
+        Self::system_default_asks_window_server()
     }
 
-    /// The first low-power, non-headless GPU on the machine, or `None` (no
-    /// such device, or no Metal at all). Says which one it picked, once, when
-    /// the machine has more than one GPU.
-    fn low_power() -> Option<Self> {
+    /// The GPU [`choose_listed`] picks from `MTLCopyAllDevices`, or `None` (it
+    /// cannot decide, or there is no Metal at all). Says which one it picked,
+    /// once, when the machine has more than one GPU.
+    fn listed(want_high: bool) -> Option<Self> {
         static SAID: std::sync::Once = std::sync::Once::new();
         let _pool = AutoreleasePool::new();
+        let (all, gpus) = Self::listing()?;
+        let (i, why) = choose_listed(&gpus, want_high)?;
+        // SAFETY: `-objectAtIndexedSubscript:` is NSArray's documented getter
+        // and `i < count` (it indexes `gpus`, one entry per element); the
+        // element is +0, borrowed from `all`, and is retained to +1 here,
+        // BEFORE `all` drops at the end of this function.
+        let dev = unsafe {
+            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            Obj::retain(at(all.id(), sel(c"objectAtIndexedSubscript:"), i))
+        }
+        .map(Self)?;
+        if gpus.len() > 1 {
+            SAID.call_once(|| {
+                crate::stderr_line!(
+                    "aterm-gpu: {} Metal devices on this machine; rendering on {} ({why})",
+                    gpus.len(),
+                    dev.name()
+                );
+            });
+        }
+        Some(dev)
+    }
+
+    /// `MTLCopyAllDevices` (+1, owned), and the two facts [`choose_listed`]
+    /// reads from each element — `None` for a nil slot. `None` overall when
+    /// the process has no Metal at all. Asks the display server nothing.
+    fn listing() -> Option<(Obj, Vec<Option<ListedGpu>>)> {
         // SAFETY: `MTLCopyAllDevices` is `CF_RETURNS_RETAINED`, so the array
         // is ours and `Obj` releases it once. `-count` and
-        // `-objectAtIndexedSubscript:` are NSArray's documented getters; the
-        // element is +0, borrowed from the array, and is retained to +1 BEFORE
-        // the array drops. `-isLowPower` / `-isHeadless` are `BOOL` getters on
-        // `MTLDevice`, read through [`ObjcBool`].
+        // `-objectAtIndexedSubscript:` are NSArray's documented getters; each
+        // element is +0, borrowed from the array, and only read here.
+        // `-isLowPower` / `-isHeadless` are `BOOL` getters on `MTLDevice`, read
+        // through [`ObjcBool`]. The caller holds the autorelease pool.
         unsafe {
             let all = Obj::from_owned(MTLCopyAllDevices())?;
             let count: unsafe extern "C" fn(Id, Sel) -> usize = msg();
             let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
             let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            let n = count(all.id(), sel(c"count"));
-            for i in 0..n {
-                let d = at(all.id(), sel(c"objectAtIndexedSubscript:"), i);
-                if d.is_null() {
-                    continue;
-                }
-                if flag(d, sel(c"isLowPower")).as_bool() && !flag(d, sel(c"isHeadless")).as_bool() {
-                    let dev = Obj::retain(d).map(Self)?;
-                    if n > 1 {
-                        SAID.call_once(|| {
-                            crate::stderr_line!(
-                                "aterm-gpu: {n} Metal devices on this machine; rendering on {} \
-                                 (low-power) — ATERM_GPU_POWER=high picks the discrete GPU",
-                                dev.name()
-                            );
-                        });
-                    }
-                    return Some(dev);
-                }
-            }
-            None
+            let gpus = (0..count(all.id(), sel(c"count")))
+                .map(|i| {
+                    let d = at(all.id(), sel(c"objectAtIndexedSubscript:"), i);
+                    (!d.is_null()).then(|| ListedGpu {
+                        low_power: flag(d, sel(c"isLowPower")).as_bool(),
+                        headless: flag(d, sel(c"isHeadless")).as_bool(),
+                    })
+                })
+                .collect();
+            Some((all, gpus))
         }
     }
 
     /// The system default GPU, or `None` when the process has no Metal device
     /// (a headless CI box with no GPU, or a denied sandbox). Raw
-    /// `MTLCreateSystemDefaultDevice`: the discrete GPU on a dual-GPU Mac —
-    /// production goes through [`Self::preferred`].
-    pub(crate) fn system_default() -> Option<Self> {
+    /// `MTLCreateSystemDefaultDevice`: the discrete GPU on a dual-GPU Mac.
+    ///
+    /// PRIVATE, and called from exactly one place — [`Self::preferred`], when
+    /// the listing cannot decide — because this is the one Metal entry point
+    /// that makes the calling process a WINDOWSERVER CLIENT (measured; see
+    /// `preferred`). A test that wants "a Metal device" asks for
+    /// [`Self::preferred`], which is also the device production renders on.
+    /// `tools/grep_guard.sh` B9d fails the tree if this gains a second caller,
+    /// a caller in a test, or a `pub`, or if `MTLCreateSystemDefaultDevice` is
+    /// named in code anywhere outside this file.
+    fn system_default_asks_window_server() -> Option<Self> {
+        #[cfg(test)]
+        tests::WINDOW_SERVER_ASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Device creation walks the IORegistry and builds the driver's own
         // object graph; measured under `OBJC_DEBUG_MISSING_POOLS=YES` it
         // autoreleases 14 objects (12 `AGXG17CDevice` among them) into whatever
@@ -855,13 +977,14 @@ impl Device {
     /// only, which has no `metal` binary at all). The cost is that a shader
     /// syntax error becomes a startup failure rather than a build failure,
     /// which is why `super`'s tests compile every library on every run.
+    #[cfg(test)]
     pub(crate) fn new_library(&self, source: &str) -> Result<Library, String> {
         let opts = CompileOptions::aterm_default()
             .ok_or_else(|| "MTLCompileOptions allocation failed".to_owned())?;
         self.new_library_with_options(source, &opts)
     }
 
-    /// [`Self::new_library`] with the compile options spelled out, so a test
+    /// `Self::new_library` with the compile options spelled out, so a test
     /// can compile the shipped sources against a DIFFERENT language version and
     /// see the pin matter.
     pub(crate) fn new_library_with_options(
@@ -964,7 +1087,7 @@ impl Device {
     ///   This crate never reads texture bytes directly — there is no
     ///   `getBytes:` anywhere in it — and every readback is a
     ///   `copyFromTexture:...toBuffer:` into a Shared `MTLBuffer` (the
-    ///   [`Pass`] readback and its siblings), which reads the GPU-side copy
+    ///   `Pass` readback and its siblings), which reads the GPU-side copy
     ///   and needs no synchronise. Keep it that way: a `getBytes:` on one of
     ///   these would hand back stale bytes on the dGPU.
     /// * `MTLStorageModeShared` is not the alternative: Shared TEXTURES are
@@ -1045,6 +1168,7 @@ impl Device {
     /// this device accepts, for the W3 device layer's geometric-grow cap (the
     /// wgpu arm asks `limits().max_buffer_size`; this is the same question in
     /// Metal).
+    #[cfg(test)]
     pub(crate) fn max_buffer_length(&self) -> usize {
         // SAFETY: `-maxBufferLength` is an `NSUInteger` getter on a live
         // `MTLDevice`.
@@ -1268,6 +1392,7 @@ impl VertexDescriptor {
     /// [`VertexFormat`] would launder a wrong constant through the same enum
     /// that produced it. An attribute never written reads as
     /// `MTLVertexFormatInvalid == 0` at offset 0, buffer 0.
+    #[cfg(test)]
     pub(crate) fn attribute_raw(&self, index: usize) -> (usize, usize, usize) {
         let _pool = AutoreleasePool::new();
         // SAFETY: as `attribute` — borrowed autoreleased accessors; the three
@@ -1291,6 +1416,7 @@ impl VertexDescriptor {
     /// A layout never written reads as stride 0 — which is exactly what the
     /// descriptor test asserts about slot 0, the index the instance stream
     /// must NOT occupy.
+    #[cfg(test)]
     pub(crate) fn layout_raw(&self, index: usize) -> (usize, usize, usize) {
         let _pool = AutoreleasePool::new();
         // SAFETY: as `attribute_raw`.
@@ -1328,6 +1454,7 @@ pub(crate) struct MtlSize {
 
 impl Device {
     /// Build an `MTLComputePipelineState` from a kernel function.
+    #[cfg(test)]
     pub(crate) fn new_compute_pipeline(&self, f: &Obj) -> Result<Obj, String> {
         // As `new_render_pipeline`, error out-param included.
         let _pool = AutoreleasePool::new();
@@ -1353,6 +1480,7 @@ impl Device {
 /// `buf` must be a shared-storage `MTLBuffer` of at least `count * 4` bytes
 /// whose GPU writes have already completed (the caller must have waited on the
 /// command buffer).
+#[cfg(test)]
 pub(crate) unsafe fn buffer_u32s(buf: &Obj, count: usize) -> Vec<u32> {
     // SAFETY: `-contents` on a shared buffer returns a CPU-visible pointer
     // valid for the buffer's lifetime; the caller pins the length and the
@@ -1386,6 +1514,7 @@ pub(crate) unsafe fn buffer_write(buf: &Obj, bytes: &[u8]) {
 /// Run a one-shot compute dispatch and block until it completes.
 ///
 /// `buffers` are bound at indices `0..buffers.len()`.
+#[cfg(test)]
 pub(crate) fn dispatch_compute(
     queue: &Obj,
     pso: &Obj,
@@ -1438,6 +1567,7 @@ pub(crate) fn dispatch_compute(
 /// Wait for a committed command buffer and turn every non-success terminal
 /// state into a diagnostic. `waitUntilCompleted` only blocks; it does not
 /// report device loss, timeout, page fault, or allocation failure.
+#[cfg(test)]
 fn wait_for_command_buffer(command_buffer: Id) -> Result<(), String> {
     const STATUS_COMPLETED: usize = 4;
     // SAFETY: callers pass a live command buffer retained by their surrounding
@@ -1520,7 +1650,7 @@ pub(crate) enum PrimitiveType {
 ///
 /// Consumed by BOTH halves of the contract: `metal_vertex_descriptor` lays
 /// every attribute and the per-instance stride at this index, and
-/// [`draw_and_read`] binds [`DrawCall::stream`] at the same index. The MSL side
+/// `draw_and_read` binds `DrawCall::stream` at the same index. The MSL side
 /// is held to it by `pipelines::tests::no_msl_buffer_binding_collides_with_the_instance_stream_slot`,
 /// which scans every shader for a `[[buffer(n)]]` that would collide.
 pub(crate) const INSTANCE_STREAM_SLOT: usize = 30;
@@ -1681,7 +1811,7 @@ pub(crate) unsafe fn texture_upload(
 /// The contract, corrected to MEASURED reality after a judge probed both
 /// halves of the original claim: the Unorm<->sRGB pair — the only pair this
 /// module uses — is Metal's documented sRGB-variant EXEMPTION and vends
-/// without [`TEXTURE_USAGE_PIXEL_FORMAT_VIEW`] (verified under
+/// without `TEXTURE_USAGE_PIXEL_FORMAT_VIEW` (verified under
 /// MTL_DEBUG_LAYER=1); the flag is required for any OTHER format pair. And a
 /// genuinely illegal view (e.g. Rgba8Unorm -> Rgba16Float without the flag)
 /// is a validation-layer SIGABRT under the house test environment, not a nil
@@ -1706,7 +1836,7 @@ pub(crate) fn texture_view(tex: &Obj, format: PixelFormat) -> Option<Obj> {
 /// Read `-[MTLTexture pixelFormat]` as its raw `MTLPixelFormat` value.
 ///
 /// Safe: a property read on a live object with no ordering precondition. It is
-/// what lets [`draw_and_read`] validate a row stride against the
+/// what lets `draw_and_read` validate a row stride against the
 /// destination it was actually handed, rather than against a number the caller
 /// asserted.
 pub(crate) fn texture_pixel_format_raw(tex: &Obj) -> usize {
@@ -1769,6 +1899,7 @@ pub(crate) fn buffer_length(buf: &Obj) -> usize {
 /// `#[expect(clippy::too_many_arguments)]` arguing a struct "would only move
 /// the same list one layer out". That was true at ten independent objects; it
 /// stopped being true once three of the fields constrain each other.)
+#[cfg(test)]
 pub(crate) struct Pass<'a> {
     /// The `MTLRenderPipelineState` to draw with.
     pub(crate) pso: &'a Obj,
@@ -1816,6 +1947,7 @@ pub(crate) struct Pass<'a> {
 /// the fullscreen triangle needs no vertex buffer, but 14 of the 18 rows are
 /// instanced `[[stage_in]]` draws, and one (the tray) is a strip. The stream
 /// binds at [`INSTANCE_STREAM_SLOT`] — the binder this struct exists to reach.
+#[cfg(test)]
 pub(crate) struct DrawCall<'a> {
     /// The row's topology — `pipelines::metal_primitive_type(spec.topology)`,
     /// never spelled at a call site.
@@ -1870,6 +2002,7 @@ pub(crate) struct DrawCall<'a> {
 /// readback buffer's length — is readable off `dst` and `readback` with
 /// `-pixelFormat`, `-width`, `-height` and `-length`. So it checks, and returns
 /// `Err`; a caller cannot get it wrong, rather than merely being told not to.
+#[cfg(test)]
 pub(crate) fn draw_and_read(
     queue: &Obj,
     pass: &Pass<'_>,
@@ -2082,7 +2215,7 @@ pub(crate) fn draw_and_read(
 /// Read a shared-storage buffer's mapped bytes.
 ///
 /// # Safety
-/// As [`buffer_u32s`], for `len` bytes.
+/// As `buffer_u32s`, for `len` bytes.
 pub(crate) unsafe fn buffer_bytes(buf: &Obj, len: usize) -> Vec<u8> {
     // SAFETY: `-contents` on a shared buffer is CPU-visible for the buffer's
     // lifetime; the caller pins the length and the completion ordering.
@@ -2099,46 +2232,154 @@ pub(crate) unsafe fn buffer_bytes(buf: &Obj, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// [`Device::preferred`] is the low-power GPU exactly when the machine has
-    /// one and `ATERM_GPU_POWER` does not ask for `high`. On a dual-GPU Mac
-    /// that is the difference between the integrated chip and the discrete one
-    /// `MTLCreateSystemDefaultDevice` answers; on a single-GPU machine the one
-    /// device is both, and the assertion holds trivially. The pick is printed so
-    /// a transcript names the device.
+    /// How many times this process has made the one WindowServer-backed Metal
+    /// call ([`Device::system_default_asks_window_server`]). Test builds only;
+    /// read by the regression below.
+    pub(super) static WINDOW_SERVER_ASKS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Every device `MTLCopyAllDevices` lists, as `(name, isLowPower,
+    /// isHeadless)`, read HERE rather than through [`Device::listing`], so the
+    /// regression below does not grade the fix with the fix's own reader.
+    /// `None` when this process has no Metal at all.
+    fn listing_read_independently() -> Option<Vec<(String, bool, bool)>> {
+        // SAFETY: as in `Device::listing` — a +1 array released once by `Obj`,
+        // +0 elements retained into a `Device` for the name and read only
+        // while the array is alive, `BOOL` getters through `ObjcBool`.
+        unsafe {
+            let all = Obj::from_owned(MTLCopyAllDevices())?;
+            let count: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let mut out = Vec::new();
+            for i in 0..count(all.id(), sel(c"count")) {
+                let d = at(all.id(), sel(c"objectAtIndexedSubscript:"), i);
+                let Some(dev) = Obj::retain(d).map(Device) else {
+                    continue;
+                };
+                out.push((
+                    dev.name(),
+                    flag(d, sel(c"isLowPower")).as_bool(),
+                    flag(d, sel(c"isHeadless")).as_bool(),
+                ));
+            }
+            Some(out)
+        }
+    }
+
+    /// THE REGRESSION (2026-09-26). [`Device::preferred`] may make the
+    /// WindowServer-backed `MTLCreateSystemDefaultDevice` call ONLY when the
+    /// device listing cannot name the GPU itself — and when it can, it returns
+    /// exactly the GPU the listing names. The expectation is derived here from
+    /// the raw listing, not from [`choose_listed`].
+    ///
+    /// Before the fix this failed on every Apple-silicon Mac: the one GPU is
+    /// not low-power, so `preferred()` fell through to the system default on
+    /// every call, and every process that built a Metal device — 240 tests in
+    /// the default `aterm-gpu`/`aterm-gui` suites among them — became a
+    /// WindowServer client whose fresh binary WindowServer then asked tccd to
+    /// preflight (measured: `ws_main_thread` on
+    /// `com.apple.tcc.preflight.kTCCServiceListenEvent`, the queue it was
+    /// parked on when its watchdog killed it on 2026-09-01). The counter is
+    /// process-wide, so the "decided" arm asserts zero asks from ANY thread,
+    /// and the "undecided" arm only a lower bound.
     #[test]
-    fn preferred_is_the_low_power_gpu_unless_asked_for_high() {
-        let Some(dev) = Device::preferred() else {
-            crate::stderr_line!("SKIP: no Metal device on this machine");
+    fn preferred_asks_the_window_server_only_when_the_listing_cannot_decide() {
+        let _pool = AutoreleasePool::new();
+        let Some(gpus) = listing_read_independently() else {
+            crate::stderr_line!("SKIP: no Metal on this machine");
             return;
         };
-        // SAFETY: `dev.0` is a live, retained `MTLDevice`; `-isLowPower` is a
-        // `BOOL` getter on it, read through `ObjcBool` exactly as `low_power`
-        // reads it.
-        let is_low = unsafe {
-            let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            flag(dev.0.id(), sel(c"isLowPower")).as_bool()
+        let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
+            .is_some_and(|v| v.eq_ignore_ascii_case("high"));
+        let display: Vec<&(String, bool, bool)> = gpus.iter().filter(|g| !g.2).collect();
+        // Without `high`, the first low-power display GPU; otherwise (and
+        // always under `high`, which asks for the system default) only a
+        // display GPU that is alone in the listing.
+        let expected = match display.iter().find(|g| g.1) {
+            Some(low) if !want_high => Some(low.0.clone()),
+            _ => (display.len() == 1).then(|| display[0].0.clone()),
         };
-        let low = Device::low_power().map(|d| d.name());
+
+        let before = WINDOW_SERVER_ASKS.load(Ordering::SeqCst);
+        let picked = Device::preferred().map(|d| d.name());
+        let asked = WINDOW_SERVER_ASKS.load(Ordering::SeqCst) - before;
         crate::stderr_line!(
-            "aterm-gpu: preferred() = {} (isLowPower={is_low}); the machine's first \
-             low-power, non-headless GPU = {low:?}",
-            dev.name()
+            "aterm-gpu: listing {gpus:?} (want_high={want_high}); preferred() = {picked:?}, \
+             window-server asks {asked}"
         );
-        let want_high = matches!(
-            std::env::var("ATERM_GPU_POWER").as_deref(),
-            Ok(v) if v.eq_ignore_ascii_case("high")
-        );
-        if !want_high {
-            assert_eq!(
-                is_low,
-                low.is_some(),
-                "preferred() must be a low-power GPU exactly when the machine has one"
-            );
-            if let Some(name) = low {
-                assert_eq!(dev.name(), name, "and it must be that one");
+        match expected {
+            Some(name) => {
+                assert_eq!(
+                    asked, 0,
+                    "the listing names the GPU ({name}), so nothing may ask the display server"
+                );
+                assert_eq!(picked, Some(name), "and preferred() is that GPU");
+            }
+            None => assert!(
+                asked >= 1,
+                "the listing cannot decide here, so the choice is the display server's"
+            ),
+        }
+    }
+
+    /// Every listing shape [`choose_listed`] can meet, pinned on any machine —
+    /// including the dual-GPU and multi-GPU shapes no machine here has. The
+    /// Apple-silicon row is the one the pre-2026-09-26 policy answered `None`
+    /// for (it knew only "the first low-power GPU", and that GPU is not
+    /// low-power), which is what sent every Metal device build to the display
+    /// server. The `high` column answers `None` for every listing with two or
+    /// more display GPUs — the dual-GPU laptop above all — because there `high`
+    /// asks for the system default, whose call also switches the mux; a `Some`
+    /// in those rows would be the unshipped "discrete GPU, display on the
+    /// integrated one" configuration.
+    #[test]
+    fn listing_decides_every_shape_it_can() {
+        /// What [`choose_listed`] answers: the index it picked and its word.
+        type Pick = Option<(usize, &'static str)>;
+        let gpu = |low_power, headless| {
+            Some(ListedGpu {
+                low_power,
+                headless,
+            })
+        };
+        let apple = gpu(false, false);
+        let integrated = gpu(true, false);
+        let discrete = gpu(false, false);
+        let compute = gpu(false, true);
+        let only = "the only display GPU";
+        #[rustfmt::skip]
+        let rows: [(&str, Vec<Option<ListedGpu>>, Pick, Pick); 11] = [
+            // shape                         listing                          default                  high
+            ("no Metal",                     vec![],                          None,                    None),
+            ("a nil slot only",              vec![None],                      None,                    None),
+            ("Apple silicon",                vec![apple],                     Some((0, only)),         Some((0, only))),
+            ("nil slot, then Apple silicon", vec![None, apple],               Some((1, only)),         Some((1, only))),
+            ("dual-GPU laptop",              vec![integrated, discrete],      Some((0, "low-power")),  None),
+            ("dual-GPU, discrete first",     vec![discrete, integrated],      Some((1, "low-power")),  None),
+            ("integrated only",              vec![integrated],                Some((0, "low-power")),  Some((0, only))),
+            ("one display GPU + compute",    vec![discrete, compute],         Some((0, only)),         Some((0, only))),
+            ("compute only",                 vec![compute],                   None,                    None),
+            ("two discrete (Mac Pro)",       vec![discrete, discrete],        None,                    None),
+            ("laptop + eGPU",                vec![integrated, discrete, discrete], Some((0, "low-power")), None),
+        ];
+        // Every row is judged before anything fails, so one run names every
+        // shape a policy change moved, not just the first.
+        let mut wrong = Vec::new();
+        for (shape, listing, default, high) in rows {
+            for (policy, want_high, want) in [("default", false, default), ("high", true, high)] {
+                let got = choose_listed(&listing, want_high);
+                if got != want {
+                    wrong.push(format!("{shape}, {policy}: got {got:?}, want {want:?}"));
+                }
             }
         }
+        assert!(
+            wrong.is_empty(),
+            "choose_listed moved:\n{}",
+            wrong.join("\n")
+        );
     }
 
     /// The ObjC `BOOL` slot at this target's width: one byte, `bool` in and

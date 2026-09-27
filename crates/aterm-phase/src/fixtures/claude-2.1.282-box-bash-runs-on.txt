@@ -1,0 +1,16 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, f2e() (`Bash command (runs on <machine>)`) with the card.standing_unavailable row, on the measured 2.1.280/2.1.281 box geometry · a Bash box that runs on another machine, the `Always allow isn’t available …` row between the question and the options
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command (runs on m3)
+
+   ls
+   List
+
+ Do you want to proceed?
+ Always allow isn’t available for commands on m3
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

@@ -43,6 +43,9 @@ const MAX_SOCK_PATH: usize = 100;
 /// exit path (Drop runs on panic too).
 struct Instance {
     child: Child,
+    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     tmp: PathBuf,
     log: PathBuf,
     sock: String,
@@ -106,11 +109,12 @@ fn boot(tag: &str) -> Option<Instance> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", "120")
+        .args(launch_isolation::control_sock(&tmp))
+        .args(["--lines", "40", "--columns", "120"])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -122,6 +126,7 @@ fn boot(tag: &str) -> Option<Instance> {
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
         child,
+        _lifeline: lifeline,
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,
@@ -299,6 +304,18 @@ done
 /// INT-1 + INT-2, live: the box under a ticking row reaches `status
 /// agent=prompt` within 500 ms of being drawn, `EVENT <local> agent prompt`
 /// is pushed, and `await agent prompt` latches — while `revision=` holds still.
+///
+/// THE 500 MS IS TIMED BETWEEN TWO PUSHES (2026-09-24). It used to run from the
+/// test writing the go-file to a polled `status` answering `prompt`, so it also
+/// timed the fake worker's `sleep` spawn before it noticed the file and one
+/// `aterm ctl` spawn per poll. At a load of ~40 that read 539 ms while the
+/// verdict itself had flipped 24 ms before the read. Both ends are now read
+/// off ONE `screen,events,ts` subscription opened before anything moves: the
+/// first frame that shows the box, and the pushed `agent prompt` event, each
+/// timed by the SERVER's `T <local> <t_us>` wake stamp. Stamped on arrival
+/// here instead, each end would also time the `aterm ctl` relay process and
+/// this test's reader thread, scheduling that load stretches while the
+/// product is right: the proxy error this test was rewritten to shed.
 #[test]
 fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let Some(inst) = boot("b") else { return };
@@ -308,7 +325,11 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
 
     // The events stream, opened before anything moves.
-    let mut sub = client_command(&inst, &["subscribe", &format!("@{sid}"), "events"])
+    // Screen frames AND events on one connection, every wake stamped by the
+    // SERVER (`ts`): the box's first frame and the verdict's push are the two
+    // ends of the latency this test bounds.
+    let streams = "screen,events,ts";
+    let mut sub = client_command(&inst, &["subscribe", &format!("@{sid}"), streams])
         .spawn()
         .expect("spawn subscribe");
     let events = sub.stdout.take().expect("subscribe stdout");
@@ -342,9 +363,27 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         "program=claude",
         |s| field(s, "program") == Some("claude"),
     );
-    // Let the FSM settle on the running job, then pin the revision.
-    std::thread::sleep(Duration::from_millis(1200));
-    let before = status(&inst, &sid);
+    // Pin the revision once the FSM has PUBLISHED the running job, never on
+    // a timer. `agent=busy` is the timeline's verdict and can lead the FSM's
+    // `running` — held for its 750 ms dwell, then published on a sweep — by
+    // most of a second; a fixed 1.2 s sleep raced that publication, and a
+    // loaded gate whose event loop fell half a second behind pinned before
+    // it, so `revision=` moved by one at the prompt on a correct server (the
+    // load-sensitive test audit of 2026-09-27). Once `running` with movement
+    // is out, nothing moves the revision while the fake keeps ticking short
+    // of a 5 s stall (`quiet_after`), so the control below still fails for a
+    // gate that bumps it when the box is drawn.
+    let before = status_until(
+        &inst,
+        &sid,
+        Duration::from_secs(20),
+        "phase=running with content_activity",
+        |s| {
+            field(s, "phase") == Some("running")
+                && field(s, "reasons")
+                    .is_some_and(|r| r.split(',').any(|r| r == "content_activity"))
+        },
+    );
     assert_eq!(field(&before, "agent"), Some("busy"), "{before}");
     let revision = field(&before, "revision").unwrap().to_string();
 
@@ -366,19 +405,13 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
 
     std::fs::write(&go, b"").expect("create the go file");
     let t0 = Instant::now();
-    let prompt = status_until(
-        &inst,
-        &sid,
-        Duration::from_millis(2000),
-        "agent=prompt",
-        |s| field(s, "agent") == Some("prompt"),
-    );
+    // The status poll proves WHAT the verdict says; how fast it moved is
+    // bounded below, between two pushes, never by this poll's spawns.
+    let prompt = status_until(&inst, &sid, Duration::from_secs(10), "agent=prompt", |s| {
+        field(s, "agent") == Some("prompt")
+    });
     let took = t0.elapsed();
     eprintln!("agent=prompt {took:?} after the go-file (busy: {busy}; program: {program})");
-    assert!(
-        took <= Duration::from_millis(500),
-        "the box reached status agent=prompt in {took:?} (> 500 ms): {prompt}"
-    );
     assert_eq!(
         field(&prompt, "agent_detail"),
         Some("bash:not-read-only"),
@@ -440,23 +473,52 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         "{bad:?}"
     );
 
-    // The push.
+    // The push, and the latency between the box's first frame and it.
     let want = format!("EVENT {local} agent prompt rev={rev} gen=");
+    // `T <local> <t_us>` opens every wake that writes to this channel, on the
+    // server's subscriber thread; the frames after it carry that instant.
+    let stamp = format!("T {local} ");
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut seen = Vec::new();
-    let mut found = false;
+    let mut wake_us: Option<u64> = None;
+    let mut boxed_at: Option<u64> = None;
+    let mut pushed_at: Option<u64> = None;
     while Instant::now() < deadline {
         if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
-            found |= line.starts_with(&want) && line.contains(" fp=");
-            seen.push(line);
-            if found {
+            if let Some(us) = line.strip_prefix(&stamp).and_then(|t| t.parse().ok()) {
+                wake_us = Some(us);
+                continue;
+            }
+            if boxed_at.is_none() && line.contains("Do you want to proceed?") {
+                boxed_at = wake_us;
+            }
+            if pushed_at.is_none() && line.starts_with(&want) && line.contains(" fp=") {
+                pushed_at = wake_us;
+            }
+            // Both ends, in either order: a wake snapshots the screen under one
+            // terminal lock and drains the timeline under another, so the sweep
+            // can publish the verdict in between and the EVENT reaches the wire
+            // one wake before the frame showing the box. That is a latency of
+            // zero (saturating), not a missing box.
+            if pushed_at.is_some() && boxed_at.is_some() {
                 break;
+            }
+            if line.starts_with("EVENT") || line.starts_with("GAP") {
+                seen.push(line);
             }
         }
     }
     let _ = sub.kill();
     let _ = sub.wait();
-    assert!(found, "no `{want}` on the events stream: {seen:?}");
+    let pushed_at =
+        pushed_at.unwrap_or_else(|| panic!("no `{want}` on the events stream: {seen:?}"));
+    let boxed_at = boxed_at.expect("the box's first frame was pushed on the screen stream");
+    let latency = Duration::from_micros(pushed_at.saturating_sub(boxed_at));
+    eprintln!("the verdict was pushed {latency:?} after the box's first frame");
+    assert!(
+        latency <= Duration::from_millis(500),
+        "the box's verdict was pushed {latency:?} after its first frame (> 500 ms): {prompt}"
+    );
 
     // The roster says the same.
     let roster = ctl_ok(&inst, &["sessions"]);
@@ -568,4 +630,210 @@ fn a_shell_that_cats_a_claude_capture_is_not_an_agent() {
         screen.contains("Should I also delete the old logs?") && screen.contains(&rule[..30]),
         "NEGATIVE CONTROL: the frame is on screen: {screen}"
     );
+}
+
+/// A fake Claude Code that draws its idle frame, waits for `die` to exist,
+/// then clears the screen (as Claude restores the terminal) and exits.
+const FAKE_EXIT: &str = r#"#!/bin/sh
+die="$1"
+rule=$(printf '%120s' '' | sed 's/ /─/g')
+printf '\033[2J\033[H'
+printf '⏺ Done.\n\n%s\n❯ \n%s\n  ? for shortcuts\n' "$rule" "$rule"
+while [ ! -e "$die" ]; do sleep 0.05; done
+rm -f "$die"
+printf '\033[2J\033[H'
+exit 0
+"#;
+
+/// AN AGENT'S EXIT IS NO AGENT AT ONCE (2026-09-24; lane U's open item for
+/// the server — the relaunch on exit got some exits late or never). Three
+/// times over, a fake Claude Code exits back to its bash: within 1 s of the
+/// exit `program=` names the shell and `agent=-`, and — the defect — NO
+/// agent verdict is published after the exit: the look that first saw the
+/// shell's group read the departed agent's name, judged the shell's prompt
+/// under Claude Code's reader and published its verdict again — `program=bash
+/// agent=idle` stood for a further look (measured: 250 ms, three rounds of
+/// three) and the in-GUI host went on seeing the agent. Under the shell,
+/// `agent=` is `-` from the first read that names it.
+///
+/// THE 1 S IS TIMED BETWEEN TWO PUSHES (the load-sensitive test audit of
+/// 2026-09-27), as its sibling above was on 2026-09-24: from the SERVER's wake
+/// stamp on the first frame after the exit (the fake's final clear) to the
+/// stamp on the pushed `agent -`, both off ONE `screen,events,ts`
+/// subscription. It used to run from the test writing `die` to a polled
+/// `status`, so it also timed the fake's `sleep 0.05` loop and one `aterm ctl`
+/// spawn per poll — three times per run. The polls still say WHAT the verdict
+/// is, under a deadline that only a hang reaches. And the verdict is pinned
+/// once two reads a sweep apart agree, not after a fixed 600 ms a slow sweep
+/// could outlast and then move the rev on a correct server.
+#[test]
+fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
+    let Some(inst) = boot("x") else { return };
+    let (local, sid) = boot_session(&inst);
+    let script = inst.tmp.join("fake-exit.sh");
+    let die = inst.tmp.join("die");
+    std::fs::write(&script, FAKE_EXIT).expect("write the fake");
+
+    // One subscription for all three rounds, opened before anything moves.
+    let mut sub = client_command(
+        &inst,
+        &["subscribe", &format!("@{sid}"), "screen,events,ts"],
+    )
+    .spawn()
+    .expect("spawn subscribe");
+    let stream = sub.stdout.take().expect("subscribe stdout");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    type_line(&inst, &sid, "/bin/bash --norc --noprofile -i");
+    status_until(&inst, &sid, Duration::from_secs(10), "program=bash", |s| {
+        field(s, "program") == Some("bash")
+    });
+    type_line(&inst, &sid, "PS1='$ '");
+    for round in 0..3 {
+        type_line(
+            &inst,
+            &sid,
+            &format!(
+                "/bin/bash -c 'exec -a claude /bin/sh {} {}'",
+                script.display(),
+                die.display()
+            ),
+        );
+        let running = status_until(
+            &inst,
+            &sid,
+            Duration::from_secs(10),
+            "program=claude, read as an agent",
+            |s| {
+                field(s, "program") == Some("claude")
+                    && matches!(field(s, "agent"), Some("idle" | "question"))
+            },
+        );
+        let rev = settled_agent_rev(&inst, &sid);
+        // Everything pushed so far is the fake's life; the stream is read from
+        // its exit on.
+        while rx.try_recv().is_ok() {}
+        std::fs::write(&die, b"").expect("the exit");
+        let t0 = Instant::now();
+        let mut seen: Vec<(Duration, String, String, u64)> = Vec::new();
+        let gone = loop {
+            let s = status(&inst, &sid);
+            let program = field(&s, "program").unwrap_or("?").to_string();
+            let agent = field(&s, "agent").unwrap_or("?").to_string();
+            let r: u64 = field(&s, "agent_rev")
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(0);
+            if seen
+                .last()
+                .is_none_or(|(_, p, a, rv)| (p, a, rv) != (&program, &agent, &r))
+            {
+                seen.push((t0.elapsed(), program.clone(), agent.clone(), r));
+            }
+            if program == "bash" && agent == "-" {
+                break true;
+            }
+            if t0.elapsed() > Duration::from_secs(20) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        eprintln!("round {round}: {seen:?} (running: {running})");
+        assert!(gone, "round {round}: never program=bash agent=-: {seen:?}");
+        for (at, program, agent, r) in &seen {
+            assert!(
+                (*r == rev && program == "claude") || agent == "-",
+                "round {round}: `agent={agent}` (rev {r}) stood at {at:?} under program={program} \
+                 — the departed agent's verdict: {seen:?}"
+            );
+        }
+        let took = exit_to_no_agent(&rx, local, round);
+        eprintln!("round {round}: agent - pushed {took:?} after the exit's first frame");
+        assert!(
+            took <= Duration::from_secs(1),
+            "round {round}: `agent -` was pushed {took:?} after the exit's first frame: {seen:?}"
+        );
+    }
+    let _ = sub.kill();
+    let _ = sub.wait();
+}
+
+/// The session's `agent_rev` once two reads 600 ms apart — more than a sweep's
+/// 250 ms floor — agree, so a verdict still settling is not pinned.
+fn settled_agent_rev(inst: &Instance, sid: &str) -> u64 {
+    let read = || -> u64 {
+        field(&status(inst, sid), "agent_rev")
+            .and_then(|r| r.parse().ok())
+            .expect("agent_rev")
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = read();
+    loop {
+        std::thread::sleep(Duration::from_millis(600));
+        let now = read();
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent_rev never settled: {last} -> {now}"
+        );
+        last = now;
+    }
+}
+
+/// From the SERVER's wake stamps on one `screen,events,ts` stream: the first
+/// screen frame without the fake's footer (its final clear, or bash's prompt)
+/// to the pushed `agent -`. Either order: a wake snapshots the screen before it
+/// drains the timeline, so the event can reach the wire one wake before the
+/// frame showing its cause — a latency of zero (saturating), not a miss.
+fn exit_to_no_agent(rx: &std::sync::mpsc::Receiver<String>, local: u64, round: usize) -> Duration {
+    let stamp = format!("T {local} ");
+    let screen = format!("DELTA {local} seq=");
+    let gone = format!("EVENT {local} agent - rev=");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut wake_us, mut exited_at, mut gone_at) = (None::<u64>, None, None);
+    let mut seen = Vec::new();
+    while exited_at.is_none() || gone_at.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = rx.recv_timeout(left) else {
+            panic!("round {round}: no exit frame and `agent -` on the stream: {seen:?}");
+        };
+        if let Some(us) = line.strip_prefix(&stamp).and_then(|t| t.parse().ok()) {
+            wake_us = Some(us);
+            continue;
+        }
+        if line.starts_with(&screen) && line.contains(" screen ") {
+            let rows: usize = line
+                .rsplit(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .expect("a screen DELTA names its row count");
+            let mut footer = false;
+            for _ in 0..rows {
+                let row = rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("a screen DELTA's rows follow its header");
+                footer |= row.contains("? for shortcuts");
+            }
+            if !footer && exited_at.is_none() {
+                exited_at = wake_us;
+            }
+            continue;
+        }
+        if gone_at.is_none() && line.starts_with(&gone) {
+            gone_at = wake_us;
+        }
+        if line.starts_with("EVENT") || line.starts_with("GAP") {
+            seen.push(line);
+        }
+    }
+    let (exited_at, gone_at) = (exited_at.unwrap(), gone_at.unwrap());
+    Duration::from_micros(gone_at.saturating_sub(exited_at))
 }

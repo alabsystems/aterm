@@ -19,10 +19,10 @@
 //!
 //! # What a green run here does and does not mean
 //!
-//! It means: for every Bash command this vendor build was OBSERVED to send,
-//! the rm policy reaches a verdict, and at least one of them is an allow; the
+//! It means: every Bash command this vendor build was OBSERVED to ask a
+//! permission for is pressed at full power when drawn into its box; the
 //! vendor's own statusLine payloads read into one HUD line carrying their
-//! figures; and the painted `/usage` panel yields window evidence. It does NOT
+//! figures; and the painted `/usage` panel yields its windows. It does NOT
 //! mean the vendor will not send something else tomorrow — nothing can mean
 //! that. It means the day it does, re-capturing makes this suite say so.
 //!
@@ -44,7 +44,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aterm_agent::harness::rm_policy::{CwdPrefix, HookEvent, RmDecision, RmPolicy, evaluate};
 use aterm_agent::harness::usage::{self, AccountView, UsageView};
 use aterm_digest::Sha256;
 
@@ -86,7 +85,6 @@ impl Fixture {
 struct Capture {
     /// The version directory's name, which is the vendor version.
     version: String,
-    dir: PathBuf,
     /// `key = value` lines of `manifest.toml`, before the `[files]` table.
     meta: BTreeMap<String, String>,
     /// `path -> (bytes, sha256)` from the manifest's `[files]` table.
@@ -170,7 +168,6 @@ fn captures() -> Vec<Capture> {
             fixtures.sort_by(|a, b| a.rel.cmp(&b.rel));
             Capture {
                 version,
-                dir,
                 meta,
                 claimed,
                 fixtures,
@@ -334,34 +331,36 @@ fn every_fixture_is_the_bytes_the_manifest_recorded() {
 // The replay
 // ---------------------------------------------------------------------------
 
-/// THE POLICY DECIDES REAL COMMANDS, and says yes to at least one.
+/// FULL POWER OVER THE COMMANDS THE VENDOR REALLY ASKED ABOUT (the owner's
+/// direction of 2026-09-24: every box its answer unless the owner limits it).
 ///
-/// Until 2026-09-23 this law compared `rm_policy::evaluate` with the hook
-/// bridge's reply over the same payloads. The bridge is retired (decision
-/// "B") and deleted; the policy is what the supervisor's rm breaker asks
-/// (`supervise::policy::rm_breaker`), so what is replayed now is the policy
-/// itself over every Bash command the vendor really sent — built the way the
-/// bridge built it (the payload's own cwd, `home`, the `SessionCwd` prefix),
-/// so a verdict here is a verdict about the COMMAND.
-///
-/// Its non-vacuity counter counts ALLOWS — the outcome the policy exists for
-/// — not mentions of two letters, which `npm run format` would satisfy.
+/// Every `PermissionRequest` payload the vendor sent carries the command its
+/// Bash box asked about. Drawn into that box — HAND-BUILT around the
+/// MEASURED command, on the 2.1.280 Bash box's measured geometry (the rule,
+/// ` Bash command`, the command row, the question, `1. Yes` / `2. No`, the
+/// `Esc to cancel · Tab to amend` footer) — the owner's default presses its
+/// `1`, and the safe rules alone (`approve = "safe"`) press nothing full
+/// power would not. Non-vacuity: at least one box is pressed that the safe
+/// rules hand over — the reason the default changed.
 #[test]
-fn every_captured_bash_command_reaches_a_policy_verdict() {
-    let dir = corpus_root();
-    let fallback_cwd = dir.join("work");
-    let policy = RmPolicy {
-        home: Some(dir.join("home")),
-        require_cwd_prefix: CwdPrefix::SessionCwd,
-        ..RmPolicy::default()
+fn every_captured_permission_request_is_pressed_at_full_power() {
+    use aterm_agent::supervise::config::Approve;
+    use aterm_agent::supervise::policy::{
+        ApprovalCtx, Choice, Decision, RULE_ALLOW_ONCE, decide_screen,
     };
-    let mut compared = 0usize;
-    let mut allowed = 0usize;
+    let dir = corpus_root();
+    let ctx = |approve: Approve| ApprovalCtx {
+        approve,
+        ..ApprovalCtx::new(dir.join("work"), Some(dir.join("home")), 502, None)
+    };
+    let mut asked = 0usize;
+    let mut unproven = 0usize;
     for cap in captures() {
-        for f in &cap.fixtures {
-            let Some(event) = HookEvent::parse(&f.kind) else {
-                continue;
-            };
+        for f in cap
+            .fixtures
+            .iter()
+            .filter(|f| f.kind == "PermissionRequest")
+        {
             let Ok(payload) = aterm_json::from_str::<aterm_json::Value>(&f.text()) else {
                 continue;
             };
@@ -372,36 +371,54 @@ fn every_captured_bash_command_reaches_a_policy_verdict() {
             else {
                 continue;
             };
-            // The PAYLOAD's cwd when it is absolute, as the bridge read it.
-            let cwd = payload
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| fallback_cwd.clone());
-            let verdict = evaluate(cmd, &cwd, event, &policy);
-            // A verdict always names itself; an allow always says why.
-            assert!(
-                verdict.decision != RmDecision::Allow || !verdict.reason.is_empty(),
-                "{}/{}: an allow with no reason for {cmd:?}",
-                cap.version,
-                f.rel
+            let mut rows = vec!["─".repeat(120), " Bash command".to_string(), String::new()];
+            rows.extend(cmd.lines().map(|l| format!("   {l}")));
+            rows.extend(
+                [
+                    "",
+                    " Do you want to proceed?",
+                    " ❯ 1. Yes",
+                    "   2. No",
+                    "",
+                    " Esc to cancel · Tab to amend",
+                ]
+                .map(str::to_string),
             );
-            compared += 1;
-            if verdict.decision == RmDecision::Allow {
-                allowed += 1;
+            let every = decide_screen(Some("claude"), &rows, &ctx(Approve::All))
+                .unwrap_or_else(|| panic!("{}/{}: no box read for {cmd:?}", cap.version, f.rel));
+            let Decision::Approve {
+                rule_id, choice, ..
+            } = &every
+            else {
+                panic!(
+                    "{}/{}: full power did not press {cmd:?}: {every:?}",
+                    cap.version, f.rel
+                );
+            };
+            assert_eq!(*choice, Choice::Digit(1), "{}/{}", cap.version, f.rel);
+            asked += 1;
+            let proven = decide_screen(Some("claude"), &rows, &ctx(Approve::Safe));
+            match proven {
+                Some(Decision::Approve { rule_id: p, .. }) => assert_eq!(
+                    p, *rule_id,
+                    "{}/{}: a proven box keeps its rule at full power",
+                    cap.version, f.rel
+                ),
+                _ => {
+                    assert_eq!(*rule_id, RULE_ALLOW_ONCE, "{}/{}", cap.version, f.rel);
+                    unproven += 1;
+                }
             }
         }
     }
     assert!(
-        compared > 0,
-        "the corpus carries no Bash tool call at all, so nothing was compared"
+        asked > 0,
+        "the corpus carries no PermissionRequest with a command"
     );
     assert!(
-        allowed > 0,
-        "{compared} command(s) compared and NOT ONE was allowed, so function 1's whole reason \
-         for existing — saying yes to a safe rm — was never replayed. Capture a turn that runs \
-         `rm <file>` inside the session's own cwd."
+        unproven > 0,
+        "{asked} box(es) replayed and every one was proven, so nothing here shows full power \
+         pressing what the safe rules hand over. Capture a turn that asks to write."
     );
 }
 
@@ -477,17 +494,16 @@ fn every_captured_statusline_renders_one_footer_line() {
 /// The design ranks aterm's own view of the grid above every vendor hook
 /// (§5.8.1), and the `/usage` panel is the only place some windows — the
 /// model bucket among them — appear at all. So the corpus carries what the
-/// vendor DREW, and the reader runs over it: every window the panel painted
-/// becomes `Evidence::Window` with `Source::Grid`, on bytes nobody wrote by
-/// hand.
+/// vendor DREW, and `harness limits`' reader runs over it: every window the
+/// panel painted is a window of its view, on bytes nobody wrote by hand.
 ///
 /// The negative control is in the same test rather than a separate one: the
 /// same reader over the session's own `status` line — a real capture of
 /// something that is NOT a usage panel — must yield nothing, so a reader that
 /// found windows everywhere could not pass this.
 #[test]
-fn the_painted_usage_panel_yields_window_evidence() {
-    use aterm_agent::harness::limits::{Evidence, WindowKind};
+fn the_painted_usage_panel_yields_its_windows() {
+    use aterm_agent::harness::cli::limits_view;
 
     let rows = |s: &str| -> Vec<String> { s.lines().map(str::to_string).collect() };
     let zone_none = |_: &str| -> Option<i64> { None };
@@ -495,27 +511,20 @@ fn the_painted_usage_panel_yields_window_evidence() {
     for cap in captures() {
         for f in cap.fixtures.iter().filter(|f| f.kind == "screen") {
             let text = f.text();
-            let got = Evidence::windows_from_screen(&rows(&text), 1_790_000_000, 0, zone_none);
+            let got = limits_view(&rows(&text), 1_790_000_000, 0, zone_none).windows;
             if f.rel.ends_with("usage.txt") {
-                let kinds: Vec<WindowKind> = got
-                    .iter()
-                    .filter_map(|e| match e {
-                        Evidence::Window { which, .. } => Some(*which),
-                        _ => None,
-                    })
-                    .collect();
+                let kinds: Vec<&str> = got.iter().map(|(w, _)| w.name.as_str()).collect();
                 assert!(
                     !kinds.is_empty(),
-                    "{}/{}: the captured /usage panel yielded no window evidence — either the \
+                    "{}/{}: the captured /usage panel yielded no window — either the \
                      vendor repainted this page or the grid reader stopped seeing it. The panel \
                      is:\n{text}",
                     cap.version,
                     f.rel
                 );
-                // THE MODEL BUCKET IS THE POINT. `windows_from_screen` drops a
-                // title it cannot map (`WindowKind::parse` returns None and
-                // `filter_map` discards it), so a vendor rename of `Current
-                // week (Fable)` would silently remove the one window that
+                // THE MODEL BUCKET IS THE POINT. The panel reader gives only
+                // a MEASURED title its vendor key, so a vendor rename of
+                // `Current week (Fable)` would silently remove the one window that
                 // exists on NO other source — while `five_hour` and
                 // `seven_day` kept the old assertion green. This panel painted
                 // it, so this panel must still yield it.
@@ -526,7 +535,7 @@ fn the_painted_usage_panel_yields_window_evidence() {
                     f.rel
                 );
                 assert!(
-                    kinds.contains(&WindowKind::SevenDayOverageIncluded),
+                    kinds.contains(&"seven_day_overage_included"),
                     "{}/{}: the panel paints `Current week (Fable)` and the reader did not \
                      produce `seven_day_overage_included`. That window appears on no other \
                      source (design 5.2), so losing it here loses it entirely. Kinds: {kinds:?}",
@@ -547,58 +556,6 @@ fn the_painted_usage_panel_yields_window_evidence() {
     }
     assert!(
         panels > 0,
-        "no painted /usage panel in the corpus, so the rank-1 evidence path was never replayed"
+        "no painted /usage panel in the corpus, so the rank-1 window path was never replayed"
     );
-}
-
-/// THE VERSION SKEW NOTE — printed, never failed.
-///
-/// A corpus captured from a build the machine no longer has is still a real
-/// observation, and failing on that would turn every vendor update into a red
-/// gate for a reason that is not about this tree. But a silent skew is how a
-/// corpus quietly stops describing the vendor, so the run SAYS so.
-#[test]
-fn the_corpus_says_which_vendor_build_it_describes() {
-    let caps = captures();
-    let installed = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        });
-    let versions: Vec<&str> = caps.iter().map(|c| c.version.as_str()).collect();
-    println!("vendor corpus: {} capture(s): {versions:?}", caps.len());
-    match installed {
-        None => println!("vendor corpus: no `claude` on PATH — nothing to compare against"),
-        Some(v) if versions.contains(&v.as_str()) => {
-            println!("vendor corpus: the installed build {v} IS in the corpus");
-        }
-        Some(v) => println!(
-            "vendor corpus: SKEW — the installed build is {v} and the corpus describes \
-             {versions:?}; nothing here has been shown to hold for {v}. Re-recording needs \
-             tools/harness-capture.sh's live mode, suspended while `aterm harness install` is \
-             retired (decision B)."
-        ),
-    }
-    for cap in &caps {
-        println!(
-            "  {} captured {} — {} payload(s)",
-            cap.version,
-            cap.meta
-                .get("captured_utc")
-                .map_or("(no date)", String::as_str),
-            cap.fixtures.len()
-        );
-        assert!(
-            cap.dir.join("manifest.toml").is_file(),
-            "{}: no manifest",
-            cap.version
-        );
-    }
 }

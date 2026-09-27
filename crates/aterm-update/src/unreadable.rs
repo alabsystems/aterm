@@ -38,9 +38,10 @@ use crate::paths::Staging;
 /// captured at any point in a day contains the explanation at least once.
 const RENOTICE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Whether the LAST completed check found the channel unreadable. Read by
-/// [`crate::spawn_background_check`] to raise the one-shot OS notification and to
-/// back the cadence off a check that cannot possibly succeed.
+/// Whether the LAST completed check found the channel unreadable. Read by the
+/// background checker's loop ([`crate::spawn_background_check_with_settings`]) to
+/// raise the one-shot OS notification and to back the cadence off a check that
+/// cannot possibly succeed.
 static STRANDED: AtomicBool = AtomicBool::new(false);
 
 /// The last time the log warning was emitted, for the [`RENOTICE_AFTER`] throttle.
@@ -78,8 +79,8 @@ pub(crate) fn clear() {
 /// every time; the log warning is throttled to [`RENOTICE_AFTER`] and the notification
 /// is fired once per process by the caller of [`is_stranded`].
 ///
-/// `explanation` comes from `github::unreadable_explanation`: it names the observed
-/// HTTP status, every cause that status cannot distinguish, and the remedy for each.
+/// `explanation` comes from `github::unreadable_explanation`: it names every cause a
+/// 404 cannot distinguish, the consequence, and the remedy.
 pub(crate) fn announce(staging: &Staging, current_build: u64, explanation: &str) {
     crate::status::record(staging, current_build, explanation);
     *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) = Some(explanation.to_string());
@@ -96,16 +97,18 @@ pub(crate) fn announce(staging: &Staging, current_build: u64, explanation: &str)
 }
 
 /// The `(title, body)` for the one-shot OS notification, built from the explanation
-/// [`announce`] recorded. Split out so the wording is testable without a GUI.
+/// [`announce`] recorded. Split out so the wording is testable without a GUI. The body
+/// IS the explanation: it already carries the consequence and the one remedy, and the
+/// check after a fix clears the latch by itself (`clear`), so nothing is added to it.
 #[must_use]
 pub(crate) fn notification() -> (String, String) {
-    let why = last_explanation()
+    let body = last_explanation()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_else(|| {
-            "aterm cannot read its release repository. Run `aterm-ctl update status` for \
-             the exact cause."
+            "aterm cannot read its release channel. This machine stays on its current \
+             version until the channel is fixed; run `aterm ctl update status` for the cause."
                 .to_string()
         });
     (
@@ -113,10 +116,7 @@ pub(crate) fn notification() -> (String, String) {
         // check, so the honest claim is the one the body makes — this Mac stays put
         // UNTIL the cause is fixed.
         "aterm is not updating on this machine".to_string(),
-        format!(
-            "{why}\n\nThis machine will stay on its current build until the channel is \
-             fixed. Then run `aterm-ctl update check`."
-        ),
+        body,
     )
 }
 
@@ -138,8 +138,11 @@ mod tests {
             !title.contains("never"),
             "the title must not claim a permanence the code does not enforce: {title}"
         );
-        assert!(body.contains("stay on its current build"), "{body}");
-        assert!(body.contains("aterm-ctl update status"), "{body}");
+        assert!(body.contains("stays on its current version"), "{body}");
+        assert!(
+            body.contains("`aterm ctl update status`") && !body.contains("aterm-ctl"),
+            "{body}"
+        );
         assert!(
             !body.contains("token"),
             "no credential is ever a remedy: {body}"
@@ -154,9 +157,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("aterm-unread-status-{}", std::process::id()));
-        let explanation = "aterm cannot read its release channel github.com/o/r (HTTP 404): \
-                           this machine will NEVER receive an update until the channel is \
-                           repaired";
+        let explanation = "aterm cannot read its release channel github.com/o/r: this \
+                           machine stays on its current version until the channel is fixed";
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let staging = Staging {
@@ -173,7 +175,7 @@ mod tests {
         let (_, body) = notification();
         assert!(body.contains("github.com/o/r"), "{body}");
         let text = std::fs::read_to_string(&staging.status).expect("status written");
-        assert!(text.contains("NEVER receive an update"), "{text}");
+        assert!(text.contains("stays on its current version"), "{text}");
         let _: aterm_toml::Value = aterm_toml::from_str(&text).expect("status stays valid TOML");
         assert!(is_stranded(), "the latch arms for the background loop");
         clear();
@@ -190,8 +192,8 @@ mod tests {
         // `reconcile_status_outcome`. That reducer NEUTRALIZES a persisted outcome that
         // falsely claims a stage; the unreadable explanation must pass through untouched.
         let explanation = String::from(
-            "aterm cannot read its release channel github.com/o/r (HTTP 404): this machine \
-             will NEVER receive an update",
+            "aterm cannot read its release channel github.com/o/r: this machine stays on \
+             its current version until the channel is fixed",
         );
         let reconciled = crate::reconcile_status_outcome(1234, 1234, None, explanation.clone());
         assert_eq!(

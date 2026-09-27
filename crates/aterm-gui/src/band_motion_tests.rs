@@ -423,7 +423,7 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
         x == aterm_messages::GLYPH_COL
             || layout
                 .elapsed
-                .is_some_and(|c| (c..c + aterm_messages::ELAPSED_W).contains(&x))
+                .is_some_and(|c| (c..c + layout.elapsed_width()).contains(&x))
             || layout
                 .eta
                 .is_some_and(|c| (c..c + layout.eta_width()).contains(&x))
@@ -582,12 +582,14 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
     let text = |cells: &[aterm_core::terminal::RenderCell]| -> String {
         cells.iter().map(|c| c.ch).collect()
     };
+    // The elapsed words, labelled (`for 20 s`, ruling 241).
     let clock = |row: &str| -> u64 {
-        let word = row
-            .split_whitespace()
-            .find(|w| w.len() == 4 && w.as_bytes()[1] == b':')
-            .unwrap_or_else(|| panic!("an elapsed clock in {row:?}"));
-        word[2..].parse().unwrap()
+        let words: Vec<&str> = row.split_whitespace().collect();
+        let at = words
+            .windows(3)
+            .position(|w| w[0] == "for" && w[2] == "s")
+            .unwrap_or_else(|| panic!("the elapsed words in {row:?}"));
+        words[at + 1].parse().unwrap()
     };
     // Half a second off the second boundary: the motion's 33 ms frame floor
     // (anchored to the center's birth, and 1 s is not a whole number of

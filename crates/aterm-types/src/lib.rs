@@ -9,7 +9,7 @@
 //! keyboard, mouse, selection, GPU views, text shaping, terminal hosting,
 //! perception, and verification.
 //!
-//! FFI boundary types (error enums, safety helpers, pointer lifecycle tracking)
+//! C ABI boundary helpers (panic catching, bounded pointer+len conversion)
 //! live in `aterm-ffi-types` (#3353).
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -25,8 +25,6 @@ pub use mutex_ext::MutexExt;
 // Formatting helpers that avoid runtime-argument `format_args!`, which the
 // Trust native lowering cannot model (see module docs).
 mod trust_fmt;
-
-pub mod sync;
 
 // `dev_seam!` — the one reader of a development-only environment variable.
 pub mod dev_seam;
@@ -46,7 +44,6 @@ mod cursor;
 // Grid indexing types (Line, Column, Point, etc.) — extracted from aterm-alacritty-bridge (#3828).
 pub mod index;
 // Re-export commonly used index types at crate root for ergonomic imports.
-pub use index::{Boundary, Column, Dimensions, Direction, Line, Point, Scroll, Side};
 
 #[macro_use]
 mod bitflags;
@@ -61,7 +58,6 @@ pub use time::duration_to_nanos;
 pub mod rfc3339;
 
 pub mod app_inspection;
-pub mod color_math;
 mod color_palette;
 pub mod control_socket;
 pub mod control_verbs;
@@ -80,26 +76,21 @@ pub use color_palette::ColorPalette;
 // Named color schemes ("theme palettes"): the single source for terminal colors.
 pub use scheme::{Appearance, ColorScheme, ThemeParts};
 
-pub mod block;
 mod buffer_access;
 pub mod buffer_command;
-mod buffer_view;
 mod clipboard;
 pub mod domain;
 mod env_sanitize;
 pub mod input;
 pub mod keyboard;
 mod kitty_keyboard;
-pub mod latency_stats;
 pub mod mouse;
-pub mod perception;
 pub mod pipeline_timestamps;
 pub use pipeline_timestamps::PipelineTimestamps;
 pub mod callback_events;
 mod callback_types;
 pub mod charset;
 pub mod paragraph_direction;
-pub mod screen_capture;
 pub mod selection;
 mod shell_blocks;
 mod shell_types;
@@ -111,7 +102,6 @@ pub mod vt_level;
 mod window;
 mod xterm_keyboard;
 // Re-export callback event types at crate root (Part of #5663 Phase 1).
-pub use callback_events::{SshConductorCallbackEvent, TmuxCallbackEvent};
 // Re-export ParagraphDirection at crate root (Part of #5663).
 pub use paragraph_direction::ParagraphDirection;
 // Re-export VtLevel at crate root (Part of #5663 Phase 1).
@@ -125,9 +115,9 @@ pub use window::{WindowOperation, WindowResponse};
 // Re-export shell block types at crate root (Part of #5663 Phase 3).
 pub use shell_blocks::{BlockState, OutputBlock, RowSpan};
 // Re-export shell types at crate root (Part of #5663 Phase 3).
-pub use shell_types::{Annotation, CommandMark, ShellEvent, TerminalMark, current_time_ms};
+pub use shell_types::{Annotation, CommandMark, TerminalMark, current_time_ms};
 // Re-export core terminal types at crate root (Part of #5663).
-pub use terminal_core::{TerminalCapabilities, TerminalSnapshot};
+pub use terminal_core::TerminalCapabilities;
 // Re-export terminal mode flags at crate root (Part of #5663).
 pub use terminal_modes::TerminalModes;
 // Re-export kitty keyboard types at crate root (Part of #5663).
@@ -137,32 +127,23 @@ pub use kitty_keyboard::{
 // Re-export xterm keyboard type at crate root (Part of #5663).
 pub use xterm_keyboard::XtermKeyboardState;
 // Re-export clipboard types at crate root (Part of #5663).
-pub use clipboard::{ClipboardOperation, ClipboardSelection, CopyToClipboardOperation};
+pub use clipboard::{ClipboardOperation, ClipboardSelection};
 pub mod osc;
 mod search_content;
 // Re-export SearchContent trait at crate root (#5759: decouple aterm-scrollback from aterm-search).
 pub use search_content::SearchContent;
 // Re-export OSC protocol types at crate root (Part of #5663).
 pub use osc::{
-    Iterm2CellSize, Iterm2SetColor, Iterm2ShellIntegrationVersion, MULTIPART_FILE_MAX_SIZE,
-    MultipartFileOperation, MultipartFileState, Notification, NotificationUrgency, RemoteHost,
-    SemanticBlock, SemanticBlockEvent, SemanticButton, SemanticButtonEvent, SemanticButtonType,
-    TaskbarProgress, TextSizingAlignment, TextSizingOperation,
+    Iterm2ShellIntegrationVersion, Notification, NotificationUrgency, RemoteHost, TaskbarProgress,
 };
 // Re-export callback type aliases at crate root (Part of #5663, Phase 2).
 pub use callback_types::{
-    AdvancedNotificationCallback, BufferActivationCallback, ClipboardCallback, ColorChangeCallback,
-    ColorChangeOp, CopyToClipboardCallback, DcsCallback, HighlightCursorLineCallback,
-    KittyImageCallback, KittyImageData, KvpCallback, MultipartFileCallback, NotificationCallback,
-    RemoteHostCallback, ReportCellSizeCallback, ReportVariableCallback, SemanticBlockCallback,
-    SemanticButtonCallback, SetBadgeFormatCallback, SetColorsCallback, SetProfileCallback,
-    ShellCallback, ShellIntegrationVersionCallback, TextSizingCallback, TitleCallback,
-    TitleEventCallback, TitleType, WindowCallback,
+    AdvancedNotificationCallback, ClipboardCallback, ColorChangeCallback, ColorChangeOp,
+    NotificationCallback, WindowCallback,
 };
 // Re-export unified buffer types at crate root for ergonomic imports.
 pub use buffer_access::BufferAccess;
 pub use buffer_command::BufferCommand;
-pub use buffer_view::{BufferMatch, BufferView};
 
 // ============================================================================
 // Terminal Size

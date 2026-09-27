@@ -672,13 +672,6 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
         eprintln!("SKIP: no variable mono face installed on this host");
         return;
     };
-    if std::env::var_os("ATERM_STEM_GAMMA").is_some() {
-        // A non-identity LUT warps the antialiased fringe of the renderer's
-        // coverage but not of the raw reference raster below, so byte equality
-        // would be comparing two different transforms.
-        eprintln!("SKIP: ATERM_STEM_GAMMA set (coverage is not the raw raster)");
-        return;
-    }
     let px = 16.0;
     let theme = aterm_render::Theme::default();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");
@@ -775,10 +768,6 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn nonvariable_bold_still_takes_the_synthetic_path() {
-    if std::env::var_os("ATERM_STEM_GAMMA").is_some() {
-        eprintln!("SKIP: ATERM_STEM_GAMMA set (coverage is not the raw raster)");
-        return;
-    }
     let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");
     let px = 16.0;
     let mut r = aterm_render::Renderer::from_bytes(dejavu, px, aterm_render::Theme::default())

@@ -109,61 +109,6 @@ fn home_from_passwd(contents: &[u8], uid: u32) -> Option<PathBuf> {
     None
 }
 
-/// Return the user's configuration directory.
-///
-/// - **macOS**: `$HOME/Library/Application Support`
-/// - **Linux**: `$XDG_CONFIG_HOME` or `$HOME/.config`
-/// - **Windows**: `%APPDATA%`
-#[must_use]
-pub fn config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        home_dir().map(|h| h.join("Library/Application Support"))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        xdg_dir("XDG_CONFIG_HOME").or_else(|| home_dir().map(|h| h.join(".config")))
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    }
-    // wasm and other targets have no OS config dir.
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        None
-    }
-}
-
-/// Return the user's CACHE directory — re-derivable bytes only, safe to
-/// delete at any time (the OS may: macOS purges Caches under disk pressure,
-/// which is exactly the contract callers must survive).
-///
-/// - **macOS**: `$HOME/Library/Caches`
-/// - **Linux**: `$XDG_CACHE_HOME` or `$HOME/.cache`
-/// - **Windows**: `%LOCALAPPDATA%` (Windows has no separate cache root; callers
-///   should nest under an app-named `cache` subdirectory)
-#[must_use]
-pub fn cache_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        home_dir().map(|h| h.join("Library/Caches"))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        xdg_dir("XDG_CACHE_HOME").or_else(|| home_dir().map(|h| h.join(".cache")))
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    }
-    // wasm and other targets have no OS cache dir.
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        None
-    }
-}
-
 /// Return the user's data directory.
 ///
 /// - **macOS**: `$HOME/Library/Application Support`
@@ -195,9 +140,11 @@ pub fn data_dir() -> Option<PathBuf> {
 /// the one `aterm_agent::operator::default_state_root` and the GUI's document
 /// journal already follow, so every state reader agrees on the directory:
 ///
-/// - `$ATERM_STATE_HOME` when set (absolute; a relative value is refused as
-///   `None`, never joined onto an arbitrary cwd) — the knob a headless or
-///   test instance uses to keep its state in a temp root;
+/// - in a development build only, the `ATERM_STATE_HOME` seam
+///   ([`crate::dev_seam!`], absolute; a relative value is refused as `None`,
+///   never joined onto an arbitrary cwd) — what a test keeps its state in a temp
+///   root with. A shipped binary reads no such variable: a scratch `$HOME` (or
+///   `$XDG_STATE_HOME` off macOS) is how a release launch is isolated;
 /// - **macOS**: `$HOME/Library/Application Support/aterm`;
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm` (absolute) or
 ///   `$HOME/.local/state/aterm`;
@@ -207,7 +154,7 @@ pub fn data_dir() -> Option<PathBuf> {
 #[must_use]
 pub fn state_dir() -> Option<PathBuf> {
     resolve_state_dir(
-        std::env::var_os("ATERM_STATE_HOME").map(PathBuf::from),
+        crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from),
         StatePlatform {
             home: home_dir(),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -228,7 +175,7 @@ pub struct StatePlatform {
     pub local_app_data: Option<PathBuf>,
 }
 
-/// The pure half of [`state_dir`]: `override_root` is `$ATERM_STATE_HOME`.
+/// The pure half of [`state_dir`]: `override_root` is the development seam.
 #[must_use]
 pub fn resolve_state_dir(
     override_root: Option<PathBuf>,
@@ -273,6 +220,12 @@ pub fn resolve_state_dir(
 /// (the window's and the session's `aterm.log`, and atpkg's `packages.log`, which every
 /// package lane appends to), so the files a person is told to look at sit side by side:
 ///
+/// - in a development build only, `$ATERM_STATE_HOME/logs` when that seam is set
+///   ([`crate::dev_seam!`], as [`state_dir`] reads it; a relative value is refused as
+///   `None`, as [`state_dir`] refuses it) — an instance given its own state root keeps
+///   its log there too, never in the person's log beside their real instance's
+///   (2026-09-24: a headless test instance's supervisor lines landed in the owner's
+///   `~/Library/Logs/aterm/aterm.log`);
 /// - **macOS**: `$HOME/Library/Logs/aterm` (Console.app's convention);
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm/logs` (absolute) or
 ///   `$HOME/.local/state/aterm/logs` — a Linux home has no business growing a `~/Library`;
@@ -283,16 +236,25 @@ pub fn resolve_state_dir(
 /// window's logger makes it `0700`). `None` only when nothing resolves.
 #[must_use]
 pub fn logs_dir() -> Option<PathBuf> {
-    resolve_logs_dir(StatePlatform {
-        home: home_dir(),
-        xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
-    })
+    resolve_logs_dir(
+        crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from),
+        StatePlatform {
+            home: home_dir(),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+            local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        },
+    )
 }
 
-/// The pure half of [`logs_dir`].
+/// The pure half of [`logs_dir`]: `override_root` is `$ATERM_STATE_HOME`.
 #[must_use]
-pub fn resolve_logs_dir(platform: StatePlatform) -> Option<PathBuf> {
+pub fn resolve_logs_dir(
+    override_root: Option<PathBuf>,
+    platform: StatePlatform,
+) -> Option<PathBuf> {
+    if let Some(root) = override_root {
+        return root.is_absolute().then(|| root.join("logs"));
+    }
     #[cfg(target_os = "macos")]
     {
         let _ = (&platform.xdg_state_home, &platform.local_app_data);
@@ -369,9 +331,17 @@ mod tests {
             xdg_state_home: Some(PathBuf::from("/xdg/state")),
             local_app_data: Some(PathBuf::from(r"C:\Users\who\AppData\Local")),
         };
+        // Spelled per host: `/tmp/...` is NOT absolute on Windows (no drive, no
+        // root — `Path::is_absolute` is false there), so the Unix literal made
+        // this assertion fail for a reason that has nothing to do with the
+        // resolver (measured 2026-09-22, the first Windows run of this suite).
+        #[cfg(not(windows))]
+        let absolute_override = PathBuf::from("/tmp/aterm-state");
+        #[cfg(windows)]
+        let absolute_override = PathBuf::from(r"C:\tmp\aterm-state");
         assert_eq!(
-            resolve_state_dir(Some(PathBuf::from("/tmp/aterm-state")), platform.clone()),
-            Some(PathBuf::from("/tmp/aterm-state")),
+            resolve_state_dir(Some(absolute_override.clone()), platform.clone()),
+            Some(absolute_override),
             "the override is the root itself, no `aterm` appended"
         );
         assert_eq!(
@@ -412,7 +382,8 @@ mod tests {
     /// THE LOG DIRECTORY RULE (packages.log beside aterm.log, 2026-09-23), pure: macOS
     /// keeps Console.app's `~/Library/Logs/aterm`, other Unix the XDG state dir's
     /// `aterm/logs` (a relative XDG value falls through to the home default), and nothing
-    /// to resolve from is `None`.
+    /// to resolve from is `None`. An instance given its own state root logs under it
+    /// (2026-09-24), a relative one is refused like the state root it would be.
     #[test]
     fn logs_dir_follows_each_platforms_convention() {
         let platform = StatePlatform {
@@ -420,27 +391,44 @@ mod tests {
             xdg_state_home: Some(PathBuf::from("/xdg/state")),
             local_app_data: Some(PathBuf::from("C:\\Users\\who\\AppData\\Local")),
         };
+        // Per host, for the reason `state_dir_honours_an_absolute_override_…`
+        // gives: `/tmp/...` is not an absolute path on Windows.
+        #[cfg(not(windows))]
+        let absolute_override = PathBuf::from("/tmp/aterm-state");
+        #[cfg(windows)]
+        let absolute_override = PathBuf::from(r"C:\tmp\aterm-state");
+        assert_eq!(
+            resolve_logs_dir(Some(absolute_override.clone()), platform.clone()),
+            Some(absolute_override.join("logs"))
+        );
+        assert_eq!(
+            resolve_logs_dir(Some(PathBuf::from("relative/state")), platform.clone()),
+            None
+        );
         #[cfg(target_os = "macos")]
         assert_eq!(
-            resolve_logs_dir(platform.clone()),
+            resolve_logs_dir(None, platform.clone()),
             Some(PathBuf::from("/Users//who/Library/Logs/aterm"))
         );
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             assert_eq!(
-                resolve_logs_dir(platform.clone()),
+                resolve_logs_dir(None, platform.clone()),
                 Some(PathBuf::from("/xdg/state/aterm/logs"))
             );
             assert_eq!(
-                resolve_logs_dir(StatePlatform {
-                    xdg_state_home: Some(PathBuf::from("relative")),
-                    ..platform.clone()
-                }),
+                resolve_logs_dir(
+                    None,
+                    StatePlatform {
+                        xdg_state_home: Some(PathBuf::from("relative")),
+                        ..platform.clone()
+                    }
+                ),
                 Some(PathBuf::from("/Users//who/.local/state/aterm/logs"))
             );
         }
         let _ = &platform;
-        assert_eq!(resolve_logs_dir(StatePlatform::default()), None);
+        assert_eq!(resolve_logs_dir(None, StatePlatform::default()), None);
     }
 
     #[test]

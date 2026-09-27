@@ -268,6 +268,7 @@ impl Grid {
     }
 
     #[doc(hidden)] // Write char with deferred autowrap. Pub for crate benchmarks only.
+    #[cfg(test)]
     pub fn write_char_wrap(&mut self, c: char) {
         // Resolve any deferred wrap before writing
         self.resolve_pending_wrap();
@@ -535,6 +536,7 @@ impl Grid {
     /// REQUIRES: all bytes 0x20..=0x7E, no RGB overflow, insert mode OFF
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
     #[inline]
+    #[cfg(test)]
     pub fn write_ascii_run_styled(
         &mut self,
         ascii: &[u8],

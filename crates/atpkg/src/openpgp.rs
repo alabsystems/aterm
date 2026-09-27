@@ -952,23 +952,17 @@ mod tests {
     }
 
     #[test]
-    fn real_2_1_280_manifest_verifies_under_the_compiled_key() {
-        assert_eq!(
-            verify_anthropic(MANIFEST_280, SIG_280),
-            Ok(VerifiedSignature {
-                created: SIG_280_CREATED
-            })
-        );
-    }
-
-    #[test]
-    fn real_2_1_278_manifest_verifies_under_the_compiled_key() {
-        assert_eq!(
-            verify_anthropic(MANIFEST_278, SIG_278),
-            Ok(VerifiedSignature {
-                created: SIG_278_CREATED
-            })
-        );
+    fn real_manifests_verify_under_the_compiled_key() {
+        for (release, manifest, sig, created) in [
+            ("2.1.280", MANIFEST_280, SIG_280, SIG_280_CREATED),
+            ("2.1.278", MANIFEST_278, SIG_278, SIG_278_CREATED),
+        ] {
+            assert_eq!(
+                verify_anthropic(manifest, sig),
+                Ok(VerifiedSignature { created }),
+                "{release}"
+            );
+        }
     }
 
     #[test]

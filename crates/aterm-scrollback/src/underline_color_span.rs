@@ -59,18 +59,4 @@ impl UnderlineColorSpan {
     pub const fn contains(&self, col: u16) -> bool {
         col >= self.start_col && col < self.end_col
     }
-
-    /// Get the span width in columns.
-    #[inline]
-    #[must_use]
-    pub const fn width(&self) -> u16 {
-        self.end_col.saturating_sub(self.start_col)
-    }
-
-    /// Serialized size in bytes: fixed `start_col + end_col + color` = 8.
-    #[inline]
-    #[must_use]
-    pub const fn serialized_size(&self) -> usize {
-        8
-    }
 }

@@ -228,9 +228,10 @@ pub fn presentation_gate_model() -> Model {
 /// The real decision is aterm-render's pure
 /// [`aterm_render::ligature_shaping::classify_shape`] (the shaping seam in
 /// `shape_ligature_run`); the Tier-1 binding is aterm-render's
-/// `tests/ligature_slice.rs::classify_shape_lattice` (the SAME conservativeness
-/// invariant, enumerated over the small-count lattice) and the `gate_*` kani
-/// proofs.
+/// `tests/ligature_slice.rs::classify_shape_conforms_to_ligature_gate_model`,
+/// which replays this model's `Classify` step with `accept'` taken from the real
+/// verdict over the whole `0..=8` lattice and shows the flag-blind gate is the
+/// `Buggy = 1` step the committed model rejects.
 ///
 /// The abstraction: a shape has `n_in` input cells and `n_out` output glyphs, and
 /// a config flag `admit` (Cascadia N:1 admission, default OFF). The gate ACCEPTS
@@ -562,8 +563,24 @@ pub fn hdr_present_gate_model() -> Model {
 /// `RetagFails` performs the required two-field fallback.
 /// `EnterSdrFallback -> UpgradeSucceeds/UpgradeFails` models the symmetric
 /// same-size Windows HDR-on path from a retained eligible SDR surface.
-/// `Buggy=1` recreates both defects: ignore a failed live re-tag, or leave the
-/// attempted upgrade f16 after its tag fails.
+/// `Buggy=1` enables three dead negative controls. Two recreate the historical
+/// defects: `BuggyRetagFailureIgnored` ignores a failed live re-tag, keeping f16
+/// and linear capture (`ResolvedF16RequiresSuccessfulRetag`), and
+/// `BuggyUpgradeFailureKeepsF16` leaves the attempted upgrade f16 after its tag
+/// fails while capture honestly reads SDR (both laws). The third,
+/// `BuggyEscapeKeepsLinearCapture`, is the SDR escape whose apply lost its
+/// metadata half: the surface resolves SDR while capture stays linear
+/// (`CaptureMatchesSurfaceEncoding`). It is the state the aterm-gpu bind reads
+/// back off a real window whose `apply_hdr_reconfigure_plan` never ran.
+///
+/// Two laws are deliberately NOT stated. "A failed re-tag falls back on both
+/// fields at once" is `ResolvedF16RequiresSuccessfulRetag` and
+/// `CaptureMatchesSurfaceEncoding` read together at stage 2. "The retained
+/// eligible-SDR stage is SDR" is the definition of stage 1: the renderer
+/// derives that stage from `!surf.is_hdr()`, so an escape whose apply was
+/// skipped leaves a surface the renderer still reads as stage 0, and one that
+/// selected `sdr_format` but kept linear capture is a
+/// `CaptureMatchesSurfaceEncoding` violation, which the aterm-gpu bind replays.
 ///
 /// Tier-1 is in aterm-gpu, in two halves, and every action is `#[refines]`-bound
 /// to BOTH:
@@ -625,8 +642,8 @@ pub fn hdr_reconfigure_retag_model() -> Model {
             action RetagFails when (stage == 0) {
                 stage = 2;
                 retagged = 0;
-                is_f16 = if Buggy == 1 { 1 } else { 0 };
-                capture_linear = if Buggy == 1 { 1 } else { 0 };
+                is_f16 = 0;
+                capture_linear = 0;
             }
 
             action EnterSdrFallback when (stage == 0) {
@@ -646,27 +663,36 @@ pub fn hdr_reconfigure_retag_model() -> Model {
             action UpgradeFails when (stage == 1) {
                 stage = 2;
                 retagged = 0;
-                is_f16 = if Buggy == 1 { 1 } else { 0 };
+                is_f16 = 0;
                 capture_linear = 0;
             }
 
-            invariant FailedRetagFallsBackAtomically:
-                if stage == 2 && retagged == 0 {
-                    is_f16 == 0 && capture_linear == 0
-                } else {
-                    is_f16 <= 1
-                };
+            action BuggyRetagFailureIgnored when (Buggy == 1 && stage == 0) {
+                stage = 2;
+                retagged = 0;
+                is_f16 = 1;
+                capture_linear = 1;
+            }
+
+            action BuggyUpgradeFailureKeepsF16 when (Buggy == 1 && stage == 1) {
+                stage = 2;
+                retagged = 0;
+                is_f16 = 1;
+                capture_linear = 0;
+            }
+
+            action BuggyEscapeKeepsLinearCapture when (Buggy == 1 && stage == 0) {
+                stage = 1;
+                retagged = 0;
+                is_f16 = 0;
+                capture_linear = 1;
+            }
+
             invariant ResolvedF16RequiresSuccessfulRetag:
                 if stage == 2 && is_f16 == 1 {
                     retagged == 1
                 } else {
                     retagged <= 1
-                };
-            invariant AwaitingUpgradeIsSdr:
-                if stage == 1 {
-                    is_f16 == 0 && capture_linear == 0
-                } else {
-                    stage == 0 || stage == 2
                 };
             invariant CaptureMatchesSurfaceEncoding:
                 capture_linear == is_f16;
@@ -1109,14 +1135,25 @@ pub fn serious_mode_model() -> Model {
 /// `pty_writes` pins the critical terminal/TUI contract: these host chords never
 /// reach the PTY.
 ///
-/// `nav_work` is the deterministic work counter for a repeat transition over an
-/// already materialized hit vector.  It is one regardless of hit count; query
-/// construction has separate engine counters/benchmarks and is intentionally
-/// not misrepresented as a wall-clock theorem here.
+/// What it does NOT claim: how much work a repeat does. A repeat over the
+/// materialized hit vector is `SearchState::step`'s modular arithmetic, and no
+/// shipping counter records work a bind could read, so a "work <= 1" law here
+/// could never fail on a linear-scan regression. It was deleted, with the twin
+/// model that stated it alone; query construction keeps its own engine counters.
 ///
-/// `Buggy=1` combines the two regressions the Tier-1 negative controls exercise:
-/// opening leaks a byte to the PTY, and forward repeat scans `hits` entries while
-/// stepping past the final ordinal instead of wrapping.
+/// `Buggy=1` is the regression family, one member per design law: opening leaks
+/// a byte to the PTY (`NoPtyLeak`); a forward repeat steps past the final
+/// ordinal instead of wrapping (`CurrentOrdinalBounded`); streaming output
+/// leaves the stale hit selected (`StaleBatchNeverSelected`); cancel leaves the
+/// viewport where the search moved it (`CancelRestoresOrigin`); accept drops the
+/// hit it accepted (`AcceptKeepsHit`).
+///
+/// Tier-1: `aterm-gui/src/app_search.rs::emacs_navigation_conforms_to_derived_transition_model`
+/// drives the chords through the real host seam (`terminal_emacs_search_pressed`
+/// and the physical release) on a headless App whose PTY is an observer pipe,
+/// projects the real search, selection, viewport and PTY bytes after every
+/// step, and rejects each member injected into the same real trace at its own
+/// action.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn emacs_search_navigation_model() -> Model {
@@ -1135,8 +1172,8 @@ pub fn emacs_search_navigation_model() -> Model {
             var dirty = 0;
             // 0 none/open, 1 cancelled, 2 accepted.
             var last_exit = 0;
+            // 1 once any byte has reached the PTY.
             var pty_writes = 0;
-            var nav_work = 0;
             action OpenForward when (active == 0) {
                 active = 1;
                 forward = 1;
@@ -1147,8 +1184,7 @@ pub fn emacs_search_navigation_model() -> Model {
                 selection = 0;
                 dirty = 0;
                 last_exit = 0;
-                pty_writes = if Buggy == 1 { pty_writes + 1 } else { pty_writes };
-                nav_work = 0;
+                pty_writes = if Buggy == 1 { 1 } else { pty_writes };
             }
             action OpenBackward when (active == 0) {
                 active = 1;
@@ -1160,8 +1196,7 @@ pub fn emacs_search_navigation_model() -> Model {
                 selection = 0;
                 dirty = 0;
                 last_exit = 0;
-                pty_writes = if Buggy == 1 { pty_writes + 1 } else { pty_writes };
-                nav_work = 0;
+                pty_writes = if Buggy == 1 { 1 } else { pty_writes };
             }
             action PublishHit when (active == 1 && hits <= Cap - 1) {
                 query = 1;
@@ -1171,7 +1206,6 @@ pub fn emacs_search_navigation_model() -> Model {
                 selection = 1;
                 dirty = 0;
                 last_exit = 0;
-                nav_work = 0;
             }
             action PublishMiss when (active == 1) {
                 query = 1;
@@ -1180,28 +1214,27 @@ pub fn emacs_search_navigation_model() -> Model {
                 selection = 0;
                 dirty = 0;
                 last_exit = 0;
-                nav_work = 0;
             }
             action Output when (active == 1 && query == 1) {
                 dirty = 1;
-                selection = 0;
-                nav_work = 0;
+                selection = if Buggy == 1 { selection } else { 0 };
             }
+            // At Buggy=1 the step off the last ordinal lands one PAST it instead
+            // of wrapping (and wraps from there, so the space stays bounded).
             action RepeatForward when (active == 1 && hits > 0 && dirty == 0) {
                 forward = 1;
-                current = if Buggy == 1 {
+                current = if current <= hits - 2 || (Buggy == 1 && current == hits - 1) {
                     current + 1
                 } else {
-                    if current <= hits - 2 { current + 1 } else { 0 }
+                    0
                 };
-                viewport = if Buggy == 1 {
+                viewport = if current <= hits - 2 || (Buggy == 1 && current == hits - 1) {
                     current + 1
                 } else {
-                    if current <= hits - 2 { current + 1 } else { 0 }
+                    0
                 };
                 selection = 1;
                 last_exit = 0;
-                nav_work = if Buggy == 1 { hits } else { 1 };
             }
             action RepeatBackward when (active == 1 && hits > 0 && dirty == 0) {
                 forward = 0;
@@ -1209,7 +1242,6 @@ pub fn emacs_search_navigation_model() -> Model {
                 viewport = if current > 0 { current - 1 } else { hits - 1 };
                 selection = 1;
                 last_exit = 0;
-                nav_work = 1;
             }
             action RefreshRepeatForward when (active == 1 && hits > 0 && dirty == 1) {
                 forward = 1;
@@ -1217,7 +1249,6 @@ pub fn emacs_search_navigation_model() -> Model {
                 viewport = if current <= hits - 2 { current + 1 } else { 0 };
                 selection = 1;
                 dirty = 0;
-                nav_work = 1;
             }
             action RefreshRepeatBackward when (active == 1 && hits > 0 && dirty == 1) {
                 forward = 0;
@@ -1225,27 +1256,23 @@ pub fn emacs_search_navigation_model() -> Model {
                 viewport = if current > 0 { current - 1 } else { hits - 1 };
                 selection = 1;
                 dirty = 0;
-                nav_work = 1;
             }
             action RefreshMiss when (active == 1 && dirty == 1) {
                 hits = 0;
                 current = 0;
                 selection = 0;
                 dirty = 0;
-                nav_work = 1;
             }
             action Cancel when (active == 1) {
                 active = 0;
-                viewport = origin;
+                viewport = if Buggy == 1 { viewport } else { origin };
                 selection = 0;
                 last_exit = 1;
-                nav_work = 0;
             }
             action Accept when (active == 1 && dirty == 0) {
                 active = 0;
-                selection = if hits > 0 { 1 } else { 0 };
+                selection = if hits > 0 && Buggy == 0 { 1 } else { 0 };
                 last_exit = 2;
-                nav_work = 0;
             }
             invariant NoPtyLeak: pty_writes == 0;
             invariant CurrentOrdinalBounded:
@@ -1259,39 +1286,6 @@ pub fn emacs_search_navigation_model() -> Model {
                 if last_exit == 1 { viewport == origin && selection == 0 } else { viewport <= Cap };
             invariant AcceptKeepsHit:
                 if last_exit == 2 && hits > 0 { selection == 1 } else { selection <= 1 };
-            invariant RepeatWorkBounded: nav_work <= 1;
-        }
-    }
-}
-
-/// Independent non-vacuity twin for the already-materialized, non-truncated
-/// match-vector step. Keeping this separate from the no-PTY-leak mutant ensures
-/// `ty` must specifically catch linear-in-hit-count repeat work rather than
-/// satisfying prove-and-catch with an earlier input-routing violation.
-///
-/// This is intentionally scoped to the host's cached vector step. Truncated
-/// point lookup, cold snapshot/index construction, and matcher wall time are
-/// bounded/measured by shipping-code counters and release tests, not claimed by
-/// this abstract state machine.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn emacs_search_repeat_work_model() -> Model {
-    crate::ty_model! {
-        EmacsSearchRepeatWork {
-            const Buggy = 0;
-            const Cap = 3;
-            var hits = 1;
-            var current = 0;
-            var work = 0;
-            action AddHit when (hits <= Cap - 1) {
-                hits = hits + 1;
-            }
-            action Step {
-                current = if current <= hits - 2 { current + 1 } else { 0 };
-                work = if Buggy == 1 { hits } else { 1 };
-            }
-            invariant CurrentOrdinalBounded: 0 <= current && current <= hits - 1;
-            invariant RepeatWorkBounded: work <= 1;
         }
     }
 }
@@ -1556,10 +1550,14 @@ pub fn grid_translate_model() -> Model {
 /// leaves its cell. The band `(top, thickness)` is clamped in a SPECIFIC ORDER —
 /// thickness into `[1, cell_h]` FIRST, then top into `[0, cell_h − thickness]` —
 /// which guarantees `top + thickness <= cell_h` for ANY raw input. This is the
-/// abstract twin of that clamp; the Tier-1 bindings are the exhaustive lattice
-/// tests `aterm-render/tests/deco_lines.rs::{resolved_bands_always_inside_the_cell,
-/// decoration_writes_stay_within_the_run_band}` (the latter drives the real
-/// emitters across every `UnderlineStyle`).
+/// abstract twin of that clamp. Tier-1:
+/// `aterm-render/tests/deco_lines.rs::resolved_bands_conform_to_the_deco_band_containment_model`
+/// drives the shipping `resolve_deco_metrics` over this model's WHOLE lattice —
+/// the underline through its config adjust hatches, the strike through its OS/2
+/// table — and requires each settled `(t, y)` to be the model's one successor;
+/// `resolved_bands_always_inside_the_cell` and
+/// `decoration_writes_stay_within_the_run_band` carry the same law past the
+/// lattice and through the real emitters.
 ///
 /// Purely additive (clamp = `min`/`max` via `if`, plus `+`/`−`/`<=`), so unlike
 /// the resolver's per-em SCALING (which is `mul`, hence L0-only) the CONTAINMENT
@@ -1568,20 +1566,23 @@ pub fn grid_translate_model() -> Model {
 /// exceed the cell — exercising the clamp), settle the thickness, then settle the
 /// top against the thickness-aware bound. Safety `Contained`: `y + t <= cell_h`.
 ///
-/// `Buggy = 1` reproduces the pre-clamp-order defect — the top is clamped against
-/// the WHOLE cell (`cell_h`, ignoring the thickness) instead of `cell_h − t`, so a
-/// low, thick band spills one or more rows past the cell bottom into the row below
-/// (the "decoration escaped its cell" failure the emitters must never produce). So
-/// `ty` PROVES `Contained` at `Buggy = 0` and CATCHES the spill at `Buggy = 1`.
+/// `Buggy = 1` is the regression family, one member per law. The pre-clamp-order
+/// defect clamps the top against the WHOLE cell (`cell_h`, ignoring the
+/// thickness) instead of `cell_h − t`, so a low, thick band spills one or more
+/// rows past the cell bottom into the row below (the "decoration escaped its
+/// cell" failure the emitters must never produce) — `Contained` catches it. And
+/// the dropped thickness FLOOR lets a zero-thickness request settle at `t = 0`,
+/// an underline that draws nothing at all — `ThicknessInCell` catches that.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn deco_band_containment_model() -> Model {
     // clamp(raw_t, 1, cell_h): raw_t is >= 0 on the lattice, so `< 1` is `== 0`.
+    // Buggy = the floor dropped: a zero request stays zero.
     let clamp_t = || {
         if_(
             le(var("raw_t"), int(0)),
-            int(1),
+            if_(gt(cst("Buggy"), int(0)), int(0), int(1)),
             if_(gt(var("raw_t"), var("cell_h")), var("cell_h"), var("raw_t")),
         )
     };
@@ -1706,9 +1707,8 @@ pub fn deco_band_containment_model() -> Model {
                 expr: settled_implies(le(add(var("y"), var("t")), var("cell_h"))),
             },
             Invariant {
-                // Always-true control (both Buggy values): the thickness clamp keeps
-                // the stroke a visible, in-cell height — proves the model reaches a
-                // settled non-degenerate band, so Contained is not checked vacuously.
+                // The stroke is a VISIBLE, in-cell height. Buggy=1's dropped floor
+                // settles a zero request at t = 0 — a line that draws nothing.
                 name: "ThicknessInCell",
                 expr: or_(
                     neq(var("phase"), int(5)),
@@ -2210,46 +2210,34 @@ pub fn styled_run_face_model() -> Model {
 /// presence-lattice test, which binds the real function's first-element class
 /// to this model's `winner` for every presence combination).
 ///
-/// This is the model of the invisible-env-knob fix: the fallback / symbol /
-/// emoji fonts used to be configurable ONLY via `$ATERM_FALLBACK_FONT`-family
-/// env vars. The TOML keys (`fallback_fonts` / `symbol_font` / `emoji_font`)
-/// must STRICTLY OUTRANK the env compat alias, which outranks built-in
-/// discovery (discovery always exists — the built-in candidate list is
-/// non-empty).
+/// This is the model of the invisible-knob fix: the fallback / symbol / emoji
+/// fonts used to be configurable ONLY via `$ATERM_FALLBACK_FONT`-family env
+/// vars, and the TOML keys (`fallback_fonts` / `symbol_font` / `emoji_font`)
+/// that replaced them must STRICTLY OUTRANK built-in discovery (discovery always
+/// exists — the built-in candidate list is non-empty). The env tier that sat
+/// between the two was deleted on 2026-09-24, so the law is two classes.
 ///
-/// Scalar projection `<<cfg_present, env_present, winner>>`: presence of a
-/// config entry / env alias, and `winner` = the class of the chain's FIRST
-/// candidate (1 = config, 2 = env, 3 = discovery), recomputed from the inputs
-/// in the same step. Four `Case*` actions spread the input square.
+/// Scalar projection `<<cfg_present, winner>>`: presence of a config entry, and
+/// `winner` = the class of the chain's FIRST candidate (1 = config,
+/// 2 = discovery), recomputed from the input in the same step. Two `Case*`
+/// actions cover the input.
 ///
-/// `Buggy` gates the inverted precedence (the pre-W6 world view where the env
-/// var was consulted first): with `Buggy = 1` the env alias outranks an
-/// explicit config entry, violating `ConfigOutranksEnv`. `ty` PROVES the law
-/// (Buggy=0) and CATCHES the inversion (Buggy=1 → counterexample).
+/// `Buggy` gates the inverted precedence (discovery consulted first, so a
+/// built-in face shadows the user's explicit choice): with `Buggy = 1` the
+/// discovery head wins even with a config entry present, violating
+/// `ConfigOutranksDiscovery`. `ty` PROVES the law (Buggy=0) and CATCHES the
+/// inversion (Buggy=1 → counterexample).
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fallback_precedence_model() -> Model {
-    // winner' for the literal inputs (c, e): committed = config > env >
-    // discovery; Buggy = env > config > discovery.
-    let winner_for = |c: i64, e: i64| {
-        let committed = if c == 1 {
-            1
-        } else if e == 1 {
-            2
-        } else {
-            3
-        };
-        let buggy = if e == 1 {
-            2
-        } else if c == 1 {
-            1
-        } else {
-            3
-        };
-        if_(gt(cst("Buggy"), int(0)), int(buggy), int(committed))
+    // winner' for the literal input c: committed = config > discovery;
+    // Buggy = discovery first (always present, so it always heads the chain).
+    let winner_for = |c: i64| {
+        let committed = if c == 1 { 1 } else { 2 };
+        if_(gt(cst("Buggy"), int(0)), int(2), int(committed))
     };
-    let case = |name: &'static str, c: i64, e: i64| Action {
+    let case = |name: &'static str, c: i64| Action {
         name,
         guard: None,
         updates: vec![
@@ -2258,12 +2246,8 @@ pub fn fallback_precedence_model() -> Model {
                 expr: int(c),
             },
             Update {
-                var: "env_present",
-                expr: int(e),
-            },
-            Update {
                 var: "winner",
-                expr: winner_for(c, e),
+                expr: winner_for(c),
             },
         ],
     };
@@ -2275,27 +2259,18 @@ pub fn fallback_precedence_model() -> Model {
                 name: "cfg_present",
                 init: 0,
             },
-            StateVar {
-                name: "env_present",
-                init: 0,
-            },
-            // Init matches CaseNeither's recomputation (discovery wins when
-            // nothing outranks it), so the initial state satisfies the invariant.
+            // Init matches CaseNone's recomputation (discovery wins when nothing
+            // outranks it), so the initial state satisfies the invariant.
             StateVar {
                 name: "winner",
-                init: 3,
+                init: 2,
             },
         ],
         fn_vars: vec![],
-        actions: vec![
-            case("CaseNeither", 0, 0),
-            case("CaseCfgOnly", 1, 0),
-            case("CaseEnvOnly", 0, 1),
-            case("CaseBoth", 1, 1),
-        ],
+        actions: vec![case("CaseNone", 0), case("CaseCfg", 1)],
         invariants: vec![Invariant {
             // An explicit config entry always heads the chain.
-            name: "ConfigOutranksEnv",
+            name: "ConfigOutranksDiscovery",
             expr: or_(le(var("cfg_present"), int(0)), eq(var("winner"), int(1))),
         }],
     }
@@ -2888,9 +2863,28 @@ pub fn pad_absorption_model() -> Model {
 ///
 /// The bounded lattice abstracts grid height away (it cancels from the exact
 /// cover equation) but retains the independent head band in `grid_top`. `Buggy=1`
-/// reproduces both defect classes: it accepts an unclamped top while leaving the
-/// bottom at the old symmetric pad, and it reuses a valid cache solely because
-/// dimensions/content match even when the cached grid origin differs.
+/// reproduces the defect classes, one slip per law:
+/// * the initial top is accepted unclamped while the bottom stays at the old
+///   symmetric pad (`ExactVerticalPadCover`, `TopPadIsBounded`);
+/// * the changed top is clamped only where it is REPORTED — `pad_top()` clamps,
+///   `set_pad_top` stores the raw request, and `grid_top()` reads the field — so
+///   the origin and the bottom band follow the unclamped request
+///   (`GridOriginTracksTopAndHead`);
+/// * or the changed top is taken unclamped everywhere while the bottom stays at
+///   the old symmetric pad — the initial path's defect on the runtime path
+///   (`ExactVerticalPadCover`, `TopPadIsBounded`);
+/// * the cache gate keys dimensions/content only, so a moved origin HITS a
+///   stale frame (`LayoutChangeForcesFullRepaint`);
+/// * the gate compares a size the stored frame never has, so it never holds and
+///   every present falls back to a full repaint — `d8a744d24`'s scissored
+///   present, whose `offscreen_holds_prev` sized the gate UNPADDED against a
+///   PADDED offscreen and so was always false at `pad > 0`, which is every
+///   point of this lattice (`IdenticalLayoutMayReuseCache`; the Tier-1
+///   identical-layout arm is the real renderer gate-hitting instead).
+///
+/// The two gate faults are alternatives, not one implementation, and so are the
+/// two changed-top faults, so `Buggy=1` picks one of each per layout in
+/// `PickLayout` (`gate_fault` and `top_fault`, which `Buggy=0` pins to zero).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn asymmetric_pad_layout_model() -> Model {
@@ -2922,18 +2916,14 @@ pub fn asymmetric_pad_layout_model() -> Model {
             clamp_changed(),
         )
     };
+    // The runtime path's own non-absorbing slip (`top_fault == 1`): the raw
+    // request is the top everywhere, and the bottom stays at the old pad.
+    let non_absorbing = || and_(eq(cst("Buggy"), int(1)), eq(var("top_fault"), int(1)));
     let initial_bottom = || {
         if_(
             eq(cst("Buggy"), int(1)),
             var("pad"),
             sub(add(var("pad"), var("pad")), clamp_initial()),
-        )
-    };
-    let changed_bottom = || {
-        if_(
-            eq(cst("Buggy"), int(1)),
-            var("pad"),
-            sub(add(var("pad"), var("pad")), clamp_changed()),
         )
     };
     let layouts_match = || eq(var("cached_grid_top"), var("grid_top"));
@@ -2990,6 +2980,20 @@ pub fn asymmetric_pad_layout_model() -> Model {
                 name: "full_repaint",
                 init: 0,
             },
+            // Which gate fault a `Buggy=1` layout carries: 0 the
+            // dimension-only key, 1 the always-false `d8a744d24` gate. Always 0
+            // at `Buggy=0`, where no fault exists to choose.
+            StateVar {
+                name: "gate_fault",
+                init: 0,
+            },
+            // Which changed-top fault a `Buggy=1` layout carries: 0 the
+            // getter-only clamp, 1 the non-absorbing runtime bottom. Always 0
+            // at `Buggy=0`.
+            StateVar {
+                name: "top_fault",
+                init: 0,
+            },
         ],
         fn_vars: vec![],
         actions: vec![
@@ -2997,6 +3001,14 @@ pub fn asymmetric_pad_layout_model() -> Model {
                 name: "PickLayout",
                 guard: Some(eq(var("phase"), int(0))),
                 updates: vec![
+                    Update {
+                        var: "gate_fault",
+                        expr: in_range(int(0), cst("Buggy")),
+                    },
+                    Update {
+                        var: "top_fault",
+                        expr: in_range(int(0), cst("Buggy")),
+                    },
                     Update {
                         var: "pad",
                         expr: in_range(int(1), int(3)),
@@ -3071,13 +3083,21 @@ pub fn asymmetric_pad_layout_model() -> Model {
                 name: "ApplyChangedTop",
                 guard: Some(eq(var("phase"), int(3))),
                 updates: vec![
+                    // The getter-only clamp REPORTS a clamped top while Buggy's
+                    // origin and bottom band read the raw request
+                    // (`changed_top`); the non-absorbing slip reports the raw
+                    // request too and leaves the bottom at the old pad.
                     Update {
                         var: "pad_top",
-                        expr: changed_top(),
+                        expr: if_(non_absorbing(), var("changed_request"), clamp_changed()),
                     },
                     Update {
                         var: "pad_bottom",
-                        expr: changed_bottom(),
+                        expr: if_(
+                            non_absorbing(),
+                            var("pad"),
+                            sub(add(var("pad"), var("pad")), changed_top()),
+                        ),
                     },
                     Update {
                         var: "grid_top",
@@ -3096,11 +3116,13 @@ pub fn asymmetric_pad_layout_model() -> Model {
                     eq(var("cache_valid"), int(1)),
                 )),
                 updates: vec![
+                    // Buggy's gate ignores the origin: the dimension-only key
+                    // always hits, the `d8a744d24` gate never does.
                     Update {
                         var: "cache_hit",
                         expr: if_(
                             eq(cst("Buggy"), int(1)),
-                            int(1),
+                            if_(eq(var("gate_fault"), int(1)), int(0), int(1)),
                             if_(layouts_match(), int(1), int(0)),
                         ),
                     },
@@ -3108,7 +3130,7 @@ pub fn asymmetric_pad_layout_model() -> Model {
                         var: "full_repaint",
                         expr: if_(
                             eq(cst("Buggy"), int(1)),
-                            int(0),
+                            if_(eq(var("gate_fault"), int(1)), int(1), int(0)),
                             if_(layouts_match(), int(0), int(1)),
                         ),
                     },
@@ -3119,6 +3141,13 @@ pub fn asymmetric_pad_layout_model() -> Model {
                 ],
             },
         ],
+        // No bottom-band window law: once settled it is `ExactVerticalPadCover`
+        // with `TopPadIsBounded` (a top in `0..=pad` leaves exactly
+        // `pad..=2*pad`), and before that `pad_bottom` has no writer. No
+        // total-cache-decision law either: only `RenderWithLayoutCache` (the
+        // one entry to phase 5) writes a 1 to `cache_hit` or `full_repaint`,
+        // and it writes them as complements in every arm at every `Buggy`, so
+        // outside phase 5 both are 0 and inside it exactly one is 1.
         invariants: vec![
             Invariant {
                 name: "ExactVerticalPadCover",
@@ -3140,17 +3169,6 @@ pub fn asymmetric_pad_layout_model() -> Model {
                     settled_layout(),
                     le(var("pad_top"), var("pad")),
                     eq(var("pad_top"), int(0)),
-                ),
-            },
-            Invariant {
-                name: "BottomAbsorbsFreedPixels",
-                expr: if_(
-                    settled_layout(),
-                    and_(
-                        le(var("pad"), var("pad_bottom")),
-                        le(var("pad_bottom"), add(var("pad"), var("pad"))),
-                    ),
-                    eq(var("pad_bottom"), int(0)),
                 ),
             },
             Invariant {
@@ -3186,14 +3204,6 @@ pub fn asymmetric_pad_layout_model() -> Model {
                     le(var("full_repaint"), int(1)),
                 ),
             },
-            Invariant {
-                name: "CacheDecisionIsTotal",
-                expr: if_(
-                    eq(var("phase"), int(5)),
-                    eq(add(var("cache_hit"), var("full_repaint")), int(1)),
-                    eq(add(var("cache_hit"), var("full_repaint")), int(0)),
-                ),
-            },
         ],
     }
 }
@@ -3204,7 +3214,30 @@ pub fn asymmetric_pad_layout_model() -> Model {
 /// expanded raw bottom. The GUI removes exactly `pad - pad_top` source rows, so
 /// its exposed frame is `grid + head + pad_top + pad`: the requested/clamped top
 /// is preserved and the visible bottom is ALWAYS the base pad. `Buggy=1`
-/// reproduces the shipped defect by exposing the uncropped raw frame/bottom.
+/// reproduces the shipped defect by exposing the uncropped raw frame/bottom, and
+/// breaks the clamp seam `clamp_visible_pad_top`
+/// (`VisibleTopMatchesRendererTop`). Dropping the clamp at just one of its GUI
+/// call sites is masked — `Backend::set_pad_top` clamps before
+/// `GpuBackend::set_visible_pad_top` clamps again — so the reachable slip is the
+/// shared helper returning the request. On the GPU backend the visible authority
+/// then keeps the raw request while the renderer's own `set_pad_top`
+/// (`.min(self.pad)` in aterm-render) still clamps the top it draws at, and the
+/// two edges disagree whenever the request exceeds the pad: the split `Crop`
+/// writes here. `pad_top` is that renderer-drawn top and `visible_pad_top` the
+/// reported one. That the drawn top is within the pad is not this machine's
+/// law: `Crop` writes it clamped at every `Buggy`, and in the code it is the
+/// renderer's own clamp, [`asymmetric_pad_layout_model`]'s `TopPadIsBounded`.
+///
+/// The Tier-1 runner observes the two edges separately — `pad_top` from a real
+/// `aterm_render::Renderer`, `visible_pad_top` from the seam — and its negative
+/// control replays the seam's unclamped answer through the real renderer
+/// clamp, GPU crop offset and frame crop: the projection is exactly the
+/// `Buggy=1` `Crop` successor.
+///
+/// The raw allocation the crop starts from (`pad_top + raw_pad_bottom == 2*pad`
+/// over a `grid + head + 2*pad` frame) is the renderer's law, proved and caught
+/// in [`asymmetric_pad_layout_model`]'s `ExactVerticalPadCover`; here `Crop`
+/// only writes it down as its input.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn visible_pad_crop_model() -> Model {
@@ -3316,7 +3349,7 @@ pub fn visible_pad_crop_model() -> Model {
                     },
                     Update {
                         var: "visible_pad_top",
-                        expr: resolved_top(),
+                        expr: if_(eq(cst("Buggy"), int(1)), var("request"), resolved_top()),
                     },
                     Update {
                         var: "visible_pad_bottom",
@@ -3347,28 +3380,12 @@ pub fn visible_pad_crop_model() -> Model {
         ],
         invariants: vec![
             Invariant {
-                name: "TopIsClamped",
+                // The GUI reports the top the renderer draws at.
+                name: "VisibleTopMatchesRendererTop",
                 expr: if_(
                     settled(),
-                    and_(
-                        le(var("pad_top"), var("pad")),
-                        eq(var("visible_pad_top"), var("pad_top")),
-                    ),
+                    eq(var("visible_pad_top"), var("pad_top")),
                     eq(var("pad_top"), int(0)),
-                ),
-            },
-            Invariant {
-                name: "RawTransportConservesTwoPads",
-                expr: if_(
-                    settled(),
-                    and_(
-                        eq(
-                            add(var("pad_top"), var("raw_pad_bottom")),
-                            add(var("pad"), var("pad")),
-                        ),
-                        eq(var("raw_height"), raw_height()),
-                    ),
-                    eq(var("raw_height"), int(0)),
                 ),
             },
             Invariant {

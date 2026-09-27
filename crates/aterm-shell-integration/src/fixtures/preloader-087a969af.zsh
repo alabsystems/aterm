@@ -1,0 +1,772 @@
+#!/bin/zsh
+# aterm_shell_integration.zsh - Shell integration for aTerm
+#
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# Source this file in your ~/.zshrc:
+#   test -e ~/.config/aterm/shell_integration.zsh && source ~/.config/aterm/shell_integration.zsh
+#
+# Features enabled:
+# - Directory tracking (OSC 7): tab title updates, "Open Terminal Here" support
+# - Command tracking (OSC 133): command history indexing, timing, notifications
+# - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
+#   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
+#   atpkg lays them — no new tab, no `exec zsh` (owner ask 2026-09-16; see "LIVE" below)
+#
+# Compatible with: zsh 5.0+
+
+# Only run in interactive shells
+[[ -o interactive ]] || return
+
+# ─── The multiplexer boundary (screen / tmux) ───
+#
+# aterm hosts ONE session per PTY. Run screen or tmux in that PTY and the
+# multiplexer owns it: every pane it draws lives inside the SAME aterm session,
+# and aterm has no name for a pane. Two things break at that boundary, and both
+# used to break SILENTLY:
+#
+#  1. $ATERM_PARENT_SESSION_ID is an ordinary exported variable, so it rides into
+#     every pane shell unchanged — and `aterm ctl`'s flagless self-location then
+#     resolves it to the session HOSTING the multiplexer. A flagless call typed
+#     in a pane drove the OUTER terminal, said OK, and moved the wrong session.
+#  2. The loader guard below is exported too, so a pane shell finds it already
+#     set and returns before defining a single hook. No OSC 133 mark is ever
+#     emitted from inside the multiplexer (and neither screen nor tmux forwards
+#     an unknown OSC outward anyway), so command blocks, exit codes and cwd
+#     tracking are ABSENT for the duration — not empty, absent.
+#
+# This block does not try to fix either — a pane is genuinely not an aterm
+# session — it makes them VISIBLE. It MARKS the crossing ($ATERM_MUX, plus the
+# outer sid so a tool can name what a flagless call would have hit), and says so
+# once. `aterm ctl` reads the marks and refuses an implicitly self-targeting call
+# rather than driving the wrong terminal.
+#
+# $ATERM_PARENT_SESSION_ID is deliberately left ALONE: it is also what provisions
+# a nested aterm's parent capability edges, and the outer session really is the
+# parent of anything launched from a pane. Marking costs nothing; unsetting would
+# quietly disarm recursion provisioning to fix a targeting bug.
+#
+# The guard is what makes the detection trustworthy WHERE IT RUNS: aterm's spawn
+# seam forces $ATERM_SHELL_INTEGRATION_INSTALLED to the EMPTY string for every
+# session it starts, so a NON-empty value proves we did not come straight from
+# aterm. That tells a real pane shell apart from an aterm window that was
+# launched FROM a pane and merely inherited $TMUX/$STY.
+#
+# HOW OFTEN IT RUNS is the part worth saying plainly, because the answer is "in
+# a pane, usually never". aterm delivers this file by pointing $ZDOTDIR at its
+# own cache dir for the shell IT starts, and the wrapper .zshrc there unsets
+# $ZDOTDIR again so the user's own tooling sees their real one. A pane shell is
+# started by screen or tmux, so it inherits no $ZDOTDIR and DOES NOT SOURCE THIS
+# FILE AT ALL. (The bash half was measured in a real GNU screen 4.09.01 window
+# under a headless aterm: STY, a screen TERM and the inherited guard all set,
+# $ATERM_MUX still EMPTY, no hook defined. zsh's injection is the stricter of
+# the two — it erases its own trail on purpose.) So this block fires only where
+# the file is genuinely sourced in a pane — a hand-installed `source …` line as
+# the header above documents — and `aterm ctl` carries the boundary otherwise.
+#
+# What DOES run in every session aterm starts is the tail of this file, past the
+# guard, and that is where the detection now originates: $ATERM_MUX_BASE records
+# the multiplexer environment THIS session shell was born into. See the export
+# below.
+__aterm_mux=""
+if [[ -n "${TMUX:-}" ]]; then
+    __aterm_mux="tmux"
+elif [[ -n "${STY:-}" ]]; then
+    __aterm_mux="screen"
+else
+    # tmux's default TERM is screen-256color, so TERM alone names the family,
+    # not the program; the markers above are consulted first for that reason.
+    case "${TERM:-}" in
+        tmux|tmux-*|tmux.*)       __aterm_mux="tmux" ;;
+        screen|screen-*|screen.*) __aterm_mux="screen" ;;
+    esac
+fi
+
+# Skip if already loaded — marking the boundary on the way out when the
+# inherited guard means we crossed one.
+if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
+    if [[ -n "$__aterm_mux" ]]; then
+        export ATERM_MUX="$__aterm_mux"
+        if [[ -n "${ATERM_PARENT_SESSION_ID:-}" ]]; then
+            export ATERM_MUX_OUTER_SESSION_ID="$ATERM_PARENT_SESSION_ID"
+            # Say it ONCE per multiplexer session — not once per pane, which is
+            # the same true sentence six times before lunch. The stamp is keyed
+            # by the multiplexer's own id ($TMUX / $STY), so every pane of one
+            # screen or tmux shares it.
+            if [[ "${ATERM_MUX_NOTICE:-1}" != "0" ]]; then
+                __aterm_mux_id="${TMUX:-${STY:-$TERM}}"
+                __aterm_mux_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/aterm/mux-notice"
+                __aterm_mux_stamp="$__aterm_mux_dir/${__aterm_mux}-${__aterm_mux_id//[!A-Za-z0-9._-]/_}"
+                if [[ ! -e "$__aterm_mux_stamp" ]] &&
+                   mkdir -p "$__aterm_mux_dir" 2>/dev/null &&
+                   : >"$__aterm_mux_stamp" 2>/dev/null; then
+                    printf 'aterm: inside %s — command blocks, exit codes and cwd tracking do not cross the multiplexer,\n       so aterm records none of them for these panes. `aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences this.\n' "$__aterm_mux" >&2
+                fi
+                unset __aterm_mux_id __aterm_mux_dir __aterm_mux_stamp
+            fi
+        fi
+    fi
+    unset __aterm_mux
+    return
+fi
+export ATERM_SHELL_INTEGRATION_INSTALLED=1
+# Past the guard, so aterm started this shell ITSELF. Record the multiplexer
+# environment this session shell was born into. This is the one detection input
+# that comes from a place which ACTUALLY RUNS for every session, and it reaches a
+# pane the only way anything can: ordinary environment inheritance. A pane's own
+# $TMUX/$STY are the multiplexer's and no longer match this base — that mismatch
+# IS the crossing — while an aterm window merely launched FROM a pane re-runs
+# this file and re-stamps the base as its own, so it matches and is not refused.
+# Same question the guard was invented to answer, asked where the answer exists.
+# It also closes what TERM cannot: a tmux set to default-terminal
+# "xterm-256color" is indistinguishable from an aterm window to TERM, and plainly
+# a pane to this. `aterm ctl` reads it as $ATERM_MUX_BASE.
+# The SPAWN SEAM stamps this for every session (aterm-gui's
+# provision_child_identity_env), including sessions whose shell never sources
+# this file — so an inherited pane stamp cannot masquerade as a fresh session's
+# own. Keep the write only as the fallback for a host that starts a shell
+# without that seam (an embedder, a hand-run integration): set it if unset,
+# never overwrite the seam's answer with a value read after the pane was entered.
+: "${ATERM_MUX_BASE:="${TMUX-}|${STY-}"}"
+export ATERM_MUX_BASE
+# Any ATERM_MUX inherited from the pane we were launched out of describes a
+# multiplexer this session is not inside. Clear it, or every window opened from
+# a tmux pane would inherit a refusal it does not deserve.
+unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID __aterm_mux
+
+# Package bin directory
+if [ -d "$HOME/.aterm/bin" ]; then
+    export PATH="$HOME/.aterm/bin:$PATH"
+fi
+
+# Source package shell hooks. The `(N)` NULL_GLOB qualifier is REQUIRED: without it
+# zsh's default NOMATCH raises "no matches found" the instant a glob matches nothing
+# (e.g. shell.d holds only `*.zsh` hooks and no `*.sh`) and ABORTS this whole sourced
+# script — killing every OSC 7 (cwd) / OSC 133 (command-block) hook defined below, and
+# printing an error as the first line of every session. Per-glob `(N)` expands an
+# empty match to nothing instead. (bash's unmatched-glob-stays-literal + the `[ -f ]`
+# guard makes the bash script safe without this.)
+if [ -d "$HOME/.aterm/shell.d" ]; then
+    for f in "$HOME/.aterm/shell.d"/*.zsh(N) "$HOME/.aterm/shell.d"/*.sh(N); do
+        [ -f "$f" ] && . "$f"
+    done
+fi
+
+# ─── The reroute directory, FIRST — and the agents directory beside it ───
+#
+# $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
+# stubs for the upstream Rust names (`aterm help reroute`), which the seam already
+# put FIRST on the PATH it handed this shell. That position is not final. This file
+# runs from the wrapper .zshenv — BEFORE /etc/zprofile (path_helper rebuilds PATH
+# from /etc/paths) and BEFORE ~/.zshrc (`. ~/.cargo/env` prepends ~/.cargo/bin) —
+# and the package blocks just above may prepend too. Measured 2026-09-07:
+# ~/.cargo/bin at position 17, ahead of the managed store at 19, so a bare `cargo`
+# ran upstream Rust silently. An ORDER failure — which is why this is move-to-front
+# (every existing occurrence removed, then prepended), never skip-if-present.
+# Asserted here, after the package blocks, and again from __aterm_first_precmd,
+# which runs after every rc file has had its say. Inert outside a session: the
+# variable is unset, or the directory (Windows lays none) does not exist.
+#
+# $ATPKG_AGENTS — exported by the atpkg shell.d hook sourced just above — names
+# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
+# (owner decision 2026-09-10). It fails the same way, for the same reasons: measured
+# 2026-09-10 on m27 at PATH position 14, behind /opt/homebrew/bin (path_helper) and
+# ~/.local/bin (~/.zshrc), so `codex` ran a brew cask that could run no command and
+# `claude` an older native install. It is moved to the front first, then the reroute
+# directory, so PATH reads reroute, agents, … — the spawn seam's own order; the two
+# hold disjoint names, so what matters is that both precede everything else.
+#
+# `${(@)path:#…}`: `:#` matches the expanded value LITERALLY (no GLOB_SUBST), so a
+# directory named with `[` or `*` is still removed by equality; `(@)` in quotes
+# keeps an EMPTY entry ("here", to a POSIX shell) — the user's — from being dropped.
+#
+# It also records, in $__aterm_managed_want, the dirs it put in front (in order),
+# which is what the per-prompt hot path below compares the head of $path against,
+# and in $__aterm_managed_agents_on / $__aterm_managed_reroute_on whether each dir
+# WAS there to front. A dir that was absent is re-probed by the hot path (one `-d`
+# per prompt, only while it stays absent — review finding 2026-09-16: a hook that
+# predates agents/ set $ATPKG_AGENTS, the `-d` here failed once, and the shell
+# never looked again) and fronted the moment it appears. The `-d` stats of the
+# steady state live HERE, on the change path, never on the per-prompt one.
+#
+# `emulate -L zsh` opens every function of this block: a user's rc may `setopt
+# ksh_arrays` (subscripts from 0 — `path[1,n]` read the wrong elements, and
+# `${(@)path:#…}` collapsed to element 0, so PATH was truncated to the two managed
+# dirs at every prompt; measured 2026-09-16), `sh_word_split`, `glob_subst`, or
+# `warn_create_global` (sourcing the hook from inside a function then printed four
+# "created globally" lines at the prompt). `emulate -L` is a builtin, local to the
+# function, and restores every option on return.
+#
+# $__aterm_managed_agents_listing leaves the names inside <prefix>/agents, joined
+# by ":", in $__aterm_managed_agents_now: one readdir, in-process — a bare glob
+# stats nothing, `(N)` makes an empty directory the empty string, and atpkg's
+# dot-prefixed temp files are not matched. It is the TWIN WATCH of the hot path
+# (step 4 below); the front records what it saw so the first prompt after a twin
+# lands is the one that rehashes.
+typeset -g __aterm_managed_agents_now=""
+__aterm_managed_agents_listing() {
+    emulate -L zsh
+    __aterm_managed_agents_now=""
+    [[ -n "${ATPKG_AGENTS:-}" ]] || return 0
+    local -a __aterm_ls
+    __aterm_ls=("$ATPKG_AGENTS"/*(N))
+    __aterm_managed_agents_now="${(j.:.)__aterm_ls}"
+}
+typeset -ga __aterm_managed_want
+typeset -gi __aterm_managed_agents_on=0
+typeset -gi __aterm_managed_reroute_on=0
+typeset -g __aterm_managed_agents_seen=""
+__aterm_reroute_path_front() {
+    emulate -L zsh
+    __aterm_managed_want=()
+    __aterm_managed_agents_on=0
+    __aterm_managed_reroute_on=0
+    if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
+        path=("$ATPKG_AGENTS" "${(@)path:#$ATPKG_AGENTS}")
+        __aterm_managed_want=("$ATPKG_AGENTS")
+        __aterm_managed_agents_on=1
+        __aterm_managed_agents_listing
+        __aterm_managed_agents_seen="$__aterm_managed_agents_now"
+    fi
+    if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
+        path=("$ATERM_REROUTE_DIR" "${(@)path:#$ATERM_REROUTE_DIR}")
+        __aterm_managed_want=("$ATERM_REROUTE_DIR" "${__aterm_managed_want[@]}")
+        __aterm_managed_reroute_on=1
+    fi
+}
+__aterm_reroute_path_front
+
+# ─── LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ───
+#
+# Owner, 2026-09-16, looking at a status row that read "✓ Claude Code 2.1.273 ·
+# Codex 0.154.0 — aterm-managed, current   what `claude` and `codex` run in new
+# tabs": "HEY! this is a bad experience. aterm atpkg DID install the latest but it
+# didn't make them available for me. instead, it is telling me to open a new tab.
+# NO! all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
+# and this message and audit that this is the actual behavior."
+#
+# What was measured in that tab: its zsh (pid 1784) was spawned at 10:44:24 by the
+# PREVIOUS app build and ADOPTED across the seamless update — the running app
+# (0.86.0, pid 1868) started at 10:44:32 — and <prefix>/agents plus the shell.d
+# hooks were created at 10:46 by the new build's first pass. Nothing above runs
+# again in a shell that is already up: the load-time assert and the first-precmd
+# one both fire ONCE, gated on $ATPKG_AGENTS / $ATERM_REROUTE_DIR being set and the
+# directories existing AT THAT INSTANT, and that shell had neither variable and no
+# directory to find. So `which -a claude` read ~/.local/bin/claude first, `codex`
+# resolved to a brew cask that hung two minutes on `--version`, and the only way to
+# the build atpkg had just installed was a new tab. The same freeze hits EVERY fresh
+# machine: the first tab opens before the seed pass creates agents/.
+#
+# The fix is a per-prompt AND per-command re-assert — preexec matters because a
+# command typed at an idle prompt after the dirs appear runs BEFORE the next precmd
+# — in four steps, all builtin-only (no `$(...)`, no backticks, no external
+# stat/dirname/readlink; pinned by a grep test):
+#
+#  1. THE HOOK IS THE SOURCE OF TRUTH when the environment is missing or stale.
+#     ~/.aterm/shell.d/00-atpkg.zsh is what atpkg generates (crates/atpkg/src/hooks.rs;
+#     the spelling is pinned from that crate's side): it exports $ATPKG_AGENTS and
+#     $ATPKG_BIN, moves agents/ to the front and appends bin/, and it is idempotent.
+#     It is (re)sourced when the copy on disk is not the copy last sourced — it
+#     appeared (a shell spawned before the file existed), or atpkg rewrote it
+#     temp+rename on a later pass, so mtime OR inode moved. The stamp is read with
+#     `zstat` (zsh/stat, loaded as the one builtin `b:zstat` so the module never
+#     shadows /usr/bin/stat): ONE stat syscall, in-process, and its `2>/dev/null` is
+#     a builtin redirection, not a fork. A hook that predates R1 (no `export
+#     ATPKG_AGENTS`) is sourced ONCE per copy, not once per prompt (review finding
+#     2026-09-16). Without the module (a minimal zsh) the fallback probes `-f` and
+#     sources only while $ATPKG_AGENTS is unset (bash and fish compare the hook's
+#     TEXT instead — their step 1; this rare fallback keeps the cheaper rule and
+#     picks a REWRITTEN hook up in the next tab).
+#  2. A DIR THAT WAS ABSENT when the front was last laid is probed again — one `-d`
+#     per prompt, only in that degraded state — and fronted when it appears: a hook
+#     that names an agents/ atpkg has not created yet, or a session whose seam
+#     exported no $ATERM_REROUTE_DIR. Nothing is assigned while it stays absent.
+#  3. THE ORDER. $__aterm_managed_want holds the dirs that must lead $path; the hot
+#     path compares the head of $path against it by string equality and assigns
+#     ONLY on a mismatch — assigning $path flushes zsh's command hash, which is
+#     exactly what a change needs (`claude` re-resolves to the twin) and pure
+#     waste otherwise.
+#  4. THE TWIN WATCH. zsh hashes a command's path on first use, and a hashed name is
+#     never searched again while the file exists — so once agents/ leads $path and
+#     `claude` has run the foreign copy, a twin that lands LATER (a fresh machine:
+#     agents/ is created at launch, the twin only once the managed program is
+#     installed — the exact window in which the owner typed `claude`) would keep
+#     losing to the hashed path for the life of the shell (measured 2026-09-16, zsh
+#     5.9 and bash 3.2.57). The names inside agents/ are listed each call (one
+#     readdir, no stat, no fork) and compared to the listing recorded when the dir
+#     was fronted; on a change — a twin laid, or removed — `rehash` empties the
+#     table and the next lookup walks $path again. A twin RE-laid under the same
+#     name changes nothing here and needs nothing: the hashed path IS the twin.
+#
+# Per prompt and per command, steady state: one zstat, one readdir, no assignment.
+# Measured 2026-09-16 (zsh 5.9, 10000 calls): ~30 µs per call before the twin
+# watch; a fork of /usr/bin/true costs ~1400 µs.
+#
+# $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
+# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $__ATERM_REROUTE_PASSTHROUGH is
+# not engaged (set, non-empty and not "0": atpkg::reroute::engaged) — so the final
+# order is reroute, agents, everything else, bin/ last (the hook appends it).
+#
+# Gated on BEING INSIDE AN ATERM SESSION ($ATERM_CHILD=1, which the spawn seam sets
+# for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
+# precisely what the adopted shell lacks. Inert everywhere else.
+typeset -g __aterm_atpkg_hook="$HOME/.aterm/shell.d/00-atpkg.zsh"
+typeset -g __aterm_atpkg_hook_seen=""
+typeset -gi __aterm_managed_live=0
+typeset -gi __aterm_have_zstat=0
+if [[ -n "${ATERM_CHILD:-}" || -n "${ATERM_SESSION_ID:-}" ]]; then
+    __aterm_managed_live=1
+    zmodload -F zsh/stat b:zstat 2>/dev/null && __aterm_have_zstat=1
+fi
+
+# Leaves "<mtime>:<inode>" of the hook on disk in $__aterm_atpkg_hook_now, or the
+# empty string when it is absent (or zsh/stat is unavailable). One stat syscall,
+# no fork. Its own global, not $REPLY: precmd runs between a user's `read` and
+# the line that consumes $REPLY, and must not clobber it.
+typeset -g __aterm_atpkg_hook_now=""
+__aterm_atpkg_hook_stamp() {
+    emulate -L zsh
+    __aterm_atpkg_hook_now=""
+    (( __aterm_have_zstat )) || return 0
+    local -A __aterm_st
+    zstat -H __aterm_st -- "$__aterm_atpkg_hook" 2>/dev/null || return 0
+    __aterm_atpkg_hook_now="$__aterm_st[mtime]:$__aterm_st[inode]"
+}
+# The copy the shell.d loop above sourced at load is the copy last sourced —
+# whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
+# sourced again until atpkg rewrites it).
+if (( __aterm_managed_live )); then
+    __aterm_atpkg_hook_stamp
+    __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+fi
+
+# Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
+__aterm_managed_derive_reroute() {
+    emulate -L zsh
+    [[ -z "${ATERM_REROUTE_DIR:-}" && -n "${ATPKG_AGENTS:-}" ]] || return 1
+    case "${__ATERM_REROUTE_PASSTHROUGH:-}" in
+        ''|0) ;;
+        *) return 1 ;;
+    esac
+    local __aterm_dir="${ATPKG_AGENTS%/*}/reroute"
+    [[ -d "$__aterm_dir" ]] || return 1
+    export ATERM_REROUTE_DIR="$__aterm_dir"
+}
+# A session shell whose seam exported no $ATERM_REROUTE_DIR but whose rc block
+# sourced the hook derives it now, so the load-time order is final too.
+if (( __aterm_managed_live )) && __aterm_managed_derive_reroute; then
+    __aterm_reroute_path_front
+fi
+
+# The hot path: every precmd and every preexec. Builtin-only — see above.
+__aterm_managed_path_live() {
+    emulate -L zsh
+    (( __aterm_managed_live )) || return 0
+    # 1. The hook: sourced when the copy on disk is not the copy last sourced.
+    if (( __aterm_have_zstat )); then
+        __aterm_atpkg_hook_stamp
+        if [[ -n "$__aterm_atpkg_hook_now" && "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen" ]]; then
+            __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+            . "$__aterm_atpkg_hook"
+            __aterm_managed_derive_reroute
+            __aterm_reroute_path_front
+            return 0
+        fi
+    elif [[ -z "${ATPKG_AGENTS:-}" && -f "$__aterm_atpkg_hook" ]]; then
+        . "$__aterm_atpkg_hook"
+        __aterm_managed_derive_reroute
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 2. A dir that was absent when the front was last laid: probe it again.
+    local -i __aterm_refront=0
+    if (( ! __aterm_managed_agents_on )) && [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
+        __aterm_refront=1
+    fi
+    if (( ! __aterm_managed_reroute_on )); then
+        if [[ -n "${ATERM_REROUTE_DIR:-}" ]]; then
+            [[ -d "$ATERM_REROUTE_DIR" ]] && __aterm_refront=1
+        elif __aterm_managed_derive_reroute; then
+            __aterm_refront=1
+        fi
+    fi
+    if (( __aterm_refront )); then
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 3. The order: assign only on a mismatch.
+    local -i __aterm_n=$#__aterm_managed_want
+    if (( __aterm_n )) && [[ "${(j.:.)path[1,__aterm_n]}" != "${(j.:.)__aterm_managed_want}" ]]; then
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 4. The twin watch: a name appearing in (or leaving) agents/ empties the hash.
+    if (( __aterm_managed_agents_on )); then
+        __aterm_managed_agents_listing
+        if [[ "$__aterm_managed_agents_now" != "$__aterm_managed_agents_seen" ]]; then
+            __aterm_managed_agents_seen="$__aterm_managed_agents_now"
+            rehash
+        fi
+    fi
+    return 0
+}
+
+# State tracking
+typeset -g __aterm_in_command=0
+typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
+
+# OSC escape sequences.
+#
+# `printf '%s'` — NOT `print -n` — because zsh's `print` without `-r` expands
+# escape sequences in its ARGUMENT, and the argument here is the whole
+# already-expanded payload. That silently undid every escape the callers below
+# construct. Verified on the wire: `__aterm_encode_cmd` correctly turned a
+# command line `a<ESC>b<BEL>c;d e` into `a\x1bb\x07c\x3bd\x20e`, and `print -n`
+# converted those escapes straight back into RAW 0x1b / 0x07 bytes inside the
+# OSC 633;E payload — the embedded BEL terminates the OSC string early and the
+# remaining bytes are parsed as fresh input, which is exactly the OSC break-out
+# the encoder exists to prevent.
+#
+# The OSC 0 title path was worse. `${title//[[:cntrl:]]/}` strips control BYTES,
+# but a command whose LITERAL text reads `echo \e]52;c;aGVsbG8=\a` contains no
+# control bytes for that guard to strip — `print` then manufactured the ESC and
+# BEL itself, smuggling a live OSC 52 clipboard write out of the tab title.
+#
+# `printf` never interprets a `%s` argument, which is why the bash script — which
+# always spelled it `printf '\033]%s\a' "$1"` — was never affected; this is now
+# the identical spelling. zsh's `printf` is a builtin, so the frame still costs
+# no fork. `print -rn --` is NOT a sufficient fix on its own: `-r` would also
+# stop the leading `\e` and trailing `\a` of the frame itself from being
+# interpreted, emitting a literal backslash-e instead of an OSC introducer.
+__aterm_osc() {
+    printf '\033]%s\a' "$1"
+}
+
+# Capture the capability nonce into a shell-local so we can immediately
+# drop it from the environment (#8015). Leaving ATERM_SHELL_NONCE in the
+# exported env lets every child process (env, ssh SendEnv, docker, cron,
+# tmux children, ...) read the 64-hex secret that would be used to bypass
+# the #7960 nonce-enforcement defense. Capture first, then unset BEFORE
+# any prompt hook fires so subprocesses never inherit it.
+#
+# If the env var is missing or empty at source-time, __aterm_shell_nonce
+# stays empty and __aterm_id_suffix falls through to the unnonced form
+# (pre-nonce compatibility for hosts that have not yet authorized a
+# nonce). This matches the documented fallback: the host's OSC 133/633
+# handler drops sequences missing/with a wrong id= only when
+# `TerminalModes::require_shell_integration_nonce` is enabled.
+typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-}"
+unset ATERM_SHELL_NONCE
+
+# Precomputed capability-nonce suffix for OSC 133/633 emissions.
+# The nonce is captured exactly once (above) and the env var is unset on the
+# very next line, so this string changes only through the re-key channel below,
+# which rewrites it together with the nonce. Computing it here
+# lets the marker emitters below expand a plain parameter instead of running
+# `$(__aterm_id_suffix)`, which forks a subshell. That mattered: the prompt
+# path fires five markers per command cycle (133;D + 133;A from precmd, 133;B
+# from zle-line-init, 633;E + 133;C from preexec), i.e. five forks of pure
+# dead time around every command. Byte-identical output — same ";id=<hex>"
+# spelling, same empty-string fallback when unnonced. `typeset -g` (not
+# `export`), exactly like $__aterm_shell_nonce itself, so #8015 (no nonce
+# inheritance by subprocesses) is preserved.
+typeset -g __aterm_id_suffix_str=""
+if [[ -n "$__aterm_shell_nonce" ]]; then
+    __aterm_id_suffix_str=";id=${__aterm_shell_nonce}"
+fi
+
+# THE RE-KEY CHANNEL (2026-09-24) — the one way the nonce above changes after
+# source time. A seamless update that could not carry a shell's nonce (a parent
+# from before 0.92, a session adopted without its screen) left every mark it
+# emits dropped for the rest of its life (`status integration=degraded`, both
+# live tabs on the owner's Mac that day), and only closing the tab cured it.
+# The host names a per-session file at spawn ($ATERM_REKEY_PATH, in its 0700
+# control dir); to re-key an adopted shell it writes a fresh 64-hex nonce there
+# (0600, created exclusively, never through a symlink) and authorizes it, and
+# THIS shell takes it at its next prompt. While nothing is pending the cost is
+# one fork-free `[[ -f ]]` per prompt; the read and the removal happen only
+# when a key waits. Captured and scrubbed from the environment like the nonce,
+# so no child process learns the path; the key itself never appears in typed
+# text, scrollback or history.
+typeset -g __aterm_rekey_path="${ATERM_REKEY_PATH:-}"
+unset ATERM_REKEY_PATH
+
+__aterm_rekey_check() {
+    emulate -L zsh
+    [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
+    local key=""
+    { IFS= read -r key < "$__aterm_rekey_path" } 2>/dev/null
+    command rm -f -- "$__aterm_rekey_path"
+    # Exactly 64 lowercase hex digits, or nothing changes.
+    [[ ${#key} -eq 64 && "$key" != *[^0-9a-f]* ]] || return 0
+    __aterm_shell_nonce="$key"
+    __aterm_id_suffix_str=";id=${key}"
+}
+
+# Capability-nonce suffix for OSC 133/633 emissions (#7960, #7987, #8015).
+# Expands to ";id=<64-hex>" when the captured nonce is non-empty, or to
+# the empty string otherwise. Reads from the captured local — never from
+# the environment — so the nonce is not inherited by subprocesses.
+# Kept as the documented helper / external entry point; the hot emitters
+# below use $__aterm_id_suffix_str instead to avoid a fork per marker.
+__aterm_id_suffix() {
+    if [[ -n "$__aterm_shell_nonce" ]]; then
+        print -rn -- ";id=${__aterm_shell_nonce}"
+    fi
+}
+
+# Percent-encode a string for use in file:// URIs (RFC 3986).
+# Unreserved chars (A-Z a-z 0-9 - _ . ~ /) pass through; all others
+# are encoded byte-by-byte as %XX. LC_ALL=C ensures multi-byte UTF-8
+# characters are split into individual bytes for correct encoding.
+#
+# Runs once per prompt (via __aterm_report_cwd), so it is fork-free by
+# construction: `printf -v` writes into a variable instead of spawning a
+# `$(printf ...)` subshell per encoded byte. A path with a single space used
+# to cost a fork; a 4-byte emoji cost four. No `& 0xFF` mask is needed (or
+# present, historically): unlike bash, zsh's `printf '%d' "'<byte>"` returns
+# the UNSIGNED byte value (195 for 0xC3), so `%02X` is already correct.
+__aterm_urlencode() {
+    local LC_ALL=C
+    # Fast path: no byte needs encoding, so the loop would copy the string
+    # verbatim. Skip it. (The class is exactly the loop's pass-through class,
+    # so this is the same decision the loop would make for every byte.)
+    if [[ "$1" != *[^a-zA-Z0-9_.~/-]* ]]; then
+        print -rn -- "$1"
+        return
+    fi
+    local string="$1" i char encoded="" hex
+    for ((i = 1; i <= ${#string}; i++)); do
+        char="${string[$i]}"
+        case "$char" in
+            [a-zA-Z0-9_.~/-]) encoded+="$char" ;;
+            *) printf -v hex '%%%02X' "'$char"; encoded+="$hex" ;;
+        esac
+    done
+    print -rn -- "$encoded"
+}
+
+# Report current working directory (OSC 7)
+__aterm_report_cwd() {
+    local cwd
+    cwd=$(__aterm_urlencode "$PWD")
+    __aterm_osc "7;file://${__aterm_report_host}${cwd}"
+}
+
+# Mark prompt start (OSC 133;A)
+__aterm_mark_prompt_start() {
+    __aterm_osc "133;A${__aterm_id_suffix_str}"
+}
+
+# Mark command line start (OSC 133;B)
+__aterm_mark_command_start() {
+    __aterm_osc "133;B${__aterm_id_suffix_str}"
+}
+
+# Mark command execution start (OSC 133;C)
+__aterm_mark_exec_start() {
+    __aterm_osc "133;C${__aterm_id_suffix_str}"
+}
+
+# Mark command completion (OSC 133;D;exitcode)
+__aterm_mark_exec_finish() {
+    __aterm_osc "133;D;$1${__aterm_id_suffix_str}"
+}
+
+# precmd - runs before each prompt
+__aterm_precmd() {
+    local last_status=$?
+
+    # A waiting re-key first, so every mark this prompt emits carries it.
+    __aterm_rekey_check
+
+    # The managed dirs, live (see "LIVE" above): one stat, one readdir, an assign
+    # (or a rehash) only on a change.
+    __aterm_managed_path_live
+
+    # If we were in a command, mark it finished
+    if (( __aterm_in_command )); then
+        __aterm_mark_exec_finish $last_status
+        __aterm_in_command=0
+    fi
+
+    # Report current directory
+    __aterm_report_cwd
+
+    # Set tab title to abbreviated CWD (OSC 0).
+    # Match HOME with trailing / to avoid false prefix matches
+    # (e.g., /Users//foo matching /Users//foobar).
+    local __aterm_tab_title="$PWD"
+    if [[ "$PWD" == "$HOME" ]]; then
+        __aterm_tab_title="~"
+    elif [[ "$PWD" == "$HOME"/* ]]; then
+        __aterm_tab_title="~${PWD#$HOME}"
+    fi
+    # Strip control characters: a crafted directory name (Unix dir names may
+    # contain any byte except '/' and NUL) could otherwise inject BEL/ESC and
+    # smuggle a nested OSC (e.g. clipboard write) out of the title. Mirrors the
+    # command-title path's ${cmd//[[:cntrl:]]/} guard.
+    if [[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]; then
+        __aterm_osc "0;${__aterm_tab_title//[[:cntrl:]]/}"
+    fi
+
+    # Mark prompt start
+    __aterm_mark_prompt_start
+
+    return $last_status
+}
+
+# Encode a string for OSC 633;E (VS Code convention).
+# Backslash-hex encodes semicolons, backslashes, and bytes <= 0x20.
+#
+# Runs once per user command, between Enter and the command actually
+# starting, so it is fork-free. Space is split out of the old
+# `[[:cntrl:]]|' '` arm because it is unconditionally 0x20 — a literal
+# beats a subshell, and spaces are the only member of that arm a real
+# command line ever contains. Control bytes keep the computed form but
+# use `printf -v` instead of a `$(printf ...)` subshell.
+__aterm_encode_cmd() {
+    local LC_ALL=C
+    local string="$1" i char encoded="" hex
+    for ((i = 1; i <= ${#string}; i++)); do
+        char="${string[$i]}"
+        case "$char" in
+            \\) encoded+="\\\\" ;;
+            \;) encoded+="\\x3b" ;;
+            ' ') encoded+="\\x20" ;;
+            [[:cntrl:]]) printf -v hex '\\x%02x' "'$char"; encoded+="$hex" ;;
+            *) encoded+="$char" ;;
+        esac
+    done
+    print -rn -- "$encoded"
+}
+
+# preexec - runs before command execution
+__aterm_preexec() {
+    __aterm_in_command=1
+
+    # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
+    # prompt that was drawn before atpkg laid agents/ must already run the twin.
+    __aterm_managed_path_live
+
+    # Report command text for session memory (OSC 633;E)
+    __aterm_osc "633;E;$(__aterm_encode_cmd "$1")${__aterm_id_suffix_str}"
+
+    # Set tab title to running command (OSC 0).
+    # Truncate to first 64 chars and strip control characters.
+    local cmd="${1:0:64}"
+    if [[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]; then
+        __aterm_osc "0;${cmd//[[:cntrl:]]/}"
+    fi
+
+    # Mark execution start
+    __aterm_mark_exec_start
+}
+
+# ─── Prompt Override ───
+# When ATERM_PROMPT_STYLE is set, override PS1 using palette-indexed colors.
+# Git branch is evaluated dynamically via PROMPT_SUBST (updates on cd).
+__aterm_set_prompt() {
+    local style="${ATERM_PROMPT_STYLE:-none}"
+    [[ "$style" == "none" ]] && return
+
+    setopt PROMPT_SUBST
+
+    local hc="${ATERM_PROMPT_HOST_COLOR:-2}"
+    local pc="${ATERM_PROMPT_PATH_COLOR:-4}"
+    local gc="${ATERM_PROMPT_GIT_COLOR:-3}"
+    local ec="${ATERM_PROMPT_ERROR_COLOR:-1}"
+    local sc="${ATERM_PROMPT_SEP_COLOR:-8}"
+
+    local h="%F{$hc}" p="%F{$pc}" g="%F{$gc}" e="%F{$ec}" s="%F{$sc}" r="%f"
+    local err="%(?.${s}.${e})"
+
+    case "$style" in
+        minimal)
+            PROMPT="${p}%1~${r} ${err}\$${r} "
+            ;;
+        standard)
+            PROMPT=''"${h}%n@%m${s}:${p}%~${r}"' $(__aterm_git_segment '"${g}"' '"${r}"') '"${err}\$${r} "
+            ;;
+        powerline)
+            PROMPT=''"${h}%n@%m${r} ${s}${r} ${p}%~${r}"' $(__aterm_git_segment '"${g}"' '"${r}"') '"${s}${r} ${err}\$${r} "
+            ;;
+    esac
+}
+
+__aterm_git_segment() {
+    local branch
+    branch=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null) || return
+    [[ -n "$branch" ]] && print -n "${1}(${branch//\%/%%})${2}"
+}
+
+# ─── Key Bindings ───
+# Bind xterm-style modifier+arrow sequences so they work at the prompt.
+# Without these, sequences like \e[1;3C (Alt+Right) leak as literal text.
+__aterm_setup_keybindings() {
+    # Alt+Arrow: word navigation
+    bindkey '\e[1;3C' forward-word       # Alt+Right
+    bindkey '\e[1;3D' backward-word      # Alt+Left
+    # Ctrl+Arrow: word navigation (alternative modifier)
+    bindkey '\e[1;5C' forward-word       # Ctrl+Right
+    bindkey '\e[1;5D' backward-word      # Ctrl+Left
+    # Home/End
+    bindkey '\e[H' beginning-of-line     # Home
+    bindkey '\e[F' end-of-line           # End
+    bindkey '\e[1~' beginning-of-line    # Home (alternate)
+    bindkey '\e[4~' end-of-line          # End (alternate)
+    # Delete
+    bindkey '\e[3~' delete-char          # Delete/Fn+Backspace
+    # Shift+Arrow: selection (if zsh supports it, otherwise history)
+    bindkey '\e[1;2A' up-line-or-history    # Shift+Up
+    bindkey '\e[1;2B' down-line-or-history  # Shift+Down
+}
+__aterm_setup_keybindings
+
+# ─── OSC 133;B (end of prompt / start of user input) ───
+# Emitted via zle-line-init so it fires after the prompt is fully drawn.
+# Placing it in preexec is too late (user has already typed their command).
+if (( ${+widgets[zle-line-init]} )); then
+    zle -A zle-line-init __aterm_orig_zle_line_init
+fi
+__aterm_zle_line_init() {
+    __aterm_mark_command_start
+    (( ${+widgets[__aterm_orig_zle_line_init]} )) && zle __aterm_orig_zle_line_init
+}
+zle -N zle-line-init __aterm_zle_line_init
+
+# Install hooks using zsh hook arrays.
+# __aterm_first_precmd is registered first so the prompt override lands before
+# __aterm_precmd emits OSC 133;A (prompt start marker).
+autoload -Uz add-zsh-hook
+
+# ─── Deferred First-Precmd Setup ───
+# Runs once on the very first precmd after the shell has fully initialized
+# and processed SIGWINCH from the initial terminal resize. Handles the prompt
+# override, then uninstalls itself.
+__aterm_first_precmd() {
+    local last_status=$?
+
+    # Apply prompt override if requested
+    # `${…:-}`: under a user's `setopt nounset` the bare form errored at every
+    # prompt and this one-shot never uninstalled itself (review note 2026-09-16).
+    if [[ -n "${ATERM_PROMPT_STYLE:-}" && "${ATERM_PROMPT_STYLE:-}" != "none" ]]; then
+        __aterm_set_prompt
+    fi
+
+    # The reroute and agents directories, FIRST — unconditionally, once: /etc/zprofile
+    # and ~/.zshrc have both run by now (see __aterm_reroute_path_front for why the
+    # load-time assert above is not final), and a ~/.zshrc carrying atpkg's rc block
+    # may have set $ATPKG_AGENTS itself, so $__aterm_managed_want is recomputed here.
+    # From this prompt on, __aterm_precmd/__aterm_preexec keep it live (the "LIVE"
+    # block above) without assigning $path unless the order is actually wrong.
+    __aterm_reroute_path_front
+
+    add-zsh-hook -d precmd __aterm_first_precmd
+    return $last_status
+}
+add-zsh-hook precmd __aterm_first_precmd
+add-zsh-hook precmd __aterm_precmd
+add-zsh-hook preexec __aterm_preexec

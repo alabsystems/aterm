@@ -268,6 +268,12 @@ impl Outcome {
                 String::new(),
             )),
             Verdict::Linked => Err(FlowError::Linked(program.to_string())),
+            // The vendor's release channel was not reached: its own error, so the verb
+            // can add the one action the index lane's offline ending already gets — re-run
+            // when the connection is back (audit, 2026-09-25).
+            Verdict::Unreachable { .. } => Err(FlowError::VendorUnreachable(
+                line.strip_prefix("atpkg: ").unwrap_or(&line).to_string(),
+            )),
             _ => Err(FlowError::Vendor(
                 line.strip_prefix("atpkg: ").unwrap_or(&line).to_string(),
             )),
@@ -1472,6 +1478,7 @@ pub(crate) mod world {
         /// [`Fake::publish_legacy_pkg`] with an artifact for this triple, as a legacy index
         /// build shipped one — what an index lane could fetch if it ever planned a vendor
         /// program (its `download` panics, so a test sees the attempt).
+        #[cfg(unix)]
         pub(crate) fn publish_legacy_pkg_with_artifact(
             &self,
             program: &str,
@@ -1511,11 +1518,13 @@ pub(crate) mod world {
         /// Publish the signed pkg manifest of index program `program` at `build`, its one
         /// artifact for `target` carrying the signed `tree_root` `root` — what an index
         /// pass's root recovery reads.
+        #[cfg(unix)]
         pub(crate) fn publish_pkg_root(&self, program: &str, build: u64, target: &str, root: &str) {
             self.publish_pkg_kind(program, build, target, root, "binary");
         }
 
         /// [`Fake::publish_pkg_root`] with the artifact's `kind` as given.
+        #[cfg(unix)]
         pub(crate) fn publish_pkg_kind(
             &self,
             program: &str,

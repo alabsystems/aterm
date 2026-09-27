@@ -26187,7 +26187,6 @@ mod tests {
 
     /// One flight, as the probe saw it launch.
     #[derive(Clone, Copy, Debug)]
-    #[allow(dead_code)]
     struct ProbeFlight {
         /// Seconds from the probe's epoch.
         at: f32,
@@ -26207,7 +26206,6 @@ mod tests {
 
     /// The probe's world: a `cols`×24 pane at 10×20 px cells, an ink map the
     /// scenario paints by hand, and the recorder.
-    #[allow(dead_code)]
     struct Probe {
         pet: PetBrain,
         t: Instant,
@@ -26269,7 +26267,6 @@ mod tests {
         home_at: Option<f32>,
     }
 
-    #[allow(dead_code)]
     impl Probe {
         fn new(cols: u16) -> Self {
             Self::at(cols, Instant::now())
@@ -26557,18 +26554,12 @@ mod tests {
 
         /// A WRAPPING LOG on the last row for `frames` frames: every frame
         /// the caret alternates between the end of a full line `(last, cols-1)`
-        /// (the row inked to it, the previous line scrolled up into the row
-        /// above) and the start of the next `(last, 0)` (the row blank) —
-        /// the b09x build log, faster than the frame rate. `burst` drives
-        /// `output_burst` too. The frames that land on col 0 are the ones the
-        /// emulator really wrapped on, so those and only those carry
-        /// [`PetSense::wrapped`].
-        fn log(&mut self, frames: u32, burst: bool) {
-            self.log_rows(frames, burst, true);
-        }
-
-        /// [`Self::log`], with the row ABOVE the last row inked (`above`) —
-        /// the scrolled previous line — or left blank (the ladder's rule 3
+        /// (the row inked to it) and the start of the next `(last, 0)` (the row
+        /// blank) — the b09x build log, faster than the frame rate. `burst`
+        /// drives `output_burst` too. The frames that land on col 0 are the ones
+        /// the emulator really wrapped on, so those and only those carry
+        /// [`PetSense::wrapped`]. The row ABOVE the last row is inked (`above`)
+        /// — the scrolled previous line — or left blank (the ladder's rule 3
         /// then seats the cat on it).
         fn log_rows(&mut self, frames: u32, burst: bool, above: bool) {
             let last = PROBE_ROWS - 1;
@@ -26597,35 +26588,6 @@ mod tests {
             }
         }
 
-        /// A wrapping log whose caret the host COALESCES: `cps` characters
-        /// a second onto `cols`-wide lines, sampled once a frame, so the
-        /// caret lands mid-line at an arbitrary column each frame (the
-        /// realistic `cat bigfile` shape: same-row jumps both ways, a wrap
-        /// shape only when a line boundary happens to fall on a frame).
-        /// `wrapped` is the emulator's truth here too: true on exactly the
-        /// frames where the running character count crossed a line boundary.
-        fn log_coalesced(&mut self, frames: u32, cps: f32, burst: bool) {
-            let last = PROBE_ROWS - 1;
-            let mut pos = 0.0f32;
-            for _ in 0..frames {
-                let was = pos;
-                pos += cps * self.frame_dur.as_secs_f32();
-                let width = f32::from(self.cols);
-                let wrapped = (pos / width).floor() > (was / width).floor();
-                let col = (pos % width).floor();
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let col = (col.clamp(0.0, width - 1.0)) as u16;
-                self.ink(last - 1, 0, self.cols);
-                self.ink(last, 0, col);
-                self.live = Some(last);
-                let caret = (last, col);
-                let mut s = self.sense_at(Some(caret));
-                s.output_burst = burst;
-                s.wrapped = wrapped;
-                let _ = self.frame_with(s, Some(caret));
-            }
-        }
-
         /// Type from `(row, from)` to `(row, to)`: one caret move per 100 ms
         /// (six frames), the row's ink growing with the caret.
         fn type_to(&mut self, row: u16, from: u16, to: u16) {
@@ -26649,83 +26611,6 @@ mod tests {
             self.hold(Some((row, mid)), 2.5);
             self.log_from = self.now();
             self.type_to(row, mid, col0);
-        }
-
-        fn report(&self, name: &str, setup: &str) {
-            let tr = self.trigger.unwrap_or(0.0);
-            println!("== {name} ==");
-            println!("   setup: {setup}");
-            if let Some(f) = self.at_trigger {
-                println!(
-                    "   at trigger: col {:.2} row {:.0} {:?} alpha {}",
-                    f.col, f.row, f.action, f.alpha
-                );
-            }
-            let acts: Vec<String> = self
-                .actions
-                .iter()
-                .map(|(t, a)| format!("{a:?}@{:+.2}", t - tr))
-                .collect();
-            println!("   actions: {}", acts.join(" "));
-            if self.flights.is_empty() {
-                println!("   flights: none");
-            }
-            for fl in &self.flights {
-                let span = (fl.to_col - fl.from_col).abs();
-                println!(
-                    "   flight @{:+.2}s [{}] ({:.2},r{:.0})->({:.2},r{:.0}) span={:.1} dur={:.3}s speed={:.1} c/s vspeed={:.1} r/s arc={:.2} big={} show={}",
-                    fl.at - tr,
-                    fl.site,
-                    fl.from_col,
-                    fl.from_row,
-                    fl.to_col,
-                    fl.to_row,
-                    span,
-                    fl.dur,
-                    span / fl.dur,
-                    (fl.to_row - fl.from_row).abs() / fl.dur,
-                    fl.arc,
-                    fl.big,
-                    fl.show
-                );
-            }
-            println!(
-                "   max frame |dcol|={:.2} @{:+.2}s {:?}; max frame |drow|={:.2} @{:+.2}s {:?}",
-                self.max_dcol.0,
-                self.max_dcol.1 - tr,
-                self.max_dcol.2,
-                self.max_drow.0,
-                self.max_drow.1 - tr,
-                self.max_drow.2
-            );
-            println!(
-                "   airborne episodes={} dust={} wiggle={} last touchdown={} stream={} \
-                 stream_run={} watch_heat={:.2}",
-                self.episodes,
-                self.dust,
-                self.wiggle,
-                self.touchdown
-                    .map_or("none".to_string(), |t| format!("{t:+.2}s")),
-                self.pet.stream,
-                self.pet.stream_run,
-                self.pet.watch_heat
-            );
-            println!(
-                "   home (travel over) {} — the settled reading below adds the \
-                 in-place landing recovery",
-                self.home_at
-                    .map_or("never moved".to_string(), |t| format!("{t:+.2}s"))
-            );
-            match self.settle_at {
-                Some(s) => println!(
-                    "   settled {:.2}s after the trigger at (col {:.2}, row {:.0}) as {:?}",
-                    s - tr,
-                    self.settle_where.0,
-                    self.settle_where.1,
-                    self.settle_where.2
-                ),
-                None => println!("   NOT settled within the run"),
-            }
         }
     }
 

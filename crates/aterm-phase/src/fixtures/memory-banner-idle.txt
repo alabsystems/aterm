@@ -1,0 +1,10 @@
+# claude-code (unrecorded) · HAND-BUILT (synthetic) and UNCONFIRMED, 2026-09-24: the busy capture's banner row under an idle composer, no spinner or done row — where Claude Code draws the critical-memory banner between turns was NOT measured, so this is the layout the reader assumes, not one it has seen
+⏺ Running the full reflow suite under the new ledger before I touch the drainer.
+
+⏺ The suite is green: 412 passed, 0 failed. The drainer is next.
+
+                                                                   Critical memory usage (140.4GB) — restart and resume with claude --continue
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

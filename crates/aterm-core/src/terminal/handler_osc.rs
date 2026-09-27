@@ -9,7 +9,7 @@
 //! - OSC 8: Hyperlinks
 //! - OSC 52: Clipboard operations
 //! - OSC 60/61/62: xterm-401 feature reporting queries
-//! - OSC 66: Text sizing (Kitty protocol)
+//! - OSC 66: Text sizing (Kitty protocol) — accepted and discarded
 //!
 //! OSC 1337 (Terminal) handlers are in `handler_osc_1337.rs`.
 //! Extracted from handler.rs as part of #485 (large files refactor).
@@ -67,7 +67,9 @@ impl TerminalHandler<'_> {
             21 => self.handle_osc_21(cap, params),
             52 => self.handle_osc_52(cap, params),
             60..=62 => self.handle_osc_feature_reporting(cap, cmd),
-            66 => self.handle_osc_66(params),
+            // OSC 66: kitty text sizing. Accepted and discarded — no host
+            // consumes it, and the engine does not render scaled text.
+            66 => {}
             // OSC 99: kitty desktop-notification protocol.
             // Gated by host notification authorization (handler_osc_notify.rs).
             99 => self.handle_osc_99(params),
@@ -98,8 +100,7 @@ impl TerminalHandler<'_> {
     /// Set window title and/or icon name from an OSC title param.
     ///
     /// OSC 0 sets both icon and window. OSC 1 sets icon only. OSC 2 sets window only.
-    /// The legacy v2 callback fires whenever the window title changes.
-    /// The v3 event callback fires for all title changes with the title type.
+    /// A real window-title change bumps the title epoch hosts poll.
     /// Titles are capped at [`MAX_TITLE_BYTES`] to prevent unbounded memory growth.
     ///
     /// Control characters (C0: 0x00-0x1F except tab, C1: 0x80-0x9F) are stripped
@@ -140,21 +141,6 @@ impl TerminalHandler<'_> {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             self.title.window = text.as_str().into();
-            if let Some(ref mut callback) = self.title.callback {
-                callback(text);
-            }
-        }
-        // v3 event callback fires for all title types (icon, window, or both).
-        if let Some(ref mut callback) = self.title.event_callback {
-            let title_type = match (icon, window) {
-                (true, true) => aterm_types::TitleType::WindowAndIcon,
-                (true, false) => aterm_types::TitleType::IconOnly,
-                (false, true) => aterm_types::TitleType::WindowOnly,
-                // Unreachable: at least one of icon/window is always true
-                // when set_title is called from OSC dispatch.
-                (false, false) => return,
-            };
-            callback(title_type, text);
         }
     }
 
@@ -165,10 +151,7 @@ impl TerminalHandler<'_> {
     /// `set_title`'s no-op guard. A host UI that labels a titleless tab with
     /// this cwd needs a cwd change to be observable exactly like a title
     /// change, while a shell re-reporting the same directory every prompt
-    /// (the OSC 7 steady state) must not thrash the signal. The
-    /// `DirectoryChanged` shell callback still fires unconditionally — the
-    /// pre-existing contract is that consumers see every report, changed or
-    /// not.
+    /// (the OSC 7 steady state) must not thrash the signal.
     ///
     /// A path [`reported_cwd_is_storable`] refuses — over-long, or containing
     /// a NUL — is IGNORED here: the prior cwd stays, nothing is signalled and
@@ -185,7 +168,6 @@ impl TerminalHandler<'_> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         *self.current_working_directory = path.map(String::from);
-        self.shell_directory_changed(path);
     }
 
     /// Handle OSC 7 current working directory.
@@ -258,7 +240,7 @@ impl TerminalHandler<'_> {
             }
             // Queue the REAL parsed cwd (host-preserving) for poll-based hosts.
             self.queue_osc_event(7, event_payload);
-            // current_working_directory / the shell callback / command marks keep
+            // current_working_directory / command marks keep
             // the PLAIN decoded path: shells commonly report their machine's
             // hostname for a LOCAL cwd (aterm's own integration scripts emit
             // `file://$(hostname)…`), and these local-path consumers (GUI
@@ -512,7 +494,7 @@ impl TerminalHandler<'_> {
     /// Handle OSC 52 clipboard query (Pd = "?").
     ///
     /// **Security (CF-003 + CF-005):** this path is gated by both
-    /// [`super::clipboard_auth::ClipboardAuth::try_mint_query_capability`]
+    /// `super::clipboard_auth::ClipboardAuth::try_mint_query_capability`
     /// (query authorization) and the `ResponseCapability` (response channel
     /// authorization). Without a host-minted `ClipboardQueryCapability`, the
     /// callback is never invoked and no response is emitted. Without a
@@ -590,7 +572,7 @@ impl TerminalHandler<'_> {
     /// Handle OSC 52 clipboard set (Pd = base64-encoded data).
     ///
     /// **Security (CF-004):** gated by
-    /// [`super::clipboard_auth::ClipboardAuth::try_mint_write_capability`].
+    /// `super::clipboard_auth::ClipboardAuth::try_mint_write_capability`.
     /// Without a host-minted [`super::clipboard_auth::ClipboardWriteCapability`],
     /// the callback is never invoked and no PTY-origin bytes reach the
     /// host clipboard delegate. The capability is unforgeable outside
@@ -650,56 +632,6 @@ impl TerminalHandler<'_> {
         self.queue_osc_event(52, content.clone());
 
         super::clipboard_auth::invoke_set(&mut self.clipboard.callback, token, selections, content);
-    }
-
-    /// Handle OSC 66 - Text sizing (Kitty protocol).
-    ///
-    /// Format: `OSC 66 ; metadata ; text ST`
-    ///
-    /// The metadata is a colon-separated list of key=value pairs controlling
-    /// text rendering dimensions and alignment.
-    ///
-    /// # Reference
-    ///
-    /// <https://sw.kovidgoyal.net/kitty/text-sizing-protocol/>
-    pub(super) fn handle_osc_66(&mut self, params: &[&[u8]]) {
-        // Need at least: OSC code, metadata, text
-        if params.len() < 3 {
-            return;
-        }
-
-        // Parse metadata (second parameter)
-        let metadata = match std::str::from_utf8(params[1]) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        // Collect text (may span multiple params if semicolons in content)
-        let text = if params.len() == 3 {
-            match std::str::from_utf8(params[2]) {
-                Ok(s) => s.to_string(),
-                Err(_) => return,
-            }
-        } else {
-            // Reconstruct text with embedded semicolons
-            let mut text = String::new();
-            for (idx, param) in params[2..].iter().enumerate() {
-                if idx > 0 {
-                    text.push(';');
-                }
-                match std::str::from_utf8(param) {
-                    Ok(s) => text.push_str(s),
-                    Err(_) => return,
-                }
-            }
-            text
-        };
-
-        // Parse into operation and invoke callback
-        let operation = super::types::TextSizingOperation::parse(metadata, &text);
-        if let Some(callback) = self.text_sizing_callback {
-            callback(operation);
-        }
     }
 
     /// Handle OSC 60/61/62 - xterm feature reporting (xterm-401).

@@ -319,8 +319,10 @@ fn mdutil_index_state(stdout: &[u8]) -> Option<crate::platform::IndexState> {
 }
 
 /// The `defaults(1)` domain of macOS Universal Control, per-host (`-currentHost`).
+#[cfg(target_os = "macos")]
 pub const UNIVERSAL_CONTROL_DOMAIN: &str = "com.apple.universalcontrol";
 /// The two keys that switch it off: the feature, and the screen-edge hand-off.
+#[cfg(target_os = "macos")]
 pub const UNIVERSAL_CONTROL_KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
 
 /// Universal Control's per-host switches, as `defaults -currentHost read` answers:
@@ -880,6 +882,115 @@ pub fn exec_or_run(command: &mut Command) -> io::Error {
     // `exec` replaces this process and never returns on success; the returned value is
     // the error that PREVENTED the exec.
     command.exec()
+}
+
+/// Wait for `child` while this process STANDS ASIDE from the terminal's interrupt and quit
+/// keys — the rule `system(3)` keeps: a ^C typed at the terminal reaches the whole
+/// foreground group, the child decides what it means, and this process lives on to collect
+/// its status. What `aterm pkg lease` waits with ([`crate::lease::hold_for`]): a holder that
+/// died of the ^C its child was still cleaning up after would drop the lease under it, and
+/// hand the shell its prompt back over the child's last lines.
+///
+/// A SIGTERM or SIGHUP sent to this process alone is PASSED ON to the child, and this
+/// process waits on (review, 2026-09-26). Those are how a supervisor ends a run — `kill
+/// <pid>`, `timeout`, a closed tab — and the pid it holds is the holder's: a packer
+/// `exec`s into `aterm pkg lease`. Died of it, the holder let the lease go while the
+/// command ran on UNLEASED and unwatched (measured: holder exit 143, its `sh` child still
+/// looping, the build no longer leased), and a pack its caller had stopped went on to its
+/// upload. Passed on, the command ends the way it would have with no holder between, and
+/// [`exit_code_like`] then leaves this process by the same signal. A signal this process
+/// was started ignoring (`nohup`) stays ignored; ^C and quit are NOT passed on, since the
+/// terminal already sent them to the whole group and a second would read as a second key.
+///
+/// The dispositions are set AFTER the spawn — an ignored signal is inherited across `exec`,
+/// and the child must meet the key with its own — and put back before this returns.
+///
+/// # Errors
+/// The wait's.
+pub fn wait_standing_aside(
+    child: &mut std::process::Child,
+) -> io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+    let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
+    FORWARD_TO.store(pid, Ordering::SeqCst);
+    let forward = forward_to_child as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: `signal(2)` with `SIG_IGN`, or with a handler that makes only
+    // async-signal-safe calls ([`forward_to_child`]); the previous dispositions are kept
+    // to be restored below.
+    let previous = unsafe {
+        [
+            (libc::SIGINT, libc::signal(libc::SIGINT, libc::SIG_IGN)),
+            (libc::SIGQUIT, libc::signal(libc::SIGQUIT, libc::SIG_IGN)),
+            (libc::SIGTERM, libc::signal(libc::SIGTERM, forward)),
+            (libc::SIGHUP, libc::signal(libc::SIGHUP, forward)),
+        ]
+    };
+    for (sig, was) in &previous[2..] {
+        if *was == libc::SIG_IGN {
+            // SAFETY: puts back the `SIG_IGN` this process was started with.
+            unsafe { libc::signal(*sig, libc::SIG_IGN) };
+        }
+    }
+    let status = child.wait();
+    // The child is reaped: its pid is free for the kernel to hand out again, so nothing is
+    // sent to it from here on.
+    let _ = FORWARD_TO.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    for (sig, was) in previous {
+        if was != libc::SIG_ERR {
+            // SAFETY: puts back the disposition this function replaced a moment ago.
+            unsafe { libc::signal(sig, was) };
+        }
+    }
+    status
+}
+
+/// The child [`wait_standing_aside`] passes SIGTERM and SIGHUP on to; `0` while it waits on
+/// none.
+static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// [`wait_standing_aside`]'s handler: the signal, sent on to the child it waits on — or,
+/// with none (a handler outliving its wait), the default action, as if never installed.
+extern "C" fn forward_to_child(sig: libc::c_int) {
+    let pid = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: `kill`, `signal` and `raise` are async-signal-safe.
+    unsafe {
+        if pid > 0 {
+            libc::kill(pid, sig);
+        } else {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+}
+
+/// Leave this process the way `status` says its child left: the child's exit code, or — for
+/// a child ended by SIGINT, SIGTERM, SIGHUP or SIGPIPE — the same signal, raised on this
+/// process with its default action, so the shell that ran it sees what it would have seen
+/// without a holder between them (bash stops a script whose foreground command died of
+/// SIGINT; it carries on past one that exited 130). Any other signal is `128 + n`: its
+/// default action may dump core, and a holder's core is nobody's evidence. Never returns
+/// for a raised signal.
+#[must_use]
+pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCode {
+    use std::os::unix::process::ExitStatusExt as _;
+    if let Some(code) = status.code() {
+        return std::process::ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1));
+    }
+    let Some(sig) = status.signal() else {
+        return std::process::ExitCode::from(1);
+    };
+    if matches!(
+        sig,
+        libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGPIPE
+    ) {
+        // SAFETY: the default action for these ends the process without a core; `raise`
+        // delivers it to this thread before it returns.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    std::process::ExitCode::from(u8::try_from(128 + sig).unwrap_or(255))
 }
 
 #[cfg(all(test, target_os = "macos"))]

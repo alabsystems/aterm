@@ -68,9 +68,13 @@ fn suballocator_reserves_a_terminal_sized_floor() {
     let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
         // THE FLIP: this file audits the WGPU-HAL suballocator floors — the
         // WGPU ORACLE arm, asked for by name post-flip.
-        Ok(mut g) => {
+        Ok(g) => {
             #[cfg(target_os = "macos")]
-            g.disarm_metal_for_oracle();
+            let g = {
+                let mut g = g;
+                g.disarm_metal_for_oracle();
+                g
+            };
             g
         }
         Err(e) => {
@@ -160,9 +164,13 @@ fn bloom_target_is_built_on_demand_not_with_the_offscreen() {
     let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
         // THE FLIP: this file audits the WGPU-HAL suballocator floors — the
         // WGPU ORACLE arm, asked for by name post-flip.
-        Ok(mut g) => {
+        Ok(g) => {
             #[cfg(target_os = "macos")]
-            g.disarm_metal_for_oracle();
+            let g = {
+                let mut g = g;
+                g.disarm_metal_for_oracle();
+                g
+            };
             g
         }
         Err(e) => {

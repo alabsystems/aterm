@@ -31,10 +31,7 @@
 //! legitimate traffic while still capping abusive peers to a tiny
 //! fraction of the 1 MiB buffer's worst case rate.
 //!
-//! Hosts can tune via [`Terminal::set_response_rate_limit`][set].
-//!
 //! [`MAX_RESPONSE_BUFFER_SIZE`]: super::MAX_RESPONSE_BUFFER_SIZE
-//! [set]: super::state::Terminal::set_response_rate_limit
 
 // aterm_time::Instant: std::time on native (byte-identical), JS clock on wasm32 where
 // Instant::now() panics. Must match the engine's other Instant seams (bell, transient).
@@ -137,6 +134,7 @@ impl ResponseRateLimiter {
 
     /// Reconfigure the limiter in place, preserving current token count
     /// up to the new capacity.
+    #[cfg(test)]
     pub(crate) fn reconfigure(&mut self, refill_bytes_per_sec: u64, capacity_bytes: u64) {
         self.refill_bytes_per_sec = refill_bytes_per_sec;
         self.capacity_bytes = capacity_bytes;

@@ -56,8 +56,8 @@ pub enum VerifyOutcome {
         /// The IO error string.
         error: String,
     },
-    /// A relocated sysroot bundle: the sanctioned install-time toolchain wiring
-    /// ([`crate::sysroot::relocate_sysroot`]) adds a `toolchain` SYMLINK inside the build tree
+    /// A relocated sysroot bundle: the (retired) install-time toolchain wiring added a
+    /// `toolchain` SYMLINK inside the build tree
     /// AFTER the signed root was captured over the pristine payload, so the on-disk tree
     /// intentionally differs from the recorded root and cannot be tree-attested. Informational
     /// (exit 0), NOT a failure. Full tree-attestation is available with the default

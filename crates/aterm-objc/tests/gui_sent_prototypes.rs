@@ -190,6 +190,10 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("NSMenu", "itemArray", "send_id"),
     ("NSMenuItem", "title", "send_id"),
     ("NSMenuItem", "submenu", "send_id"),
+    // `chrome` lists what the menu SHOWS (ruling 267): hidden items and
+    // Option-key alternates are skipped.
+    ("NSMenuItem", "isHidden", "send_bool"),
+    ("NSMenuItem", "isAlternate", "send_bool"),
     // ---- NSBitmapImageRep: the chrome capture. THE OTHER NEAR-TWIN PAIR:
     // the rendering intent is a SIGNED NSInteger and the file type is an
     // UNSIGNED NSUInteger, in the same six lines of the same function.

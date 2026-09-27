@@ -39,6 +39,7 @@ impl PackedColors {
     /// Create with default foreground and background.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn new() -> Self {
         Self::DEFAULT
     }
@@ -46,6 +47,7 @@ impl PackedColors {
     /// Create with indexed foreground and default background.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn with_indexed_fg(fg_index: u8) -> Self {
         Self((Self::MODE_INDEXED << Self::FG_MODE_SHIFT) | (fg_index as u32))
     }
@@ -53,6 +55,7 @@ impl PackedColors {
     /// Create with indexed background and default foreground.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn with_indexed_bg(bg_index: u8) -> Self {
         Self((Self::MODE_INDEXED << Self::BG_MODE_SHIFT) | ((bg_index as u32) << 8))
     }
@@ -60,6 +63,7 @@ impl PackedColors {
     /// Create with both indexed colors.
     #[must_use]
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn with_indexed(fg_index: u8, bg_index: u8) -> Self {
         Self(
             (Self::MODE_INDEXED << Self::FG_MODE_SHIFT)
@@ -191,6 +195,7 @@ impl PackedColors {
     /// Set background to default.
     #[must_use]
     #[inline]
+    #[cfg(any(test, kani))]
     pub const fn set_bg_default(self) -> Self {
         Self(self.0 & !(Self::MODE_MASK << Self::BG_MODE_SHIFT))
     }
@@ -302,6 +307,7 @@ impl PackedColor {
     /// Get the raw packed u32 value.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub const fn raw(self) -> u32 {
         self.0
     }

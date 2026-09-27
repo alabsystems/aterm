@@ -2256,10 +2256,10 @@ mod tests {
     // ===== the https payload lanes =====
 
     #[cfg(unix)]
-    use crate::extract::fixtures::gzip_bytes;
-    use crate::extract::fixtures::{ZipMember, tar_bytes, zip_bytes};
+    use crate::extract::fixtures::{ZipMember, gzip_bytes, tar_bytes, zip_bytes};
 
     /// An https artifact over `archive`, signed for ITS bytes and for `root`.
+    #[cfg(unix)]
     fn vendor_artifact(archive: &Path, payload: &str, root: &str) -> Artifact {
         let mut a = artifact(&file_sha256(archive).unwrap(), root);
         a.kind = if payload == "dmg" {
@@ -2294,6 +2294,7 @@ mod tests {
 
     /// The `gh` archive shape as tar bytes: a versioned top-level directory to strip,
     /// an executable, a plain file.
+    #[cfg(unix)]
     fn gh_tar() -> Vec<u8> {
         tar_bytes(&[
             ("gh_2.80.0_macOS_arm64/", b'5', "", b"", 0o755),
@@ -2309,6 +2310,7 @@ mod tests {
     }
 
     /// …and the same shape as a zip.
+    #[cfg(unix)]
     fn gh_zip() -> Vec<u8> {
         zip_bytes(
             &[

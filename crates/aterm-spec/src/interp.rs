@@ -281,6 +281,36 @@ pub fn admits(m: &Model, prev: &State, next: &State) -> Option<&'static str> {
         .map(|a| a.name)
 }
 
+/// The ONE successor of `state` under `action` whose `var` is `value` — how a
+/// Tier-1 lattice walk chooses its point among a nondeterministic
+/// `\in lo..hi` pick while still reaching that point through the model's OWN
+/// transition (entering the model by writing the picked values into a state
+/// would also accept a point the model cannot reach). `None` when the model
+/// cannot pick `value` from `state`.
+///
+/// # Panics
+///
+/// If two successors share `var == value`: then `var` does not identify the
+/// pick, and choosing between them would be the harness deciding for the
+/// model.
+// Skip: spec-model harness machinery over caller-built states (a collected
+// successor Vec and a filtered iterator), the same tier as `admits`' callers.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn pick(m: &Model, state: &State, action: &str, var: &str, value: i64) -> Option<State> {
+    let mut matching = m
+        .successors(action, state)
+        .into_iter()
+        .filter(|s| s.get(var) == Some(&value));
+    let chosen = matching.next()?;
+    assert!(
+        matching.next().is_none(),
+        "{}: `{action}` has two successors with {var} = {value} from {state:?}",
+        m.name
+    );
+    Some(chosen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,11 +329,13 @@ mod tests {
         assert!(!fired0.contains("AdmitStaleKitty"));
         assert!(!fired0.contains("AdmitStaleTheme"));
         assert!(!fired0.contains("AdmitStaleSparkle"));
+        assert!(!fired0.contains("PublishLiveUnadmitted"));
         let fired1 = fired_actions(&with_buggy(&m, 1));
         assert!(fired1.contains("AdmitStaleTrail"));
         assert!(fired1.contains("AdmitStaleKitty"));
         assert!(fired1.contains("AdmitStaleTheme"));
         assert!(fired1.contains("AdmitStaleSparkle"));
+        assert!(fired1.contains("PublishLiveUnadmitted"));
     }
 
     /// The promoted checker still proves and catches on a known model — the

@@ -1,36 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Base64 and hex encoding/decoding for aterm.
+//! Base64, CRC-32 and DEFLATE for aterm.
 //!
 //! Zero external dependencies. Provides:
 //!
-//! - [`base64`] — standard and URL-safe Base64 with optional padding.
-//! - [`hex`] — hexadecimal encoding and decoding.
+//! - [`base64`] — standard Base64 (RFC 4648 §4), strict and lenient decode.
 //! - [`inflate`] — RFC 1951 (DEFLATE) + RFC 1950 (zlib) decompression with a
 //!   decompression-bomb output ceiling.
 //!
 //! ## Usage
 //!
 //! ```rust
-//! use aterm_codec::{base64, hex};
+//! use aterm_codec::base64;
 //!
 //! // Base64
 //! let encoded = base64::encode(b"Hello, world!").unwrap();
 //! assert_eq!(encoded, "SGVsbG8sIHdvcmxkIQ==");
 //! let decoded = base64::decode(&encoded).unwrap();
 //! assert_eq!(decoded, b"Hello, world!");
-//!
-//! // URL-safe Base64 (no padding)
-//! let encoded = base64::encode_url_safe_no_pad(b"Hello, world!").unwrap();
-//! let decoded = base64::decode_url_safe_no_pad(&encoded).unwrap();
-//! assert_eq!(decoded, b"Hello, world!");
-//!
-//! // Hex
-//! let encoded = hex::encode(b"\xde\xad\xbe\xef").unwrap();
-//! assert_eq!(encoded, "deadbeef");
-//! let decoded = hex::decode(&encoded).unwrap();
-//! assert_eq!(decoded, b"\xde\xad\xbe\xef");
 //! ```
 
 #![deny(clippy::all)]
@@ -38,7 +26,6 @@
 
 pub mod base64;
 pub mod crc32;
-pub mod hex;
 pub mod inflate;
 
 use std::fmt;

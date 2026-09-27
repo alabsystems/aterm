@@ -143,17 +143,22 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             Cmd::Upgrade {
                 sid: String::new(),
                 dry_run: false,
-                every: None,
                 json: false,
             },
         ),
         (
-            "upgrade s-abc --dry-run --every 30 --json",
+            "upgrade s-abc --dry-run --json",
             Cmd::Upgrade {
                 sid: "s-abc".to_string(),
                 dry_run: true,
-                every: Some(30),
                 json: true,
+            },
+        ),
+        ("upgrade models", Cmd::UpgradeModels { set: None }),
+        (
+            "upgrade models set claude-opus-5-5,claude-fable-5-1",
+            Cmd::UpgradeModels {
+                set: Some("claude-opus-5-5,claude-fable-5-1".to_string()),
             },
         ),
         ("--help", Cmd::Help),
@@ -183,13 +188,16 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "limits @a @b",
         "ledger rm",
         "ledger recovery",
+        "upgrade models set",
+        "upgrade models frob",
+        "upgrade models set a b",
         "ledger statusline",
         "disk --apply everything",
         "usage --bogus",
         "usage --state",
         "upgrade abc",
-        "upgrade --every 5",
-        "upgrade --every soon",
+        // The loop is gone: the window's host takes the steps, on a push.
+        "upgrade --every 60",
     ] {
         assert!(parse(&words(line)).is_err(), "{line} should be refused");
     }
@@ -202,7 +210,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
 fn the_deleted_verbs_are_refused_by_name_and_point_at_the_engine() {
     for verb in DELETED {
         let e = parse(&words(verb)).expect_err(verb);
-        assert!(e.contains("deleted on 2026-09-23"), "{verb}: {e}");
+        assert!(e.contains("is gone"), "{verb}: {e}");
         // `config` also held main's live-upgrade switch: its refusal says
         // where that went, and no other deleted verb's does.
         assert_eq!(
@@ -467,26 +475,56 @@ fn scripted(stdout: String, code: i32, stderr: &str) -> Scripted {
     }
 }
 
-/// The screen's banner is the evidence, and the reader is aterm-phase's —
-/// nothing is re-parsed here. NEGATIVE CONTROL: the same frame without the
-/// notice classifies as nothing.
+/// The wall is the engine's own reading (`aterm_phase::wall`) and its reset
+/// is placed by the supervisor's clock — nothing is re-parsed here. NEGATIVE
+/// CONTROL: the same frame without the notice shows no wall.
 #[test]
-fn the_screen_evidence_is_the_banner_and_the_painted_windows() {
+fn the_view_is_the_engines_wall_and_the_painted_windows() {
     let now = 1_758_412_800;
-    let ev = evidence_from_screen(&limited_screen(), now, 0);
-    assert_eq!(ev.len(), 1, "{ev:?}");
-    let c = limits::classify(&ev, now).expect("a limit is read");
-    assert_eq!(c.class, limits::Class::Session5hLimit);
-    assert_eq!(c.resets_at, Some(now + 3 * 3600));
-    assert!(evidence_from_screen(&idle_screen(), now, 0).is_empty());
+    let zone_none = |_: &str| -> Option<i64> { None };
+    let v = limits_view(&limited_screen(), now, 0, zone_none);
+    let wall = v.wall.as_ref().expect("a wall is read");
+    assert_eq!(wall.kind, aterm_phase::WallKind::UsageSession);
+    assert_eq!(v.resets_at, Some(now + 3 * 3600));
+    assert!(v.windows.is_empty(), "{v:?}");
+    let idle = limits_view(&idle_screen(), now, 0, zone_none);
+    assert_eq!(idle.wall, None);
+    assert!(idle.windows.is_empty());
 }
 
-/// `limits` makes ONE screen read of the named session and prints the
-/// classifier's verdict at `source=grid`. NEGATIVE CONTROLS: an idle screen
-/// is `class=none`, and a read that fails is exit 1 naming the session —
-/// never `class=none`, which would read as "measured, nothing wrong".
+/// Claude Code's critical-memory banner (2026-09-24) is the engine's own
+/// wall, `wall=memory`, and no limit: a restart ends it, not a wait, so it
+/// has no reset. Its words say `usage` and `continue`, and neither the wall
+/// table (it places the banner by position, never by phrase) nor the painted
+/// `/usage` reader read them as a usage window.
 #[test]
-fn limits_reads_the_sessions_screen_once_and_classifies_it() {
+fn the_memory_banner_is_its_own_wall_and_no_limit() {
+    use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
+    let zone_none = |_: &str| -> Option<i64> { None };
+    let v = limits_view(&screen(MEMORY_BANNER_IDLE), 1_758_412_800, 0, zone_none);
+    let wall = v.wall.as_ref().expect("the banner is read");
+    assert_eq!(wall.kind, aterm_phase::WallKind::Memory);
+    assert!(!wall.kind.reads_limited(), "a restart ends it, not a reset");
+    assert_eq!(v.resets_at, None);
+    assert!(v.windows.is_empty(), "{v:?}");
+    assert!(
+        limits_text(&v).starts_with("wall=memory resets_at=- "),
+        "{}",
+        limits_text(&v)
+    );
+    let text = format!(
+        "{} (140.4GB) \u{2014} restart and resume with claude --continue",
+        aterm_phase::anchor_text("wall.memory")
+    );
+    assert_eq!(aterm_phase::classify_wall(&text), None, "never by phrase");
+}
+
+/// `limits` makes ONE screen read of the named session and prints its wall
+/// at `source=grid`. NEGATIVE CONTROLS: an idle screen is `wall=none`, and a
+/// read that fails is exit 1 naming the session — never `wall=none`, which
+/// would read as "measured, nothing wrong".
+#[test]
+fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
     let tmp = Tmp::new("limits");
     let env = env_at(&tmp);
     let run_with = |ctl: &mut Scripted, sid: Option<&str>, json: bool| {
@@ -504,7 +542,11 @@ fn limits_reads_the_sessions_screen_once_and_classifies_it() {
     let mut ctl = scripted(text_json(&limited_screen()), 0, "");
     let (code, out, _) = run_with(&mut ctl, Some("@s-worker"), false);
     assert_eq!(code, ok);
-    assert!(out.starts_with("class=session-5h-limit"), "{out}");
+    assert!(out.starts_with("wall=usage-session"), "{out}");
+    assert!(
+        out.contains("message=You've hit your session limit"),
+        "{out}"
+    );
     assert!(out.contains("source=grid"), "{out}");
     assert!(out.contains("resets_at=2025-09-21T03:00:00Z"), "{out}");
     assert_eq!(ctl.asked.len(), 1, "one read: {:?}", ctl.asked);
@@ -518,13 +560,15 @@ fn limits_reads_the_sessions_screen_once_and_classifies_it() {
     let mut ctl = scripted(text_json(&limited_screen()), 0, "");
     let (_, json, _) = run_with(&mut ctl, None, true);
     assert!(ctl.asked[0].starts_with("@s-test text"), "{:?}", ctl.asked);
-    assert!(json.contains("\"class\":\"session-5h-limit\""), "{json}");
+    assert!(json.contains("\"schema\":2"), "{json}");
+    assert!(json.contains("\"kind\":\"usage-session\""), "{json}");
+    assert!(json.contains("\"windows\":[]"), "{json}");
     assert!(json.contains("\"source\":\"grid\""), "{json}");
 
     let mut ctl = scripted(text_json(&idle_screen()), 0, "");
     let (code, out, _) = run_with(&mut ctl, Some("@s-worker"), false);
     assert_eq!(code, ok);
-    assert!(out.starts_with("class=none source=grid"), "{out}");
+    assert!(out.starts_with("wall=none source=grid"), "{out}");
 
     let mut ctl = scripted(String::new(), 1, "ERR no such session @s-gone");
     let (code, out, err) = run_with(&mut ctl, Some("@s-gone"), false);
@@ -536,7 +580,7 @@ fn limits_reads_the_sessions_screen_once_and_classifies_it() {
 /// **NO SESSION, NO READ.** Outside an aterm session (`$ATERM_PARENT_SESSION_ID`
 /// empty) and with no `@<sid>` on the line, `limits` used to send an
 /// unaddressed read — classifying whichever session the socket defaults to —
-/// and print `class=… source=grid` naming nobody. It refuses, exit 2, and
+/// and print `wall=… source=grid` naming nobody. It refuses, exit 2, and
 /// reads nothing. NEGATIVE CONTROL: the same env with a sid on the line reads
 /// that session.
 #[test]
@@ -764,56 +808,6 @@ fn the_disk_knobs_are_read_from_aterm_toml() {
     assert_eq!(toml_int("[disk]\nn = 2\nn = x\n", "disk", "n"), Some(2));
 }
 
-/// A SWITCH that gates acts reads what the window's own `[harness]` parse
-/// reads, and fails closed where [`toml_bool`] would answer nothing: absent is
-/// the default, `true`/`false` (bare or quoted, as the window's policy reads
-/// the value's text) is itself, and a value it cannot read is OFF — so is a
-/// file TOML refuses, a key said twice among them, because the window starts
-/// escalate-only on it — and a `false` written below another header, which a
-/// kill switch may not ignore (main, 2026-09-24). Negative controls: the
-/// default is honoured both ways, another table's key is not this one, and a
-/// misplaced `true` is nothing.
-#[test]
-fn a_switch_reads_off_on_a_value_it_cannot_read() {
-    for (text, default_on, want) in [
-        ("", true, true),
-        ("", false, false),
-        ("[harness]\nupgrade = false\n", true, false),
-        ("[harness]\nupgrade = true\n", false, true),
-        ("harness.upgrade = false\n", true, false),
-        // The spellings the line reader missed, which the window reads.
-        ("harness = { upgrade = false }\n", true, false),
-        ("harness = { upgrade = true }\n", false, true),
-        ("harness . \"upgrade\" = false\n", true, false),
-        ("[harness]\nupgrade = \"no\"\n", true, false),
-        // Quoted, as the window's own [harness] parser reads it.
-        ("[harness]\nupgrade = \"true\"\n", false, true),
-        ("[harness]\nupgrade = \"false\"\n", true, false),
-        ("[harness]\nupgrade = 0\n", true, false),
-        ("harness = 5\n", true, false),
-        // Not TOML: OFF, whatever it says. Last-assignment-wins read the
-        // first of these ON.
-        ("[harness]\nupgrade = false\nupgrade = true\n", true, false),
-        ("[harness]\nupgrade = true\nupgrade = maybe\n", true, false),
-        ("font_px = \n", true, false),
-        ("[other]\nupgrade = false\n", true, true),
-        ("[theme]\nharness.upgrade = false\n", true, false),
-        (
-            "[harness]\nupgrade = true\n[theme]\nharness.upgrade = false\n",
-            true,
-            false,
-        ),
-        ("[theme]\nharness.upgrade = true\n", false, false),
-        ("[harness.sub]\nupgrade = false\n", true, true),
-    ] {
-        assert_eq!(
-            toml_switch(text, "harness", "upgrade", default_on),
-            want,
-            "{text:?} (default {default_on})"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The boolean reader and the hand-run upgrade (ported from main, 2026-09-24)
 // ---------------------------------------------------------------------------
@@ -829,9 +823,8 @@ fn a_switch_reads_off_on_a_value_it_cannot_read() {
 /// key: the switch read OFF on the glass while the harness read it ON (main's
 /// audit 2026-09-24, measured against `aterm_toml::from_str::<Value>`, which
 /// reads all three `false`). Ported with main's key: on this branch the
-/// boolean reader answers `disk.apply`, and the switch itself is
-/// [`toml_switch`] over the same parser
-/// (`a_switch_reads_off_on_a_value_it_cannot_read`).
+/// boolean reader answers `disk.apply`, and the `[harness]` switches are the
+/// supervisor policy's own reader (`crate::supervise::config`'s tests).
 #[test]
 fn the_boolean_reader_reads_every_spelling_the_gui_parser_reads() {
     for text in [
@@ -877,8 +870,7 @@ fn the_boolean_reader_reads_every_spelling_the_gui_parser_reads() {
 /// a `false` the owner wrote, and it reads nothing else. Every spelling the
 /// parser path admits is salvaged, one `false` beats any `true`, and a
 /// refused file never answers `true`: `false` is the safe side, so a refused
-/// `disk.apply = true` is not consent to remove anything. (The switch reads a
-/// refused file OFF outright: [`toml_switch`].)
+/// `disk.apply = true` is not consent to remove anything.
 #[test]
 fn a_file_the_parser_refuses_can_only_read_off() {
     const TYPO: &str = "font_px = \n";
@@ -928,60 +920,28 @@ fn a_file_the_parser_refuses_can_only_read_off() {
 /// the switch says where it found it.
 ///
 /// That line is what an owner appends, and TOML files it under the last
-/// header (`theme.harness.enabled`), so the GUI — and the first, root-key-only
-/// revision of main's parser-first reader — read the switch unset: ON. A kill
-/// switch may not stop working because of where in the file it was written
-/// (main's review of 2026-09-24, measured then: line reader `Some(false)`,
-/// root-key-only `None`). A misplaced `false` wins even over a root `true`; a
-/// misplaced `true` is nothing. Settings still shows ON there, so a refused
-/// `upgrade` names the line on stderr — and says nothing of it when the switch
-/// sits where TOML reads it. Ported from main, where `status` and `mark` said
-/// it too; both are deleted here.
+/// header (`theme.harness.enabled`), so a root-key-only reader reads the
+/// switch unset: ON. A kill switch may not stop working because of where in
+/// the file it was written (main's review of 2026-09-24): the policy's reader
+/// limits on it and names it (`crate::supervise::config`'s tests), and a
+/// refused `upgrade` prints that note on stderr — and says nothing of it when
+/// the switch sits where TOML reads it. The boolean reader keeps the same
+/// rule for `disk.apply`: a misplaced `false` is no consent, a misplaced
+/// `true` is not consent either.
 #[test]
 fn a_kill_switch_written_below_another_header_still_reads_off() {
-    for (text, at) in [
-        (
-            "font_px = 14\n[theme]\nname = \"x\"\nharness.enabled = false\n",
-            "theme.harness.enabled",
-        ),
-        (
-            "[harness]\nenabled = true\n[theme]\nharness.enabled = false\n",
-            "theme.harness.enabled",
-        ),
-        (
-            "[theme.dark]\nharness = { enabled = false }\n",
-            "theme.dark.harness.enabled",
-        ),
-        (
-            "[[keybind]]\nkey = \"a\"\nharness.enabled = false\n",
-            "keybind[0].harness.enabled",
-        ),
+    for text in [
+        "font_px = 14\n[theme]\nname = \"x\"\nharness.enabled = false\n",
+        "[harness]\nenabled = true\n[theme]\nharness.enabled = false\n",
+        "[theme.dark]\nharness = { enabled = false }\n",
+        "[[keybind]]\nkey = \"a\"\nharness.enabled = false\n",
     ] {
         assert_eq!(
             toml_bool(text, "harness", "enabled"),
             Some(false),
             "{text:?}"
         );
-        assert_eq!(
-            misplaced_false(text, "harness", "enabled").as_deref(),
-            Some(at),
-            "{text:?}"
-        );
     }
-    // Where TOML itself reads the switch, nothing is misplaced; a misplaced
-    // `true` turns nothing off and so names nothing.
-    for text in [
-        "[harness]\nenabled = false\n[theme]\nharness.enabled = false\n",
-        "[theme]\nharness.enabled = true\n",
-    ] {
-        assert_eq!(
-            misplaced_false(text, "harness", "enabled"),
-            None,
-            "{text:?}"
-        );
-    }
-    // `disk.apply` rides the same reader: a misplaced `false` is no consent
-    // (its default anyway), a misplaced `true` is not consent either.
     assert_eq!(
         toml_bool("[other]\ndisk.apply = false\n", "disk", "apply"),
         Some(false)
@@ -1000,7 +960,7 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
         "font_px = 14\n[theme]\nname = \"x\"\nharness.enabled = false\n",
     )
     .expect("write config");
-    assert!(!harness_switch(Some(&config), "enabled"));
+    assert!(!SupervisorConfig::from_path(Some(&config)).0.enabled);
     let (ok, out, err) = go(&upgrade_cmd(true, false), &env);
     assert!(ok, "{out}{err}");
     assert!(out.contains(UPGRADE_BYPASSED), "{out}");
@@ -1008,13 +968,10 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
         err.contains("TOML files as `theme.harness.enabled`"),
         "{err}"
     );
-    assert!(
-        err.contains("Settings ▸ Harness reads the switch as ON"),
-        "{err}"
-    );
+    assert!(err.contains("limits all the same"), "{err}");
     // NEGATIVE CONTROL: the switch where TOML reads it is off, and unremarked.
     std::fs::write(&config, "[harness]\nenabled = false\n").expect("write config");
-    assert!(!harness_switch(Some(&config), "enabled"));
+    assert!(!SupervisorConfig::from_path(Some(&config)).0.enabled);
     let (_, out, err) = go(&upgrade_cmd(true, false), &env);
     assert!(out.contains(UPGRADE_BYPASSED), "{out}");
     assert!(!err.contains("TOML files as"), "{err}");
@@ -1039,7 +996,6 @@ fn upgrade_cmd(dry_run: bool, json: bool) -> Cmd {
     Cmd::Upgrade {
         sid: String::new(),
         dry_run,
-        every: None,
         json,
     }
 }
@@ -1126,7 +1082,6 @@ fn a_refused_upgrade_names_the_restarts_it_leaves_in_flight() {
     let one = Cmd::Upgrade {
         sid: "s-aaaa".to_string(),
         dry_run: false,
-        every: None,
         json: false,
     };
     let (_, _, err) = go_code(&one, &env);
@@ -1143,57 +1098,9 @@ fn a_refused_upgrade_names_the_restarts_it_leaves_in_flight() {
     assert!(!err.contains("restart"), "{err}");
 }
 
-/// `--every` re-reads the switch before EVERY pass: a loop started with the
-/// harness on stands down the tick it is turned off, says so ONCE, and sweeps
-/// again when it is turned back on — it never exits, so a switch turned off
-/// and on again does not end a hand-started loop.
-#[test]
-fn every_pass_rereads_the_master_switch() {
-    let tmp = Tmp::new("upgrade-every");
-    let env = env_at(&tmp);
-    std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
-    let config = env.config.clone().expect("config path");
-    let opts = super::super::upgrade_drive::Opts {
-        home: tmp.path().join("home"),
-        state: env.state.clone(),
-        sock: None,
-        only_sid: None,
-        dry_run: false,
-    };
-    let mut was_off = false;
-    let mut pass = || {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = upgrade_pass(&env, &opts, false, &mut was_off, &mut out, &mut err);
-        (
-            format!("{code:?}"),
-            String::from_utf8_lossy(&out).into_owned(),
-            String::from_utf8_lossy(&err).into_owned(),
-        )
-    };
-    let ok = format!("{:?}", ExitCode::SUCCESS);
-    let refused = format!("{:?}", ExitCode::from(1));
-    assert_eq!(pass().0, ok);
-    std::fs::write(&config, "[harness]\nenabled = false\n").expect("write config");
-    let (code, out, err) = pass();
-    assert_eq!(code, refused);
-    assert!(out.contains("step=refused:bypassed"), "{out}");
-    assert!(err.contains("upgrade refused"), "{err}");
-    let (code, out, err) = pass();
-    assert_eq!(code, refused);
-    assert!(
-        out.contains("step=refused:bypassed"),
-        "every tick is a line: {out}"
-    );
-    assert!(err.is_empty(), "the sentence is said once per turn: {err}");
-    std::fs::write(&config, "harness = { enabled = true }\n").expect("write config");
-    let (code, out, _) = pass();
-    assert_eq!(code, ok, "{out}");
-    assert!(out.is_empty(), "{out}");
-}
-
 /// A one-shot `upgrade` whose sweep never RAN does not exit 0: it decided
-/// nothing about any session. The lock held by another sweeper — the
-/// window's own host, every minute by default — exits 75, atpkg's "try again
+/// nothing about any session. The lock held by another actor — the
+/// window's own host, at a session's step — exits 75, atpkg's "try again
 /// later"; a state directory that cannot hold the lock exits 1. Measured
 /// before the fix: `step=busy:…` and exit 0 for all three.
 #[test]
@@ -1321,4 +1228,403 @@ fn a_ledger_tail_keeps_only_the_newest_rows() {
         READ_MAX_ROWS
     );
     assert!(tail_lines(&path, 0).expect("read").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// the live upgrade: the owner's view and word
+// ---------------------------------------------------------------------------
+
+/// The owner's grammar (gap audit 2026-09-24): `ledger upgrade`, `upgrade
+/// [<sid>] --status`, `upgrade <sid> --now|--defer <dur>|--skip`. Before that
+/// day `ledger upgrade` answered `ledger takes disk, an @<sid> and a row
+/// count, not "upgrade"` and there was no word to say at all.
+#[test]
+fn the_owners_upgrade_grammar_parses_and_refuses_what_it_cannot_mean() {
+    let cases = [
+        (
+            "ledger upgrade 5 --json",
+            Cmd::Ledger {
+                file: LedgerFile::Upgrade,
+                count: 5,
+                json: true,
+            },
+        ),
+        (
+            "upgrade --status",
+            Cmd::UpgradeOwner {
+                sid: String::new(),
+                ask: OwnerAsk::Status,
+                json: false,
+            },
+        ),
+        (
+            "upgrade s-abc --status --json",
+            Cmd::UpgradeOwner {
+                sid: "s-abc".to_string(),
+                ask: OwnerAsk::Status,
+                json: true,
+            },
+        ),
+        (
+            "upgrade s-abc --now",
+            Cmd::UpgradeOwner {
+                sid: "s-abc".to_string(),
+                ask: OwnerAsk::Now,
+                json: false,
+            },
+        ),
+        (
+            "upgrade s-abc --defer 6h",
+            Cmd::UpgradeOwner {
+                sid: "s-abc".to_string(),
+                ask: OwnerAsk::Defer(6 * 3_600),
+                json: false,
+            },
+        ),
+        (
+            "upgrade --skip s-abc",
+            Cmd::UpgradeOwner {
+                sid: "s-abc".to_string(),
+                ask: OwnerAsk::Skip,
+                json: false,
+            },
+        ),
+    ];
+    for (line, want) in cases {
+        let (got, _) = parse(&words(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert_eq!(got, want, "{line}");
+    }
+    for line in [
+        "upgrade --now",
+        "upgrade --defer 1h",
+        "upgrade s-abc --now --skip",
+        "upgrade s-abc --status --now",
+        "upgrade s-abc --now --dry-run",
+        "upgrade s-abc --skip --every 30",
+        "upgrade s-abc --defer",
+        "upgrade s-abc --defer 0",
+        "upgrade s-abc --defer 31d",
+        "upgrade s-abc --defer soon",
+        "upgrade s-abc s-def --now",
+        "usage --now",
+        "ledger --status",
+    ] {
+        assert!(parse(&words(line)).is_err(), "{line} should be refused");
+    }
+    // NEGATIVE CONTROL: the sweep's own grammar is untouched.
+    assert!(matches!(
+        parse(&words("upgrade s-abc --dry-run"))
+            .expect("the sweep")
+            .0,
+        Cmd::Upgrade { dry_run: true, .. }
+    ));
+}
+
+#[test]
+fn a_deferral_is_a_span_with_a_unit_within_a_month() {
+    for (v, secs) in [
+        ("90s", 90),
+        ("90", 90),
+        ("30m", 1_800),
+        ("6h", 21_600),
+        ("2d", 172_800),
+        ("30d", UPGRADE_MAX_DEFER_S),
+    ] {
+        assert_eq!(parse_defer(v), Ok(secs), "{v}");
+    }
+    for bad in ["", "0", "0h", "31d", "6 h", "6hours", "-1h", "h", "1.5h"] {
+        assert!(parse_defer(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// A recorded upgrade under `env`'s state, as the window's upgrade step leaves one.
+fn record_upgrade(env: &Env, session: &str, tab: &str, extra: &str) {
+    let dir = env.state.join("upgrade");
+    std::fs::create_dir_all(&dir).expect("state");
+    let now = u64::try_from(env.now).expect("now");
+    std::fs::write(
+        dir.join(format!("{session}.json")),
+        format!(
+            r#"{{"phase":"pending","from":"2.1.281","to":"2.1.282","source":"managed","tab":"{tab}","salt":1,"pending_since":{},"wait":"not-idle:busy","wait_since":{}{extra}}}"#,
+            now - 30_120,
+            now - 30_000
+        ),
+    )
+    .expect("state file");
+}
+
+/// A live stand-in Claude Code holding `session` on `version` in `tab`: this
+/// test binary parked in `harness::upgrade_drive`'s own park test, its tab in
+/// its environment, and Claude's session file for it under `home` with the
+/// kernel's start time — what `--status` vets a recorded upgrade against.
+#[cfg(unix)]
+fn live_holder(
+    home: &std::path::Path,
+    session: &str,
+    tab: &str,
+    version: &str,
+) -> std::process::Child {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+        .args(["harness::upgrade_drive::tests::park_when_asked", "--exact"])
+        .env("UPGRADE_DRIVE_TEST_PARK", "1")
+        .env("ATERM_PARENT_SESSION_ID", tab)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the stand-in agent");
+    let pid = child.id();
+    let started = (0..500).any(|_| {
+        let read = atpkg::caller_shell::process_args(pid)
+            .is_some_and(|a| a.env_var("UPGRADE_DRIVE_TEST_PARK").is_some());
+        if !read {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        read
+    });
+    // The kernel's start time as Claude renders `procStart`: `ps` in the C
+    // locale and UTC, whitespace squashed.
+    let start = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    if !started || start.is_empty() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the stand-in agent {pid} never started");
+    }
+    std::fs::create_dir_all(home.join(".claude/sessions")).expect("sessions");
+    std::fs::write(
+        home.join(format!(".claude/sessions/{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{session}","cwd":"/","version":"{version}","status":"busy","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#
+        ),
+    )
+    .expect("session file");
+    child
+}
+
+/// `upgrade --status` PRINTS WHAT THE SWEEP RECORDED — how long behind, what
+/// it waits on, the owner's word, whether it is stalled — sweeping nothing:
+/// no lock is taken — for each upgrade a live Claude Code still holds behind
+/// its target in its tab. The owner's word then lands under the lock and
+/// shows in the next `--status`, with its ledger line in `ledger upgrade`.
+/// NEGATIVE CONTROLS: the same recorded upgrade with NO live holder (review
+/// of 2026-09-25: a state file outlives its conversation) is not listed; a
+/// tab with nothing recorded is refused (exit 1), writing nothing.
+#[cfg(unix)]
+#[test]
+fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
+    let tmp = Tmp::new("upgrade-owner");
+    let env = env_at(&tmp);
+    let tab = "s-b5cf2faabac5ce5127bd";
+    record_upgrade(&env, "03396a15", tab, "");
+    let status = |sid: &str| Cmd::UpgradeOwner {
+        sid: sid.to_string(),
+        ask: OwnerAsk::Status,
+        json: false,
+    };
+    let (ok, out, err) = go(&status(""), &env);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        out, "no upgrade is recorded\n",
+        "no live holder: nothing to show"
+    );
+    assert!(err.is_empty(), "no sessions at all is a verdict: {err}");
+    let home = env.home.clone().expect("home");
+    let mut agent = live_holder(&home, "03396a15", tab, "2.1.281");
+    let (ok, out, err) = go(&status(""), &env);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        out,
+        format!(
+            "upgrade tab={tab} session=03396a15 from=2.1.281 to=2.1.282(managed) phase=pending \
+             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- stalled=overdue\n"
+        )
+    );
+    assert!(
+        !env.state.join("upgrade/sweep.lock").exists(),
+        "a status read takes no lock"
+    );
+    let (ok, out, _) = go(&status("s-0000"), &env);
+    assert!(ok);
+    assert!(
+        out.starts_with("no upgrade is recorded for tab s-0000"),
+        "{out}"
+    );
+
+    let now = Cmd::UpgradeOwner {
+        sid: tab.to_string(),
+        ask: OwnerAsk::Now,
+        json: false,
+    };
+    let (ok, out, err) = go(&now, &env);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains(" request=now "), "{out}");
+    let (_, out, _) = go(&status(tab), &env);
+    assert!(out.contains(" request=now "), "{out}");
+
+    let (_, out, _) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Upgrade,
+            count: 5,
+            json: false,
+        },
+        &env,
+    );
+    assert!(
+        out.contains(&format!(
+            " requested:now tab={tab} session=03396a15 2.1.281 -> 2.1.282(managed) — the owner's word"
+        )),
+        "{out}"
+    );
+
+    let (code, out, err) = go_code(
+        &Cmd::UpgradeOwner {
+            sid: "s-0000".to_string(),
+            ask: OwnerAsk::Skip,
+            json: false,
+        },
+        &env,
+    );
+    assert_eq!(code, format!("{:?}", ExitCode::from(1)), "{out}{err}");
+    assert!(
+        err.contains("no upgrade is recorded for tab s-0000"),
+        "{err}"
+    );
+    assert!(out.is_empty(), "{out}");
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+/// THE OWNER'S WORD SAYS WHICH SWITCH IT WAITS ON (review of 2026-09-25): the
+/// window takes upgrade steps only while BOTH `[harness] enabled` and
+/// `[harness] upgrade` read on (the one `[harness]` reader), and the word only
+/// noted the first — under `upgrade = false` it printed `request=now`, exited
+/// 0 and said nothing, while nothing in the window would ever read it. Each
+/// switch off is named, the word is written either way. NEGATIVE CONTROL: both
+/// on, nothing is said.
+#[test]
+fn an_owners_word_names_the_switch_that_keeps_the_window_off() {
+    let tmp = Tmp::new("upgrade-owner-switch");
+    let env = env_at(&tmp);
+    let tab = "s-b5cf2faabac5ce5127bd";
+    let config = env.config.clone().expect("config path");
+    let now = Cmd::UpgradeOwner {
+        sid: tab.to_string(),
+        ask: OwnerAsk::Now,
+        json: false,
+    };
+    let hand_run = format!("the next `aterm harness upgrade {tab}`");
+    for (toml, says) in [
+        (
+            "[harness]\nupgrade = false\n",
+            vec!["`[harness] upgrade` reads off", hand_run.as_str()],
+        ),
+        (
+            "[harness]\nenabled = false\n",
+            vec!["`[harness] enabled` reads off", "nothing moves"],
+        ),
+        ("[harness]\nenabled = true\nupgrade = true\n", Vec::new()),
+    ] {
+        record_upgrade(&env, "03396a15", tab, "");
+        std::fs::write(&config, toml).expect("write config");
+        let (ok, out, err) = go(&now, &env);
+        assert!(ok, "{toml}: {out}{err}");
+        assert!(
+            out.contains(" request=now "),
+            "{toml}: the word lands: {out}"
+        );
+        if says.is_empty() {
+            assert!(err.is_empty(), "{toml}: {err}");
+        }
+        for words in says {
+            assert!(err.contains(words), "{toml}: {err}");
+        }
+    }
+}
+
+/// A word the busy lock keeps out exits 75 — the sweep's own "try again"
+/// code — and writes nothing.
+#[test]
+fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
+    let tmp = Tmp::new("upgrade-owner-busy");
+    let env = env_at(&tmp);
+    let tab = "s-b5cf2faabac5ce5127bd";
+    record_upgrade(&env, "03396a15", tab, "");
+    let before = std::fs::read_to_string(env.state.join("upgrade/03396a15.json")).expect("state");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(env.state.join("upgrade/sweep.lock"))
+        .expect("lock file");
+    held.try_lock().expect("the test holds the sweep lock");
+    let (code, _, err) = go_code(
+        &Cmd::UpgradeOwner {
+            sid: tab.to_string(),
+            ask: OwnerAsk::Defer(60),
+            json: false,
+        },
+        &env,
+    );
+    held.unlock().expect("release");
+    assert_eq!(
+        code,
+        format!("{:?}", ExitCode::from(atpkg::lock::CONTENDED_EXIT)),
+        "{err}"
+    );
+    assert!(err.contains("nothing was written"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(env.state.join("upgrade/03396a15.json")).expect("state"),
+        before
+    );
+}
+
+/// A dry run's line carries how long the session has been behind and its
+/// current wait has lasted, from the recorded upgrade; a report with no
+/// recorded upgrade is the plain line.
+#[test]
+fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
+    let report = super::super::upgrade_drive::Report {
+        pid: 4205,
+        tab: "s-b5cf".to_string(),
+        session: "03396a15".to_string(),
+        from: "2.1.281".to_string(),
+        to: "2.1.282(managed)".to_string(),
+        step: "wait:not-idle".to_string(),
+    };
+    let row = super::super::upgrade_drive::Row {
+        behind_since: 1_000,
+        wait: "not-idle:busy".to_string(),
+        wait_since: 1_120,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    upgrade_line_with(&mut out, false, &report, Some((&row, 31_120)));
+    upgrade_line_with(&mut out, false, &report, None);
+    upgrade_line_with(&mut out, true, &report, Some((&row, 31_120)));
+    let out = String::from_utf8(out).expect("utf8");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[0],
+        "upgrade pid=4205 tab=s-b5cf session=03396a15 from=2.1.281 to=2.1.282(managed) \
+         step=wait:not-idle pending_for=8h22m wait_for=8h20m"
+    );
+    assert!(lines[1].ends_with("step=wait:not-idle"), "{}", lines[1]);
+    assert!(
+        lines[2].contains(r#""pending_for_s":30120"#),
+        "{}",
+        lines[2]
+    );
+    assert!(lines[2].contains(r#""wait_for_s":30000"#), "{}", lines[2]);
 }

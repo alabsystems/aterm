@@ -35,7 +35,6 @@ aterm-log = { workspace = true }
 # so field agreement is compiler-enforced rather than hand-synced.
 serde = { workspace = true }
 aterm-toml = { workspace = true }
-aterm-json = { workspace = true }
 # Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
 # lives here rather than in aterm-update because BOTH sides need it: the client verifies
 # it, and the owner-side minting tool emits and signs it through the very same type. Two
@@ -61,6 +60,9 @@ aterm-codec = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# The Linux binary-identity round-trip test reads its JSON back through the
+# workspace's own parser; the library itself writes no JSON.
+aterm-json = { workspace = true }
 # The roster tests must SIGN deterministic fixtures with obviously-synthetic seeds
 # (`Ed25519KeyPair::from_seed_unchecked` + `.sign`), which needs ring's `alloc` feature.
 # Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only, so

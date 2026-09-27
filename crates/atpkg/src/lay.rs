@@ -84,7 +84,8 @@ pub fn write_in_process(file: &Executable) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// The one writer under test lays a Unix mode, so the module is Unix-only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -97,7 +98,6 @@ mod tests {
 
     /// The in-process writer: mode 0755, the exact bytes, an existing file replaced, no
     /// temp left behind.
-    #[cfg(unix)]
     #[test]
     fn the_in_process_writer_lays_0755_atomically() {
         use std::os::unix::fs::PermissionsExt as _;

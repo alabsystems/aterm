@@ -10,7 +10,12 @@ repository.workspace = true
 description = "aterm CPU rasterizer: the terminal grid -> an RGBA framebuffer. The renderer core AND the read_image pixel-introspection oracle (headless, testable)."
 
 [features]
-default = ["disk-tier", "embedded-font", "embedded-symbols"]
+default = ["disk-tier", "embedded-font", "embedded-symbols", "bundled-font-stack"]
+# DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
+# reads (`ATERM_RASTERIZER`, the golden/parity suites' portable-raster pin, and
+# `ATERM_NO_PROCEDURAL_GLYPHS`). A debug build compiles them anyway; the release
+# cutter never enables it (aterm-gui's `dev-seams` forwards here).
+dev-seams = []
 # Compile source↔spec anchors into the library for the downstream aterm-gui
 # closure gate. Off by default, so production rendering carries no verifier dep.
 spec-anchors = ["dep:aterm-spec"]
@@ -29,6 +34,17 @@ embedded-font = []
 # out of the box with NO installed Nerd Font. Tried last in the runtime fallback, so any
 # installed/configured face still wins. DEFAULT-ON; --no-default-features drops the ~2.5MB.
 embedded-symbols = []
+# The BUNDLED TERMINAL FONT STACK (owner decision, 2026-09-24: the fonts a stock
+# Linux ships are poor and incomplete, so aterm ships its own). JetBrains Mono
+# 2.304 (Regular/Bold/Italic/BoldItalic, ~1.1MB, OFL-1.1) becomes the DEFAULT
+# primary when no font is configured, and Noto Sans Symbols 2 + Noto Sans Math
+# (~1.6MB, OFL-1.1) join the symbol tier ahead of the system faces; the embedded
+# DejaVu Sans Mono leads the broad fallback tier. See `src/bundled.rs` and
+# assets/bundled/*.LICENSE.txt. Compiled in on NON-macOS targets only: the macOS
+# default (SF Mono + CoreText system coverage) is unchanged by that decision, and
+# a universal binary would carry the ~2.8MB twice for faces it never selects.
+# DEFAULT-ON; --no-default-features drops it (and reverts to the system chain).
+bundled-font-stack = ["embedded-font"]
 
 [dependencies]
 # Path (not `workspace = true`) so we can set default-features = false here without

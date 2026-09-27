@@ -34,12 +34,12 @@
 //!
 //! Nothing in the host calls this router yet. Neither render arm
 //! (`App::tick_cursor_fx`, `app_render.rs:22418`, nor
-//! `App::compose_cursor_companion`, `app_render.rs:31307`) calls [`duty`], and
+//! `App::compose_cursor_companion`, `app_render.rs:31307`) calls `duty`, and
 //! the shipped pet is still fed by v1's `CompanionOwner::sense`
 //! (`companion.rs:1020`). Everything here is therefore a **receiver-facing
 //! value**: the four §7.2(a) beats are exposed as DATA on [`Flight`] —
 //! the snap-to cell ([`Flight::land`]), the spine floor
-//! ([`Flight::disp_floor`]), the whip ([`Flight::lead_at`]) and the arrival
+//! (`Flight::disp_floor`), the whip (`Flight::lead_at`) and the arrival
 //! edge ([`Flight::land_at`]) — and the seams that would CONSUME them do not
 //! exist yet. Naming them, so the next stage cannot mistake this file for the
 //! finished feature:
@@ -52,7 +52,7 @@
 //!   (`kitty_cursor.rs:1302`) and the head has no public `disp` setter; a
 //!   `CursorCat::on_meteor(&Flight)` seam is animator-stage work.
 //! * **Whip** — `kitty_cursor.rs:1344` computes `lead = LEAD_MAX·bank`, never
-//!   negative; the same seam must add [`Flight::lead_at`] in its place.
+//!   negative; the same seam must add `Flight::lead_at` in its place.
 //! * **Landing squash** — `CursorCat::land_at` is private
 //!   (`kitty_cursor.rs:585`) and set only to the animator's own `now`; the
 //!   same seam must set it to [`Flight::land_at`].
@@ -109,7 +109,7 @@
 //! (`App::tick_cursor_fx`) while the composed arm draws its companion from
 //! `App::compose_cursor_companion`. Two arms, one decision — so an impulse
 //! minted for a split pane can reach a body that the other arm drew, or no
-//! body at all. [`duty`] is shaped so both arms can call it with their own
+//! body at all. `duty` is shaped so both arms can call it with their own
 //! query and ink probe; wiring either arm is host-stage work (see WIRING
 //! STATUS above — today neither does).
 //!
@@ -125,10 +125,13 @@ use aterm_time::Instant;
 use crate::companion::CompanionDuty;
 use crate::cursor_glow::Geom;
 use crate::kitty_pet::{PetFrame, PetSense};
+#[cfg(test)]
 use crate::kitty_registry::KittyLook;
 use crate::word_decorations::CatFootprint;
 
-use super::{CompanionImpulse, Ctx, Dir, timing};
+#[cfg(test)]
+use super::timing;
+use super::{CompanionImpulse, Ctx, Dir};
 
 // ===========================================================================
 // 1. The constants (§7.2's beat table)
@@ -144,6 +147,7 @@ use super::{CompanionImpulse, Ctx, Dir, timing};
 /// Why bypass the follower at all: T2. A follower that eases to 0.97 over
 /// 130 ms banks the cat two frames after the meteor has already landed, which
 /// is exactly the lag tell v2 exists to delete.
+#[cfg(test)]
 pub const FLYING_DISP_FLOOR: f32 = 0.97;
 
 /// **`lead = −0.30` cell at `t = 0`** (§7.2, row "Whip") — the flying head is
@@ -154,16 +158,14 @@ pub const FLYING_DISP_FLOOR: f32 = 0.97;
 /// one place in the theme where a mark starts behind where it will settle, and
 /// it is legal under T3 because the mark is already at full brightness — only
 /// its offset moves.
+#[cfg(test)]
 pub const FLYING_LEAD_0: f32 = -0.30;
 
 /// **`LEAD_MAX = +0.22`** cell — the flying head's resting lead once the whip
 /// has settled (§7.2). The head leans into travel at rest, which is what makes
 /// a stationary cat still read as "going that way".
+#[cfg(test)]
 pub const FLYING_LEAD_MAX: f32 = 0.22;
-
-/// The flying head squints (`HAPPY_GATE`) for the flight **plus 200 ms**
-/// (§7.2, row "Eyes"). A pose parameter on existing frames; no new art.
-pub const FLYING_SQUINT_MS: f32 = 200.0;
 
 /// The 1-px look-back toward the launch lasts **250 ms** after arrival (§7.2,
 /// row "Eyes"). This is the LONGEST thing v2 itself still computes after the
@@ -171,6 +173,7 @@ pub const FLYING_SQUINT_MS: f32 = 200.0;
 /// [`BodyImpulse::deadline`] asks the cadence for. The squash (`LAND_DUR 0.42`)
 /// belongs to the head's own animator, which keeps its own cadence; v2 does not
 /// hold the frame open for a clock it does not own.
+#[cfg(test)]
 pub const FLYING_LOOKBACK_MS: f32 = 250.0;
 
 // ===========================================================================
@@ -198,15 +201,6 @@ pub enum Body {
     /// admitted body simply draws no cat, and the body that was there keeps
     /// whatever exit its own animator gives it.
     None,
-}
-
-impl Body {
-    /// True when this body puts pixels on glass — the predicate a host uses to
-    /// spend its single companion claim.
-    #[must_use]
-    pub fn on_glass(self) -> bool {
-        !matches!(self, Self::None)
-    }
 }
 
 /// What the host already decided about companions before v2 was asked.
@@ -273,7 +267,7 @@ pub enum Reaction {
 /// method is a value a receiver reads.
 ///
 /// A `Flight` is minted for every CREDITED spawn: §6.1's same-row jump at or
-/// past [`timing::JUMP_MIN_CELLS`] — the same 8 cells §7.2(a)'s snap clause
+/// past `timing::JUMP_MIN_CELLS` — the same 8 cells §7.2(a)'s snap clause
 /// names (`|Δx| > 8·cw`) — and §6.11's Return-licensed vertical variant,
 /// whose path may be a single row. The snap VERDICT is the follower's, not
 /// the router's: the follower holds the previous rest the router never sees,
@@ -296,7 +290,7 @@ pub struct Flight {
     /// **THE SNAP-TO** (§7.2(a), row "Teleport"): the landing cell — the
     /// caret the head escorts on the frame the impulse was minted, which by
     /// T2 is the frame the caret was first observed at its landing.
-    /// [`Duty::seat`] on that frame is the placement follower's rest for THIS
+    /// `Duty::seat` on that frame is the placement follower's rest for THIS
     /// cell, and where the follower's snap clause holds (`|Δx| > 8·cw`, or
     /// the shipped `Δy > 2·ch`) the receiver SETS the follower there
     /// (`settle = Some(rest)`) instead of gliding from the launch: a cat
@@ -309,6 +303,7 @@ impl Flight {
     /// Draw the body mirrored — the existing `facing_left` bank, and no other
     /// facing state (§7.2: "no facing flip beyond the existing bank").
     #[must_use]
+    #[cfg(test)]
     pub fn facing_left(&self) -> bool {
         matches!(self.dir, Dir::Left)
     }
@@ -317,6 +312,7 @@ impl Flight {
     /// a floor (`max`) so a cat already at full earned momentum is not pulled
     /// DOWN by its own meteor.
     #[must_use]
+    #[cfg(test)]
     pub fn disp_floor(&self) -> f32 {
         FLYING_DISP_FLOOR
     }
@@ -330,6 +326,7 @@ impl Flight {
     /// 60 Hz panel and a 120 Hz panel show the same lean at the same wall time
     /// (T7), and a dropped frame costs nothing but the frame.
     #[must_use]
+    #[cfg(test)]
     pub fn lead_at(&self, now: Instant) -> f32 {
         let age = now.saturating_duration_since(self.t0).as_secs_f32();
         FLYING_LEAD_0 + (FLYING_LEAD_MAX - FLYING_LEAD_0) * timing::spring_whip(age)
@@ -338,14 +335,9 @@ impl Flight {
     /// True once the caret's own landing frame has passed — the edge the
     /// squash, the pin, the ring and the bell all key on.
     #[must_use]
+    #[cfg(test)]
     pub fn landed(&self, now: Instant) -> bool {
         now >= self.land_at
-    }
-
-    /// The squint holds through the flight and [`FLYING_SQUINT_MS`] past it.
-    #[must_use]
-    pub fn squint_until(&self) -> Instant {
-        add_ms(self.land_at, FLYING_SQUINT_MS)
     }
 
     /// The 1-px look-back toward the launch ends here
@@ -353,6 +345,7 @@ impl Flight {
     /// itself still computes for the flight, hence
     /// [`BodyImpulse::deadline`]'s answer.
     #[must_use]
+    #[cfg(test)]
     pub fn settled_at(&self) -> Instant {
         add_ms(self.land_at, FLYING_LOOKBACK_MS)
     }
@@ -409,6 +402,7 @@ impl BodyImpulse {
     /// `CursorCat::is_active`), and a router that also armed the cadence for
     /// them would be a second, disagreeing answer to "is anything animating".
     #[must_use]
+    #[cfg(test)]
     pub fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Fly(flight) => Some(flight.settled_at()),
@@ -1062,6 +1056,7 @@ impl PetOffer {
     /// True when this frame offers the pet nothing — the common case, and the
     /// one-branch early-out a receiver keys on.
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.perk_at.is_none() && self.catch.is_none() && self.mote_t.is_none()
     }
@@ -1080,6 +1075,7 @@ impl PetOffer {
 /// *derives* one: there is no code path in this file that constructs a
 /// [`KittyLook`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct Identity {
     /// The look this process launched with, or the one a favourite pin
     /// replaced it with.
@@ -1093,6 +1089,7 @@ pub struct Identity {
 /// One [`duty`] call's inputs — the whole of what the host knows this frame.
 /// No `Debug`, for [`SeatQuery`]'s reason.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub struct DutyQuery {
     /// The host's already-reached companion verdicts.
     pub admitted: CompanionAdmission,
@@ -1112,6 +1109,7 @@ pub struct DutyQuery {
 
 /// EVERYTHING THE HOST NEEDS, in one value.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(test)]
 pub struct Duty {
     /// Which body to draw (L-A: exactly one, possibly none).
     pub body: Body,
@@ -1149,6 +1147,7 @@ pub struct Duty {
 /// then the seat — computed only for the flying head, so an ink-probing loop
 /// is never paid for the pet or for a frame that draws no cat.
 #[must_use]
+#[cfg(test)]
 pub fn duty<F>(query: &DutyQuery, ink: F) -> Duty
 where
     F: Fn(u16, u16) -> Option<bool>,
@@ -1176,6 +1175,7 @@ where
 /// `at + ms`, saturating rather than panicking on an absurd offset. The one
 /// place milliseconds become an `Instant` in this module, so nobody rounds on
 /// the way and lands a frame early (§8.1's reasoning for [`timing::flight`]).
+#[cfg(test)]
 fn add_ms(at: Instant, ms: f32) -> Instant {
     at.checked_add(std::time::Duration::from_secs_f32(ms / 1000.0))
         .unwrap_or(at)

@@ -22,13 +22,14 @@
 //! handshake ends with each side sending a CONFIRM — record 0 of its direction,
 //! empty — that the peer must open before the handshake returns: key possession
 //! and the hello transcript are confirmed before any application byte flows,
-//! and a peer without the key is refused inside the handshake. Still pre-shared:
-//! the key itself; an online key agreement (forward secrecy) is the rung above.
+//! and a peer without the key is refused inside the handshake. The record key
+//! is the pre-shared key itself; the `handshake` feature's key agreement, which
+//! enters through [`SealedStream::with_transcript`], adds forward secrecy.
 //!
 //! # Framing
 //! Each `write(buf)` seals `buf` into one or more records of at most
-//! [`MAX_PLAINTEXT`] plaintext bytes each (like TLS's 16 KiB record ceiling)
-//! and emits `len: u32-le ‖ nonce ‖ ciphertext ‖ tag` per record. Each `read`
+//! [`MAX_PLAINTEXT`] plaintext bytes each (a record ceiling, as in TLS) and
+//! emits `len: u32-le ‖ nonce ‖ ciphertext ‖ tag` per record. Each `read`
 //! drains from the currently-open record, opening the next on demand — so the
 //! caller sees a plain byte stream and its own framing (the broker's `Frame`)
 //! rides inside, blind to the record boundaries beneath it. An empty record is
@@ -37,11 +38,13 @@
 //!
 //! # Bounds
 //! A record whose length prefix exceeds [`MAX_RECORD`] is rejected before any of
-//! it is read, so a hostile prefix pins at most `MAX_RECORD` bytes; the one
-//! record read before the peer has authenticated (its confirm) is capped at
-//! exactly [`OVERHEAD`](crate::OVERHEAD) bytes, so an unkeyed peer can make the
-//! reader allocate nothing beyond that. A partial or timed-out transport read is
-//! resumed at the same record boundary by the next `read`, never desynced.
+//! it is read, so a hostile prefix pins at most `MAX_RECORD` bytes; under the
+//! hello handshake the one record read before the peer has authenticated (its
+//! confirm) is capped at exactly [`OVERHEAD`](crate::OVERHEAD) bytes, so an
+//! unkeyed peer can make the reader allocate nothing beyond that. A partial or
+//! timed-out transport read is resumed at the same record boundary by the next
+//! `read`, never desynced. A write that fails after part of a record reached the
+//! transport cannot be resumed that way, so it poisons the send side.
 //!
 //! Honest boundary: there is no close-notify record. A transport cut exactly at a
 //! record boundary is indistinguishable from an orderly close (`read` returns
@@ -151,12 +154,38 @@ impl Session {
     }
 }
 
-/// The AAD of record `seq` in the direction `prefix` describes: `prefix ‖ seq`.
-fn record_aad(prefix: &[u8], seq: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(prefix.len() + 8);
+/// Set `aad` to the AAD of record `seq` in the direction `prefix` describes,
+/// `prefix ‖ seq`, reusing its allocation.
+fn record_aad(aad: &mut Vec<u8>, prefix: &[u8], seq: u64) {
+    aad.clear();
     aad.extend_from_slice(prefix);
     aad.extend_from_slice(&seq.to_le_bytes());
-    aad
+}
+
+/// The send half's mutable state.
+struct SendState {
+    /// The sequence the next record is sealed under.
+    seq: u64,
+    /// Set once a record was only partly written: the peer can no longer parse
+    /// the wire past it, so every later write errors instead of sealing records
+    /// the peer will never open.
+    poisoned: bool,
+    /// The record being written, `len ‖ nonce ‖ ciphertext ‖ tag`, and its AAD.
+    /// Kept across records so a write allocates nothing once warm; `rec` holds
+    /// at most `LEN_PREFIX + MAX_RECORD` bytes, and only ciphertext at rest.
+    rec: Vec<u8>,
+    aad: Vec<u8>,
+}
+
+impl SendState {
+    fn new() -> SendState {
+        SendState {
+            seq: 0,
+            poisoned: false,
+            rec: Vec::new(),
+            aad: Vec::new(),
+        }
+    }
 }
 
 /// The receive half's mutable state.
@@ -165,10 +194,13 @@ struct RecvState {
     seq: u64,
     /// The record buffer. While a record is being read it holds the sealed bytes
     /// (`rec[..body_len]`, filled to `body_filled`); once opened in place, the
-    /// plaintext is `rec[pos..end]` and `read` drains it.
+    /// plaintext is `rec[pos..end]` and `read` drains it. It only grows (to at
+    /// most `MAX_RECORD`), so a record costs no allocation and no zero-fill.
     rec: Vec<u8>,
     pos: usize,
     end: usize,
+    /// The AAD scratch for the record being opened.
+    aad: Vec<u8>,
     /// The in-progress wire read — the 4-byte length prefix, then the body —
     /// accumulated across partial and timed-out transport reads so a socket
     /// timeout never desyncs the record boundary (the broker's liveness probe
@@ -190,6 +222,7 @@ impl RecvState {
             rec: Vec::new(),
             pos: 0,
             end: 0,
+            aad: Vec::new(),
             hdr: [0u8; LEN_PREFIX],
             hdr_filled: 0,
             body_len: 0,
@@ -207,7 +240,7 @@ pub struct SealedStream<S> {
     // The per-record AAD counters, SHARED across try_clone so two handles to one
     // socket write a single ordered record sequence and read against a single
     // expected sequence.
-    send_seq: Arc<Mutex<u64>>,
+    send: Arc<Mutex<SendState>>,
     recv: Arc<Mutex<RecvState>>,
 }
 
@@ -217,7 +250,7 @@ impl<S> SealedStream<S> {
             inner,
             key,
             session,
-            send_seq: Arc::new(Mutex::new(0)),
+            send: Arc::new(Mutex::new(SendState::new())),
             recv: Arc::new(Mutex::new(RecvState::new())),
         }
     }
@@ -230,19 +263,9 @@ impl<S> SealedStream<S> {
 }
 
 impl<S: Read + Write> SealedStream<S> {
-    /// Open the client end of a sealed stream over `inner` under the pre-shared
-    /// `key`: run the handshake (see the module docs) against a peer that runs
-    /// [`handshake_server`](Self::handshake_server). Returns only after the
-    /// peer's confirm record has opened — i.e. the peer has proven it holds the
-    /// key and saw the same two hellos.
-    ///
-    /// # Errors
-    /// The transport error; `InvalidData` if the peer is not an astream sealed
-    /// transport or its confirm fails to authenticate (wrong key, tampered
-    /// hello); `UnexpectedEof` if the peer closed mid-handshake.
     /// Wrap a stream whose key and TRANSCRIPT a handshake above this layer already
-    /// established — the forward-secret ([`crate::client_handshake`]) and identity
-    /// ([`crate::client_identity_handshake`]) paths.
+    /// established — the forward-secret (`client_handshake`, `handshake` feature) and identity
+    /// (`client_identity_handshake`, `identity` feature) paths.
     ///
     /// No hello exchange and no confirm record: those exist to give a bare
     /// pre-shared key freshness and key confirmation, and a key agreement has
@@ -263,6 +286,16 @@ impl<S: Read + Write> SealedStream<S> {
         Self::with_session(inner, key, Session::from_binding(transcript, is_client))
     }
 
+    /// Open the client end of a sealed stream over `inner` under the pre-shared
+    /// `key`: run the handshake (see the module docs) against a peer that runs
+    /// [`handshake_server`](Self::handshake_server). Returns only after the
+    /// peer's confirm record has opened — i.e. the peer has proven it holds the
+    /// key and saw the same two hellos.
+    ///
+    /// # Errors
+    /// The transport error; `InvalidData` if the peer is not an astream sealed
+    /// transport or its confirm fails to authenticate (wrong key, tampered
+    /// hello); `UnexpectedEof` if the peer closed mid-handshake.
     pub fn handshake_client(inner: S, key: [u8; KEY_LEN]) -> io::Result<Self> {
         Self::handshake(inner, key, true)
     }
@@ -312,12 +345,12 @@ impl<S: Read + Write> SealedStream<S> {
         //    opening the peer's proves the same of the peer. Again send first,
         //    read second.
         {
-            let mut seq = stream.send_seq.lock().unwrap();
+            let mut tx = stream.send.lock().unwrap();
             write_record(
                 &mut stream.inner,
                 &stream.key,
                 &stream.session,
-                &mut seq,
+                &mut tx,
                 b"",
             )?;
         }
@@ -372,33 +405,58 @@ impl<S: TryCloneable> SealedStream<S> {
             inner: self.inner.try_clone()?,
             key: self.key,
             session: self.session.clone(),
-            send_seq: Arc::clone(&self.send_seq),
+            send: Arc::clone(&self.send),
             recv: Arc::clone(&self.recv),
         })
     }
 }
 
-/// Seal `plaintext` (at most `MAX_PLAINTEXT` bytes) as record `*seq` of this
-/// side's direction and write it: `len ‖ nonce ‖ ciphertext ‖ tag`, built in one
-/// buffer with no plaintext copy. Advances `*seq` once the bytes are written.
+/// Seal `plaintext` (at most `MAX_PLAINTEXT` bytes) as record `tx.seq` of this
+/// side's direction and write it: `len ‖ nonce ‖ ciphertext ‖ tag`, sealed in
+/// place in `tx.rec`. Advances `tx.seq` once the bytes are written.
+///
+/// An error before any byte of the record reached the transport leaves the
+/// stream intact: a retry seals the record afresh under the same sequence. An
+/// error after some did poisons the send side, because the peer's record
+/// boundary is then lost for good.
 fn write_record<S: Write>(
     inner: &mut S,
     key: &[u8; KEY_LEN],
     session: &Session,
-    seq: &mut u64,
+    tx: &mut SendState,
     plaintext: &[u8],
 ) -> io::Result<()> {
     debug_assert!(plaintext.len() <= MAX_PLAINTEXT);
+    if tx.poisoned {
+        return Err(io::Error::other(
+            "sealed stream: an earlier record was only partly written",
+        ));
+    }
     let sealed_len = NONCE_LEN + plaintext.len() + TAG_LEN;
-    let mut rec = Vec::with_capacity(LEN_PREFIX + sealed_len);
-    rec.extend_from_slice(&(sealed_len as u32).to_le_bytes());
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
-    rec.extend_from_slice(&nonce);
-    rec.extend_from_slice(plaintext);
-    seal_in_place(key, &record_aad(&session.send, *seq), &mut rec, LEN_PREFIX);
-    inner.write_all(&rec)?;
-    *seq = seq.wrapping_add(1);
+    tx.rec.clear();
+    tx.rec.reserve(LEN_PREFIX + sealed_len);
+    tx.rec.extend_from_slice(&(sealed_len as u32).to_le_bytes());
+    tx.rec.extend_from_slice(&nonce);
+    tx.rec.extend_from_slice(plaintext);
+    record_aad(&mut tx.aad, &session.send, tx.seq);
+    seal_in_place(key, &tx.aad, &mut tx.rec, LEN_PREFIX);
+    let mut sent = 0;
+    while sent < tx.rec.len() {
+        let err = match inner.write(&tx.rec[sent..]) {
+            Ok(0) => io::Error::from(io::ErrorKind::WriteZero),
+            Ok(k) => {
+                sent += k;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => e,
+        };
+        tx.poisoned = sent > 0;
+        return Err(err);
+    }
+    tx.seq = tx.seq.wrapping_add(1);
     Ok(())
 }
 
@@ -465,13 +523,14 @@ fn read_record<S: Read>(
         }
         rs.body_len = n;
         rs.body_filled = 0;
-        rs.rec.clear();
-        rs.rec.resize(n, 0);
+        if rs.rec.len() < n {
+            rs.rec.resize(n, 0);
+        }
     }
     let n = rs.body_len;
     fill(inner, &mut rs.rec[..n], &mut rs.body_filled)?;
-    let aad = record_aad(&session.recv, rs.seq);
-    let end = match open_in_place(key, &aad, &mut rs.rec[..n]) {
+    record_aad(&mut rs.aad, &session.recv, rs.seq);
+    let end = match open_in_place(key, &rs.aad, &mut rs.rec[..n]) {
         Ok(plain) => NONCE_LEN + plain.len(),
         Err(_) => {
             rs.poisoned = true;
@@ -499,11 +558,21 @@ impl<S: Write> Write for SealedStream<S> {
         // One write ⇒ one or more records, all under the send lock, so records
         // from two handles never interleave within a write and each record's
         // sequence matches its position on the wire.
-        let mut seq = self.send_seq.lock().unwrap();
+        let mut tx = self.send.lock().unwrap();
+        let mut written = 0;
         for chunk in buf.chunks(MAX_PLAINTEXT) {
-            write_record(&mut self.inner, &self.key, &self.session, &mut seq, chunk)?;
+            if let Err(e) = write_record(&mut self.inner, &self.key, &self.session, &mut tx, chunk)
+            {
+                // Records already on the wire are bytes this call consumed and
+                // must be reported as such: an `Err` tells the caller nothing was
+                // written, and a retry would re-send them as fresh, valid records
+                // the peer accepts twice. A persistent error resurfaces on the
+                // next call (a record cut part-way poisons the send side).
+                return if written == 0 { Err(e) } else { Ok(written) };
+            }
+            written += chunk.len();
         }
-        Ok(buf.len())
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -774,8 +843,8 @@ mod tests {
         // returning Ok(0), which every std consumer would take as end-of-stream.
         w.write_all(b"ab").unwrap();
         {
-            let mut seq = w.send_seq.lock().unwrap();
-            write_record(&mut w.inner, &w.key, &w.session, &mut seq, b"").unwrap();
+            let mut tx = w.send.lock().unwrap();
+            write_record(&mut w.inner, &w.key, &w.session, &mut tx, b"").unwrap();
         }
         w.write_all(b"cd").unwrap();
         let wire = w.get_ref().clone();
@@ -837,6 +906,105 @@ mod tests {
         }
         assert_eq!(got, b"survive timeouts");
         assert!(timeouts > 0, "the transport did time out mid-record");
+    }
+
+    /// A transport that times out ONCE when `stall_at` bytes have been accepted:
+    /// a write that would cross that offset takes only the bytes up to it (a
+    /// short write), and the next call fails with `TimedOut` having taken none —
+    /// the shape of a socket with `SO_SNDTIMEO` whose peer stopped reading.
+    struct Stall {
+        wire: Vec<u8>,
+        stall_at: usize,
+        fired: bool,
+    }
+    impl Stall {
+        fn new(stall_at: usize) -> Stall {
+            Stall {
+                wire: Vec::new(),
+                stall_at,
+                fired: false,
+            }
+        }
+    }
+    impl Write for Stall {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut take = buf.len();
+            if !self.fired {
+                if self.wire.len() == self.stall_at {
+                    self.fired = true;
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "stalled"));
+                }
+                take = take.min(self.stall_at - self.wire.len());
+            }
+            self.wire.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_that_stalls_after_whole_records_reports_them_written() {
+        // The first record goes out whole and the transport stalls exactly at the
+        // boundary before the second. `write` must report the first record's bytes
+        // as written (`Ok(n)`), as the `Write` contract requires: an `Err` tells
+        // the caller that NOTHING was written, and a caller that then retries the
+        // same buffer re-sends bytes the peer already has, as fresh, valid records.
+        let (sc, ss) = sessions();
+        let data: Vec<u8> = (0..2 * MAX_PLAINTEXT + 10)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let first_record = LEN_PREFIX + MAX_PLAINTEXT + OVERHEAD;
+        let mut w = SealedStream::with_session(Stall::new(first_record), KEY, sc);
+
+        // A caller that treats the timeout as transient and retries what `write`
+        // did not report written.
+        let mut off = 0;
+        while off < data.len() {
+            match w.write(&data[off..]) {
+                Ok(n) => off += n,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("unexpected {e}"),
+            }
+        }
+        assert!(w.inner.fired, "the transport did stall");
+        let mut r = SealedStream::with_session(Cursor::new(w.inner.wire), KEY, ss);
+        let got = read_all(&mut r, 1 << 16);
+        assert_eq!(got.len(), data.len(), "each byte arrives exactly once");
+        assert!(got == data);
+    }
+
+    #[test]
+    fn a_record_cut_part_way_poisons_the_send_side() {
+        // The transport takes 10 bytes of the first record, then times out. That
+        // record can never be completed, so the peer cannot parse anything after
+        // it: every later write must fail rather than report success for records
+        // appended to a wire the peer will reject.
+        let (sc, _) = sessions();
+        let mut w = SealedStream::with_session(Stall::new(10), KEY, sc);
+        let e = w.write(b"first").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            w.write(b"second").is_err(),
+            "a cut record poisons the stream"
+        );
+        assert!(w.write(b"third").is_err(), "and it stays poisoned");
+        assert_eq!(w.inner.wire.len(), 10, "nothing is sealed after the cut");
+    }
+
+    #[test]
+    fn a_write_that_stalls_before_its_record_starts_can_be_retried() {
+        // Nothing of the record reached the transport, so the stream is intact:
+        // the retry seals it again under the same sequence and the peer reads it.
+        let (sc, ss) = sessions();
+        let mut w = SealedStream::with_session(Stall::new(0), KEY, sc);
+        let e = w.write(b"retry me").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(w.inner.wire.is_empty());
+        w.write_all(b"retry me").unwrap();
+        let mut r = SealedStream::with_session(Cursor::new(w.inner.wire), KEY, ss);
+        assert_eq!(read_all(&mut r, 64), b"retry me");
     }
 
     // ---- the handshake, over real sockets --------------------------------------

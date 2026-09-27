@@ -202,8 +202,6 @@ fn result_after(
     let installs = decision == SemanticPrewarmResultDecision::InstallCurrent;
     let fails_closed = decision == SemanticPrewarmResultDecision::FailClosedCurrent;
     state.insert("decision", result_decision_code(decision));
-    state.insert("installed", i64::from(installs));
-    state.insert("failed_closed", i64::from(fails_closed));
     state.insert(
         "cached",
         i64::from(decision == SemanticPrewarmResultDecision::CacheSuperseded),
@@ -311,9 +309,12 @@ fn dropped_base_mixed_candidate_and_fail_open_mutants_are_rejected() {
         SemanticPrewarmResultDecision::InstallCurrent,
     );
     assert_eq!(admits(&model, &mixed_before, &mixed_install), None);
-    assert!(!model.check_invariant("InstallOnlyLatestReady", &mixed_install));
+    assert!(!model.check_invariant("DecisionMatchesIdentity", &mixed_install));
 
     // Exact-current construction failure must clear an older active renderer.
+    // This only checks the law refuses the fail-open slot; the poll that
+    // performs the clear is driven, over the whole lattice, by `tray_raster`'s
+    // `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects`.
     let failed_input = ResultInputs {
         generation_matches: true,
         request_matches: true,
@@ -331,6 +332,29 @@ fn dropped_base_mixed_candidate_and_fail_open_mutants_are_rejected() {
     fail_open.insert("active_after", 1);
     assert_eq!(admits(&model, &failed_before, &fail_open), None);
     assert!(!model.check_invariant("CurrentFailureFailsClosed", &fail_open));
+
+    // Readiness tested before generation: a ready renderer forked from an
+    // obsolete generation's base filed in the candidate cache.
+    let stale_input = ResultInputs {
+        generation_matches: false,
+        request_matches: false,
+        candidate_matches: false,
+        renderer_ready: true,
+        active_before: false,
+        active_before_latest: false,
+    };
+    let stale_before = result_before(&model, stale_input);
+    assert_eq!(
+        shipping_result_decision(stale_input),
+        SemanticPrewarmResultDecision::IgnoreStaleGeneration
+    );
+    let stale_cached = result_after(
+        &stale_before,
+        stale_input,
+        SemanticPrewarmResultDecision::CacheSuperseded,
+    );
+    assert_eq!(admits(&model, &stale_before, &stale_cached), None);
+    assert!(!model.check_invariant("DecisionMatchesIdentity", &stale_cached));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -413,5 +437,4 @@ fn shipping_request_swap_conforms_and_rejects_mismatched_active_paint() {
     let retained = request_after(&before, mixed, false);
     assert_eq!(admits(&model, &before, &retained), None);
     assert!(!model.check_invariant("MismatchedReadyMovesToCache", &retained));
-    assert!(!model.check_invariant("RetainedPaintIsExactOrHostSeed", &retained));
 }

@@ -758,6 +758,7 @@ impl Predictor {
     /// re-derive them from the host's grid — so the set is retired. Cheap no-op when
     /// nothing is pending, which is the case for every scroll that happens while the
     /// user is not typing ahead.
+    #[cfg(test)]
     pub fn note_scroll(&mut self) {
         self.reset();
     }

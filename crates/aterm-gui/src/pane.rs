@@ -71,7 +71,7 @@ use crate::tab_model::{
 /// terminal command spelling; the generic tree stores the corresponding
 /// content axis explicitly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SplitDir {
+pub(crate) enum SplitDir {
     /// Children sit SIDE BY SIDE, split by a vertical divider (Cmd-D). The first
     /// child is the LEFT pane, the second the RIGHT; the columns are divided.
     Vertical,
@@ -83,13 +83,13 @@ pub enum SplitDir {
 /// Terminal compatibility name for the generic content split tree.  Its leaf
 /// payload is still a session id during Phase A; window integration resolves
 /// stable `ViewId`s through the process `ViewStore` before reaching this adapter.
-pub type PaneNode = SplitTree<u64>;
+pub(crate) type PaneNode = SplitTree<u64>;
 
 /// One visible pane's placement in the window grid, in CELL coordinates. The GUI
 /// locks that session's `Terminal`, snapshots it at `(rows, cols)`, and blits the
 /// cells into the composite window frame at `(row_off, col_off)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PaneRect {
+pub(crate) struct PaneRect {
     /// The session occupying this rect (`Leaf::session`).
     pub session: u64,
     /// Top-left cell row offset of this pane within the window grid.
@@ -106,7 +106,7 @@ pub struct PaneRect {
 /// that keyboard input + the control socket target, and whose cursor draws solid).
 /// Every tab owns one; a fresh tab is a single leaf focused on its own session.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PaneTree {
+pub(crate) struct PaneTree {
     root: PaneNode,
     /// The session id of the focused leaf. Always references a leaf that exists in
     /// `root` (maintained by `split`/`close`); used to route input + draw the solid
@@ -188,7 +188,7 @@ impl SplitDir {
 /// drive a drag-to-resize. The embedded logical hit names the exact split with a
 /// root-to-node path and carries the divided-axis span used for pointer ratios.
 #[derive(Clone, PartialEq, Debug)]
-pub struct DividerHit {
+pub(crate) struct DividerHit {
     /// Canonical logical-pixel divider identity.
     logical: LogicalDividerHit,
     /// Which way the hit split divides (vertical divider = columns, horizontal =
@@ -200,7 +200,7 @@ impl PaneTree {
     /// A new single-pane tab holding `session` (the day-one one-session-per-tab
     /// layout). Focus is that one session.
     #[must_use]
-    pub fn new(session: u64) -> Self {
+    pub(crate) fn new(session: u64) -> Self {
         PaneTree {
             root: PaneNode::Leaf(session),
             focus: session,
@@ -211,7 +211,7 @@ impl PaneTree {
     /// Toggle pane ZOOM: when on, [`compute_layout`](Self::compute_layout) returns
     /// only the focused pane filling the window. A no-op (stays off) for a
     /// single-pane tab. Returns the new zoom state.
-    pub fn toggle_zoom(&mut self) -> bool {
+    pub(crate) fn toggle_zoom(&mut self) -> bool {
         self.zoomed = !self.zoomed && self.len() > 1;
         self.zoomed
     }
@@ -219,13 +219,13 @@ impl PaneTree {
     /// The currently FOCUSED session id (the pane keyboard input + the control
     /// socket target). Always a live leaf.
     #[must_use]
-    pub fn focus(&self) -> u64 {
+    pub(crate) fn focus(&self) -> u64 {
         self.focus
     }
 
     /// Move focus to `session` if it is a leaf in this tab. No-op (returns `false`)
     /// for an unknown id, so a stale focus request can never desync `focus`.
-    pub fn set_focus(&mut self, session: u64) -> bool {
+    pub(crate) fn set_focus(&mut self, session: u64) -> bool {
         if self.contains(session) {
             self.focus = session;
             true
@@ -236,35 +236,15 @@ impl PaneTree {
 
     /// Whether `session` is a leaf anywhere in this tab.
     #[must_use]
-    pub fn contains(&self, session: u64) -> bool {
+    pub(crate) fn contains(&self, session: u64) -> bool {
         self.root.contains(session)
     }
 
     /// Every leaf session id in this tab, in left-to-right / top-to-bottom tree
     /// order. Used to resize/tear-down a whole tab's panes and to test round-trips.
     #[must_use]
-    pub fn sessions(&self) -> Vec<u64> {
+    pub(crate) fn sessions(&self) -> Vec<u64> {
         self.root.leaves()
-    }
-
-    /// Visit every leaf session id WITHOUT allocating — [`Self::sessions`] for hot
-    /// paths (the per-present output→present attribution walks every tab's leaves
-    /// each frame; a `Vec` per tab per present would be steady-state churn).
-    #[allow(
-        dead_code,
-        reason = "allocation-free compatibility traversal retained for downstream terminal adapters"
-    )]
-    pub fn for_each_session(&self, f: &mut impl FnMut(u64)) {
-        fn walk(node: &PaneNode, f: &mut impl FnMut(u64)) {
-            match node {
-                PaneNode::Leaf(session) => f(*session),
-                PaneNode::Split { first, second, .. } => {
-                    walk(first, f);
-                    walk(second, f);
-                }
-            }
-        }
-        walk(&self.root, f);
     }
 
     /// Project the terminal compatibility tree into another leaf identity while
@@ -288,7 +268,7 @@ impl PaneTree {
     /// order via [`rebuild`](Self::rebuild); a SEAMLESS-update boot uses it as the
     /// layout↔live-fd bridge, re-adopting the running shell into its exact original pane.
     #[must_use]
-    pub fn to_layout(
+    pub(crate) fn to_layout(
         &self,
         session_meta: &impl Fn(u64) -> (Option<String>, String),
     ) -> crate::restore::PaneLayout {
@@ -336,7 +316,7 @@ impl PaneTree {
     /// `fresh` is too short (the caller then falls back to a plain single-pane tab), so a
     /// short spawn list can never panic-index.
     #[must_use]
-    pub fn rebuild(layout: &crate::restore::PaneLayout, fresh: &[u64]) -> Option<Self> {
+    pub(crate) fn rebuild(layout: &crate::restore::PaneLayout, fresh: &[u64]) -> Option<Self> {
         if fresh.len() < layout.leaf_count() {
             return None;
         }
@@ -416,7 +396,7 @@ impl PaneTree {
             project = "aterm_gui::pane_tree_conformance::project"
         )
     )]
-    pub fn split_focused(&mut self, dir: SplitDir, new_session: u64) -> bool {
+    pub(crate) fn split_focused(&mut self, dir: SplitDir, new_session: u64) -> bool {
         let focus = self.focus;
         let axis = match dir {
             SplitDir::Vertical => SplitAxis::Horizontal,
@@ -433,7 +413,7 @@ impl PaneTree {
     }
 
     /// Close the FOCUSED pane (Cmd-W). See [`Self::close_pane`].
-    pub fn close_focused(&mut self) -> CloseOutcome {
+    pub(crate) fn close_focused(&mut self) -> CloseOutcome {
         self.close_pane(self.focus)
     }
 
@@ -464,7 +444,7 @@ impl PaneTree {
             project = "aterm_gui::pane_tree_conformance::project"
         )
     )]
-    pub fn close_pane(&mut self, session: u64) -> CloseOutcome {
+    pub(crate) fn close_pane(&mut self, session: u64) -> CloseOutcome {
         let closed = if self.contains(session) {
             session
         } else {
@@ -524,7 +504,7 @@ impl PaneTree {
     /// 24-row grid and the `.max(1)` below inflated it into a 1x1 phantom: a pane
     /// the compositor drew off the end of the world.
     #[must_use]
-    pub fn compute_layout(&self, rows: u16, cols: u16) -> Vec<PaneRect> {
+    pub(crate) fn compute_layout(&self, rows: u16, cols: u16) -> Vec<PaneRect> {
         self.layout_cells(rows, cols, self.zoomed)
     }
 
@@ -584,33 +564,10 @@ impl PaneTree {
     /// zoom. `None` only if the focused leaf somehow isn't in the tree, and the
     /// caller must treat that as "unmeasurable", never as "fits".
     #[must_use]
-    pub fn focused_rect(&self, rows: u16, cols: u16) -> Option<PaneRect> {
+    pub(crate) fn focused_rect(&self, rows: u16, cols: u16) -> Option<PaneRect> {
         self.layout_cells(rows, cols, false)
             .into_iter()
             .find(|r| r.session == self.focus)
-    }
-
-    /// Hit-test: the session id of the pane whose rect contains cell `(row, col)`,
-    /// or `None` when the point lands on a divider / outside the grid. Used by
-    /// click-to-focus.
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "terminal compatibility hit-test retained while canonical ViewId routing is authoritative"
-    )]
-    pub fn pane_at(&self, row: u16, col: u16, rows: u16, cols: u16) -> Option<u64> {
-        if self.zoomed && self.len() > 1 {
-            return Some(self.focus);
-        }
-        self.root.leaf_at(
-            LogicalPoint {
-                x: f32::from(col),
-                y: f32::from(row),
-            },
-            LogicalRect::new(0.0, 0.0, f32::from(cols.max(1)), f32::from(rows.max(1))),
-            1.0,
-            1.0,
-        )
     }
 
     /// The session of the pane directly adjacent to the focused one in `dir`, or
@@ -620,7 +577,7 @@ impl PaneTree {
     /// only considers panes that overlap its rows); ties break toward the larger
     /// overlap, then the smaller offset (top-/left-most), for a stable choice.
     #[must_use]
-    pub fn focus_neighbor(&self, dir: FocusDir, rows: u16, cols: u16) -> Option<u64> {
+    pub(crate) fn focus_neighbor(&self, dir: FocusDir, rows: u16, cols: u16) -> Option<u64> {
         if self.zoomed {
             return None;
         }
@@ -646,7 +603,13 @@ impl PaneTree {
     /// divider drag. Zoomed or single-pane tabs have no draggable divider (the
     /// focused pane fills the window), so this is always `None` for them.
     #[must_use]
-    pub fn divider_at(&self, row: u16, col: u16, rows: u16, cols: u16) -> Option<DividerHit> {
+    pub(crate) fn divider_at(
+        &self,
+        row: u16,
+        col: u16,
+        rows: u16,
+        cols: u16,
+    ) -> Option<DividerHit> {
         if self.len() == 1 || (self.zoomed && self.len() > 1) {
             return None;
         }
@@ -674,7 +637,7 @@ impl PaneTree {
     /// degenerate split too small to hold a divider. The caller passes the result to
     /// [`Self::set_divider_ratio`], which applies the `[MIN_RATIO, MAX_RATIO]` clamp.
     #[must_use]
-    pub fn ratio_for_pointer(&self, hit: &DividerHit, row: u16, col: u16) -> Option<f32> {
+    pub(crate) fn ratio_for_pointer(&self, hit: &DividerHit, row: u16, col: u16) -> Option<f32> {
         SplitTree::<u64>::ratio_for_pointer(
             &hit.logical,
             LogicalPoint {
@@ -692,14 +655,14 @@ impl PaneTree {
     /// no longer names a split (e.g. the tree changed under a stale hit), leaving the
     /// tree untouched. A pure DATA edit — no structural change, so focus/zoom are
     /// preserved; the caller relays out + repaints.
-    pub fn set_divider_ratio(&mut self, hit: &DividerHit, ratio: f32) -> bool {
+    pub(crate) fn set_divider_ratio(&mut self, hit: &DividerHit, ratio: f32) -> bool {
         self.root.set_divider_ratio(&hit.logical, ratio)
     }
 }
 
 /// A direction for keyboard pane-focus navigation ([`PaneTree::focus_neighbor`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FocusDir {
+pub(crate) enum FocusDir {
     /// Move focus to the pane on the left.
     Left,
     /// Move focus to the pane on the right.
@@ -714,7 +677,7 @@ pub enum FocusDir {
 /// whether the tab survives (a sibling remained) or must close (it was the last
 /// pane).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CloseOutcome {
+pub(crate) enum CloseOutcome {
     /// A sibling remained: the parent split collapsed into it. `closed` is the
     /// removed session.
     Collapsed { closed: u64 },
@@ -726,7 +689,7 @@ pub enum CloseOutcome {
 impl CloseOutcome {
     /// The session id that was removed (to tear down + deregister), in both cases.
     #[must_use]
-    pub fn closed(self) -> u64 {
+    pub(crate) fn closed(self) -> u64 {
         match self {
             CloseOutcome::Collapsed { closed } | CloseOutcome::LastPane { closed } => closed,
         }
@@ -1189,21 +1152,11 @@ mod tests {
         assert_eq!(outcome.closed(), 9);
     }
 
-    /// Focus → session mapping: click-to-focus picks the pane under the cell, and
-    /// a divider cell maps to no pane (focus unchanged).
+    /// `set_focus` moves focus to a live leaf and rejects an unknown id.
     #[test]
-    fn pane_at_hit_test() {
+    fn set_focus_follows_live_leaves() {
         let mut t = PaneTree::new(1);
-        t.split_focused(SplitDir::Vertical, 2); // 40 | divider(40) | 39
-        // A cell in the left band → session 1.
-        assert_eq!(t.pane_at(5, 10, 24, 80), Some(1));
-        // A cell in the right band → session 2.
-        assert_eq!(t.pane_at(5, 60, 24, 80), Some(2));
-        // The divider column → no pane.
-        assert_eq!(t.pane_at(5, 40, 24, 80), None);
-        // Out of grid → no pane.
-        assert_eq!(t.pane_at(99, 99, 24, 80), None);
-        // set_focus follows the hit-test result.
+        t.split_focused(SplitDir::Vertical, 2);
         assert!(t.set_focus(1));
         assert_eq!(t.focus(), 1);
         assert!(!t.set_focus(999), "unknown id is rejected, focus unchanged");

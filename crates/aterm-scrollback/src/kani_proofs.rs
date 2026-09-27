@@ -1047,7 +1047,8 @@ fn line_serialize_roundtrip_plain() {
     };
 
     let line = Line::from(std::str::from_utf8(content).unwrap());
-    let serialized = line.serialize();
+    let mut serialized = Vec::new();
+    line.serialize_into(&mut serialized);
     let recovered = Line::deserialize(&serialized);
 
     kani::assert(

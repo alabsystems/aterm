@@ -21,7 +21,8 @@
 //!   `openApplicationAtURL` as the handoff does, and through `open -n` — wrote untagged files.
 //!   So did a tracked instance of such an app relaunching itself after a clean copy had been
 //!   swapped in at its own path. Tagged copies of the same apps wrote tagged files.
-//!   `crates/aterm-update/tests/provenance_relaunch_probe.rs` repeats this with `open -n`.
+//!   The `open -n` half was a never-run `#[ignore]`d probe, `aterm-update`'s
+//!   `tests/provenance_relaunch_probe.rs`, added in `3178275d0`; check that out to repeat it.
 //! * aterm does not follow that rule. Pid 2061 (0.91.0) was started by that same lane — a
 //!   LaunchServices launch with a launchd job of its own, from `/Applications/aterm.app`
 //!   whose root and executable carried no tag — and every file it wrote was tagged, with the
@@ -34,8 +35,8 @@
 
 /// What the prober measured. Each field is the RAW answer, so "clean" and "could not look"
 /// stay distinct in the log line.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct ProvenanceFacts {
     /// `atpkg::provenance::measure_tracked` — `Some(true)` tracked, `Some(false)` not,
     /// `None` the probe could not be written or read back — never a guess logged as a
@@ -49,8 +50,8 @@ pub(crate) struct ProvenanceFacts {
 }
 
 /// The one log line for `facts`. Pure, so every shape is pinned by a test.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn log_line(facts: ProvenanceFacts) -> &'static str {
     match (facts.tracked, facts.bundle_clean) {
         (None, _) => "provenance: could not tell whether this aterm is tracked by macOS",

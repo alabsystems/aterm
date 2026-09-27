@@ -521,6 +521,28 @@ impl PetBrain {
         self.observe_console_with_exclusions(input, facts, pane, &[]);
     }
 
+    /// Cells the LAST world observation classified — the pet's per-frame walk
+    /// size, in cells.
+    ///
+    /// Published because the walk is the resident pet's whole per-frame cost
+    /// (min(rows,64) x min(cols,256), unconditional on every presented frame)
+    /// and until now the count existed only inside `PetWorld`, read by two
+    /// in-crate tests. That left the cost measurable by a bench and by an A/B
+    /// of two live instances, but NOT from inside a running product — which is
+    /// precisely how the 2026-09-24 audit ended with the pet's ~0.39 ms split
+    /// unresolved by 4x between `observe` and everything else.
+    ///
+    /// Zero when the pet has never made a coherent observation, and zero after
+    /// a refused one: [`PetWorld::retire`] clears the count, so this reports
+    /// the cells of an observation that actually stood, never a stale total.
+    #[must_use]
+    pub fn observed_cells(&self) -> usize {
+        self.console
+            .world
+            .as_ref()
+            .map_or(0, |world| world.examined_cells())
+    }
+
     pub fn observe_console_with_exclusions(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -661,6 +683,7 @@ impl PetBrain {
     /// Explicitly attributed edit geometry from an application adapter.
     /// The adapter must supply the current input sequence and surface stamp;
     /// stale reports and unobserved ranges are refused, never queued.
+    #[cfg(test)]
     pub fn note_console_edit(
         &mut self,
         input_seq: u64,

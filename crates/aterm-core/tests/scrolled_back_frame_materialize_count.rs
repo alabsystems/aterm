@@ -16,7 +16,7 @@
 //!
 //! A COUNT has none of those problems. It is machine-independent, it is exact,
 //! it cannot flake under load, and it rides `cargo test` — and therefore
-//! `tools/verify.sh --fast`, the merge contract — at zero marginal cost. This
+//! `tools/verify.sh`, the merge contract — at zero marginal cost. This
 //! crate already had the shape (`aterm_grid::test_counters`); it had simply
 //! never been pointed at the campaign's own numbers.
 //!
@@ -24,7 +24,7 @@
 //! 2026-08-31. The second half was false: `.githooks/pre-push` was demoted to
 //! ADVISORY on 2026-08-24 — one printf and `exit 0` — on the very rule quoted
 //! above ("a hook slow enough to be bypassed teaches the bypass"), so
-//! `verify.sh --fast` is the only automatic home this file has.
+//! `verify.sh` is the only automatic home this file has.
 //!
 //! WHAT A COUNT CANNOT CATCH, said plainly so nobody reads more into a green run
 //! than it means: a CONSTANT-FACTOR slowdown with the counts unchanged. If
@@ -75,8 +75,8 @@
 //! yet, which no test today can distinguish from its absence. Recorded here so
 //! the next reader does not mistake it for an untested field and delete it.
 
-use aterm_core::prelude::Terminal;
 use aterm_core::render::RenderInput;
+use aterm_core::terminal::Terminal;
 use aterm_grid::test_counters::take_viewport_row_materialize;
 use aterm_scrollback::Scrollback;
 

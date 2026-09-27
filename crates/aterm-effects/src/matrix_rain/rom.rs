@@ -262,12 +262,6 @@ impl RomMaster {
     pub fn row(&self, glyph: usize, y: usize) -> u32 {
         self.rows[glyph * MASTER_H + y]
     }
-
-    /// Whether master pixel `(x, y)` of `glyph` is inked.
-    #[must_use]
-    pub fn is_set(&self, glyph: usize, x: usize, y: usize) -> bool {
-        x < MASTER_W && (self.row(glyph, y) >> x) & 1 == 1
-    }
 }
 
 /// Rasterize the whole ROM (the master is ~12 KB); pure integer math, so the

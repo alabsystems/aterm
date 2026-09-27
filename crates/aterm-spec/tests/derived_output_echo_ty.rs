@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-0 for sink-ordered output-echo publication. The exhaustive gate proves
-//! the healthy model and catches `Buggy=1`; the two concrete traces below keep
-//! the stale-completion and torn-sample mutants independently non-vacuous.
+//! the healthy model and catches `Buggy=1`; the three concrete traces below keep
+//! the stale-completion, torn-sample and publish-before-accept mutants
+//! independently non-vacuous.
 
 use aterm_spec::derive::{Model, output_echo_receipt_publication_model};
 use aterm_spec::{interp, verify};
@@ -116,4 +117,32 @@ fn sample_cannot_mix_the_boundary_order_with_older_echo_timestamps() {
         "the independent-atomic sampler mutant must be a concrete counterexample",
     );
     assert!(buggy.check_invariant("StateBounded", &torn));
+}
+
+#[test]
+fn an_echo_the_sink_has_not_accepted_is_never_published() {
+    let model = output_echo_receipt_publication_model();
+    assert!(
+        !model.action_enabled("PublishOlderEcho", &model.init_state()),
+        "the committed tracker publishes only an accepted order"
+    );
+
+    let buggy = interp::with_buggy(&model, 1);
+    let early = drive(&buggy, &["PublishOlderEcho"]);
+    assert_eq!((early["accepted"], early["published_order"]), (0, 1));
+    assert!(
+        !buggy.check_invariant("PublishFollowsAcceptance", &early),
+        "the attempt-minted order must publish ahead of acceptance",
+    );
+    for other in [
+        "LatestCompletedOrderWins",
+        "BoundaryRetiresOlderEcho",
+        "SampleIsOnePublishedVersion",
+        "StateBounded",
+    ] {
+        assert!(
+            buggy.check_invariant(other, &early),
+            "only the acceptance law may see the early publication, not `{other}`",
+        );
+    }
 }

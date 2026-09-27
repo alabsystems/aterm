@@ -22,7 +22,7 @@
 //! one-window app: `fleet_watch` is a whole sibling-discovery subsystem, the
 //! control socket already enumerates every live instance deterministically, and
 //! several instances co-existing is a supported, used configuration (an agent
-//! launches its own instance on its own `$ATERM_CONTROL_SOCK`). A named mutex
+//! launches its own instance on its own `--control-sock`). A named mutex
 //! would make "there can be only one" a process-lifetime FACT enforced below
 //! all of that, instead of a preference the operator states. So the second
 //! instance is never prevented from existing — it is simply not *started* when
@@ -87,25 +87,6 @@ impl WindowingBehavior {
                 Some(WindowingBehavior::Attach)
             }
             _ => None,
-        }
-    }
-
-    /// The behaviour for a possibly-absent, possibly-invalid config value: the
-    /// safe default for both. Pure companion to [`WindowingBehavior::parse`] so
-    /// the precedence "absent = default, invalid = default" is testable on its
-    /// own (the caller adds the warning line for the invalid case).
-    #[must_use]
-    pub fn resolve(raw: Option<&str>) -> WindowingBehavior {
-        raw.and_then(WindowingBehavior::parse)
-            .unwrap_or(WindowingBehavior::NewWindow)
-    }
-
-    /// The value spelling this behaviour writes/reads in `aterm.toml`.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            WindowingBehavior::NewWindow => "new_window",
-            WindowingBehavior::Attach => "attach",
         }
     }
 }
@@ -379,10 +360,6 @@ pub struct LaunchEnv {
     /// `$ATERM_UPDATED_FROM` is set — this process is an update SUCCESSOR,
     /// re-spawned by the outgoing one with its argv verbatim to finish an apply.
     pub updated_from: bool,
-    /// `$ATERM_HEADLESS` is PRESENT (presence, not truthiness — the same test
-    /// the router's own mode fork applies, so the two agree about which launches
-    /// are headless-shaped).
-    pub headless: bool,
 }
 
 /// The `-d <dir>` spellings a PLAIN launch may carry and still be policy-eligible.
@@ -406,13 +383,11 @@ const PLAIN_LAUNCH_DIR_FLAGS: &[&str] = &["-d", "--working-directory"];
 /// * `-e` / `--command` / `--` open a payload boundary — a whole child command
 ///   line. `spawn` cannot carry one, so forwarding would silently drop the
 ///   command the operator asked to run.
-/// * `--headless` / `$ATERM_HEADLESS` ask for an engine + control socket with no
-///   window. Forwarding would answer with a TAB in someone's window — the exact
-///   opposite — and CI would hang waiting for a process that already exited. The
-///   ENV form is [`LaunchEnv::headless`]: the router's mode fork makes a merely
-///   PRESENT `$ATERM_HEADLESS` windowish, so without this the variable alone
-///   (no flag) walked straight through the gate and the documented exclusion was
-///   a comment, not a rule.
+/// * `--headless` asks for an engine + control socket with no window.
+///   Forwarding would answer with a TAB in someone's window — the exact opposite
+///   — and CI would hang waiting for a process that already exited. It is an
+///   unrecognized token below, so it fails closed; the flag is the one spelling
+///   (no environment variable arms headless, 2026-09-24).
 /// * `--diagnose` is the release gates' probe; it must measure THIS process.
 /// * `$ATERM_UPDATED_FROM` marks an update SUCCESSOR: the outgoing process
 ///   re-spawns itself with its own argv verbatim to complete an apply. Under
@@ -434,7 +409,7 @@ const PLAIN_LAUNCH_DIR_FLAGS: &[&str] = &["-d", "--working-directory"];
 /// forwards under any policy, so it never reaches this gate at all.
 #[must_use]
 pub fn plain_launch_is_policy_eligible(scan: &[std::ffi::OsString], env: LaunchEnv) -> bool {
-    if env.updated_from || env.headless {
+    if env.updated_from {
         return false;
     }
     let mut it = scan.iter();
@@ -491,16 +466,8 @@ mod tests {
     #[test]
     fn the_default_policy_is_todays_behaviour() {
         assert_eq!(WindowingBehavior::default(), WindowingBehavior::NewWindow);
-        assert_eq!(
-            WindowingBehavior::resolve(None),
-            WindowingBehavior::NewWindow
-        );
         // An unrecognized value must NOT silently become `attach`: a typo in
         // aterm.toml may not change where terminals open.
-        assert_eq!(
-            WindowingBehavior::resolve(Some("join-please")),
-            WindowingBehavior::NewWindow
-        );
         assert_eq!(WindowingBehavior::parse("join-please"), None);
     }
 
@@ -526,8 +493,6 @@ mod tests {
                 "{spelling}"
             );
         }
-        assert_eq!(WindowingBehavior::NewWindow.name(), "new_window");
-        assert_eq!(WindowingBehavior::Attach.name(), "attach");
     }
 
     /// THE ROUTING TABLE, every cell of it. Twelve combinations, no ambiguity.
@@ -749,10 +714,7 @@ mod tests {
         }
         // An update successor re-runs its own argv; it is a relaunch, never a
         // request for another terminal.
-        let updated = LaunchEnv {
-            updated_from: true,
-            ..LaunchEnv::default()
-        };
+        let updated = LaunchEnv { updated_from: true };
         assert!(!plain_launch_is_policy_eligible(&[], updated));
         assert!(!plain_launch_is_policy_eligible(
             &args(&["--window"]),
@@ -760,25 +722,21 @@ mod tests {
         ));
     }
 
-    /// `$ATERM_HEADLESS` alone — no `--headless` flag anywhere in argv — is the
-    /// shape the router's mode fork makes windowish by PRESENCE. The gate's own
-    /// documentation has always excluded it; this pins that it actually does,
-    /// because a forwarded headless launch answers with a tab in someone's window
-    /// and leaves CI waiting for a control socket that will never exist.
+    /// `--headless` anywhere before the payload makes a launch ineligible: a
+    /// forwarded headless launch answers with a tab in someone's window and
+    /// leaves CI waiting for a control socket that will never exist.
     #[test]
-    fn a_headless_environment_is_never_policy_eligible() {
-        let headless = LaunchEnv {
-            headless: true,
-            ..LaunchEnv::default()
-        };
+    fn a_headless_launch_is_never_policy_eligible() {
         for argv in [&[][..], &["--window"][..], &["--window", "-d", "/tmp"][..]] {
             assert!(
                 plain_launch_is_policy_eligible(&args(argv), LaunchEnv::default()),
-                "{argv:?} is the eligible shape without the variable"
+                "{argv:?} is the eligible shape without the flag"
             );
+            let mut headless = argv.to_vec();
+            headless.push("--headless");
             assert!(
-                !plain_launch_is_policy_eligible(&args(argv), headless),
-                "{argv:?} must never be forwarded under $ATERM_HEADLESS"
+                !plain_launch_is_policy_eligible(&args(&headless), LaunchEnv::default()),
+                "{headless:?} must never be forwarded"
             );
         }
     }

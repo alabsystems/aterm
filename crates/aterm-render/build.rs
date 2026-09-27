@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! COMPILE-TIME licence gate for the bundled DISPLAY FACES (`assets/game/`).
+//! COMPILE-TIME licence gate for the bundled DISPLAY FACES (`assets/game/`) and
+//! the non-macOS terminal font STACK (`assets/bundled/`).
 //!
 //! Every file in that directory is a candidate for `include_bytes!`, and
 //! `include_bytes!` puts the bytes in the shipped binary whether or not any
@@ -22,8 +23,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// The directory holding the bundled display faces, relative to the manifest.
-const ASSET_DIR: &str = "assets/game";
+/// The directories holding gated bundled faces, relative to the manifest: the
+/// display faces (`assets/game/`) and the non-macOS terminal font STACK
+/// (`assets/bundled/` — JetBrains Mono and the Noto symbol/math faces), which is
+/// held to exactly the same exact-sibling grant rule.
+const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled"];
 
 /// The suffix that marks a file as a licence notice rather than an asset.
 const LICENSE_SUFFIX: &str = ".LICENSE.txt";
@@ -47,18 +51,21 @@ const GRANT_MARKERS: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={ASSET_DIR}");
-    let root =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets the manifest dir"))
-            .join(ASSET_DIR);
+    let manifest =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets the manifest dir"));
     let mut failures = Vec::new();
-    gate_dir(&root, &root, &mut failures);
+    for dir in ASSET_DIRS {
+        println!("cargo:rerun-if-changed={dir}");
+        let root = manifest.join(dir);
+        gate_dir(&root, &manifest, &mut failures);
+    }
     if !failures.is_empty() {
         panic!(
-            "\n\nDISPLAY-FACE LICENCE GATE failed for {ASSET_DIR}/:\n\n{}\n\n\
+            "\n\nBUNDLED-FACE LICENCE GATE failed for {}:\n\n{}\n\n\
              Embedding a face in the aterm binary is redistribution. Ship a face only \
              with a sibling <stem>{LICENSE_SUFFIX} whose text names an OFL / Apache / MIT \
              grant, or remove the asset.\n",
+            ASSET_DIRS.join("/, "),
             failures.join("\n")
         );
     }

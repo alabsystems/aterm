@@ -124,7 +124,7 @@ pub(crate) const HOMECOMING_SLOTS: usize = 8;
 /// performed ceremony ([`KittyTenure::commit_hello`]) or a non-program
 /// verdict ([`KittyTenure::note_non_program_verdict`]) rewrites it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Arrival {
+pub(crate) enum Arrival {
     /// The full arrival ceremony — owed only to a stranger: a cat this
     /// window has never worn, or has not worn within [`HOMECOMING`].
     Ceremony,
@@ -159,7 +159,7 @@ struct Homecoming {
 /// look is a pure function of `id`, carried here so the render rung never
 /// re-hashes per frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AppIdentity {
+pub(crate) struct AppIdentity {
     /// Canonical app id (`"claude"`, `"vim"`, a basename).
     pub id: String,
     /// The first-token basename the id was derived from.
@@ -174,7 +174,7 @@ pub struct AppIdentity {
 /// covers a late OSC 633;E that lands after 133;C already flipped the block
 /// to `Executing`.
 #[derive(Default)]
-pub struct AppKittySlot {
+pub(crate) struct AppKittySlot {
     key: Option<(u64, BlockState, bool)>,
     identity: Option<AppIdentity>,
 }
@@ -183,7 +183,7 @@ impl AppKittySlot {
     /// Resolve the pane's RAW program claim from its current shell block,
     /// re-deriving only when the `(block, state, commandline)` key moves.
     /// This is the ungated claim; [`KittyTenure`] decides whether it is worn.
-    pub fn resolve(&mut self, block: Option<&OutputBlock>) -> Option<&AppIdentity> {
+    pub(crate) fn resolve(&mut self, block: Option<&OutputBlock>) -> Option<&AppIdentity> {
         let key = block.map(|b| (b.id, b.state, b.commandline.is_some()));
         if key != self.key {
             self.key = key;
@@ -236,7 +236,7 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
 /// minimum time between two switches is `TENURE`, quick flickers never
 /// land, and the cat lingers after a program exits.
 #[derive(Default)]
-pub struct KittyTenure {
+pub(crate) struct KittyTenure {
     worn: Option<AppIdentity>,
     candidate: Option<(Option<AppIdentity>, Instant)>,
     /// THE HOMECOMING roster: the cats this window has worn, LRU by `at`.
@@ -260,7 +260,11 @@ impl KittyTenure {
     /// Feed this frame's raw claim; returns the claim ON GLASS after the
     /// gate. Idempotent for a stable input at a stable time, monotone in
     /// `now`, so re-observing (a capture splice, a typed summon) is harmless.
-    pub fn observe(&mut self, raw: Option<&AppIdentity>, now: Instant) -> Option<&AppIdentity> {
+    pub(crate) fn observe(
+        &mut self,
+        raw: Option<&AppIdentity>,
+        now: Instant,
+    ) -> Option<&AppIdentity> {
         if raw == self.worn.as_ref() {
             self.candidate = None;
             return self.worn.as_ref();
@@ -280,7 +284,7 @@ impl KittyTenure {
 
     /// The claim currently on glass (`None` = the base cat), without
     /// advancing the gate.
-    pub fn worn(&self) -> Option<&AppIdentity> {
+    pub(crate) fn worn(&self) -> Option<&AppIdentity> {
         self.worn.as_ref()
     }
 
@@ -306,7 +310,7 @@ impl KittyTenure {
     /// raw claim moved on meanwhile, the next [`Self::observe`] simply starts
     /// the fresh candidate's clock — the same correction it applies to any
     /// stale claim.
-    pub fn poll(&mut self, now: Instant) -> bool {
+    pub(crate) fn poll(&mut self, now: Instant) -> bool {
         match self.candidate.take() {
             Some((cand, since)) if now.duration_since(since) >= dwell_for(cand.as_ref()) => {
                 let moved = cand != self.worn;
@@ -402,7 +406,7 @@ impl KittyTenure {
     /// HOW LOUDLY the current costume arrived — the rate law's ruling for
     /// the most recent landing, read (never advanced) by the render seam at
     /// the `sync_look` sites, where the pet's actual pair is in hand.
-    pub fn arrival(&self) -> Arrival {
+    pub(crate) fn arrival(&self) -> Arrival {
         self.arrival
     }
 
@@ -414,7 +418,7 @@ impl KittyTenure {
     /// `last_hello` (the ONLY writer of that clock), and consumes the
     /// latch back to [`Arrival::Quiet`] so a pair the flying-kitty latch
     /// re-delivers later cannot replay a ceremony already performed.
-    pub fn commit_hello(&mut self, now: Instant) {
+    pub(crate) fn commit_hello(&mut self, now: Instant) {
         if let Some(id) = self.worn.as_ref()
             && let Some(h) = self.roster.iter_mut().flatten().find(|h| h.id == id.id)
         {
@@ -431,7 +435,7 @@ impl KittyTenure {
     /// seam would perform a ceremony authorised by a landing minutes old.
     /// Only the announcement is reset; the roster, its debts and the
     /// `last_hello` clock are untouched (a debt is owed, not spent).
-    pub fn note_non_program_verdict(&mut self) {
+    pub(crate) fn note_non_program_verdict(&mut self) {
         self.arrival = Arrival::Quiet;
     }
 }

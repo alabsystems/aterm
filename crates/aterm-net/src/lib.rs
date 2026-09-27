@@ -21,22 +21,18 @@
 //! Every piece below is built and tested (unit + end-to-end over real
 //! loopback-TLS). The LISTENER side is wired into `aterm-gui`'s control server via
 //! `net_listen` — **secure-default-OFF**: it binds only when an operator sets
-//! `ATERM_NET_LISTEN`/`_CERT`/`_KEY` (those selectors are deny-listed, so a nested
-//! aterm never inherits them). The DRIVER side ([`dial_and_relay`](drive::dial_and_relay))
+//! aterm.toml's `[net] listen`/`cert`/`key`, and only in a top-level aterm (a
+//! nested one never binds a second surface). The DRIVER side ([`dial_and_relay_pinned`](drive::dial_and_relay_pinned))
 //! ships as the `dial <name>` control verb (`aterm_gui::control::try_net_dial` ->
-//! `net_connections::dial_relay` -> `dial_and_relay`), and `aterm_agent::RelayClient`
+//! `net_connections::dial_relay` -> `dial_and_relay_pinned`), and `aterm_agent::RelayClient`
 //! drives a `Turn` over that relay end-to-end (see aterm-agent's
 //! `remote_turn_loopback_tls` test); the astream record codec for an OFFLINE observer
 //! remains the one genuinely external follow-up. The pieces:
 //!
-//! 1. [`Transport`] — generalizes `proxy.rs`'s `UnixStream::connect` dial to any
-//!    connected channel, yielding **owned** read/write halves (TLS has no
-//!    `UnixStream::try_clone`, so the relay owns its halves — the teardown pitfall
-//!    the review flagged). [`LoopbackTransport`] is the 0-hop case; [`tls`] is the
-//!    real TLS 1.3 transport and [`drive`] composes both ends of the network drive.
-//! 2. [`pump`] — the transport-agnostic byte relay (the `connect_and_relay` core)
-//!    that carries any verb's framing verbatim, incl. binary.
-//! 3. [`channel_bind`] / [`verify_presented`] — the capability binding that
+//! 1. [`tls`] — the TLS 1.3 transport ([`tls::relay`] owns both halves: TLS has no
+//!    `UnixStream::try_clone`), and [`drive`] composes both ends of the network
+//!    drive over it.
+//! 2. [`channel_bind`] / [`verify_presented`] — the capability binding that
 //!    replaces the local same-uid `SO_PEERCRED` check, which has **no network
 //!    analog**. The presented secret is `HMAC-SHA256(edge_token, channel_exporter)`
 //!    (the token is the MAC key), verified in constant time, so a token captured
@@ -45,11 +41,9 @@
 //!    Over the TLS 1.3 exporter ([`TlsTransport`](tls::TlsTransport), RFC 5705) it
 //!    resists even an active MITM. Proven by `channel_bind_model` +
 //!    `net_capability_grant_model` (`aterm-spec`).
-//! 4. [`RemoteEndpoint`] — the pinned `(host, sid, nonce, fingerprint)` a dialer
+//! 3. [`RemoteEndpoint`] — the pinned `(host, sid, nonce, fingerprint)` a dialer
 //!    checks before presenting the token (the cert fingerprint is TLS-enforced; the
 //!    nonce rebind guard is the dialer's responsibility — see [`RemoteEndpoint`]).
-//! 5. [`RemoteOp::DialRemote`] — the object-capability gating WHICH remote endpoint
-//!    a node may dial (the local `Scope::Owner` is all-or-nothing).
 
 use std::io::{self, Read, Write};
 
@@ -57,87 +51,16 @@ use std::io::{self, Read, Write};
 // token is the key.
 use aterm_digest::HmacSha256;
 use aterm_session::{EdgeToken, hex_nibble};
-use aterm_uds::CtlStream;
 
 /// TLS 1.3 transport (rustls) with the RFC 5705 keying-material exporter that
 /// binds the capability to the channel.
 pub mod tls;
 
-/// The network drive — both ends ([`serve`](drive::serve)/[`dial_and_relay`]
-/// (drive::dial_and_relay)) composed from the transport, the channel-bound
+/// The network drive — both ends ([`serve`](drive::serve)/[`dial_and_relay_pinned`]
+/// (drive::dial_and_relay_pinned)) composed from the transport, the channel-bound
 /// capability, and the relay. Secure-default-OFF: nothing binds without an
 /// explicit operator-stood-up listener.
 pub mod drive;
-
-/// A connected network channel for the control protocol. Generalizes the local
-/// `UnixStream::connect` dial: the relay takes OWNED halves (no `try_clone`
-/// dependency), so a TLS/QUIC transport drops in unchanged.
-pub trait Transport {
-    /// Consume the transport into its owned read and write halves.
-    fn split(self: Box<Self>) -> (Box<dyn Read + Send>, Box<dyn Write + Send>);
-    /// The per-connection exporter that binds a capability to THIS channel (the
-    /// TLS keying material in production; a per-connection nonce here). Distinct
-    /// per connection, so a token bound to one channel is useless on another.
-    fn exporter(&self) -> Vec<u8>;
-}
-
-/// The 0-hop transport: a connected `CtlStream` pair (on Unix, a plain std
-/// `UnixStream` socketpair). The same `pump` and binding run over it as over a
-/// real network transport — local is the trivial case of remote, by
-/// construction.
-pub struct LoopbackTransport {
-    stream: CtlStream,
-    exporter: Vec<u8>,
-}
-
-impl LoopbackTransport {
-    /// A connected loopback pair `(a, b)`, each carrying the SAME channel
-    /// exporter `exporter` (the two ends of one channel share keying material).
-    #[must_use]
-    pub fn pair(exporter: Vec<u8>) -> (Self, Self) {
-        let (a, b) = CtlStream::pair().expect("socketpair");
-        (
-            Self {
-                stream: a,
-                exporter: exporter.clone(),
-            },
-            Self {
-                stream: b,
-                exporter,
-            },
-        )
-    }
-}
-
-impl Transport for LoopbackTransport {
-    fn split(self: Box<Self>) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
-        let w = self.stream.try_clone().expect("clone loopback");
-        (Box::new(self.stream), Box::new(w))
-    }
-    fn exporter(&self) -> Vec<u8> {
-        self.exporter.clone()
-    }
-}
-
-/// Relay bytes from `reader` to `writer` until EOF — the transport-agnostic core
-/// of `connect_and_relay`, carrying any verb's framing (status lines, `OK <n>`
-/// bodies, `subscribe` push frames, the `bytes` stream, binary) verbatim.
-///
-/// # Errors
-/// Propagates the first I/O error from either half.
-pub fn pump<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
-    let mut buf = [0u8; 32 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            return Ok(total);
-        }
-        writer.write_all(&buf[..n])?;
-        writer.flush()?;
-        total += n as u64;
-    }
-}
 
 /// The channel-bound presented secret: `HMAC-SHA256(edge_token, channel_exporter)`.
 /// The edge token is the HMAC KEY (the unforgeable secret) and the channel
@@ -386,46 +309,10 @@ impl RemoteEndpoint {
     }
 }
 
-/// The network object-capability: WHICH remote endpoint a node may dial. The
-/// local fabric's `Scope::Owner` is all-or-nothing; crossing a host needs a
-/// capability scoped to one endpoint, presented (channel-bound) on the dial.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RemoteOp {
-    /// Authority to dial exactly this endpoint (and no other).
-    DialRemote(RemoteEndpoint),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pump_carries_an_arbitrary_exchange_over_the_transport_verbatim() {
-        // The relay carries a control-protocol response — including a multi-line
-        // `OK <n>` body and a raw non-UTF-8 byte — across the transport unchanged.
-        let (client, server) = LoopbackTransport::pair(b"chan-1".to_vec());
-        let payload = b"OK 1\n{\"k\":1}\n\xff\n".to_vec();
-        let p2 = payload.clone();
-        let srv = std::thread::spawn(move || {
-            let (mut r, mut w) = Box::new(server).split();
-            let mut first = [0u8; 6];
-            std::io::Read::read_exact(&mut r, &mut first).unwrap();
-            assert_eq!(&first, b"screen"); // the relayed verb arrived
-            w.write_all(&p2).unwrap();
-            w.flush().unwrap();
-        });
-        let (mut cr, mut cw) = Box::new(client).split();
-        cw.write_all(b"screen").unwrap();
-        cw.flush().unwrap();
-        let mut got = vec![0u8; payload.len()];
-        std::io::Read::read_exact(&mut cr, &mut got).unwrap();
-        assert_eq!(
-            got, payload,
-            "the byte pump is format-agnostic and lossless"
-        );
-        srv.join().unwrap();
-    }
-
+    use aterm_uds::CtlStream;
     #[test]
     fn channel_binding_rejects_a_cross_channel_replay() {
         // A token captured on channel A must NOT authorize on channel B — the
@@ -538,20 +425,5 @@ mod tests {
             !ep.matches("fp-2", "nonce-1"),
             "swapped host (fresh fingerprint) refused"
         );
-    }
-
-    #[test]
-    fn dial_remote_is_scoped_to_one_endpoint() {
-        let ep1 = RemoteEndpoint {
-            host: "h1".into(),
-            sid: "s1".into(),
-            nonce: "n1".into(),
-            fingerprint: "f1".into(),
-        };
-        let cap = RemoteOp::DialRemote(ep1.clone());
-        // The capability authorizes exactly ep1, not a different endpoint.
-        match cap {
-            RemoteOp::DialRemote(e) => assert_eq!(e, ep1),
-        }
     }
 }

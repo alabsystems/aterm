@@ -100,7 +100,7 @@ pub fn refusal(
          missing   the `trust: <version>` line a Trust rustc prints in `rustc -vV`\n\
          \n  \
          rust-toolchain.toml pins `channel = \"trust\"`: a rustup toolchain atpkg maintains as a\n  \
-         symlink, ~/.rustup/toolchains/trust -> <prefix>/store/trust/current. This build reached\n  \
+         symlink, ~/.rustup/toolchains/trust -> <prefix>/rustup/trust. This build reached\n  \
          an upstream compiler instead — a `RUSTUP_TOOLCHAIN` / `cargo +stable` override, a cargo\n  \
          that is not rustup's (Homebrew's ignores the pin), or a missing/dangling `trust` link.\n\
          \n  \

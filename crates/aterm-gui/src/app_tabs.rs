@@ -50,6 +50,7 @@ pub(crate) enum ClosePreflightVisibility {
 
 /// Type the operator bootstrap command through the session's canonical input
 /// receipt while preserving its exact one-frame `line + CR` wire contract.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn inject_operator_launch_line(
     term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
     ctx: &crate::SessionCtx,
@@ -981,13 +982,10 @@ impl App {
     }
 
     /// Attach another view of an existing native app as a sibling of the
-    /// focused canonical leaf. This is the content-agnostic split capability
-    /// used by restore, duplicate-view commands and tests; it never fabricates a
-    /// terminal compatibility tree.
-    #[allow(
-        dead_code,
-        reason = "stable restore/duplicate-view host seam; live command registration lands independently"
-    )]
+    /// focused canonical leaf: the content-agnostic split the mixed-leaf tests
+    /// build their layouts with (no shipping command duplicates a native view
+    /// yet). It never fabricates a terminal compatibility tree.
+    #[cfg(test)]
     pub(crate) fn split_active_with_native(
         &mut self,
         wid: WindowId,
@@ -1570,6 +1568,9 @@ impl App {
         // the next refresh recomposes — never the inverse (fresh epoch over
         // stale facts, which would serve a revoked menu for 30 s, §2.4).
         let connections_revision = self.connections.revision();
+        // The same order for the upgrade view's revision (gap #21): read
+        // before the row it composes from.
+        let upgrade_revision = self.upgrade_view.revision();
         // Tab Subject & Status owns the live activity line when it has anything
         // honest to say; the older generated summary remains the fallback so
         // nothing regresses while the two subsystems coexist (RFC §11).
@@ -1591,6 +1592,7 @@ impl App {
             && c.label == label
             && c.activity_revision == activity_revision
             && c.connections_revision == connections_revision
+            && c.upgrade_revision == upgrade_revision
         {
             return c.ext.clone();
         }
@@ -1659,6 +1661,10 @@ impl App {
                 .collect()
         };
         let can_rename = self.can_rename_session(retry_window);
+        let upgrade = sid.as_ref().and_then(|sid| {
+            self.upgrade_view
+                .menu_for(sid.as_str(), crate::upgrade_host::now_s())
+        });
         let input = chrome::SessionChromeInput {
             can_rename,
             label: label.to_string(),
@@ -1671,6 +1677,7 @@ impl App {
             has_session,
             timeline,
             connections,
+            upgrade,
         };
         let ext = chrome::TabChromeExt {
             tooltip: chrome::compose_tooltip(&input),
@@ -1683,6 +1690,7 @@ impl App {
                 label: label.to_string(),
                 activity_revision,
                 connections_revision,
+                upgrade_revision,
                 composed_ms: now,
                 ext: ext.clone(),
             },
@@ -2241,41 +2249,23 @@ impl App {
     }
 
     /// Test-only: append a stub `session` as a NEW tab of EXISTING window `wid` and
-    /// switch to it (mirrors `open_tab`'s id-list edit without a real PTY spawn). The
-    /// session is pooled (one view) so `tab_ids[active]` resolves; `session.id` MUST
+    /// switch to it — the shipping [`Self::install_new_tab`] body `open_tab` runs
+    /// after its spawn, fed a stub session instead of a real PTY. `session.id` MUST
     /// equal `self.next_session_id` (the test builds it that way), which is then
-    /// bumped. Used to stage a multi-tab front window for the detach test. Publishes
-    /// the appended terminal as the window's canonical front capability.
+    /// bumped. Used to stage multi-tab windows; the appended terminal becomes the
+    /// window's canonical front capability.
     // bench-support: many_tabs_idle in benches/frame_latency.rs stages its
     // N-tab window through this exact helper (see src/bench_support.rs).
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn push_stub_tab(&mut self, wid: WindowId, session: crate::Session) {
-        debug_assert_eq!(
-            session.id, self.next_session_id,
-            "stub tab session id must match the minted session id",
-        );
-        let sid = session.id;
-        self.next_session_id += 1;
-        Self::register_session(&self.store, &session, None);
-        let layout = pane::PaneTree::new(sid);
-        let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
-            .expect("stub tab identity space");
-        self.pool.insert(session);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.layouts.push(layout);
-            ws.tabs.add();
-            ws.tab_set.push(tab).expect("fresh tab id");
-        }
-        // `tabs.add()` switched the active tab to the new one; if `wid` is frontmost
-        // the global handle must follow it too (matches `open_tab_in`), so the test
-        // harness mirrors production's "active-tab change re-points the handle".
-        self.resync_active_or_window(wid);
+        self.install_new_tab(wid, session);
     }
 
     /// Test-only: split window `wid`'s ACTIVE tab into a 2-pane vertical split,
-    /// spawning a fresh stub session for the new (now-focused) pane. Mirrors
-    /// `split_focused_pane`'s pooling/registration without a real PTY. Returns the
-    /// new pane's session id. Used to exercise split-tab teardown headlessly.
+    /// spawning a fresh stub session for the new (now-focused) pane — the shipping
+    /// [`Self::install_split_pane`] body a split runs after its spawn, fed a stub
+    /// session instead of a real PTY (the pre-spawn refusals are the caller's to
+    /// stage). Returns the new pane's session id.
     // bench-support: the flood/pet compose fixtures in benches/frame_latency.rs
     // stage their 2-pane split through this exact helper (src/bench_support.rs).
     #[cfg(any(test, feature = "bench-support"))]
@@ -2308,23 +2298,10 @@ impl App {
         sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
     ) -> u64 {
         let sid = self.next_session_id;
-        self.next_session_id += 1;
         let stub = crate::stub_session_with_sink(sid, sink);
-        Self::register_session(&self.store, &stub, None);
-        self.view_store
-            .insert_terminal(sid)
-            .expect("stub view identity space");
-        self.pool.insert(stub);
-        if let Some(t) = self.active_tree_mut(wid) {
-            assert!(t.split_focused(dir, sid), "stub split must succeed");
+        if let Err(why) = self.install_split_pane(wid, dir, stub) {
+            panic!("stub split must succeed: {why}");
         }
-        let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-        assert!(self.sync_tab_model_from_layout(wid, active));
-        // Size the split panes explicitly, mirroring the real split path —
-        // `sync_window` only re-fits when a shared (views > 1) session exists —
-        // and re-publish the global handle exactly as the real split does.
-        self.resize_panes(wid);
-        self.resync_active_or_window(wid);
         sid
     }
 
@@ -2658,12 +2635,20 @@ impl App {
     }
 
     /// One registry handle as the status item sees it: the effective title,
-    /// the typed `role`/`attention`, whether a supervisor's claim is live (one
-    /// meta leaf-lock take), and the server's published agent verdict (one
-    /// timeline leaf-lock take, never nested in the first). No `Terminal`
-    /// lock: the verdict is the status sweep's publication, not a re-read.
+    /// the typed `role`/`attention`, whether it is SUPERVISED — a supervisor's
+    /// claim is live (one meta leaf-lock take), or `hosted` (this instance's
+    /// supervisor host is on) and the verdict names an agent the host
+    /// supervises ([`crate::harness_host::agent_of`]), so the box is the
+    /// host's before its loop has taken the claim (the E2E probe of
+    /// 2026-09-25: a trust dialog raised "approval waiting" from the raw
+    /// verdict, then "needs you" from the host's escalation — two
+    /// notifications for one box) — and the server's published agent verdict
+    /// (one timeline leaf-lock take, never nested in the first). No
+    /// `Terminal` lock: the verdict is the status sweep's publication, not a
+    /// re-read.
     pub(crate) fn status_session_row(
         h: &crate::session_store::SessionHandle,
+        hosted: bool,
     ) -> crate::status_item::SessionRow {
         let (user_title, role, attention, supervised) = {
             let m = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -2674,23 +2659,42 @@ impl App {
                 m.live_supervisor(crate::metrics::now_us()).is_some(),
             )
         };
-        let agent = {
+        let (agent, host_supervises, stall) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let a = tl.agent();
-            (a.word != "-").then(|| crate::status_item::AgentFact {
+            let agent = (a.word != "-").then(|| crate::status_item::AgentFact {
                 word: a.word,
                 detail: a.detail.clone(),
                 rev: a.rev,
                 subject: a.subject.clone(),
-            })
+            });
+            let stall = a.input.clone().map(|f| (f, a.program.clone(), a.reader));
+            (
+                agent,
+                hosted && crate::harness_host::agent_of(a).is_some(),
+                stall,
+            )
         };
+        // The published stall, in the server attention's own words — composed
+        // after the timeline's leaf lock is released (it reads the clock and
+        // the zone).
+        let input_stall = stall.map(|(fact, program, reader)| {
+            crate::input_stall::menu_row(
+                &fact,
+                program.as_deref(),
+                reader,
+                h.ctx.self_id.as_str(),
+                std::time::Instant::now(),
+            )
+        });
         crate::status_item::SessionRow {
             id: h.local_id,
             title: user_title.unwrap_or_else(|| h.title.clone()),
             role,
             attention,
             agent,
-            supervised,
+            supervised: supervised || host_supervises,
+            input_stall,
         }
     }
 
@@ -2707,12 +2711,16 @@ impl App {
         if self.headless {
             return;
         }
+        let hosted = self
+            .harness
+            .as_ref()
+            .is_some_and(crate::harness_host::HostHandle::supervising);
         let row = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
             store
                 .by_local(session)
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-                .map(Self::status_session_row)
+                .map(|h| Self::status_session_row(h, hosted))
         };
         let current = row.as_ref().and_then(crate::status_item::escalation);
         let looking = self
@@ -2750,11 +2758,11 @@ impl App {
         HERALD_POSTS.with(|posts| posts.borrow_mut().push(notice.clone()));
         #[cfg(not(test))]
         {
-            let message = crate::notify::NotifyMsg {
-                session: notice.session,
-                title: Some(notice.title.to_owned()),
-                body: notice.body,
-            };
+            let message = crate::notify::NotifyMsg::new(
+                notice.session,
+                Some(notice.title.to_owned()),
+                notice.body,
+            );
             if let Err(
                 std::sync::mpsc::TrySendError::Full(dropped)
                 | std::sync::mpsc::TrySendError::Disconnected(dropped),
@@ -2774,13 +2782,17 @@ impl App {
     /// paths). `Exited` sessions are excluded: a dead operator is not a
     /// running operator.
     pub(crate) fn operator_fleet_glance(&self) -> crate::status_item::FleetGlance {
+        let hosted = self
+            .harness
+            .as_ref()
+            .is_some_and(crate::harness_host::HostHandle::supervising);
         let rows: Vec<crate::status_item::SessionRow> = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
             store
                 .snapshot()
                 .into_iter()
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-                .map(|h| Self::status_session_row(&h))
+                .map(|h| Self::status_session_row(&h, hosted))
                 .collect()
         };
         let mut glance = crate::status_item::classify(&rows);
@@ -2856,6 +2868,7 @@ impl App {
     /// `dispatch_menu_action` twin for `Wake::OperatorAction`).
     ///
     /// See [`operator_cli_on_path`] for the Start-side launchability gate.
+    #[cfg(target_os = "macos")]
     pub(crate) fn dispatch_operator_action(
         &mut self,
         el: &ActiveEventLoop,
@@ -3053,6 +3066,7 @@ impl App {
 
     /// MRU bookkeeping for a menu-driven raise, skipped when the id already
     /// vanished (the stale-row miss path).
+    #[cfg(target_os = "macos")]
     fn note_window_focused_if_present(&mut self, wid: WindowId) {
         if self.windows.contains_key(&wid) {
             self.note_window_focused(wid);
@@ -3236,42 +3250,51 @@ impl App {
             identity,
             None, // fresh shell (not a seamless-update adoption)
         ) {
-            Ok(session) => {
-                self.next_session_id += 1;
-                // P1.1: register in the process-wide registry (additive index) so a
-                // cross-session `@<selector>` verb can reach this tab. The parent is
-                // the FOCUSED pane's session of the OWNER window when the tab was
-                // opened (the family tree; a user-opened tab is a child of the pane
-                // it was opened from).
-                let parent = self
-                    .front_terminal(owner)
-                    .and_then(|terminal| self.pool.get(terminal.session))
-                    .map(|s| s.ctx.self_id.clone());
-                Self::register_session(&self.store, &session, parent);
-                let layout = pane::PaneTree::new(id);
-                let tab =
-                    crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
-                        .expect("tab/view identity space");
-                self.pool.insert(session);
-                // Append a fresh single-pane tree (one leaf) and bump the owner
-                // window's index in lockstep (keeps `layouts.len() == tabs.count`).
-                if let Some(ws) = self.windows.get_mut(&owner) {
-                    ws.layouts.push(layout);
-                    ws.tabs.add();
-                    ws.tab_set.push(tab).expect("fresh tab id");
-                }
-                // Mirror the owner; if it's frontmost, also re-point the globals.
-                if self.frontmost_window == Some(owner) {
-                    self.sync_active_session();
-                } else {
-                    self.sync_window(owner);
-                }
-            }
+            Ok(session) => self.install_new_tab(owner, session),
             Err(e) => {
                 crate::logging::stderr_line!("aterm-gui: could not open a new tab: {e}");
                 self.post_message(crate::message_reporters::new_tab_failed(&e.to_string()));
             }
         }
+    }
+
+    /// Install an already-spawned `session` as a NEW last tab of window `owner` and
+    /// switch to it — the bookkeeping half of [`Self::open_tab_in_cwd_observing`],
+    /// split from the spawn (a real PTY) so the headless tests drive this SAME body
+    /// with a stub session (`push_stub_tab`). `session.id` must be the minted
+    /// `next_session_id`, which this bumps.
+    ///
+    /// The new tab moves the owner's front session, so when `owner` is the front
+    /// window the global control/notify handle follows it here, in the seam that
+    /// moved it (`active_handle_model`; Tier-1: `active_handle_conformance`).
+    pub(crate) fn install_new_tab(&mut self, owner: WindowId, session: crate::Session) {
+        debug_assert_eq!(
+            session.id, self.next_session_id,
+            "a new tab's session id must be the minted session id",
+        );
+        let id = session.id;
+        self.next_session_id += 1;
+        // P1.1: register in the process-wide registry (additive index) so a
+        // cross-session `@<selector>` verb can reach this tab. The parent is the
+        // FOCUSED pane's session of the OWNER window when the tab was opened (the
+        // family tree; a user-opened tab is a child of the pane it was opened from).
+        let parent = self
+            .front_terminal(owner)
+            .and_then(|terminal| self.pool.get(terminal.session))
+            .map(|s| s.ctx.self_id.clone());
+        Self::register_session(&self.store, &session, parent);
+        let layout = pane::PaneTree::new(id);
+        let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
+            .expect("tab/view identity space");
+        self.pool.insert(session);
+        // Append a fresh single-pane tree (one leaf) and bump the owner window's
+        // index in lockstep (keeps `layouts.len() == tabs.count`).
+        if let Some(ws) = self.windows.get_mut(&owner) {
+            ws.layouts.push(layout);
+            ws.tabs.add();
+            ws.tab_set.push(tab).expect("fresh tab id");
+        }
+        self.resync_active_or_window(owner);
     }
 
     /// Cmd-1..Cmd-9: switch to tab index `i` (0-based) if it exists. No-op (and no
@@ -3751,23 +3774,6 @@ impl App {
         }
     }
 
-    /// RETIRED AFFORDANCE (update-flow UX rework): the titlebar "Update" capsule is gone
-    /// — the update affordance moved to the VERSION menu (one-click apply, see
-    /// [`crate::menu::update_version_menu`] / `App::refresh_version_menu`) — so nothing
-    /// calls this any more and the macOS `toolbar::set_update_available` it fans out to
-    /// is itself a documented no-op. Kept (allow(dead_code) makes it a live root, so the
-    /// `Apprt::set_toolbar_update_available` seam it exercises stays warning-free)
-    /// because `platform.rs` is outside this change's surface; delete both together.
-    #[allow(
-        dead_code,
-        reason = "keeps the Apprt::set_toolbar_update_available seam compiling while the titlebar capsule is retired; platform.rs is owned by concurrent work"
-    )]
-    pub(crate) fn set_toolbar_update_available(&self, available: bool) {
-        for handle in self._toolbars.values() {
-            self.apprt.set_toolbar_update_available(handle, available);
-        }
-    }
-
     /// Cmd-W: close the FOCUSED pane of the FRONTMOST window's active tab. Returns
     /// `Some(window)` — the window whose last tab just closed — iff that was the LAST
     /// pane of the LAST tab, so the caller escalates to closing THAT window (the
@@ -3856,6 +3862,7 @@ impl App {
     /// user may have changed focus while the worker was aborting, so temporarily
     /// target the originally requested leaf, run the ordinary close transaction,
     /// then restore any still-live newer selection.
+    #[cfg(any(unix, test))]
     pub(crate) fn replay_deferred_handoff_view_close(
         &mut self,
         window: WindowId,
@@ -3926,6 +3933,7 @@ impl App {
 
     /// Resolve one deferred whole-tab close by stable identity so intervening tab
     /// selection/reordering cannot redirect it to a different tab.
+    #[cfg(unix)]
     pub(crate) fn replay_deferred_handoff_tab_close(
         &mut self,
         window: WindowId,
@@ -4006,7 +4014,6 @@ impl App {
         }
         match readiness {
             crate::native_app::CloseReadiness::Ready => Ok(true),
-            crate::native_app::CloseReadiness::Pending { .. } => Ok(false),
             crate::native_app::CloseReadiness::Blocked { recovery } => {
                 // THE VERDICT IS THE SAME EITHER WAY; ONLY THE SCREEN DIFFERS.
                 // A Quiet probe still runs the reducer and still reports
@@ -4990,7 +4997,6 @@ impl App {
     /// which is what makes `aterm ctl key menu` exercise the same path the
     /// physical key does. ⇧F10 is not a menu chord on macOS, whose chips pop a
     /// native `NSMenu` instead.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub(crate) fn open_active_tab_context_menu(&mut self, wid: WindowId) -> bool {
         let Some(index) = self
             .windows
@@ -5063,7 +5069,21 @@ impl App {
     ///
     /// A no-op (beyond the dismiss) when `i` is not a live action row; the
     /// caller has already hit-tested, this is the belt.
+    ///
+    /// An agent-upgrade row (gap #21) needs no event loop: it is dispatched
+    /// here, through the one dispatcher the macOS relay's
+    /// `Wake::TabMenuUpgrade` reaches too ([`App::dispatch_tab_menu_upgrade`]),
+    /// with the pop-time tab and the session and build the card showed.
     pub(crate) fn activate_tab_menu_entry(&mut self, wid: WindowId, i: usize) {
+        let upgrade = self.windows.get(&wid).and_then(|ws| {
+            let menu = ws.tab_menu.as_ref()?;
+            match menu.entries.get(i)? {
+                crate::session_chrome::TabMenuEntry::Upgrade { sid, to, word, .. } => {
+                    Some((menu.tab, sid.clone(), to.clone(), *word))
+                }
+                _ => None,
+            }
+        });
         let chosen = self.windows.get(&wid).and_then(|ws| {
             let menu = ws.tab_menu.as_ref()?;
             match menu.entries.get(i)? {
@@ -5076,6 +5096,9 @@ impl App {
             }
         });
         self.close_tab_menu(wid);
+        if let Some((tab, sid, to, word)) = upgrade {
+            self.dispatch_tab_menu_upgrade(wid, tab, sid, to, word);
+        }
         if let Some((tab, action)) = chosen
             && let Some(proxy) = self.proxy.clone()
         {
@@ -5280,9 +5303,7 @@ impl App {
     // NOT `#[cfg(debug_assertions)]`: the `debug_assert!` call sites type-check
     // their condition in release too (the macro only gates EXECUTION, not
     // compilation), so a debug-only definition fails the release build with
-    // E0599. Define it unconditionally; `allow(dead_code)` silences the
-    // release-only "never called" warning (debug builds do call it).
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    // E0599 — and those same call sites keep it live for the dead-code lint.
     pub(crate) fn structural_invariants_ok(&self) -> bool {
         self.structural_invariant_violation().is_none()
     }
@@ -5302,7 +5323,6 @@ impl App {
     /// broken relationship nor the window it broke in. The message costs a passing
     /// frame nothing: `assert!` evaluates its format arguments ONLY on the failing
     /// branch.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn structural_invariant_violation(&self) -> Option<String> {
         let Some(fid) = self.frontmost_window else {
             return Some("frontmost_window is None: no window holds the front".to_string());
@@ -5370,7 +5390,6 @@ impl App {
                         == Some(view)
                 }
                 crate::front_content::WindowFocus::Host => ws.front_content.is_none(),
-                crate::front_content::WindowFocus::Overlay => true,
             };
             let projection_shape = ws.tabs.count == ws.layouts.len()
                 && if ws.layouts.is_empty() {
@@ -7060,6 +7079,7 @@ mod mixed_tab_tests {
                     icon: None,
                     role: None,
                     attention: None,
+                    questions: None,
                     identity: None,
                 },
             )),
@@ -7203,6 +7223,50 @@ mod mixed_tab_tests {
         lossy.insert("lost_on_failure", 1);
         assert_eq!(admits(&model, &after_close, &lossy), None);
         assert!(!model.check_invariant("FailedReopenRetainsDescriptor", &lossy));
+
+        // The ledger at the model's `Cap`: Cap + 1 closes through the shipping
+        // path saturate it, because a full push evicts the oldest descriptor.
+        // A push that evicted one too few (`len > capacity`) would retain Cap + 1.
+        let cap = model
+            .consts
+            .iter()
+            .find_map(|&(name, value)| (name == "Cap").then_some(value))
+            .expect("NativeReopenLedger declares Cap");
+        let mut full = App::headless_for_test();
+        full.closed_recovery.tabs = crate::closed_recovery::RecoveryLedger::new(
+            usize::try_from(cap).expect("small model capacity"),
+            crate::closed_recovery::CLOSED_TAB_MAX_AGE_MS,
+        );
+        let active_id = |app: &App| app.windows[&wid].tab_set.active_id().unwrap().get() as i64;
+        assert!(full.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let mut state = model.init_state();
+        let mut before_last_close = state.clone();
+        for close in 0..=cap {
+            if close > 0 {
+                assert!(full.open_settings_tab(crate::native_settings::SettingsRoute::About));
+                let opened = active_id(&full);
+                let mut after_open = state.clone();
+                after_open.insert("native_live", 1);
+                after_open.insert("opened_id", opened);
+                after_open.insert("next_id", opened + 1);
+                assert_step(&model, &state, &after_open, "OpenAnother");
+                state = after_open;
+            }
+            let retired = active_id(&full);
+            full.close_active_native_tab(wid).unwrap();
+            let mut after_close = state.clone();
+            after_close.insert("ledger", full.closed_recovery.tabs.len() as i64);
+            after_close.insert("native_live", 0);
+            after_close.insert("retired_id", retired);
+            assert_step(&model, &state, &after_close, "Close");
+            before_last_close = std::mem::replace(&mut state, after_close);
+        }
+        assert_eq!(state["ledger"], cap, "the full ledger evicted its oldest");
+
+        let mut overfull = state.clone();
+        overfull.insert("ledger", cap + 1);
+        assert_eq!(admits(&model, &before_last_close, &overfull), None);
+        assert!(!model.check_invariant("LedgerBounded", &overfull));
     }
 }
 
@@ -7556,13 +7620,17 @@ mod session_chrome_app_tests {
         ));
         assert_eq!(app.operator_fleet_glance().connections, 2);
         // …and dissolving one leaves the other honestly counted.
-        assert!(crate::connections::disconnect_in(
-            &app.connections,
-            &a_sid,
-            &b_sid,
-            &b_ctx.edges,
-            "test"
-        ));
+        assert!(
+            crate::connections::disconnect_kind_in(
+                &app.connections,
+                &a_sid,
+                &b_sid,
+                &b_ctx.edges,
+                None,
+                "test"
+            )
+            .is_some()
+        );
         assert_eq!(app.operator_fleet_glance().connections, 1);
     }
 
@@ -7617,13 +7685,17 @@ mod session_chrome_app_tests {
             "B recomposed with the inbound inverse: {tip_b:?}"
         );
         // Dissolve — again with no other epoch movement — and both clear.
-        assert!(crate::connections::disconnect_in(
-            &app.connections,
-            &a_sid,
-            &b_sid,
-            &b_ctx.edges,
-            "test"
-        ));
+        assert!(
+            crate::connections::disconnect_kind_in(
+                &app.connections,
+                &a_sid,
+                &b_sid,
+                &b_ctx.edges,
+                None,
+                "test"
+            )
+            .is_some()
+        );
         let cleared = app.tab_chrome_ext(WindowId(0), &titles);
         for (i, ext) in cleared.iter().enumerate() {
             assert!(

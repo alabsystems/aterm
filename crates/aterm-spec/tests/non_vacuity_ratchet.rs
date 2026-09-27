@@ -19,24 +19,44 @@
 //! sweep over EVERY model in `xref::model_registry()`, not the ones someone
 //! remembered.
 //!
-//! **This is a ratchet, not a clean bill of health.** The table below is the
-//! measured state of the workspace on 2026-09-16, and it is large. Most entries
-//! are SPACE guards (`StateBounds`, `ValuesBounded`, `PhaseBounded` and friends),
-//! which state the bounds rather than a design claim and are expected to be
-//! uncatchable — those are not defects and never will be. The rest are design
-//! claims that presently assert nothing, and each is a candidate for a real
-//! mutant. The table makes both visible and stops either from growing.
+//! **An uncaught invariant is one of two things, and only one is allowed.** A
+//! SPACE guard (`StateBounds`, `ValuesBounded`, `PhaseBounded` and friends)
+//! states the bounds the interpreter and `ty` are asked to walk, not a design
+//! claim; it is expected to be uncatchable and is listed in `SPACE_GUARDS`.
+//! Anything else uncaught is a GHOST — a design claim that asserts nothing — and
+//! fails this test: give it a real mutant (a `Buggy` branch reproducing a
+//! plausible defect the invariant catches) or, if it only restates a guard or
+//! another invariant, delete it. There is no third list. Ghosts measured on
+//! 2026-09-16 were carried as debt in an `UNCAUGHT` table while they were paid
+//! down; the last of them went on 2026-09-26, and the table went with them, so
+//! nothing can be parked there again.
 //!
-//! **The assertion is TWO-SIDED, which is the whole point.** A NEW uncaught
-//! invariant fails the test, and so does an entry that is now CAUGHT but still
-//! listed. The second direction is what turns this from a suppression list into a
-//! ratchet: you cannot quietly add debt, and you cannot fix an invariant without
-//! recording that you did.
+//! **The assertion is TWO-SIDED, which is the whole point.** The uncaught set
+//! must EQUAL `SPACE_GUARDS`: a new ghost fails, and so does a listed guard some
+//! mutant now falsifies — that "space guard" was a design claim all along and
+//! must move out. `INTERPRETER_INELIGIBLE` is held to the same equality, so a
+//! model the sweep cannot evaluate is named, never silently skipped.
 //!
-//! To update after a deliberate change: run the test, read the diff it prints,
-//! and edit the table to match — never the other way round.
+//! **A space guard is checked for its SHAPE, not taken on trust.** Filing a
+//! design claim under `SPACE_GUARDS` would launder a ghost as a bound, so
+//! `every_space_guard_is_a_range_bound` requires each listed invariant to be a
+//! conjunction of range atoms — ONE state variable compared (`<=`, `>`) against
+//! an expression over literals and constants — that leaves every variable it
+//! bounds more than one value. A relation between two variables
+//! (`published <= accepted`) is a claim about the design, even when it sits
+//! inside a `StateBounded`; so is a pin (`x <= 0`, or a bound over the `Buggy`
+//! dial, which is no constant). Each gets its own name and its own mutant.
+//!
+//! To update after a deliberate change: run the test, read what it prints, and
+//! fix the model (or, for a genuine bound, `SPACE_GUARDS`) — never the other way
+//! round.
 
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Once;
+
+use aterm_spec::derive::Expr;
 
 /// Models the interpreter cannot evaluate (a function-valued `Expr` is
 /// TLA+-generation only, Tier-0 ty-checked rather than interpreter-evaluable).
@@ -47,77 +67,66 @@ const INTERPRETER_INELIGIBLE: &[&str] = &[
     "EvictFull",
     "TierResidency",
     "Recording",
-    "Coalesce",
     "NativeTabIdentity",
     "NativeDraftJournal",
     "TitleSummaryRuntime",
-    "RainbowTerminusAdmission",
     "SettingsPageScroll",
     "PresentRetry",
 ];
 
-/// `(model, invariants no `Buggy = 1` member falsifies)`, measured 2026-09-16.
-const UNCAUGHT: &[(&str, &[&str])] = &[
-    ("TerminalModes", &["ModesValid"]),
-    ("Ring", &["LenBounded"]),
-    ("Cursor", &["CursorBounded"]),
-    ("ReadImageSeq", &["SeqIsStaleOrCurrent"]),
-    (
-        "OperatorEventDelivery",
-        &[
-            "Bounds",
-            "ClaimStateOwnsToken",
-            "EscalationOccursAtCap",
-            "InDoubtOnlyAfterEscalation",
-        ],
-    ),
-    (
-        "OperatorWalActuator",
-        &[
-            "MutationRequiresDurableIntent",
-            "ResultFollowsOneSubmittedMutation",
-            "AuthorityStateIsExclusive",
-            "DurableOutcomesAreExclusive",
-            "ResolutionHasDurableOutcome",
-        ],
-    ),
+/// `(model, invariants that state the SPACE, not the design)` — uncaught by
+/// every `Buggy = 1` member and expected to stay so. Asserted still-uncaught,
+/// like `INTERPRETER_INELIGIBLE`: a guard a mutant starts to falsify is a design
+/// claim and moves out of this list.
+const SPACE_GUARDS: &[(&str, &[&str])] = &[
     ("OperatorResyncCursor", &["Bounds"]),
     ("OperatorLeadership", &["Bounds"]),
-    (
-        "OperatorFleetFault",
-        &[
-            "Bounds",
-            "MarkerOwnsEveryBlockedPhase",
-            "ClearCommitHasNoAmbiguity",
-        ],
-    ),
-    ("WindowRouting", &["FrontmostLive", "FrontmostAllocated"]),
     ("PressCustody", &["StateBounds"]),
     ("SelectionCustody", &["StateIsBounded"]),
+    // Both `props::no_wedge` instances: `waiting <= 1` bounds a flag, and the
+    // models' design claim is the separate deadlock-freedom obligation.
     ("ForwardHandshake", &["WaitingIsBool"]),
     ("TlsBufferedRelay", &["WaitingIsBool"]),
-    ("PaneTree", &["TreeNonEmpty"]),
-    (
-        "ControlConnectionAdmission",
-        &[
-            "ArrivalsBounded",
-            "EveryArrivalAccounted",
-            "AcceptedWorkAccounted",
-            "CompletedWasAccepted",
-        ],
-    ),
-    (
-        "NativeControlRouting",
-        &[
-            "FrontKindBounded",
-            "BareSessionIffFrontTerminal",
-            "ExplicitSessionIffLive",
-        ],
-    ),
+    ("NativeMarkdownViewport", &["StepsBounded"]),
+    ("NativeEditorViewport", &["ScrollPhaseBounded"]),
+    // `active_work` projects `Option<UpdaterWorkTicket>::is_some()`: a second
+    // worker is unrepresentable, so `SingleFlight` bounds a flag. The join law is
+    // bound at Tier-1 on the real `CheckStart::Joined`.
+    ("NativeUpdater", &["SingleFlight", "GenerationBounded"]),
+    ("ReleasePublishedIdentity", &["PublishedIdentityBounds"]),
+    ("ReleaseClaimLanding", &["ClaimStateBounds"]),
+    ("FocusModifierCache", &["StateBounds"]),
+    ("PetStrokeDetector", &["StrokeStateBounded"]),
+    ("ConsoleLifeEpisode", &["StateBounded"]),
+    ("ConsoleResidentHandoff", &["StateBounded"]),
+    ("ReducedMotionCompanionHandoff", &["StateBounded"]),
+    ("CursorHintLicense", &["StateBounded"]),
+    ("RainbowTypedContinuity", &["Bounded"]),
+    ("SameCaretTypedEcho", &["Bounded"]),
+    ("UnknownInsertOrphanKey", &["Bounded"]),
+    ("EchoLedgerBridge", &["StateBounded"]),
+    ("ComposedSyncHold", &["ComposedSyncValuesBounded"]),
+    ("SnapshotGenerationCommit", &["Bounds"]),
+    ("VideoBatchPublicationDurability", &["Bounds"]),
+    ("CaptureAfterPresent", &["ValuesBounded"]),
+    ("NativeCaptureSource", &["ValuesBounded"]),
+    ("SurfaceCoverage", &["FrameFitsSurface"]),
+    ("StartupPhasePublication", &["PhaseBounded"]),
+    ("GpuLossRoute", &["RouteRange"]),
+    ("PredictiveEchoVisibility", &["Bounds"]),
+    ("OutputEchoReceiptPublication", &["StateBounded"]),
+    // The 0..2 queue counts define this bounded model's state space; the
+    // cross-session design claim is DecisionReadsOnlySelectedSink, which the
+    // process-wide ACTIVE mutant falsifies.
+    ("PasteOrderSinkIsolation", &["PendingIsBounded"]),
+    ("RainbowLandingPool", &["StateBounds"]),
+    ("OperatorEventDelivery", &["Bounds"]),
+    ("OperatorFleetFault", &["Bounds"]),
+    ("ControlConnectionAdmission", &["ArrivalsBounded"]),
+    ("NativeControlRouting", &["FrontKindBounded"]),
     (
         "NativeReopenLedger",
         &[
-            "LedgerBounded",
             "NativeLiveBounded",
             "NextIdentityBounded",
             "FailureCountBounded",
@@ -125,35 +134,15 @@ const UNCAUGHT: &[(&str, &[&str])] = &[
     ),
     (
         "ClosedRecoveryLedgers",
-        &[
-            "ViewLedgerBounded",
-            "TabLedgerBounded",
-            "LiveLeavesBounded",
-            "FailureCountBounded",
-        ],
+        &["LiveLeavesBounded", "FailureCountBounded"],
     ),
-    (
-        "NativeSettingsSingleton",
-        &["RequestingWindowFocused", "OpensBounded"],
-    ),
+    ("NativeSettingsSingleton", &["OpensBounded"]),
     (
         "NativeSettingsDraftClose",
         &["FlagsBounded", "ResultBounded", "PreservationBounded"],
     ),
-    (
-        "NativePackagesWorker",
-        &[
-            "SingleFlightHasOneKind",
-            "CommandResultHasOrigin",
-            "StateIsBounded",
-        ],
-    ),
-    (
-        "NativeMarkdownHistory",
-        &["CursorWithinHistory", "EmptyIffNoCursor", "VisitsBounded"],
-    ),
-    ("NativeMarkdownViewport", &["StepsBounded"]),
-    ("NativeEditorViewport", &["ScrollPhaseBounded"]),
+    ("NativePackagesWorker", &["StateIsBounded"]),
+    ("NativeMarkdownHistory", &["VisitsBounded"]),
     (
         "NativeEditorCommandPalette",
         &["ResultsBounded", "PhaseBounded"],
@@ -167,563 +156,149 @@ const UNCAUGHT: &[(&str, &[&str])] = &[
         &[
             "ModeBounded",
             "QueryBounded",
-            "CaretBounded",
-            "AnchorBounded",
             "DocumentEditsBounded",
             "ExitKindBounded",
-            "QueryOnlyWhileModal",
         ],
     ),
+    // The native-app config, document, async-delivery and Smart Title models:
+    // every design claim beside these bounds carries its own mutant.
     (
         "NativeConfigTransaction",
-        &[
-            "KeysBounded",
-            "PatchBaseNotFuture",
-            "AcceptedHasRevision",
-            "RevisionBounded",
-        ],
+        &["KeysBounded", "RevisionBounded"],
     ),
     (
         "SeriousModeIntentQueue",
-        &[
-            "ProjectionTracksLatestIntent",
-            "QueueBounded",
-            "CompletionBounded",
-            "IssuedBounded",
-            "ValuesBoolean",
-        ],
+        &["QueueBounded", "IssuedBounded", "ValuesBoolean"],
     ),
-    (
-        "ConfigFileCommitCas",
-        &[
-            "IndeterminateDoesNotClaimDurability",
-            "OneSerializedCommitOwner",
-            "Bounded",
-        ],
-    ),
-    (
-        "ConfigCatalogSnapshot",
-        &[
-            "ViewsNeverAhead",
-            "ConsumersUseCompleteSnapshot",
-            "RevisionBounded",
-        ],
-    ),
+    ("ConfigFileCommitCas", &["Bounded"]),
+    ("ConfigCatalogSnapshot", &["RevisionBounded"]),
     (
         "CompositeAccessibilityRoute",
         &["GenerationsBounded", "OwnerDomain"],
     ),
-    (
-        "NativeDocumentPublication",
-        &[
-            "SnapshotCurrent",
-            "EditorCurrent",
-            "AnchorsTransformed",
-            "SequenceBounded",
-        ],
-    ),
+    ("NativeDocumentPublication", &["SequenceBounded"]),
     (
         "RestoreManifestSingleUse",
-        &[
-            "AtMostOneConsumer",
-            "ClaimRemovesVisibleName",
-            "OwnerBounded",
-            "FlagsBounded",
-        ],
+        &["OwnerBounded", "FlagsBounded"],
     ),
-    (
-        "NativeClosePlan",
-        &[
-            "NoSilentLoss",
-            "FrozenFinalSequence",
-            "ClosedHasNoViews",
-            "SequenceBounded",
-        ],
-    ),
-    (
-        "NativeSaveIntentLatch",
-        &[
-            "ClosedSequenceIsDurable",
-            "DurableNotFuture",
-            "TargetNotFuture",
-            "RequestedNotFuture",
-            "SequenceBounded",
-        ],
-    ),
-    (
-        "NativeAsyncDelivery",
-        &[
-            "AcceptedReducedOnce",
-            "DocumentPublishedToEditor",
-            "DocumentPublishedToMarkdown",
-            "GenerationsBounded",
-            "AcceptedBounded",
-        ],
-    ),
-    (
-        "TitleSummary",
-        &[
-            "ObservationRetryIsBoolean",
-            "DisabledHasNoObservationRetry",
-            "RetiredObservationIsQuiescent",
-            "WorkerLaneHasOneStampedJob",
-        ],
-    ),
+    ("NativeClosePlan", &["SequenceBounded"]),
+    ("NativeSaveIntentLatch", &["SequenceBounded"]),
+    ("NativeAsyncDelivery", &["GenerationsBounded"]),
+    ("TitleSummary", &["ObservationRetryIsBoolean"]),
     (
         "TitleSummaryObservationScheduler",
-        &[
-            "ActiveSessionStartsBatch",
-            "SelectedSessionIsValid",
-            "WorkerSelectionIsValid",
-            "Bounds",
-        ],
+        &["SelectedSessionIsValid", "WorkerSelectionIsValid", "Bounds"],
     ),
-    (
-        "TitleSummaryManagedEndpoint",
-        &[
-            "EndpointBelongsToOwnedProcess",
-            "AutomaticEndpointNeverUsesSharedDefault",
-            "ReuseRetainsOwnedEndpoint",
-            "Bounds",
-        ],
-    ),
+    ("TitleSummaryManagedEndpoint", &["Bounds"]),
     (
         "TitleSummarySocketOwnerRetry",
-        &[
-            "UniqueObservationSucceeds",
-            "PermanentErrorsFailClosed",
-            "TimeoutConsumesTheBound",
-            "RetryBudgetIsBounded",
-            "Bounds",
-        ],
+        &["RetryBudgetIsBounded", "Bounds"],
     ),
-    (
-        "NativeUpdater",
-        &[
-            "SingleFlight",
-            "GenerationBounded",
-            "QuitPolicyDoesNotApply",
-        ],
-    ),
-    (
-        "ReleaseDurablePostIntent",
-        &[
-            "CreateConvergenceRequiresVisibility",
-            "UploadRequiresConvergedDraft",
-            "UploadConvergenceRequiresVisibility",
-            "DurableIntentStateBounded",
-        ],
-    ),
-    (
-        "RosterPairRedo",
-        &[
-            "TargetHalfHasRedoAuthority",
-            "StaleSnapshotWritesNothing",
-            "StateBounded",
-        ],
-    ),
-    (
-        "ReleaseChannelFloor",
-        &[
-            "FrozenFloorFitsClaim",
-            "RuntimeMatchesFrozenJournal",
-            "RevalidatedOwnsLease",
-            "CompletedReleasesLease",
-            "RejectionCannotSilentlyDropLease",
-            "AbandonIsExplicitAndTerminal",
-            "FloorStateBounds",
-        ],
-    ),
-    (
-        "ReleaseJournalPrefix",
-        &["CompletionRequiresEveryStep", "JournalPrefixBounds"],
-    ),
-    (
-        "ReleasePublisherFence",
-        &["RefusalHasObservedTransportFault", "FenceStateBounds"],
-    ),
-    (
-        "ReleaseKeyEpochTransition",
-        &["ConsumedEpochIsClosed", "KeyEpochBounds"],
-    ),
-    (
-        "ReleaseHistoricalRecovery",
-        &["CompletionReleasesOwner", "HistoricalRecoveryBounds"],
-    ),
-    ("ReleasePublishedIdentity", &["PublishedIdentityBounds"]),
-    (
-        "ReleaseYankSuccessorFirst",
-        &["CompleteMeansConverged", "YankStateBounds"],
-    ),
-    ("ReleaseClaimLanding", &["ClaimStateBounds"]),
-    (
-        "ReleaseChannelSingleHead",
-        &[
-            "HistoricalManifestNeverDeleted",
-            "HistoricalSignatureNeverDeleted",
-            "NominalCrashPreservesRemoteLease",
-            "ArchiveStateBounds",
-        ],
-    ),
-    (
-        "NativeUpdateAdmission",
-        &[
-            "ReplacementPreservesForeground",
-            "ColdFallbackNeverDropsForeground",
-            "UnsafeStateNeverReexecutes",
-            "BlockedIsRetryableWithoutReexec",
-            "ApplyAtMostOnce",
-            "AttemptsBounded",
-        ],
-    ),
+    // The release/updater batch (2026-09-25): each bound below is the model's
+    // explored box and nothing more; every design claim beside it has its own
+    // mutant, and the laws that only restated a guard or another law are gone.
+    ("ReleaseDurablePostIntent", &["DurableIntentStateBounded"]),
+    ("RosterPairRedo", &["StateBounded"]),
+    ("ReleaseChannelFloor", &["FloorStateBounds"]),
+    ("ReleaseJournalPrefix", &["JournalPrefixBounds"]),
+    ("ReleasePublisherFence", &["FenceStateBounds"]),
+    ("ReleaseHistoricalRecovery", &["HistoricalRecoveryBounds"]),
+    ("ReleaseYankSuccessorFirst", &["YankStateBounds"]),
+    ("ReleaseChannelSingleHead", &["ArchiveStateBounds"]),
+    ("NativeUpdateAdmission", &["AttemptsBounded"]),
     (
         "NativeUpdateAutoIntent",
-        &[
-            "UnsuccessfulAttemptRetainsIntent",
-            "PhysicalFailureIsManualOnly",
-            "AttemptRequiresImportedStage",
-            "DeferralsBounded",
-            "AcceptedAtMostOnce",
-            "AttemptsBounded",
-        ],
+        &["DeferralsBounded", "AttemptsBounded"],
     ),
-    (
-        "NativeUpdateHiddenOutputQuiet",
-        &[
-            "AttemptOnlyAfterAgedQuiet",
-            "HiddenSampleRemainsUnacknowledged",
-            "Bounds",
-        ],
-    ),
+    ("NativeUpdateHiddenOutputQuiet", &["Bounds"]),
     (
         "NativeUpdateAttemptIdentity",
-        &[
-            "ActiveIdentityIsCurrent",
-            "RetryUsesFreshIdentity",
-            "OneLiveAttemptAuthority",
-            "NonceBounded",
-            "AbortsBounded",
-        ],
+        &["NonceBounded", "AbortsBounded"],
     ),
-    (
-        "NativeUpdateWorkerQueue",
-        &[
-            "AbstractFifoBoundaryIsBinary",
-            "PendingEmptyQueueHasRetryEdge",
-            "SettlementIsExplicit",
-            "RestartAtMostOnce",
-        ],
-    ),
-    (
-        "NativeUpdateStatusReconciliation",
-        &[
-            "ReadyPreservesPersistedOutcome",
-            "HonestTerminalOutcomeIsPreserved",
-        ],
-    ),
-    (
-        "TrailAudioLifecycle",
-        &[
-            "WorkerMailboxIsBounded",
-            "DropAccountingIsBounded",
-            "RunningOwnsOneDeadline",
-            "IdlePauseDisarmsDeadline",
-            "StartFailureIsExplicitAndTerminal",
-        ],
-    ),
-    (
-        "TrailAudioStartLatency",
-        &[
-            "BufferOwnershipConserved",
-            "IdleIsCallbackAndWakeFree",
-            "PhaseBounded",
-        ],
-    ),
-    (
-        "AsymmetricPadLayout",
-        &[
-            "BottomAbsorbsFreedPixels",
-            "GridOriginTracksTopAndHead",
-            "IdenticalLayoutMayReuseCache",
-            "CacheDecisionIsTotal",
-        ],
-    ),
-    (
-        "VisiblePadCrop",
-        &["TopIsClamped", "RawTransportConservesTwoPads"],
-    ),
-    ("FocusModifierCache", &["StateBounds"]),
-    (
-        "InputReleasePairing",
-        &[
-            "LiteralInputRetainsSilentReleaseOwnership",
-            "LocalRepeatRetainsSilentReleaseOwnership",
-            "StateBounds",
-        ],
-    ),
-    (
-        "TabStopHandoff",
-        &[
-            "AdmissionIsCoveringAndBounded",
-            "InvalidProjectionIsNeverAdmitted",
-        ],
-    ),
-    (
-        "ScrollbackMaintenanceLane",
-        &[
-            "MutationRequiresMemoryPressure",
-            "MutationRequiresCompletedPressureTrim",
-        ],
-    ),
-    (
-        "TopAnchoredScrollHistory",
-        &["FixedFooterIsPreserved", "StateIsBounded"],
-    ),
-    (
-        "KittySingDetector",
-        &["DriveMatchesLifecycle", "CountBounded", "PhaseBounded"],
-    ),
-    ("PetStrokeDetector", &["StrokeStateBounded"]),
-    ("ConsoleLifeEpisode", &["StateBounded"]),
-    ("ConsoleResidentHandoff", &["StateBounded"]),
-    (
-        "CursorCatEarnFloor",
-        &["ActiveRequiresSinging", "RunBounded", "FlagsBounded"],
-    ),
-    ("CursorCatCurseWince", &["HiddenCueNeverSummons"]),
-    ("ReducedMotionCompanionHandoff", &["StateBounded"]),
-    (
-        "CursorCatMotionPulseRouting",
-        &["DeliveryIsClassifiedAndAtMostOnce", "StateBounded"],
-    ),
-    ("CursorHintLicense", &["StateBounded"]),
-    ("RainbowTypedContinuity", &["Bounded"]),
-    ("SameCaretTypedEcho", &["Bounded"]),
-    ("UnknownInsertOrphanKey", &["Bounded"]),
-    ("EchoLedgerBridge", &["StateBounded"]),
-    (
-        "CursorViewportLifecycle",
-        &[
-            "HiddenPetLifecycleProgresses",
-            "CursorViewportValuesBounded",
-        ],
-    ),
+    ("NativeUpdateDiskTransaction", &["CrashBudgetBounded"]),
+    // The saturating drop counter. The 64-slot FIFO's bound is a design claim
+    // (the one-token `mpsc::channel()` slip breaks it), not space.
+    ("TrailAudioLifecycle", &["DropAccountingIsBounded"]),
+    ("TrailAudioStartLatency", &["PhaseBounded"]),
+    ("InputReleasePairing", &["StateBounds"]),
+    ("TopAnchoredScrollHistory", &["StateIsBounded"]),
+    ("KittySingDetector", &["CountBounded", "PhaseBounded"]),
+    ("CursorCatEarnFloor", &["RunBounded", "FlagsBounded"]),
+    ("CursorCatMotionPulseRouting", &["StateBounded"]),
+    ("CursorViewportLifecycle", &["CursorViewportValuesBounded"]),
     (
         "CursorCompanionOwnerLifecycle",
-        &[
-            "PresentationPinsPreserveTheSighting",
-            "DurableIdentitySurvives",
-            "CompanionOwnerValuesBounded",
-        ],
+        &["CompanionOwnerValuesBounded"],
     ),
-    ("ComposedSyncHold", &["ComposedSyncValuesBounded"]),
-    (
-        "SyncReopenVisibility",
-        &[
-            "CleanReopenMayPresentCompletedBoundary",
-            "SyncReopenValuesBounded",
-        ],
-    ),
-    (
-        "RainbowJumpBurstLifecycle",
-        &[
-            "ResidentBounded",
-            "GhostBounded",
-            "TotalBounded",
-            "GhostIdentityBounded",
-            "WakeMatchesResidents",
-            "IssuedBounded",
-            "WakeBounded",
-        ],
-    ),
-    (
-        "NativeUpdateOverlapHandoff",
-        &[
-            "ParentExitRequiresCommitOrLegacyAck",
-            "GroupSignalEliminatesLiveDescendants",
-        ],
-    ),
-    (
-        "NativeUpdateDiskTransaction",
-        &[
-            "LegacyRefusalPreservesRecoveryAuthority",
-            "ModernReadyRecoveryRequiresReadyAndIsExact",
-            "ReceiptBindsExactNewIdentity",
-            "FailedSwapNeverReplacesOld",
-            "FailedRollbackPreservesRecoveryAuthority",
-            "ExecFailureCannotGcBeforeRestore",
-            "CrashLoopRestoreUsesExactOld",
-            "RollbackGcRequiresRestoreAndDisarm",
-            "CrashBudgetBounded",
-        ],
-    ),
-    (
-        "ExactProfanityCompletion",
-        &[
-            "ActiveUsesCanonicalIdentity",
-            "HarmlessAndSettledAreInactive",
-            "CompletionCreatesExactlyOneEpisode",
-        ],
-    ),
-    ("SnapshotGenerationCommit", &["Bounds"]),
-    (
-        "VideoRecordingLifecycle",
-        &[
-            "Bounds",
-            "ModeMatchesRecordingPhase",
-            "TapOnlyOnGlass",
-            "OffscreenTimerExact",
-            "LateCancellationCannotRevoke",
-        ],
-    ),
-    (
-        "ExactInstanceRetention",
-        &["Bounds", "MissingAloneUsesPidFallback"],
-    ),
-    (
-        "AnchoredArtifactTransaction",
-        &[
-            "Bounds",
-            "ActiveTransactionIsPinned",
-            "PathIdentityTracksAncestor",
-            "OperationRequiresPinnedObject",
-            "CompletedReplyWasValidated",
-            "FailedReplyCertifiesNothing",
-        ],
-    ),
-    (
-        "ArtifactReplyPublication",
-        &[
-            "Bounds",
-            "ChallengeRequiresCompleteWire",
-            "AbortReleaseRemovesUncommittedArtifact",
-        ],
-    ),
-    (
-        "ArtifactHandoffCapacity",
-        &["CountMatchesCharges", "UnitsMatchCharges", "LiveOwnsCharge"],
-    ),
-    ("VideoBatchPublicationDurability", &["Bounds"]),
-    (
-        "ArtifactReaderLease",
-        &[
-            "Bounds",
-            "MaintenanceRequiresArm",
-            "FinishedSweepReopensIdle",
-        ],
-    ),
-    ("CaptureAfterPresent", &["AttemptsBounded", "ValuesBounded"]),
-    ("NativeCaptureSource", &["ValuesBounded"]),
-    (
-        "PresentedFrameTap",
-        &[
-            "ReservedPhaseRequiresAcceptedCopy",
-            "TerminalPhaseHasResult",
-            "ResultOnlyAtTerminal",
-            "ValuesBounded",
-        ],
-    ),
-    (
-        "VideoTapSlot",
-        &[
-            "DropCountBounded",
-            "EvictionMatchesOverflow",
-            "ValuesBounded",
-        ],
-    ),
-    (
-        "HdrReconfigureRetag",
-        &["AwaitingUpgradeIsSdr", "ValuesBounded"],
-    ),
+    ("SyncReopenVisibility", &["SyncReopenValuesBounded"]),
     (
         "LayoutCoordinateReset",
         &["CoordinateBounded", "ValuesBounded"],
     ),
+    ("BudgetedSearchResume", &["ValuesBounded"]),
+    ("VideoRecordingLifecycle", &["Bounds"]),
+    ("ExactInstanceRetention", &["Bounds"]),
+    ("AnchoredArtifactTransaction", &["Bounds"]),
+    ("ArtifactReplyPublication", &["Bounds"]),
+    ("ArtifactReaderLease", &["Bounds"]),
+    ("PresentedFrameTap", &["ValuesBounded"]),
+    // `MaxDrops` truncates the shipping take's unbounded `dropped` counter.
+    ("VideoTapSlot", &["DropCountBounded", "ValuesBounded"]),
+    ("HdrReconfigureRetag", &["ValuesBounded"]),
     (
         "SemanticPrewarmGeneration",
-        &[
-            "QueueContainsOnlyCurrent",
-            "GenerationsBounded",
-            "FlagsBounded",
-        ],
+        &["GenerationsBounded", "FlagsBounded"],
     ),
     (
         "SemanticPrewarmHandshake",
-        &[
-            "CurrentFailureFailsClosed",
-            "CacheOnlySupersededReady",
-            "InputsBounded",
-            "OutputsBounded",
-        ],
+        &["InputsBounded", "OutputsBounded"],
     ),
-    (
-        "SemanticPrewarmRequestSwap",
-        &["InputsWellFormed", "FlagsBounded"],
-    ),
-    ("SurfaceCoverage", &["FrameFitsSurface"]),
-    ("StartupPhasePublication", &["PhaseBounded"]),
-    ("GpuLossRoute", &["RouteRange"]),
-    (
-        "GpuLossRecovery",
-        &[
-            "Bounds",
-            "ExhaustedFailureIsParked",
-            "DeliveredRetryHasNoDeadline",
-            "FailedFallbackIsDiagnosed",
-            "ReadyCpuOwnsRedrawUntilPresent",
-            "CpuPresentWasReady",
-            "CpuPresentCompletesFailure",
-        ],
-    ),
-    (
-        "RecoveryRedraw",
-        &["Bounds", "RecoveryStimulusRequestsRedraw"],
-    ),
-    ("PredictiveEchoVisibility", &["Bounds"]),
-    ("OutputEchoReceiptPublication", &["StateBounded"]),
-    // The 0..2 queue counts define this bounded model's state space; the
-    // cross-session design claim is DecisionReadsOnlySelectedSink, which the
-    // process-wide ACTIVE mutant falsifies.
-    ("PasteOrderSinkIsolation", &["PendingIsBounded"]),
-    (
-        "StreamingSearch",
-        &[
-            "MemoryBounded",
-            "TotalMatchesConsistent",
-            "ScanProgressConsistent",
-        ],
-    ),
-    (
-        "BudgetedSearchResume",
-        &[
-            "LifecycleShape",
-            "CursorMatchesSearchId",
-            "DeliveryShape",
-            "IdentityIsLatest",
-            "ValuesBounded",
-        ],
-    ),
+    ("SemanticPrewarmRequestSwap", &["FlagsBounded"]),
+    ("GpuLossRecovery", &["Bounds"]),
+    ("RecoveryRedraw", &["Bounds"]),
+    // `passes` is the bounded retry phase (first, second, later); the
+    // scheduling claim is NoPrematureSameBuildPass, which Buggy falsifies.
+    ("AtpkgSessionIndexRetry", &["BoundedRetry"]),
 ];
+
+thread_local! {
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs one interpreter probe, catching its panic: `Err(())` is the probe's
+/// verdict that the model does not fit, which the caller reports. The panic's
+/// own output is silenced on THIS thread only. The hook is process-wide and the
+/// sweeps run as parallel tests, so a hook swapped per sweep would let one
+/// sweep's restore print the other's expected panics, or one sweep's silence
+/// swallow another test's assertion message.
+fn quietly<T>(probe: impl FnOnce() -> T) -> Result<T, ()> {
+    static FILTER: Once = Once::new();
+    FILTER.call_once(|| {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !QUIET.with(Cell::get) {
+                report(info);
+            }
+        }));
+    });
+    QUIET.with(|quiet| quiet.set(true));
+    let verdict = catch_unwind(AssertUnwindSafe(probe)).map_err(|_| ());
+    QUIET.with(|quiet| quiet.set(false));
+    verdict
+}
 
 #[test]
 fn no_model_grows_a_ghost_invariant() {
     let models = aterm_spec::xref::model_registry();
 
-    // Silence the interpreter's panic output for the eligibility probe below;
-    // the panics are expected and are reported by this test, not by libtest.
-    std::panic::set_hook(Box::new(|_| {}));
-    let mut measured: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut actual: BTreeSet<(&str, &str)> = BTreeSet::new();
     let mut ineligible: Vec<&str> = Vec::new();
     for m in &models {
-        match catch_unwind(AssertUnwindSafe(|| {
-            aterm_spec::verify::uncaught_invariants(m)
-        })) {
-            Ok(names) if !names.is_empty() => measured.push((m.name, names)),
-            Ok(_) => {}
-            Err(_) => ineligible.push(m.name),
+        match quietly(|| aterm_spec::verify::uncaught_invariants(m)) {
+            Ok(names) => actual.extend(names.into_iter().map(|inv| (m.name, inv))),
+            Err(()) => ineligible.push(m.name),
         }
     }
-    let _ = std::panic::take_hook();
 
     assert_eq!(
         ineligible, INTERPRETER_INELIGIBLE,
@@ -733,45 +308,209 @@ fn no_model_grows_a_ghost_invariant() {
          in the model, not a licence to stop checking it."
     );
 
-    let expected: std::collections::BTreeMap<&str, Vec<&str>> = UNCAUGHT
+    let guards: BTreeSet<(&str, &str)> = SPACE_GUARDS
         .iter()
-        .map(|(model, invs)| (*model, invs.to_vec()))
+        .flat_map(|(model, invs)| invs.iter().map(move |inv| (*model, *inv)))
         .collect();
-    let actual: std::collections::BTreeMap<&str, Vec<&str>> = measured.into_iter().collect();
+    let show = |set: Vec<&(&str, &str)>| -> String {
+        set.iter()
+            .map(|(model, inv)| format!("{model}::{inv}"))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
 
-    let mut grew: Vec<String> = Vec::new();
-    let mut fixed: Vec<String> = Vec::new();
-    for (model, invs) in &actual {
-        let known = expected.get(model).cloned().unwrap_or_default();
-        for inv in invs {
-            if !known.contains(inv) {
-                grew.push(format!("{model}::{inv}"));
-            }
-        }
-    }
-    for (model, invs) in &expected {
-        let now = actual.get(model).cloned().unwrap_or_default();
-        for inv in invs {
-            if !now.contains(inv) {
-                fixed.push(format!("{model}::{inv}"));
-            }
-        }
-    }
+    let ghosts: Vec<_> = actual.difference(&guards).collect();
+    let caught_guards: Vec<_> = guards.difference(&actual).collect();
 
     assert!(
-        grew.is_empty(),
-        "NEW ghost invariant(s) — no `Buggy = 1` member falsifies these, so they \
+        ghosts.is_empty(),
+        "GHOST invariant(s) — no `Buggy = 1` member falsifies these, so they \
          assert nothing about the code and any `ty` proof of them proves nothing:\n  {}\n\
-         Give each one a mutant that violates it, or (if it states the SPACE rather \
-         than a design claim) add it to the table with that reason.",
-        grew.join("\n  ")
+         Give each one a mutant that violates it, delete it if it only restates a \
+         guard or another invariant, or (if it states the SPACE rather than a design \
+         claim) add it to `SPACE_GUARDS`.",
+        show(ghosts)
     );
     assert!(
-        fixed.is_empty(),
-        "these invariant(s) are now CAUGHT by a mutant but are still listed as \
-         uncaught:\n  {}\n\
-         Remove them from `UNCAUGHT`. The ratchet is two-sided on purpose: a fix \
-         that is not recorded is a fix the next regression can silently undo.",
-        fixed.join("\n  ")
+        caught_guards.is_empty(),
+        "these `SPACE_GUARDS` entries are CAUGHT by a mutant (or no longer exist):\n  {}\n\
+         A bound some `Buggy = 1` member falsifies is a design claim — remove it from \
+         `SPACE_GUARDS`.",
+        show(caught_guards)
     );
+}
+
+/// Every evaluable model's `Buggy = 1` space, walked with every invariant
+/// stripped, fits the interpreter's state budget. `uncaught_invariants` walks
+/// exactly that space for an invariant no mutant breaks, so where it does not fit
+/// the sweep cannot NAME a ghost: it panics, and the model reads as
+/// `INTERPRETER_INELIGIBLE` instead. A mutant that can repeat its slip forever
+/// (each spawn/close cycle stranding one more registry entry, say) is how a model
+/// lands here, and the fix is a mutant that fires only from a sound state, as
+/// `props::lifecycle_no_leak`'s does.
+#[test]
+fn every_buggy_space_fits_the_interpreter() {
+    let mut unbounded: Vec<&str> = Vec::new();
+    for m in aterm_spec::xref::model_registry() {
+        if INTERPRETER_INELIGIBLE.contains(&m.name) {
+            continue;
+        }
+        let mut space = aterm_spec::interp::with_buggy(&m, 1);
+        space.invariants.clear();
+        if quietly(|| aterm_spec::interp::bmc(&space)).is_err() {
+            unbounded.push(m.name);
+        }
+    }
+    assert!(
+        unbounded.is_empty(),
+        "these models' Buggy=1 space exceeds the interpreter's budget, so the ghost \
+         sweep cannot name their uncaught invariants:\n  {}\n\
+         Each has a mutant that can fire forever: guard it to fire only from a state \
+         the correct model can reach.",
+        unbounded.join("\n  ")
+    );
+}
+
+/// The value of `e` under the model's constants, or `None` when it mentions a
+/// state variable. `Buggy` does not count as a constant: it is the mutant dial,
+/// and a bound over it (`x <= Buggy`) pins the variable at the committed config.
+fn constant_value(e: &Expr, consts: &[(&str, i64)]) -> Option<i64> {
+    match e {
+        Expr::Int(n) => Some(*n),
+        Expr::ConstRef(name) if *name != "Buggy" => consts
+            .iter()
+            .find_map(|&(constant, value)| (constant == *name).then_some(value)),
+        Expr::Add(a, b) => Some(constant_value(a, consts)? + constant_value(b, consts)?),
+        Expr::Sub(a, b) => Some(constant_value(a, consts)? - constant_value(b, consts)?),
+        _ => None,
+    }
+}
+
+/// A range atom: ONE state variable compared against a constant expression,
+/// either way round, as `(variable, lowest allowed, highest allowed)`.
+fn range_atom(
+    e: &Expr,
+    consts: &[(&str, i64)],
+) -> Option<(&'static str, Option<i64>, Option<i64>)> {
+    let k = |e: &Expr| constant_value(e, consts);
+    match e {
+        Expr::Le(a, b) => match (&**a, &**b) {
+            (Expr::Var(x), bound) => Some((*x, None, Some(k(bound)?))),
+            (bound, Expr::Var(x)) => Some((*x, Some(k(bound)?), None)),
+            _ => None,
+        },
+        Expr::Gt(a, b) => match (&**a, &**b) {
+            (Expr::Var(x), bound) => Some((*x, Some(k(bound)? + 1), None)),
+            (bound, Expr::Var(x)) => Some((*x, None, Some(k(bound)? - 1))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Why `e`, a space guard's body, is not a range bound: each conjunct that is
+/// not a range atom, and each variable its atoms PIN to a single value (or to
+/// none). Model variables count up from zero, so an upper bound of zero
+/// (`x <= 0`, `1 > x`) or a lower bound meeting the upper one (`x > 0 && x <= 1`)
+/// says "this never moves": a claim about the design, not the extent of the space.
+fn not_range_bounds(e: &Expr, consts: &[(&str, i64)]) -> Vec<String> {
+    fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match e {
+            Expr::And(a, b) => {
+                conjuncts(a, out);
+                conjuncts(b, out);
+            }
+            atom => out.push(atom),
+        }
+    }
+    let mut atoms = Vec::new();
+    conjuncts(e, &mut atoms);
+    let mut bad = Vec::new();
+    let mut extent: BTreeMap<&str, (i64, Option<i64>)> = BTreeMap::new();
+    for atom in atoms {
+        let Some((x, low, high)) = range_atom(atom, consts) else {
+            bad.push(atom.to_tla());
+            continue;
+        };
+        let (lo, hi) = extent.entry(x).or_insert((0, None));
+        *lo = (*lo).max(low.unwrap_or(0));
+        *hi = match (*hi, high) {
+            (Some(h), Some(n)) => Some(h.min(n)),
+            (h, n) => h.or(n),
+        };
+    }
+    for (x, (lo, hi)) in extent {
+        if let Some(hi) = hi
+            && hi <= lo
+        {
+            bad.push(format!("`{x}` is pinned to {lo}..={hi}"));
+        }
+    }
+    bad
+}
+
+#[test]
+fn every_space_guard_is_a_range_bound() {
+    let models = aterm_spec::xref::model_registry();
+    let mut laundered: Vec<String> = Vec::new();
+    for (model, guards) in SPACE_GUARDS {
+        let m = models
+            .iter()
+            .find(|m| m.name == *model)
+            .unwrap_or_else(|| panic!("`SPACE_GUARDS` names `{model}`, which is not registered"));
+        for guard in *guards {
+            let inv = m
+                .invariants
+                .iter()
+                .find(|inv| inv.name == *guard)
+                .unwrap_or_else(|| panic!("`{model}` has no invariant `{guard}`"));
+            for atom in not_range_bounds(&inv.expr, &m.consts) {
+                laundered.push(format!("{model}::{guard}: {atom}"));
+            }
+        }
+    }
+    assert!(
+        laundered.is_empty(),
+        "these `SPACE_GUARDS` conjuncts are not range bounds — each relates state \
+         variables or pins one to a single value, which is a design claim, not the \
+         space:\n  {}\n\
+         Give each its own named invariant with a `Buggy` mutant that falsifies it, \
+         or delete it if it only restates a guard or another invariant.",
+        laundered.join("\n  ")
+    );
+}
+
+/// The shape check is itself non-vacuous: a pin and a bound over the `Buggy`
+/// dial are refused, while an ordinary two-sided bound passes.
+#[test]
+fn range_bound_check_refuses_pins_and_the_buggy_dial() {
+    let var = || Box::new(Expr::Var("x"));
+    let int = |n| Box::new(Expr::Int(n));
+    let konst = |name| Box::new(Expr::ConstRef(name));
+    let consts = [("Cap", 3), ("Buggy", 0)];
+    let rejected = |e: Expr| !not_range_bounds(&e, &consts).is_empty();
+
+    assert!(rejected(Expr::Le(var(), int(0))), "x <= 0 pins x");
+    assert!(rejected(Expr::Gt(int(1), var())), "1 > x pins x");
+    assert!(
+        rejected(Expr::Le(var(), konst("Buggy"))),
+        "Buggy is the dial"
+    );
+    assert!(
+        rejected(Expr::And(
+            Box::new(Expr::Gt(var(), int(0))),
+            Box::new(Expr::Le(var(), int(1))),
+        )),
+        "x > 0 && x <= 1 pins x to one"
+    );
+    assert!(
+        rejected(Expr::Le(var(), Box::new(Expr::Var("y")))),
+        "a relation"
+    );
+
+    assert!(!rejected(Expr::Le(var(), konst("Cap"))));
+    assert!(!rejected(Expr::And(
+        Box::new(Expr::Gt(var(), int(0))),
+        Box::new(Expr::Le(var(), Box::new(Expr::Sub(konst("Cap"), int(1))))),
+    )));
 }

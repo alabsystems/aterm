@@ -95,6 +95,7 @@ sealed = ["aterm-link/sealed"]
 dev-seams = [
     "aterm-cli/dev-seams",
     "aterm-gui/dev-seams",
+    "aterm-link/dev-seams",
     "aterm-update/dev-seams",
     "atpkg/dev-seams",
 ]
@@ -104,6 +105,10 @@ dev-seams = [
 # regression it pins (`aterm ship` reaching the session parser) is invisible
 # with piped stdio, because piped stdio takes the WINDOW route instead.
 libc = { workspace = true }
+# Every live-headless test arms its instance with a lifeline
+# (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its
+# instances with it. aterm-uds is a dependency-free leaf the binary links already.
+aterm-uds = { workspace = true }
 
 [build-dependencies]
 # Windows only: compile + link the icon, the side-by-side manifest and

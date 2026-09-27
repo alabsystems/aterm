@@ -1505,7 +1505,7 @@ fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
 ///    this term's light is `s2l(page + b) − s2l(page)`: page-dependent, and
 ///    near-linear in the bytes at the page's own slope.
 /// 2. On an EDR panel the aurora pass (`fs_hdr_glow`, the WGSL twin of the
-///    proven [`aterm_render::hdr::hdr_additive_encode`]) re-emits the same
+///    proven `aterm_render::hdr::hdr_additive_encode`) re-emits the same
 ///    quads as `s2l(b) · HDR_GLOW_BOOST` in linear light above reference
 ///    white: page-INDEPENDENT and convex in the bytes — [`crate::color_math::relative_luminance`]
 ///    of the premultiplied colour itself, times the boost.

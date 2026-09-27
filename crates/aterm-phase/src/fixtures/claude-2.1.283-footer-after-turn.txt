@@ -1,0 +1,25 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (80x24, the owner's settings: auto mode by default, the top effort level on) · idle after a turn in auto mode · the effort tag's word is replaced by the stand-in `workspace`, same width
+  14
+  15
+  16
+  17
+  18
+  19
+  20
+  21
+  22
+  23
+  24
+  25
+  26
+  27
+  28
+  29
+  30
+
+✻ Worked for 2s · done 8:12 PM
+
+──────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

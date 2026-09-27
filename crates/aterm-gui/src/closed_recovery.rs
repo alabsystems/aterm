@@ -230,6 +230,7 @@ mod tests {
             icon: None,
             role: None,
             attention: None,
+            questions: None,
             identity: None,
         })
     }
@@ -329,10 +330,43 @@ mod tests {
         assert_eq!(ledger.candidate(0).unwrap().value, unavailable);
     }
 
+    /// Tier-1 for `ClosedRecoveryLedgers`, driven through the App's shipping close
+    /// and reopen paths: `close_active_tab` on a two-leaf tab, `close_tab_at` on a
+    /// one-leaf tab, `reopen_last_closed_view` and `reopen_last_closed_tab`. The
+    /// App's ledgers are rebuilt with the model's capacities (2 views, 3 tabs), so
+    /// the real `push` saturates where the model's clamp does. Which ledger each
+    /// close records into is the App's choice, never the test's.
     #[test]
     fn dual_ledgers_tier1_conform_and_reject_double_record_negative_control() {
         use aterm_spec::derive::closed_recovery_ledgers_model;
         use aterm_spec::interp::{State, admits};
+
+        use crate::App;
+        use crate::native_settings::SettingsRoute;
+        use crate::tab_model::SplitAxis;
+
+        #[derive(Clone, Copy, Default)]
+        struct Facts {
+            failures: i64,
+        }
+
+        fn project(model: &aterm_spec::derive::Model, app: &App, facts: Facts) -> State {
+            let window = &app.windows[&WindowId(0)];
+            // Tab 0 is the bootstrap terminal; the model's one tab is the one after it.
+            let live_tabs = window.tab_set.len() as i64 - 1;
+            let live_leaves = if live_tabs == 1 {
+                window.tab_set.tabs()[1].root.len() as i64
+            } else {
+                0
+            };
+            let mut state = model.init_state();
+            state.insert("view_ledger", app.closed_recovery.views.len() as i64);
+            state.insert("tab_ledger", app.closed_recovery.tabs.len() as i64);
+            state.insert("live_tabs", live_tabs);
+            state.insert("live_leaves", live_leaves);
+            state.insert("failures", facts.failures);
+            state
+        }
 
         fn assert_step(
             model: &aterm_spec::derive::Model,
@@ -349,39 +383,100 @@ mod tests {
         }
 
         let model = closed_recovery_ledgers_model();
-        let initial = model.init_state();
-        let placement =
-            ClosedViewPlacement::new(Vec::new(), RestoreBranch::Second, SplitKind::Vertical, 0.5)
-                .unwrap();
-        let mut ledgers = ClosedRecoveryLedgers {
-            views: RecoveryLedger::new(2, 100),
-            tabs: RecoveryLedger::new(3, 100),
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let facts = Facts::default();
+        app.closed_recovery = ClosedRecoveryLedgers {
+            views: RecoveryLedger::new(2, CLOSED_VIEW_MAX_AGE_MS),
+            tabs: RecoveryLedger::new(3, CLOSED_TAB_MAX_AGE_MS),
         };
-        ledgers.views.push(
-            ClosedView {
-                original_window: WindowId(1),
-                original_tab: TabId::from_stored(7),
-                view: terminal("closed-view"),
-                placement,
-            },
-            1,
+        let open_two_leaf_tab = |app: &mut App| {
+            assert!(app.open_settings_tab(SettingsRoute::About));
+            app.split_active_with_stub_terminal(wid, SplitAxis::Vertical);
+        };
+        open_two_leaf_tab(&mut app);
+        assert_eq!(project(&model, &app, facts), model.init_state());
+
+        let step = |app: &mut App, action: &'static str, operate: &dyn Fn(&mut App)| {
+            let before = project(&model, app, facts);
+            operate(app);
+            let after = project(&model, app, facts);
+            assert_step(&model, &before, &after, action);
+            assert!(app.structural_invariants_ok());
+            (before, after)
+        };
+        let close_leaf = |app: &mut App| {
+            app.close_active_tab();
+        };
+        let close_tab = |app: &mut App| {
+            assert!(!app.close_tab_at(WindowId(0), 1));
+        };
+
+        let (before_view, after_view) = step(&mut app, "CloseView", &close_leaf);
+        step(&mut app, "ReopenView", &|app| {
+            app.reopen_last_closed_view().unwrap();
+        });
+        step(&mut app, "CloseView", &close_leaf);
+        step(&mut app, "CloseTab", &close_tab);
+        step(&mut app, "OpenTab", &open_two_leaf_tab);
+        step(&mut app, "CloseView", &close_leaf);
+        step(&mut app, "CloseTab", &close_tab);
+        step(&mut app, "OpenTab", &open_two_leaf_tab);
+        // The view ledger is full: the real push drops the oldest record.
+        let (before_full_view, at_view_cap) = step(&mut app, "CloseView", &close_leaf);
+        assert_eq!(at_view_cap["view_ledger"], 2);
+        step(&mut app, "CloseTab", &close_tab);
+        step(&mut app, "OpenTab", &open_two_leaf_tab);
+        step(&mut app, "CloseView", &close_leaf);
+        let (before_full_tab, at_tab_cap) = step(&mut app, "CloseTab", &close_tab);
+        assert_eq!(at_tab_cap["tab_ledger"], 3);
+        let (_, reopened_tab) = step(&mut app, "ReopenTab", &|app| {
+            app.reopen_last_closed_tab().unwrap();
+        });
+
+        // Failed reconstruction consumes neither ledger. With no window left
+        // to host it, both reopens fail and both candidates stay.
+        let views = app.closed_recovery.views.len();
+        let tabs = app.closed_recovery.tabs.len();
+        app.windows.clear();
+        app.frontmost_window = None;
+        assert!(app.reopen_last_closed_view().is_err());
+        assert_eq!(app.closed_recovery.views.len(), views);
+        let mut after_view_failure = reopened_tab.clone();
+        after_view_failure.insert("failures", 1);
+        assert_step(&model, &reopened_tab, &after_view_failure, "FailView");
+        assert!(app.reopen_last_closed_tab().is_err());
+        assert_eq!(app.closed_recovery.tabs.len(), tabs);
+        let mut after_tab_failure = after_view_failure.clone();
+        after_tab_failure.insert("failures", 2);
+        // Healthy, the two failures are one transition (they differ only in the
+        // ledger a consuming failure would hit), so `admits` names `FailView`.
+        assert_eq!(
+            model.successors("FailTab", &after_view_failure).as_slice(),
+            std::slice::from_ref(&after_tab_failure),
+            "the failed tab reopen conforms to FailTab"
         );
-        let mut after_view = initial.clone();
-        after_view.insert("view_ledger", ledgers.views.len() as i64);
-        after_view.insert("live_leaves", 1);
-        assert_step(&model, &initial, &after_view, "CloseView");
 
-        let before_failure_len = ledgers.views.len();
-        let _failed_candidate = ledgers.views.candidate(2).unwrap();
-        assert_eq!(ledgers.views.len(), before_failure_len);
-        let mut after_failure = after_view.clone();
-        after_failure.insert("failures", 1);
-        assert_step(&model, &after_view, &after_failure, "FailView");
-
+        // Negative controls. One close recorded in both ledgers:
         let mut double_record = after_view.clone();
         double_record.insert("tab_ledger", 1);
         double_record.insert("double_recorded", 1);
-        assert_eq!(admits(&model, &initial, &double_record), None);
+        assert_eq!(admits(&model, &before_view, &double_record), None);
         assert!(!model.check_invariant("OnlyOneRecordPerClose", &double_record));
+        // A full push that evicts one too few, in either ledger:
+        let mut overfull_view = at_view_cap.clone();
+        overfull_view.insert("view_ledger", 3);
+        assert_eq!(admits(&model, &before_full_view, &overfull_view), None);
+        assert!(!model.check_invariant("ViewLedgerBounded", &overfull_view));
+        let mut overfull_tab = at_tab_cap.clone();
+        overfull_tab.insert("tab_ledger", 4);
+        assert_eq!(admits(&model, &before_full_tab, &overfull_tab), None);
+        assert!(!model.check_invariant("TabLedgerBounded", &overfull_tab));
+        // A failed reopen that consumed its record:
+        let mut lossy = after_view_failure;
+        lossy.insert("view_ledger", reopened_tab["view_ledger"] - 1);
+        lossy.insert("lost_on_failure", 1);
+        assert_eq!(admits(&model, &reopened_tab, &lossy), None);
+        assert!(!model.check_invariant("FailedReopenRetainsRecord", &lossy));
     }
 }

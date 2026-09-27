@@ -8,11 +8,6 @@
 //! durability proof match the still-pending plan. The draft format is bounded, checksummed,
 //! and fail-closed: recovery never returns a valid prefix when a later record is corrupt.
 
-#![allow(
-    dead_code,
-    reason = "native document host-effect integration lands in staged consumers"
-)]
-
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -209,6 +204,7 @@ pub(crate) struct SavePlan {
 
 impl SavePlan {
     /// Host-side preflight immediately before creating/replacing the target.
+    #[cfg(test)]
     pub(crate) fn preflight(&self, actual: ObservedFileVersion) -> Result<(), VersionConflict> {
         detect_version_conflict(self.expected, actual).map_or(Ok(()), Err)
     }
@@ -356,6 +352,7 @@ impl SaveReducer {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn phase(&self) -> &SavePhase {
         &self.phase
     }
@@ -544,6 +541,7 @@ pub(crate) struct JournalRecord {
 }
 
 impl JournalRecord {
+    #[cfg(test)]
     pub(crate) fn snapshot(snapshot: &DocumentSnapshot) -> Self {
         Self::snapshot_for(JournalDocumentKey(snapshot.id.get()), snapshot)
     }
@@ -557,6 +555,7 @@ impl JournalRecord {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn delta(
         document: DocumentId,
         base_seq: Seq,
@@ -580,10 +579,6 @@ impl JournalRecord {
         };
         validate_record_shape(&record)?;
         Ok(record)
-    }
-
-    pub(crate) fn belongs_to(&self, document: DocumentId) -> bool {
-        self.belongs_to_key(JournalDocumentKey(document.get()))
     }
 
     pub(crate) fn belongs_to_key(&self, key: JournalDocumentKey) -> bool {
@@ -688,6 +683,7 @@ pub(crate) fn decode_journal(bytes: &[u8]) -> Result<Vec<JournalRecord>, Journal
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct JournalRecovery {
     pub(crate) document: DocumentId,
     pub(crate) durable_seq: Seq,
@@ -705,6 +701,7 @@ pub(crate) struct StoredJournalRecovery {
 }
 
 /// Validate and replay a complete journal, yielding only its latest durable sequence.
+#[cfg(test)]
 pub(crate) fn recover_journal(
     document: DocumentId,
     bytes: &[u8],
@@ -837,9 +834,7 @@ pub(crate) struct JournalAppendProof {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalStage {
-    Encode,
     Append,
-    Sync,
     VerifyProof,
 }
 
@@ -902,6 +897,7 @@ pub(crate) struct DraftJournalReducer {
 }
 
 impl DraftJournalReducer {
+    #[cfg(test)]
     pub(crate) fn new(document: DocumentId, durable_seq: Seq) -> Self {
         Self::new_with_key(document, JournalDocumentKey(document.get()), durable_seq)
     }
@@ -925,6 +921,7 @@ impl DraftJournalReducer {
         self.durable_seq
     }
 
+    #[cfg(test)]
     pub(crate) fn phase(&self) -> &JournalPhase {
         &self.phase
     }
@@ -1640,6 +1637,15 @@ mod tests {
         let rejected = model.successors("RetryIndeterminate", &indeterminate);
         assert_eq!(rejected, vec![indeterminate.clone()]);
         assert!(model.check_invariant("IndeterminateDoesNotClaimDurability", &indeterminate));
+        // Negative control: booking the unverified publication as committed —
+        // adopting `visible` as the baseline, which the reducer above refused —
+        // is no transition of the healthy model.
+        let claimed = aterm_spec::interp::with_buggy(&model, 1)
+            .successors("ResolveManualIndeterminate", &locked)[0]
+            .clone();
+        assert_eq!(claimed["manual_committed"], 1);
+        assert_eq!(aterm_spec::interp::admits(&model, &locked, &claimed), None);
+        assert!(!model.check_invariant("IndeterminateDoesNotClaimDurability", &claimed));
 
         reducer.accept_observation(visible).unwrap();
         assert_eq!(reducer.begin(&snapshot).unwrap().expected, visible);

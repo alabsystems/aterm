@@ -223,10 +223,11 @@ pub fn stable_dmg_asset_name() -> String {
     "aterm.dmg".to_string()
 }
 
-/// The stable, version-independent twin of the updater zip — the PRIMARY
-/// download: the alab.systems homepage is a single evergreen button pointed at
-/// `releases/latest/download/aterm-mac.zip`, the lightweight app-only
-/// container (the app installs its toolchain itself on first launch).
+/// The stable, version-independent twin of the updater zip, for bookmarked and
+/// printed links to `releases/latest/download/aterm-mac.zip`, the lightweight
+/// app-only container (the app installs its toolchain itself on first launch).
+/// The alab.systems homepage button is NOT this link: `publish/site-sync.py`
+/// points it at the versioned DMG of the newest release that carries one.
 /// Byte-identical to the [`zip_asset_name`] asset of the same cut, exactly as
 /// the DMG twin is to its canonical DMG, and like it elected by NO client —
 /// the in-app updater stages from the manifest's version-bound `zip` field —
@@ -271,10 +272,10 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 /// The zip is unconditional because every manifest this cutter emits names one,
 /// and a manifest naming an asset the channel does not carry is exactly the
 /// live-but-unelectable state this module exists to prevent. The stable twins
-/// are unconditional for the inverse reason: the website's evergreen
-/// `releases/latest/download/aterm-mac.zip` button (the homepage's ONLY
-/// download) and every printed/bookmarked `.../aterm.dmg` link 404 on any
-/// release that drops them. The sidecars are unconditional for the humans, not
+/// are unconditional for the inverse reason: every bookmarked or printed
+/// `releases/latest/download/aterm-mac.zip` or `.../aterm.dmg` link 404s on any
+/// release that drops them. (The homepage button links the versioned DMG, which
+/// `publish/site-sync.py` picks.) The sidecars are unconditional for the humans, not
 /// the updater: the containers are the manual downloads, their digests
 /// otherwise live only inside the appcast TOML nobody opens, and a download
 /// nobody can check is a funnel that trains people not to check. The TWIN
@@ -534,7 +535,7 @@ pub enum HeadPatchValue {
 ///   API, `"true" | "false" | "legacy"`, hence `-f`).
 ///
 /// The live PATCH ([`head_patch_argv`]) and the fake GitHub in
-/// `tests/channel_latest.rs` both read this table, so a field dropped here is dropped
+/// `tests/it/channel_latest.rs` both read this table, so a field dropped here is dropped
 /// from the tests too — and the adopt-path proof fails at the pointer gate.
 pub const HEAD_PATCH: [(&str, HeadPatchValue); 3] = [
     ("draft", HeadPatchValue::Bool(false)),
@@ -562,7 +563,7 @@ pub fn head_patch_argv(endpoint: &str) -> Vec<String> {
 
 /// The remote half of putting one cut onto its release on the public channel — every
 /// call that talks to GitHub — so that [`publish_on_channel`] can fix their ORDER in
-/// one place and a fake GitHub can prove it (`tests/channel_latest.rs`).
+/// one place and a fake GitHub can prove it (`tests/it/channel_latest.rs`).
 pub trait ChannelRelease {
     /// Converge one asset onto the release under a durable one-shot upload intent,
     /// re-downloaded and proved byte-identical to the local file.

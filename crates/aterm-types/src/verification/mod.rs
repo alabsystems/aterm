@@ -4,10 +4,7 @@
 
 //! Shared verification helpers used across extracted crates.
 //!
-//! - `stubs`: Kani-friendly replacements for `HashMap`, `HashSet`, `Instant`, `VecDeque`
-//!
-//! FFI pointer lifecycle tracking (`ffi_free_tracker`, `terminal_handle_tracker`)
-//! lives in `aterm-ffi-types` (#3353).
+//! - `stubs`: a Kani-friendly replacement for `HashMap` (`VerifyMap`)
 
 /// Verification-friendly container stubs for Kani proofs.
 pub mod stubs;

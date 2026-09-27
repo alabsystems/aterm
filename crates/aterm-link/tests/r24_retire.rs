@@ -88,7 +88,7 @@ fn the_doctor_retires_a_ghost_through_a_live_bridge() {
         dry.contains(ghost) && dry.contains("nothing published (dry)"),
         "{dry}"
     );
-    assert!(dry.contains("hosts a running bridge"), "{dry}");
+    assert!(dry.contains("'s bridge is asked to publish them"), "{dry}");
     assert_eq!(
         presence_body(&w, ghost)
             .as_deref()

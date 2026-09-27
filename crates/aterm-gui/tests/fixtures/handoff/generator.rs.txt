@@ -127,6 +127,7 @@ fn fx_window(
         outer_x: Some(96),
         outer_y: Some(48),
         maximized: None,
+        show: crate::restore::WindowShow::UNKNOWN,
         tabs: Vec::new(),
         native_tabs: Vec::new(),
         tab_order: Vec::new(),

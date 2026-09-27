@@ -132,6 +132,9 @@ pub mod install;
 pub mod landing;
 /// Laying executables (shims, stubs, tombstones): one temp + `rename(2)` writer.
 pub mod lay;
+/// Toolchain leases: a run holds the store build it resolved for as long as it runs, so gc
+/// never reclaims it and the unattended trust flip waits for it.
+pub mod lease;
 pub mod linkmode;
 pub mod lock;
 pub mod machine;
@@ -151,19 +154,14 @@ pub mod noindex;
 pub mod notice;
 /// OpenPGP detached-signature verification (vendor-direct design §1.2): a v4 RSA
 /// signature over a vendor's digest document, under a key compiled into this binary.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the vendor-direct lane, which lands separately; delete this attribute when it does"
-    )
-)]
 pub(crate) mod openpgp;
 pub mod ops;
 /// `packages.log` beside `aterm.log`: one whole line per pass and per program transition,
 /// written by every lane, rotated under the store lock — what Settings ▸ Packages' Activity
 /// reads (Phase 4).
 pub mod packages_log;
+/// A waiting pending stub wakes when the package pass replaces a `bin/` shim.
+mod pending_wake;
 pub mod pin;
 pub mod platform;
 pub mod progress;
@@ -173,6 +171,9 @@ pub mod protected;
 /// `com.apple.provenance`: the predicate (`listxattr`), the per-process tracking
 /// measurement, and the two sentences every refusal that names the tag shares.
 pub mod provenance;
+/// Flip when quiet: an unattended update stages a new Trust toolchain at once and flips it
+/// only when no run leases or runs from the one it replaces — four hours at the most.
+pub mod quiet;
 pub mod relocate;
 pub mod reroute;
 /// The rustup toolchain seam owner (Lockstep S1): `<rustup_home>/toolchains/trust` ->
@@ -207,12 +208,10 @@ pub mod vendor_direct;
 pub mod verify;
 
 pub use activate::{Aliases, activate_channel, atomic_symlink, install_shims};
-pub use apply::{Group, TxnOutcome, plan_groups, transact};
+pub use apply::{Group, TxnOutcome, plan_groups};
 pub use cache::IndexCache;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
-pub use cost::{disk_ok, human_bytes, needs_consent};
-pub use discovery::{IndexRepo, resolve_account};
-pub use dispatch::{ApplyStrategy, strategy_for};
+pub use discovery::resolve_account;
 pub use extract::{
     EntryKind, ExtractError, ExtractReject, TooLargeReason, extract_tar_zst, vet_entry,
     vet_hardlink,
@@ -222,14 +221,12 @@ pub use flow::{
     InstallRequest, VendorFetchError, VendorGet, apply_channel, apply_channel_with, install,
     resolve_verified_index,
 };
-pub use gate::{ApplyDecision, decide, is_yanked};
-pub use gc::{GcReport, reclaimable, run as run_gc};
+pub use gate::ApplyDecision;
 pub use install::{StageError, verify_and_stage};
 pub use linkmode::{
     LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
     linked_programs, linked_programs_checked, linked_tool_names, refresh, unlink,
 };
-pub use lock::{StoreLock, StoreLockError, try_lock_store};
 // `parse_index` is deliberately NOT re-exported (and is `pub(crate)`): outside this
 // crate, the only way to a parsed `Index` is `TrustedRoster::authorize_index`, which runs
 // the machine-id bind the raw parse would let a caller skip. See its doc in `manifest`.
@@ -237,20 +234,15 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, TARGETS, parse_pkg,
 };
 pub use net::{DirFetcher, GithubFetcher};
-pub use noindex::{Migration, Verdict, migrate, scan, verify};
 pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, Selection, select_index};
-pub use shim_env::ShimEnv;
 pub use sig::{
     Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,
     check_freshness,
 };
 pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
-pub use sysroot::{relocate_sysroot, write_toolchain_version};
 pub use tree::{sha256_file, tree_root};
-pub use vendor::{VENDOR_HOSTS, shadowing_binary_on_path, system_satisfied};
-pub use verify::{VerifyOutcome, verify_all, verify_program};
 
 /// The base64 Ed25519 public key(s) of the **paper master** this binary trusts — atpkg's
 /// one and only trust root, shared verbatim with the app update channel.

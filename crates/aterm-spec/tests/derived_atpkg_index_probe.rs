@@ -3,11 +3,42 @@
 
 use aterm_spec::{
     derive::{
-        atpkg_index_probe_cooldown_model, atpkg_index_successor_selection_model,
-        atpkg_index_wake_highwater_model,
+        atpkg_index_probe_completion_cadence_model, atpkg_index_probe_cooldown_model,
+        atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
     },
     interp, verify,
 };
+
+#[test]
+fn the_next_probe_uses_the_shared_stamps_completion_clock() {
+    let model = atpkg_index_probe_completion_cadence_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name)
+    );
+    verify::prove_and_catch_scalar(&model, "atpkg index probe completion cadence");
+
+    let buggy = interp::with_buggy(&model, 1);
+    let mut fixed = model.init_state();
+    let mut old = buggy.init_state();
+    for action in ["Start", "NetworkTick", "Complete"] {
+        assert!(model.fire(action, &mut fixed));
+        assert!(buggy.fire(action, &mut old));
+    }
+    for _ in 0..5 {
+        assert!(model.fire("Tick", &mut fixed));
+        assert!(buggy.fire("Tick", &mut old));
+    }
+    assert!(model.fire("LocalCheck", &mut fixed));
+    assert!(buggy.fire("LocalCheck", &mut old));
+    assert_eq!(fixed["phase"], 2, "the new probe still waits for the stamp");
+    assert_eq!(old["phase"], 3, "the old start clock probes too soon");
+    assert!(!buggy.check_invariant("NoProbeBeforeSharedStampExpires", &old));
+    assert!(model.fire("Tick", &mut fixed));
+    assert!(model.fire("DueCheck", &mut fixed));
+    assert_eq!(fixed["phase"], 3, "the next tick starts the probe");
+}
 
 #[test]
 fn cross_process_probe_cooldown_proves_and_catches_duplicate_ranges() {

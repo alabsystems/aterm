@@ -90,6 +90,33 @@ fn grid_with_tiered_scrollback() {
     assert!(grid.scrollback_lines() > grid.storage.ring_buffer_scrollback());
 }
 
+/// A store that arrives PRE-FILLED (a restored checkpoint's history) numbers
+/// its carried lines from `0` and the live top past them — the identity
+/// `oldest_absolute_row()` documents. The counter used to start at `rows`
+/// whatever the store held, so the oldest row saturated onto the live top and
+/// every carried line read as evicted.
+#[test]
+fn a_prefilled_tiered_store_is_numbered_below_the_live_top() {
+    let mut scrollback = Scrollback::new(100, 1000, 10_000_000);
+    for i in 0..35 {
+        scrollback.push_str(&format!("carried {i}"));
+    }
+    let grid = Grid::with_tiered_scrollback(6, 24, 1000, scrollback);
+
+    assert_eq!(grid.scrollback_lines(), 35);
+    assert_eq!(
+        grid.oldest_absolute_row(),
+        0,
+        "the oldest carried line is row 0"
+    );
+    assert_eq!(
+        grid.visible_to_absolute(0),
+        35,
+        "the live top is numbered past every carried line"
+    );
+    assert_eq!(grid.absolute_row_counter(), 41);
+}
+
 #[test]
 fn grid_scrollback_content_preserved() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);

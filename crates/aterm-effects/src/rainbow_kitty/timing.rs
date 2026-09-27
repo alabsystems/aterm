@@ -565,11 +565,13 @@ pub fn spring_snap(age_s: f32) -> f32 {
 }
 
 /// `spring-whip`'s natural frequency, rad/s (§2.5).
+#[cfg(test)]
 pub const SPRING_WHIP_OMEGA: f32 = 24.0;
 
 /// `spring-whip`'s damping ratio (§2.5). Under 1, so it OVERSHOOTS — which is
 /// the point: the flying kitty is yanked backwards and springs past her
 /// resting lead before settling.
+#[cfg(test)]
 pub const SPRING_WHIP_ZETA: f32 = 0.6;
 
 /// `spring-whip` — the DAMPED unit step (ω = 24 rad/s, ζ = 0.6) of §2.5:
@@ -581,6 +583,7 @@ pub const SPRING_WHIP_ZETA: f32 = 0.6;
 /// `e^(−ζωt) = e^(−2.6) ≈ 0.07` at `t = 0.18`, the number the spec quotes.
 #[inline]
 #[must_use]
+#[cfg(test)]
 pub fn spring_whip(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
@@ -632,11 +635,6 @@ pub const FIELD_STAR_COV_CEIL: f32 = STAR_STACK_ADD * FIELD_STAR_COV_REQUEST_MAX
 /// mini-fan stars fly OVER INK, so they are priced by v1's
 /// `RAINBOW_TRANSIENT_COV_CAP` instead. Class centres: m1 118, m2 80, m3 61.
 pub const TRANSIENT_STAR_COV_CEIL: f32 = 118.0;
-
-/// L2's over-ink ledger cap (v1's `OVER_INK_COV_CAP`), restated here because
-/// the transient lane's whole justification is that it is ledger-held over
-/// probed glyph cells and the caret cell is exempt.
-pub const OVER_INK_COV_CAP: f32 = 47.0;
 
 /// L3's graded-jump roof (v1's `RAINBOW_JUMP_COV_CEIL`): the meteor's
 /// `head_cov = min(118·bright, 160)` (§6.3) tops out here.

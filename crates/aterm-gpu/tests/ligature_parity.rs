@@ -2,69 +2,42 @@
 // Copyright 2026 Andrew Yates
 //
 // CPU==GPU parity with an ACTIVELY-LIGATING font. The other parity tests use the
-// host system font (which may not ligate the demo text), so this one points BOTH
-// renderers at the bundled JetBrains Mono via $ATERM_FONT and renders a row full
+// host system font (which may not ligate the demo text), so this one builds BOTH
+// renderers on the bundled JetBrains Mono (as their family) and renders a row full
 // of programming operators ("a => b != c == d -> e <= f"). It asserts:
 //   1. the CPU frame actually ligated (it differs from the same renderer with
 //      ligatures forced off — so the test is non-vacuous), and
 //   2. the GPU frame matches the CPU frame within the usual <=8 LSB blend
 //      tolerance — i.e. the shared shaping plan keys + places the IDENTICAL
 //      ligature glyph on both paths.
-// Its own test BINARY (separate process) so the $ATERM_FONT env set here never
-// races the other parity SUITES; within this binary the set is hoisted behind a
-// OnceLock (see ligature_test_font) so the parallel #[test] threads never race
-// it either. Gated: no GPU / font -> skip cleanly.
+// Gated: no GPU / font -> skip cleanly.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
 mod common;
-use common::{backends, max_channel_delta_frame as max_channel_delta};
+use common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
-// Layout-independent ligature font discovery, and the SINGLE point where
-// $ATERM_FONT is exported to both renderers. Order: (a) $ATERM_LIGATURE_TEST_FONT
+// Layout-independent ligature font discovery. Order: (a) $ATERM_LIGATURE_TEST_FONT
 // if set and readable; (b) the committed fixture in the sibling aterm-render crate
-// (present in both canonical and vendored layouts).
-//
-// DISCOVERY DOES NOT READ $ATERM_FONT, only WRITES it. $ATERM_FONT is a
-// production setting that outranks `font_family` in config, so reading it here
-// let a developer's own font preference displace the committed fixture and
-// redden tests that hard-assert fixture-specific ligature behaviour. The
-// override is the dedicated var; the export below is unchanged, because pointing
-// both renderers at the resolved font is this helper's actual job.
-//
-// Every test in this binary wants the SAME font, but libtest runs the #[test]
-// fns on PARALLEL threads — a per-test set_var would race a sibling test's
-// renderer construction (C-side getenv/setenv under concurrent mutation is
-// dangling-pointer UB). So the mutation is hoisted here: `get_or_init` parks
-// every caller until the closure returns, so the ONE write is complete before
-// any renderer in this process is built — the same guarantee glow_parity.rs
-// gets from its Once. Returns the resolved path; None -> the caller SKIPs.
-fn ligature_test_font() -> Option<&'static std::path::Path> {
-    static FONT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    FONT.get_or_init(|| {
-        let found = std::env::var("ATERM_LIGATURE_TEST_FONT")
-            .ok()
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.exists())
-            .or_else(|| {
-                // aterm-gpu manifest is crates/aterm-gpu; the fixture is a sibling crate over.
-                const FIXTURE: &str = concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
-                );
-                let p = std::path::PathBuf::from(FIXTURE);
-                p.exists().then_some(p)
-            })?;
-        // Set exactly once per process (OnceLock init), before any renderer is
-        // constructed — every concurrent caller is parked in get_or_init until this
-        // write completes, so no getenv can observe it mid-mutation — and routed
-        // through the workspace's one lock-scoped env helper.
-        aterm_log::env::set("ATERM_FONT", &found);
-        Some(found)
-    })
-    .as_deref()
+// (present in both canonical and vendored layouts). The resolved path is handed to
+// both renderers as their FAMILY (`backends_with_font`) — the window's own
+// `--font` seam — so nothing here writes the environment. None -> the caller SKIPs.
+fn ligature_test_font() -> Option<std::path::PathBuf> {
+    std::env::var("ATERM_LIGATURE_TEST_FONT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .or_else(|| {
+            // aterm-gpu manifest is crates/aterm-gpu; the fixture is a sibling crate over.
+            const FIXTURE: &str = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
+            );
+            let p = std::path::PathBuf::from(FIXTURE);
+            p.exists().then_some(p)
+        })
 }
 
 #[test]
@@ -72,21 +45,20 @@ fn ligature_font_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Points BOTH renderers at the ligature font: resolves AND exports $ATERM_FONT,
-    // once per process (see ligature_test_font).
-    if ligature_test_font().is_none() {
+    // Builds BOTH renderers on the ligature font (see ligature_test_font).
+    let Some(font) = ligature_test_font() else {
         eprintln!(
             "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
         );
         return;
-    }
+    };
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
     // A CPU renderer with ligatures FORCED OFF, to prove the ligated frame is not
     // vacuously equal (the font really ligates the operators).
-    let Some(mut cpu_off) = Renderer::from_system(px, theme) else {
+    let Some(mut cpu_off) = Renderer::from_system_with_family(font.to_str(), px, theme) else {
         return;
     };
     cpu_off.set_text_shaping(TextShapingConfig {
@@ -138,15 +110,15 @@ fn ligature_selection_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
-    if ligature_test_font().is_none() {
+    // Builds BOTH renderers on the ligature font (see ligature_test_font).
+    let Some(font) = ligature_test_font() else {
         eprintln!(
             "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
         );
         return;
-    }
+    };
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
 
@@ -206,15 +178,15 @@ fn cursor_cutout_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
-    if ligature_test_font().is_none() {
+    // Builds BOTH renderers on the ligature font (see ligature_test_font).
+    let Some(font) = ligature_test_font() else {
         eprintln!(
             "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
         );
         return;
-    }
+    };
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
     // 日 is not in the JetBrains fixture, so each renderer spawns its OWN
@@ -282,15 +254,15 @@ fn ligature_ink_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
-    if ligature_test_font().is_none() {
+    // Builds BOTH renderers on the ligature font (see ligature_test_font).
+    let Some(font) = ligature_test_font() else {
         eprintln!(
             "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
         );
         return;
-    }
+    };
 
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+    let Some((mut cpu, mut gpu)) = backends_with_font(&font, px, theme) else {
         return;
     };
 

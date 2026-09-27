@@ -267,16 +267,9 @@ mod tests {
     /// apart would be two definitions of "protected"; this pins them.
     #[test]
     fn the_home_folders_match_the_noindex_walks_prune_list() {
-        let source = include_str!("noindex.rs");
-        let start = source
-            .find("const SKIP_DIRS: &[&str] = &[")
-            .expect("noindex.rs names its prune list");
-        let block = &source[start..];
-        let end = block.find("];").expect("the prune list closes");
-        let block = &block[..end];
         for folder in HOME_FOLDERS {
             assert!(
-                block.contains(&format!("\"{folder}\"")),
+                crate::noindex::SKIP_DIRS.contains(folder),
                 "noindex::SKIP_DIRS must prune {folder:?} — the two lists have drifted"
             );
         }

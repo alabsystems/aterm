@@ -18,4 +18,4 @@ pub(crate) mod gcb;
 pub(crate) mod width;
 
 // Re-export commonly used functions
-pub use width::{char_width, char_width_cjk, is_ambiguous_width, str_width, str_width_cjk};
+pub use width::{char_width, char_width_cjk, is_ambiguous_width, str_width};

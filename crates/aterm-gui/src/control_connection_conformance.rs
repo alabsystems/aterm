@@ -5,8 +5,12 @@
 //!
 //! The trace drives the genuine shipping `BoundedDispatch` with real `CtlStream`
 //! pairs, projects queued + running admissions plus observed outcomes into the
-//! derived model, and checks every transition. A historical over-admission
-//! projection is independently rejected so the test cannot pass vacuously.
+//! derived model, and checks every transition. Completion runs through
+//! `BoundedDispatch::serve_next`, the one body every control and subscription
+//! worker loops on, under a panicking handler; a `serve_next` that lost its
+//! completion guard would fail the `Complete` step. A historical over-admission
+//! projection and a completion that keeps its lane are independently rejected so
+//! the test cannot pass vacuously.
 
 #![cfg(test)]
 
@@ -117,16 +121,30 @@ fn shipping_connection_dispatch_conforms_and_rejects_overflow() {
     );
 
     let before_complete = project(&model, &dispatch, facts);
-    drop(dispatch.pop());
+    // The shipping worker body. The handler records what it sees while it runs,
+    // then panics, so only the completion guard's `Drop` can release the lane.
+    let mut while_serving = None;
+    let returned = dispatch.serve_next(|stream| {
+        while_serving = Some(project(&model, &dispatch, facts));
+        drop(stream);
+        panic!("synthetic control handler panic");
+    });
+    assert!(!returned, "the handler really panicked");
     assert_eq!(
-        project(&model, &dispatch, facts),
-        before_complete,
+        while_serving.as_ref(),
+        Some(&before_complete),
         "popping starts work but must retain its admission lane"
     );
-    dispatch.complete();
     facts.completed += 1;
     let after_complete = project(&model, &dispatch, facts);
     assert_transition(&model, &before_complete, &after_complete, "Complete");
+
+    // Negative control: a worker that returns without releasing its lane (the
+    // same panic with no guard) leaves the pool one lane short for good.
+    let mut leaked = after_complete.clone();
+    leaked.insert("outstanding", before_complete["outstanding"]);
+    assert_eq!(admits(&model, &before_complete, &leaked), None);
+    assert!(!model.check_invariant("AcceptedWorkAccounted", &leaked));
 
     // Capacity released by genuine worker completion is immediately reusable.
     assert!(admit(&model, &dispatch, &mut facts, true).is_none());

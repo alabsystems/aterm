@@ -39,12 +39,16 @@ const COLS: usize = 24;
 
 fn fresh_gpu() -> Option<GpuRenderer> {
     match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(mut g) => {
+        Ok(g) => {
             // THE FLIP: this suite drives the WGPU ORACLE arm's blit seams
             // (they read the wgpu offscreen); post-flip the oracle must be
             // asked for by name.
             #[cfg(target_os = "macos")]
-            g.disarm_metal_for_oracle();
+            let g = {
+                let mut g = g;
+                g.disarm_metal_for_oracle();
+                g
+            };
             Some(g)
         }
         Err(e) => {

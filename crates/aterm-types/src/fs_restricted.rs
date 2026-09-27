@@ -39,7 +39,14 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        // Only a mode that is not already `0700` is written: a `chmod(2)` to the
+        // mode a directory already has still moves its `st_ctime` (APFS), and
+        // tippy aborts when an ancestor of its executable changes ctime mid-run
+        // — aterm-update-core's copy of this rule learned that on 2026-09-15
+        // (privatedir.rs). The stat below still proves the final mode.
+        if !std::fs::metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let meta = std::fs::metadata(dir)?;
         let uid = current_uid();
         if !dir_safe_for_private_write(uid, meta.uid(), meta.mode()) {
@@ -138,5 +145,36 @@ mod tests {
         assert!(!dir_safe_for_private_write(501, 501, 0o040775));
         assert!(!dir_safe_for_private_write(501, 501, 0o040757));
         assert!(!dir_safe_for_private_write(501, 501, 0o040722));
+    }
+
+    /// A directory already `0700` and ours is left EXACTLY alone — no `chmod(2)`,
+    /// so its `st_ctime` does not move — while a drifted mode is still forced back
+    /// to `0700`. A same-mode chmod moves the ctime on APFS, and tippy snapshots the
+    /// ctime of every ancestor of the executable it runs and aborts on a change
+    /// ("ancestor … changed identity or contents"). This copy of the rule kept the
+    /// unconditional chmod after aterm-update-core's copy dropped it on 2026-09-15,
+    /// and on 2026-09-24 a merge-contract run lost its whole tippy stage to it:
+    /// `~/Library/Application Support/aterm`, the control-socket directory and an
+    /// ancestor of the atpkg store, had its ctime moved mid-compile.
+    #[cfg(unix)]
+    #[test]
+    fn an_already_private_dir_keeps_its_ctime_and_a_drifted_one_is_hardened() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("atypes-privdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let stamp = || {
+            let m = std::fs::metadata(&dir).unwrap();
+            (m.ctime(), m.ctime_nsec(), m.mode() & 0o7777)
+        };
+        let before = stamp();
+        assert_eq!(before.2, 0o700);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(stamp(), before, "an unchanged directory was written");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(stamp().2, 0o700, "a drifted mode is hardened");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

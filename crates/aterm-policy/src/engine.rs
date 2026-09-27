@@ -20,9 +20,7 @@
 //! 4. If no rule matches, returns `policy.defaults.unmatched`.
 //!
 //! Rules whose selector string fails to parse are treated as never-matching
-//! (fail-closed at the rule level). A fully malformed TOML is handled upstream
-//! by [`crate::Policy::from_toml_or_hardened`] which returns the Hardened
-//! profile and `fell_back = true`.
+//! (fail-closed at the rule level).
 //!
 //! # Totality
 //!
@@ -55,7 +53,6 @@ use std::sync::Arc;
 use crate::{
     OriginTag, Policy, RateLimit, Response,
     limits::{RateLimitSlot, RateLimiterSet, TimeSource},
-    profiles,
     selector::{BucketKey, DispatchedSequence, FunctionKind, SequenceSelector},
 };
 
@@ -187,40 +184,11 @@ impl PolicyEngine {
         }
     }
 
-    /// Fail-closed default engine (Hardened profile). Used when the TOML
-    /// policy fails to load (§4.4).
-    #[must_use]
-    pub fn hardened() -> Self {
-        Self::new(profiles::hardened())
-    }
-
-    /// Load a TOML policy into an engine, falling back to [`Self::hardened`]
-    /// on any parse error or schema mismatch (§4.4).
-    ///
-    /// Returns `(engine, fell_back)`. The caller can use the bool for
-    /// telemetry — the engine itself is always safe to evaluate against.
-    #[must_use]
-    pub fn from_toml_or_hardened(src: &str) -> (Self, bool) {
-        let (policy, fell_back) = Policy::from_toml_or_hardened(src);
-        (Self::new(policy), fell_back)
-    }
-
     /// Borrow the underlying [`Policy`] — useful for introspection (FFI,
     /// host UIs, mirror-field sync in #7993).
     #[must_use]
     pub fn policy(&self) -> &Policy {
         &self.policy
-    }
-
-    /// Replace the backing policy, rebuilding the decision tree.
-    ///
-    /// Cheaper than constructing a brand-new engine because we reuse the
-    /// same bucket `HashMap` layout, but the hot path still takes an
-    /// amortized linear pass over the rule list. Hosts that hot-swap
-    /// policies mid-session call this method rather than constructing a
-    /// second engine.
-    pub fn replace_policy(&mut self, policy: Policy) {
-        *self = Self::new(policy);
     }
 
     /// Evaluate the policy against a dispatched sequence and its origin.
@@ -374,21 +342,6 @@ impl PolicyEngine {
         self.limiters.try_consume_slot(slot, amount, clock)
     }
 
-    /// Borrow the engine's rate-limiter set — intended for diagnostics
-    /// and for host surfaces that want to read the current token balance
-    /// (e.g. an observability panel).
-    #[must_use]
-    pub fn rate_limiters(&self) -> &RateLimiterSet {
-        &self.limiters
-    }
-
-    /// Borrow the engine's rate-limiter set mutably. Intended for host
-    /// code that needs to reconfigure a single bucket without rebuilding
-    /// the policy from scratch (e.g. a runtime kill-switch toggle).
-    pub fn rate_limiters_mut(&mut self) -> &mut RateLimiterSet {
-        &mut self.limiters
-    }
-
     /// Look up a [`RateLimit`] configuration by id. Returns `None` when
     /// the active policy does not declare a bucket with that id.
     #[must_use]
@@ -510,13 +463,6 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn fail_closed_on_garbage_toml() {
-        let (eng, fell_back) = PolicyEngine::from_toml_or_hardened("<<< not toml >>>");
-        assert!(fell_back);
-        assert_eq!(eng.policy().profile, Profile::Hardened);
-    }
-
-    #[test]
     fn malformed_rule_selector_is_skipped() {
         let mut p = profiles::standard();
         // Inject a rule with a garbage selector. It must never match;
@@ -621,20 +567,6 @@ mod tests {
         let d = eng.evaluate(&osc(52, &["c", "?"]), OriginTag::Host);
         assert_eq!(d.response, Response::Drop);
         assert!(d.matched_rule.is_none());
-    }
-
-    #[test]
-    fn replace_policy_rebuilds_tree() {
-        let mut eng = PolicyEngine::new(profiles::permissive());
-        assert_eq!(
-            eng.evaluate(&osc(52, &["c", "?"]), OriginTag::Pty).response,
-            Response::Execute,
-        );
-        eng.replace_policy(profiles::hardened());
-        assert_eq!(
-            eng.evaluate(&osc(52, &["c", "?"]), OriginTag::Pty).response,
-            Response::Drop,
-        );
     }
 
     #[test]

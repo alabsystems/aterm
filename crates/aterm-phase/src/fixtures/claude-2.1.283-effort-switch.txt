@@ -1,0 +1,40 @@
+# claude-code 2.1.283 · HAND-BUILT 2026-09-26 (no live capture yet: on Haiku 4.5 `/effort high` applied without asking): rows from the 2.1.283 render code ($J, kind "effort") on the MEASURED model-switch capture's geometry · `Change effort level?`, no footer
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/work1
+
+  Updated to latest. Got 33 features, 240 bugfixes, and 103 other changes.
+  code.claude.com/docs/en/changelog for details
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ Reply with the single word: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 8:14 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Change effort level?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current effort level. Switching to high means the full history gets re-read on
+   your next message.
+
+   ❯ 1. Yes, switch to high
+     2. No, go back

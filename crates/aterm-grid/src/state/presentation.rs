@@ -704,6 +704,7 @@ impl GridPresentationState {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn styles_mut(&mut self) -> &mut StyleTable {
         &mut self.styles
     }

@@ -6,8 +6,7 @@
 //! [`check_report`] is the symbol the roster calls. It answers one question —
 //! *is aterm's third-party surface still the surface this repository says it
 //! is?* — with NO COMPILATION and NO NETWORK: one `cargo tree` resolution per
-//! cell plus a few hundred file reads, because it sits inside `gate all` and on
-//! the pre-push path.
+//! cell plus a few hundred file reads, because it sits inside `gate all`.
 //!
 //! # Why patch liveness is the obligation that justifies this gate
 //!
@@ -54,6 +53,7 @@
 //! | `[OB-14]` | the measured surface conforms to its ratchet | `tools/forge-budget.tsv` |
 //! | `[OB-15]` | no `[patch]` CAPTURES a differential oracle | `[dev-dependencies]` + `Cargo.lock` |
 //! | `[OB-16]` | the mirror's `[source]` fragment and `Cargo.lock` agree, and a present mirror covers the lock | [`crate::mirror_config`] + [`crate::mirror`] |
+//! | `[OB-17]` | the fork ledger parses, names the measured cell matrix, and records exactly the vendored forks — path, version, license, §4(b) flag and census class | `vendor/forge.toml` `[forge]` + `[[fork]]` via [`crate::policy`] |
 //!
 //! # What it deliberately does NOT re-check
 //!
@@ -67,7 +67,7 @@
 
 use crate::mirror_config::{self, Finding};
 use crate::model::{Cell, Graph, PkgId};
-use crate::{Outcome, PRECISION_NOTE, attest, budget, resolve};
+use crate::{Outcome, PRECISION_NOTE, attest, budget, policy, resolve};
 use aterm_census::scan_set::{REVIEWED_VENDORED_CRATES, VendoredMode};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -735,6 +735,28 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
          status is outside it entirely."
     );
 
+    // -- [OB-17] the fork ledger ----------------------------------------------
+    // Until 2026-09-25 only `cargo test -p aterm-forge` read the `[forge]` and
+    // `[[fork]]` halves of this file, so a judged edit — a `[forge] cells` row
+    // for `TOTALLY-BOGUS` / `sparc64-unknown-none` — left this verb GREEN.
+    let _ = writeln!(
+        log,
+        "  [OB-17] FORK LEDGER — {POLICY_FILE} parses fail-closed, names the cell matrix forge \
+         measures, and records every vendored fork as the tree has it:"
+    );
+    let ledger = ledger_findings(root);
+    for why in &ledger {
+        let _ = writeln!(log, "  ✗ FAIL [OB-17] {why}");
+    }
+    fails += ledger.len();
+    if ledger.is_empty() {
+        let _ = writeln!(
+            log,
+            "    OK — header and fork blocks agree with default_cells(), [patch.crates-io], \
+             [OB-7]'s license reading and REVIEWED_VENDORED_CRATES."
+        );
+    }
+
     // -- verdict --------------------------------------------------------------
     // Counted separately in the verdict because they are separate things: a
     // fork is third-party source under standing review, a first-party target
@@ -779,6 +801,134 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
 // ---------------------------------------------------------------------------
 // Pieces
 // ---------------------------------------------------------------------------
+
+/// `[OB-17]`: one line per way the fork ledger disagrees with the tree.
+///
+/// The ledger's header is the record of what every forge number was measured
+/// over, so it must BE [`resolve::default_cells`]; its `[[fork]]` blocks are the
+/// record of what aterm redistributes, so they must be the VENDORED
+/// `[patch.crates-io]` entries exactly, at the path, version and license their
+/// manifests carry, with the §4(b) flag `[OB-7]` derives from that license and
+/// the census class REVIEWED_VENDORED_CRATES gives them. An absent ledger is a
+/// finding only once a vendored fork exists to be recorded.
+fn ledger_findings(root: &Path) -> Vec<String> {
+    let vendored: Vec<policy::PatchEntry> = match policy::patch_entries(root) {
+        Ok(all) => all
+            .into_iter()
+            .filter(policy::PatchEntry::is_vendored)
+            .collect(),
+        Err(e) => return vec![e],
+    };
+    if !root.join(POLICY_FILE).is_file() {
+        return if vendored.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "{POLICY_FILE} is missing, but {} vendored fork(s) are patched in — the ledger \
+                 is where their redistribution obligations are recorded. Fix: restore it, one \
+                 `[[fork]]` block per vendored `[patch.crates-io]` entry.",
+                vendored.len()
+            )]
+        };
+    }
+    let ledger = match policy::load(root) {
+        Ok(p) => p,
+        Err(e) => return vec![e],
+    };
+    let mut out = Vec::new();
+    let measured = resolve::default_cells();
+    if ledger.forge.cells != measured {
+        let names = |cells: &[Cell]| {
+            cells
+                .iter()
+                .map(|c| format!("{} ({}, {})", c.name, c.triple, c.package))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push(format!(
+            "{POLICY_FILE}'s [forge] cells name [{}], but forge measures [{}]. A ledger row \
+             nothing measures reads as an audited cell and is not one. Fix: make the block \
+             equal `resolve::default_cells()`, or fix default_cells.",
+            names(&ledger.forge.cells),
+            names(&measured)
+        ));
+    }
+    for p in &vendored {
+        let Some(f) = ledger.forks.iter().find(|f| f.name == p.name) else {
+            out.push(format!(
+                "vendored fork `{}` ({}) has no `[[fork]]` block in {POLICY_FILE} — its \
+                 redistribution obligations are recorded nowhere. Fix: add the block, with the \
+                 reason it exists in the comment above it.",
+                p.name, p.path
+            ));
+            continue;
+        };
+        let tree = (
+            p.path.as_str(),
+            p.manifest_version.as_str(),
+            p.license.as_str(),
+        );
+        let recorded = (f.path.as_str(), f.version.as_str(), f.license.as_str());
+        if recorded != tree {
+            out.push(format!(
+                "`[[fork]] {}` records path/version/license {recorded:?}, but the tree has \
+                 {tree:?}. Fix: update the block to match the vendored manifest — the ledger is \
+                 the record of what is redistributed, so it may not describe another copy.",
+                p.name
+            ));
+        }
+        // `apache_notice` says whether §4(b) notices are OWED; `[OB-7]` decides that
+        // from the license alone, so the flag may only ever agree with it.
+        let owed = attest::apache_is_mandatory(&p.license);
+        if f.apache_notice != owed {
+            out.push(format!(
+                "`[[fork]] {}` records apache_notice = {}, but its license `{}` makes the \
+                 Apache-2.0 §4(b) notices {} — which is what `[OB-7]` enforces. Fix: set \
+                 apache_notice = {owed}.",
+                p.name,
+                f.apache_notice,
+                p.license,
+                if owed {
+                    "OWED"
+                } else {
+                    "NOT owed (a non-Apache arm is available)"
+                }
+            ));
+        }
+        // The census classification is REVIEWED_VENDORED_CRATES's; a fork with no
+        // row there is `[OB-11]`'s finding, so only a row that exists is compared.
+        if let Some(reviewed) = REVIEWED_VENDORED_CRATES
+            .iter()
+            .find(|v| v.package == p.name)
+        {
+            let census = match &reviewed.mode {
+                VendoredMode::Scanned { namespace, .. } => {
+                    (policy::CensusMode::Scanned, Some(*namespace))
+                }
+                VendoredMode::BuildDepOnly { .. } => (policy::CensusMode::BuildDepOnly, None),
+            };
+            let recorded = (f.census_mode, f.census_namespace.as_deref());
+            if recorded != census {
+                out.push(format!(
+                    "`[[fork]] {}` records census mode/namespace {recorded:?}, but \
+                     REVIEWED_VENDORED_CRATES classifies it {census:?}. Fix: copy the \
+                     registry's classification — the registry is the one the census runs on.",
+                    p.name
+                ));
+            }
+        }
+    }
+    for f in &ledger.forks {
+        if !vendored.iter().any(|p| p.name == f.name) {
+            out.push(format!(
+                "`[[fork]] {}` ({}) records a fork no `[patch.crates-io]` entry vendors. Fix: \
+                 delete the stale block.",
+                f.name, f.path
+            ));
+        }
+    }
+    out
+}
 
 /// Split the nodes named `name` into "the fork is live" and the UNPATCHED
 /// siblings resolving under the same name. A sibling is any node of that name
@@ -1464,6 +1614,7 @@ reason = \"no arch intrinsics reach the shipped build\"
             "[OB-13]",
             "[OB-14]",
             "[OB-16]",
+            "[OB-17]",
         ] {
             assert!(
                 log.contains(tag),

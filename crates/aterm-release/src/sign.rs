@@ -48,7 +48,7 @@
 //!     atpkg/aterm-ctl/aterm-cli BEFORE the outer bundle seals them) + make-dmg.sh's
 //!     DMG signature.
 //!   * apps/aterm-mac/notarize.sh — auth assembly, the ad-hoc/Dev-ID/hardened-
-//!     runtime preflights (pure, fixture-tested in tests/signconf.rs), submit
+//!     runtime preflights (pure, fixture-tested in tests/it/signconf.rs), submit
 //!     --wait, staple, validate, spctl assessment.
 
 use std::path::{Path, PathBuf};
@@ -1011,7 +1011,7 @@ impl NotaryAuth {
 }
 
 /// The notarize.sh refusal preflights, as a PURE function over `codesign -dv
-/// --verbose=2` output (fixture-tested in tests/signconf.rs). Rejects, in the
+/// --verbose=2` output (fixture-tested in tests/it/signconf.rs). Rejects, in the
 /// script's order:
 ///   1. an ad-hoc signature ("Signature=adhoc") — cannot be notarized; loudly,
 ///      rather than wasting a round-trip to Apple;
@@ -1040,7 +1040,7 @@ impl NotaryAuth {
 /// [`DrClass::Cdhash`] refuses: text with no requirement in it classifies
 /// [`DrClass::Unsigned`] or [`DrClass::Unknown`] and is left alone, because an
 /// artifact carrying no requirement at all is already rejected by rule 2's
-/// missing Authority line, and the pure fixtures in tests/signconf.rs predate
+/// missing Authority line, and the pure fixtures in tests/it/signconf.rs predate
 /// the probe.
 pub fn devid_preflight(codesign_info: &str, is_app: bool) -> Result<(), String> {
     if codesign_info.contains("Signature=adhoc") {
@@ -1787,7 +1787,7 @@ mod dr_tests {
     #[test]
     fn requirement_free_text_does_not_invent_a_refusal() {
         // Rule 4 is a positive test. Output with no probe (the pre-existing
-        // fixtures in tests/signconf.rs) must keep its old verdict, and an
+        // fixtures in tests/it/signconf.rs) must keep its old verdict, and an
         // UNSIGNED artifact is already caught by the Authority rule — with that
         // message, not this one.
         let no_probe = "Identifier=com.aterm.aterm\n\

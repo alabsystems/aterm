@@ -312,7 +312,7 @@ pub(super) fn build_client(
     if let Some(process) = managed_process {
         #[cfg(target_os = "macos")]
         {
-            let (socket, _) = loopback_socket(effective_endpoint).ok_or_else(|| {
+            let socket = loopback_socket(effective_endpoint).ok_or_else(|| {
                 "managed Ollama connector requires an HTTP loopback endpoint".to_string()
             })?;
             return Ok(
@@ -797,15 +797,14 @@ fn host_is_loopback(host: &str) -> bool {
     canonical_loopback_ip(host).is_some()
 }
 
-pub(super) fn loopback_socket(endpoint: &str) -> Option<(std::net::SocketAddr, String)> {
+pub(super) fn loopback_socket(endpoint: &str) -> Option<std::net::SocketAddr> {
     let (scheme, host, port) = endpoint_authority(endpoint)?;
     if scheme != "http" {
         return None;
     }
     let port = port?;
     let ip = canonical_loopback_ip(host)?;
-    let socket = std::net::SocketAddr::new(ip, port);
-    Some((socket, socket.to_string()))
+    Some(std::net::SocketAddr::new(ip, port))
 }
 
 pub(super) fn snapshot_prompt(snapshot: &Snapshot) -> String {

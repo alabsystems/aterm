@@ -38,12 +38,6 @@ impl<T, const N: usize> SmallVec<T, N> {
         }
     }
 
-    /// Create a new, empty `SmallVec` (const-compatible alias for `new`).
-    #[must_use]
-    pub const fn new_const() -> Self {
-        Self::new()
-    }
-
     /// Create a `SmallVec` with the given capacity pre-allocated.
     ///
     /// If `capacity <= N`, uses inline storage. Otherwise, allocates on the heap.
@@ -177,74 +171,6 @@ impl<T, const N: usize> SmallVec<T, N> {
         }
     }
 
-    /// Insert an element at the given index.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index > len`.
-    // Skip: the raw element shift joins ArrayVec::insert/remove/retain's
-    // init/provenance classification (the sep model cannot see the shifted
-    // region's bounds across the raw ops). Same audited len-invariant.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub fn insert(&mut self, index: usize, value: T) {
-        let len = self.len();
-        assert!(index <= len, "index out of bounds: {index} > {len}");
-
-        match &mut self.data {
-            SmallVecData::Inline {
-                buf,
-                len: inline_len,
-            } if *inline_len < N => {
-                // Shift elements right
-                // SAFETY: we have room and all elements in 0..inline_len are init
-                unsafe {
-                    let ptr = buf.as_mut_ptr().cast::<T>();
-                    std::ptr::copy(ptr.add(index), ptr.add(index + 1), *inline_len - index);
-                    std::ptr::write(ptr.add(index), value);
-                }
-                *inline_len += 1;
-            }
-            _ => {
-                // Either inline-full or already on heap: ensure heap
-                self.ensure_heap();
-                if let SmallVecData::Heap(vec) = &mut self.data {
-                    vec.insert(index, value);
-                }
-            }
-        }
-    }
-
-    /// Remove and return the element at the given index.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index >= len`.
-    // Skip: the raw element shift / drop walk joins ArrayVec's
-    // insert/remove/retain init-provenance classification (per-slot
-    // memory-model producer lane). Same audited len-invariant.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub fn remove(&mut self, index: usize) -> T {
-        let len = self.len();
-        assert!(index < len, "index out of bounds: {index} >= {len}");
-
-        match &mut self.data {
-            SmallVecData::Inline {
-                buf,
-                len: inline_len,
-            } => {
-                // SAFETY: element at index is initialized, and we shift remaining left
-                unsafe {
-                    let ptr = buf.as_mut_ptr().cast::<T>();
-                    let value = std::ptr::read(ptr.add(index));
-                    std::ptr::copy(ptr.add(index + 1), ptr.add(index), *inline_len - index - 1);
-                    *inline_len -= 1;
-                    value
-                }
-            }
-            SmallVecData::Heap(vec) => vec.remove(index),
-        }
-    }
-
     /// Remove the element at `index` by swapping it with the last element.
     ///
     /// This is O(1) but does not preserve ordering.
@@ -261,40 +187,6 @@ impl<T, const N: usize> SmallVec<T, N> {
         let last = len - 1;
         self.as_mut_slice().swap(index, last);
         self.pop().expect("invariant: len > 0 after swap")
-    }
-
-    /// Truncate to the given length, dropping excess elements.
-    // Skip: the raw element shift / drop walk joins ArrayVec's
-    // insert/remove/retain init-provenance classification (per-slot
-    // memory-model producer lane). Same audited len-invariant.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub fn truncate(&mut self, new_len: usize) {
-        match &mut self.data {
-            SmallVecData::Inline { buf, len } => {
-                if new_len < *len {
-                    // inline `*len <= N` by invariant (push spills before
-                    // exceeding N), but the verifier cannot see that across
-                    // calls, so clamp both slice bounds to provably in-bounds
-                    // values (identical when the invariant holds:
-                    // `new_len < len <= N`), then iterate the clamped subslice
-                    // — the slice operation carries the `start <= end <= N`
-                    // proof and the loop has no per-index obligation.
-                    let end = if *len < N { *len } else { N };
-                    let start = if new_len < end { new_len } else { end };
-                    for slot in &mut buf[start..end] {
-                        // SAFETY: elements `new_len..len` were initialized
-                        // when pushed (`end <= len`), so every slot in the
-                        // subslice holds a live value; each is dropped
-                        // exactly once.
-                        unsafe {
-                            slot.assume_init_drop();
-                        }
-                    }
-                    *len = new_len;
-                }
-            }
-            SmallVecData::Heap(vec) => vec.truncate(new_len),
-        }
     }
 
     /// Extend from a slice (requires `T: Clone`).
@@ -392,32 +284,6 @@ impl<T, const N: usize> SmallVec<T, N> {
         }
     }
 
-    /// Convert into a `Vec<T>`.
-    // Skip: the inline->Vec drain joins the raw-shift init/provenance family.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub fn into_vec(mut self) -> Vec<T> {
-        match &mut self.data {
-            SmallVecData::Inline { buf, len } => {
-                // inline `*len <= N` by invariant; clamp to a provably in-bounds
-                // count (a no-op when the invariant holds) so the `buf[..current_len]`
-                // read below carries a `<= N` proof.
-                let current_len = if *len < N { *len } else { N };
-                let mut vec = Vec::with_capacity(current_len);
-                // SAFETY: elements 0..current_len are initialized
-                for elem in &buf[..current_len] {
-                    vec.push(unsafe { elem.assume_init_read() });
-                }
-                // Prevent double-drop: zero the length so Drop does nothing
-                *len = 0;
-                vec
-            }
-            SmallVecData::Heap(vec) => {
-                // Take the vec out, leave an empty one in its place
-                std::mem::take(vec)
-            }
-        }
-    }
-
     /// Create from a single element repeated `n` times.
     // Skip: the repeat-fill joins the raw-shift init/provenance family; `T: Clone`
     // is caller-chosen code besides (user-T dispatch).
@@ -434,33 +300,6 @@ impl<T, const N: usize> SmallVec<T, N> {
             sv.push(value);
         }
         sv
-    }
-
-    /// An iterator over references to elements.
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
-        self.as_slice().iter()
-    }
-
-    /// An iterator over mutable references to elements.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
-        self.as_mut_slice().iter_mut()
-    }
-
-    /// Retain only elements where the predicate returns true.
-    ///
-    /// Panic-safe: if the predicate panics, all elements are in a valid state.
-    /// Works in both inline and heap modes.
-    // Skip: the raw element shift / drop walk joins ArrayVec's
-    // insert/remove/retain init-provenance classification (per-slot
-    // memory-model producer lane). Same audited len-invariant.
-    #[cfg_attr(trust_verify, trust::skip)]
-    pub fn retain<F: FnMut(&T) -> bool>(&mut self, f: F) {
-        match &mut self.data {
-            SmallVecData::Heap(vec) => vec.retain(f),
-            SmallVecData::Inline { buf, len } => {
-                retain_inline(buf, len, f);
-            }
-        }
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -494,87 +333,6 @@ impl<T, const N: usize> SmallVec<T, N> {
             self.data = SmallVecData::Heap(vec);
         }
     }
-}
-
-// ── Inline retain with drop guard ──────────────────────────────────────────
-
-// Skip: the inline compaction's raw slot shuffle joins the init/provenance
-// family (per-slot memory-model producer lane); its predicate is
-// caller-chosen code besides. Same audited len-invariant.
-#[cfg_attr(trust_verify, trust::skip)]
-fn retain_inline<T, const N: usize>(
-    buf: &mut [MaybeUninit<T>; N],
-    len: &mut usize,
-    mut f: impl FnMut(&T) -> bool,
-) {
-    let original_len = *len;
-    *len = 0;
-
-    struct RetainGuard<'a, T, const N: usize> {
-        buf: &'a mut [MaybeUninit<T>; N],
-        len: &'a mut usize,
-        write: usize,
-        read: usize,
-        original_len: usize,
-    }
-
-    impl<T, const N: usize> Drop for RetainGuard<'_, T, N> {
-        fn drop(&mut self) {
-            // Elements read..original_len have NOT been processed — drop them.
-            // `read <= original_len <= N` by invariant; clamp both slice
-            // bounds so they are provably in bounds (identical when the
-            // invariant holds), then iterate the clamped subslice — the slice
-            // operation carries the `start <= end <= N` proof, no per-index
-            // obligation remains.
-            let end = if self.original_len < N {
-                self.original_len
-            } else {
-                N
-            };
-            let start = if self.read < end { self.read } else { end };
-            for slot in &mut self.buf[start..end] {
-                // SAFETY: the element is initialized and unprocessed; it is
-                // dropped exactly once.
-                unsafe {
-                    slot.assume_init_drop();
-                }
-            }
-            *self.len = self.write;
-        }
-    }
-
-    let mut guard = RetainGuard {
-        buf,
-        len,
-        write: 0,
-        read: 0,
-        original_len,
-    };
-
-    while guard.read < original_len {
-        let read = guard.read;
-        // SAFETY: element at `read` is initialized (read < original_len)
-        let keep = unsafe { f(&*guard.buf[read].as_ptr()) };
-        guard.read += 1;
-        if keep {
-            if guard.write != read {
-                // SAFETY: both indices in bounds; read element consumed, write slot empty
-                unsafe {
-                    let val = guard.buf[read].assume_init_read();
-                    guard.buf[guard.write] = MaybeUninit::new(val);
-                }
-            }
-            guard.write += 1;
-        } else {
-            // SAFETY: element is initialized; drop it
-            unsafe {
-                guard.buf[read].assume_init_drop();
-            }
-        }
-    }
-
-    guard.original_len = guard.read;
-    drop(guard);
 }
 
 // ── Trait impls ─────────────────────────────────────────────────────────────
@@ -773,8 +531,8 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
             let bound = if *end < N { *end } else { N };
             let s = if *start < bound { *start } else { bound };
             // Drop each not-yet-yielded element exactly once, advancing `start`
-            // BEFORE dropping — mirroring the `retain_inline` guard discipline —
-            // so no slot can be dropped twice even if an element's Drop panics.
+            // BEFORE dropping, so no slot can be dropped twice even if an
+            // element's Drop panics.
             // (`saturating_add` is identical here since `start < bound <= N`.)
             for slot in &mut buf[s..bound] {
                 *start = start.saturating_add(1);
@@ -800,7 +558,8 @@ impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
     fn into_iter(mut self) -> Self::IntoIter {
         // Move the storage out, leaving an empty inline buffer behind so the
         // source `SmallVec`'s Drop is a harmless no-op (len 0). This avoids the
-        // heap allocation `into_vec()` would perform for the inline case.
+        // heap allocation a detour through `Vec` would perform for the inline
+        // case.
         let data = std::mem::replace(
             &mut self.data,
             SmallVecData::Inline {
@@ -851,7 +610,6 @@ mod tests {
     // track, so a double-drop or leak is caught, not just a wrong count.
     struct DropCounter {
         counter: std::rc::Rc<std::cell::Cell<usize>>,
-        #[allow(dead_code)]
         payload: String,
     }
 
@@ -866,6 +624,9 @@ mod tests {
 
     impl Drop for DropCounter {
         fn drop(&mut self) {
+            // The payload is intact at drop time: a double drop or a drop of
+            // freed storage reads garbage here (and Miri flags the read).
+            assert_eq!(self.payload, "into-iter drop payload");
             self.counter.set(self.counter.get() + 1);
         }
     }
@@ -920,29 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_and_remove() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(3);
-        sv.insert(1, 2);
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-
-        let removed = sv.remove(1);
-        assert_eq!(removed, 2);
-        assert_eq!(sv.as_slice(), &[1, 3]);
-    }
-
-    #[test]
-    fn test_truncate() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        sv.truncate(1);
-        assert_eq!(sv.as_slice(), &[1]);
-    }
-
-    #[test]
     fn test_from_vec() {
         let sv: SmallVec<i32, 4> = SmallVec::from_vec(vec![1, 2, 3]);
         assert!(sv.is_inline());
@@ -951,15 +689,6 @@ mod tests {
         let sv: SmallVec<i32, 2> = SmallVec::from_vec(vec![1, 2, 3, 4, 5]);
         assert!(!sv.is_inline());
         assert_eq!(sv.as_slice(), &[1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_into_vec() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        let vec = sv.into_vec();
-        assert_eq!(vec, vec![1, 2]);
     }
 
     #[test]
@@ -1046,137 +775,6 @@ mod tests {
         sv.push("another string".into());
         drop(sv);
         // If we get here without ASAN/MIRI complaint, drop is correct.
-    }
-
-    #[test]
-    fn test_insert_at_end() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.insert(1, 2);
-        assert_eq!(sv.as_slice(), &[1, 2]);
-    }
-
-    #[test]
-    fn test_insert_at_beginning() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(2);
-        sv.push(3);
-        sv.insert(0, 1);
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn test_insert_out_of_bounds_panics() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.insert(1, 42);
-    }
-
-    #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn test_remove_out_of_bounds_panics() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.remove(0);
-    }
-
-    #[test]
-    fn test_retain_inline() {
-        let mut sv: SmallVec<i32, 8> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        sv.push(4);
-        sv.push(5);
-        assert!(sv.is_inline());
-        sv.retain(|x| x % 2 == 0);
-        assert_eq!(sv.as_slice(), &[2, 4]);
-        assert!(sv.is_inline());
-    }
-
-    #[test]
-    fn test_retain_heap() {
-        let mut sv: SmallVec<i32, 2> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        sv.push(4);
-        sv.push(5);
-        assert!(!sv.is_inline());
-        sv.retain(|x| x % 2 == 0);
-        assert_eq!(sv.as_slice(), &[2, 4]);
-    }
-
-    #[test]
-    fn test_retain_inline_with_drop_types() {
-        let mut sv: SmallVec<String, 8> = SmallVec::new();
-        sv.push("keep-a".into());
-        sv.push("drop-b".into());
-        sv.push("keep-c".into());
-        sv.push("drop-d".into());
-        sv.push("keep-e".into());
-        assert!(sv.is_inline());
-        sv.retain(|s| s.starts_with("keep"));
-        assert_eq!(sv.as_slice(), &["keep-a", "keep-c", "keep-e"]);
-    }
-
-    #[test]
-    fn test_retain_inline_panic_safety() {
-        use std::panic;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Debug)]
-        struct Tracked(#[allow(dead_code)] i32);
-
-        impl Drop for Tracked {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::Relaxed);
-
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let mut sv: SmallVec<Tracked, 8> = SmallVec::new();
-            sv.push(Tracked(1));
-            sv.push(Tracked(2));
-            sv.push(Tracked(3));
-            sv.push(Tracked(4));
-            sv.push(Tracked(5));
-
-            let mut call_count = 0;
-            sv.retain(|_| {
-                call_count += 1;
-                if call_count == 3 {
-                    panic!("predicate panic");
-                }
-                true
-            });
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 5);
-    }
-
-    #[test]
-    fn test_retain_all() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        sv.retain(|_| true);
-        assert_eq!(sv.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn test_retain_none() {
-        let mut sv: SmallVec<i32, 4> = SmallVec::new();
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-        sv.retain(|_| false);
-        assert!(sv.is_empty());
     }
 
     #[test]
@@ -1429,149 +1027,6 @@ mod kani_proofs {
         kani::assert(slice[2] == c, "element 2 must survive spill");
         kani::assert(slice[3] == d, "element 3 must survive spill");
         kani::assert(slice[4] == e, "element 4 (post-spill push) must be correct");
-    }
-
-    /// Verify that insert and remove preserve element ordering.
-    ///
-    /// Starts with [a, b, c], inserts d at a symbolic index, verifies the
-    /// resulting order, then removes from a symbolic index and verifies
-    /// the removed value and remaining order.
-    #[kani::proof]
-    #[kani::unwind(7)]
-    fn smallvec_insert_remove_ordering() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let c: u32 = kani::any();
-        let d: u32 = kani::any();
-
-        // Use distinct symbolic values to make ordering verifiable.
-        kani::assume(a != b && a != c && a != d);
-        kani::assume(b != c && b != d);
-        kani::assume(c != d);
-
-        let mut sv: SmallVec<u32, 8> = SmallVec::new();
-        sv.push(a);
-        sv.push(b);
-        sv.push(c);
-
-        // Insert d at symbolic position (0..=3 is valid).
-        let ins_idx: usize = kani::any();
-        kani::assume(ins_idx <= 3);
-
-        sv.insert(ins_idx, d);
-        kani::assert(sv.len() == 4, "len must be 4 after insert");
-
-        // Verify d is at the inserted position.
-        kani::assert(
-            sv.as_slice()[ins_idx] == d,
-            "inserted element must be at the specified index",
-        );
-
-        // Verify that elements before the insert point are unchanged.
-        let original = [a, b, c];
-        let mut orig_i = 0;
-        let mut sv_i = 0;
-        while sv_i < 4 {
-            if sv_i == ins_idx {
-                // This is where d was inserted; skip it.
-                sv_i += 1;
-                continue;
-            }
-            kani::assert(
-                sv.as_slice()[sv_i] == original[orig_i],
-                "non-inserted elements must maintain relative order",
-            );
-            orig_i += 1;
-            sv_i += 1;
-        }
-
-        // Now remove at the insert index — should get d back.
-        let removed = sv.remove(ins_idx);
-        kani::assert(removed == d, "remove must return the inserted element");
-        kani::assert(sv.len() == 3, "len must be 3 after remove");
-
-        // Original elements restored.
-        kani::assert(sv.as_slice()[0] == a, "element 0 must be a after remove");
-        kani::assert(sv.as_slice()[1] == b, "element 1 must be b after remove");
-        kani::assert(sv.as_slice()[2] == c, "element 2 must be c after remove");
-    }
-
-    /// Verify the retain drop guard on inline storage: after retain,
-    /// len equals the count of elements satisfying the predicate, and
-    /// every surviving element actually satisfies it.
-    ///
-    /// Uses a symbolic threshold to partition [0,1,2,3] into keep/discard
-    /// sets, then checks the invariant.
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn smallvec_retain_len_invariant() {
-        let threshold: u32 = kani::any();
-        kani::assume(threshold <= 4);
-
-        let mut sv: SmallVec<u32, 4> = SmallVec::new();
-        sv.push(0);
-        sv.push(1);
-        sv.push(2);
-        sv.push(3);
-
-        kani::assert(sv.is_inline(), "must be inline for inline retain path");
-
-        sv.retain(|&x| x < threshold);
-
-        // Expected survivors: values in {0..threshold}.
-        let expected_len = threshold as usize;
-        kani::assert(
-            sv.len() == expected_len,
-            "len must equal count of elements satisfying predicate",
-        );
-
-        // Every retained element must satisfy the predicate.
-        let slice = sv.as_slice();
-        let mut i = 0;
-        while i < sv.len() {
-            kani::assert(
-                slice[i] < threshold,
-                "retained element must satisfy predicate",
-            );
-            i += 1;
-        }
-    }
-
-    /// Verify the spill transition: ensure_heap moves all inline elements
-    /// to the heap without loss or reordering.
-    ///
-    /// Pushes symbolic values inline, forces a spill via insert at capacity,
-    /// and verifies all original elements are preserved.
-    #[kani::proof]
-    #[kani::unwind(7)]
-    fn smallvec_spill_transition_preserves_all() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let c: u32 = kani::any();
-        let d: u32 = kani::any();
-
-        let mut sv: SmallVec<u32, 4> = SmallVec::new();
-        sv.push(a);
-        sv.push(b);
-        sv.push(c);
-        sv.push(d);
-
-        kani::assert(sv.is_inline(), "must start inline");
-
-        // Force spill via insert at end (capacity is full).
-        let extra: u32 = kani::any();
-        sv.insert(4, extra);
-
-        kani::assert(!sv.is_inline(), "must be heap after spill via insert");
-        kani::assert(sv.len() == 5, "len must be 5 after insert-spill");
-
-        // All original elements preserved in order.
-        let slice = sv.as_slice();
-        kani::assert(slice[0] == a, "element 0 preserved after spill");
-        kani::assert(slice[1] == b, "element 1 preserved after spill");
-        kani::assert(slice[2] == c, "element 2 preserved after spill");
-        kani::assert(slice[3] == d, "element 3 preserved after spill");
-        kani::assert(slice[4] == extra, "inserted element at correct position");
     }
 
     /// Verify as_slice length invariant: for a symbolic number of pushes,

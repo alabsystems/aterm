@@ -220,6 +220,40 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
     (ok, noise)
 }
 
+/// Block until `pid` — a child of this process that ends by itself — has EXITED:
+/// a zombie in `ps`, its status fixed and not yet reaped, so the pid is still
+/// ours and nothing can be recycled under a signal sent to it next. The state,
+/// never a nap: a loaded machine can keep `sh -c 'exit 7'` alive past any fixed
+/// sleep, and a TERM that beats it to its `exit` turns "died on its own" into
+/// "retired by us". Bounded only as a fail-safe (`false`).
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn exited_on_its_own(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let stat = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if stat.starts_with('Z') {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Off unix [`retire_smoke_child`] itself gives the child two seconds to leave on
+/// its own before it terminates anything, so there is nothing to wait for here.
+#[cfg(not(unix))]
+#[must_use]
+pub(crate) fn exited_on_its_own(_pid: u32) -> bool {
+    true
+}
+
 /// Bring exactly the launched GUI process to the front without Accessibility or
 /// Apple-events permission.
 ///
@@ -236,6 +270,19 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
 /// where every `--fast` run therefore recorded `skip: gui smoke (could not
 /// make the test window frontmost)` and the merge-contract sentence was
 /// unreachable. `swift <file>` interprets the same source on both toolchains.
+///
+/// THE SAME SENTENCE WENT UNREACHABLE AGAIN ON A LOADED MACHINE (2026-09-24,
+/// m27, macOS 26.6.2). The program asked WindowServer once and gave the answer
+/// three seconds; a `--fast` run is ~40 minutes at ~220% CPU on a fanless
+/// laptop, and under its own load the freshly launched child did not win focus
+/// inside that window. The stage skipped, the receipt recorded
+/// `merge-contract no`, and the pre-push hook then refused a correctly shaped
+/// gated merge — so the machine the gate exists to serve could not satisfy it
+/// while it was busy satisfying it. Measured the same day with the machine
+/// idle: the identical program returns 0, so this is a deadline, not a
+/// capability. The wait is [`ACTIVATE_DEADLINE_SECS`] now and the activation is
+/// RE-ISSUED while it runs — one `activate` that loses a race against a
+/// contended WindowServer is not evidence the app cannot come forward.
 #[must_use]
 pub fn activate_macos_gui_pid(pid: u32) -> bool {
     const SWIFT: &str = "/usr/bin/swift";
@@ -246,7 +293,10 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
         "aterm-verify-activate-{}-{pid}.swift",
         std::process::id()
     ));
-    if std::fs::write(&script, ACTIVATE_SWIFT).is_err() {
+    let program = ACTIVATE_SWIFT
+        .replace("{deadline}", &ACTIVATE_DEADLINE_SECS.to_string())
+        .replace("{reissue}", &ACTIVATE_REISSUE_SECS.to_string());
+    if std::fs::write(&script, &program).is_err() {
         return false;
     }
     let ok = Command::new(SWIFT)
@@ -261,16 +311,41 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
     ok
 }
 
-/// The activation program, byte-identical to the one the script inlined.
+/// How long the activation program waits for WindowServer to report THIS pid as
+/// frontmost before it fails closed.
+///
+/// Sized for the machine the gate actually runs on: a `--fast` run saturates a
+/// fanless laptop for the better part of an hour, and the three seconds this
+/// was cannot be told apart from "the app may not come forward" when
+/// WindowServer is that contended. Twelve is long enough that load is no longer
+/// the explanation and short enough that a genuinely refused activation still
+/// skips the stage inside a few seconds of the old budget — the stage around it
+/// already takes ~5 s.
+pub(crate) const ACTIVATE_DEADLINE_SECS: u32 = 12;
+
+/// How often the program RE-ISSUES `activate` while it waits. One call that
+/// loses a race against a contended WindowServer says nothing about whether the
+/// app can come forward, and re-asking is free.
+pub(crate) const ACTIVATE_REISSUE_SECS: u32 = 2;
+
+/// The activation program. `{deadline}` and `{reissue}` are substituted from the
+/// two constants above so the Swift and the Rust can never disagree about the
+/// budget.
 const ACTIVATE_SWIFT: &str = r#"
 import AppKit
 import Foundation
 
 let pid = pid_t(CommandLine.arguments[1])!
 guard let app = NSRunningApplication(processIdentifier: pid) else { exit(2) }
-_ = app.activate(options: [.activateAllWindows])
-let deadline = Date().addingTimeInterval(3)
+let deadline = Date().addingTimeInterval({deadline})
+var nextActivate = Date()
 while Date() < deadline {
+    // RE-ISSUED, not asked once: under a loaded WindowServer the first call can
+    // simply lose the race, which is not the same as being refused.
+    if Date() >= nextActivate {
+        _ = app.activate(options: [.activateAllWindows])
+        nextActivate = Date().addingTimeInterval({reissue})
+    }
     if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { exit(0) }
     RunLoop.current.run(until: Date().addingTimeInterval(0.05))
 }
@@ -382,7 +457,8 @@ pub fn smoke_helpers_selftest(root: &Path) -> bool {
         noise.push_str(&err);
     }
     // Negative control: a child that exited on its own must NOT be reported as
-    // successfully retired.
+    // successfully retired — retired only once it HAS exited, so a TERM can
+    // never beat a starved `sh` to its `exit 7`.
     let mut unexpected_accepted = true;
     if let Ok(mut quick) = Command::new("/bin/sh")
         .args(["-c", "exit 7"])
@@ -390,9 +466,9 @@ pub fn smoke_helpers_selftest(root: &Path) -> bool {
         .stderr(Stdio::null())
         .spawn()
     {
-        std::thread::sleep(Duration::from_millis(50));
+        let exited = exited_on_its_own(quick.id());
         let (ok, err) = retire_smoke_child(&mut quick);
-        unexpected_accepted = ok;
+        unexpected_accepted = ok || !exited;
         noise.push_str(&err);
     }
 
@@ -501,8 +577,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
-        std::thread::sleep(Duration::from_millis(50));
+        // Its own exit, witnessed — not a 50 ms nap that a loaded machine can
+        // outlast, letting the TERM below kill it first and read as ours.
+        let exited = exited_on_its_own(child.id());
         let (ok, _) = retire_smoke_child(&mut child);
+        assert!(exited, "`exit 7` never exited within 30 s");
         assert!(!ok, "exit 7 is not something this teardown caused");
     }
 
@@ -592,5 +671,58 @@ mod tests {
     #[test]
     fn the_harness_selftest_passes_on_this_machine() {
         assert!(smoke_helpers_selftest(Path::new("/repo")));
+    }
+
+    /// THE SWIFT AND THE RUST MAY NOT DISAGREE ABOUT THE BUDGET. The activation
+    /// program carries its deadline as a placeholder substituted from
+    /// [`ACTIVATE_DEADLINE_SECS`] / [`ACTIVATE_REISSUE_SECS`], because a number
+    /// typed twice is a number that drifts — and when it drifts here the whole
+    /// merge contract silently becomes unclaimable on a loaded machine, which is
+    /// exactly what happened on 2026-09-24.
+    #[test]
+    fn the_activation_program_carries_the_rust_budget_and_no_placeholders() {
+        let program = ACTIVATE_SWIFT
+            .replace("{deadline}", &ACTIVATE_DEADLINE_SECS.to_string())
+            .replace("{reissue}", &ACTIVATE_REISSUE_SECS.to_string());
+        // The Swift has braces of its own, so name the placeholders exactly.
+        assert!(
+            !program.contains("{deadline}") && !program.contains("{reissue}"),
+            "every placeholder must be substituted:\n{program}"
+        );
+        assert!(
+            ACTIVATE_SWIFT.contains("{deadline}") && ACTIVATE_SWIFT.contains("{reissue}"),
+            "the template must still CARRY the placeholders, or the substitution \
+             is silently doing nothing"
+        );
+        assert!(
+            program.contains("addingTimeInterval(12)"),
+            "the deadline the Rust states must be the deadline the Swift waits:\n{program}"
+        );
+        assert!(
+            program.contains("addingTimeInterval(2)"),
+            "the re-issue interval must reach the Swift:\n{program}"
+        );
+        // The re-issue is the point: asking once is what failed.
+        assert!(
+            program.matches("app.activate").count() == 1 && program.contains("nextActivate"),
+            "activation must be re-issued on a schedule, not called once:\n{program}"
+        );
+        // And the budget has to be big enough to outlast a loaded WindowServer,
+        // while still failing closed well inside a human's patience. Both are
+        // constants, so the build decides this, not a test run.
+        const {
+            assert!(
+                ACTIVATE_DEADLINE_SECS >= 8 && ACTIVATE_DEADLINE_SECS <= 30,
+                "the activation deadline is outside the reasoned range: too short \
+                 and a loaded WindowServer reads as a refusal, too long and a \
+                 genuinely refused activation stalls the stage"
+            )
+        };
+        const {
+            assert!(
+                ACTIVATE_REISSUE_SECS >= 1 && ACTIVATE_REISSUE_SECS < ACTIVATE_DEADLINE_SECS,
+                "the re-issue must fit inside the deadline several times over"
+            )
+        };
     }
 }

@@ -28,18 +28,22 @@
 
 #![cfg(unix)]
 // The scaffolding below (the two hosts, their guis, the broker) serves the
-// `sealed` tests; a default build compiles only the refusal test at the end.
-#![cfg_attr(not(feature = "sealed"), allow(dead_code, unused_imports))]
+// `sealed` tests and is gated with them; a default build compiles only the
+// refusal test at the end.
 
 mod harness;
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output, Stdio};
 
-use aterm_link::ctl::Ctl;
-use aterm_link::fabric::kv;
+#[cfg(feature = "sealed")]
+use aterm_link::{ctl::Ctl, fabric::kv};
+#[cfg(feature = "sealed")]
+use std::{
+    io::{BufRead, BufReader},
+    process::Child,
+    time::{Duration, Instant},
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_aterm-link");
 
@@ -83,6 +87,7 @@ impl Host {
             .env("XDG_RUNTIME_DIR", self.path("run"))
             .env("ATERM_FABRIC_HOME", self.path("root"))
             .env("ATERM_BIN", BIN)
+            .env("HOSTNAME", self.name)
             .stdin(Stdio::null());
         cmd
     }
@@ -100,6 +105,7 @@ impl Host {
         )
     }
 
+    #[cfg(feature = "sealed")]
     fn node(&self) -> String {
         std::fs::read_to_string(self.root().join("link-state/node"))
             .expect("a provisioned node id")
@@ -117,6 +123,7 @@ impl Drop for Host {
 }
 
 /// A headless aterm on a [`Host`], with NO fabric command: `on`/`join` arm it.
+#[cfg(feature = "sealed")]
 struct Gui {
     child: Child,
     ctl_sock: String,
@@ -124,6 +131,7 @@ struct Gui {
     state: PathBuf,
 }
 
+#[cfg(feature = "sealed")]
 impl Gui {
     fn boot(h: &Host) -> Self {
         let _permit = harness::boot_permit();
@@ -137,14 +145,14 @@ impl Gui {
             .env("XDG_RUNTIME_DIR", h.path("run"))
             .env("XDG_CONFIG_HOME", h.path("cfg"))
             .env("SHELL", "/bin/sh")
-            .env("ATERM_LINES", "40")
-            .env("ATERM_COLUMNS", "120")
+            .args(["--lines", "40", "--columns", "120"])
             // The bridge child inherits it, and its node presence row's
             // `host=` reads it first — two "hosts" on one machine say so.
             .env("HOSTNAME", h.name)
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(err);
+        harness::arm_lifeline(&mut cmd, &h.dir);
         let child = cmd.spawn().expect("launch aterm-gui --headless");
         let ctl_sock = h.path("run/aterm/aterm.sock");
         let token = harness::World::wait_for_token_at(&ctl_sock);
@@ -178,6 +186,7 @@ impl Gui {
     }
 }
 
+#[cfg(feature = "sealed")]
 impl Drop for Gui {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -192,8 +201,10 @@ impl Drop for Gui {
 }
 
 /// A process killed on drop — the test's own broker.
+#[cfg(feature = "sealed")]
 struct Proc(Child);
 
+#[cfg(feature = "sealed")]
 impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -201,6 +212,7 @@ impl Drop for Proc {
     }
 }
 
+#[cfg(feature = "sealed")]
 /// A loopback port nothing listens on right now.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -209,6 +221,7 @@ fn free_port() -> u16 {
         .expect("an ephemeral loopback port")
 }
 
+#[cfg(feature = "sealed")]
 /// Start the broker with EXACTLY the argv `on --service none` printed, and
 /// wait for its readiness line.
 fn spawn_printed_broker(argv_line: &str) -> Proc {
@@ -228,6 +241,7 @@ fn spawn_printed_broker(argv_line: &str) -> Proc {
     Proc(child)
 }
 
+#[cfg(feature = "sealed")]
 /// The step lines named `name` from an `on`/`join` run's STEPS block.
 fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
     let steps = out
@@ -246,6 +260,7 @@ fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+#[cfg(feature = "sealed")]
 fn verdict<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
     step(out, name)
         .into_iter()
@@ -253,6 +268,7 @@ fn verdict<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+#[cfg(feature = "sealed")]
 fn mode_of(p: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777
@@ -775,7 +791,7 @@ fn the_tcp_broker_refuses_a_remote_bind_an_unguarded_start_and_a_readable_key() 
     assert!(
         err.contains("not a loopback address")
             && err.contains("--allow-remote")
-            && err.contains("not a per-host identity"),
+            && err.contains("every host of the fleet holds the one key"),
         "{err}"
     );
     let (code, _, err) = run(&["--tcp", "127.0.0.1:0", "--key-file", &key, &log]);

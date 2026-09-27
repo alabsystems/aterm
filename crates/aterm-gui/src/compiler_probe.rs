@@ -13,7 +13,7 @@
 /// The `rustc -vV` fields the provenance stamp needs. Every field degrades to
 /// `"unknown"` rather than failing the build (mirrors `build.rs`'s best-effort git
 /// probes), so a hostile/odd toolchain can't brick compilation.
-pub struct RustcVv {
+pub(crate) struct RustcVv {
     /// The full first line, e.g. `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)`.
     pub version_line: String,
     /// The full `commit-hash:` value (40 hex; some distro builds say "unknown").
@@ -41,7 +41,7 @@ fn trustc_parenthetical(first_line: &str) -> Option<String> {
 }
 
 /// Parse `rustc -vV` output. Tolerant: missing lines yield `"unknown"`, never a panic.
-pub fn parse_rustc_vv(vv: &str) -> RustcVv {
+pub(crate) fn parse_rustc_vv(vv: &str) -> RustcVv {
     let field = |key: &str| {
         vv.lines()
             .find_map(|l| l.strip_prefix(key))
@@ -90,7 +90,11 @@ pub fn parse_rustc_vv(vv: &str) -> RustcVv {
 ///
 /// Deliberately NOT inferred from a `-dev` release string: ANY locally built rustc
 /// (upstream included) reports `-dev`, so `-dev` alone is zero evidence of Trust.
-pub fn detect_flavor(vv: &str, rustc_path: &str, rustup_toolchain: Option<&str>) -> &'static str {
+pub(crate) fn detect_flavor(
+    vv: &str,
+    rustc_path: &str,
+    rustup_toolchain: Option<&str>,
+) -> &'static str {
     let vv_says_trust = vv.lines().any(|l| {
         l.strip_prefix("binary:")
             .is_some_and(|b| b.trim() == "trustc")

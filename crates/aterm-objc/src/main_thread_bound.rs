@@ -333,66 +333,6 @@ impl<T> MainThreadBound<T> {
     {
         run_on_main(|mt| f(self.get(mt)))
     }
-
-    /// [`Self::get_on_main`], mutably.
-    ///
-    /// # THE SAME ESCAPE, IN THE `mut` SPELLING
-    ///
-    /// This method used to carry no counterexample of its own — its whole
-    /// documentation was *"as [`Self::get_on_main`]"*, which is a claim about
-    /// a sibling and not evidence about this signature. W15's question is what
-    /// a defect looks like SPELLED DIFFERENTLY, and `&mut T` is the obvious
-    /// second spelling of `&T`: it is a different bound, on a different
-    /// method, and "the same argument applies" is exactly what a guard armed
-    /// at one spelling always says.
-    ///
-    /// So it is compiled here rather than asserted. The return-value escape:
-    ///
-    /// ```compile_fail
-    /// # use aterm_objc::{MainThread, MainThreadBound};
-    /// # use std::sync::Mutex;
-    /// let mt = MainThread::new().unwrap();
-    /// let mut bound = MainThreadBound::new(Mutex::new(7_u8), mt);
-    /// let escaped: &mut Mutex<u8> = bound.get_on_main_mut(|m| m);
-    /// ```
-    ///
-    /// — refused with *"lifetime may not live long enough"*. And the escape
-    /// through a captured slot, with a `Sync` `T` so that neither `F: Send`
-    /// nor `R: Send` is doing the work:
-    ///
-    /// ```compile_fail
-    /// # use aterm_objc::{MainThread, MainThreadBound};
-    /// # use std::sync::Mutex;
-    /// let mt = MainThread::new().unwrap();
-    /// let mut bound = MainThreadBound::new(Mutex::new(7_u8), mt);
-    /// let slot: Mutex<Option<&Mutex<u8>>> = Mutex::new(None);
-    /// bound.get_on_main_mut(|r| {
-    ///     *slot.lock().unwrap() = Some(&*r);
-    /// });
-    /// ```
-    ///
-    /// — refused with `E0521`. Both hold, and now both are compiled.
-    ///
-    /// # Blocking
-    ///
-    /// As [`Self::get_on_main`].
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::get_on_main`]. And one this method's sibling cannot reach:
-    /// if `T`'s own destructor is what panics, that happens in [`Drop`], where
-    /// [`run_on_main`] re-raises it on the dropping thread — a panic out of a
-    /// drop, which aborts if the thread was already unwinding. That is
-    /// `dispatch_sync`'s semantics arriving in a destructor, not a defect
-    /// here, and it is written down because it is silent.
-    #[inline]
-    pub fn get_on_main_mut<F, R>(&mut self, f: F) -> R
-    where
-        F: Send + FnOnce(&mut T) -> R,
-        R: Send,
-    {
-        run_on_main(|mt| f(self.get_mut(mt)))
-    }
 }
 
 impl<T> Drop for MainThreadBound<T> {

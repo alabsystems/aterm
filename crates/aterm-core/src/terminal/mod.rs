@@ -9,6 +9,9 @@
 
 /// The alt-screen scroll-off archive: rows a fullscreen app scrolled off its top.
 mod alt_archive;
+/// Tier-1 conformance of the alt-screen selection park to `AltSelectionPark`.
+#[cfg(test)]
+mod alt_selection_park_conformance;
 /// UAX #9 BiDi visual-reordering bridge (off-by-default `bidi` feature → `aterm-bidi`).
 #[cfg(feature = "bidi")]
 mod bidi_reorder;
@@ -16,7 +19,6 @@ mod bidi_stubs;
 mod blocks_api;
 mod buffer_api;
 mod builder;
-mod callback_clearers;
 mod callback_setters;
 mod callbacks;
 mod checkpoint;
@@ -28,7 +30,7 @@ mod constructors;
 mod content;
 mod csi_dispatch_table;
 pub mod custody;
-pub(crate) mod dcs_auth;
+mod foreground_handback;
 mod grouped_state;
 mod handler;
 mod handler_dec;
@@ -44,6 +46,7 @@ mod handler_state;
 mod handler_window;
 mod handler_xtgettcap;
 mod handler_xtsmgraphics;
+mod history_carry;
 pub(crate) mod host_traits;
 pub(crate) mod hyperlink_auth;
 /// Inline-image survival across a width-changing reflow (see its module docs).
@@ -82,6 +85,8 @@ mod search_index;
 mod stack_response;
 mod state;
 mod state_accessors;
+#[cfg(test)]
+mod terminal_modes_conformance;
 mod transient_state;
 mod types;
 
@@ -95,23 +100,22 @@ mod types;
 // `terminal_modes` (still emitted by aterm-core's anchors, now visible downstream via
 // its `spec-anchors` feature) PLUS the six ISOLATION machines.
 
-use callbacks::{
-    BufferActivationCallback, MAX_DCS_CALLBACK_BYTES, MAX_DCS_GLOBAL_BUDGET, SGR_STACK_MAX_DEPTH,
-    TITLE_STACK_MAX_DEPTH, WindowCallback,
-};
 pub use callbacks::{ColorChangeOp, ColorTarget};
+use callbacks::{
+    MAX_DCS_GLOBAL_BUDGET, SGR_STACK_MAX_DEPTH, TITLE_STACK_MAX_DEPTH, WindowCallback,
+};
 pub use colors_api::ColorPaletteMut;
 #[cfg(feature = "sixel")]
 use grouped_state::SixelState;
 use grouped_state::{
     ClipboardState, ColorState, CursorSaveState, DcsState, DcsType, Iterm2State, MarksState,
-    NotificationState, SemanticState, ShellIntegrationState, TitleState,
+    NotificationState, ShellIntegrationState, TitleState,
 };
 use reset::{ResetGroups, reset_common_fields};
 use transient_state::{TransientState, Vt52CursorState};
 
 pub use alt_archive::{
-    ALT_ARCHIVE_DEFAULT_BUDGET, ALT_ARCHIVE_ENV, ALT_ARCHIVE_MAX_ROWS, ALT_ARCHIVE_MIN_SHARE,
+    ALT_ARCHIVE_DEFAULT_BUDGET, ALT_ARCHIVE_MAX_ROWS, ALT_ARCHIVE_MIN_SHARE,
     ALT_ARCHIVE_ROW_OVERHEAD, ALT_ARCHIVE_TOTAL_BUDGET, AltArchive, AltArchiveBudget,
     AltArchiveCarry, AltArchiveDiffer, AltArchiveFence, AltArchiveGap, AltArchiveGapKind,
     AltArchiveImport, AltArchiveQuery, AltArchiveRead, alt_archive_row_charge,
@@ -129,6 +133,7 @@ pub use checkpoint::{
     TerminalCheckpoint,
 };
 pub use custody::CustodyTransition;
+pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};
 pub use mode_mirror::ModeMirror;
 // The injected-clock seam, re-exported so an out-of-crate replay/lash harness
 // can feed a FIXED ClockReading and get bit-deterministic state regardless of
@@ -138,21 +143,11 @@ pub use observe::{
     first_matching_row,
 };
 pub use processing::ClockReading;
-pub use shell::{
-    Annotation, BlockState, CommandMark, OutputBlock, ShellEvent, ShellState, TerminalMark,
-};
+pub use shell::{Annotation, BlockState, CommandMark, OutputBlock, ShellState, TerminalMark};
+pub(crate) use types::SavedCursorState;
 pub use types::{
-    ClipboardOperation, ClipboardSelection, CopyToClipboardOperation, CurrentStyle, CursorStyle,
-    Iterm2CellSize, Iterm2SetColor, Iterm2ShellIntegrationVersion, MouseEncoding, MouseMode,
-    TerminalModes, TerminalSize, TerminalSnapshot,
-};
-#[allow(
-    unused_imports,
-    reason = "RemoteHost re-export used by session::terminal_state; dead_code propagation hides usage"
-)]
-pub(crate) use types::{
-    MultipartFileOperation, RemoteHost, SavedCursorState, SemanticBlock, SemanticBlockEvent,
-    SemanticButton, SemanticButtonEvent, SemanticButtonType,
+    ClipboardOperation, ClipboardSelection, CurrentStyle, CursorStyle,
+    Iterm2ShellIntegrationVersion, MouseEncoding, MouseMode, TerminalModes, TerminalSize,
 };
 // Terminal-internal: not re-exported to crate level
 pub use aterm_types::XtermKeyboardState;
@@ -166,27 +161,6 @@ pub use state::{
 use types::{SgrPushMask, SgrStackEntry, TaskbarProgress};
 
 use crate::grid::Cursor;
-
-/// Feature-gated terminal-internal constants needed by extracted test crates.
-#[cfg(test)]
-pub mod testing {
-    /// Maximum completed command marks (OSC 133).
-    pub const COMMAND_MARKS_MAX: usize = super::shell::COMMAND_MARKS_MAX;
-    /// Maximum completed output blocks (OSC 133).
-    pub const OUTPUT_BLOCKS_MAX: usize = super::shell::OUTPUT_BLOCKS_MAX;
-    /// Maximum number of terminal marks (OSC 1337 SetMark).
-    pub const TERMINAL_MARKS_MAX: usize = super::shell::TERMINAL_MARKS_MAX;
-    /// Maximum number of annotations (OSC 1337 AddAnnotation).
-    pub const ANNOTATIONS_MAX: usize = super::shell::ANNOTATIONS_MAX;
-    /// Maximum number of semantic code blocks (OSC 1337 Block).
-    pub const SEMANTIC_BLOCKS_MAX: usize = super::shell::SEMANTIC_BLOCKS_MAX;
-    /// Maximum number of semantic buttons (OSC 1337 Button).
-    pub const SEMANTIC_BUTTONS_MAX: usize = super::shell::SEMANTIC_BUTTONS_MAX;
-    /// Maximum OSC 52 clipboard query response size (64 KiB).
-    pub const MAX_OSC52_QUERY_RESPONSE_BYTES: usize = super::MAX_OSC52_QUERY_RESPONSE_BYTES;
-    // Re-export types needed by extracted tests (from their origin crate).
-    pub use aterm_types::osc::{SemanticBlockEvent, SemanticButtonEvent};
-}
 
 // Type alias for user_vars HashMap.
 pub(crate) type UserVarsMap = std::collections::HashMap<String, String>;
@@ -220,13 +194,6 @@ pub(crate) type PendingNotificationsMap = std::collections::HashMap<String, type
 /// not need that headroom, so it keeps its own smaller cap.
 pub(crate) const MAX_OSC52_QUERY_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Maximum bytes captured by OSC 1337 `CopyToClipboard` text capture mode.
-///
-/// While capture mode is active, every printed character is appended until
-/// `EndCopy` is received. This cap prevents unbounded growth when peers never
-/// send `EndCopy` (accidental or malicious).
-pub(crate) const MAX_COPY_TO_CLIPBOARD_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
-
 /// Maximum bytes allowed in the terminal response buffer.
 ///
 /// Responses from query sequences (for example DSR/DA/DECRQSS/OSC queries) are
@@ -236,7 +203,7 @@ pub(crate) const MAX_COPY_TO_CLIPBOARD_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_RESPONSE_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Maximum title/icon-name length in bytes for OSC 0/1/2 and the public
-/// `set_title`/`set_icon_name` API. Matches OSC 777's cap in
+/// `set_title` API. Matches OSC 777's cap in
 /// `handler_osc_notify.rs`. The parser's OSC buffer allows up to 65534
 /// bytes, but real terminal titles are short strings.
 const MAX_TITLE_BYTES: usize = 1024;

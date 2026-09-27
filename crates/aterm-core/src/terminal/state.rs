@@ -3,22 +3,21 @@
 
 //! Terminal struct definition and root state accessors.
 
-use super::callbacks::{BufferActivationCallback, TextSizingCallback, WindowCallback};
+use super::callbacks::WindowCallback;
 #[cfg(feature = "sixel")]
 use super::grouped_state::SixelState;
 use super::grouped_state::{
     BiDiGroupState, ClipboardState, ColorState, CursorSaveState, DcsState, Iterm2State, MarksState,
-    NotificationState, SemanticState, ShellIntegrationState, TitleState,
+    NotificationState, ShellIntegrationState, TitleState,
 };
 use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TaskbarProgress, TerminalModes};
 
 use crate::grid::Grid;
 use crate::parser::Parser;
-use crate::platform::FontDescriptor;
 
 use aterm_types::charset::CharacterSetState;
-use aterm_types::{KittyKeyboardState, Rgb, XtermKeyboardState};
+use aterm_types::{KittyKeyboardState, XtermKeyboardState};
 
 pub use aterm_grid::RowBandMove;
 
@@ -157,7 +156,7 @@ impl ContentScrollState {
     ///   construction and is `Invalidate` defensively;
     /// * `d_e > 0`: `Bands` iff NO uniform rows were recorded meanwhile
     ///   (`d_u == 0` — the epoch wins over later uniform rows, the pin
-    ///   `epoch_change_wins_over_later_uniform_rows_and_overflow_retires` keeps),
+    ///   `delta_since_replays_only_fully_explained_epochs` keeps),
     ///   EVERY epoch step was a band batch (`d_e == d_bb`), and the moves fit the
     ///   ring (`1 <= d_bs <= 16`); otherwise `Invalidate` — a RIS, a resize, an
     ///   alt flip, a margined scroll, a mixed batch, or more than 16 moves between
@@ -229,6 +228,10 @@ impl ContentScrollState {
 /// DECSTR return these modes to the DEC power-on state, which is already what
 /// [`TerminalModes::new`] and `handle_decstr` do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one independent host value per DEC mode, not a state machine"
+)]
 pub(super) struct ConfiguredModes {
     /// Host value last applied for DECAWM (mode 7).
     pub(super) auto_wrap: bool,
@@ -236,6 +239,14 @@ pub(super) struct ConfiguredModes {
     pub(super) focus_reporting: bool,
     /// Host value last applied for bracketed paste (mode 2004).
     pub(super) bracketed_paste: bool,
+    /// The host's default for alternate scroll (DEC 1007), set by
+    /// [`Terminal::set_host_alternate_scroll`]. Not a `TerminalConfig` field:
+    /// aterm-gui turns 1007 ON for every live session (Audit M5) and nothing
+    /// else moves it. The foreground handback restores 1007 to THIS value,
+    /// never to the power-on OFF — the 2026-09-25 review found that every
+    /// handback switched the wheel-scrolls-`less` default off for the rest of
+    /// the session.
+    pub(super) alternate_scroll: bool,
 }
 
 impl Default for ConfiguredModes {
@@ -248,6 +259,7 @@ impl Default for ConfiguredModes {
             auto_wrap: true,
             focus_reporting: false,
             bracketed_paste: false,
+            alternate_scroll: false,
         }
     }
 }
@@ -304,18 +316,14 @@ pub struct Terminal {
     /// never resets (it is a running total, not a pending signal). NOT checkpointed
     /// (a live supervision counter, not replay state — like `last_bell_time`).
     pub(super) bell_total: u64,
-    /// Cursor style change callback (called when DECSCUSR changes cursor style).
-    pub(super) cursor_style_callback: Option<Box<dyn FnMut(aterm_types::CursorStyle) + Send>>,
     /// Host-preferred DEFAULT cursor style: the shape used before any DECSCUSR and
     /// restored on RIS/DECSTR. Distinct from the live `modes.cursor_style` (which an
     /// app drives via DECSCUSR) and persisted here on `Terminal` so it survives the
     /// `*modes = TerminalModes::new()` reset. Set via [`Terminal::set_default_cursor_style`].
     pub(super) default_cursor_style: aterm_types::CursorStyle,
-    /// Buffer activation callback (called when switching between main/alt screen).
-    pub(super) buffer_activation_callback: Option<BufferActivationCallback>,
     /// Grouped notification state (OSC 9, OSC 99, OSC 777).
     pub(super) notifications: NotificationState,
-    /// Grouped clipboard and copy-capture callback state.
+    /// Grouped OSC 52 clipboard callback state.
     pub(super) clipboard: ClipboardState,
     /// Grouped state for Terminal OSC 1337 protocol extensions.
     pub(super) iterm2: Iterm2State,
@@ -355,8 +363,6 @@ pub struct Terminal {
     ///
     /// Grouped color state (palette, defaults, cursor, selection).
     pub(super) color: ColorState,
-    /// Font descriptor for rendering text (family, size, weight, italic).
-    pub(super) font: FontDescriptor,
     /// Grouped BiDi (bidirectional text) state.
     ///
     /// Bundles configuration, resolver, and per-line render cache.
@@ -368,8 +374,6 @@ pub struct Terminal {
     pub(super) shell: ShellIntegrationState,
     /// Grouped marks and annotations state.
     pub(super) marks_state: MarksState,
-    /// Grouped semantic blocks/buttons state and callbacks (OSC 1337).
-    pub(super) semantic: SemanticState,
     /// Taskbar progress state (ConEmu OSC 9;4).
     ///
     /// Set by OSC 9;4;state;progress sequences. Host application can
@@ -392,10 +396,6 @@ pub struct Terminal {
     ///
     /// Called when window manipulation or query sequences are received.
     pub(super) window_callback: Option<WindowCallback>,
-    /// Callback for text sizing events (OSC 66 - Kitty protocol).
-    ///
-    /// Called when text sizing escape sequences are received.
-    pub(super) text_sizing_callback: Option<TextSizingCallback>,
     /// Text selection state (mouse-based selection).
     ///
     /// Tracks the current text selection for copy operations. The selection is
@@ -494,17 +494,6 @@ pub struct Terminal {
     /// is no separate "accept OSC 8 at all" switch, because what a click may
     /// OPEN is decided in the host at press time, not here.
     pub(super) hyperlink_auth: super::hyperlink_auth::HyperlinkAuth,
-    /// Host-side authorization state for raw DCS callback delivery
-    /// (OSC P ... ST → registered `FnMut(&[u8], u8)`). See
-    /// [`super::dcs_auth`] for the security model: the zero-sized
-    /// [`super::dcs_auth::DcsEmitCapability`] token is the **only**
-    /// way a handler can reach `self.dcs.callback`. Defaults to
-    /// authorized. Addresses CF-013 from
-    /// `reports/2026-04-18-privilege-conflation-audit.md` — the raw
-    /// payload delivered to host callbacks is PTY-origin and the
-    /// emission site wraps it in `Provenance<&[u8], Pty>` at the type
-    /// level before erasing provenance at the FFI boundary.
-    pub(super) dcs_auth: super::dcs_auth::DcsAuth,
     /// OSC / escape-sequence policy: the engine installed via
     /// [`super::Terminal::apply_policy_engine`] **plus** the gate verdicts
     /// compiled from it.
@@ -624,12 +613,6 @@ impl std::fmt::Debug for Terminal {
 }
 
 impl Terminal {
-    /// Default foreground color (light gray - matches xterm default).
-    pub const DEFAULT_FOREGROUND: Rgb = super::transient_state::DEFAULT_FOREGROUND;
-
-    /// Default background color (black - matches xterm default).
-    pub const DEFAULT_BACKGROUND: Rgb = super::transient_state::DEFAULT_BACKGROUND;
-
     /// Get a reference to the grid.
     #[must_use]
     pub fn grid(&self) -> &Grid {
@@ -656,24 +639,6 @@ impl Terminal {
     /// Get a mutable reference to the grid.
     pub fn grid_mut(&mut self) -> &mut Grid {
         &mut self.grid
-    }
-
-    /// Mark the cursor cell as damaged for re-rendering.
-    ///
-    /// Call this before rendering when cursor visibility has been toggled
-    /// (e.g., during cursor blink). This ensures the cursor cell is included
-    /// in damage-based rendering even though no cell content changed.
-    ///
-    /// # Example
-    ///
-    /// In a cursor blink timer callback:
-    /// ```text
-    /// cursor_visible = !cursor_visible;
-    /// terminal.mark_cursor_damage();
-    /// renderer.render(&terminal, surface);
-    /// ```
-    pub fn mark_cursor_damage(&mut self) {
-        self.grid.mark_cursor_damage();
     }
 
     /// Whether the grid currently holds unconsumed damage (D-1).
@@ -790,21 +755,6 @@ impl Terminal {
 
     // Scrollback, memory, and clear methods in buffer_api.rs.
 
-    /// Enable or disable 8-bit C1 control code interpretation (0x80-0x9F).
-    ///
-    /// By default, C1 controls are disabled for security in UTF-8 terminals.
-    /// When disabled, bytes 0x80-0x9F are treated as invalid UTF-8 and replaced
-    /// with the Unicode replacement character. This prevents escape sequence
-    /// injection attacks where malicious data embeds C1 controls.
-    ///
-    /// Enable this only for legacy applications that require C1 support.
-    ///
-    /// See: dgl.cx/2023/09/ansi-terminal-security
-    #[cfg(test)]
-    pub fn set_c1_controls_enabled(&mut self, enabled: bool) {
-        self.parser.set_c1_controls_enabled(enabled);
-    }
-
     /// Get the terminal modes.
     #[must_use]
     pub fn modes(&self) -> &TerminalModes {
@@ -838,36 +788,6 @@ impl Terminal {
 
     // format_paste in buffer_api.rs.
 
-    /// Restore remote host from session state.
-    ///
-    /// This sets the remote host state without invoking callbacks.
-    /// Used for session resurrection via `SessionManager::restore_terminal`.
-    #[cfg(test)] // called from session::terminal_state (test gated)
-    #[allow(
-        dead_code,
-        reason = "consumed by the (un-wired) session test-support layer"
-    )]
-    pub(crate) fn restore_remote_host(&mut self, host: Option<super::types::RemoteHost>) {
-        self.iterm2.remote_host = host;
-    }
-
-    /// Get the current title stack depth.
-    ///
-    /// The title stack stores pushed icon labels and window titles.
-    /// Maximum depth is `TITLE_STACK_MAX_DEPTH` (10).
-    #[cfg(test)]
-    #[must_use]
-    pub fn title_stack_depth(&self) -> usize {
-        self.title.stack.len()
-    }
-
-    /// Global DCS budget bytes currently tracked (test-only).
-    #[cfg(test)]
-    #[must_use]
-    pub fn dcs_total_bytes(&self) -> usize {
-        self.dcs.total_bytes
-    }
-
     /// Check if the VT parser is in Ground state.
     ///
     /// Returns `true` when the parser has no pending escape sequence. Used by
@@ -891,31 +811,6 @@ impl Terminal {
     // - shell_api.rs
     // - blocks_api.rs
     // - semantic_api.rs
-
-    /// Configure the response-sequence rate limiter (Part of #7874).
-    ///
-    /// Gates every call to `send_response` (DSR/DA/DECRQSS/XTGETTCAP/OSC
-    /// color queries/title reports, etc.) so a malicious PTY peer cannot
-    /// amplify bandwidth by spamming query sequences. Responses that
-    /// exceed the rate are silently dropped — same contract as buffer
-    /// overflow.
-    ///
-    /// # Parameters
-    ///
-    /// - `refill_bytes_per_sec`: token refill rate. Defaults to 100 KiB/s,
-    ///   which is ~500x the peak legitimate response traffic during shell
-    ///   startup. Set to `0` to freeze tokens at their current level (no
-    ///   replenishment after burst is drained).
-    /// - `burst_bytes`: maximum token balance / burst capacity. Defaults
-    ///   to 64 KiB. Set to `0` to drop every response (kill switch).
-    ///
-    /// Calling this preserves the current token balance, clamped to the
-    /// new capacity.
-    pub fn set_response_rate_limit(&mut self, refill_bytes_per_sec: u64, burst_bytes: u64) {
-        self.transient
-            .response_rate_limiter
-            .reconfigure(refill_bytes_per_sec, burst_bytes);
-    }
 }
 
 #[cfg(test)]

@@ -68,7 +68,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
 
 use aterm_types::control_verbs::{framing_of, Framing};
 
@@ -180,8 +179,11 @@ impl Ctl {
     ///
     /// # Errors
     ///
-    /// If the descriptor cannot be duplicated for the reader half.
+    /// If `fd` names no open socket — refused before anything takes ownership
+    /// of the number, see [`inherited_socket`] — or if the descriptor cannot be
+    /// duplicated for the reader half.
     pub fn adopt(fd: RawFd) -> io::Result<Self> {
+        inherited_socket(fd)?;
         // THIS CALL REACHES THE CRATE'S ONE `unsafe` BLOCK — see
         // [`unsafe_adopt`], which is where the obligation is discharged. The
         // note used to say "SAFETY-adjacent, not an `unsafe` block", which was
@@ -220,44 +222,11 @@ impl Ctl {
         Self::authenticate(UnixStream::connect(sock)?, token)
     }
 
-    /// [`Ctl::connect`] with EVERY byte of the lane bounded by `deadline` —
-    /// the `AUTH` write included, which [`Ctl::connect`] followed by a
-    /// [`Ctl::set_deadline`] would leave unbounded.
-    ///
-    /// For a short-lived caller that must not be held by a peer that accepted
-    /// and then said nothing. A request that runs past the deadline fails with
-    /// [`io::ErrorKind::TimedOut`] and LATCHES the connection lost, because a
-    /// reply arriving after the caller gave up on it would be read as the
-    /// header of the next.
-    ///
-    /// # Errors
-    ///
-    /// As [`Ctl::connect`], or setting the socket's timeouts.
-    pub fn connect_within(sock: &str, token: &str, deadline: Duration) -> io::Result<Self> {
-        let stream = UnixStream::connect(sock)?;
-        stream.set_read_timeout(Some(deadline))?;
-        stream.set_write_timeout(Some(deadline))?;
-        Self::authenticate(stream, token)
-    }
-
     fn authenticate(stream: UnixStream, token: &str) -> io::Result<Self> {
         let mut ctl = Self::from_stream(stream)?;
         ctl.writer.write_all(format!("AUTH {token}\n").as_bytes())?;
         ctl.writer.flush()?;
         Ok(ctl)
-    }
-
-    /// Re-arm the lane's deadline: how long one read or write may take from
-    /// now on, or `None` for unbounded. A caller that is about to park on a
-    /// long `await` raises it past the wait it asked for and lowers it again
-    /// after.
-    ///
-    /// # Errors
-    ///
-    /// Setting the socket's timeouts.
-    pub fn set_deadline(&self, deadline: Option<Duration>) -> io::Result<()> {
-        self.writer.set_read_timeout(deadline)?;
-        self.writer.set_write_timeout(deadline)
     }
 
     /// The underlying stream, for a caller that must bound a read.
@@ -281,9 +250,8 @@ impl Ctl {
 
     /// Run one request, LATCHING the connection on an I/O failure.
     ///
-    /// A deadline that fired ([`Ctl::connect_within`], [`Ctl::set_deadline`])
-    /// surfaces from the socket as `WouldBlock` on some platforms and
-    /// `TimedOut` on others, with a message ("Resource temporarily
+    /// A deadline that fired surfaces from the socket as `WouldBlock` on some
+    /// platforms and `TimedOut` on others, with a message ("Resource temporarily
     /// unavailable") that names neither; it is reported as ONE kind and one
     /// sentence, so a caller printing it says what happened.
     fn guarded<T>(&mut self, r: io::Result<T>) -> io::Result<T> {
@@ -419,7 +387,7 @@ impl Ctl {
 /// the fact is written where a reader will meet it rather than left to a
 /// crate-wide "there is no unsafe here" that three docs used to make and that a
 /// one-file scan used to guard;
-/// `bridge::tests::this_modules_doc_and_unsafe_surface_match_what_it_ships` now
+/// `bridge::tests::the_crates_unsafe_surface_is_exactly_the_ctl_adoption` now
 /// reads every file this crate ships and fails on a SECOND block or a second
 /// call site.
 ///
@@ -427,10 +395,47 @@ impl Ctl {
 /// process owns and that nothing else will close it. It holds by construction:
 /// the launcher `dup2`'d it into place before `exec` ([`aterm_uds::spawnfd`]),
 /// this is the only call site for that number, and it runs once at startup.
+/// The one case construction does not cover — a bridge started by hand, with
+/// nothing inherited — is checked, not assumed: [`Ctl::adopt`] asks
+/// [`inherited_socket`] first, so a number that is closed, or names a file,
+/// never reaches this block.
 fn unsafe_adopt(fd: RawFd) -> OwnedFd {
     // SAFETY: see the doc comment above — a live inherited descriptor, adopted
     // exactly once.
     unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+/// Refuse to adopt `fd` unless it names an OPEN SOCKET, asked without taking
+/// ownership: `/dev/fd/<n>` is the descriptor itself on macOS (fdesc) and on
+/// Linux (the `/proc/self/fd` magic link), so its metadata is the descriptor's
+/// `fstat` through a path — no `unsafe`, and no second owner of the number.
+///
+/// Without it, a bridge started with nothing inherited (`aterm link serve`
+/// typed at a shell, no `--sock`) wrapped whatever sat at fd 3: nothing, and
+/// dropping the wrapper after the failed clone closed a descriptor that was
+/// never open — std aborts on that in a debug build — or a file this process
+/// had opened since, which a release build would silently close under its
+/// owner.
+fn inherited_socket(fd: RawFd) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = std::fs::metadata(format!("/dev/fd/{fd}")).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "descriptor {fd} is not open ({e}): the bridge inherits its aterm \
+                 connection on fds 3 and 4 when aterm launches it; started by hand, \
+                 it needs --sock <path> --token-file <path>"
+            ),
+        )
+    })?;
+    if meta.file_type().is_socket() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("descriptor {fd} is not a socket, so it is not an inherited aterm connection"),
+        ))
+    }
 }
 
 /// The verb keyword of a request line, selector stripped. `framing_of` wants the
@@ -473,6 +478,44 @@ fn count_after_ok(header: &str, ceiling: usize) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `adopt` refuses a number that names no open socket BEFORE taking
+    /// ownership of it. It used to wrap whatever sat at the number: with
+    /// nothing there, `try_clone` failed and dropping the wrapper closed a
+    /// descriptor that was never open — std's closed-descriptor assertion
+    /// aborted the process (three crash reports, 2026-09-01, `aterm link
+    /// serve` run with no inherited fds), and a release build would instead
+    /// have closed whatever the number named by then. A file at the number is
+    /// refused too, and stays its owner's.
+    #[test]
+    fn adopt_refuses_a_number_that_names_no_open_socket() {
+        // Far above any descriptor a test process opens (the lowest free
+        // number is always taken first), so no concurrent test can hold it.
+        let err = Ctl::adopt(9_999)
+            .err()
+            .expect("a closed number must be refused");
+        assert!(
+            err.to_string().contains("descriptor 9999"),
+            "the refusal must name the number: {err}"
+        );
+
+        let file = std::fs::File::open("Cargo.toml").expect("open a regular file");
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let err = Ctl::adopt(fd)
+            .err()
+            .expect("a regular file must be refused");
+        assert!(err.to_string().contains("not a socket"), "{err}");
+        // Still open, still the File's: a second adopt reports the same kind,
+        // not a closed number.
+        let again = Ctl::adopt(fd).err().expect("still refused");
+        assert!(again.to_string().contains("not a socket"), "{again}");
+        drop(file);
+
+        // The positive arm: a live socket at the number IS adopted.
+        let (near, _far) = UnixStream::pair().expect("socketpair");
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(near);
+        assert!(Ctl::adopt(fd).is_ok(), "a live socket must be adopted");
+    }
 
     /// The framing is read from the VERB TABLE, sub-forms included — the one
     /// thing this client must not keep its own copy of.

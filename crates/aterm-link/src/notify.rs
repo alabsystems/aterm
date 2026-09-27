@@ -124,6 +124,22 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LIMIT: u32 = 10;
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 
+#[derive(Debug)]
+enum Notice {
+    Record(usize, u64, String, Vec<u8>),
+    /// The broker scanned through `next`, including offsets the selector did
+    /// not match. Sent after the page's records so the executor persists it
+    /// only after it has handled every matching record in that page.
+    Checkpoint(usize, u64),
+}
+
+/// A broker reader hands one row directly to the serial notification executor.
+/// No second row is buffered while an operator command runs: a broker body can
+/// be 16 MiB, and an unbounded channel let a slow command grow without limit.
+fn notice_handoff() -> (mpsc::SyncSender<Notice>, mpsc::Receiver<Notice>) {
+    mpsc::sync_channel(0)
+}
+
 // ---------------------------------------------------------------------------
 // the selectors
 // ---------------------------------------------------------------------------
@@ -460,8 +476,8 @@ impl Store {
 
 /// TEST-ONLY fault injection, armed by `$ATERM_LINK_NOTIFY_FAULT` — and
 /// TEST-ONLY is enforced, not merely documented: [`Fault::from_env`] reads the
-/// variable only in a build with `debug_assertions`, so a released `aterm-link
-/// notify` honours no fault at all.
+/// variable through `aterm_types::dev_seam!`, which a release build compiles to
+/// `None`, so a released `aterm-link notify` honours no fault at all.
 ///
 /// THE GATE IS THE BRIDGE'S, APPLIED TO ITS TWIN. `bridge::Fault` closed exactly
 /// this in round 2 and its doc argued the whole case; the argument transfers
@@ -498,14 +514,14 @@ impl Fault {
         // reason, as `bridge::Fault::from_env`. See the type's doc: this knob is
         // stripped by no deny list, and the process it kills is the fleet's only
         // way to wake a human.
-        if !cfg!(debug_assertions) {
+        let Some(fault) = aterm_types::dev_seam!("ATERM_LINK_NOTIFY_FAULT") else {
             return Fault::None;
-        }
+        };
         if store.root.join("fault-fired").exists() {
             return Fault::None;
         }
-        match std::env::var("ATERM_LINK_NOTIFY_FAULT").as_deref() {
-            Ok("kill-after-exec") => Fault::KillAfterExec,
+        match fault.to_str() {
+            Some("kill-after-exec") => Fault::KillAfterExec,
             _ => Fault::None,
         }
     }
@@ -822,7 +838,7 @@ impl Notifier {
     /// each on its own connection and its own thread, all feeding one executor —
     /// because the command must run one at a time and the journal has one writer.
     fn follow(&mut self) -> io::Result<()> {
-        let (tx, rx) = mpsc::channel::<(usize, u64, String, Vec<u8>)>();
+        let (tx, rx) = notice_handoff();
         for (idx, sel) in self.cfg.on.iter().enumerate() {
             let cfg = self.cfg.clone();
             let sel = sel.clone();
@@ -833,12 +849,21 @@ impl Notifier {
                 .spawn(move || reader(idx, &sel, &cfg, &root, &tx))?;
         }
         drop(tx);
-        while let Ok((idx, off, subject, body)) = rx.recv() {
-            let Some(sel) = self.cfg.on.get(idx).cloned() else {
-                continue;
-            };
-            self.on_record(&sel, off, &subject, &body)?;
-            self.store.set_cursor(&sel.key(), off + 1)?;
+        while let Ok(notice) = rx.recv() {
+            match notice {
+                Notice::Record(idx, off, subject, body) => {
+                    let Some(sel) = self.cfg.on.get(idx).cloned() else {
+                        continue;
+                    };
+                    self.on_record(&sel, off, &subject, &body)?;
+                    self.store.set_cursor(&sel.key(), off + 1)?;
+                }
+                Notice::Checkpoint(idx, next) => {
+                    if let Some(sel) = self.cfg.on.get(idx) {
+                        self.store.set_cursor(&sel.key(), next)?;
+                    }
+                }
+            }
         }
         // Every reader gave up, which only happens when they all failed to
         // reconnect for good. Say so rather than exiting 0.
@@ -849,34 +874,79 @@ impl Notifier {
     }
 }
 
-/// One selector's reader thread: connect, subscribe from the durable cursor,
-/// pump, and on any failure back off and do it again.
+/// One selector's reader thread: bounded catch-up, then subscribe from the
+/// page's resume cursor, and on any failure back off and do it again. Every
+/// selector has its own reader, so one deep backlog or slow notification does
+/// not delay the other selectors' subscriptions.
 ///
 /// It re-reads the cursor from DISK on every reconnect and never resumes below
 /// what it has already forwarded, so a reconnect replays at most the records the
-/// executor had not finished with — which the journal then dedups.
-fn reader(
-    idx: usize,
-    sel: &Sel,
-    cfg: &Config,
-    root: &Path,
-    tx: &mpsc::Sender<(usize, u64, String, Vec<u8>)>,
-) {
+/// executor had not finished with — which the journal then dedups. The paged
+/// scan matters: astream's plain subscription snapshots every retained record
+/// from its cursor into an Arc-pointer vector, so subscribing directly from a
+/// stale cursor would exchange startup latency for a broker-side memory spike.
+fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSender<Notice>) {
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
     let mut seen: Option<u64> = None;
     let mut backoff = RECONNECT_MIN;
     loop {
-        match subscribe(cfg, root, &key, &filter, seen) {
-            Ok(mut sub) => {
+        match connect_for_reader(cfg, root, &key, &filter, seen) {
+            Ok((mut conn, mut from)) => {
                 backoff = RECONNECT_MIN;
+                let mut closed = false;
+                loop {
+                    let (rows, (next, head)) = match conn.fetch(from, &filter, PAGE) {
+                        Ok(page) => page,
+                        Err(e) => {
+                            eprintln!("aterm-link notify: {} catch-up ended: {e}", sel.label());
+                            closed = true;
+                            break;
+                        }
+                    };
+                    for (off, subject, body) in rows {
+                        if tx.send(Notice::Record(idx, off, subject, body)).is_err() {
+                            return; // the executor is gone
+                        }
+                        seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
+                    }
+                    if tx.send(Notice::Checkpoint(idx, next)).is_err() {
+                        return;
+                    }
+                    // The checkpoint follows all records from this page in the
+                    // zero-buffer handoff. Once accepted, those rows have all
+                    // been processed, even if the checkpoint's fsync is pending.
+                    seen = Some(seen.map_or(next, |s| s.max(next)));
+                    let made_progress = next > from;
+                    from = next;
+                    if next >= head || !made_progress {
+                        break;
+                    }
+                }
+                if closed {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    continue;
+                }
+                let mut sub = match conn.subscribe(from, &filter) {
+                    Ok(sub) => sub,
+                    Err(e) => {
+                        eprintln!(
+                            "aterm-link notify: {} could not subscribe: {e}",
+                            sel.label()
+                        );
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(RECONNECT_MAX);
+                        continue;
+                    }
+                };
                 loop {
                     match sub.recv() {
                         Ok(Some((off, subject, body))) => {
-                            seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
-                            if tx.send((idx, off, subject, body)).is_err() {
+                            if tx.send(Notice::Record(idx, off, subject, body)).is_err() {
                                 return; // the executor is gone
                             }
+                            seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -896,16 +966,17 @@ fn reader(
     }
 }
 
-/// Open one subscription for a reader thread, from the highest of the durable
-/// cursor, what the thread has already forwarded, and — only when neither
-/// exists — `--since`.
-fn subscribe(
+/// Open one reader's connection from the highest of the durable cursor, what
+/// this thread has already forwarded, and — only when neither exists —
+/// `--since`. A first `--since=head` is persisted before subscribing, so a
+/// restart while idle still replays records published after this first start.
+fn connect_for_reader(
     cfg: &Config,
     root: &Path,
     key: &str,
     filter: &str,
     seen: Option<u64>,
-) -> io::Result<astream_broker::Subscription<Box<dyn transport::Stream>>> {
+) -> io::Result<(Conn, u64)> {
     let store = Store {
         root: root.to_path_buf(),
     };
@@ -922,10 +993,14 @@ fn subscribe(
         (None, None) => match cfg.since {
             Since::Start => 0,
             Since::At(n) => n,
-            Since::Head => conn.fetch(0, filter, 0)?.1 .1,
+            Since::Head => {
+                let head = conn.fetch(0, filter, 0)?.1 .1;
+                store.set_cursor(key, head)?;
+                head
+            }
         },
     };
-    conn.subscribe(from, filter)
+    Ok((conn, from))
 }
 
 // ---------------------------------------------------------------------------
@@ -983,7 +1058,7 @@ pub fn main(args: &[String]) -> ExitCode {
     let outcome = if once {
         notifier.catch_up()
     } else {
-        notifier.catch_up().and_then(|()| notifier.follow())
+        notifier.follow()
     };
     let c = notifier.counts;
     println!(
@@ -1099,7 +1174,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
         }
     };
     if cfg.state_dir.is_empty() {
-        cfg.state_dir = default_state_dir();
+        cfg.state_dir = crate::cli::default_state_dir();
     }
     Ok(cfg)
 }
@@ -1129,30 +1204,33 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
     Ok((limit, ms))
 }
 
-/// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else the
-/// working directory.
-///
-/// The same rule `serve` uses, and deliberately the same directory: §9.3 puts the
-/// journal "beside the bridge's other durable state". It is duplicated rather
-/// than shared because this wave's ownership split gave `main.rs` to another
-/// rung; one of the two copies should go when a later rung next touches it.
-fn default_state_dir() -> String {
-    if let Ok(x) = std::env::var("XDG_STATE_HOME") {
-        if !x.is_empty() {
-            return format!("{x}/aterm-link");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return format!("{home}/.local/state/aterm-link");
-        }
-    }
-    "./aterm-link-state".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slow `--exec` leaves the consumer unavailable. Readers must stop at
+    /// their current row rather than queue broker bodies while it runs. Once
+    /// the executor accepts rows, a reader still delivers them in order.
+    #[test]
+    fn follow_handoff_backpressures_a_stalled_executor_without_losing_order() {
+        let (tx, rx) = notice_handoff();
+        let first = Notice::Record(0, 41, String::from("first"), vec![1; 1024]);
+        let first = match tx.try_send(first) {
+            Err(mpsc::TrySendError::Full(row)) => row,
+            other => panic!("a stalled executor must leave no queued row: {other:?}"),
+        };
+        let second = Notice::Record(0, 42, String::from("second"), vec![2; 1024]);
+        let producer = std::thread::spawn(move || {
+            tx.send(first).expect("executor accepts first row");
+            tx.send(second).expect("executor accepts second row");
+        });
+
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(first, Notice::Record(0, 41, subject, _) if subject == "first"));
+        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(second, Notice::Record(0, 42, subject, _) if subject == "second"));
+        producer.join().unwrap();
+    }
 
     /// **EVERY SUBJECT SEGMENT THAT BECOMES AN ENVIRONMENT VALUE IS A
     /// PRINCIPAL.** The shape check was the whole wall, and the segments went
@@ -1235,13 +1313,15 @@ mod tests {
     /// position, same `abort()` — was left armed in every build. Four
     /// independent lenses reported the survivor. A list of files to check would
     /// have the same shape of gap as that fix did, so this reads the directory:
-    /// any file that reads a `*_FAULT` variable must carry the release gate, and
-    /// the next knob added anywhere in the crate fails here until it does.
+    /// a `*_FAULT` variable is read through `aterm_types::dev_seam!` (compiled out
+    /// of a release build) and never through `std::env`, and the next knob added
+    /// anywhere in the crate fails here until it is. (`aterm-update-core`'s
+    /// `env_reads` gate holds the same rule workspace-wide.)
     #[test]
     fn no_fault_knob_this_crate_ships_is_armed_in_a_released_binary() {
         // Assembled, so this test's own source is not the thing it finds.
-        let reads_a_fault = concat!("_FAULT", "\").as_deref()");
-        let gate = concat!("!cfg!(debug_", "assertions)");
+        let reads_a_fault = concat!("_FAULT", "\")");
+        let gate = concat!("dev_", "seam!(\"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut knobs: Vec<String> = Vec::new();
         let mut files = 0;
@@ -1260,11 +1340,14 @@ mod tests {
                 continue;
             }
             knobs.push(name.clone());
-            assert!(
-                body.contains(gate),
-                "{name} reads a fault knob out of the environment with no \
-                 release gate: a shipped binary honours it"
-            );
+            for (at, _) in body.match_indices(reads_a_fault) {
+                let line = &body[body[..at].rfind('\n').map_or(0, |i| i + 1)..at];
+                assert!(
+                    line.contains(gate),
+                    "{name} reads a fault knob out of the environment with no \
+                     release gate — a shipped binary honours it: {line}"
+                );
+            }
         }
         assert!(
             files > 1,
@@ -1277,37 +1360,6 @@ mod tests {
             knobs,
             vec!["bridge.rs".to_string(), "notify.rs".to_string()],
             "the two fault knobs this crate ships"
-        );
-    }
-
-    /// The text of `fn default_state_dir` in `src`, from its signature to the
-    /// line that closes it. Whitespace and all: the point of the pin is that the
-    /// copies are IDENTICAL, so a comparison that normalised anything would let
-    /// the copies drift in exactly the way that made this worth pinning.
-    fn state_dir_rule(src: &str) -> &str {
-        let at = src
-            .find("fn default_state_dir() -> String {")
-            .expect("the state-dir rule");
-        let rest = &src[at..];
-        let end = rest.find("\n}\n").expect("its closing brace") + 3;
-        &rest[..end]
-    }
-
-    /// **THE STATE-DIR RULE IS DUPLICATED FROM `cli.rs`, SO IT IS PINNED TO
-    /// IT.** `cli.rs` carried this rule as a binary main until 2026-09-10, so it
-    /// exists twice — there and in `notify.rs` —
-    /// and it belongs in `state.rs` where all three could call one copy. Until it
-    /// moves, every copy is pinned to the original: change `cli.rs`'s rule and
-    /// this fails, rather than leaving `notify` reading its state under a
-    /// directory `serve` no longer writes.
-    #[test]
-    fn the_state_dir_rule_matches_the_serve_binarys() {
-        assert_eq!(
-            state_dir_rule(include_str!("notify.rs")),
-            state_dir_rule(include_str!("cli.rs")),
-            "notify.rs's copy of the state-dir rule has drifted from cli.rs's; \
-             `aterm-link notify` would read its state under a directory \
-             `aterm-link serve` no longer uses"
         );
     }
 

@@ -6,7 +6,8 @@
 //! The trace drives the genuine `EditorWorkspace` reducer over the shipping
 //! `DocumentStore`, projects its view/document state into the derived model, and
 //! checks each named transition. Independent corrupted projections prove that a
-//! collapsed active mark or minibuffer-to-document input leak cannot pass.
+//! collapsed active mark, a minibuffer-to-document input leak, or a search caret
+//! past the document end cannot pass.
 
 #![cfg(test)]
 
@@ -38,7 +39,7 @@ fn project(
     let snapshot = store.snapshot(document).expect("live editor document");
     let selection = view.primary_selection();
     let (mode, query, active_search_origin) = match &view.minibuffer {
-        Minibuffer::Inactive | Minibuffer::Message(_) => (0, 0, None),
+        Minibuffer::Inactive => (0, 0, None),
         Minibuffer::Command { query, .. } => (1, query.chars().count(), None),
         Minibuffer::Search { query, origin } => (2, query.chars().count(), Some(*origin)),
         Minibuffer::Buffer { query } => (3, query.chars().count(), None),
@@ -104,6 +105,13 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let model = native_editor_modal_model();
     let mut store = DocumentStore::new();
     let document = store.open("mem://editor-modal-conformance".into(), "abc".into());
+    // The model's `Cap` is the length of the document this trace opens.
+    let cap = model
+        .consts
+        .iter()
+        .find_map(|(name, value)| (*name == "Cap").then_some(*value))
+        .expect("NativeEditorModal declares Cap");
+    assert_eq!(usize::try_from(cap).unwrap(), "abc".len());
     let mut workspace = EditorWorkspace::new();
     let mut view = workspace
         .attach(&mut store, document, DocumentViewId(701))
@@ -186,6 +194,13 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     workspace.insert_text(&mut store, &mut view, "b").unwrap();
     let search_typed = project(&model, &store, document, &view, facts);
     assert_transition(&model, &search_open, &search_typed, "MinibufferType");
+
+    // Negative control: an off-by-one search clamp parks the caret one past the
+    // document end, which neither the transition nor `CaretBounded` admits.
+    let mut overrun = search_typed.clone();
+    overrun.insert("caret", cap + 1);
+    assert_eq!(admits(&model, &search_open, &overrun), None);
+    assert!(!model.check_invariant("CaretBounded", &overrun));
     workspace.minibuffer_backspace(&store, &mut view).unwrap();
     let search_erased = project(&model, &store, document, &view, facts);
     assert_transition(&model, &search_typed, &search_erased, "MinibufferBackspace");

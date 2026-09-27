@@ -22,7 +22,6 @@ crate-type = ["cdylib", "rlib"]
 # aterm-sixel has no libc/C, so it targets wasm32-unknown-unknown cleanly.
 aterm-core = { path = "../aterm-core", default-features = false, features = ["sixel"] }
 aterm-render = { path = "../aterm-render", default-features = false }
-aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # The shared cursor-wake + sparkle-words engines (the SAME art the native app
 # runs — extracted from aterm-gui). Closure is wasm32-clean (aterm-time clock).
 aterm-effects = { path = "../aterm-effects" }

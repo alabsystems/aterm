@@ -8,20 +8,28 @@
 //! or restarted logical stream exposes `reset` and a new ID; scan completion can
 //! precede result-delta completion; and only the final drain retires the cursor.
 //!
-//! The action set and the registry enrolment are held elsewhere, not re-pinned
-//! here: `executable_model_walks_every_public_lifecycle_branch` fires every
-//! action, aterm-core's `budgeted_resume_refinement_actions_are_complete`
-//! requires one `#[refines]` anchor per action in both directions, and
-//! `non_vacuity_ratchet.rs` names this model, so dropping it from
-//! `xref::model_registry()` fails there.
+//! The action set is held elsewhere, not re-pinned here:
+//! `executable_model_walks_every_public_lifecycle_branch` fires every public
+//! action, and aterm-core's `budgeted_resume_refinement_actions_are_complete`
+//! requires one `#[refines]` anchor per public action in both directions and a
+//! waiver for the one `Buggy`-only action. Registry enrolment is
+//! pinned below, directly, rather than left to whichever ratchet table happens
+//! to name the model.
 
 use aterm_spec::derive::budgeted_search_resume_model;
 use aterm_spec::{interp, verify};
 
 #[test]
 fn budgeted_search_resume_proves_and_catches_stale_continuation() {
+    let model = budgeted_search_resume_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name),
+        "BudgetedSearchResume must stay enrolled in the model registry"
+    );
     verify::prove_and_catch_scalar(
-        &budgeted_search_resume_model(),
+        &model,
         "derived BudgetedSearchResume spec (identity/reset/delta-drain lifecycle)",
     );
 }
@@ -32,11 +40,10 @@ fn assert_invariants(
 ) {
     for invariant in [
         "LifecycleShape",
-        "CursorMatchesSearchId",
+        "IdentityStableWithoutReset",
         "ResetMintsFresh",
         "ResetStartsAtBeginning",
         "DeliveryShape",
-        "IdentityIsLatest",
         "ValuesBounded",
     ] {
         assert!(
@@ -251,4 +258,72 @@ fn delivery_backlog_cannot_complete_or_stutter_early() {
         !model.successors("Drain", &state).contains(&stutter),
         "negative control: a drain-only resume must advance delivery progress"
     );
+}
+
+/// Each remaining law is caught by a `Buggy=1` slip in `search_budgeted`: the
+/// completion gate dropped from the cursor, completion read from the scan
+/// alone, and a resume that mints a fresh token per turn.
+#[test]
+fn each_lifecycle_law_has_its_own_slip() {
+    let model = budgeted_search_resume_model();
+    assert_eq!(
+        model.successors("BuggyScanOnlyCompletion", &model.init_state()),
+        vec![model.init_state()],
+        "the scan-only completion is a stutter at the committed config"
+    );
+    assert_eq!(
+        verify::audit_dead_negative_controls(&model, &[]),
+        Ok(0),
+        "no action is dead at the committed config (strict vacuity)"
+    );
+    let buggy = interp::with_consts(&model, &[("Buggy", 1)]);
+
+    // Completion from the scan alone: the dense scan turn reports complete and
+    // cursorless with its backlog still held. The lifecycle shape is a valid
+    // completed stream; only the delivery law sees the stranded matches.
+    let stranded = buggy.successors("BuggyScanOnlyCompletion", &buggy.init_state())[0].clone();
+    assert_eq!(
+        (
+            stranded["live"],
+            stranded["complete"],
+            stranded["cursor"],
+            stranded["delivery"]
+        ),
+        (0, 1, 0, 1)
+    );
+    assert!(buggy.check_invariant("LifecycleShape", &stranded));
+    assert!(!buggy.check_invariant("DeliveryShape", &stranded));
+
+    let mut kept = buggy.init_state();
+    for action in ["Start", "Resume", "FinishScan"] {
+        assert!(buggy.fire(action, &mut kept), "{action}: {kept:?}");
+    }
+    assert_eq!((kept["complete"], kept["live"]), (1, 1));
+    assert!(!buggy.check_invariant("LifecycleShape", &kept));
+
+    // The same gate-free cursor at the final drain: the backlog is delivered
+    // and complete, yet the stream still reads live.
+    let mut drained = buggy.init_state();
+    for action in ["StartBacklog", "Drain", "DrainComplete"] {
+        assert!(buggy.fire(action, &mut drained), "{action}: {drained:?}");
+    }
+    assert_eq!(
+        (drained["complete"], drained["live"], drained["delivery"]),
+        (1, 1, 3)
+    );
+    assert!(!buggy.check_invariant("DeliveryShape", &drained));
+
+    let started = buggy.successors("Start", &buggy.init_state())[0].clone();
+    let rotated = buggy.successors("Resume", &started)[0].clone();
+    assert_eq!(
+        (
+            rotated["cursor"],
+            rotated["search_id"],
+            rotated["stream_id"],
+            rotated["reset"]
+        ),
+        (2, 2, 1, 0),
+        "a fresh token without a reset"
+    );
+    assert!(!buggy.check_invariant("IdentityStableWithoutReset", &rotated));
 }

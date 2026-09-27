@@ -27,8 +27,8 @@ pub(crate) const DEFAULT_MEMORY_BUDGET: usize = 100 * 1024 * 1024;
 /// interactive sessions, but bounded for attacker workloads.
 ///
 /// Hosts that need unbounded history can opt in via
-/// `Scrollback::set_line_limit(None)` or
-/// `ConfigBuilder::unlimited_scrollback()`.
+/// `Scrollback::set_line_limit(None)` or a `TerminalConfig` whose
+/// `scrollback_limit` is `None`.
 pub const DEFAULT_LINE_LIMIT: usize = 100_000;
 
 /// Maximum decompressed size for a single scrollback page (64 MiB).

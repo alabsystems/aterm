@@ -67,11 +67,14 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(run() as u8)
 }
 
+#[cfg(target_os = "macos")]
 const PASS: i32 = 0;
+#[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
 const NOT_RUN: i32 = 2;
 
 /// The env var that turns this binary into one of its own child probes.
+#[cfg(target_os = "macos")]
 const MODE: &str = "ATERM_OBJC_BOUND_DRIVE_MODE";
 
 /// How long the parent waits before declaring a child hung.
@@ -79,6 +82,7 @@ const MODE: &str = "ATERM_OBJC_BOUND_DRIVE_MODE";
 /// Generous on purpose: a FALSE "it hung" would be the worst outcome this file
 /// could produce, and the `nodrop` child proves the same budget is far more
 /// than the working path needs.
+#[cfg(target_os = "macos")]
 const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(not(target_os = "macos"))]
@@ -196,7 +200,8 @@ mod macos {
     /// the same structural reason the real ones are.
     struct DeallocWatch {
         _calls: Cell<i64>,
-        where_died: WhereDidIDie,
+        /// Held for its `Drop`, which is the observation stage 4 makes.
+        _where_died: WhereDidIDie,
     }
 
     declare_class! {
@@ -365,7 +370,7 @@ mod macos {
             mt,
             DeallocWatch {
                 _calls: Cell::new(0),
-                where_died: WhereDidIDie(flag.clone()),
+                _where_died: WhereDidIDie(flag.clone()),
             },
         ) else {
             eprintln!("objc-bound-drive: NOT RUN — the probe class could not be instantiated.");
@@ -411,7 +416,7 @@ mod macos {
             mt,
             DeallocWatch {
                 _calls: Cell::new(0),
-                where_died: WhereDidIDie(flag.clone()),
+                _where_died: WhereDidIDie(flag.clone()),
             },
         ) else {
             eprintln!("objc-bound-drive: NOT RUN — the probe class could not be instantiated.");
@@ -577,21 +582,6 @@ mod macos {
                 return ProbeOutcome::StillRunning;
             }
             std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// The ivar field the stages read through their `Arc`, kept alive so the
-    /// struct is not merely a destructor with a name.
-    const _: () = {
-        assert!(size_of::<WhereDidIDie>() == size_of::<std::sync::Arc<AtomicU32>>());
-    };
-
-    impl DeallocWatch {
-        /// Never called; it exists so `where_died` is a READ field and not a
-        /// silently-dead one.
-        #[allow(dead_code)]
-        fn watcher(&self) -> &WhereDidIDie {
-            &self.where_died
         }
     }
 }

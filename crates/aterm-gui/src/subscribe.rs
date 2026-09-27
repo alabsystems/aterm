@@ -74,7 +74,7 @@ use crate::turn_ledger::TurnLedger;
 /// `screen`/`cursor`/`cells` ride the `content_seq` delta path; `events` rides the
 /// block-complete (OSC 133 D) signal; `bytes` rides the raw output fan-out.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct TargetStreams {
+pub(crate) struct TargetStreams {
     /// Emit `DELTA <sid> seq=<n> screen <changed rows>` when content advances.
     pub screen: bool,
     /// Emit `DELTA <sid> seq=<n> cursor <row> <col> <visible> <style>` on any caret
@@ -150,7 +150,7 @@ impl TargetStreams {
 /// the request and the grant are different types precisely so a parse result cannot
 /// be handed to [`push_loop`] by mistake.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct RequestedInstance {
+pub(crate) struct RequestedInstance {
     /// The INSTANCE-lifecycle stream (not per-target): emit `EVENT * session-created
     /// <sid>` when a session is spawned (by anyone) and `EVENT * session-exited <sid>
     /// reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown>` when one
@@ -164,13 +164,27 @@ pub struct RequestedInstance {
     /// through the `sessions`/`who` verbs, so Owner keeps it and every other scope is
     /// REFUSED (`ERR denied`) rather than handed a stream that pushes nothing.
     ///
-    /// BEST-EFFORT, 250ms-SAMPLED: this is a point-in-time set diff on each wake, and
-    /// an unwatched sibling never fires the notify, so the loop observes it only on the
-    /// bounded 250ms poll. A sibling that both spawns AND exits inside one 250ms window
-    /// appears in neither snapshot and emits neither event — the store keeps no
-    /// monotonic lifecycle log to recover a sub-tick create→exit. Adequate for
-    /// supervision (a session that lived <250ms is rarely actionable); a driver needing
-    /// every ephemeral lifecycle must poll `ls` faster or drive from an event log.
+    /// JOURNAL-DRIVEN, 250ms-SAMPLED: each wake drains the store's roster journal, a
+    /// monotonic log of every registration and exit that keeps the newest
+    /// [`crate::session_store::ROSTER_JOURNAL_CAP`] (512) records. An unwatched sibling
+    /// never fires the notify, so the loop observes it only on the bounded 250ms poll —
+    /// but a sibling that spawns AND exits between two wakes is still reported, as both
+    /// events in order, because the journal kept both records. The lossy case is a
+    /// subscriber the journal has rolled past (more than 512 records between two of its
+    /// wakes): it falls back to a set diff of the live roster, which reports only the
+    /// NET change (`reason=unknown` on the exits) and cannot see a create→exit pair that
+    /// cancelled out. The push loop's `drain_roster` has the detail.
+    ///
+    /// On a subscription that also ADOPTS (`@*`), a live session's `session-created`
+    /// follows its watch's `sub <local> <sid>` ack, so the watch exists when the line
+    /// is written. The two exceptions are said on the wire: a session gone again by
+    /// the wake that saw it (its `session-exited` follows in the same frame), and one
+    /// whose adoption is deferred at [`crate::control::MAX_SUBSCRIBE_TARGETS`], which
+    /// is announced at once with a trailing `watch=deferred` and acked, with no second
+    /// announcement, by the wake that adopts it — possibly never, since a slot frees
+    /// only when a watched session exits. The push loop's `drain_membership` says why.
+    /// A session the cap left over when `@*` arrived (the handshake watches at most
+    /// the cap) is in the baseline: never announced, and acked when it is adopted.
     pub sessions: bool,
 }
 
@@ -187,7 +201,7 @@ pub struct RequestedInstance {
 /// cross-instance roster) added to [`RequestedInstance`] inherits the check by
 /// construction rather than by someone remembering to add one.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct InstanceStreams {
+pub(crate) struct InstanceStreams {
     sessions: bool,
 }
 
@@ -203,7 +217,7 @@ impl InstanceStreams {
     /// than a refusal and fail-closed matches the rest of the surface. This fallback
     /// is what keeps the invariant true if a future caller forgets the refusal.
     #[must_use]
-    pub fn authorize(req: RequestedInstance, scope: Scope) -> Self {
+    pub(crate) fn authorize(req: RequestedInstance, scope: Scope) -> Self {
         InstanceStreams {
             sessions: req.sessions && scope.is_owner_class(),
         }
@@ -211,7 +225,7 @@ impl InstanceStreams {
 
     /// Whether the instance lifecycle stream was granted.
     #[must_use]
-    pub fn sessions(self) -> bool {
+    pub(crate) fn sessions(self) -> bool {
         self.sessions
     }
 }
@@ -221,7 +235,7 @@ impl InstanceStreams {
 /// [`Scope`]: the two halves are authorized by different checks (per resolved target
 /// vs. once for the connection), and the type says so at the boundary.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct Requested {
+pub(crate) struct Requested {
     /// The per-target frame sources, gated once per resolved selector.
     pub targets: TargetStreams,
     /// `mail`'s `kinds=`/`from=` filter. Inert unless `targets.mail` is set; it
@@ -395,7 +409,7 @@ impl Requested {
 /// per-target flags in the first place. (It also keeps the signature inside clippy's
 /// argument budget without a stylistic `allow`.)
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct PushOptions {
+pub(crate) struct PushOptions {
     /// `since=<seq>`: the client's last-seen `content_seq`. Seeds each watch's
     /// `last_sent_seq` so the immediate catch-up fires exactly when content moved
     /// past it.
@@ -433,7 +447,7 @@ struct SubscriberHandle {
 /// session id so the existing `Wake::Output { session }` fan-out can find every
 /// subscriber of the session that just produced output in O(1).
 #[derive(Default)]
-pub struct SubscriberSet {
+pub(crate) struct SubscriberSet {
     /// session local id -> the handles watching it. A session with no subscribers
     /// has no entry (and `notify` is then a cheap miss).
     by_session: HashMap<u64, Vec<SubscriberHandle>>,
@@ -451,7 +465,7 @@ pub struct SubscriberSet {
 /// one redundant lock+miss; a stale `false` is possible only in the instant after a
 /// register and is benign — the next output burst observes `true`, and the
 /// subscriber's `recv_timeout` requeries, so no update is permanently lost.
-pub struct SubscriberRegistry {
+pub(crate) struct SubscriberRegistry {
     inner: Mutex<SubscriberSet>,
     any: AtomicBool,
 }
@@ -459,7 +473,7 @@ pub struct SubscriberRegistry {
 impl SubscriberRegistry {
     /// Lock the underlying set. Same shape as `Mutex::lock`, so every existing
     /// `registry.lock()` call site is unchanged.
-    pub fn lock(&self) -> LockResult<MutexGuard<'_, SubscriberSet>> {
+    pub(crate) fn lock(&self) -> LockResult<MutexGuard<'_, SubscriberSet>> {
         self.inner.lock()
     }
     /// Lock-free fast-path: `true` iff at least one session has a subscriber. The
@@ -470,7 +484,7 @@ impl SubscriberRegistry {
     /// output burst observes `true`, and the subscriber's own `recv_timeout` requeries,
     /// so no update is permanently lost.)
     #[must_use]
-    pub fn any(&self) -> bool {
+    pub(crate) fn any(&self) -> bool {
         self.any.load(Ordering::Acquire)
     }
     /// Refresh the flag from the (locked) set's emptiness. Called by register/drop
@@ -485,11 +499,11 @@ impl SubscriberRegistry {
 /// Shared handle to the subscriber registry: held by `App` (the producer side,
 /// for the one `Wake::Output` notify hook) and cloned into the control thread
 /// (the consumer side, where a `subscribe` connection registers itself).
-pub type Subscribers = Arc<SubscriberRegistry>;
+pub(crate) type Subscribers = Arc<SubscriberRegistry>;
 
 /// A new, empty subscriber registry.
 #[must_use]
-pub fn new_registry() -> Subscribers {
+pub(crate) fn new_registry() -> Subscribers {
     Arc::new(SubscriberRegistry {
         inner: Mutex::new(SubscriberSet::default()),
         any: AtomicBool::new(false),
@@ -500,7 +514,7 @@ pub fn new_registry() -> Subscribers {
 /// here, and on drop deregisters itself from every session it watched. RAII so a
 /// subscriber that returns (write failure / client hangup) cannot leak an entry
 /// that would make `notify` pay for a dead receiver forever.
-pub struct Subscription {
+pub(crate) struct Subscription {
     registry: Subscribers,
     /// The sessions this subscription registered under (for precise deregistration).
     sessions: Vec<u64>,
@@ -528,7 +542,7 @@ impl Subscription {
     /// Idempotent per subscription: a session already registered under OUR token
     /// is not registered twice (a duplicate handle would double every notify for
     /// that session and leave a stale entry behind on drop).
-    pub fn watch(&mut self, local_id: u64) {
+    pub(crate) fn watch(&mut self, local_id: u64) {
         if self.sessions.contains(&local_id) {
             return;
         }
@@ -553,7 +567,7 @@ impl Subscription {
     /// `notify` walks and a `sessions` entry `Drop` must later clean up. The
     /// same precise `token` match `Drop` uses, so it can only ever remove OUR
     /// handle, never another connection's on the same session.
-    pub fn unwatch(&mut self, local_id: u64) {
+    pub(crate) fn unwatch(&mut self, local_id: u64) {
         let mut g = self.registry.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(v) = g.by_session.get_mut(&local_id) {
             v.retain(|h| h.token != self.token);
@@ -570,7 +584,7 @@ impl Subscription {
     /// `false` on timeout. A spurious/coalesced wake is fine: the caller re-reads
     /// the latest state and emits a delta only if `content_seq` advanced.
     #[must_use]
-    pub fn wait(&self, timeout: Duration) -> bool {
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
         matches!(self.rx.recv_timeout(timeout), Ok(()))
     }
 }
@@ -596,7 +610,7 @@ impl SubscriberSet {
     /// output; dropping it deregisters from all watched sessions. The single-slot
     /// notify is created here and its receiver handed back inside the subscription.
     #[must_use]
-    pub fn register(registry: &Subscribers, sessions: &[u64]) -> Subscription {
+    pub(crate) fn register(registry: &Subscribers, sessions: &[u64]) -> Subscription {
         // capacity 1 == single-slot: at most one pending notify (coalescing).
         let (tx, rx) = sync_channel::<()>(1);
         let mut g = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -624,7 +638,7 @@ impl SubscriberSet {
     /// (notify already pending) or a hung-up receiver (subscriber thread gone) is
     /// silently ignored, so the producer's reader/GUI thread is NEVER stalled by a
     /// slow or dead subscriber. This is the ONLY method the producer calls.
-    pub fn notify(&self, local_id: u64) {
+    pub(crate) fn notify(&self, local_id: u64) {
         let Some(handles) = self.by_session.get(&local_id) else {
             return; // no subscribers for this session: cheap miss
         };
@@ -641,14 +655,14 @@ impl SubscriberSet {
     /// `who` verb reports and the "eye" a presence indicator lights. Counts every
     /// stream (a `screen`+`events` subscriber counts once: one registration).
     #[must_use]
-    pub fn watchers(&self, local_id: u64) -> usize {
+    pub(crate) fn watchers(&self, local_id: u64) -> usize {
         self.by_session.get(&local_id).map_or(0, Vec::len)
     }
 
-    /// Number of distinct sessions with at least one subscriber (test/introspection).
+    /// Number of distinct sessions with at least one subscriber.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
-    pub fn watched_sessions(&self) -> usize {
+    pub(crate) fn watched_sessions(&self) -> usize {
         self.by_session.len()
     }
 }
@@ -752,19 +766,19 @@ struct Watch {
 /// or an edge that happens to reach far enough": there is no such edge, and a
 /// type that cannot represent one cannot leak one.
 #[derive(Clone, Copy)]
-pub struct AdoptScope(bool);
+pub(crate) struct AdoptScope(bool);
 
 impl AdoptScope {
     /// Grant `@*` adoption IFF it was requested AND the connection is Owner.
     #[must_use]
-    pub fn authorize(requested: bool, scope: Scope) -> Self {
+    pub(crate) fn authorize(requested: bool, scope: Scope) -> Self {
         AdoptScope(requested && scope.is_owner_class())
     }
 
-    /// The refusing default — no adoption. What every non-`@*` subscribe passes.
+    /// The refusing default — no adoption: `authorize(false, _)` for the tests.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)] // used by tests + any future non-adopting `push_loop` caller
-    pub fn none() -> Self {
+    pub(crate) fn none() -> Self {
         AdoptScope(false)
     }
 
@@ -1116,6 +1130,10 @@ fn drain_title_event(
 ///   loop does not yet — it reads `text --json` and classifies with
 ///   aterm-phase itself, the verdict used only for one bounded `await agent
 ///   prompt` (the laws review of 2026-09-24).
+/// * `EVENT <sid> human` for a `human` row — a person started typing,
+///   clicking or scrolling in the session through a window after at least
+///   [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without (the burst edge;
+///   `status human_ms=` is the running age).
 /// * `EVENT <sid> closing <payload>` for the `closing` row the store writes as
 ///   it retires the session — the `reason=<token> by=<sid|human|->` the `exits`
 ///   ledger holds. This watch's own `Arc` is the ONLY wire path that can still
@@ -1172,7 +1190,11 @@ fn drain_timeline_events(
         out.push_str(&format!("GAP {sid} events-dropped={missed}\n"));
     }
     for (kind, payload) in fresh {
-        out.push_str(&format!("EVENT {sid} {kind} {payload}\n"));
+        if payload.is_empty() {
+            out.push_str(&format!("EVENT {sid} {kind}\n"));
+        } else {
+            out.push_str(&format!("EVENT {sid} {kind} {payload}\n"));
+        }
     }
     high
 }
@@ -1192,6 +1214,11 @@ fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         // face of `status agent=` — a client may park on it instead of
         // re-reading screens (the in-GUI supervisor does not yet).
         "agent-change" => Some("agent"),
+        // A PERSON started typing, clicking or scrolling in the session through
+        // a window after ≥ 30 s without (`crate::app_input::note_person`): `EVENT <local>
+        // human`, no payload — `status human_ms=` says how long ago since.
+        // The supervisor keeps its hands off for `[harness] human_grace_s`.
+        "human" => Some("human"),
         // The FABRIC digest (design §11.2): `inbox`, `inbox-seen`, `post`,
         // `fetch`, `post-landed`, `hold`, `topic`. Their wire name IS the record kind, and the list
         // lives beside the code that WRITES them
@@ -1233,12 +1260,15 @@ fn drain_bell_event(sid: &str, total: u64, last_bell: u64, out: &mut String) -> 
 struct RosterCursor {
     /// Highest roster-journal seq already drained. `0` = "seen nothing".
     seq: u64,
-    /// The live sids as of `seq` (recovery input only — see the type doc).
+    /// The sids this cursor counts as live as of `seq` (recovery input only —
+    /// see the type doc): the live roster the subscription was seeded with,
+    /// which is never announced (a fresh subscriber `ls`s for its baseline),
+    /// plus every sid announced since, minus every exit announced since.
     known: std::collections::HashSet<String>,
 }
 
-/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid> reason=<…>` /
-/// `EVENT * fabric-retire <sid>` for every roster change since the cursor's watermark — the INSTANCE lifecycle
+/// Append `EVENT * session-created <sid>[ watch=deferred]` / `EVENT * session-exited <sid> reason=<…>` /
+/// `EVENT * fabric-retire <sid>` to `out` for every roster change since the cursor's watermark — the INSTANCE lifecycle
 /// stream (`*` = instance-level, not a per-channel event). Surfaces a SIBLING
 /// spawn/exit a fleet supervisor is not watching, so it need not poll `ls`.
 ///
@@ -1259,89 +1289,128 @@ struct RosterCursor {
 ///     neither event — the store keeps no monotonic lifecycle log." A snapshot
 ///     diff reports only the NET change between two instants; events that
 ///     cancelled out are gone. The journal records each transition as it
-///     happens, so BOTH events are emitted, in order, on the next wake — without
-///     shortening the tick or adding a notify path.
+///     happens, so BOTH events are emitted, in order, on the next wake —
+///     without shortening the tick or adding a notify path.
 ///
 /// The `known` set and [`diff_session_events`] survive as the RECOVERY path: a
 /// cursor that fell past the journal's retained low-water rebuilds and diffs
-/// exactly as before. That arm is behaviour-identical to the old code (it IS the
-/// old code), so the worst case degrades to today's cost rather than to a wire
-/// change or a dropped event.
+/// exactly as before. For a subscription that does not adopt, that arm is
+/// behaviour-identical to the old code (it IS the old code), so the worst case
+/// degrades to today's cost rather than to a wire change or a dropped event.
 ///
-/// The cursor is advanced in place only after its frames have been produced, so
+/// It reads the registry through the guard its caller holds — the ONE read
+/// [`drain_membership`] shares with adoption, which is the point: see there.
+/// `watched` is `Some` exactly when the subscription adopts (`@*`), and answers
+/// whether a local id has a watch once that pass's adoptions are built. A
+/// `session-created` for a session that is LIVE under this read and that
+/// `watched` answers `false` for carries a trailing `watch=deferred` — on
+/// either arm. Every other `session-created` is plain, so on a subscription
+/// that adopts a plain one means the session is watched or is gone again (its
+/// `session-exited` is in the same batch). Without `watched` nothing is marked.
+///
+/// The cursor is advanced in place only after its lines have been produced, so
 /// the watermark can never move without the events having been written.
-fn drain_session_events(store: &Store, cursor: &mut RosterCursor) -> Vec<Frame> {
-    let mut out = String::new();
-    {
-        // ONE read-lock hold. Never taken across a Terminal lock or a socket
-        // write — the guard is dropped before the frame goes out, exactly like
-        // the snapshot read it replaces.
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        let high = g.roster_seq();
-        if high == cursor.seq {
-            // THE IDLE TICK: nothing has entered or left the registry since we
-            // last looked. One integer compare, no allocation, no set build.
-            return Vec::new();
-        }
-        match g.roster_low_seq() {
-            // Fast path: every record we have not seen is still retained, so the
-            // delta is exact and complete.
-            Some(low) if cursor.seq + 1 >= low => {
-                for rec in g.roster_since(cursor.seq) {
-                    match rec.change {
-                        crate::session_store::RosterChange::Created => {
-                            out.push_str(&format!("EVENT * session-created {}\n", rec.sid));
-                            cursor.known.insert(rec.sid.clone());
-                        }
-                        crate::session_store::RosterChange::Exited => {
-                            // `reason=` is a TRAILING additive token (old clients
-                            // key on the sid and ignore the tail): the journal row
-                            // knows why the session went, so the push says so —
-                            // the one thing a driver could never ask afterwards.
-                            out.push_str(&format!(
-                                "EVENT * session-exited {} reason={}\n",
-                                rec.sid,
-                                rec.reason.as_str()
-                            ));
-                            cursor.known.remove(&rec.sid);
-                        }
-                        // An operator's request to the bridge, not a membership
-                        // change: `known` is untouched.
-                        crate::session_store::RosterChange::RetireRequested => {
-                            out.push_str(&format!("EVENT * fabric-retire {}\n", rec.sid));
-                        }
+fn drain_roster(
+    g: &crate::session_store::SessionStore,
+    cursor: &mut RosterCursor,
+    watched: Option<&dyn Fn(u64) -> bool>,
+    out: &mut String,
+) {
+    let high = g.roster_seq();
+    if high == cursor.seq {
+        // THE IDLE TICK: nothing has entered or left the registry since we
+        // last looked. One integer compare, no allocation, no set build.
+        return;
+    }
+    // The marker for a session live under this read with no watch, on a
+    // subscription that adopts: its adoption was deferred at the cap.
+    let mark = |sid: &str| {
+        let deferred = watched.is_some_and(|w| {
+            g.by_sid(&aterm_session::SessionId::new(sid))
+                .is_some_and(|h| !w(h.local_id))
+        });
+        if deferred { " watch=deferred" } else { "" }
+    };
+    match g.roster_low_seq() {
+        // Fast path: every record we have not seen is still retained, so the
+        // delta is exact and complete.
+        Some(low) if cursor.seq + 1 >= low => {
+            for rec in g.roster_since(cursor.seq) {
+                match rec.change {
+                    crate::session_store::RosterChange::Created => {
+                        out.push_str(&format!(
+                            "EVENT * session-created {}{}\n",
+                            rec.sid,
+                            mark(&rec.sid)
+                        ));
+                        cursor.known.insert(rec.sid.clone());
+                    }
+                    crate::session_store::RosterChange::Exited => {
+                        // `reason=` is a TRAILING additive token (old clients
+                        // key on the sid and ignore the tail): the journal row
+                        // knows why the session went, so the push says so —
+                        // the one thing a driver could never ask afterwards.
+                        out.push_str(&format!(
+                            "EVENT * session-exited {} reason={}\n",
+                            rec.sid,
+                            rec.reason.as_str()
+                        ));
+                        cursor.known.remove(&rec.sid);
+                    }
+                    // An operator's request to the bridge, not a membership
+                    // change: `known` is untouched.
+                    crate::session_store::RosterChange::RetireRequested => {
+                        out.push_str(&format!("EVENT * fabric-retire {}\n", rec.sid));
                     }
                 }
             }
-            // RECOVERY: records between our watermark and the retained window
-            // were drop-oldest evicted (or the journal is somehow empty at a
-            // non-zero high). Rebuild and diff — the pre-journal behaviour,
-            // verbatim. Net-lossy for the cancelled-out pairs, which is exactly
-            // and only as lossy as the design was before the journal existed.
-            _ => {
-                let live = g.live_sids();
-                diff_session_events(&live, &cursor.known, &mut out);
-                cursor.known = live;
-            }
         }
-        cursor.seq = high;
+        // RECOVERY: records between our watermark and the retained window
+        // were drop-oldest evicted (or the journal is somehow empty at a
+        // non-zero high). Rebuild and diff — the pre-journal behaviour, with
+        // the same marker on a newcomer as the fast path. Net-lossy for the
+        // cancelled-out pairs, which is exactly and only as lossy as the
+        // design was before the journal existed.
+        _ => {
+            let live = g.live_sids();
+            diff_session_events(&live, &cursor.known, &mark, out);
+            cursor.known = live;
+        }
     }
+    cursor.seq = high;
+}
+
+/// [`drain_roster`] for a subscription that does not adopt, as the one frame
+/// the push loop would emit — the shape the roster tests assert on. The loop
+/// itself reaches [`drain_roster`] only through [`drain_membership`].
+#[cfg(test)]
+fn drain_session_events(store: &Store, cursor: &mut RosterCursor) -> Vec<Frame> {
+    let mut out = String::new();
+    drain_roster(
+        &store.read().unwrap_or_else(|p| p.into_inner()),
+        cursor,
+        None,
+        &mut out,
+    );
     if out.is_empty() {
         return Vec::new();
     }
     vec![Frame::text(Tag::Instance, out)]
 }
 
-/// The pure set-diff half of [`drain_session_events`] (store-free, unit-testable):
-/// `session-created` for sids newly live, `session-exited … reason=unknown` for sids
-/// gone (a set diff knows THAT a session went, never why).
+/// The pure set-diff half of [`drain_roster`] (store-free, unit-testable):
+/// `session-created` for sids newly live, each followed by whatever `mark`
+/// answers for it (`""`, or [`drain_roster`]'s ` watch=deferred`), and
+/// `session-exited … reason=unknown` for sids gone (a set diff knows THAT a
+/// session went, never why).
 fn diff_session_events(
     live: &std::collections::HashSet<String>,
     known: &std::collections::HashSet<String>,
+    mark: &dyn Fn(&str) -> &'static str,
     out: &mut String,
 ) {
     for sid in live.difference(known) {
-        out.push_str(&format!("EVENT * session-created {sid}\n"));
+        out.push_str(&format!("EVENT * session-created {sid}{}\n", mark(sid)));
     }
     for sid in known.difference(live) {
         // The set diff has no journal row to read a reason from: it reports the
@@ -1768,7 +1837,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
 /// the process-local id, the live engine handle, the session's live byte
 /// fan-out (for the `bytes` stream — a `subscribe` registers on it lazily), its
 /// turn ledger, and its event timeline (the `events` digest's meta-push source).
-pub type ResolvedTarget = (
+pub(crate) type ResolvedTarget = (
     u64,
     Arc<Mutex<Terminal>>,
     Arc<ByteFanout>,
@@ -1897,7 +1966,7 @@ fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions
 /// the three and silently default the third, because the struct has no `Default`
 /// and every field must be named at the construction site.
 #[derive(Clone, Copy)]
-pub struct PushScopes {
+pub(crate) struct PushScopes {
     /// Per-target `ReadScreen` authority, one check per entry of `targets`.
     pub streams: TargetStreams,
     /// Connection-wide authority; the only key to the whole-instance roster.
@@ -1917,7 +1986,7 @@ struct PushCursors {
 }
 
 #[cfg(test)]
-pub fn push_loop<W: Write>(
+pub(crate) fn push_loop<W: Write>(
     registry: &Subscribers,
     store: &Store,
     targets: &[ResolvedTarget],
@@ -1925,7 +1994,7 @@ pub fn push_loop<W: Write>(
     opts: PushOptions,
     writer: &mut W,
 ) {
-    push_loop_with_peer_probe(registry, store, targets, scopes, opts, writer, || false);
+    push_loop_with_peer_probe(registry, store, targets, scopes, opts, "", writer, || false);
 }
 
 /// The production push loop with an explicit peer-liveness probe.
@@ -1936,12 +2005,28 @@ pub fn push_loop<W: Write>(
 /// sampled on every bounded liveness wake and must be non-blocking (or tightly
 /// bounded). The control-socket host supplies a read-side EOF/HUP probe; the
 /// generic [`push_loop`] wrapper keeps in-memory/test writers source-compatible.
-pub fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
+///
+/// `handshake` is the subscription's ack — `OK subscribe <n>` and one `sub
+/// <local> <sid>` line per target, formatted by the control dispatch — and it
+/// is written HERE, once every one of `targets` has its watch seeded, before
+/// the first frame. It used to be written by the dispatch before this loop
+/// seeded anything, so a reader acting on a `sub` line — the fabric bridge
+/// reads that session's `topic ls` there — could read before the seed, and a
+/// change the session recorded between that read and the seed was below the
+/// watch's watermark: in no read and pushed by nobody. Every `sub` line on the
+/// wire, the handshake's and each adoption's ([`drain_membership`]), now
+/// follows its watch's seed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the handshake is written between the seed and the first frame, which only this function sees"
+)]
+pub(crate) fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
     registry: &Subscribers,
     store: &Store,
     targets: &[ResolvedTarget],
     scopes: PushScopes,
     opts: PushOptions,
+    handshake: &str,
     writer: &mut W,
     mut peer_gone: P,
 ) {
@@ -1991,6 +2076,15 @@ pub fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
     // as backlog is a wake wasted. Seeding first makes the registration the
     // real barrier it is documented to be.
     let mut sub = SubscriberSet::register(registry, &local_ids);
+
+    // THE HANDSHAKE, NOW THAT EVERY WATCH IN IT IS SEEDED: see the doc above.
+    // A write failure is the client gone, which ends the stream as `Gone`
+    // does below.
+    if !handshake.is_empty()
+        && (writer.write_all(handshake.as_bytes()).is_err() || writer.flush().is_err())
+    {
+        return;
+    }
 
     let mut egress = Egress::new(writer, opts.timestamps);
     // `Gone` is not a failure to report: the client hanging up IS how a push-only
@@ -2047,7 +2141,6 @@ fn pump<W: Write, P: FnMut() -> bool>(
     // caller must never be able to hand `pump` a scope set the connection did not
     // actually prove.
     let PushScopes { streams, adopt, .. } = scopes;
-    let PushCursors { roster, adopt_seq } = cursors;
     let since_turn = opts.since_turn;
     // The catch-up is a wake like any other, so it opens one: its frames share a
     // stamp ledger, and its flush is `end_wake`.
@@ -2122,26 +2215,18 @@ fn pump<W: Write, P: FnMut() -> bool>(
             }
         }
 
-        // ADOPT: a `@*` subscription's target set is LIVE — sessions created
-        // after it subscribed join it here, each acked with the same
-        // `sub <local> <sid>` line the initial handshake emits, so a client
-        // demultiplexes an adopted channel exactly the way it does an original
-        // one (the shipped bridge already reads `sub` lines anywhere in the
-        // stream, because the ack was never guaranteed to arrive in one read).
-        if adopt.on() && !push_held("adopt") {
-            for f in adopt_new_targets(store, watches, sub, streams, opts, adopt_seq) {
-                egress.emit(f)?;
-            }
-        }
-
-        // INSTANCE lifecycle (connection-level, once per wake): a sibling spawn/exit
-        // the subscriber is not watching, so a fleet supervisor need not poll `ls`.
-        if let Some(cursor) = roster.as_mut()
-            && !push_held("sessions")
-        {
-            for f in drain_session_events(store, cursor) {
-                egress.emit(f)?;
-            }
+        // MEMBERSHIP (connection-level, once per wake). ADOPT: a `@*`
+        // subscription's target set is LIVE — sessions created after it
+        // subscribed join it here, each acked with the same `sub <local> <sid>`
+        // line the initial handshake emits, so a client demultiplexes an
+        // adopted channel exactly the way it does an original one. And the
+        // INSTANCE lifecycle: a sibling spawn/exit the subscriber is not
+        // watching, so a fleet supervisor need not poll `ls`. One pass under one
+        // store read, so no plain announcement comes before its watch exists,
+        // and one the cap leaves unwatched says `watch=deferred` — see
+        // [`drain_membership`].
+        for f in drain_membership(store, watches, sub, streams, opts, adopt, cursors) {
+            egress.emit(f)?;
         }
 
         // The "everything closed" exit sits BELOW both drains above, never between
@@ -2173,21 +2258,30 @@ fn pump<W: Write, P: FnMut() -> bool>(
     }
 }
 
-/// TEST-ONLY: whether one of [`pump`]'s two per-wake store reads is HELD —
-/// `adopt` ([`adopt_new_targets`]) or `sessions` ([`drain_session_events`]) —
-/// because a file of that name exists in the directory `$ATERM_TEST_PUSH_HOLD`
-/// names. A held step is skipped for that wake with its cursor untouched, so
-/// the journal replays it on the first wake after the file goes.
+/// TEST-ONLY: whether one of [`drain_membership`]'s two decisions is HELD —
+/// `adopt` ([`pick_adoptions`]) or `sessions` ([`drain_roster`]) — because a
+/// file of that name exists in the directory `$ATERM_TEST_PUSH_HOLD` names. A
+/// held decision is skipped for that wake with its cursor untouched, so the
+/// journal replays it on the first wake after the file goes. Both are read
+/// before the pass takes its store guard.
 ///
-/// THE WINDOW IT OPENS IS REAL, and only its width is chosen. A session
-/// registered in the store is announced (`EVENT * session-created`) and adopted
-/// (`sub <local> <sid>`, its watch seeded at the timeline's high) on the push
-/// loop's next wake — up to the 250 ms tick later — and by two separate store
-/// reads, so a spawn landing between them is announced one wake BEFORE it is
-/// adopted. A reader that acts on the announcement, or that reads a session
-/// the store lists before the watch exists, is racing that window, and a test
-/// that raced it from outside would be the flake this codebase refuses. So the
-/// test holds each step open and closes it at the named point.
+/// THE STATES IT HOLDS OPEN ARE REAL, and only how long they last is chosen.
+/// A session registered in the store is listed by it at once and adopted
+/// (`sub <local> <sid>`, its watch seeded at the timeline's high) only on the
+/// push loop's next wake — up to the 250 ms tick later — so a reader of the
+/// store's roster (an attach, a `GAP`, a roster round) can read a session
+/// before its watch exists. And at [`crate::control::MAX_SUBSCRIBE_TARGETS`]
+/// a session is announced `watch=deferred` and adopted only when a slot
+/// frees, if ever. Holding `adopt` while `sessions` runs is that deferral
+/// without 256 sessions: the pass announces the session marked
+/// `watch=deferred`, which is true, and acks it on the first pass after the
+/// file goes. A test that raced these states from outside would be the flake
+/// this codebase refuses, so it holds each open and closes it at a named
+/// point.
+///
+/// What no hold can open is the window [`drain_membership`] closed: both
+/// decisions are still taken under its one store guard, so a plain
+/// `session-created` never precedes its session's watch.
 ///
 /// TEST-ONLY IS ENFORCED, not documented: the variable is read only in a build
 /// with `debug_assertions` — aterm-link's `Fault` rule — and only through
@@ -2250,9 +2344,11 @@ fn initial_timeline_watermark(
     timeline.lock().unwrap_or_else(|p| p.into_inner()).high_id()
 }
 
-/// ADOPT every live session this `@*` subscription is not already watching —
-/// driven by the STORE'S ROSTER JOURNAL, so an idle wake costs one integer
-/// compare and a busy one costs O(sessions created).
+/// Which live sessions this `@*` subscription should ADOPT now — every one it
+/// is not already watching, up to the cap — driven by the STORE'S ROSTER
+/// JOURNAL, so an idle wake costs one integer compare and a busy one costs
+/// O(sessions created). Returns each as the tuple [`new_watch`] takes, cloned
+/// out of `g`, with its sid; [`drain_membership`] builds the watches.
 ///
 /// THE COST CATEGORY THIS DELETES. `subscribe` froze its target list at
 /// subscribe time, and the push loop is documented PUSH-ONLY — it never reads
@@ -2275,86 +2371,176 @@ fn initial_timeline_watermark(
 /// and `roster_since` names exactly what did. So adoption does not re-introduce
 /// the per-tick whole-registry walk the roster cursor just deleted.
 ///
+/// THE CAP. The `MAX_SUBSCRIBE_TARGETS` cap that bounds an explicit selector
+/// list bounds this too — a subscription cannot fan out past it by living a
+/// long time. When the cap is reached adoption is DEFERRED, not dropped: the
+/// watermark is NOT advanced, so a later wake with a free slot picks the same
+/// session up. The `sessions` stream does not wait for that wake: it has
+/// already announced the session with `watch=deferred` ([`drain_roster`]), and
+/// the adopting wake's `sub <local> <sid>` ack is the rest of the news. (A
+/// session the cap left over when `@*` arrived is in the stream's baseline and
+/// was never announced; its ack is the only news.)
+fn pick_adoptions(
+    g: &crate::session_store::SessionStore,
+    watches: &[Watch],
+    adopt_seq: &mut u64,
+) -> Vec<(ResolvedTarget, String)> {
+    let room = crate::control::MAX_SUBSCRIBE_TARGETS.saturating_sub(watches.len());
+    if room == 0 {
+        return Vec::new();
+    }
+    let high = g.roster_seq();
+    if high == *adopt_seq {
+        // THE IDLE TICK: nothing has entered or left the registry.
+        return Vec::new();
+    }
+    let unwatched = |h: &&crate::session_store::SessionHandle| {
+        !watches.iter().any(|w| w.local_id == h.local_id)
+    };
+    let carve = |h: &crate::session_store::SessionHandle| {
+        (
+            (
+                h.local_id,
+                h.term.clone(),
+                h.ctx.byte_fanout.clone(),
+                h.ctx.turns.clone(),
+                h.ctx.timeline.clone(),
+                h.ctx.fabric.clone(),
+            ),
+            h.sid.as_str().to_string(),
+        )
+    };
+    let mut picked: Vec<(ResolvedTarget, String)> = match g.roster_low_seq() {
+        // FAST PATH: resolve only the sids the journal says were CREATED.
+        // An `Exited` record needs nothing — `prune_closed` above already
+        // retired that watch — and a Created sid that has since exited
+        // resolves to `None` and is skipped, which is what makes replaying
+        // a stale watermark safe.
+        Some(low) if adopt_seq.saturating_add(1) >= low => g
+            .roster_since(*adopt_seq)
+            .filter(|r| r.change == crate::session_store::RosterChange::Created)
+            .filter_map(|r| g.by_sid(&aterm_session::SessionId::new(&r.sid)))
+            .filter(|h| unwatched(h))
+            .map(carve)
+            .collect(),
+        // RECOVERY: the watermark fell past the journal's retained window
+        // (or this is the very first pass on an instance whose journal has
+        // already rolled). Walk the registry once — the pre-journal cost,
+        // paid only where the journal genuinely cannot answer.
+        _ => g
+            .live_handles()
+            .filter(|h| unwatched(h))
+            .map(carve)
+            .collect(),
+    };
+    // ADVANCE ONLY IF WE TOOK EVERYTHING. Truncating to the cap and moving
+    // the watermark anyway would put the deferred sessions permanently
+    // behind it — the exact "seen, therefore never retried" bug that made
+    // the old bridge lose sessions.
+    if picked.len() <= room {
+        *adopt_seq = high;
+    } else {
+        picked.truncate(room);
+    }
+    picked
+}
+
+/// One wake's MEMBERSHIP pass: ADOPT the sessions a `@*` subscription is not
+/// yet watching ([`pick_adoptions`]) and drain the INSTANCE roster
+/// ([`drain_roster`]), both under ONE store read, then build the adopted
+/// watches before the caller writes a single frame of either.
+///
+/// WHY ONE READ. These were two reads, adoption's first. A session registered
+/// between them was in the roster's batch and not in adoption's, so it was
+/// announced — `EVENT * session-created` — one wake BEFORE its watch existed.
+/// The fabric bridge read a session's opt-ins (`topic ls`) when it was
+/// announced, and the watch that arrived a wake later seeded the session's
+/// timeline at THAT wake's high, so a `topic add` made in between was below
+/// the seed and after the read: pushed by nobody, with no `GAP`, until some
+/// later gap or reconnect. A session whose adoption was DEFERRED at
+/// [`crate::control::MAX_SUBSCRIBE_TARGETS`] was announced the same way, as
+/// though it were watched.
+///
+/// WHY THAT CLOSES THE WINDOW RATHER THAN NARROWING IT. Both decisions are
+/// taken from the same registry state, so there is no instant between them for
+/// a registration to land in: one that lands after the read is above both
+/// cursors' high-water, and a later pass decides both for it at once. Under
+/// that one read every `session-created` in the batch is for a session that is
+/// gone again (announced with its exit: nothing to watch), already watched,
+/// adopted by this very pass, or deferred at the cap — and [`drain_roster`]
+/// marks the last kind `watch=deferred`, so no plain line claims a watch that
+/// does not exist. This pass seeds its adoptions (`new_watch`) after the guard
+/// drops and before returning, and the loop writes the returned frames after
+/// that — the `sub <local> <sid>` acks first, the roster's lines second. So a
+/// reader acting on a plain announcement, or on an ack, acts after that
+/// session's watch was seeded, and whatever the session records from then on
+/// is pushed, or reported by a `GAP` if the timeline evicts it first. The
+/// law, and its replay of the two-read pass, is aterm-spec's
+/// `SubscribeAnnouncementOrder`, bound to this function by
+/// `membership_passes_refine_the_announcement_model`.
+///
+/// WHY A DEFERRED SESSION IS ANNOUNCED AT ONCE rather than held back until a
+/// slot frees. The `sessions` stream exists to tell a supervisor about
+/// sessions it is NOT watching, and a slot frees only when a watched session
+/// exits — which may be never — so holding the line back would hide the
+/// session for as long as the cap holds. The marker keeps the line honest
+/// instead: the session exists and this subscription has no watch of it. The
+/// adopting pass writes the ack alone: the session was announced once, when
+/// it appeared.
+///
+/// THE MARKER IS AN ANNOTATION, NOT THE STATE. It rides one line, written
+/// once, and a reader can drop a line — the fabric bridge's run loop drops
+/// push lines while its broker is unreachable — and a session the cap left
+/// over when `@*` arrived is never announced at all. So a consumer that must
+/// not lose track of an unwatched session keeps the one thing that is always
+/// on the wire for a watched one, its `sub` ack, and treats every session it
+/// has no ack for as unwatched. The fabric bridge does exactly that
+/// (aterm-link `bridge.rs`, `Bridge::watched`), re-deriving the unwatched set
+/// on every roster round: it reads such a session's opt-ins every round, and
+/// once more on the ack, which follows the seed.
+///
 /// DISCIPLINE. Clone-then-release: handles are cloned out under the store read
 /// guard, which is dropped before `new_watch` takes any `Terminal` lock and
-/// before any write. The `MAX_SUBSCRIBE_TARGETS` cap that bounds an explicit
-/// selector list bounds this too — a subscription cannot fan out past it by
-/// living a long time. When the cap is reached adoption is DEFERRED, not
-/// dropped: the watermark is NOT advanced, so a later wake with a free slot
-/// picks the same session up, and an Owner that also asked for the `sessions`
-/// stream saw its `session-created` immediately regardless.
-fn adopt_new_targets(
+/// before any write. A subscription that neither adopts nor asked for the
+/// `sessions` stream takes no read at all.
+fn drain_membership(
     store: &Store,
     watches: &mut Vec<Watch>,
     sub: &mut Subscription,
     streams: TargetStreams,
     opts: &PushOptions,
-    adopt_seq: &mut u64,
+    adopt: AdoptScope,
+    cursors: &mut PushCursors,
 ) -> Vec<Frame> {
-    let room = crate::control::MAX_SUBSCRIBE_TARGETS.saturating_sub(watches.len());
-    if room == 0 {
+    if !adopt.on() && cursors.roster.is_none() {
         return Vec::new();
     }
-    let fresh: Vec<(ResolvedTarget, String)> = {
+    // The test-only holds ([`push_held`]) are read BEFORE the guard: they
+    // stat a file, which has no business under the store lock.
+    let (adopt_held, roster_held) = (push_held("adopt"), push_held("sessions"));
+    let (picked, roster) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        let high = g.roster_seq();
-        if high == *adopt_seq {
-            // THE IDLE TICK: nothing has entered or left the registry.
-            return Vec::new();
-        }
-        let unwatched = |h: &&crate::session_store::SessionHandle| {
-            !watches.iter().any(|w| w.local_id == h.local_id)
-        };
-        let carve = |h: &crate::session_store::SessionHandle| {
-            (
-                (
-                    h.local_id,
-                    h.term.clone(),
-                    h.ctx.byte_fanout.clone(),
-                    h.ctx.turns.clone(),
-                    h.ctx.timeline.clone(),
-                    h.ctx.fabric.clone(),
-                ),
-                h.sid.as_str().to_string(),
-            )
-        };
-        let mut picked: Vec<(ResolvedTarget, String)> = match g.roster_low_seq() {
-            // FAST PATH: resolve only the sids the journal says were CREATED.
-            // An `Exited` record needs nothing — `prune_closed` above already
-            // retired that watch — and a Created sid that has since exited
-            // resolves to `None` and is skipped, which is what makes replaying
-            // a stale watermark safe.
-            Some(low) if adopt_seq.saturating_add(1) >= low => g
-                .roster_since(*adopt_seq)
-                .filter(|r| r.change == crate::session_store::RosterChange::Created)
-                .filter_map(|r| g.by_sid(&aterm_session::SessionId::new(&r.sid)))
-                .filter(|h| unwatched(h))
-                .map(carve)
-                .collect(),
-            // RECOVERY: the watermark fell past the journal's retained window
-            // (or this is the very first pass on an instance whose journal has
-            // already rolled). Walk the registry once — the pre-journal cost,
-            // paid only where the journal genuinely cannot answer.
-            _ => g
-                .live_handles()
-                .filter(|h| unwatched(h))
-                .map(carve)
-                .collect(),
-        };
-        // ADVANCE ONLY IF WE TOOK EVERYTHING. Truncating to the cap and moving
-        // the watermark anyway would put the deferred sessions permanently
-        // behind it — the exact "seen, therefore never retried" bug that made
-        // the old bridge lose sessions.
-        if picked.len() <= room {
-            *adopt_seq = high;
+        let picked = if adopt.on() && !adopt_held {
+            pick_adoptions(&g, watches, &mut cursors.adopt_seq)
         } else {
-            picked.truncate(room);
+            Vec::new()
+        };
+        let mut roster = String::new();
+        if let Some(cursor) = cursors.roster.as_mut()
+            && !roster_held
+        {
+            let watched = |local: u64| {
+                watches.iter().any(|w| w.local_id == local)
+                    || picked.iter().any(|(t, _)| t.0 == local)
+            };
+            let watched: Option<&dyn Fn(u64) -> bool> = adopt.on().then_some(&watched);
+            drain_roster(&g, cursor, watched, &mut roster);
         }
-        picked
+        (picked, roster)
         // guard drops here, BEFORE `new_watch` takes any Terminal lock
     };
-    let mut out = Vec::with_capacity(fresh.len());
-    for (target, sid) in fresh {
+    let mut out = Vec::with_capacity(picked.len() + 1);
+    for (target, sid) in picked {
         // Register for wakes BEFORE building the watch, so a burst that lands
         // between the two still wakes us. (It could not be lost either way — a
         // wake re-reads the session's CURRENT state — but registering second
@@ -2365,6 +2551,9 @@ fn adopt_new_targets(
             format!("sub {} {sid}\n", target.0),
         ));
         watches.push(new_watch(&target, streams, opts));
+    }
+    if !roster.is_empty() {
+        out.push(Frame::text(Tag::Instance, roster));
     }
     out
 }
@@ -2704,7 +2893,7 @@ pub(crate) mod bench_seam {
             let live: std::collections::HashSet<String> =
                 self.live.iter().map(|s| s.to_string()).collect();
             let mut out = String::new();
-            super::diff_session_events(&live, &self.known, &mut out);
+            super::diff_session_events(&live, &self.known, &|_| "", &mut out);
             self.known = live;
             out.len()
         }
@@ -2867,18 +3056,23 @@ mod tests {
         let registry = new_registry();
         let mut sub = SubscriberSet::register(&registry, &[]);
         let mut watches: Vec<Watch> = Vec::new();
-        let mut adopt_seq = 0u64;
+        // No `sessions` stream: this pins adoption alone.
+        let mut cursors = PushCursors {
+            roster: None,
+            adopt_seq: 0,
+        };
         let streams = TargetStreams {
             events: true,
             ..Default::default()
         };
         let opts = PushOptions::default();
-        let adopt = |w: &mut Vec<Watch>, sub: &mut Subscription, seq: &mut u64| {
-            text(&adopt_new_targets(&store, w, sub, streams, &opts, seq))
+        let all = AdoptScope::authorize(true, Scope::Owner);
+        let adopt = |w: &mut Vec<Watch>, sub: &mut Subscription, c: &mut PushCursors| {
+            text(&drain_membership(&store, w, sub, streams, &opts, all, c))
         };
 
         assert!(
-            adopt(&mut watches, &mut sub, &mut adopt_seq).is_empty(),
+            adopt(&mut watches, &mut sub, &mut cursors).is_empty(),
             "an instance with no sessions adopts nothing"
         );
 
@@ -2887,7 +3081,7 @@ mod tests {
         store.write().unwrap_or_else(|p| p.into_inner()).register(h);
 
         assert_eq!(
-            adopt(&mut watches, &mut sub, &mut adopt_seq),
+            adopt(&mut watches, &mut sub, &mut cursors),
             format!("sub 5 {sid}\n"),
             "the adopted channel is acked exactly like a handshake channel"
         );
@@ -2899,7 +3093,7 @@ mod tests {
         );
 
         assert!(
-            adopt(&mut watches, &mut sub, &mut adopt_seq).is_empty(),
+            adopt(&mut watches, &mut sub, &mut cursors).is_empty(),
             "a second pass adopts nothing — the watermark caught up"
         );
         assert!(
@@ -4062,6 +4256,33 @@ mod tests {
         assert_eq!(wm2, Some(4));
     }
 
+    /// A person started typing (`app_input::note_person` records the
+    /// `human` row once per burst): the digest pushes `EVENT <local> human`,
+    /// bare — no trailing space, nothing a parser must strip. NEGATIVE
+    /// CONTROL: the `spawned` row beside it is not pushed.
+    #[test]
+    fn a_human_row_pushes_a_bare_event() {
+        let timeline = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session_timeline::SessionTimeline::default(),
+        ));
+        let seeded = initial_timeline_watermark(
+            &timeline,
+            TargetStreams {
+                events: true,
+                ..Default::default()
+            },
+        );
+        {
+            let mut t = timeline.lock().unwrap();
+            t.record("spawned", "state=alive".to_string());
+            t.record("human", String::new());
+        }
+        let mut out = String::new();
+        let wm = drain_timeline_events(&timeline, "7", seeded, &mut out);
+        assert_eq!(out, "EVENT 7 human\n");
+        assert_eq!(wm, Some(2));
+    }
+
     /// A WATERMARK BELOW THE RETAINED LOW IS A HOLE, AND IT IS SAID. The
     /// timeline is drop-oldest at `TIMELINE_CAP`; a watcher that fell behind by
     /// more than that comes back to records it never saw gone, and the drain
@@ -4242,6 +4463,7 @@ mod tests {
                 adopt: AdoptScope::none(),
             },
             PushOptions::default(),
+            "",
             &mut sink,
             close_once,
         );
@@ -4441,7 +4663,7 @@ mod tests {
         // A new session (s-ccc) appears; s-bbb is gone.
         let live: HashSet<String> = ["s-aaa".to_string(), "s-ccc".to_string()].into();
         let mut out = String::new();
-        diff_session_events(&live, &known, &mut out);
+        diff_session_events(&live, &known, &|_| "", &mut out);
         assert!(
             out.contains("EVENT * session-created s-ccc\n"),
             "created: {out:?}"
@@ -4456,7 +4678,7 @@ mod tests {
         );
         // No change -> nothing.
         let mut out2 = String::new();
-        diff_session_events(&live, &live, &mut out2);
+        diff_session_events(&live, &live, &|_| "", &mut out2);
         assert!(out2.is_empty(), "unchanged set emits nothing: {out2:?}");
     }
 
@@ -4472,8 +4694,8 @@ mod tests {
     /// THE SCP-4 CORRECTNESS FIX, with its own negative control.
     ///
     /// A sibling that BOTH spawns and exits between two wakes used to appear in
-    /// neither snapshot and emit neither event — the push loop's module doc says
-    /// so outright. The journal records each transition as it happens, so both
+    /// neither snapshot and emit neither event — the `sessions` stream's own doc
+    /// said so outright. The journal records each transition as it happens, so both
     /// events now surface, in order, on the next wake.
     ///
     /// The negative control is the OLD mechanism run over the SAME two instants:
@@ -4501,7 +4723,7 @@ mod tests {
         // NEGATIVE CONTROL: the pre-journal snapshot diff, on the same instants.
         let after = store.read().unwrap_or_else(|p| p.into_inner()).live_sids();
         let mut old_way = String::new();
-        diff_session_events(&after, &before, &mut old_way);
+        diff_session_events(&after, &before, &|_| "", &mut old_way);
         assert!(
             old_way.is_empty(),
             "the snapshot diff cannot see a cancelled-out pair — if it can, this \
@@ -4897,5 +5119,1026 @@ mod tests {
             !out.contains("EVENT 13 exited"),
             "`exited` belongs to the events stream, which was not requested: {out:?}"
         );
+    }
+
+    /// The opt-in the announcement tests below are about.
+    const PROBE_TOPIC: &str = "probe";
+
+    /// The record that proves a watch has pushed everything it ever will up to
+    /// the instant it was written — see [`OptInProbe`].
+    const HEARTBEAT: &str = "heartbeat";
+
+    /// A subscriber socket that ACTS on what the push loop writes, on the push
+    /// loop's own thread, at the instant each line is written — the earliest
+    /// instant any real reader could act on it. `Egress::emit` writes every
+    /// frame through as it is produced, so a reaction here lands at an exact
+    /// point inside a wake: after the frame it reacts to, before whatever the
+    /// loop does next. That is what makes the announcement tests deterministic
+    /// with no hook in the shipping code. `on_line` answering `false` hangs the
+    /// socket up, which ends the loop exactly as a client disconnect does.
+    struct Scripted<F: FnMut(&str) -> bool> {
+        wire: String,
+        partial: String,
+        on_line: F,
+        hung_up: bool,
+    }
+
+    impl<F: FnMut(&str) -> bool> Scripted<F> {
+        fn new(on_line: F) -> Self {
+            Scripted {
+                wire: String::new(),
+                partial: String::new(),
+                on_line,
+                hung_up: false,
+            }
+        }
+    }
+
+    impl<F: FnMut(&str) -> bool> Write for Scripted<F> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.hung_up {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let text = String::from_utf8_lossy(buf);
+            self.wire.push_str(&text);
+            self.partial.push_str(&text);
+            while !self.hung_up
+                && let Some(nl) = self.partial.find('\n')
+            {
+                let line: String = self.partial.drain(..=nl).collect();
+                self.hung_up = !(self.on_line)(line.trim_end_matches('\n'));
+            }
+            if self.hung_up {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.hung_up {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The peer-liveness probe as a DEADLINE, so a scripted scenario that never
+    /// completes ends the loop instead of hanging the suite — the test then
+    /// fails on whatever did not happen.
+    fn gone_after(secs: u64) -> impl FnMut() -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        move || std::time::Instant::now() > deadline
+    }
+
+    /// A handle carved into the tuple `run_subscribe` hands the push loop.
+    fn target_of(h: &crate::session_store::SessionHandle) -> ResolvedTarget {
+        (
+            h.local_id,
+            h.term.clone(),
+            h.ctx.byte_fanout.clone(),
+            h.ctx.turns.clone(),
+            h.ctx.timeline.clone(),
+            h.ctx.fabric.clone(),
+        )
+    }
+
+    /// The scopes the fabric bridge subscribes with: `subscribe @*
+    /// events,sessions` from the Owner.
+    fn bridge_scopes() -> PushScopes {
+        PushScopes {
+            streams: TargetStreams {
+                events: true,
+                ..Default::default()
+            },
+            instance: InstanceStreams::authorize(
+                RequestedInstance { sessions: true },
+                Scope::Owner,
+            ),
+            adopt: AdoptScope::authorize(true, Scope::Owner),
+        }
+    }
+
+    /// What the fabric bridge does with a session it is told about, reduced to
+    /// the part the announcement tests are about.
+    ///
+    /// The bridge reads a session's opt-ins — the `topic ls` verb answers
+    /// exactly [`crate::fabric::SessionFabric::topics`] — when the push lane
+    /// first announces the session (`EVENT * session-created <sid>`, marked
+    /// `watch=deferred` or not), again on every `sub <local> <sid>` ack of its
+    /// watch, and on every 2 s roster round while it holds no ack (aterm-link
+    /// `bridge.rs`, `Bridge::topics_sampled` and `Bridge::watched`). This probe
+    /// makes the first two reads and none of the rounds, so what a test here
+    /// shows, it shows without them. The session's agent opts into
+    /// [`PROBE_TOPIC`] one instant after the FIRST read, so from then on the
+    /// bridge can learn the add only from a later read, from the watch's push,
+    /// or from a `GAP`. Once the add is
+    /// made and the watch is acked, it records [`HEARTBEAT`] on the session's
+    /// timeline. That record is newer than any seed the watch can carry, and a
+    /// watch drains its timeline in id order in one frame, so when the
+    /// heartbeat comes back every record the watch will ever push up to it has
+    /// been pushed.
+    struct OptInProbe {
+        local: u64,
+        sid: String,
+        ctx: Arc<crate::SessionCtx>,
+        /// Every read the bridge made of the opt-ins, in order.
+        reads: Vec<Vec<String>>,
+        acked: bool,
+        beat: bool,
+    }
+
+    impl OptInProbe {
+        fn new(h: &crate::session_store::SessionHandle) -> Self {
+            OptInProbe {
+                local: h.local_id,
+                sid: h.sid.as_str().to_string(),
+                ctx: h.ctx.clone(),
+                reads: Vec::new(),
+                acked: false,
+                beat: false,
+            }
+        }
+
+        fn ack_line(&self) -> String {
+            format!("sub {} {}", self.local, self.sid)
+        }
+
+        fn created_line(&self) -> String {
+            format!("EVENT * session-created {}", self.sid)
+        }
+
+        fn deferred_line(&self) -> String {
+            format!("{} watch=deferred", self.created_line())
+        }
+
+        /// One `topic ls`, and the add that follows the first one.
+        fn read(&mut self) {
+            self.reads.push(
+                self.ctx
+                    .fabric
+                    .topics()
+                    .into_iter()
+                    .map(|(t, _)| t)
+                    .collect(),
+            );
+            if self.reads.len() == 1 {
+                assert!(
+                    self.ctx
+                        .fabric
+                        .topic_add(PROBE_TOPIC, "head", &self.ctx.timeline),
+                    "a fresh session holds no opt-in yet"
+                );
+            }
+        }
+
+        /// React to one wire line; `false` once the heartbeat is back.
+        fn on_line(&mut self, line: &str) -> bool {
+            if line == self.ack_line() {
+                self.acked = true;
+                self.read();
+            } else if self.reads.is_empty()
+                && (line == self.created_line() || line == self.deferred_line())
+            {
+                self.read();
+            }
+            if self.acked && !self.beat {
+                self.beat = true;
+                self.ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record("meta-change", HEARTBEAT.to_string());
+            }
+            line != format!("EVENT {} meta {HEARTBEAT}", self.local)
+        }
+
+        /// Whether the add reached the bridge by ANY road it has: a read after
+        /// it, the watch's push, or a `GAP` that sends it back to `topic ls`.
+        fn learned(&self, wire: &str) -> bool {
+            self.reads
+                .iter()
+                .any(|topics| topics.iter().any(|t| t == PROBE_TOPIC))
+                || wire.contains(&format!("EVENT {} topic add {PROBE_TOPIC} ", self.local))
+                || wire.contains(&format!("GAP {} events-dropped=", self.local))
+        }
+
+        /// Wire offsets of the watch's ack and of the plain and the marked
+        /// announcement.
+        fn order(&self, wire: &str) -> (Option<usize>, Option<usize>, Option<usize>) {
+            (
+                wire.find(&format!("{}\n", self.ack_line())),
+                wire.find(&format!("{}\n", self.created_line())),
+                wire.find(&format!("{}\n", self.deferred_line())),
+            )
+        }
+    }
+
+    /// THE ANNOUNCEMENT RACE, reported with d420834a6. Adoption and the roster
+    /// drain were two store reads, so a session registered between them was
+    /// announced (`EVENT * session-created`) one wake BEFORE its watch existed:
+    /// a line that told the reader the session was watched, while no watch
+    /// would push what it recorded until the next wake's seed.
+    ///
+    /// The registration lands at exactly that instant, every run: on the write
+    /// of the `sub` line that acks the adoption of an EARLIER session, T — a
+    /// frame the loop emits after the adoption's store read and before the
+    /// roster's, when they were two. The ORDER assertion is the regression
+    /// check. `learned` is the end-to-end claim with the bridge as it now
+    /// reads (see [`OptInProbe`]), which re-reads on the ack and so would learn
+    /// the add under the two-read code as well.
+    #[test]
+    fn a_spawn_between_adoption_and_the_roster_is_announced_with_its_watch() {
+        const T: u64 = 1;
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        // T predates the subscription but is not among its initial targets, so
+        // the FIRST wake adopts it, and acking that adoption is the injection.
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(crate::session_store::test_handle(T));
+        let s = crate::session_store::test_handle(2);
+        let mut probe = OptInProbe::new(&s);
+        let mut spawn = Some(s);
+        let t_ack = format!("sub {T} ");
+        let mut sink = Scripted::new(|line: &str| {
+            if line.starts_with(&t_ack)
+                && let Some(h) = spawn.take()
+            {
+                store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+            }
+            probe.on_line(line)
+        });
+        push_loop_with_peer_probe(
+            &registry,
+            &store,
+            &[],
+            bridge_scopes(),
+            PushOptions::default(),
+            "",
+            &mut sink,
+            gone_after(20),
+        );
+        let wire = std::mem::take(&mut sink.wire);
+        drop(sink);
+
+        assert!(
+            spawn.is_none(),
+            "REACH: T was adopted, so S was registered mid-wake: {wire:?}"
+        );
+        assert!(
+            !probe.reads.is_empty() && probe.beat,
+            "REACH: S was announced, acked and its heartbeat came back: {wire:?}"
+        );
+        let (ack, announced, deferred) = probe.order(&wire);
+        assert!(
+            ack.is_some() && ack < announced,
+            "S is announced only once its watch exists — its `sub` ack comes first: \
+             {wire:?}"
+        );
+        assert_eq!(deferred, None, "S had a free slot: {wire:?}");
+        assert!(
+            probe.learned(&wire),
+            "the `topic add` made after the bridge's first read reached it by no \
+             road — not a later read, not S's watch, no GAP: {wire:?}"
+        );
+    }
+
+    /// The cap twin. At [`crate::control::MAX_SUBSCRIBE_TARGETS`] watches
+    /// adoption is DEFERRED — the cap must hold, and does — and the roster used
+    /// to announce the deferred session plainly, as if it were watched. It is
+    /// announced AT ONCE still, because the `sessions` stream exists to tell a
+    /// supervisor about sessions it is not watching, but marked
+    /// `watch=deferred`; the adoption that follows when a slot frees is its
+    /// `sub` ack alone, with no second announcement. The probe reads the
+    /// session on the marked line and again on the ack, as the bridge does,
+    /// so the add made in between is learned.
+    ///
+    /// Every step runs on the push loop's thread from what it writes, except
+    /// the kick-off, which waits for the subscription's REGISTRATION: that
+    /// follows the roster seed in `push_loop`, so S lands above the roster
+    /// cursor. The marked line is written by a pass that saw S registered at
+    /// the cap, and the slot is freed on that line, so every pass before it
+    /// had room zero.
+    #[test]
+    fn a_session_deferred_at_the_cap_is_announced_at_once_and_marked() {
+        use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        let handles: Vec<crate::session_store::SessionHandle> = (0..CAP as u64)
+            .map(crate::session_store::test_handle)
+            .collect();
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            for h in &handles {
+                g.register(h.clone());
+            }
+        }
+        let targets: Vec<ResolvedTarget> = handles.iter().map(target_of).collect();
+        let s = crate::session_store::test_handle(CAP as u64);
+        let mut probe = OptInProbe::new(&s);
+        let kick = {
+            let (store, registry) = (store.clone(), registry.clone());
+            std::thread::spawn(move || {
+                while registry.lock().unwrap().watchers(1) == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                store.write().unwrap_or_else(|p| p.into_inner()).register(s);
+            })
+        };
+        let mut room_freed = false;
+        let mut acked_at_cap = false;
+        let (ack, deferred) = (probe.ack_line(), probe.deferred_line());
+        let mut sink = Scripted::new(|line: &str| {
+            acked_at_cap |= !room_freed && line == ack;
+            let more = probe.on_line(line);
+            if line == deferred && !room_freed {
+                store
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .deregister_local(0);
+                room_freed = true;
+            }
+            more
+        });
+        push_loop_with_peer_probe(
+            &registry,
+            &store,
+            &targets,
+            bridge_scopes(),
+            PushOptions::default(),
+            "",
+            &mut sink,
+            gone_after(20),
+        );
+        let wire = std::mem::take(&mut sink.wire);
+        drop(sink);
+        kick.join().unwrap();
+
+        assert!(
+            room_freed && probe.acked && probe.beat,
+            "REACH: S was announced at the cap, W0 closed, S was adopted and its \
+             heartbeat came back: {wire:?}"
+        );
+        assert!(
+            !acked_at_cap,
+            "the cap held: S was not adopted while {CAP} watches were live"
+        );
+        let (ack, announced, marked) = probe.order(&wire);
+        assert!(
+            marked.is_some() && marked < ack,
+            "S is announced before a slot frees, marked `watch=deferred`: {wire:?}"
+        );
+        assert_eq!(
+            (announced, wire.matches(&probe.created_line()).count()),
+            (None, 1),
+            "S is announced once, marked, and never again as if watched: {wire:?}"
+        );
+        assert!(
+            probe.learned(&wire),
+            "the `topic add` made after the bridge's first read reached it by no \
+             road — not a later read, not S's watch, no GAP: {wire:?}"
+        );
+    }
+
+    /// The deferred session, one pass at a time: announced at once and marked
+    /// by the pass that could not adopt it; a pass that adopts it later acks it
+    /// and says nothing more; one that exits first is announced exiting like
+    /// any other; and the journal's RECOVERY arm marks a newcomer the same way,
+    /// while the churned sessions nobody could watch net to nothing, as
+    /// recovery always has.
+    #[test]
+    fn a_deferred_session_is_announced_at_once_and_acked_when_adopted() {
+        use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
+        use crate::session_store::{ROSTER_JOURNAL_CAP, test_handle};
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        let mut sub = SubscriberSet::register(&registry, &[]);
+        let term = Arc::new(Mutex::new(Terminal::new(4, 8)));
+        // CAP watches on local ids no session carries: nothing here prunes,
+        // so they hold the cap without CAP real sessions.
+        let mut watches: Vec<Watch> = (0..CAP as u64)
+            .map(|i| watch_on(10_000 + i, &term))
+            .collect();
+        let mut cursors = PushCursors {
+            roster: Some(roster_cursor(&store)),
+            adopt_seq: 0,
+        };
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let opts = PushOptions::default();
+        let all = AdoptScope::authorize(true, Scope::Owner);
+        let pass = |w: &mut Vec<Watch>, sub: &mut Subscription, c: &mut PushCursors| {
+            text(&drain_membership(&store, w, sub, streams, &opts, all, c))
+        };
+        let spawn = |local: u64| {
+            let h = test_handle(local);
+            let sid = h.sid.as_str().to_string();
+            store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+            sid
+        };
+        let close = |local: u64| {
+            store
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .deregister_local(local);
+        };
+
+        // Deferred, then gone before a slot opens.
+        let a = spawn(1);
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!("EVENT * session-created {a} watch=deferred\n"),
+            "at the cap: no `sub`, and the announcement says so"
+        );
+        close(1);
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!("EVENT * session-exited {a} reason=unknown\n"),
+            "a deferred session that leaves is announced exiting like any other"
+        );
+
+        // Deferred, then a slot opens. Slots are freed by dropping a
+        // PLACEHOLDER (index 0): an adopted watch is pushed at the end, and
+        // dropping it would put its session back in the running for the slot.
+        let b = spawn(2);
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!("EVENT * session-created {b} watch=deferred\n")
+        );
+        drop(watches.remove(0));
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!("sub 2 {b}\n"),
+            "the adopting pass acks, and announces nothing a second time"
+        );
+        assert_eq!(pass(&mut watches, &mut sub, &mut cursors), "");
+
+        // RECOVERY. Back at the cap (b took the freed slot): c is deferred,
+        // then d, e registers and d leaves while the journal rolls past the
+        // roster cursor, so recovery has to find e by the set diff.
+        let c = spawn(3);
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!("EVENT * session-created {c} watch=deferred\n")
+        );
+        let d = spawn(4);
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!("EVENT * session-created {d} watch=deferred\n")
+        );
+        let e = spawn(5);
+        close(4);
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            for i in 0..ROSTER_JOURNAL_CAP as u64 {
+                g.register(test_handle(100 + i));
+                g.deregister_local(100 + i);
+            }
+            let seq = cursors.roster.as_ref().expect("sessions stream").seq;
+            assert!(
+                g.roster_low_seq().expect("journal is non-empty") > seq + 1,
+                "REACH: the roster cursor is past the retained window"
+            );
+        }
+        assert_eq!(
+            pass(&mut watches, &mut sub, &mut cursors),
+            format!(
+                "EVENT * session-created {e} watch=deferred\n\
+                 EVENT * session-exited {d} reason=unknown\n"
+            ),
+            "recovery marks the newcomer it cannot watch, reports the deferred \
+             session that left, and nets the churn to nothing"
+        );
+        drop(watches.remove(0));
+        drop(watches.remove(0));
+        let adopted = pass(&mut watches, &mut sub, &mut cursors);
+        let mut acks: Vec<&str> = adopted.lines().collect();
+        acks.sort_unstable();
+        assert_eq!(
+            acks,
+            [format!("sub 3 {c}"), format!("sub 5 {e}")],
+            "the ones still waiting are acked by the pass that adopts them, and \
+             not announced again"
+        );
+    }
+
+    /// THE HANDSHAKE'S ACK FOLLOWS ITS WATCH'S SEED, as an adoption's does. A
+    /// reader acting on `sub <local> <sid>` — the fabric bridge reads the
+    /// session's opt-ins there — must find the watch already seeded, or a
+    /// `topic add` made between its read and the seed is below the watch's
+    /// watermark and in no read: pushed by nobody. The subscription here is
+    /// the bridge's own, `subscribe @* events,sessions` through the control
+    /// handler, and S's agent opts in at the instant its handshake ack is
+    /// written, on the thread that writes it.
+    #[test]
+    fn a_handshake_ack_is_written_after_its_watch_is_seeded() {
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        let s = crate::session_store::test_handle(1);
+        let (local, sid, ctx) = (s.local_id, s.sid.as_str().to_string(), s.ctx.clone());
+        store.write().unwrap_or_else(|p| p.into_inner()).register(s);
+        let active: crate::control::ActiveHandle = Arc::new(Mutex::new(None));
+        let ack = format!("sub {local} {sid}");
+        let pushed = format!("EVENT {local} topic add {PROBE_TOPIC} ");
+        let mut added = false;
+        let mut sink = Scripted::new(|line: &str| {
+            if line == ack && !added {
+                added = true;
+                assert!(
+                    ctx.fabric.topic_add(PROBE_TOPIC, "head", &ctx.timeline),
+                    "a fresh session holds no opt-in yet"
+                );
+            }
+            !line.starts_with(&pushed)
+        });
+        crate::control::run_subscribe_with_peer_probe(
+            "subscribe @* events,sessions",
+            &active,
+            &store,
+            &registry,
+            Scope::Owner,
+            &mut sink,
+            gone_after(5),
+        );
+        let wire = std::mem::take(&mut sink.wire);
+        drop(sink);
+
+        assert!(added, "REACH: the handshake acked S: {wire:?}");
+        assert!(
+            wire.contains(&pushed),
+            "the add made on S's handshake ack was below its watch's seed, so the watch \
+             never pushed it: {wire:?}"
+        );
+    }
+
+    /// `@*` AT THE CAP ON ARRIVAL. An instance already holding more live
+    /// sessions than [`crate::control::MAX_SUBSCRIBE_TARGETS`] is exactly the
+    /// case adoption defers rather than drops, and a live target set is
+    /// bounded by the cap from its first wake, not only once it has grown. So
+    /// the handshake watches the cap and acks each, and the session left over
+    /// is adopted — acked — when a slot frees.
+    #[test]
+    fn an_at_star_subscription_over_the_cap_watches_the_cap_and_defers_the_rest() {
+        use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        let mut sids = std::collections::BTreeMap::new();
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            for local in 0..=CAP as u64 {
+                let h = crate::session_store::test_handle(local);
+                sids.insert(local, h.sid.as_str().to_string());
+                g.register(h);
+            }
+        }
+        let active: crate::control::ActiveHandle = Arc::new(Mutex::new(None));
+        let mut acked: Vec<u64> = Vec::new();
+        let mut left_over: Option<u64> = None;
+        let mut sink = Scripted::new(|line: &str| {
+            let Some(local) = line
+                .strip_prefix("sub ")
+                .and_then(|rest| rest.split_once(' '))
+                .and_then(|(l, _)| l.parse::<u64>().ok())
+            else {
+                return true;
+            };
+            if Some(local) == left_over {
+                return false;
+            }
+            acked.push(local);
+            if acked.len() == CAP {
+                left_over = sids.keys().copied().find(|l| !acked.contains(l));
+                store
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .deregister_local(acked[0]);
+            }
+            true
+        });
+        crate::control::run_subscribe_with_peer_probe(
+            "subscribe @* events,sessions",
+            &active,
+            &store,
+            &registry,
+            Scope::Owner,
+            &mut sink,
+            gone_after(10),
+        );
+        let wire = std::mem::take(&mut sink.wire);
+        drop(sink);
+
+        assert!(
+            wire.starts_with(&format!("OK subscribe {CAP}\n")),
+            "a `@*` over the cap watches the cap: {:?}",
+            wire.lines().next()
+        );
+        assert_eq!(acked.len(), CAP, "every handshake target is acked");
+        let left_over = left_over.expect("REACH: one session was left over at the cap");
+        assert!(
+            wire.contains(&format!("sub {left_over} {}\n", sids[&left_over])),
+            "the session the cap left over is acked once a slot frees"
+        );
+    }
+
+    /// TIER-1 for `SubscribeAnnouncementOrder` (aterm-spec
+    /// `derive::subscribe_announcement_order_model`), its ENDPOINT half: the
+    /// real [`drain_membership`] driven through every branch the model has,
+    /// each pass projected onto the model's four steps and every step — and
+    /// every environment move between passes — checked against the machine
+    /// ([`aterm_spec::verify::validate_transition_tiered`], with `ty trace
+    /// validate` where `ty` is installed), with the law checked on every state.
+    /// No bridge reads this world, so the bridge's variables stay at their
+    /// initial values and an ack, once written, stays on the wire
+    /// (`ackwire`); aterm-link's `bridge_rounds_refine_the_announcement_model`
+    /// binds the other half.
+    ///
+    /// A pass is atomic from here, so its steps are built from what the pass
+    /// decided — the session's `sub` ack, its `session-created` line, and the
+    /// watch set and roster cursor it left — and the state it leaves is
+    /// required to equal the projection of the real state afterwards. `snap_*`
+    /// is what the store held when the pass ran: nothing else writes it.
+    ///
+    /// THE NEGATIVE CONTROL is the historical two-read pass, rebuilt from the
+    /// same real functions — [`pick_adoptions`] under one read, then
+    /// [`drain_roster`] under a second read with no watch set to consult, the
+    /// roster the old code had — with the registration landing between the
+    /// two, and again with the session deferred at the cap. The healthy
+    /// machine must REJECT the roster step it takes, and `Buggy=1` must admit
+    /// it and reach a state the law refutes.
+    #[test]
+    fn membership_passes_refine_the_announcement_model() {
+        use aterm_spec::interp::State;
+        let model = aterm_spec::derive::subscribe_announcement_order_model();
+        const LAW: &str = "NotAnnouncedBeforeItsWatchOrExit";
+
+        let admits =
+            |overrides: &[(&'static str, i64)], prev: &State, next: &State, action: &str| {
+                aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    overrides,
+                    prev,
+                    next,
+                    Some(action),
+                    &format!("subscribe announcement {action}"),
+                )
+            };
+        let step = |prev: &State, next: &State, action: &str| {
+            let (ok, why) = admits(&[], prev, next, action);
+            assert!(
+                ok,
+                "the real {action} is not the model's: {prev:?} -> {next:?}\n{why}"
+            );
+            assert!(model.check_invariant(LAW, next), "{LAW} fails at {next:?}");
+        };
+
+        // Every scenario, as the model's environment moves and passes.
+        // `RegisterDuringPass` registers S after the pass returned and before
+        // its frames would be written: after its read, which is the case the
+        // one read exists for.
+        #[derive(Clone, Copy, Debug)]
+        enum Move {
+            Register,
+            Exit,
+            FreeSlot,
+            Pass,
+            RegisterDuringPass,
+        }
+        let (reg, exit, free, pass, reg_mid) = (
+            Move::Register,
+            Move::Exit,
+            Move::FreeSlot,
+            Move::Pass,
+            Move::RegisterDuringPass,
+        );
+        let scenarios: &[&[Move]] = &[
+            &[free, reg, pass, pass],
+            &[reg, pass, free, pass, pass],
+            &[reg, pass, exit, pass],
+            &[free, reg, exit, pass],
+            &[reg, exit, pass],
+            &[free, reg_mid, pass, exit, pass],
+            &[reg_mid, pass, free, pass],
+        ];
+        let mut lines_seen = std::collections::BTreeSet::new();
+        for (i, moves) in scenarios.iter().enumerate() {
+            let mut w = AnnounceWorld::new();
+            let mut state = w.project();
+            assert_eq!(state, model.init_state(), "scenario {i} starts at Init");
+            for mv in moves.iter().copied() {
+                let prev = state.clone();
+                match mv {
+                    Move::Register => {
+                        w.register();
+                        state = w.project();
+                        step(&prev, &state, "Register");
+                    }
+                    Move::Exit => {
+                        w.exit();
+                        state = w.project();
+                        step(&prev, &state, "Exit");
+                    }
+                    Move::FreeSlot => {
+                        w.free_slot();
+                        state = w.project();
+                        step(&prev, &state, "FreeSlot");
+                    }
+                    Move::Pass | Move::RegisterDuringPass => {
+                        let (picked, line) = w.pass(|w| {
+                            if matches!(mv, Move::RegisterDuringPass) {
+                                w.register();
+                            }
+                        });
+                        lines_seen.insert(line);
+                        let after = w.project();
+                        let mut s1 = prev.clone();
+                        s1.insert("phase", 1);
+                        s1.insert("snap_reg", prev["reg"]);
+                        s1.insert("snap_live", prev["live"]);
+                        s1.insert("picked", picked);
+                        step(&prev, &s1, "Read");
+                        let mut s2 = s1.clone();
+                        s2.insert("phase", 2);
+                        s2.insert("line", line);
+                        s2.insert("drained", after["drained"]);
+                        step(&s1, &s2, "Drain");
+                        let mut s3 = s2.clone();
+                        s3.insert("phase", 3);
+                        s3.insert("watched", after["watched"]);
+                        step(&s2, &s3, "Seed");
+                        if matches!(mv, Move::RegisterDuringPass) {
+                            let mut registered = s3.clone();
+                            registered.insert("reg", 1);
+                            registered.insert("live", 1);
+                            step(&s3, &registered, "Register");
+                            s3 = registered;
+                        }
+                        let mut s4 = s3.clone();
+                        s4.insert("phase", 0);
+                        s4.insert("line", 0);
+                        s4.insert("snap_reg", 0);
+                        s4.insert("snap_live", 0);
+                        s4.insert("picked", 0);
+                        if line != 0 {
+                            s4.insert("told", line);
+                        }
+                        if picked == 1 {
+                            s4.insert("ackwire", 1);
+                        }
+                        step(&s3, &s4, "Write");
+                        assert_eq!(s4, after, "scenario {i}: the pass left what it decided");
+                        state = after;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            lines_seen,
+            std::collections::BTreeSet::from([0, 1, 2]),
+            "the scenarios reach every line a pass can write for S"
+        );
+
+        // THE NEGATIVE CONTROL: the two-read pass, a registration between the
+        // reads (room free), and its cap twin (registered before, room zero).
+        for (label, room, register_between) in [
+            ("between the reads", true, true),
+            ("at the cap", false, false),
+        ] {
+            let mut w = AnnounceWorld::new();
+            if room {
+                w.free_slot();
+            }
+            if !register_between {
+                w.register();
+            }
+            let s0 = w.project();
+            let (picked, line) = w.two_read_pass(|w| {
+                if register_between {
+                    w.register();
+                }
+            });
+            let after = w.project();
+            assert_eq!(
+                (picked, line, after["watched"]),
+                (0, 1, 0),
+                "{label}: the two-read pass announces S plainly and adopts nothing"
+            );
+            let mut s1 = s0.clone();
+            s1.insert("phase", 1);
+            s1.insert("snap_reg", s0["reg"]);
+            s1.insert("snap_live", s0["live"]);
+            s1.insert("picked", 0);
+            if register_between {
+                s1.insert("reg", 1);
+                s1.insert("live", 1);
+            }
+            let mut s2 = s1.clone();
+            s2.insert("phase", 2);
+            s2.insert("line", line);
+            s2.insert("drained", after["drained"]);
+            let (healthy, _) = admits(&[], &s1, &s2, "Drain");
+            assert!(
+                !healthy,
+                "{label}: the healthy machine admitted the two-read roster"
+            );
+            let (old, why) = admits(&[("Buggy", 1)], &s1, &s2, "Drain");
+            assert!(
+                old,
+                "{label}: Buggy=1 must reproduce the two-read roster\n{why}"
+            );
+            let buggy = aterm_spec::interp::with_buggy(&model, 1);
+            let mut end = s2.clone();
+            assert!(buggy.fire("Seed", &mut end) && buggy.fire("Write", &mut end));
+            assert_eq!(end, after, "{label}: Buggy=1 lands where the real pass did");
+            assert!(
+                !buggy.check_invariant(LAW, &end),
+                "{label}: S told it is watched, with no watch and no exit: {end:?}"
+            );
+        }
+    }
+
+    /// One session S (local 7) and one `@*` + `sessions` subscription, held
+    /// at the cap by placeholder watches until a slot is freed — the world
+    /// [`membership_passes_refine_the_announcement_model`] projects.
+    struct AnnounceWorld {
+        store: Store,
+        _registry: Subscribers,
+        sub: Subscription,
+        watches: Vec<Watch>,
+        cursors: PushCursors,
+        /// S, built once: a handle's sid is minted when it is built.
+        handle: crate::session_store::SessionHandle,
+        sid: String,
+        /// The roster seq of S's `Created` record, once S is registered.
+        created: Option<u64>,
+        told: i64,
+        /// A pass has written S's `sub` ack.
+        ack_written: bool,
+    }
+
+    impl AnnounceWorld {
+        const S: u64 = 7;
+
+        fn new() -> Self {
+            use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
+            let store = crate::session_store::new_store();
+            let registry = new_registry();
+            let sub = SubscriberSet::register(&registry, &[]);
+            let term = Arc::new(Mutex::new(Terminal::new(4, 8)));
+            let watches = (0..CAP as u64)
+                .map(|i| watch_on(10_000 + i, &term))
+                .collect();
+            let cursors = PushCursors {
+                roster: Some(roster_cursor(&store)),
+                adopt_seq: 0,
+            };
+            let handle = crate::session_store::test_handle(Self::S);
+            AnnounceWorld {
+                store,
+                _registry: registry,
+                sub,
+                watches,
+                cursors,
+                sid: handle.sid.as_str().to_string(),
+                handle,
+                created: None,
+                told: 0,
+                ack_written: false,
+            }
+        }
+
+        fn register(&mut self) {
+            let mut g = self.store.write().unwrap_or_else(|p| p.into_inner());
+            g.register(self.handle.clone());
+            self.created = Some(g.roster_seq());
+        }
+
+        fn exit(&mut self) {
+            self.store
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .deregister_local(Self::S);
+        }
+
+        /// Drop a PLACEHOLDER: an adopted watch is pushed at the end.
+        fn free_slot(&mut self) {
+            assert_ne!(self.watches[0].local_id, Self::S);
+            drop(self.watches.remove(0));
+        }
+
+        fn watched(&self) -> bool {
+            self.watches.iter().any(|w| w.local_id == Self::S)
+        }
+
+        /// The real state as the model's variables, between passes.
+        fn project(&self) -> aterm_spec::interp::State {
+            use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            let live = g
+                .by_sid(&aterm_session::SessionId::new(&self.sid))
+                .is_some();
+            let seq = self.cursors.roster.as_ref().expect("sessions stream").seq;
+            let watched = self.watched();
+            [
+                ("reg", i64::from(self.created.is_some())),
+                ("live", i64::from(live)),
+                ("room", i64::from(watched || self.watches.len() < CAP)),
+                ("phase", 0),
+                ("snap_reg", 0),
+                ("snap_live", 0),
+                ("picked", 0),
+                ("line", 0),
+                ("drained", i64::from(self.created.is_some_and(|c| seq >= c))),
+                ("watched", i64::from(watched)),
+                ("told", self.told),
+                ("ackwire", i64::from(self.ack_written)),
+                // No bridge reads this world: its half stays at Init.
+                ("added", 0),
+                ("pushed", 0),
+                ("listed", 0),
+                ("acked", 0),
+                ("asking", 0),
+                ("seen", 0),
+                ("known", 0),
+                ("stopped", 0),
+            ]
+            .into()
+        }
+
+        /// What `frames` say about S: whether they ack its watch, and its
+        /// `session-created` line — `0` none, `1` plain, `2` `watch=deferred`.
+        /// The told state and the ack on the wire move with the frames, as the
+        /// write would move them.
+        fn decided(&mut self, frames: &str) -> (i64, i64) {
+            let picked = frames.contains(&format!("sub {} {}\n", Self::S, self.sid));
+            self.ack_written |= picked;
+            let created = format!("EVENT * session-created {}", self.sid);
+            let line = if frames.contains(&format!("{created} watch=deferred\n")) {
+                2
+            } else if frames.contains(&format!("{created}\n")) {
+                1
+            } else {
+                0
+            };
+            if line != 0 {
+                self.told = line;
+            }
+            (i64::from(picked), line)
+        }
+
+        /// One real membership pass; `before_write` runs after it returns and
+        /// before its frames would reach the wire.
+        fn pass(&mut self, before_write: impl FnOnce(&mut Self)) -> (i64, i64) {
+            let frames = text(&drain_membership(
+                &self.store,
+                &mut self.watches,
+                &mut self.sub,
+                TargetStreams {
+                    events: true,
+                    ..Default::default()
+                },
+                &PushOptions::default(),
+                AdoptScope::authorize(true, Scope::Owner),
+                &mut self.cursors,
+            ));
+            before_write(self);
+            self.decided(&frames)
+        }
+
+        /// The pass as it was before `drain_membership`: adoption under one
+        /// read, `between` with no guard held, then the roster under a second
+        /// read with no watch set to consult, then the adopted watches.
+        fn two_read_pass(&mut self, between: impl FnOnce(&mut Self)) -> (i64, i64) {
+            let picked = {
+                let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+                pick_adoptions(&g, &self.watches, &mut self.cursors.adopt_seq)
+            };
+            between(self);
+            let mut roster = String::new();
+            {
+                let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+                let cursor = self.cursors.roster.as_mut().expect("sessions stream");
+                drain_roster(&g, cursor, None, &mut roster);
+            }
+            let mut frames = String::new();
+            for (target, sid) in picked {
+                self.sub.watch(target.0);
+                frames.push_str(&format!("sub {} {sid}\n", target.0));
+                self.watches.push(new_watch(
+                    &target,
+                    TargetStreams {
+                        events: true,
+                        ..Default::default()
+                    },
+                    &PushOptions::default(),
+                ));
+            }
+            frames.push_str(&roster);
+            self.decided(&frames)
+        }
     }
 }

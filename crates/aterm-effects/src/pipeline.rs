@@ -47,14 +47,16 @@ use aterm_render::{
     GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration, theme_is_dark,
 };
 
-use crate::companion::{CompanionOwner, CompanionRung, ContrastFallback, GlowOwnership, PetFacts};
+use crate::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts};
 use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
+#[cfg(test)]
+use crate::host::Wake;
 use crate::host::{
-    CaptureMode, ChromeGeom, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts,
-    Visibility, Wake,
+    CaptureMode, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts, Visibility,
 };
-use crate::kitty_pet::{PetArrival, PetInputKind, PetSpecies};
+use crate::kitty_pet::{PetInputKind, PetSpecies};
+#[cfg(test)]
 use crate::kitty_registry::KittyLook;
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue, RainTickInput,
@@ -614,6 +616,7 @@ impl EffectsPipeline {
     /// deadline), `At` for an exact engine wake (`next_deadline_ms`), `Idle`
     /// once everything has settled (0% idle).
     #[must_use]
+    #[cfg(test)]
     pub fn wake(&self) -> Wake {
         match self.next_deadline_ms() {
             Some(ms) => Wake::At(self.now() + Duration::from_secs_f64(ms / 1000.0)),
@@ -825,18 +828,21 @@ impl EffectsPipeline {
     /// frame, once the caret has been still, and a pipeline with no resident
     /// on glass drops it (a typed word never summons). The latch re-arms
     /// [`Self::is_active`], so the page's next `wake()` asks for frames.
+    #[cfg(test)]
     pub fn note_trick(&mut self, trick: aterm_lexicon::Trick, confirmed: bool) {
         self.companion.note_trick(self.now(), trick, confirmed);
     }
 
     /// The typed line turned into prose, or was aborted, before a tentative
     /// kitty command was performed: take it back. Idempotent.
+    #[cfg(test)]
     pub fn revoke_trick(&mut self) {
         self.companion.revoke_trick();
     }
 
     /// The whole submitted line was pet talk: the pet does not grieve the
     /// fast `command not found` the shell is about to report.
+    #[cfg(test)]
     pub fn note_trick_submit(&mut self) {
         self.companion.note_trick_submit(self.now());
     }
@@ -1061,23 +1067,9 @@ impl EffectsPipeline {
     /// rand` natively, `crypto.getRandomValues` on the page) — the engine
     /// stays clockless and dieless. `enabled = false` retires the body, the
     /// hit rect and the frame lane at once. Off at construction. Resets the
-    /// look to the launch rung: a native host that holds a stronger verdict
-    /// calls [`Self::set_companion_look`] after it.
+    /// look to the launch rung.
     pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
         self.companion.set_enabled_seed(enabled, seed);
-    }
-
-    /// The NATIVE look verdict dresses the pet until Phase 5: the `(coat,
-    /// iris)` pair the precedence law chose, the tenure gate's authorised
-    /// arrival, and the rung that won. The web never calls this.
-    pub fn set_companion_look(&mut self, pair: (u8, u8), arrival: PetArrival, rung: CompanionRung) {
-        self.companion.set_look(pair, arrival, rung);
-    }
-
-    /// The pinned favourite (the Kitty Log's, host-side) — the precedence
-    /// law's top rung, always quiet. `None` on the web.
-    pub fn set_favourite(&mut self, look: Option<KittyLook>) {
-        self.companion.set_favourite(look);
     }
 
     /// THE MOTION POLICY, general: the host's STABLE reduce-motion preference
@@ -2067,17 +2059,11 @@ impl EffectsPipeline {
             reduced_motion: self.deco_cfg.reduced_motion,
             serious: false,
             shed_envelope: 1.0,
-            chrome: ChromeGeom {
-                pad: self.chrome_pad,
-                head: self.chrome_head,
-                ..ChromeGeom::default()
-            },
             // The owner holds the pointer it was handed through
             // `note_pointer_px`; the per-frame field is for hosts that feed
             // it with the frame.
             pointer_px: None,
             capture: CaptureMode::Present,
-            sound_allowed: false,
             geometry: FrameGeom {
                 rows: geom.rows,
                 cols: geom.cols,

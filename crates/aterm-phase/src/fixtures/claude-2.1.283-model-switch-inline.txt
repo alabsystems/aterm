@@ -1,0 +1,25 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `aterm ctl text` of a private headless aterm (100x36, `CLAUDE_CODE_NO_FLICKER=0 claude --model claude-haiku-4-5`: the inline renderer, one turn, then `/model opus`) · the cache-miss confirmation two columns in under a full-width `─` rule where the composer was, no footer; the user, host and scratch path anonymised
+host:work1 user00$ CLAUDE_CODE_NO_FLICKER=0 claude --model claude-haiku-4-5
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /…/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/work1
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ Reply with the single word: ok
+
+⏺ ok
+
+✻ Crunched for 1s · done 9:10 PM
+
+❯ /model opus
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  Switch model?
+  Your next response will be slower and use more tokens
+
+  This conversation is cached for the current model. Switching to Opus 5.5 means the full history
+  gets re-read on your next message.
+
+  ❯ 1. Yes, switch to Opus 5.5
+    2. No, go back

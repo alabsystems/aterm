@@ -12,7 +12,8 @@
 //!   Tier 0 (also enforced at COMPILE TIME by build.rs): the invariants are
 //!     proven exhaustively over every Start/Scan/Nav/Add/Invalidate/Reflow/
 //!     Cancel interleaving, and a counterexample is required at `Buggy=1`
-//!     (the dropped invalidation clamp — non-vacuity).
+//!     (one slip per law, the dropped invalidation clamp among them —
+//!     non-vacuity).
 //!
 //!   Tier 1 (THIS file's heart): the model is bound to the LITERAL shipping
 //!     `StreamingSearch`. Every bounded interleaving of the unit-effect trace alphabet is

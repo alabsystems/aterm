@@ -51,10 +51,10 @@
 //! * `2` — NOT RUN: no event loop, no window server, or no window. Never a pass.
 
 /// Every stage agreed.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const PASS: i32 = 0;
 /// At least one finding. See the transcript.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
 /// Nothing was driven. NEVER reported as a pass.
 const NOT_RUN: i32 = 2;

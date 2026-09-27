@@ -964,7 +964,7 @@ fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
     let base = pool.live();
 
     let mut t = Terminal::new(25, COLS);
-    t.set_alt_archive_enabled(true); // regardless of ATERM_ALT_ARCHIVE
+    t.set_alt_archive_enabled(true); // explicitly, whatever the default
     t.set_alt_archive_shared(true);
     assert_eq!(
         pool.live(),
@@ -2785,7 +2785,7 @@ mod handoff_carry {
         assert_eq!((r.rows.len(), r.lost), (0, last - 5));
     }
 
-    /// An archive that is off refuses a carry: `ATERM_ALT_ARCHIVE=0` on the
+    /// An archive that is off refuses a carry: an archive switched off on the
     /// adopting side drops the rows.
     #[test]
     fn an_archive_that_is_off_refuses_the_carry() {

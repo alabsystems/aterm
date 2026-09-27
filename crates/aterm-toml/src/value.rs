@@ -60,11 +60,6 @@ impl<K: Ord, V> Map<K, V> {
         self.inner.iter()
     }
 
-    /// Entries in key order, values mutable.
-    pub fn iter_mut(&mut self) -> btree_map::IterMut<'_, K, V> {
-        self.inner.iter_mut()
-    }
-
     /// Keys in order.
     pub fn keys(&self) -> btree_map::Keys<'_, K, V> {
         self.inner.keys()
@@ -80,16 +75,6 @@ impl<K: Ord + core::borrow::Borrow<str>, V> Map<K, V> {
     /// The value for `key`.
     pub fn get(&self, key: &str) -> Option<&V> {
         self.inner.get(key)
-    }
-
-    /// The value for `key`, mutably.
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
-        self.inner.get_mut(key)
-    }
-
-    /// Is `key` present?
-    pub fn contains_key(&self, key: &str) -> bool {
-        self.inner.contains_key(key)
     }
 
     /// Delete `key`.
@@ -238,26 +223,9 @@ impl Value {
         }
     }
 
-    /// The date-time, if this is one.
-    #[must_use]
-    pub fn as_datetime(&self) -> Option<&Datetime> {
-        match self {
-            Value::Datetime(v) => Some(v),
-            _ => None,
-        }
-    }
-
     /// The array, if this is one.
     #[must_use]
     pub fn as_array(&self) -> Option<&Vec<Value>> {
-        match self {
-            Value::Array(a) => Some(a),
-            _ => None,
-        }
-    }
-
-    /// The array, mutably.
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
@@ -281,48 +249,6 @@ impl Value {
         }
     }
 
-    /// Is this a string?
-    #[must_use]
-    pub fn is_str(&self) -> bool {
-        matches!(self, Value::String(_))
-    }
-
-    /// Is this an integer?
-    #[must_use]
-    pub fn is_integer(&self) -> bool {
-        matches!(self, Value::Integer(_))
-    }
-
-    /// Is this a float?
-    #[must_use]
-    pub fn is_float(&self) -> bool {
-        matches!(self, Value::Float(_))
-    }
-
-    /// Is this a boolean?
-    #[must_use]
-    pub fn is_bool(&self) -> bool {
-        matches!(self, Value::Boolean(_))
-    }
-
-    /// Is this a date-time?
-    #[must_use]
-    pub fn is_datetime(&self) -> bool {
-        matches!(self, Value::Datetime(_))
-    }
-
-    /// Is this an array?
-    #[must_use]
-    pub fn is_array(&self) -> bool {
-        matches!(self, Value::Array(_))
-    }
-
-    /// Is this a table?
-    #[must_use]
-    pub fn is_table(&self) -> bool {
-        matches!(self, Value::Table(_))
-    }
-
     /// A human-facing name for this value's kind.
     #[must_use]
     pub fn type_str(&self) -> &'static str {
@@ -335,14 +261,6 @@ impl Value {
             Value::Array(_) => "array",
             Value::Table(_) => "table",
         }
-    }
-
-    /// Deserialize any `T` out of this value.
-    ///
-    /// # Errors
-    /// If the value does not match `T`'s shape.
-    pub fn try_into<T: serde::de::DeserializeOwned>(self) -> crate::Result<T> {
-        T::deserialize(self)
     }
 }
 

@@ -81,8 +81,6 @@
 //! and thread them as data.
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // errno values, pinned so classification stays pure on every platform
@@ -96,6 +94,7 @@ pub const ERRNO_EPERM: i32 = 1;
 
 /// `ESRCH` — "no such process". Distinguishes "the pid is gone" from "the pid
 /// is not ours" when the responsibility SPI returns `-1`.
+#[cfg(any(target_os = "macos", test))]
 pub const ERRNO_ESRCH: i32 = 3;
 
 /// `ENOENT` — "no such file or directory". On a path that TCC guards, this is
@@ -108,6 +107,7 @@ pub const ERRNO_ENOENT: i32 = 2;
 
 /// The user's TCC store, relative to `$HOME`. Reaching it requires Full Disk
 /// Access; its contents are never read.
+#[cfg(any(target_os = "macos", test))]
 const TCC_DB_RELATIVE: &str = "Library/Application Support/com.apple.TCC/TCC.db";
 
 /// Hard cap on an `Info.plist` read. A plist over the cap reads as absent —
@@ -324,6 +324,7 @@ impl Default for ProbeGate {
 /// The user's `TCC.db` under `home`. Its contents are never read; only its
 /// reachability is a fact about Full Disk Access.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn tcc_db_path(home: &Path) -> PathBuf {
     home.join(TCC_DB_RELATIVE)
 }
@@ -352,8 +353,9 @@ pub const fn classify_probe(outcome: ProbeOutcome) -> FdaProbe {
     }
 }
 
-/// The answer on a platform that has no TCC. Compiled everywhere so it can be
-/// tested everywhere; used as the whole implementation off macOS.
+/// The answer on a platform that has no TCC: the whole implementation off
+/// macOS, and compiled into every test build so it is tested everywhere.
+#[cfg(any(test, not(target_os = "macos")))]
 #[must_use]
 pub const fn unsupported_probe() -> FdaProbe {
     FdaProbe::refused(ProbeLabel::UnsupportedPlatform)
@@ -365,6 +367,7 @@ pub const fn unsupported_probe() -> FdaProbe {
 ///
 /// `syscall` is called **at most once**, and only after every refusal has been
 /// ruled out. It receives the resolved `TCC.db` path.
+#[cfg(any(target_os = "macos", test))]
 pub fn probe_fda_with<F>(
     gate: ProbeGate,
     exe: Option<&Path>,
@@ -403,7 +406,7 @@ where
 ///
 /// Refuses — with no syscall — when the gate is off, when `$HOME` is unset, or
 /// when the running executable is not inside a `.app` bundle. Off macOS it is
-/// [`unsupported_probe`].
+/// `unsupported_probe`.
 #[must_use]
 pub fn probe_fda(gate: ProbeGate) -> FdaProbe {
     #[cfg(target_os = "macos")]
@@ -612,6 +615,7 @@ fn bundle_layout_root(exe: &Path) -> Option<PathBuf> {
 /// `true` when the path cannot be handed to a C API because it contains an
 /// interior NUL byte.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 fn path_has_interior_nul(path: &Path) -> bool {
     path.as_os_str().as_encoded_bytes().contains(&0)
 }
@@ -706,6 +710,7 @@ pub const fn classify_responsible(
 }
 
 /// Map the SPI's `(return value, errno)` pair to a result. Pure.
+#[cfg(any(target_os = "macos", test))]
 pub const fn responsible_answer(ret: i32, errno: i32) -> Result<i32, ResponsibleError> {
     if ret >= 0 {
         return Ok(ret);
@@ -803,6 +808,7 @@ pub fn is_under_protected_root(path: &Path, protected: &[PathBuf]) -> bool {
 /// back to the basename, which for the shapes that matter
 /// (`…/iTerm.app/Contents/MacOS/iTerm2`) is the same string anyway.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn display_name(exe: &Path, info_plist_text: Option<&str>) -> String {
     if let Some(text) = info_plist_text {
         for key in ["CFBundleDisplayName", "CFBundleName"] {
@@ -897,6 +903,13 @@ impl DrClass {
 /// 3. an `identifier` clause plus a certificate/anchor clause ⇒
 ///    [`DrClass::Identity`];
 /// 4. otherwise [`DrClass::Unknown`].
+///
+/// Rules 2 and 3 read only the text OUTSIDE quoted strings: an identifier, a
+/// team or a hash is data the bundle's author chose, so `identifier
+/// "com.cdhash.x"` on a Developer ID copy must not read as a cdhash pin — the
+/// class the Trash offers to move. `codesign` prints a plain alphanumeric value
+/// bare (`identifier mycdhash`), so rule 2 also wants the clause's shape: the
+/// word `cdhash` on its own, followed by a hash constant (`H"…"`).
 #[must_use]
 pub fn classify_dr(requirement: &str) -> DrClass {
     let text = requirement.trim();
@@ -907,7 +920,8 @@ pub fn classify_dr(requirement: &str) -> DrClass {
     if lower.contains("not signed at all") || lower.contains("code object is not signed") {
         return DrClass::Unsigned;
     }
-    if lower.contains("cdhash") {
+    let lower = without_quoted_strings(&lower);
+    if has_cdhash_clause(&lower) {
         return DrClass::Cdhash;
     }
     let has_identifier = lower.contains("identifier ") || lower.contains("identifier\"");
@@ -919,6 +933,45 @@ pub fn classify_dr(requirement: &str) -> DrClass {
         return DrClass::Identity;
     }
     DrClass::Unknown
+}
+
+/// Whether lowercased `text`, its quoted strings emptied, holds a `cdhash`
+/// clause: the word on its own — not part of a bare value such as `mycdhash` —
+/// followed by a hash constant.
+fn has_cdhash_clause(text: &str) -> bool {
+    text.match_indices("cdhash").any(|(at, word)| {
+        let joined = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+        !text[..at].chars().next_back().is_some_and(joined)
+            && text[at + word.len()..].trim_start().starts_with("h\"")
+    })
+}
+
+/// `text` with the inside of every closed `"…"` string removed and its quotes
+/// kept, so `identifier "x"` still reads as an identifier clause. A string
+/// honours backslash escapes and does not cross a line; an unclosed quote is
+/// kept as written.
+fn without_quoted_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let mut rest = line;
+        while let Some(open) = rest.find('"') {
+            let inner = &rest[open + 1..];
+            let mut escaped = false;
+            let close = inner.char_indices().find_map(|(at, c)| {
+                let closes = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                closes.then_some(at)
+            });
+            let Some(close) = close else {
+                break;
+            };
+            out.push_str(&rest[..=open]);
+            out.push('"');
+            rest = &inner[close + 1..];
+        }
+        out.push_str(rest);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -969,38 +1022,58 @@ pub struct BundleIdentity {
     pub bundle_id: Option<String>,
     /// The `designated => …` clause.
     pub dr_text: String,
+    /// How that requirement is shaped — `Unsigned` when `codesign` says the
+    /// code is not signed at all, which leaves no clause to classify.
+    pub dr: DrClass,
     /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
     pub signing: &'static str,
     /// The Team ID, when there is a real one.
     pub team: Option<String>,
 }
 
-/// Read one bundle's identity: `Info.plist`, then `codesign`. `None` for a
-/// bundle under a protected root, whose read could raise the very dialog this
-/// module exists to explain.
+/// Read one bundle's identity: `Info.plist`, then `codesign`. `None` when that
+/// could raise the very dialog this module exists to explain — the bundle, its
+/// `Info.plist`, or anything `codesign` could open through it resolves under a
+/// protected root — and whenever the bundle cannot be vouched for
+/// (`bundle_reaches_protected` has the whole list): among others, one stray
+/// link in its `Contents`, anything but `Contents` and plain files at its top
+/// level, or an `Info.plist` naming a main executable by anything but a plain
+/// file name. So one such shape in the RUNNING bundle leaves its identity unread,
+/// and the census off.
 #[must_use]
 pub fn bundle_identity(root: &Path, protected: &[PathBuf]) -> Option<BundleIdentity> {
-    if is_under_protected_root(root, protected) {
+    let plist = root.join("Contents").join("Info.plist");
+    if !census_may_read(root, protected)
+        || !census_may_read(&plist, protected)
+        || bundle_reaches_protected(root, protected)
+    {
         return None;
     }
-    let text = read_plist_text(&root.join("Contents").join("Info.plist"));
-    let bundle_id = text
-        .as_deref()
-        .and_then(|t| plist_string(t, "CFBundleIdentifier"))
-        .map(str::to_owned);
+    let bundle_id = read_info_plist(&plist).and_then(|info| info.bundle_id);
     Some(signed_identity(root, bundle_id))
 }
 
 fn signed_identity(root: &Path, bundle_id: Option<String>) -> BundleIdentity {
-    let report = codesign_report(root);
+    identity_from_report(codesign_report(root).as_deref(), bundle_id)
+}
+
+/// The identity a `codesign` report describes. Pure.
+fn identity_from_report(report: Option<&str>, bundle_id: Option<String>) -> BundleIdentity {
+    let dr_text = report.and_then(designated_requirement).unwrap_or_default();
+    let signing = report.map_or("unknown", classify_signing);
     BundleIdentity {
         bundle_id,
-        dr_text: report
-            .as_deref()
-            .and_then(designated_requirement)
-            .unwrap_or_default(),
-        signing: report.as_deref().map_or("unknown", classify_signing),
-        team: report.as_deref().and_then(team_identifier),
+        // Only the whole report can say "unsigned". A requirement clause that
+        // merely contains the phrase (a quoted identifier) is signed code whose
+        // class could not be read, never an unsigned copy the Trash may take.
+        dr: match (signing, classify_dr(&dr_text)) {
+            ("unsigned", _) => DrClass::Unsigned,
+            (_, DrClass::Unsigned) => DrClass::Unknown,
+            (_, class) => class,
+        },
+        dr_text,
+        signing,
+        team: report.and_then(team_identifier),
     }
 }
 
@@ -1009,34 +1082,90 @@ fn signed_identity(root: &Path, bundle_id: Option<String>) -> BundleIdentity {
 /// `None` when it cannot run or does not finish.
 #[cfg(target_os = "macos")]
 fn codesign_report(root: &Path) -> Option<String> {
+    let (_, out, err) = run_bounded(
+        "/usr/bin/codesign",
+        &[
+            "-d".as_ref(),
+            "-r-".as_ref(),
+            "--verbose=2".as_ref(),
+            root.as_os_str(),
+        ],
+    )?;
+    Some(format!("{out}\n{err}"))
+}
+
+/// Run one of Apple's tools with stdin closed, within [`CODESIGN_CEILING`]:
+/// whether it succeeded, then its stdout and its stderr — each read on its own
+/// thread, so output larger than a pipe's buffer cannot wedge the tool. `None`
+/// when it cannot run or does not finish, and when either stream is over
+/// [`TOOL_OUTPUT_MAX_BYTES`] or is not UTF-8: a report read in part is not
+/// read. Gated native-only first, as the wasm census reads gates: its
+/// reader threads are never part of the wasm module.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(target_os = "macos")]
+fn run_bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String, String)> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("/usr/bin/codesign")
-        .args(["-d", "-r-", "--verbose=2"])
-        .arg(root)
+    fn drain(
+        pipe: impl std::io::Read + Send + 'static,
+    ) -> Option<std::thread::JoinHandle<Option<String>>> {
+        // `Builder::spawn`, not `thread::spawn`: a thread the OS refuses is no
+        // report, never a panic in the census or the Trash's worker.
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.take(TOOL_OUTPUT_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                let whole =
+                    u64::try_from(bytes.len()).is_ok_and(|len| len <= TOOL_OUTPUT_MAX_BYTES);
+                whole
+                    .then_some(bytes)
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .ok()
+    }
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    // wasm-clock-guard: allow — `codesign_report` is `#[cfg(target_os = "macos")]`
-    // (it runs Apple's `codesign`), so neither clock read below reaches wasm.
+    let (Some(out), Some(err)) = (
+        child.stdout.take().and_then(drain),
+        child.stderr.take().and_then(drain),
+    ) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    // wasm-clock-guard: allow — `run_bounded` is `#[cfg(target_os = "macos")]`
+    // (it runs Apple's tools), so neither clock read below reaches wasm.
     let deadline = std::time::Instant::now() + CODESIGN_CEILING;
-    while child.try_wait().ok()?.is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            // wasm-clock-guard: allow — the same macOS-only function.
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    // The child has exited: both pipes are closed and neither read can block.
-    let mut text = String::new();
-    let _ = child.stdout.take()?.read_to_string(&mut text);
-    text.push('\n');
-    let _ = child.stderr.take()?.read_to_string(&mut text);
-    Some(text)
+    };
+    let out = out.join().ok()??;
+    let err = err.join().ok()??;
+    Some((status.success(), out, err))
 }
+
+/// The most of one stream [`run_bounded`] reads: a bundle's reports are a few
+/// kilobytes.
+#[cfg(target_os = "macos")]
+const TOOL_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 
 #[cfg(not(target_os = "macos"))]
 fn codesign_report(_root: &Path) -> Option<String> {
@@ -1076,7 +1205,16 @@ fn team_identifier(report: &str) -> Option<String> {
 /// How the code is signed, from the same report. Fails toward the weaker
 /// claim: anything unrecognised is `unknown`, never `developer-id`.
 fn classify_signing(report: &str) -> &'static str {
-    if report.contains("code object is not signed at all") {
+    // `codesign -d` on unsigned code prints ONE line, `<path>: code object is
+    // not signed at all`. Matching that whole shape — not the phrase anywhere —
+    // keeps a folder name containing the phrase from passing a signed copy off
+    // as unsigned, which the Trash would then offer to move.
+    let mut lines = report.lines().filter(|line| !line.trim().is_empty());
+    if let (Some(only), None) = (lines.next(), lines.next())
+        && only
+            .trim_end()
+            .ends_with(": code object is not signed at all")
+    {
         return "unsigned";
     }
     if report.lines().any(|line| line.trim() == "Signature=adhoc") {
@@ -1183,11 +1321,14 @@ impl Claimants {
             .collect()
     }
 
-    /// The conflicting copies the Security panel offers to move to the Trash:
-    /// ad-hoc (cdhash) or unsigned ones, beside a running copy whose grant
-    /// survives updates. Anything else is listed and left alone — beside an
-    /// unstable running copy the conflicting one may well be the real release,
-    /// and a copy whose signature could not be read is not known to be either.
+    /// The conflicting copies that MAY be moved to the Trash: ad-hoc (signed ad
+    /// hoc, with a cdhash requirement) or unsigned ones, beside a running copy
+    /// whose grant survives updates. The panel offers the ones of these it
+    /// lists ([`Self::offered_for_trash`]). A Developer ID copy is never one,
+    /// whatever its requirement says. Anything else is listed and left alone —
+    /// beside an unstable running copy the conflicting one may well be the real
+    /// release, and a copy whose signature could not be read is not known to be
+    /// either.
     #[must_use]
     pub fn retirable(&self) -> Vec<&Claimant> {
         let stable_running = self.found.iter().any(|c| c.running && c.dr.grant_stable());
@@ -1196,7 +1337,26 @@ impl Claimants {
         }
         self.conflicting()
             .into_iter()
-            .filter(|c| matches!(c.dr, DrClass::Cdhash | DrClass::Unsigned))
+            .filter(|c| {
+                matches!(
+                    (c.dr, c.signing),
+                    (DrClass::Cdhash, "adhoc") | (DrClass::Unsigned, "unsigned")
+                )
+            })
+            .collect()
+    }
+
+    /// The copies the Security panel lists AND offers to move to the Trash: the
+    /// first [`MAX_CLAIMANT_ROWS`] conflicting copies that are
+    /// [`Self::retirable`]. The panel's button and the `privacy` verb's note
+    /// both read this one rule.
+    #[must_use]
+    pub fn offered_for_trash(&self) -> Vec<&Claimant> {
+        let retirable = self.retirable();
+        self.conflicting()
+            .into_iter()
+            .take(MAX_CLAIMANT_ROWS)
+            .filter(|copy| retirable.contains(copy))
             .collect()
     }
 
@@ -1248,34 +1408,288 @@ pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Ca
     if !std::fs::metadata(root).is_ok_and(|m| m.is_dir()) {
         return Candidate::NotOurs;
     }
-    if !census_may_read(root, protected) {
+    let plist = root.join("Contents").join("Info.plist");
+    // The plist too: a `Contents` link into a protected root is followed by
+    // every read below, `codesign` included.
+    if !census_may_read(root, protected) || !census_may_read(&plist, protected) {
         return Candidate::Hole;
     }
-    let plist = root.join("Contents").join("Info.plist");
     match std::fs::symlink_metadata(&plist) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Candidate::NotOurs,
         Err(_) => return Candidate::Hole,
         Ok(meta) if !meta.is_file() => return Candidate::NotOurs,
         Ok(_) => {}
     }
-    let Some(text) = read_plist_text(&plist) else {
+    // Read as `CFBundle` reads it, so a binary plist — every App Store app's —
+    // answers whose it is rather than leaving a hole in the census.
+    let Some(info) = read_info_plist(&plist) else {
         return Candidate::Hole;
     };
-    match plist_string(&text, "CFBundleIdentifier") {
-        Some(id) if id == bundle_id => Candidate::Ours(signed_identity(root, Some(id.to_owned()))),
+    match info.bundle_id.as_deref() {
+        Some(id) if id == bundle_id => {
+            if bundle_reaches_protected(root, protected) {
+                return Candidate::Hole;
+            }
+            Candidate::Ours(signed_identity(root, Some(id.to_owned())))
+        }
         _ => Candidate::NotOurs,
     }
 }
 
 /// Whether the bundle at `claimant.path` is still the copy the census
-/// classified: it still claims `bundle_id`, with the same requirement. Runs
-/// `codesign`, so it belongs on a worker.
+/// classified: it still claims `bundle_id`, with the same identity
+/// ([`same_identity`]). Runs `codesign`, so it belongs on a worker.
 #[must_use]
 pub fn still_claims(claimant: &Claimant, bundle_id: &str) -> bool {
     matches!(
         read_candidate(&claimant.path, bundle_id, &protected_roots(&[])),
-        Candidate::Ours(id) if id.dr_text == claimant.dr_text
+        Candidate::Ours(id) if same_identity(&id, claimant)
     )
+}
+
+/// Whether a fresh read describes the copy the census classified: the same
+/// requirement text, class and signing. An unsigned copy has no requirement
+/// text, and neither does a read that failed, so the text alone cannot tell
+/// them apart — the class and signing do — and a read that could not
+/// establish a class is never the same copy.
+fn same_identity(fresh: &BundleIdentity, claimant: &Claimant) -> bool {
+    fresh.dr != DrClass::Unknown
+        && fresh.dr == claimant.dr
+        && fresh.signing == claimant.signing
+        && fresh.dr_text == claimant.dr_text
+}
+
+/// [`list_root`], except that a folder under a protected root is never listed —
+/// an app run from `~/Desktop` must not list the Desktop — and is a hole in the
+/// look instead.
+fn list_unless_protected(dir: &Path, protected: &[PathBuf]) -> Listing {
+    if census_may_read(dir, protected) {
+        list_root(dir)
+    } else {
+        Listing::Unreadable
+    }
+}
+
+/// The most entries [`bundle_reaches_protected`] walks, and how deep: a real
+/// bundle has a few dozen. A bundle larger or deeper is not vouched for.
+const BUNDLE_WALK_MAX_ENTRIES: usize = 4096;
+const BUNDLE_WALK_MAX_DEPTH: usize = 16;
+
+/// Whether the bundle at `root` cannot be vouched for before `codesign` reads it.
+///
+/// It reaches only what is physically inside the bundle, on the bundle's own
+/// volume — its top level (one listing) and its `Contents` (walked) — so it
+/// never lists a place `codesign` would not open, and it refuses whatever
+/// could lead `codesign` elsewhere:
+///
+/// * a `Contents` under a protected root, as spelled or resolved, or one that
+///   resolves outside the bundle;
+/// * a bundle that resolves to a folder the census would not take for one
+///   ([`looks_like_bundle`]: `x.app -> ~`), that holds a protected root, or
+///   whose path holds a control character (`codesign` prints it raw);
+/// * at the top level, where `CFBundle` looks for a main executable it does
+///   not find in `Contents/MacOS`, anything but `Contents` and plain files;
+/// * in `Contents`, a link that does not resolve inside it — it follows none,
+///   and a real bundle's only links are its own aliases (`atpkg -> aterm`) —
+///   a folder on another volume (something mounted inside it), or a platform
+///   `Info-*.plist`;
+/// * an `Info.plist` that names a main executable other than a plain file
+///   name, as Apple's own parser reads it ([`plist_names_plain_executables`]).
+///
+/// `true`, too, when it cannot finish (an unreadable folder, or past the
+/// bounds).
+fn bundle_reaches_protected(root: &Path, protected: &[PathBuf]) -> bool {
+    let contents = root.join("Contents");
+    if !census_may_read(&contents, protected) {
+        return true;
+    }
+    let Ok(bundle) = std::fs::canonicalize(root) else {
+        return true;
+    };
+    // `codesign`'s report prints the executable's path raw, a field a line: a
+    // control character in it could forge a line the signing readers trust.
+    let spelled_plainly = |path: &Path| !path.to_string_lossy().chars().any(char::is_control);
+    if !spelled_plainly(root) || !spelled_plainly(&bundle) {
+        return true;
+    }
+    let named_like_a_bundle = looks_like_bundle(&bundle);
+    let holds_a_protected_root = protected.iter().any(|guarded| {
+        guarded.starts_with(&bundle)
+            || std::fs::canonicalize(guarded).is_ok_and(|guarded| guarded.starts_with(&bundle))
+    });
+    if !named_like_a_bundle || holds_a_protected_root {
+        return true;
+    }
+    let Ok(inside) = std::fs::canonicalize(&contents) else {
+        return true;
+    };
+    let Some(volume) = device_of(&bundle) else {
+        return true;
+    };
+    if !inside.starts_with(&bundle) {
+        return true;
+    }
+    let mut seen = 0usize;
+    // CFBundle looks for a main executable it does not find in `Contents/MacOS`
+    // at the bundle's top level, so nothing there may lead anywhere: only
+    // `Contents` and plain files.
+    let Ok(top) = std::fs::read_dir(&bundle) else {
+        return true;
+    };
+    for entry in top {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        seen += 1;
+        if seen > BUNDLE_WALK_MAX_ENTRIES {
+            return true;
+        }
+        if entry.file_name() != "Contents" && !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return true;
+        }
+    }
+    let mut stack = vec![(contents, 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if device_of(&dir) != Some(volume) {
+            return true;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return true;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            seen += 1;
+            if seen > BUNDLE_WALK_MAX_ENTRIES {
+                return true;
+            }
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                return true;
+            };
+            // `CFBundle` reads a platform plist (`Info-macos.plist`) before
+            // `Info.plist`, and may match either name in any case; only
+            // `Info.plist` itself is read here, so no other.
+            if depth == 0 {
+                let name = entry.file_name();
+                let lower = name.to_string_lossy().to_ascii_lowercase();
+                if name != "Info.plist"
+                    && lower.starts_with("info")
+                    && Path::new(&lower)
+                        .extension()
+                        .is_some_and(|ext| ext == "plist")
+                {
+                    return true;
+                }
+            }
+            if kind.is_symlink() {
+                if !std::fs::canonicalize(&path).is_ok_and(|target| target.starts_with(&inside)) {
+                    return true;
+                }
+            } else if kind.is_dir() {
+                if depth + 1 > BUNDLE_WALK_MAX_DEPTH {
+                    return true;
+                }
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    // `codesign` also opens the main executable the plist NAMES, with no link
+    // involved: an absolute `CFBundleExecutable`, or one that climbs with
+    // `..`, leaves `Contents` as surely as a link does. No plist names none.
+    let plist = inside.join("Info.plist");
+    match std::fs::symlink_metadata(&plist) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(_) => !plist_names_plain_executables(&plist),
+    }
+}
+
+/// What `CFBundle` reads from a bundle's `Info.plist`: its identifier — the
+/// `CFBundleIdentifier-macos` variant where there is one, which `CFBundle`
+/// applies over the plain key whatever its value, a value it cannot use
+/// leaving none (measured: `-macosx`, `-ios` and `~mac` are not applied) —
+/// and, on macOS, whether every key that names an executable names
+/// a plain file ([`plain_file_name`]). Every such key is judged —
+/// `CFBundleExecutable`, its `-macos` variant, the old `NSExecutable` — since
+/// `CFBundle` may use any of them.
+#[derive(Debug, PartialEq, Eq)]
+struct InfoPlist {
+    bundle_id: Option<String>,
+    #[cfg(target_os = "macos")]
+    plain_executables: bool,
+}
+
+/// Whether `name` is a plain file name: one path component with no control
+/// character (which would forge a line in `codesign`'s report), so the
+/// executable `codesign` opens is inside `Contents/MacOS`, or, not found
+/// there, a plain file at the bundle's top level, the only kind the walk lets
+/// stand there.
+#[cfg(any(target_os = "macos", test))]
+fn plain_file_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !name.chars().any(char::is_control)
+}
+
+/// A bundle's `Info.plist` as `CFBundle` reads it, parsed in process by the
+/// same CoreFoundation reader (`CFPropertyListCreateWithData`): binary plists
+/// — every App Store app's — every encoding, entity and spelling it accepts,
+/// and nothing it does not (a JSON file is no plist to it). `None` when the
+/// file cannot be read, or is over [`INFO_PLIST_MAX_BYTES`] — a hole, since
+/// `CFBundle` might read it; a file CoreFoundation cannot parse gives
+/// `CFBundle` no identifier and no executable name, so it reads as naming
+/// nothing.
+#[cfg(target_os = "macos")]
+fn read_info_plist(plist: &Path) -> Option<InfoPlist> {
+    let meta = std::fs::metadata(plist).ok()?;
+    if !meta.is_file() || meta.len() > INFO_PLIST_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(plist).ok()?;
+    Some(imp::parse_info_plist(&bytes).unwrap_or(InfoPlist {
+        bundle_id: None,
+        plain_executables: true,
+    }))
+}
+
+/// Off macOS there is no `CFBundle` (and no `codesign`): a text plist's
+/// identifier, read as it is, and no executable to vouch for.
+#[cfg(not(target_os = "macos"))]
+fn read_info_plist(plist: &Path) -> Option<InfoPlist> {
+    let text = read_plist_text(plist)?;
+    Some(InfoPlist {
+        bundle_id: plist_string(&text, "CFBundleIdentifier").map(str::to_owned),
+    })
+}
+
+/// Whether `plist`, read as `CFBundle` reads it ([`read_info_plist`]), names
+/// only plain executables. A plist that cannot be read is not vouched for.
+#[cfg(target_os = "macos")]
+fn plist_names_plain_executables(plist: &Path) -> bool {
+    read_info_plist(plist).is_some_and(|info| info.plain_executables)
+}
+
+/// Off macOS nothing runs `codesign`, so nothing follows the name.
+#[cfg(not(target_os = "macos"))]
+fn plist_names_plain_executables(_plist: &Path) -> bool {
+    true
+}
+
+/// The volume `path` (followed) lives on, as its device number.
+#[cfg(unix)]
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|meta| meta.dev())
+}
+
+/// Off unix there is no device number to compare, and no TCC to ask.
+#[cfg(not(unix))]
+fn device_of(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|_| 0)
 }
 
 /// Whether the census may look inside `path`: not under a protected root as
@@ -1383,7 +1797,7 @@ pub fn classify_claimants(
             Candidate::Ours(id) => found.push(Claimant {
                 running: running == Some(candidate.as_path()),
                 path: candidate,
-                dr: classify_dr(&id.dr_text),
+                dr: id.dr,
                 dr_text: id.dr_text,
                 signing: id.signing,
                 team: id.team,
@@ -1411,20 +1825,30 @@ pub fn claimants_for(bundle_id: &str) -> Claimants {
     let roots = claimant_search_roots(running.as_deref(), home.as_deref());
     let registered = registered_bundles(bundle_id);
     let protected = protected_roots(&[]);
-    // A folder under a protected root is never listed — an app run from
-    // `~/Desktop` must not list the Desktop — so it is a hole in the look.
-    classify_claimants(
+    census_in(
+        bundle_id,
         running.as_deref(),
         &roots,
         registered.as_deref(),
-        |dir| {
-            if census_may_read(dir, &protected) {
-                list_root(dir)
-            } else {
-                Listing::Unreadable
-            }
-        },
-        |root| read_candidate(root, bundle_id, &protected),
+        &protected,
+    )
+}
+
+/// [`claimants_for`] with its sources given: the real listing and candidate
+/// reads, each behind the protected-root fence.
+fn census_in(
+    bundle_id: &str,
+    running: Option<&Path>,
+    roots: &[(PathBuf, bool)],
+    registered: Option<&[PathBuf]>,
+    protected: &[PathBuf],
+) -> Claimants {
+    classify_claimants(
+        running,
+        roots,
+        registered,
+        |dir| list_unless_protected(dir, protected),
+        |root| read_candidate(root, bundle_id, protected),
     )
 }
 
@@ -1797,6 +2221,7 @@ pub fn tccutil_reset_command(bundle_id: &str, folder: Folder) -> Vec<String> {
 ///
 /// Absolute on purpose: a destructive mutation of the human's privacy state may
 /// not be resolved through `PATH`, where anything could answer to the name.
+#[cfg(any(unix, test))]
 pub const TCCUTIL_PATH: &str = "/usr/bin/tccutil";
 
 /// Whether [`TCCUTIL_PATH`] can be run at all.
@@ -1819,17 +2244,6 @@ pub enum TccutilPresence {
 }
 
 impl TccutilPresence {
-    /// The report token.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Executable => "executable",
-            Self::Missing => "missing",
-            Self::NotExecutable => "not-executable",
-            Self::Unknown => "unknown",
-        }
-    }
-
     /// Whether an invocation may be attempted. Only [`Self::Executable`] —
     /// [`Self::Unknown`] fails toward "do not offer a destructive button".
     #[must_use]
@@ -1843,6 +2257,7 @@ impl TccutilPresence {
 /// A path that exists but is not a regular file is [`TccutilPresence::Missing`]:
 /// there is no tool there.
 #[must_use]
+#[cfg(any(unix, test))]
 pub const fn classify_tccutil(is_file: bool, executable: bool) -> TccutilPresence {
     match (is_file, executable) {
         (false, _) => TccutilPresence::Missing,
@@ -1923,17 +2338,6 @@ pub enum ResetOffer {
 }
 
 impl ResetOffer {
-    /// The report token.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Offer => "offer",
-            Self::ExplainRebuild => "explain-rebuild",
-            Self::HideNoTool => "hide-no-tool",
-            Self::HideNoBundleId => "hide-no-bundle-id",
-        }
-    }
-
     /// Whether the *Ask again* button is rendered at all.
     #[must_use]
     pub const fn shows_button(self) -> bool {
@@ -2059,19 +2463,6 @@ impl ResetPlan {
         &self.folders
     }
 
-    /// How many invocations this plan is. Never zero.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.folders.len()
-    }
-
-    /// Always `false` — a plan with no folder is not constructible. Present
-    /// because `len` is.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.folders.is_empty()
-    }
-
     /// The argv for each folder, in plan order. PURE — it builds commands; it
     /// never runs one, and each is a separate, non-atomic invocation whose
     /// result is recorded on its own ([`ResetAttempt`]).
@@ -2103,16 +2494,6 @@ pub enum ResetStatus {
 }
 
 impl ResetStatus {
-    /// The report token.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Reset => "reset",
-            Self::Declined { .. } => "declined",
-            Self::ToolAbsent => "tool-absent",
-        }
-    }
-
     /// Whether this folder's row actually changed.
     #[must_use]
     pub const fn is_reset(self) -> bool {
@@ -2128,12 +2509,6 @@ impl ResetStatus {
             Some(other) => Self::Declined { code: Some(other) },
             None => Self::Declined { code: None },
         }
-    }
-
-    /// [`Self::from_exit_status`] for a caller that already has a code.
-    #[must_use]
-    pub const fn from_exit_code(code: i32) -> Self {
-        Self::from_exit_status(Some(code))
     }
 }
 
@@ -2194,34 +2569,6 @@ pub enum ResetOutcome {
     ToolAbsent,
     /// There was nothing to attempt. Not a success, and never rendered as one.
     NotAttempted,
-}
-
-impl ResetOutcome {
-    /// The report token.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AllReset => "all-reset",
-            Self::Partial => "partial",
-            Self::NoneReset => "none-reset",
-            Self::ToolAbsent => "tool-absent",
-            Self::NotAttempted => "not-attempted",
-        }
-    }
-
-    /// Whether any folder's row changed — the gate on offering the warm-up
-    /// afterwards.
-    #[must_use]
-    pub const fn any_reset(self) -> bool {
-        matches!(self, Self::AllReset | Self::Partial)
-    }
-
-    /// Whether EVERY attempted folder reset. The only state in which a string
-    /// may speak about the whole set.
-    #[must_use]
-    pub const fn all_reset(self) -> bool {
-        matches!(self, Self::AllReset)
-    }
 }
 
 /// Fold the per-invocation results of one gesture into one outcome. PURE and
@@ -2502,138 +2849,6 @@ impl ConsentKey {
     }
 }
 
-/// A cached probe, with how old it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CachedProbe {
-    /// The probe.
-    pub probe: FdaProbe,
-    /// Age at lookup — the `probe_age_ms=` field.
-    pub age: Duration,
-}
-
-#[derive(Debug)]
-struct CacheEntry {
-    key: ConsentKey,
-    probe: FdaProbe,
-    at: Instant,
-}
-
-/// A consent probe cache with a caller-supplied freshness interval.
-///
-/// **Owned by the instance, never a process-global.** A successor that adopts
-/// sessions across an in-place apply constructs its own, which starts empty
-/// and re-probes on first demand, so a stale `granted` can never survive an
-/// apply that changed the identity. There is deliberately no `static` here for
-/// a successor to inherit.
-///
-/// Interior mutability, so a `&self` holder (the GUI's App, the CLI's report)
-/// can read through it. [`ConsentCache::clear`] is the app-activation and
-/// post-handoff hook.
-#[derive(Debug, Default)]
-pub struct ConsentCache {
-    entry: Mutex<Option<CacheEntry>>,
-}
-
-impl ConsentCache {
-    /// An empty cache.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Drop everything. Called on app activation (so a grant made while aterm
-    /// was in the background is seen) and whenever the identity may have
-    /// moved.
-    pub fn clear(&self) {
-        *self.lock() = None;
-    }
-
-    /// `true` when nothing is cached.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.lock().is_none()
-    }
-
-    /// The cached probe for `key`, if one is present and younger than
-    /// `interval`. A different key is always a miss.
-    #[must_use]
-    pub fn get(&self, key: &ConsentKey, interval: Duration) -> Option<CachedProbe> {
-        self.get_at(key, interval, Instant::now())
-    }
-
-    /// [`ConsentCache::get`] with the clock injected.
-    #[must_use]
-    pub fn get_at(
-        &self,
-        key: &ConsentKey,
-        interval: Duration,
-        now: Instant,
-    ) -> Option<CachedProbe> {
-        let guard = self.lock();
-        let entry = guard.as_ref()?;
-        if entry.key != *key {
-            return None;
-        }
-        let age = now.saturating_duration_since(entry.at);
-        (age < interval).then_some(CachedProbe {
-            probe: entry.probe,
-            age,
-        })
-    }
-
-    /// Record a probe against `key`.
-    pub fn store(&self, key: ConsentKey, probe: FdaProbe) {
-        self.store_at(key, probe, Instant::now());
-    }
-
-    /// [`ConsentCache::store`] with the clock injected.
-    pub fn store_at(&self, key: ConsentKey, probe: FdaProbe, now: Instant) {
-        *self.lock() = Some(CacheEntry {
-            key,
-            probe,
-            at: now,
-        });
-    }
-
-    /// The cached probe for `key`, or `probe()`'s answer, stored and returned.
-    ///
-    /// The probe closure is called at most once, and only on a miss.
-    pub fn get_or_probe<F>(&self, key: &ConsentKey, interval: Duration, probe: F) -> CachedProbe
-    where
-        F: FnOnce() -> FdaProbe,
-    {
-        self.get_or_probe_at(key, interval, Instant::now(), probe)
-    }
-
-    /// [`ConsentCache::get_or_probe`] with the clock injected.
-    pub fn get_or_probe_at<F>(
-        &self,
-        key: &ConsentKey,
-        interval: Duration,
-        now: Instant,
-        probe: F,
-    ) -> CachedProbe
-    where
-        F: FnOnce() -> FdaProbe,
-    {
-        if let Some(hit) = self.get_at(key, interval, now) {
-            return hit;
-        }
-        let fresh = probe();
-        self.store_at(key.clone(), fresh, now);
-        CachedProbe {
-            probe: fresh,
-            age: Duration::ZERO,
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CacheEntry>> {
-        // A poisoned consent cache is a stale probe, not a corrupted one:
-        // recovering the value is strictly better than panicking in a probe.
-        self.entry.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // macOS implementation — the only code here that touches the OS
 // ---------------------------------------------------------------------------
@@ -2862,6 +3077,139 @@ mod imp {
         }
         Some(out)
     }
+
+    /// `bytes` — a bundle's `Info.plist`, read by the caller — parsed by the
+    /// reader `CFBundle` uses, `CFPropertyListCreateWithData`: XML, binary or
+    /// old-style text, never JSON. `None` when it is not a plist that reader
+    /// accepts; a plist that is not a dictionary reads as naming nothing.
+    ///
+    /// Nothing is kept but the identifier and one verdict, and no string is
+    /// converted past a bound: a binary plist can point thousands of keys at
+    /// ONE large string, which `CoreFoundation` shares but a copy per key would
+    /// multiply. A key longer than [`KEY_MAX_UNITS`] is none `CFBundle` reads;
+    /// a value longer than [`VALUE_MAX_UNITS`] is no bundle identifier and no
+    /// file name. A string that does not come back whole (an embedded NUL) is
+    /// unread, so it can never compare equal to a name it is not.
+    pub(super) fn parse_info_plist(bytes: &[u8]) -> Option<super::InfoPlist> {
+        type CfRef = *const libc::c_void;
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFDataCreate(alloc: CfRef, bytes: *const u8, length: isize) -> CfRef;
+            fn CFPropertyListCreateWithData(
+                alloc: CfRef,
+                data: CfRef,
+                options: usize,
+                format: *mut isize,
+                error: *mut CfRef,
+            ) -> CfRef;
+            fn CFGetTypeID(cf: CfRef) -> usize;
+            fn CFDictionaryGetTypeID() -> usize;
+            fn CFStringGetTypeID() -> usize;
+            fn CFDictionaryGetCount(dict: CfRef) -> isize;
+            fn CFDictionaryGetKeysAndValues(dict: CfRef, keys: *mut CfRef, values: *mut CfRef);
+            fn CFStringGetLength(string: CfRef) -> isize;
+            fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+            fn CFStringGetCString(string: CfRef, buffer: *mut u8, size: isize, encoding: u32)
+            -> u8;
+            fn CFRelease(cf: CfRef);
+        }
+        const UTF8: u32 = 0x0800_0100;
+        const IMMUTABLE: usize = 0;
+        // A CFString of at most `max` UTF-16 units as Rust text, whole or not
+        // at all; the length is checked before anything is allocated.
+        let text = |value: CfRef, max: isize| -> Option<String> {
+            // SAFETY: `value` is a live CF object owned by the dictionary the
+            // caller holds; its type is checked before any string call.
+            unsafe {
+                if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
+                    return None;
+                }
+                let units = CFStringGetLength(value);
+                if units > max {
+                    return None;
+                }
+                let size = CFStringGetMaximumSizeForEncoding(units, UTF8).checked_add(1)?;
+                let mut buf = vec![0u8; usize::try_from(size).ok()?];
+                if CFStringGetCString(value, buf.as_mut_ptr(), size, UTF8) == 0 {
+                    return None;
+                }
+                let end = buf.iter().position(|&b| b == 0)?;
+                buf.truncate(end);
+                let string = String::from_utf8(buf).ok()?;
+                let whole = isize::try_from(string.encode_utf16().count()).ok() == Some(units);
+                whole.then_some(string)
+            }
+        };
+        let len = isize::try_from(bytes.len()).ok()?;
+        // SAFETY: `bytes` is a live buffer of exactly `len` bytes, copied by
+        // `CFDataCreate`; a null allocator is the documented default.
+        let data = unsafe { CFDataCreate(std::ptr::null(), bytes.as_ptr(), len) };
+        if data.is_null() {
+            return None;
+        }
+        // SAFETY: `data` is a valid CFData we own; null format and error slots
+        // are documented as allowed.
+        let plist = unsafe {
+            CFPropertyListCreateWithData(
+                std::ptr::null(),
+                data,
+                IMMUTABLE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: `data` was created above and is released exactly once.
+        unsafe { CFRelease(data) };
+        if plist.is_null() {
+            return None;
+        }
+        // The `-macos` key, when present, IS the identifier `CFBundle` reports —
+        // even a value it cannot use (a number, a string with a NUL), which
+        // leaves no usable identifier rather than falling back to the plain key.
+        let mut plain_id = None;
+        let mut macos_id: Option<Option<String>> = None;
+        let mut plain_executables = true;
+        // SAFETY: `plist` is a valid property list we own (Create rule); the
+        // dictionary calls run only once its type is checked, the key and
+        // value buffers hold exactly `count` slots, and `plist` is released
+        // exactly once, after the last read of anything it owns.
+        unsafe {
+            if CFGetTypeID(plist) == CFDictionaryGetTypeID() {
+                let count = usize::try_from(CFDictionaryGetCount(plist)).unwrap_or(0);
+                let mut keys: Vec<CfRef> = vec![std::ptr::null(); count];
+                let mut values: Vec<CfRef> = vec![std::ptr::null(); count];
+                CFDictionaryGetKeysAndValues(plist, keys.as_mut_ptr(), values.as_mut_ptr());
+                for (key, value) in keys.iter().zip(&values) {
+                    let Some(key) = text(*key, KEY_MAX_UNITS) else {
+                        continue;
+                    };
+                    match key.as_str() {
+                        "CFBundleIdentifier" => plain_id = text(*value, VALUE_MAX_UNITS),
+                        "CFBundleIdentifier-macos" => {
+                            macos_id = Some(text(*value, VALUE_MAX_UNITS));
+                        }
+                        _ => {}
+                    }
+                    if plain_executables && key.to_ascii_lowercase().contains("executable") {
+                        plain_executables = text(*value, VALUE_MAX_UNITS)
+                            .is_some_and(|name| super::plain_file_name(&name));
+                    }
+                }
+            }
+            CFRelease(plist);
+        }
+        Some(super::InfoPlist {
+            bundle_id: macos_id.unwrap_or(plain_id),
+            plain_executables,
+        })
+    }
+
+    /// The longest key [`parse_info_plist`] reads: `CFBundle`'s own keys, the
+    /// platform variants among them, are a few dozen units.
+    const KEY_MAX_UNITS: isize = 128;
+    /// The longest value it reads: a bundle identifier, or a file name (at most
+    /// 255 bytes on APFS).
+    const VALUE_MAX_UNITS: isize = 1024;
 }
 
 /// The bundle half of a [`ConsentKey`] for an executable: its `.app` root when
@@ -2917,6 +3265,7 @@ mod tests {
         Candidate::Ours(BundleIdentity {
             bundle_id: Some("x".to_string()),
             dr_text: dr.to_string(),
+            dr: classify_dr(dr),
             signing: if dr.contains("cdhash") {
                 "adhoc"
             } else {
@@ -3170,6 +3519,40 @@ mod tests {
         assert!(c.retirable().is_empty());
     }
 
+    /// A Developer ID copy whose requirement pins a cdhash is unstable and
+    /// conflicts, but it is not the ad-hoc or unsigned copy the Trash offers to
+    /// move: it is listed and left alone, beside an ad-hoc copy that is offered.
+    #[test]
+    fn a_developer_id_copy_is_never_retirable() {
+        let running = PathBuf::from("/A/x.app");
+        let pinned = PathBuf::from("/A/x-pinned.app");
+        let adhoc = PathBuf::from("/A/x-adhoc.app");
+        let c = classify_claimants(
+            Some(&running),
+            &[(PathBuf::from("/A"), true)],
+            Some(&[]),
+            |_| Listing::Entries(vec![running.clone(), pinned.clone(), adhoc.clone()]),
+            |root: &Path| {
+                if root == running.as_path() {
+                    ours(DEV_ID)
+                } else if root == pinned.as_path() {
+                    Candidate::Ours(BundleIdentity {
+                        bundle_id: Some("x".to_string()),
+                        dr_text: "cdhash H\"aa\"".to_string(),
+                        dr: DrClass::Cdhash,
+                        signing: "developer-id",
+                        team: Some("T".to_string()),
+                    })
+                } else {
+                    ours("designated => cdhash H\"bb\"")
+                }
+            },
+        );
+        assert_eq!(c.conflicting().len(), 2);
+        let retirable: Vec<&Path> = c.retirable().iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(retirable, vec![adhoc.as_path()]);
+    }
+
     /// THE TRASH GESTURE'S CORE: a copy is moved only if the owner was shown
     /// it, a fresh census still offers it, it is still the same bundle right
     /// before the move, and nothing runs from it. Every other
@@ -3257,39 +3640,850 @@ mod tests {
         );
     }
 
-    /// The census never looks inside a protected root, as spelled or reached
-    /// through a link: the bundle behind the link is a hole, never read.
+    /// The census never looks inside a protected root — through a link to the
+    /// bundle, through a `Contents` link, through a plist link, or through any
+    /// link out of the bundle `codesign` would follow — and never lists a
+    /// protected folder. Here every
+    /// path is already resolved, so the resolved arm is what refuses; the
+    /// spelled arm is pinned on its own by
+    /// `the_spelled_protected_arm_refuses_on_its_own`.
     #[cfg(unix)]
     #[test]
-    fn the_census_does_not_follow_a_link_into_a_protected_root() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-census-protected-{}", std::process::id()));
+    fn the_census_does_not_look_inside_a_protected_root() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("aterm-census-protected-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let documents = dir.join("Documents");
+        let plist = "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>";
         let hidden = documents.join("x.app");
         std::fs::create_dir_all(hidden.join("Contents")).unwrap();
+        std::fs::write(hidden.join("Contents/Info.plist"), plist).unwrap();
+        let apps = dir.join("Applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let protected = vec![documents.clone()];
+
+        // As spelled: the path is under the root with no link involved.
+        assert!(!census_may_read(&hidden, &protected));
+        assert_eq!(
+            list_unless_protected(&documents, &protected),
+            Listing::Unreadable
+        );
+        assert!(census_may_read(&apps, &protected));
+        assert!(matches!(
+            list_unless_protected(&apps, &protected),
+            Listing::Entries(_)
+        ));
+
+        // Resolved: the bundle is a link into the root.
+        let link = apps.join("x.app");
+        std::os::unix::fs::symlink(&hidden, &link).unwrap();
+        assert!(is_under_protected_root(&hidden, &protected));
+        assert!(
+            !is_under_protected_root(&link, &protected),
+            "not as spelled"
+        );
+        assert!(!census_may_read(&link, &protected), "but once resolved");
+        assert_eq!(read_candidate(&link, "x", &protected), Candidate::Hole);
+
+        // A real bundle directory whose `Contents` is a link into the root.
+        let shell = apps.join("y.app");
+        std::fs::create_dir_all(&shell).unwrap();
+        std::os::unix::fs::symlink(hidden.join("Contents"), shell.join("Contents")).unwrap();
+        assert!(
+            census_may_read(&shell, &protected),
+            "the bundle itself is outside"
+        );
+        assert_eq!(read_candidate(&shell, "x", &protected), Candidate::Hole);
+        assert_eq!(bundle_identity(&shell, &protected), None);
+
+        // A real bundle whose executable is a link into the root.
+        let exe_link = apps.join("z.app");
+        std::fs::create_dir_all(exe_link.join("Contents/MacOS")).unwrap();
         std::fs::write(
-            hidden.join("Contents/Info.plist"),
+            exe_link.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string>\
+             <key>CFBundleExecutable</key><string>z</string></dict></plist>",
+        )
+        .unwrap();
+        std::fs::write(documents.join("z"), b"").unwrap();
+        std::os::unix::fs::symlink(documents.join("z"), exe_link.join("Contents/MacOS/z")).unwrap();
+        assert_eq!(
+            read_candidate(&exe_link, "x", &protected),
+            Candidate::Hole,
+            "codesign would open the executable under the root"
+        );
+        assert_eq!(bundle_identity(&exe_link, &protected), None);
+
+        // A file inside `_CodeSignature` that links into the root: whatever
+        // `codesign` could open is checked, not a list of paths.
+        let sig_link = apps.join("s.app");
+        std::fs::create_dir_all(sig_link.join("Contents/_CodeSignature")).unwrap();
+        std::fs::write(
+            sig_link.join("Contents/Info.plist"),
             "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
         )
         .unwrap();
+        let resources = sig_link.join("Contents/_CodeSignature/CodeResources");
+        std::os::unix::fs::symlink(documents.join("z"), &resources).unwrap();
+        assert_eq!(read_candidate(&sig_link, "x", &protected), Candidate::Hole);
+        assert_eq!(bundle_identity(&sig_link, &protected), None);
+        std::fs::remove_file(&resources).unwrap();
+        std::fs::write(&resources, b"").unwrap();
+        assert!(
+            !bundle_reaches_protected(&sig_link, &protected),
+            "the control: the same bundle without the link is vouched for"
+        );
+
+        // A link out of the bundle — here to a folder outside the root that
+        // holds a second link into it — is unvouched, and never followed.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(documents.join("z"), elsewhere.join("CodeResources")).unwrap();
+        let hop = apps.join("h.app");
+        std::fs::create_dir_all(hop.join("Contents")).unwrap();
+        std::fs::write(
+            hop.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, hop.join("Contents/_CodeSignature")).unwrap();
+        assert_eq!(
+            read_candidate(&hop, "x", &protected),
+            Candidate::Hole,
+            "a link out of the bundle"
+        );
+        assert_eq!(bundle_identity(&hop, &protected), None);
+        // A link to a folder ABOVE the root (here the one that holds Documents):
+        // out of the bundle, so unvouched without listing what is there.
+        let above = apps.join("a.app");
+        std::fs::create_dir_all(above.join("Contents")).unwrap();
+        std::fs::write(
+            above.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&dir, above.join("Contents/Resources")).unwrap();
+        assert!(bundle_reaches_protected(&above, &protected));
+        assert_eq!(read_candidate(&above, "x", &protected), Candidate::Hole);
+        // A `Contents` that is itself a link out of the bundle, to the folder
+        // above the root: unvouched before anything is listed.
+        let out = apps.join("u.app");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            dir.join("Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&dir, out.join("Contents")).unwrap();
+        assert!(bundle_reaches_protected(&out, &protected));
+        assert_eq!(read_candidate(&out, "x", &protected), Candidate::Hole);
+        assert_eq!(bundle_identity(&out, &protected), None);
+        // The same, to a folder that holds nothing protected and no link at
+        // all: only the rule that `Contents` stays inside the bundle refuses
+        // it, since a walk of what it names would find nothing.
+        let away = dir.join("away");
+        std::fs::create_dir_all(&away).unwrap();
+        std::fs::write(
+            away.join("Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        let w = apps.join("w.app");
+        std::fs::create_dir_all(&w).unwrap();
+        std::os::unix::fs::symlink(&away, w.join("Contents")).unwrap();
+        assert!(bundle_reaches_protected(&w, &protected));
+        assert_eq!(read_candidate(&w, "x", &protected), Candidate::Hole);
+        assert_eq!(bundle_identity(&w, &protected), None);
+        // A plist that is itself a link into the root is never read: an id
+        // that is not ours would otherwise have answered NotOurs.
+        let other = apps.join("o.app");
+        std::fs::create_dir_all(other.join("Contents")).unwrap();
+        std::fs::write(
+            documents.join("other.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>other</string></dict></plist>",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            documents.join("other.plist"),
+            other.join("Contents/Info.plist"),
+        )
+        .unwrap();
+        assert_eq!(read_candidate(&other, "x", &protected), Candidate::Hole);
+        // A `Contents` that is itself a link into the root, with no plist to
+        // stop the read earlier: the walk refuses before listing it.
+        let bare = apps.join("b.app");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(documents.join("no-plist")).unwrap();
+        std::os::unix::fs::symlink(documents.join("no-plist"), bare.join("Contents")).unwrap();
+        assert!(bundle_reaches_protected(&bare, &protected));
+        assert_eq!(bundle_identity(&bare, &protected), None);
+        // A link inside the bundle (its own alias) is fine and never followed,
+        // so even one that loops ends nothing but itself.
+        let cyc = apps.join("c.app");
+        std::fs::create_dir_all(cyc.join("Contents/MacOS")).unwrap();
+        std::fs::write(cyc.join("Contents/MacOS/aterm"), b"").unwrap();
+        std::os::unix::fs::symlink("aterm", cyc.join("Contents/MacOS/atpkg")).unwrap();
+        std::os::unix::fs::symlink(cyc.join("Contents"), cyc.join("Contents/loop")).unwrap();
+        assert!(!bundle_reaches_protected(&cyc, &protected));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The walk reaches only what is physically inside a bundle-named folder —
+    /// its top level and its own `Contents` — so it cannot list a place
+    /// `codesign` would not open. Each refusal has a control that differs from
+    /// it in that one respect and is vouched for.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_stays_inside_the_bundles_own_contents() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("aterm-census-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let apps = dir.join("Applications");
         std::fs::create_dir_all(&apps).unwrap();
-        let link = apps.join("x.app");
-        std::os::unix::fs::symlink(&hidden, &link).unwrap();
-        let protected = vec![documents.canonicalize().unwrap()];
+        let lay = |at: &Path| {
+            std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
+            std::fs::write(
+                at.join("Contents/Info.plist"),
+                "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+            )
+            .unwrap();
+            std::fs::write(at.join("Contents/MacOS/x"), b"").unwrap();
+        };
 
-        assert!(census_may_read(&apps, &protected));
+        // A bundle that resolves to a folder not named like one (`x.app -> ~`):
+        // what is inside that folder is not a bundle's.
+        let home = dir.join("home");
+        lay(&home);
+        let r = apps.join("r.app");
+        std::os::unix::fs::symlink(&home, &r).unwrap();
+        assert!(bundle_reaches_protected(&r, &[]));
+        let named = dir.join("home.app");
+        lay(&named);
+        let r2 = apps.join("r2.app");
+        std::os::unix::fs::symlink(&named, &r2).unwrap();
         assert!(
-            !census_may_read(&link, &protected),
-            "resolved under Documents"
+            !bundle_reaches_protected(&r2, &[]),
+            "the control: the same link, to a folder named like a bundle"
         );
+        // The updater's displaced copy is named like one too.
+        let rollback = dir.join("home.app.rollback");
+        lay(&rollback);
+        let r3 = apps.join("r3.app");
+        std::os::unix::fs::symlink(&rollback, &r3).unwrap();
+        assert!(!bundle_reaches_protected(&r3, &[]), "`.app.rollback`");
+
+        // A bundle that holds a protected root is refused before anything in it
+        // is listed.
+        let p = apps.join("p.app");
+        lay(&p);
+        std::fs::create_dir_all(p.join("Contents/Private")).unwrap();
+        std::fs::write(p.join("Contents/Private/secret.txt"), b"").unwrap();
+        assert!(bundle_reaches_protected(&p, &[p.join("Contents/Private")]));
         assert!(
-            !census_may_read(&documents, &protected),
-            "spelled under Documents"
+            !bundle_reaches_protected(&p, &[]),
+            "the control: nothing protected inside it"
         );
-        assert_eq!(read_candidate(&link, "x", &protected), Candidate::Hole);
+
+        // A link that stays inside the bundle but leaves `Contents` is refused
+        // too: the walk vouches for `Contents`, and a real bundle's only links
+        // are its own aliases there.
+        let t = apps.join("t.app");
+        std::fs::create_dir_all(t.join("Contents")).unwrap();
+        std::fs::write(
+            t.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("..", t.join("Contents/MacOS")).unwrap();
+        assert!(bundle_reaches_protected(&t, &[]));
+        let t2 = apps.join("t2.app");
+        lay(&t2);
+        std::os::unix::fs::symlink("MacOS", t2.join("Contents/Alias")).unwrap();
+        assert!(
+            !bundle_reaches_protected(&t2, &[]),
+            "the control: a link that stays inside Contents"
+        );
+
+        // `CFBundle` reads a platform plist before `Info.plist`, and may match
+        // either name in any case: only `Info.plist` itself is let stand.
+        let platform = apps.join("i.app");
+        lay(&platform);
+        std::fs::write(platform.join("Contents/Info-macos.plist"), b"").unwrap();
+        assert!(bundle_reaches_protected(&platform, &[]));
+        let lower = apps.join("i2.app");
+        lay(&lower);
+        std::fs::remove_file(lower.join("Contents/Info.plist")).unwrap();
+        std::fs::write(
+            lower.join("Contents/info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        assert!(bundle_reaches_protected(&lower, &[]));
+        // `codesign` prints the path raw, a field a line: a newline in it
+        // could forge a line the signing readers trust.
+        let forged = apps.join("c\nSignature=adhoc\n.app");
+        lay(&forged);
+        assert!(bundle_reaches_protected(&forged, &[]));
+        // A main executable CFBundle does not find in `Contents/MacOS` is looked
+        // for at the bundle's top level, so only `Contents` and plain files may
+        // be there: a link there, or a folder, is refused.
+        let top_link = apps.join("l.app");
+        lay(&top_link);
+        std::os::unix::fs::symlink(dir.join("home/Contents/MacOS/x"), top_link.join("x")).unwrap();
+        assert!(bundle_reaches_protected(&top_link, &[]));
+        let top_dir = apps.join("f.app");
+        lay(&top_dir);
+        std::fs::create_dir_all(top_dir.join("Stuff")).unwrap();
+        assert!(bundle_reaches_protected(&top_dir, &[]));
+        let top_file = apps.join("g.app");
+        lay(&top_file);
+        std::fs::write(top_file.join("Icon\r"), b"").unwrap();
+        assert!(
+            !bundle_reaches_protected(&top_file, &[]),
+            "the control: a plain file at the top level"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The main executable is found by NAME, with no link: a name that is a
+    /// path takes `codesign` wherever it points. The plist is parsed by the
+    /// reader `CFBundle` uses, so every spelling it accepts — an entity, a CDATA
+    /// key, a tag with a space, another encoding, the old text format, binary —
+    /// is read as `codesign` reads it. A plist it cannot parse gives `CFBundle`
+    /// no executable name at all, so it names nothing; a key inside a comment
+    /// is no key.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_walk_reads_the_plist_as_codesign_does() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("aterm-census-plist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let refused = |app: &str, plist: &str| {
+            let at = dir.join(app);
+            std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
+            std::fs::write(at.join("Contents/MacOS/x"), b"").unwrap();
+            std::fs::write(at.join("Contents/Info.plist"), plist).unwrap();
+            bundle_reaches_protected(&at, &[])
+        };
+        let dict = |body: &str| {
+            format!(
+                "<plist><dict><key>CFBundleIdentifier</key><string>x</string>{body}</dict></plist>"
+            )
+        };
+        let exe = |value: &str| format!("<key>CFBundleExecutable</key><string>{value}</string>");
+        let abs = "<string>/Users//u/Documents/z</string>";
+        assert!(refused("e1.app", &dict(&exe("/Users//u/Documents/z"))));
+        assert!(refused("e2.app", &dict(&exe("../../../Documents/z"))));
+        assert!(refused("e3.app", &dict(&exe("MacOS/x"))));
+        assert!(refused("e4.app", &dict(&exe(".."))));
+        assert!(refused("e5.app", &dict(&exe(""))));
+        assert!(refused(
+            "e6.app",
+            &dict(&exe("&#47;Users&#47;u&#47;Documents&#47;z"))
+        ));
+        assert!(refused(
+            "e7.app",
+            &dict(&format!("<key><![CDATA[CFBundleExecutable]]></key>{abs}"))
+        ));
+        assert!(refused(
+            "e9.app",
+            &dict("<key>CFBundleExecutable</key><array/>")
+        ));
+        assert!(refused(
+            "e11.app",
+            &dict(&format!("<key >CFBundleExecutable</key>{abs}"))
+        ));
+        assert!(refused(
+            "e12.app",
+            &dict(&format!("<key>CFBundleExecutable</key >{abs}"))
+        ));
+        assert!(refused(
+            "e13.app",
+            &dict(&format!(
+                "{}<key>CFBundleExecutable-macos</key>{abs}",
+                exe("x")
+            ))
+        ));
+        assert!(refused(
+            "e15.app",
+            &dict(&format!("<key>NSExecutable</key>{abs}"))
+        ));
+        assert!(refused("e17.app", &dict(&exe("x\nSignature=adhoc"))));
+        // No file name is two thousand units long: past the bound it is not
+        // read at all, and so not vouched for.
+        assert!(refused("e18.app", &dict(&exe(&"a".repeat(2000)))));
+        // A key hundreds of units long is none `CFBundle` reads, whatever it
+        // says: its value is not judged (nor copied).
+        assert!(!refused(
+            "e19.app",
+            &dict(&format!("<key>{}Executable</key>{abs}", "x".repeat(200)))
+        ));
+        // UTF-7 spells the key in bytes with no `<key` in them — declared
+        // plainly, or behind a first `encoding` that says UTF-8.
+        let utf7 = "+ADw-key+AD4-CFBundleExecutable+ADw-/key+AD4-\
+                    +ADw-string+AD4-/Users//u/Documents/z+ADw-/string+AD4-";
+        for (app, declaration) in [
+            ("d1.app", "<?xml version=\"1.0\" encoding=\"UTF-7\"?>"),
+            (
+                "d3.app",
+                "<?xml version=\"1.0\" encoding =\"UTF-8\" encoding=\"UTF-7\"?>",
+            ),
+        ] {
+            assert!(
+                refused(app, &format!("{declaration}{}", dict(utf7))),
+                "{app}"
+            );
+        }
+        assert!(refused(
+            "n.app",
+            "{ CFBundleIdentifier = x; CFBundleExecutable = \"/Users//u/Documents/z\"; }"
+        ));
+        // A plist CoreFoundation cannot parse — markup inside a key, a
+        // `<string>` where a key goes, JSON — gives `CFBundle` no executable
+        // name at all: it falls back to the bundle's own, which the walk has
+        // vouched for. It names nothing, so it is not refused for its name.
+        for (app, plist) in [
+            (
+                "e14.app",
+                dict(&format!("<key>CFBundleExec<!-- -->utable</key>{abs}")),
+            ),
+            (
+                "e16.app",
+                dict(&format!("<string>CFBundleExecutable</string>{abs}")),
+            ),
+            (
+                "j.app",
+                "{\"CFBundleExecutable\": \"/Users//u/Documents/z\"}".to_string(),
+            ),
+        ] {
+            assert!(!refused(app, &plist), "{app}");
+        }
+        // The controls: a plain name; a key inside a comment, which `CFBundle`
+        // never reads; a plain name declared UTF-8.
+        assert!(!refused("e10.app", &dict(&exe("x"))), "a plain name");
+        assert!(
+            !refused(
+                "e8.app",
+                &dict(&format!(
+                    "<!-- {} -->{}",
+                    exe("/Users//u/Documents/z"),
+                    exe("x")
+                ))
+            ),
+            "a key inside a comment is no key"
+        );
+        assert!(
+            !refused(
+                "d2.app",
+                &format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}",
+                    dict(&exe("x"))
+                )
+            ),
+            "UTF-8 declared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The executable rule: one plain path component with no control
+    /// character.
+    #[test]
+    fn only_plain_file_names_are_plain() {
+        assert!(plain_file_name("aterm"));
+        for name in [
+            "/Users//u/Documents/z",
+            "../z",
+            "",
+            "MacOS/x",
+            "..",
+            "x\nSignature=adhoc",
+        ] {
+            assert!(!plain_file_name(name), "{name:?}");
+        }
+    }
+
+    /// A binary `Info.plist` — what every App Store app ships — is read as
+    /// `CFBundle` reads it: another program's is simply not ours, never a hole
+    /// that leaves the census partial on every Mac; one naming ours is ours.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_binary_info_plist_answers_whose_bundle_it_is() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("aterm-census-binary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let binary = |app: &str, id: &str| {
+            let at = dir.join(app);
+            std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
+            let plist = at.join("Contents/Info.plist");
+            std::fs::write(
+                &plist,
+                format!(
+                    "<plist><dict><key>CFBundleIdentifier</key><string>{id}</string></dict></plist>"
+                ),
+            )
+            .unwrap();
+            let converted = std::process::Command::new("/usr/bin/plutil")
+                .args(["-convert", "binary1"])
+                .arg(&plist)
+                .status()
+                .expect("plutil runs");
+            assert!(converted.success());
+            assert!(
+                read_plist_text(&plist).is_none(),
+                "the text reader cannot read it"
+            );
+            at
+        };
+        let other = binary("Numbers.app", "com.apple.iWork.Numbers");
+        assert_eq!(read_candidate(&other, "x", &[]), Candidate::NotOurs);
+        let ours = binary("x.app", "x");
+        assert!(matches!(
+            read_candidate(&ours, "x", &[]),
+            Candidate::Ours(BundleIdentity { bundle_id: Some(ref id), .. }) if id == "x"
+        ));
+        // `CFBundleIdentifier-macos` is the identifier `CFBundle` applies over
+        // the plain key (measured with NSBundle), in both directions.
+        let variant = |app: &str, plain: &str, macos: &str| {
+            let at = dir.join(app);
+            std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
+            std::fs::write(
+                at.join("Contents/Info.plist"),
+                format!(
+                    "<plist><dict><key>CFBundleIdentifier</key><string>{plain}</string>\
+                     <key>CFBundleIdentifier-macos</key><string>{macos}</string></dict></plist>"
+                ),
+            )
+            .unwrap();
+            at
+        };
+        assert!(matches!(
+            read_candidate(&variant("v1.app", "other", "x"), "x", &[]),
+            Candidate::Ours(_)
+        ));
+        assert_eq!(
+            read_candidate(&variant("v2.app", "x", "other"), "x", &[]),
+            Candidate::NotOurs
+        );
+        // A `-macos` value it cannot use still overrides the plain key: the
+        // bundle has no identifier, so it is not ours.
+        let unusable = dir.join("v3.app");
+        std::fs::create_dir_all(unusable.join("Contents/MacOS")).unwrap();
+        std::fs::write(
+            unusable.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string>\
+             <key>CFBundleIdentifier-macos</key><integer>1</integer></dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(read_candidate(&unusable, "x", &[]), Candidate::NotOurs);
+        // A JSON file is no plist to `CFBundle`: it names no identifier, so a
+        // copy whose `Info.plist` is JSON naming ours cannot claim it.
+        let json = dir.join("j.app");
+        std::fs::create_dir_all(json.join("Contents/MacOS")).unwrap();
+        std::fs::write(
+            json.join("Contents/Info.plist"),
+            "{\"CFBundleIdentifier\": \"x\", \"CFBundlePackageType\": \"APPL\"}",
+        )
+        .unwrap();
+        assert_eq!(read_candidate(&json, "x", &[]), Candidate::NotOurs);
+        // An identifier that is `x`, a NUL and more is not `x`: a string that
+        // does not come back whole is unread, never cut short.
+        let nul = binary("n.app", "x");
+        // `bplist00`, one dictionary: CFBundleIdentifier = "x\0junk" (an ASCII
+        // string object holding a NUL), then its offset table and trailer.
+        let mut bplist = b"bplist00\xd1\x01\x02\x5f\x10\x12CFBundleIdentifier\x56x\0junk".to_vec();
+        bplist.extend_from_slice(&[8, 11, 32, 0, 0, 0, 0, 0, 0, 1, 1]);
+        bplist.extend_from_slice(&3u64.to_be_bytes());
+        bplist.extend_from_slice(&0u64.to_be_bytes());
+        bplist.extend_from_slice(&39u64.to_be_bytes());
+        std::fs::write(nul.join("Contents/Info.plist"), &bplist).unwrap();
+        assert_eq!(read_candidate(&nul, "x", &[]), Candidate::NotOurs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A report read in part is not read: a stream one byte over the cap, or one
+    /// that is not UTF-8, makes the whole run `None`; at the cap it is whole.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tool_report_read_in_part_is_no_report() {
+        let bytes = |count: u64| format!("head -c {count} /dev/zero");
+        let sh = |script: &str| run_bounded("/bin/sh", &["-c".as_ref(), script.as_ref()]);
+        assert_eq!(sh(&bytes(TOOL_OUTPUT_MAX_BYTES + 1)), None);
+        assert_eq!(sh("printf '\\377'"), None);
+        let whole = sh(&bytes(TOOL_OUTPUT_MAX_BYTES)).expect("a report at the cap");
+        assert!(whole.0 && whole.2.is_empty());
+        assert_eq!(
+            u64::try_from(whole.1.len()).ok(),
+            Some(TOOL_OUTPUT_MAX_BYTES)
+        );
+    }
+
+    /// A folder on another volume — a disk image mounted inside the bundle — is
+    /// refused without being listed. The control is the same bundle once the
+    /// image is detached. `hdiutil` needs no privilege and raises no dialog.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_walk_does_not_cross_into_another_volume() {
+        struct Detach(PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .output();
+            }
+        }
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("aterm-census-volume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("m.app");
+        let mount = bundle.join("Contents/Vol");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        let image = dir.join("vol.dmg");
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            let out = std::process::Command::new("/usr/bin/hdiutil")
+                .args(args)
+                .output()
+                .expect("hdiutil runs");
+            assert!(
+                out.status.success(),
+                "hdiutil {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        hdiutil(&[
+            "create".as_ref(),
+            "-quiet".as_ref(),
+            "-size".as_ref(),
+            "1m".as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            image.as_os_str(),
+        ]);
+        hdiutil(&[
+            "attach".as_ref(),
+            "-quiet".as_ref(),
+            "-nobrowse".as_ref(),
+            "-readonly".as_ref(),
+            "-mountpoint".as_ref(),
+            mount.as_os_str(),
+            image.as_os_str(),
+        ]);
+        let attached = Detach(mount.clone());
+        let refused = bundle_reaches_protected(&bundle, &[]);
+        drop(attached);
+        assert!(refused, "a volume mounted inside the bundle");
+        assert!(
+            !bundle_reaches_protected(&bundle, &[]),
+            "the control: the same bundle, detached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The census's refusals, one arm at a time. The spelled arm alone refuses
+    /// a path under a protected root that does not exist yet, where there is
+    /// nothing to resolve; and the listing takes the same refusal.
+    #[test]
+    fn the_spelled_protected_arm_refuses_on_its_own() {
+        let root = PathBuf::from("/nonexistent-aterm-census/Documents");
+        let protected = vec![root.clone()];
+        let missing = root.join("not-yet.app");
+        assert!(
+            std::fs::canonicalize(&missing).is_err(),
+            "nothing to resolve"
+        );
+        assert!(!census_may_read(&missing, &protected));
+        assert_eq!(
+            list_unless_protected(&missing, &protected),
+            Listing::Unreadable
+        );
+        assert_eq!(
+            list_unless_protected(Path::new("/nonexistent-aterm-census/Apps"), &protected),
+            Listing::Missing,
+            "outside the root, a missing folder is simply missing"
+        );
+    }
+
+    /// Only codesign's whole one-line "not signed" report is unsigned: the phrase
+    /// inside a path on a signed copy's report is not.
+    #[test]
+    fn unsigned_is_the_whole_report_not_a_phrase_in_it() {
+        assert_eq!(
+            classify_signing("/A/x.app: code object is not signed at all\n"),
+            "unsigned"
+        );
+        let planted = "Executable=/A/x: code object is not signed at all/x\n\
+                       Identifier=x\nSignature=adhoc\n\
+                       # designated => cdhash H\"aa\"\n";
+        assert_eq!(classify_signing(planted), "adhoc");
+        assert_ne!(
+            identity_from_report(Some(planted), None).dr,
+            DrClass::Unsigned
+        );
+        // The phrase inside a signed copy's requirement clause is not unsigned.
+        let quoted = "Identifier=x\nTeamIdentifier=T\n\
+                      designated => identifier \"code object is not signed at all\" and \
+                      anchor apple generic and certificate leaf[subject.OU] = \"T\"\n";
+        assert_eq!(classify_signing(quoted), "developer-id");
+        assert_eq!(
+            identity_from_report(Some(quoted), None).dr,
+            DrClass::Unknown
+        );
+    }
+
+    /// The census's own wiring lists through the protected-root fence: a
+    /// required folder under a protected root is a hole in the look, where a
+    /// plain listing would have called the look complete.
+    #[test]
+    fn the_census_lists_through_the_protected_fence() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("aterm-census-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let desktop = dir.join("Desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::write(desktop.join("notes.txt"), b"").unwrap();
+        let roots = [(desktop.clone(), true)];
+        let fenced = census_in("x", None, &roots, Some(&[]), std::slice::from_ref(&desktop));
+        assert_eq!(fenced.enumeration, Enumeration::Partial, "never listed");
+        let open = census_in("x", None, &roots, Some(&[]), &[]);
+        assert_eq!(
+            open.enumeration,
+            Enumeration::Complete,
+            "the control: listed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The last check before a move compares the whole identity: an unsigned
+    /// copy and a failed read both have no requirement text, and must not
+    /// compare equal; a read with no class is never the same copy.
+    #[test]
+    fn the_identity_recheck_tells_an_unsigned_copy_from_a_failed_read() {
+        let unsigned = identity_from_report(
+            Some("/x.app: code object is not signed at all\n"),
+            Some("x".to_string()),
+        );
+        let failed = identity_from_report(None, Some("x".to_string()));
+        let copy = Claimant {
+            path: PathBuf::from("/A/x.app"),
+            dr: unsigned.dr,
+            dr_text: unsigned.dr_text.clone(),
+            signing: unsigned.signing,
+            team: None,
+            running: false,
+        };
+        assert!(same_identity(&unsigned, &copy));
+        assert!(
+            !same_identity(&failed, &copy),
+            "a failed read is not the copy"
+        );
+        let unknown = Claimant {
+            dr: DrClass::Unknown,
+            signing: "unknown",
+            ..copy.clone()
+        };
+        assert!(!same_identity(&failed, &unknown), "Unknown never matches");
+        let adhoc = identity_from_report(
+            Some("Signature=adhoc\n# designated => cdhash H\"aa\"\n"),
+            Some("x".to_string()),
+        );
+        assert!(!same_identity(&adhoc, &copy), "re-signed ad hoc");
+    }
+
+    /// The Trash is offered only among the rows the owner can see: a retirable
+    /// copy past the first MAX_CLAIMANT_ROWS conflicting ones is never offered.
+    #[test]
+    fn only_listed_copies_are_offered_for_the_trash() {
+        let dir = PathBuf::from("/A");
+        let running = dir.join("x.app");
+        let stable_other = |i: usize| dir.join(format!("x-stable-{i:02}.app"));
+        let mut entries = vec![running.clone()];
+        entries.extend((0..MAX_CLAIMANT_ROWS).map(stable_other));
+        let late = dir.join("z-adhoc.app");
+        entries.push(late.clone());
+        let c = classify_claimants(
+            Some(&running),
+            &[(dir.clone(), true)],
+            Some(&[]),
+            |_| Listing::Entries(entries.clone()),
+            |root: &Path| {
+                if root == running.as_path() {
+                    ours(DEV_ID)
+                } else if root == late.as_path() {
+                    ours("designated => cdhash H\"aa\"")
+                } else {
+                    ours(
+                        "designated => identifier \"x\" and anchor apple generic and \
+                          certificate leaf[subject.OU] = \"OTHER\"",
+                    )
+                }
+            },
+        );
+        assert_eq!(c.conflicting().len(), MAX_CLAIMANT_ROWS + 1);
+        assert_eq!(c.retirable().len(), 1, "the ad-hoc copy is retirable");
+        assert!(
+            c.offered_for_trash().is_empty(),
+            "but it is past the listed rows, so it is not offered"
+        );
+    }
+
+    /// An unsigned bundle leaves `codesign` no requirement to print, so its
+    /// class comes from the report as a whole: `Unsigned`, never `Unknown` —
+    /// and beside a Developer-ID running copy it is offered for the Trash,
+    /// while a copy whose signature could not be read is not.
+    #[test]
+    fn an_unsigned_copy_is_unsigned_and_offered_an_unreadable_one_is_not() {
+        let unsigned = identity_from_report(
+            Some("/x/y.app: code object is not signed at all\n"),
+            Some("x".to_string()),
+        );
+        assert_eq!(unsigned.dr, DrClass::Unsigned);
+        assert_eq!(unsigned.signing, "unsigned");
+        assert_eq!(identity_from_report(None, None).dr, DrClass::Unknown);
+
+        let dir = PathBuf::from("/A");
+        let running = dir.join("x.app");
+        let bare = dir.join("x-unsigned.app");
+        let unread = dir.join("x-unread.app");
+        let entries = vec![running.clone(), bare.clone(), unread.clone()];
+        let c = classify_claimants(
+            Some(&running),
+            &[(dir.clone(), true)],
+            Some(&[]),
+            |_| Listing::Entries(entries.clone()),
+            |root: &Path| {
+                if root == running.as_path() {
+                    ours(DEV_ID)
+                } else if root == bare.as_path() {
+                    Candidate::Ours(unsigned.clone())
+                } else {
+                    Candidate::Ours(identity_from_report(None, Some("x".to_string())))
+                }
+            },
+        );
+        assert_eq!(c.conflicting().len(), 2);
+        let offered: Vec<_> = c
+            .offered_for_trash()
+            .iter()
+            .map(|x| x.path.clone())
+            .collect();
+        assert_eq!(offered, vec![bare]);
     }
 
     #[test]
@@ -3831,6 +5025,41 @@ mod tests {
             ("anchor apple", DrClass::Unknown),
             ("identifier \"com.aterm.aterm\"", DrClass::Unknown),
             ("nonsense", DrClass::Unknown),
+            // A Developer ID copy named for a cdhash is still stable.
+            (
+                "identifier \"com.cdhash.x\" and anchor apple generic and \
+                 certificate leaf[subject.OU] = \"CDHASH\"",
+                DrClass::Identity,
+            ),
+            // A quoted string is the author's data, not clauses: even a whole
+            // clause's shape inside one is neither rule 2 nor rule 3.
+            (
+                "identifier \"x cdhash H\" and anchor apple generic",
+                DrClass::Identity,
+            ),
+            ("identifier \"anchor apple\"", DrClass::Unknown),
+            // `codesign` prints a plain alphanumeric value bare: a word that
+            // merely contains `cdhash` is not the clause, which is the word on
+            // its own followed by a hash constant.
+            (
+                "designated => identifier mycdhash and anchor apple generic and \
+                 certificate leaf[subject.OU] = A66A9P66Z7",
+                DrClass::Identity,
+            ),
+            ("identifier cdhash", DrClass::Unknown),
+            ("(cdhash H\"abc\")", DrClass::Cdhash),
+            // An escaped quote does not close the string: the anchor clause
+            // here is inside it.
+            (
+                "identifier \"a\\\" and anchor apple generic\"",
+                DrClass::Unknown,
+            ),
+            // A string does not cross a line: a stray quote in an earlier line
+            // of codesign's report cannot swallow the requirement after it.
+            (
+                "Executable=/A/we\"ird\ndesignated => cdhash H\"aa\"",
+                DrClass::Cdhash,
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(classify_dr(input), want, "classifying {input:?}");
@@ -4059,23 +5288,21 @@ mod tests {
             TccutilPresence::Missing,
         );
         let cases = [
-            (true, true, run, "executable", true),
-            (true, false, notx, "not-executable", false),
-            (false, false, gone, "missing", false),
+            (true, true, run, true),
+            (true, false, notx, false),
+            (false, false, gone, false),
             // A directory (or anything that is not a regular file) at the path
             // is "no tool there", never "present but unusable".
-            (false, true, gone, "missing", false),
+            (false, true, gone, false),
         ];
-        for (is_file, executable, want, token, can_run) in cases {
+        for (is_file, executable, want, can_run) in cases {
             let got = classify_tccutil(is_file, executable);
             assert_eq!(got, want, "is_file={is_file} executable={executable}");
-            assert_eq!(got.as_str(), token);
             assert_eq!(got.can_run(), can_run);
         }
         // The default fails toward "do not offer a destructive button".
         assert_eq!(TccutilPresence::default(), TccutilPresence::Unknown);
         assert!(!TccutilPresence::Unknown.can_run());
-        assert_eq!(TccutilPresence::Unknown.as_str(), "unknown");
     }
 
     #[test]
@@ -4135,8 +5362,6 @@ mod tests {
     fn a_plan_is_one_command_per_folder_in_plan_order_from_one_subject() {
         let plan = ResetPlan::new(" a.b.c ", Folder::ALL).expect("plan builds");
         assert_eq!(plan.bundle_id(), "a.b.c", "the subject is trimmed once");
-        assert_eq!(plan.len(), Folder::ALL.len());
-        assert!(!plan.is_empty());
         assert_eq!(plan.folders(), Folder::ALL);
 
         let commands = plan.commands();
@@ -4266,7 +5491,7 @@ mod tests {
             ),
             Folder::ALL,
         );
-        assert_eq!(offered.map(|p| p.len()), Some(Folder::ALL.len()));
+        assert_eq!(offered.map(|p| p.commands().len()), Some(Folder::ALL.len()));
 
         let (run, notx, gone, unk) = (
             TccutilPresence::Executable,
@@ -4293,13 +5518,12 @@ mod tests {
     #[test]
     fn one_invocations_status_is_read_from_its_exit_alone() {
         assert_eq!(ResetStatus::from_exit_status(Some(0)), ResetStatus::Reset);
-        assert_eq!(ResetStatus::from_exit_code(0), ResetStatus::Reset);
         assert_eq!(
-            ResetStatus::from_exit_code(1),
+            ResetStatus::from_exit_status(Some(1)),
             ResetStatus::Declined { code: Some(1) }
         );
         assert_eq!(
-            ResetStatus::from_exit_code(64),
+            ResetStatus::from_exit_status(Some(64)),
             ResetStatus::Declined { code: Some(64) }
         );
         // Killed by a signal: a decline with no code, never a success.
@@ -4326,7 +5550,7 @@ mod tests {
         let ok = |f: Folder| ResetAttempt::new(f, ResetStatus::Reset);
         let bad = |f: Folder, c: i32| ResetAttempt::from_exit_status(f, Some(c));
         let gone = ResetAttempt::tool_absent;
-        let cases: [(&[ResetAttempt], ResetOutcome, &str); 7] = [
+        let cases: [(&[ResetAttempt], ResetOutcome); 7] = [
             // all ok
             (
                 &[
@@ -4335,7 +5559,6 @@ mod tests {
                     ok(Folder::Downloads),
                 ],
                 ResetOutcome::AllReset,
-                "all-reset",
             ),
             // one nonzero
             (
@@ -4345,7 +5568,6 @@ mod tests {
                     ok(Folder::Downloads),
                 ],
                 ResetOutcome::Partial,
-                "partial",
             ),
             // all nonzero
             (
@@ -4355,7 +5577,6 @@ mod tests {
                     bad(Folder::Downloads, 70),
                 ],
                 ResetOutcome::NoneReset,
-                "none-reset",
             ),
             // tccutil absent — a property of the machine, not of a folder
             (
@@ -4365,27 +5586,22 @@ mod tests {
                     gone(Folder::Downloads),
                 ],
                 ResetOutcome::ToolAbsent,
-                "tool-absent",
             ),
             // the tool vanished after one folder had already been reset
             (
                 &[ok(Folder::Documents), gone(Folder::Desktop)],
                 ResetOutcome::Partial,
-                "partial",
             ),
             // nothing ran, and not because the tool is missing
             (
                 &[bad(Folder::Documents, 1), gone(Folder::Desktop)],
                 ResetOutcome::NoneReset,
-                "none-reset",
             ),
             // nothing to do is not a success
-            (&[], ResetOutcome::NotAttempted, "not-attempted"),
+            (&[], ResetOutcome::NotAttempted),
         ];
-        for (attempts, want, token) in cases {
-            let got = reset_outcome(attempts);
-            assert_eq!(got, want, "{attempts:?}");
-            assert_eq!(got.as_str(), token);
+        for (attempts, want) in cases {
+            assert_eq!(reset_outcome(attempts), want, "{attempts:?}");
         }
     }
 
@@ -4397,16 +5613,11 @@ mod tests {
             ResetAttempt::from_exit_status(Folder::Downloads, None),
         ];
         let outcome = reset_outcome(&attempts);
-        assert_eq!(outcome, ResetOutcome::Partial);
-        assert!(outcome.any_reset());
-        assert!(
-            !outcome.all_reset(),
+        assert_eq!(
+            outcome,
+            ResetOutcome::Partial,
             "one success must never speak for the whole set"
         );
-        assert!(ResetOutcome::AllReset.all_reset());
-        assert!(!ResetOutcome::NoneReset.any_reset());
-        assert!(!ResetOutcome::ToolAbsent.any_reset());
-        assert!(!ResetOutcome::NotAttempted.any_reset());
 
         // The warm-up follows only what actually reset.
         assert_eq!(folders_reset(&attempts), vec![Folder::Documents]);
@@ -4429,18 +5640,6 @@ mod tests {
         );
         assert!(folders_reset(&attempts).is_empty());
         assert_eq!(reset_outcome(&attempts), ResetOutcome::ToolAbsent);
-    }
-
-    #[test]
-    fn repair_tokens_render_for_every_state() {
-        assert_eq!(ResetStatus::Reset.as_str(), "reset");
-        assert_eq!(ResetStatus::Declined { code: Some(1) }.as_str(), "declined");
-        assert_eq!(ResetStatus::Declined { code: None }.as_str(), "declined");
-        assert_eq!(ResetStatus::ToolAbsent.as_str(), "tool-absent");
-        assert_eq!(ResetOffer::Offer.as_str(), "offer");
-        assert_eq!(ResetOffer::ExplainRebuild.as_str(), "explain-rebuild");
-        assert_eq!(ResetOffer::HideNoTool.as_str(), "hide-no-tool");
-        assert_eq!(ResetOffer::HideNoBundleId.as_str(), "hide-no-bundle-id");
     }
 
     // -- the posture join ----------------------------------------------------
@@ -4624,142 +5823,6 @@ mod tests {
     }
 
     // -- cache ---------------------------------------------------------------
-
-    fn key(bundle: &str, dr: &str) -> ConsentKey {
-        ConsentKey::new(bundle, dr)
-    }
-
-    #[test]
-    fn a_fresh_cache_is_empty_and_a_successor_inherits_nothing() {
-        // A successor that adopts sessions across an in-place apply builds its
-        // own cache; there is no process-global to inherit.
-        let successor = ConsentCache::new();
-        assert!(successor.is_empty());
-        assert_eq!(
-            successor.get(
-                &key("/Applications/aterm.app", "identity"),
-                Duration::from_secs(5)
-            ),
-            None
-        );
-
-        // And an explicit clear (app activation, post-handoff) empties one.
-        let cache = ConsentCache::new();
-        cache.store(
-            key("/Applications/aterm.app", "identity"),
-            FdaProbe {
-                state: FdaState::Granted,
-                label: ProbeLabel::OpenOk,
-            },
-        );
-        assert!(!cache.is_empty());
-        cache.clear();
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn the_cache_expires_at_the_caller_supplied_interval() {
-        let cache = ConsentCache::new();
-        let k = key("/Applications/aterm.app", "identity");
-        let probe = FdaProbe {
-            state: FdaState::Denied,
-            label: ProbeLabel::OpenEperm,
-        };
-        let t0 = Instant::now();
-        cache.store_at(k.clone(), probe, t0);
-
-        let interval = Duration::from_millis(5000);
-        let hit = cache
-            .get_at(&k, interval, t0 + Duration::from_millis(1840))
-            .expect("fresh within the interval");
-        assert_eq!(hit.probe, probe);
-        assert_eq!(hit.age, Duration::from_millis(1840));
-
-        assert!(
-            cache.get_at(&k, interval, t0 + interval).is_none(),
-            "exactly at the interval is stale"
-        );
-        assert!(
-            cache
-                .get_at(&k, interval, t0 + Duration::from_millis(9000))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_changed_identity_misses_the_cache() {
-        let cache = ConsentCache::new();
-        let granted = FdaProbe {
-            state: FdaState::Granted,
-            label: ProbeLabel::OpenOk,
-        };
-        let t0 = Instant::now();
-        cache.store_at(key("/Applications/aterm.app", "identity-A"), granted, t0);
-        let interval = Duration::from_secs(60);
-
-        // A rebuild changed the designated requirement: a stale `granted` must
-        // not survive it.
-        assert!(
-            cache
-                .get_at(&key("/Applications/aterm.app", "cdhash-B"), interval, t0)
-                .is_none()
-        );
-        // A different bundle likewise.
-        assert!(
-            cache
-                .get_at(
-                    &key("/Applications/aterm (dev).app", "identity-A"),
-                    interval,
-                    t0
-                )
-                .is_none()
-        );
-        // The same identity still hits.
-        assert!(
-            cache
-                .get_at(&key("/Applications/aterm.app", "identity-A"), interval, t0)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn get_or_probe_calls_the_probe_only_on_a_miss() {
-        let cache = ConsentCache::new();
-        let k = key("/Applications/aterm.app", "identity");
-        let interval = Duration::from_secs(5);
-        let t0 = Instant::now();
-
-        let mut calls = 0u32;
-        let first = cache.get_or_probe_at(&k, interval, t0, || {
-            calls += 1;
-            FdaProbe {
-                state: FdaState::Denied,
-                label: ProbeLabel::OpenEperm,
-            }
-        });
-        assert_eq!(calls, 1);
-        assert_eq!(first.probe.state, FdaState::Denied);
-        assert_eq!(first.age, Duration::ZERO);
-
-        let second = cache.get_or_probe_at(&k, interval, t0 + Duration::from_secs(1), || {
-            calls += 1;
-            unreachable!("probed inside the interval");
-        });
-        assert_eq!(calls, 1);
-        assert_eq!(second.probe.state, FdaState::Denied);
-        assert_eq!(second.age, Duration::from_secs(1));
-
-        // Past the interval it probes again.
-        let third = cache.get_or_probe_at(&k, interval, t0 + Duration::from_secs(6), || {
-            calls += 1;
-            FdaProbe {
-                state: FdaState::Granted,
-                label: ProbeLabel::OpenOk,
-            }
-        });
-        assert_eq!(calls, 2);
-        assert_eq!(third.probe.state, FdaState::Granted);
-    }
 
     #[test]
     fn cache_bundle_prefers_the_bundle_root() {

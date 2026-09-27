@@ -72,7 +72,7 @@ use aterm_uds::CtlStream;
 /// discovered live from the graph entry, since the child binds it only once it
 /// (an inner aterm) actually starts.
 #[derive(Clone)]
-pub struct ProxyEntry {
+pub(crate) struct ProxyEntry {
     pub nonce: LaunchNonce,
     pub read: EdgeToken,
     pub write: EdgeToken,
@@ -86,7 +86,7 @@ impl ProxyEntry {
     /// durable-config and clipboard-exfil authorities are never carried by an
     /// inherited edge (only the instance Owner holds them).
     #[must_use]
-    pub fn token_for(&self, op: Op) -> Option<&EdgeToken> {
+    pub(crate) fn token_for(&self, op: Op) -> Option<&EdgeToken> {
         match op {
             Op::ReadScreen => Some(&self.read),
             Op::WriteInput => Some(&self.write),
@@ -99,11 +99,11 @@ impl ProxyEntry {
 /// This aterm's map of spawned children → the capability it holds over each.
 /// Shared between the spawn path (which inserts) and the control server (which
 /// reads to forward). Empty until this aterm spawns a child.
-pub type ProxyTable = Arc<RwLock<HashMap<SessionId, ProxyEntry>>>;
+pub(crate) type ProxyTable = Arc<RwLock<HashMap<SessionId, ProxyEntry>>>;
 
 /// A fresh, empty proxy table.
 #[must_use]
-pub fn new_proxy_table() -> ProxyTable {
+pub(crate) fn new_proxy_table() -> ProxyTable {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
@@ -115,12 +115,12 @@ static PROXIES: std::sync::OnceLock<ProxyTable> = std::sync::OnceLock::new();
 
 /// The process-wide [`ProxyTable`] (lazily initialized, cloned Arc).
 #[must_use]
-pub fn proxies() -> ProxyTable {
+pub(crate) fn proxies() -> ProxyTable {
     PROXIES.get_or_init(new_proxy_table).clone()
 }
 
 /// Record the capability this aterm holds over a child it just spawned.
-pub fn register_child(child: SessionId, entry: ProxyEntry) {
+pub(crate) fn register_child(child: SessionId, entry: ProxyEntry) {
     proxies()
         .write()
         .unwrap_or_else(|p| p.into_inner())
@@ -129,7 +129,7 @@ pub fn register_child(child: SessionId, entry: ProxyEntry) {
 
 /// Look up the capability for a child by session id (cloned out).
 #[must_use]
-pub fn lookup_child(sid: &SessionId) -> Option<ProxyEntry> {
+pub(crate) fn lookup_child(sid: &SessionId) -> Option<ProxyEntry> {
     proxies()
         .read()
         .unwrap_or_else(|p| p.into_inner())
@@ -139,7 +139,7 @@ pub fn lookup_child(sid: &SessionId) -> Option<ProxyEntry> {
 
 /// Drop the capability for a child (its session closed) so the process-wide table
 /// does not grow for the process lifetime as tabs open and close.
-pub fn deregister_child(child: &SessionId) {
+pub(crate) fn deregister_child(child: &SessionId) {
     proxies()
         .write()
         .unwrap_or_else(|p| p.into_inner())
@@ -170,7 +170,7 @@ static SELF_SOCK: RwLock<Option<(std::path::PathBuf, String)>> = RwLock::new(Non
 /// server without bound. The socket exists at record time (we just bound it),
 /// so canonicalization only falls back on exotic filesystems — and then to a
 /// dir-canonical + filename join, mirroring `confine_proxy_sock`'s own shape.
-pub fn set_self_sock(sock_dir: &Path, sock_path: &str) {
+pub(crate) fn set_self_sock(sock_dir: &Path, sock_path: &str) {
     let canon = std::fs::canonicalize(sock_path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| {
@@ -188,7 +188,7 @@ pub fn set_self_sock(sock_dir: &Path, sock_path: &str) {
 
 /// This instance's own bound socket path, or `None` when no socket is bound.
 #[must_use]
-pub fn self_sock_path() -> Option<String> {
+pub(crate) fn self_sock_path() -> Option<String> {
     SELF_SOCK
         .read()
         .unwrap_or_else(|p| p.into_inner())
@@ -199,7 +199,7 @@ pub fn self_sock_path() -> Option<String> {
 /// Test-only: clear the recorded self socket so tests that set it cannot leak
 /// state into other tests in the same process.
 #[cfg(test)]
-pub fn clear_self_sock() {
+pub(crate) fn clear_self_sock() {
     *SELF_SOCK.write().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
@@ -208,7 +208,7 @@ pub fn clear_self_sock() {
 /// [`SELF_SOCK`] concurrently would flake). Acquire this FIRST, hold it for the
 /// test's whole self-sock window, and `clear_self_sock` before dropping it.
 #[cfg(test)]
-pub fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -217,9 +217,9 @@ pub fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
 /// SIBLING instance (and the flagless `aterm-ctl` client) can resolve `@<sid>` to
 /// our socket. No-op until the control socket is bound ([`set_self_sock`]);
 /// best-effort. Uses [`publish_graph_entry`], so an instance on an explicit
-/// `$ATERM_CONTROL_SOCK` ALSO lands its entry in the default rendezvous dir the
+/// `--control-sock` ALSO lands its entry in the default rendezvous dir the
 /// client reads. Called at the session-registration seam for every session.
-pub fn publish_session(sid: &SessionId, nonce: &LaunchNonce) {
+pub(crate) fn publish_session(sid: &SessionId, nonce: &LaunchNonce) {
     let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
     if let Some((dir, sock)) = guard.as_ref() {
         // What goes on DISK is the spelling every reader can dial and dedupe:
@@ -255,7 +255,7 @@ fn published_sock_spelling(sock: &str) -> String {
 /// close) is harmless: the sibling forward re-checks socket liveness and the
 /// hosting instance re-checks its own store, so a stale entry can only produce
 /// `ERR no such session`, never a wrong target.
-pub fn unpublish_session(sid: &SessionId) {
+pub(crate) fn unpublish_session(sid: &SessionId) {
     let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
     if let Some((dir, _)) = guard.as_ref() {
         retire_graph_entry(dir, sid);
@@ -281,7 +281,7 @@ pub fn unpublish_session(sid: &SessionId) {
 /// compares `AUTH` against the token it minted in memory, so a foreign value
 /// is refused exactly as no token is.
 #[must_use]
-pub fn read_sibling_token(sock_path: &str) -> Option<String> {
+pub(crate) fn read_sibling_token(sock_path: &str) -> Option<String> {
     let p = Path::new(sock_path);
     let dir = p.parent()?;
     let name = p.file_name()?.to_string_lossy();
@@ -302,14 +302,20 @@ pub fn read_sibling_token(sock_path: &str) -> Option<String> {
 /// `sock <abs-path>\nnonce <hex>\npid <n>\n`. The `pid` is THIS (the hosting)
 /// process's — recorded so the flagless client's `instances`/`ls` can report a
 /// pid even for an explicit-socket instance whose socket filename encodes none.
-/// Edge tokens are NEVER written here — they travel only via the injected env.
+/// Edge tokens are NEVER written here — they live only in the child's 0600
+/// edge-token file ([`write_edge_tokens`]), whose path rides `ATERM_EDGE_TOKENS`.
 /// Best-effort: a write failure just means the parent cannot reach us by proxy
 /// (direct per-instance reach still works).
 ///
 /// This writes into ONE dir only; [`publish_graph_entry`] wraps it to ALSO
 /// mirror into the well-known default rendezvous dir when the instance runs on
-/// an explicit `$ATERM_CONTROL_SOCK` outside it.
-pub fn write_graph_entry(sock_dir: &Path, sid: &SessionId, sock_path: &str, nonce: &LaunchNonce) {
+/// an explicit `--control-sock` outside it.
+pub(crate) fn write_graph_entry(
+    sock_dir: &Path,
+    sid: &SessionId,
+    sock_path: &str,
+    nonce: &LaunchNonce,
+) {
     let dir = sock_dir.join("graph");
     // 0700 + owner-verified, like the sibling `images/` subdir (control_auth).
     if crate::control_auth::ensure_private_dir(&dir).is_err() {
@@ -340,7 +346,7 @@ static MIRROR_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 /// `None`). The caller MUST hold [`self_sock_test_guard`] and clear it before
 /// dropping the guard, so the override is never visible outside its own test.
 #[cfg(test)]
-pub fn set_mirror_dir_override(dir: Option<PathBuf>) {
+pub(crate) fn set_mirror_dir_override(dir: Option<PathBuf>) {
     *MIRROR_DIR_OVERRIDE
         .write()
         .unwrap_or_else(|p| p.into_inner()) = dir;
@@ -350,7 +356,7 @@ pub fn set_mirror_dir_override(dir: Option<PathBuf>) {
 /// publish a graph entry into, or `None` when `sock_dir` already IS it (the
 /// default per-instance case — no mirror needed) or the per-user base cannot be
 /// resolved. The flagless `aterm-ctl` client only ever reads the default dir, so
-/// an instance launched on an explicit `$ATERM_CONTROL_SOCK` (whose entries would
+/// an instance launched on an explicit `--control-sock` (whose entries would
 /// otherwise land ONLY beside that socket) must mirror here to stay discoverable.
 fn rendezvous_mirror_dir(sock_dir: &Path) -> Option<PathBuf> {
     // Under test, a set override stands in for the real default dir so no unit
@@ -391,7 +397,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 /// Publish a session's discovery graph entry into the instance's OWN `sock_dir`
 /// AND — when that dir is not the default rendezvous dir (i.e. this instance runs
-/// on an explicit `$ATERM_CONTROL_SOCK`) — into the default dir too, so the
+/// on an explicit `--control-sock`) — into the default dir too, so the
 /// flagless `aterm-ctl` client (which only ever reads the default dir) can still
 /// self-locate and enumerate this instance. The entry carries the ABSOLUTE `sock
 /// <path>`, so the client resolves the right socket wherever it actually lives.
@@ -400,7 +406,12 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// is unavailable/unwritable simply degrades to the own-dir entry (no crash — a
 /// headless explicit-socket instance still runs, just undiscoverable by flagless
 /// clients until the default dir is writable).
-pub fn publish_graph_entry(sock_dir: &Path, sid: &SessionId, sock_path: &str, nonce: &LaunchNonce) {
+pub(crate) fn publish_graph_entry(
+    sock_dir: &Path,
+    sid: &SessionId,
+    sock_path: &str,
+    nonce: &LaunchNonce,
+) {
     write_graph_entry(sock_dir, sid, sock_path, nonce);
     if let Some(rv) = rendezvous_mirror_dir(sock_dir) {
         write_graph_entry(&rv, sid, sock_path, nonce);
@@ -411,7 +422,7 @@ pub fn publish_graph_entry(sock_dir: &Path, sid: &SessionId, sock_path: &str, no
 /// default rendezvous dir (the inverse of [`publish_graph_entry`]). Best-effort;
 /// a leftover is harmless (the nonce guard fails a stale dial closed and the
 /// client re-probes liveness), so this is hygiene, not correctness.
-pub fn retire_graph_entry(sock_dir: &Path, sid: &SessionId) {
+pub(crate) fn retire_graph_entry(sock_dir: &Path, sid: &SessionId) {
     remove_graph_entry(sock_dir, sid);
     if let Some(rv) = rendezvous_mirror_dir(sock_dir) {
         remove_graph_entry(&rv, sid);
@@ -446,7 +457,7 @@ fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// Remove this session's graph entry (best-effort) on graceful exit so a dead
 /// session's socket path is not left for a parent to dial. (A leftover is harmless
 /// anyway — the nonce guard fails a stale dial closed — so this is hygiene.)
-pub fn remove_graph_entry(sock_dir: &Path, sid: &SessionId) {
+pub(crate) fn remove_graph_entry(sock_dir: &Path, sid: &SessionId) {
     let _ = std::fs::remove_file(graph_path(sock_dir, sid));
 }
 
@@ -455,7 +466,7 @@ pub fn remove_graph_entry(sock_dir: &Path, sid: &SessionId) {
 /// `remove_graph_entry`. Mirrors `control_auth::sweep_stale_instances` for the
 /// sibling per-instance files; best-effort (the nonce guard already fails a stale
 /// dial closed, so this only keeps the dir bounded). Called at spawn.
-pub fn sweep_stale_graph(sock_dir: &Path) {
+pub(crate) fn sweep_stale_graph(sock_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(sock_dir.join("graph")) else {
         return;
     };
@@ -488,26 +499,101 @@ pub fn sweep_stale_graph(sock_dir: &Path) {
 /// parent's session lifetime — which matches the EXISTING per-launch AUTH token
 /// file (`aterm-<pid>.token`), also 0600 in the same 0700 same-uid dir for the
 /// whole session, so the trust boundary (same-uid + 0600) is unchanged. The PARENT
-/// owns the file and removes it on session/child teardown ([`remove_edge_tokens`]);
-/// crash leftovers are swept at the next spawn ([`sweep_stale_edges`]). Inheritance
-/// across a NEW aterm hop is still blocked — `ATERM_EDGE_TOKENS` stays deny-listed,
-/// so only a same-shell relaunch (which re-inherits the pinned path) re-reads it.
-pub fn write_edge_tokens(
+/// owns the file: the [`ChildProxy`] that records its path removes it when the
+/// child's session ends (see there for why a crash leftover needs no sweep).
+/// Inheritance across a NEW aterm hop is still blocked — `ATERM_EDGE_TOKENS` stays
+/// deny-listed, so only a same-shell relaunch (which re-inherits the pinned path)
+/// re-reads it.
+pub(crate) fn write_edge_tokens(
     sock_dir: &Path,
     child_sid: &SessionId,
     read_hex: &str,
     write_hex: &str,
     signal_hex: &str,
-) -> Option<String> {
+) -> Option<EdgeFile> {
     let dir = sock_dir.join("edges");
     if crate::control_auth::ensure_private_dir(&dir).is_err() {
         return None;
     }
+    #[cfg(unix)]
+    sweep_dead_edge_files(&dir);
     let path = dir.join(child_sid.as_str());
     let body = format!("read {read_hex}\nwrite {write_hex}\nsignal {signal_hex}\n");
     let mut f = open_private(&path).ok()?;
-    f.write_all(body.as_bytes()).ok()?;
-    Some(path.to_string_lossy().into_owned())
+    // THE OWNER'S LOCK, taken before the secret is written: the parent holds it
+    // for the child's life ([`EdgeFile`]), so a later sweep can tell a live
+    // parent's file from a dead one's ([`sweep_dead_edge_files`]).
+    #[cfg(unix)]
+    let locked = lock_owner(&f);
+    #[cfg(not(unix))]
+    let locked = true;
+    if !locked || f.write_all(body.as_bytes()).is_err() {
+        // The open created the file, and a partial write left some secret in it.
+        // No `ChildProxy` will record a path this returns no name for, so nothing
+        // else would ever remove it.
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(EdgeFile { path, _lock: f })
+}
+
+/// One edge-token file this aterm wrote ([`write_edge_tokens`]) and the open
+/// handle whose `flock` marks its owner alive: held by the [`ChildProxy`] for
+/// the child's life, released when it drops (after the file is removed).
+#[derive(Debug)]
+pub(crate) struct EdgeFile {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl EdgeFile {
+    /// The file's absolute path — what rides the child's env.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Take `f`'s exclusive owner lock without waiting (`flock(LOCK_EX|LOCK_NB)`
+/// on its own open description): `false` if it cannot be taken.
+#[cfg(unix)]
+fn lock_owner(f: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: `f` is an open file for the duration of the call; LOCK_NB never
+    // waits.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Remove the edge-token files in `dir` whose owning parent is gone (the
+/// audit of 2026-09-25: nothing ever removed a crashed parent's file, one per
+/// crash for ever). A file is its parent's while the parent's `flock` on it
+/// holds ([`EdgeFile`]), so the owner test is the crash markers' own
+/// (`crash_signal::markers::probe`): a file whose lock this sweep can take is
+/// a dead parent's — its tokens authorize nothing again, the child's `(sid,
+/// nonce)` never being reissued — and is removed. A file still EMPTY is left
+/// alone: its writer may be between the create and the lock. A file the
+/// probe cannot read either way is left too. A file of a build before the
+/// lock (no lock ever held) reads as a dead owner's; a seamless update does
+/// not carry the child proxies it would authorize against, so it is inert
+/// too.
+#[cfg(unix)]
+fn sweep_dead_edge_files(dir: &Path) {
+    use crate::crash_signal::markers::{Owner, probe};
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() || meta.len() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        if probe(&path) == Owner::Dead {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Read the three edge-token hexes `(read, write, signal)` from the 0600 file at
@@ -517,9 +603,8 @@ pub fn write_edge_tokens(
 /// REPEATABLE (F1, revised): this read is non-destructive and may run any number
 /// of times for the parent session's lifetime — a child re-launched in the SAME
 /// shell re-reads the same file to re-install the parent edges. The parent owns the
-/// file's removal ([`remove_edge_tokens`] on teardown, [`sweep_stale_edges`] for
-/// crash leftovers); the reader never deletes it.
-pub fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
+/// file's removal ([`ChildProxy`]); the reader never deletes it.
+pub(crate) fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
     let body = std::fs::read_to_string(path).ok()?;
     let (mut r, mut w, mut s) = (None, None, None);
     for line in body.lines() {
@@ -534,27 +619,56 @@ pub fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
     Some((r?, w?, s?))
 }
 
-/// The edge-token filename for a child session id, under `<sock_dir>/edges/`.
-fn edge_path(sock_dir: &Path, child_sid: &SessionId) -> std::path::PathBuf {
-    sock_dir.join("edges").join(child_sid.as_str())
+/// What this aterm holds for ONE child it provisioned: the proxy-table key its
+/// [`ProxyEntry`] was registered under and the 0600 edge-token file it wrote
+/// ([`write_edge_tokens`]), when it could write one.
+///
+/// It RETIRES both when it drops. The session that spawned the child holds it, so
+/// a closed tab deregisters its child and a long-lived aterm opening and closing
+/// tabs does not grow [`proxies`] for the process lifetime (audit finding S1,
+/// `aterm_spec::derive::proxy_registry_model`); and a spawn that fails after
+/// provisioning drops it on the way out, so the same retirement runs with no
+/// second copy of the teardown to keep in step. The file removed is the exact
+/// path written — never one re-derived from a socket dir that may resolve
+/// differently by teardown time.
+///
+/// There is deliberately NO liveness-based sweep of the `edges/` dir: a
+/// freshly-provisioned child has no discovery entry UNTIL it launches (often much
+/// later, or never), so "no live graph entry" cannot distinguish a still-needed
+/// fresh file from an orphan — a sweep on that signal would clobber the very file
+/// a not-yet-launched (or about-to-relaunch) child must read. A file orphaned by a
+/// CRASHED parent is cryptographically inert: its tokens authorize only against
+/// the dead child's exact `(sid, nonce)`, both random and never reissued, so a
+/// leftover can never authorize anything again.
+pub(crate) struct ChildProxy {
+    sid: SessionId,
+    edge_file: Option<EdgeFile>,
 }
 
-/// Remove the parent→child edge-token file the PARENT wrote ([`write_edge_tokens`])
-/// once the spawned child session is torn down — the parent owns the file (it lives
-/// in the parent's own 0700 socket dir) and is responsible for its removal, since
-/// the file now PERSISTS for the session rather than being consumed on the child's
-/// first read (so a same-shell child relaunch can re-read it). Best-effort, run on
-/// graceful session/child teardown ([`crate::main`]'s `Session::drop`).
-///
-/// There is deliberately NO liveness-based sweep: a freshly-provisioned child has no
-/// discovery entry UNTIL it launches (often much later, or never), so "no live graph
-/// entry" cannot distinguish a still-needed fresh file from an orphan — a sweep on
-/// that signal would clobber the very file a not-yet-launched (or about-to-relaunch)
-/// child must read. A file orphaned by a CRASHED parent is cryptographically inert:
-/// its tokens authorize only against the dead child's exact `(sid, nonce)`, both
-/// random and never reissued, so a leftover can never authorize anything again.
-pub fn remove_edge_tokens(sock_dir: &Path, child_sid: &SessionId) {
-    let _ = std::fs::remove_file(edge_path(sock_dir, child_sid));
+impl ChildProxy {
+    /// Register `entry` as this aterm's capability over child `sid` and take
+    /// ownership of that registration and of `edge_file` (its owner lock
+    /// included).
+    pub(crate) fn register(sid: SessionId, entry: ProxyEntry, edge_file: Option<EdgeFile>) -> Self {
+        register_child(sid.clone(), entry);
+        Self { sid, edge_file }
+    }
+
+    /// The child's session id (the proxy-table key).
+    #[cfg(test)]
+    pub(crate) fn sid(&self) -> &SessionId {
+        &self.sid
+    }
+}
+
+impl Drop for ChildProxy {
+    fn drop(&mut self) {
+        deregister_child(&self.sid);
+        if let Some(file) = &self.edge_file {
+            // Removed while still locked: no sweep can take it in between.
+            let _ = std::fs::remove_file(file.path());
+        }
+    }
 }
 
 /// The HOSTING pid a session's discovery entry records (`pid <n>`), or `None`
@@ -564,14 +678,14 @@ pub fn remove_edge_tokens(sock_dir: &Path, child_sid: &SessionId) {
 /// instance already serving this id?" without dialing a same-uid-writable path.
 /// A pid alone grants nothing and reveals nothing, which is why this reads the
 /// line rather than the `sock` one.
-pub fn graph_entry_host_pid(sock_dir: &Path, sid: &SessionId) -> Option<u32> {
+pub(crate) fn graph_entry_host_pid(sock_dir: &Path, sid: &SessionId) -> Option<u32> {
     let body = std::fs::read_to_string(graph_path(sock_dir, sid)).ok()?;
     aterm_types::control_socket::graph_entry_pid(&body)
 }
 
 /// Read a child's discovery entry: `(sock_path, nonce)` or `None` if absent /
 /// malformed. PURE parse split out for testing.
-pub fn read_graph_entry(sock_dir: &Path, sid: &SessionId) -> Option<(String, LaunchNonce)> {
+pub(crate) fn read_graph_entry(sock_dir: &Path, sid: &SessionId) -> Option<(String, LaunchNonce)> {
     let body = std::fs::read_to_string(graph_path(sock_dir, sid)).ok()?;
     parse_graph_entry(&body)
 }
@@ -593,7 +707,7 @@ fn parse_graph_entry(body: &str) -> Option<(String, LaunchNonce)> {
 /// own selector inlined to `@.`). The shipped path forwards DIRECT children only
 /// (one hop) — the child is never in its own proxy table, so no cycle can form.
 #[must_use]
-pub fn forward_first_line(edge_hex: &str, verb: &str) -> String {
+pub(crate) fn forward_first_line(edge_hex: &str, verb: &str) -> String {
     format!("TOKEN {edge_hex} {verb}\n")
 }
 
@@ -605,11 +719,32 @@ pub fn forward_first_line(edge_hex: &str, verb: &str) -> String {
 ///
 /// Returns `Ok(())` on a clean close, or an `io::Error` if the dial / handshake
 /// failed before any relay (so the caller can answer `ERR`).
-pub fn connect_and_relay(
+pub(crate) fn connect_and_relay(
     child_sock: &str,
     first_line: &str,
     client: &CtlStream,
     client_prebuffered: &[u8],
+) -> std::io::Result<()> {
+    deliver_then_relay(
+        child_sock,
+        first_line,
+        client,
+        client_prebuffered,
+        relay_bidirectional,
+    )
+}
+
+/// [`connect_and_relay`] with its relay stage as a parameter: the REPLY-FIDELITY
+/// contract (`reply_fidelity_model`) lives entirely in this function, so it is
+/// driven by the Tier-1 bind with the real relay and with a relay that fails
+/// after delivery (`reply_fidelity_conformance`) — a `try_clone` under fd
+/// exhaustion cannot be staged in a shared test process.
+fn deliver_then_relay(
+    child_sock: &str,
+    first_line: &str,
+    client: &CtlStream,
+    client_prebuffered: &[u8],
+    relay: impl FnOnce(&CtlStream, &CtlStream) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let child = CtlStream::connect(child_sock)?;
     // Present the handshake + folded, rewritten verb.
@@ -624,7 +759,7 @@ pub fn connect_and_relay(
     // negative for an op that already reached the child. Only a connect/handshake
     // error (the `?`s above, before any byte was delivered) surfaces as `Err` so
     // the caller can honestly answer `ERR forward`.
-    let _ = relay_bidirectional(client, &child);
+    let _ = relay(client, &child);
     Ok(())
 }
 
@@ -694,17 +829,31 @@ fn copy_until_eof<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io:
 /// would park forever before the relay even starts. `buffer()` returns the
 /// pipelined leftovers when present and an empty slice otherwise, no syscall.
 #[must_use]
-pub fn drain_buffered<R: Read>(reader: &mut std::io::BufReader<R>) -> Vec<u8> {
+pub(crate) fn drain_buffered<R: Read>(reader: &mut std::io::BufReader<R>) -> Vec<u8> {
     let buffered = reader.buffer().to_vec();
     let n = buffered.len();
     reader.consume(n);
     buffered
 }
 
+#[cfg(all(test, unix))]
+#[path = "reply_fidelity_conformance.rs"]
+mod reply_fidelity_conformance;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    /// A capability with fresh tokens, for tests that only need an entry.
+    fn test_entry() -> ProxyEntry {
+        ProxyEntry {
+            nonce: LaunchNonce::generate(),
+            read: EdgeToken::generate(),
+            write: EdgeToken::generate(),
+            signal: EdgeToken::generate(),
+        }
+    }
 
     /// The published spelling of a Windows socket path drops the verbatim
     /// prefix and nothing else, so the bind-time entry and every later
@@ -747,7 +896,7 @@ mod tests {
     }
 
     /// FINDING #2 (custom-socket discovery split-brain): an instance bound to an
-    /// EXPLICIT `$ATERM_CONTROL_SOCK` — whose socket lives OUTSIDE the default
+    /// EXPLICIT `--control-sock` — whose socket lives OUTSIDE the default
     /// rendezvous dir — mirrors its session graph entry INTO that default dir (the
     /// only dir the flagless `aterm-ctl` client reads). The client must recover the
     /// ABSOLUTE explicit socket path (wherever it lives) + nonce from that entry, so
@@ -1010,17 +1159,156 @@ mod tests {
         relay.join().unwrap();
     }
 
+    /// Which of `relay_bidirectional`'s two error arms a teardown case drives.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum RelayFault {
+        /// The child-bound socket loses its send half: the MAIN thread's
+        /// client-to-child write fails the moment the original client sends a
+        /// request, while the worker is parked reading a child that never speaks.
+        ChildBound,
+        /// The client-bound socket loses its send half: the WORKER's
+        /// child-to-client write fails the moment the child answers, while the
+        /// main thread is parked reading an original client that never speaks.
+        ClientBound,
+    }
+
+    /// Tear the real relay down under `fault` while both peers stay open and
+    /// otherwise silent, and project what it left onto `RelayTeardown`'s
+    /// variables. `done` is teardown observed by the peer whose bytes the
+    /// faulted arm was relaying — its read sees EOF once the relay shuts that
+    /// socket (the other peer reads EOF from the injected fault alone, so it
+    /// could not tell) — and each read half is observed on a clone of that
+    /// local socket taken beforehand (a non-blocking read answers EOF when shut,
+    /// `WouldBlock` when a pump could still park on it). The second value is
+    /// whether `relay_bidirectional` returned: its worker joined.
+    #[cfg(unix)]
+    fn relay_teardown_under(
+        fault: RelayFault,
+    ) -> (std::collections::BTreeMap<&'static str, i64>, bool) {
+        use std::time::Duration;
+        let (original, relay_client) = CtlStream::pair().expect("client pair");
+        let (relay_child, child_peer) = CtlStream::pair().expect("child pair");
+        let client_probe = relay_client.try_clone().expect("clone");
+        let child_probe = relay_child.try_clone().expect("clone");
+        let faulted = match fault {
+            RelayFault::ChildBound => &relay_child,
+            RelayFault::ClientBound => &relay_client,
+        };
+        faulted
+            .shutdown(std::net::Shutdown::Write)
+            .expect("inject the send fault");
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let relay = std::thread::spawn(move || {
+            let result = relay_bidirectional(&relay_client, &relay_child);
+            let _ = returned_tx.send(());
+            result
+        });
+
+        // The peer whose bytes the faulted arm relays speaks, and is the one
+        // witness of teardown: the other peer reads EOF from the fault itself.
+        let (mut speaker, said) = match fault {
+            RelayFault::ChildBound => (&original, b"screen\n".as_slice()),
+            RelayFault::ClientBound => (&child_peer, b"OK reply\n".as_slice()),
+        };
+        speaker.write_all(said).expect("speak");
+        speaker
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("deadline");
+        let mut byte = [0u8; 1];
+        let done = matches!(speaker.read(&mut byte), Ok(0));
+        let returned = returned_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let read_open = |probe: &CtlStream| {
+            probe.set_nonblocking(true).expect("non-blocking probe");
+            let mut byte = [0u8; 1];
+            match (&*probe).read(&mut byte) {
+                Ok(0) => 0,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 1,
+                other => panic!("{fault:?}: unexpected probe read: {other:?}"),
+            }
+        };
+        let observed = std::collections::BTreeMap::from([
+            ("child_read_open", read_open(&child_probe)),
+            ("client_read_open", read_open(&client_probe)),
+            ("done", i64::from(done)),
+        ]);
+        // Release anything still parked before judging, so a failure cannot hang.
+        drop(child_peer);
+        drop(original);
+        let _ = relay.join();
+        (observed, returned)
+    }
+
+    /// CONFORMANCE (Tier-1) of the REAL relay to
+    /// `aterm_spec::derive::relay_teardown_model` (`RelayTeardown`, audit M2):
+    /// when the cross-process relay tears down, BOTH read halves of BOTH of its
+    /// local sockets are shut, so a pump parked on a CLONE of either one gets EOF
+    /// and the worker thread joins — no parked thread, no held fd.
+    ///
+    /// `relay_bidirectional` has two error arms, one per pump, and each is
+    /// driven by the fault that exercises it while both peers stay open and
+    /// silent ([`RelayFault`]): a failed write toward the child (the main
+    /// thread's arm) and a failed write toward the original client (the
+    /// worker's arm). For each, the projection ([`relay_teardown_under`]) must
+    /// be the model's `Teardown` step, and the relay must have returned.
+    ///
+    /// NEGATIVE CONTROL: `Buggy = 1` (the original `shutdown(Write)`-only) must
+    /// reject every real step. Turn EITHER arm's `shutdown(Both)` calls into
+    /// `shutdown(Write)` and its case leaves both read halves open with a pump
+    /// still parked — the step only the mutant admits.
+    #[test]
+    #[cfg(unix)]
+    fn relay_teardown_conforms_to_readers_unblock_after_teardown() {
+        use aterm_spec::verify::validate_transition_tiered;
+        let model = aterm_spec::derive::relay_teardown_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        for fault in [RelayFault::ChildBound, RelayFault::ClientBound] {
+            let (observed, returned) = relay_teardown_under(fault);
+            let (ok, why) = validate_transition_tiered(
+                &model,
+                &[],
+                &model.init_state(),
+                &observed,
+                Some("Teardown"),
+                "RelayTeardown(relay_bidirectional)",
+            );
+            assert!(
+                ok,
+                "{fault:?}: the relay tore down to {observed:?}, not the model's Teardown \
+                 (a read half a pump could still park on) — {why}"
+            );
+            assert!(
+                returned,
+                "{fault:?}: the relay did not return: a pump is still parked"
+            );
+            let (admitted, _) = validate_transition_tiered(
+                &buggy,
+                &[],
+                &buggy.init_state(),
+                &observed,
+                Some("Teardown"),
+                "RelayTeardown(Buggy=1)",
+            );
+            assert!(
+                !admitted,
+                "{fault:?}: the shutdown(Write)-only mutant admitted the real teardown, so \
+                 this conformance cannot tell the two apart"
+            );
+        }
+    }
+
     /// F1 (revised): edge-token secrets round-trip through the 0600 file, the file
     /// is owner-only (0600), and the read is REPEATABLE — it PERSISTS for the
     /// session so a child re-launched in the same shell can re-read it. The PARENT
-    /// removes it on teardown via `remove_edge_tokens` (keyed by child sid).
+    /// removes it at teardown: the `ChildProxy` holding its path drops.
     #[test]
     fn edge_tokens_file_is_0600_and_read_is_repeatable() {
         let dir = std::env::temp_dir().join(format!("aterm-edges-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sid = SessionId::generate();
         let (r, w, s) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
-        let path = write_edge_tokens(&dir, &sid, &r, &w, &s).expect("write");
+        let file = write_edge_tokens(&dir, &sid, &r, &w, &s).expect("write");
+        let path = file.path().to_string_lossy().into_owned();
         // 0600 — owner read/write only (no group/other bits). POSIX-mode
         // assert; on Windows the file inherits the private dir's ACL instead.
         #[cfg(unix)]
@@ -1039,14 +1327,75 @@ mod tests {
             Some((r, w, s)),
             "second read still succeeds (persists)"
         );
-        // The parent owns removal, keyed by child sid; after it the file is gone.
-        remove_edge_tokens(&dir, &sid);
+        // A child that never had a file retires without touching this one.
+        drop(ChildProxy::register(
+            SessionId::generate(),
+            test_entry(),
+            None,
+        ));
+        assert!(read_edge_tokens(&path).is_some(), "only its own file");
+        // The parent owns removal: retiring the child removes exactly this file.
+        drop(ChildProxy::register(sid, test_entry(), Some(file)));
         assert!(
             read_edge_tokens(&path).is_none(),
             "removed by owning parent"
         );
-        // A different child's sid is a no-op (removes only its own file).
-        remove_edge_tokens(&dir, &SessionId::generate());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DEAD PARENT'S EDGE FILE IS SWEPT, A LIVE ONE'S NEVER (the audit of
+    /// 2026-09-25: `edges/` was never swept, one file per crashed parent for
+    /// ever — twelve on the owner's Mac since August). A parent holds its
+    /// file's owner lock for the child's life; at the next provisioning a file
+    /// whose lock is free (its parent gone — here, its handle dropped without
+    /// the removal a clean retire does, as a crash leaves it) is removed.
+    /// NEGATIVE CONTROLS: the file of a live parent (its `EdgeFile` held) and
+    /// an EMPTY file (a writer between its create and its lock) stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_parents_edge_file_is_swept_and_a_live_ones_never() {
+        let dir = std::env::temp_dir().join(format!("aterm-edges-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hex = |c: &str| c.repeat(32);
+        let live = write_edge_tokens(
+            &dir,
+            &SessionId::generate(),
+            &hex("aa"),
+            &hex("bb"),
+            &hex("cc"),
+        )
+        .expect("live");
+        let crashed = write_edge_tokens(
+            &dir,
+            &SessionId::generate(),
+            &hex("dd"),
+            &hex("ee"),
+            &hex("ff"),
+        )
+        .expect("crashed");
+        let crashed_path = crashed.path().to_path_buf();
+        drop(crashed); // the lock released, the file left: a crashed parent
+        let edges = dir.join("edges");
+        let empty = edges.join(SessionId::generate().as_str());
+        std::fs::write(&empty, b"").unwrap();
+        assert!(
+            crashed_path.exists(),
+            "nothing sweeps before a provisioning"
+        );
+        let next = write_edge_tokens(
+            &dir,
+            &SessionId::generate(),
+            &hex("11"),
+            &hex("22"),
+            &hex("33"),
+        )
+        .expect("next");
+        assert!(!crashed_path.exists(), "the dead parent's file is swept");
+        assert!(live.path().exists(), "a live parent's file is never swept");
+        assert!(empty.exists(), "an empty file may be mid-write: left");
+        assert!(next.path().exists());
+        drop((live, next));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1087,11 +1436,15 @@ mod tests {
         // entry carries the canonical form even when the raw path was recorded
         // through a symlinked ancestor (macOS temp: /var → /private/var).
         let sock = dir.join("aterm-88001.sock").to_string_lossy().into_owned();
-        let canon_sock = std::fs::canonicalize(&dir)
-            .unwrap()
-            .join("aterm-88001.sock")
-            .to_string_lossy()
-            .into_owned();
+        // …in the PUBLISHED spelling: Windows' canonical form is the verbatim
+        // `\\?\C:\…`, which `publish_session` un-verbatims so one socket has
+        // one spelling in the graph (`published_sock_spelling`, identity on Unix).
+        let canon_sock = published_sock_spelling(
+            &std::fs::canonicalize(&dir)
+                .unwrap()
+                .join("aterm-88001.sock")
+                .to_string_lossy(),
+        );
         set_self_sock(&dir, &sock);
         publish_session(&sid, &nonce);
         let (got_sock, got_nonce) = read_graph_entry(&dir, &sid).expect("published");

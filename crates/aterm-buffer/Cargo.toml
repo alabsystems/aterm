@@ -9,9 +9,6 @@ license.workspace = true
 repository.workspace = true
 description = "aterm buffer-primitives kernel (ATERM_DESIGN §4): the 11-verb BufferApi over the single event-log spine. RING-3, FROZEN at M1."
 
-[dependencies]
-aterm-error = { workspace = true }
-
 [dev-dependencies]
 proptest = { workspace = true }
 # Tier-1 conformance (conformance_eventlog.rs) validates the real EventLog

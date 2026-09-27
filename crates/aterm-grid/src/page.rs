@@ -165,7 +165,7 @@ impl<T> Offset<T> {
     }
 
     /// Get the byte offset.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     pub const fn byte_offset(self) -> u32 {
         self.byte_offset
@@ -236,13 +236,13 @@ pub struct PageSlice<T> {
     ptr: NonNull<T>,
     len: u16,
     page_id: PageId,
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     offset: Offset<T>,
 }
 
 impl<T> PageSlice<T> {
     /// Length of the slice (u16).
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     #[must_use]
     pub const fn len_u16(&self) -> u16 {
         self.len
@@ -255,7 +255,7 @@ impl<T> PageSlice<T> {
     }
 
     /// Offset within the page.
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(any(test, kani))]
     #[must_use]
     pub const fn offset(&self) -> Offset<T> {
         self.offset

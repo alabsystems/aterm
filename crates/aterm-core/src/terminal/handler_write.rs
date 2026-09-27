@@ -182,11 +182,6 @@ impl TerminalHandler<'_> {
         // Translate character through the active character set
         let translated = self.charset.translate(c);
 
-        // Capture for CopyToClipboard mode
-        if let Some(state) = self.clipboard.copy_state.as_mut() {
-            state.push(translated);
-        }
-
         let width = char_width(translated, self.modes.ambiguous_width_double);
 
         if width == 0 {
@@ -249,18 +244,17 @@ impl TerminalHandler<'_> {
     /// ZWJ tracking, and style/extras computation.
     ///
     /// Falls back to per-character `write_char` when preconditions aren't met
-    /// (VT52, insert mode, no autowrap, active clipboard, pending ZWJ, extras).
+    /// (VT52, insert mode, no autowrap, pending ZWJ, extras).
     #[allow(
         clippy::too_many_lines,
         reason = "hot-path character dispatch with many optimized branches"
     )]
     pub(super) fn write_unicode_bulk(&mut self, chars: &[char]) {
         // Precondition: must NOT be in VT52 cursor addressing, insert mode,
-        // no-autowrap, or clipboard capture mode, and must not have style extras.
+        // or no-autowrap, and must not have style extras.
         if self.transient.vt52_cursor_state != super::Vt52CursorState::None
             || self.modes.insert_mode
             || !self.modes.auto_wrap
-            || self.clipboard.copy_state.is_some()
             || self.transient.has_transient_extras
             || self.style.has_style_extras()
             || self.transient.last_combining_was_zwj

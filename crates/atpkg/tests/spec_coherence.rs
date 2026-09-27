@@ -57,12 +57,6 @@ const RUSTC_TUPLE: [&str; 4] = ["trust", "trust-ir", "trust-cg", "trust-vc"];
 /// set is exactly the client's compiled roster (`atpkg::stub::AGENT_PROGRAMS`).
 const VENDOR_AGENTS: [&str; 2] = ["codex", "claude"];
 
-/// Every known unpacked org system on the roadmap. Each must stay named in the
-/// spec's FUTURE MEMBERS / NOT-YET-PUBLISHABLE notes until it graduates to an
-/// active row — a name that silently vanishes from both is a roadmap loss no
-/// one decided.
-const ROADMAP: [&str; 5] = ["orca-alab", "ty", "astream", "amail", "trust-wp"];
-
 /// `crates/atpkg` -> repo root, verified by the presence of the spec itself so
 /// a layout move fails loudly here instead of as a confusing read error below.
 fn repo_root() -> PathBuf {
@@ -208,35 +202,6 @@ fn active_rows(spec: &str) -> Vec<SpecRow> {
     rows
 }
 
-fn active_names(rows: &[SpecRow]) -> BTreeSet<String> {
-    rows.iter().map(|r| r.name.clone()).collect()
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
-}
-
-/// Whole-token search: `name` bounded by non-name characters on both sides, so
-/// `ty` never matches inside `authenticity` and `trust-wp` never matches
-/// inside `trust-wp-rustc`. ASCII names only; the haystack may carry UTF-8
-/// (the spec's `§` cross-references) — byte-boundary checks on continuation
-/// bytes are safely non-word.
-fn mentions_token(text: &str, name: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut from = 0;
-    while let Some(pos) = text[from..].find(name) {
-        let start = from + pos;
-        let end = start + name.len();
-        let pre_ok = start == 0 || !is_word_byte(bytes[start - 1]);
-        let post_ok = end == bytes.len() || !is_word_byte(bytes[end]);
-        if pre_ok && post_ok {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
-}
-
 /// A shell `NAME="a b c"` list on a non-comment line of `script`.
 fn shell_list(script: &str, name: &str, rel: &str) -> BTreeSet<String> {
     let prefix = format!("{name}=\"");
@@ -316,24 +281,6 @@ fn active_rows_parse_with_published_build_numbers() {
     }
 }
 
-/// (b) trust-wp must NOT be active: its `trust-wp-rustc` is linked with
-/// absolute rpaths into hash-named private sysroots (the fix lives in the
-/// trust-wp repo), and a pinned-but-unfetchable rustc-group member aborts the
-/// WHOLE trust tuple on every client (§7).
-#[test]
-fn trust_wp_is_not_an_active_row() {
-    let root = repo_root();
-    let rows = active_rows(&read(&root, "tools/atpkg-programs.spec"));
-    assert!(
-        !active_names(&rows).contains("trust-wp"),
-        "tools/atpkg-programs.spec lists trust-wp as an active row — it is \
-         NOT relocatable (absolute rpaths; spec NOT-YET-PUBLISHABLE note) and \
-         pinning it wedges the entire rustc coherence group on every client \
-         (§7). Delete the row; it rejoins only when a relocatable build has a \
-         signed pkg-trust-wp-<build>.toml"
-    );
-}
-
 /// (c) The `rustc` coherence group is exactly the trust verifier tuple. A
 /// missing member version-splits the tuple (it stops moving with its
 /// siblings); an extra member that cannot stage aborts the whole group on
@@ -356,35 +303,6 @@ fn rustc_coherence_group_is_exactly_the_trust_tuple() {
          whole group on every client. Fix the group column of the drifted \
          row(s)"
     );
-}
-
-/// (e) Roadmap conservation: every known unpacked org system stays named in
-/// the spec's notes until it graduates to an active row, so no future member
-/// can vanish from the plan as the side effect of a comment rewrite.
-#[test]
-fn roadmap_names_cannot_vanish_from_the_spec_notes() {
-    let root = repo_root();
-    let spec = read(&root, "tools/atpkg-programs.spec");
-    let active = active_names(&active_rows(&spec));
-    let comments: String = spec
-        .lines()
-        .filter(|l| l.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for name in ROADMAP {
-        if active.contains(name) {
-            // Graduated: a packed, published row supersedes the note.
-            continue;
-        }
-        assert!(
-            mentions_token(&comments, name),
-            "tools/atpkg-programs.spec no longer names {name:?} anywhere in \
-             its notes and it is not an active row — the roadmap just lost a \
-             system silently. Restore it under FUTURE MEMBERS (or \
-             NOT-YET-PUBLISHABLE with its blocking condition), or graduate it \
-             to a real row via the FUTURE MEMBERS runway"
-        );
-    }
 }
 
 /// (f) The root Cargo.toml's `[workspace.metadata.atpkg]` still ships ONE

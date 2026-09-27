@@ -90,11 +90,11 @@ pub fn slice_copy(src: &[u8], dst: &mut [u8]) {
     // `#[target_feature(enable = "avx2")]` copy was rejected: 13.6..14.4
     // ns/op, slower than this scalar tier (the AVX callee cannot inline into
     // a non-AVX caller, and the feature check is paid per call), and it needs
-    // `unsafe`, which the default safe-encode + safe-decode build forbids.
+    // `unsafe`, which this crate forbids.
     //
     // aarch64 keeps upstream's gate, so its codegen is untouched. The x86_64
     // Linux and Windows lanes take the tier too: the shipped Linux release
-    // (tools/linux-auto-release.sh) and the x86_64-pc-windows-gnu
+    // (`ship linux-build` on an x86_64 host) and the x86_64-pc-windows-gnu
     // cfg-validation build now inline the SSE2 copies where they called
     // `memcpy`, and `xtask gate linux` (a `cargo check`) type-checks the tier.
     // The numbers above are from macOS on the i7-7920HQ only; the tier's speed

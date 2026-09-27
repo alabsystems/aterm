@@ -37,8 +37,6 @@
 // so a second measurement in the same process measures the first one's freed
 // arena and lies.
 
-#![allow(dead_code)]
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -357,7 +355,6 @@ unsafe extern "system" {
 }
 
 const SYMOPT_UNDNAME: u32 = 0x0000_0002;
-const SYMOPT_DEFERRED_LOADS: u32 = 0x0000_0004;
 const SYMOPT_LOAD_LINES: u32 = 0x0000_0010;
 const MAX_SYM_NAME: usize = 1024;
 

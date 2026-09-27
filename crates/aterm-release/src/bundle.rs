@@ -16,7 +16,7 @@
 //! not in this tree.
 //! PlistBuddy is replaced by [`stamp_info_plist`] — pure string substitution
 //! on the committed template, unit-tested against goldens in
-//! `tests/plist_stamp.rs` — so the stamp is deterministic and testable off-mac.
+//! `tests/it/plist_stamp.rs` — so the stamp is deterministic and testable off-mac.
 //! The binaries arrive PRE-stripped from `buildplan::run` (strip -x is that
 //! module's charter); Credits.html is the committed
 //! `apps/aterm-mac/Credits.html` (extracted from build-app.sh's heredoc),
@@ -470,7 +470,8 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     // plus argv0 compat SYMLINKS. One Mach-O carries the window, the session,
     // and every verb; the symlinks keep every pre-one-binary name resolving
     // (old installs' ~/.local/bin/aterm -> aterm-cli, in-session `aterm-ctl`
-    // scripts, $ATERM_CTL, aterm-nest's aterm-gui lookup, direct atpkg calls).
+    // scripts, the drive/fleet clients' sibling lookup, aterm-nest's aterm-gui
+    // lookup, direct atpkg calls).
     // The binary dispatches on argv[0], so each alias IS that tool. Symlinks
     // are not Mach-Os: nothing extra to sign, and the sealed bundle covers
     // them as resources.
@@ -593,7 +594,7 @@ pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Resul
     let shipped = app.join("Contents/MacOS/aterm");
     // In-process sha256 (aterm-digest): the digest on record is provably the digest of
     // the bytes on disk, not of whatever a shelled hasher happened to read.
-    let binary_sha256 = sha256_hex(&shipped)?;
+    let binary_sha256 = crate::dmg::sha256_file(&shipped)?;
     // build-app.sh emits the BARE short commit here (its `commit=` line runs
     // rev-parse without the -dirty suffix; only ATermGitCommit carries it).
     let bare_commit = spec.git_commit.trim_end_matches("-dirty");
@@ -651,30 +652,6 @@ fn yes_no(b: bool) -> &'static str {
 /// `aterm_types::rfc3339` civil-calendar math, exact for all of Unix time.
 pub fn epoch_to_rfc3339(epoch: u64) -> String {
     aterm_types::rfc3339::format_rfc3339(epoch)
-}
-
-/// Streaming in-process SHA-256 of a file (shared shape with dmg.rs — kept
-/// module-local so each file stays self-contained for the #[path] test mounts).
-fn sha256_hex(path: &Path) -> Result<String, String> {
-    use aterm_digest::Sha256;
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
 }
 
 #[cfg(test)]

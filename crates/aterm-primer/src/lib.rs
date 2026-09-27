@@ -115,9 +115,22 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// `${VAR:?}`, and that shape stops a session on a confirmation box that
 /// bypass mode does not skip. The inbox sentence stops telling every agent to poll twice a turn
 /// (with `fabric=absent` nothing can ever arrive) and stops saying "nothing
-/// types it" beside `aterm drive task`, which types `Inbox: task @<off>`.
+/// types it" beside `aterm drive task`, which types `Inbox: task @<off>`. v10
+/// (2026-09-24, the owner decision that supersedes decision 1's default: *"all
+/// such dialogs must be approved by default unless there is a setting added
+/// later by the user explicitly to NOT do this"*): the `rm` sentence's reason.
+/// v9 said the unguarded-`$VAR` box "no permission mode skips" — true of the
+/// vendor, false inside aterm the day its harness began answering every
+/// permission box Yes (`[harness] approve`, default `all`). An agent told a
+/// human will stop the command reads the box as a safety net; the harness now
+/// presses it, so the `${VAR:?}` guard is the agent's own and the sentence
+/// says so. It names AN ATERM WINDOW's harness (the harness round-3 review of
+/// the same day): the block reaches every aterm child, but an owner may limit
+/// a headless instance's harness off (`[harness] headless = false`) or the
+/// whole harness (`enabled = false`), so "aterm's harness" would claim a
+/// press some sessions never get; the guard's advice holds either way.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v9 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v10 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 /// The end marker closing the managed block.
 const MARK_END: &str = "<!-- /aterm primer -->";
@@ -143,8 +156,8 @@ STRIPS `CLAUDE*`, `ANTHROPIC_*`, `COPILOT_*`, `CODEX_*`, `CURSOR_*`, and `AI_*` 
 the shells it spawns — `aterm help` explains why. On macOS, `Operation not permitted` on a
 file is usually privacy consent, not a broken tool, and it can arrive with NO dialog: run
 `aterm ctl privacy` before retrying — never in a loop, never `sudo`, never by rewriting the
-path (`aterm help permissions`). An `rm` operand is a literal path or `\"${VAR:?}/…\"`: an
-unguarded `$VAR` there stops the session on a confirmation box that no permission mode skips.
+path (`aterm help permissions`). An `rm` operand is a literal path or `\"${VAR:?}/…\"`: an unguarded
+`$VAR` raises a box an aterm window's harness answers Yes by default, so the guard is yours.
 If neither variable is set, you are not inside aterm; ignore this section.";
 
 /// The Rust paragraph (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md §4
@@ -227,10 +240,14 @@ part in messaging — nothing to configure.";
 /// The one sentence every surface that could leave a user surprised by a
 /// reinstalled primer must carry: `aterm agents status` (so the knob is
 /// discoverable) and `aterm agents remove` (so a removal is never silently undone
-/// by the next session without the user knowing how to make it stick).
+/// by the window's next pass without the user knowing how to make it stick). It
+/// states the contract the code keeps — the WINDOW's spawn path, throttled and
+/// config-gated (`aterm-cli`'s `--help` blurb names the same off switch) — never
+/// "each time it opens a session", which a plain `aterm` shell session never does.
 pub const AUTO_PRIME_NOTE: &str = "\
-aterm installs/updates this primer for every detected agent each time it opens a
-session (set `agents_auto_prime = false` in ~/.config/aterm/aterm.toml to stop).";
+The aterm window re-installs this primer for every detected agent when it spawns a
+session, at most once a minute — a plain `aterm` shell session never does
+(set `agents_auto_prime = false` in ~/.config/aterm/aterm.toml to stop).";
 
 /// The off switch as ONE phrase — the parenthetical of [`AUTO_PRIME_NOTE`] (the
 /// footer `aterm agents status` and `aterm agents remove` print) and, on the pass
@@ -1644,7 +1661,8 @@ fn status_line_with_xdg(home: &Path, xdg: Option<&Path>) -> String {
 // `aterm agents`: the CLI's entry point
 // ---------------------------------------------------------------------------
 
-/// The usage text for `aterm agents` (printed on an unknown subcommand/agent).
+/// The usage text for `aterm agents` (printed for `-h`/`--help`/`help`, and on an
+/// unknown subcommand/agent).
 fn usage() -> String {
     let mut s = String::from(
         "usage: aterm agents [status | install [<agent>…] | remove [<agent>…] | primer [<agent>]]\n\
@@ -1655,8 +1673,8 @@ fn usage() -> String {
          session — at most once a minute, only while `agents_auto_prime` is on; a plain\n\
          `aterm` shell session never does.\n\
          \n\
-           status    each agent's context file and whether the primer is installed (default)\n\
-           install   install/update the primer for every detected agent (config dir exists);\n\
+         \x20 status    each agent's context file and whether the primer is installed (default)\n\
+         \x20 install   install/update the primer for every detected agent (config dir exists);\n\
          \x20           name agents to force them (creates the file if needed)\n\
          \x20 remove    remove the primer block (everywhere, or from the named agents)\n\
          \x20 primer    print the block itself — paste it into any AGENTS.md/CLAUDE.md;\n\
@@ -1727,9 +1745,7 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                     FileSituation::NoFile => "absent (no context file yet)".to_string(),
                     FileSituation::File(Ok(BlockState::Absent)) => "absent".to_string(),
                     FileSituation::File(Ok(BlockState::Current)) => "installed".to_string(),
-                    FileSituation::File(Ok(BlockState::Stale)) => {
-                        "stale (install updates it)".to_string()
-                    }
+                    FileSituation::File(Ok(BlockState::Stale)) => "stale".to_string(),
                     FileSituation::File(Err(e)) => format!("ERROR: {e}"),
                 };
                 let _ = writeln!(
@@ -1743,7 +1759,7 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                 for s in skills_for(a.name) {
                     let st = match skill_status(home, xdg, s) {
                         SkillState::Current => "installed",
-                        SkillState::Stale => "stale (install updates it)",
+                        SkillState::Stale => "stale",
                         SkillState::Foreign => "foreign — yours, left alone",
                         SkillState::Absent => "absent",
                     };
@@ -1756,8 +1772,7 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                 }
             }
             out.push_str(
-                "\n`aterm agents install` installs/updates the primer and the bundled skills for\n\
-                 detected agents; `aterm agents primer` prints the block for manual pasting.\n",
+                "\n`aterm agents install` brings every detected agent's primer and skills up to date.\n",
             );
             let _ = writeln!(out, "{AUTO_PRIME_NOTE}");
             (out, 0)
@@ -1925,6 +1940,7 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
             let _ = writeln!(out, "\n{AUTO_PRIME_NOTE}");
             (out, i32::from(failed))
         }
+        "-h" | "--help" | "help" => (usage(), 0),
         _ => (
             format!("aterm agents: unknown command '{sub}'\n\n{}", usage()),
             2,
@@ -2037,8 +2053,8 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         // Marked + versioned, so installs are idempotent and updatable.
         assert!(block.starts_with(MARK_BEGIN) && block.trim_end().ends_with(MARK_END));
         assert!(
-            MARK_BEGIN.contains(" v9 "),
-            "the verb pointer, the rm sentence and the inbox sentence changed: bump the version"
+            MARK_BEGIN.contains(" v10 "),
+            "the rm sentence's reason changed (approve-all, 2026-09-24): bump the version"
         );
         // v9: the verb pointer is the short catalog and the per-verb entry, never
         // the 114 KB page.
@@ -2268,7 +2284,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         let old = format!("before\n\n{V1_BLOCK}\nafter\n");
         assert_eq!(block_state(&old, &block).unwrap(), BlockState::Stale);
         let updated = upsert_block(&old, &block).unwrap().unwrap();
-        assert!(updated.starts_with("before\n\n<!-- aterm primer v9"));
+        assert!(updated.starts_with("before\n\n<!-- aterm primer v10"));
         assert!(updated.ends_with("<!-- /aterm primer -->\n\nafter\n"));
         assert_eq!(
             updated.matches(MARK_PREFIX).count(),
@@ -2300,7 +2316,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v9"),
+                updated.starts_with("mine\n\n<!-- aterm primer v10"),
                 "{}",
                 a.name
             );
@@ -2360,7 +2376,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v9"),
+                updated.starts_with("mine\n\n<!-- aterm primer v10"),
                 "{}",
                 a.name
             );
@@ -2408,7 +2424,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v9"),
+                updated.starts_with("mine\n\n<!-- aterm primer v10"),
                 "{}",
                 a.name
             );
@@ -2466,7 +2482,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v9"),
+                updated.starts_with("mine\n\n<!-- aterm primer v10"),
                 "{}",
                 a.name
             );
@@ -2787,6 +2803,10 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         let (status, _) = agents_report(home.path(), &[]);
         assert!(status.contains(AUTO_PRIME_NOTE), "status footer:\n{status}");
         assert!(status.contains("agents_auto_prime = false"));
+        // The contract the code keeps, not the one it never did (the CLI session
+        // never primes; the window does, at most once a minute).
+        assert!(!status.contains("each time it opens a session"));
+        assert!(status.contains("once a minute") && status.contains("never does"));
         let (removed, code) = agents_report(home.path(), &["remove".to_string()]);
         assert_eq!(code, 0);
         assert!(
@@ -2807,6 +2827,11 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             agents_report(home.path(), &["install".to_string(), "copilot".to_string()]);
         assert_eq!(code, 2);
         assert!(msg.contains("unknown agent"));
+        for h in ["-h", "--help", "help"] {
+            let (out, code) = agents_report(home.path(), &[h.to_string()]);
+            assert_eq!(code, 0, "{h}");
+            assert_eq!(out, usage(), "{h}");
+        }
     }
 
     #[test]
@@ -3669,6 +3694,62 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         // And the addendum-free block too, which is what `aterm agents primer`
         // prints for an agent the registry does not know.
         assert!(generic().contains("aterm ctl @self inbox"));
+    }
+
+    /// v10 (2026-09-24): the primer's reason for the `rm` guard is aterm's own
+    /// — its harness answers the unguarded-`$VAR` box Yes by default (`[harness]
+    /// approve`), so the guard is the agent's. Main's 3e9890b0d dropped the
+    /// v9 one-sentence pin on the operand shape; what stays pinned is the claim
+    /// approve-all made FALSE: no block may still say a permission mode cannot
+    /// skip that box, nor claim the press for every aterm child (a headless
+    /// instance's harness is off by default).
+    #[test]
+    fn no_agent_block_says_the_rm_box_cannot_be_skipped() {
+        for a in AGENT_FILES {
+            let block = primer_block(Some(a.name)).replace('\n', " ");
+            assert!(
+                block.contains(
+                    "an aterm window's harness answers Yes by default, so the guard is yours"
+                ),
+                "{}: {block}",
+                a.name
+            );
+            // NEGATIVE CONTROL: the v9 reason and the first v10 wording.
+            assert!(
+                !block.contains("no permission mode skips"),
+                "{}: {block}",
+                a.name
+            );
+            assert!(
+                !block.contains("box aterm's harness answers"),
+                "{}: {block}",
+                a.name
+            );
+        }
+    }
+
+    /// HARNESS ROUND-1 REVIEW (2026-09-24): the supervise skill's phase table
+    /// says what `prompt` is now — a box named by its title, footer or none —
+    /// and that `kind question` (an AskUserQuestion dialog, which reads
+    /// `prompt` and may ask "Do you want to proceed?" over `1. Yes`) is never
+    /// pressed as an approval. NEGATIVE CONTROL: the old row, which made a
+    /// live `Esc to cancel` row the whole test and so told a manager a
+    /// footerless box was no `prompt`, is gone.
+    #[test]
+    fn the_supervise_skill_says_a_question_prompt_is_never_an_approval() {
+        let body = SUPERVISE_SKILL_BODY;
+        for needle in [
+            "named by its TITLE",
+            "**`kind question` is NOT a permission box**",
+            "never press it as an approval",
+            "draw none",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?}");
+        }
+        assert!(
+            !body.contains("a box without one is no `prompt` to `phase`"),
+            "the footer-only reading of `prompt` is still in the table"
+        );
     }
 
     /// The fabric note carries the facts an agent otherwise gets wrong: that a

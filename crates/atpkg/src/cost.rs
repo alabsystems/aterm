@@ -120,15 +120,6 @@ fn one_decimal(n: u64, k: u32) -> String {
     s
 }
 
-/// Whether an install must ask for cost consent before downloading: its download **or**
-/// installed size meets/exceeds `threshold` (the "this is big — proceed?" gate, §11). Below
-/// the threshold the install stays silent (batteries-included). A `metered` fleet config
-/// would lower the threshold to 0 (always consent); this is the pure predicate.
-#[must_use]
-pub fn needs_consent(download_bytes: u64, disk_installed: u64, threshold: u64) -> bool {
-    download_bytes >= threshold || disk_installed >= threshold
-}
-
 /// Disk preflight (§9/§10.2): whether `required` installed bytes fit in `available` while
 /// still leaving at least `free_floor` bytes free afterward. Saturating — a colossal
 /// `required` can never wrap to "fits". For a coherence group, pass the **sum** of every
@@ -203,17 +194,6 @@ mod tests {
             };
             assert_eq!(human_bytes(n), expected, "n = {n}");
         }
-    }
-
-    #[test]
-    fn consent_triggers_above_threshold_on_either_dimension() {
-        let mb = 100 * (1 << 20);
-        // Below on both ⇒ silent.
-        assert!(!needs_consent(1 << 20, 5 << 20, mb));
-        // Download alone over ⇒ consent.
-        assert!(needs_consent(mb, 0, mb));
-        // Installed alone over ⇒ consent (a small download that expands hugely).
-        assert!(needs_consent(1 << 20, mb, mb));
     }
 
     #[test]

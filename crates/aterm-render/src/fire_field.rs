@@ -209,7 +209,7 @@ pub struct FirePrecomp {
     offr: u32,
 }
 
-/// Compute the patch-constant terms of [`fire_core`] once per FirePatch.
+/// Compute the patch-constant terms of `fire_core` once per FirePatch.
 #[inline]
 #[must_use]
 pub fn fire_precomp(p: &FireFieldParams) -> FirePrecomp {
@@ -232,7 +232,7 @@ pub fn fire_precomp(p: &FireFieldParams) -> FirePrecomp {
 /// Sample the fire field at `(px, py)` given the patch-constant [`FirePrecomp`].
 /// Arithmetic is VERBATIM the original `fire_core`; the only change is reading
 /// `pc.ch/chu/peak/tr/tr2/aa/offr` instead of re-deriving them — so the result
-/// is bit-identical to [`fire_core`] (and thus to the WGSL twin) at every pixel.
+/// is bit-identical to `fire_core` (and thus to the WGSL twin) at every pixel.
 #[must_use]
 pub fn fire_core_px(px: i32, py: i32, p: &FireFieldParams, pc: &FirePrecomp) -> FireCore {
     // v: height above the flame root, px. Below the root the envelope MIRRORS,
@@ -331,6 +331,7 @@ pub fn fire_core_px(px: i32, py: i32, p: &FireFieldParams, pc: &FirePrecomp) -> 
 /// The GPU-mirror / parity anchor: [`fire_core_px`] with a freshly computed
 /// [`fire_precomp`]. Byte-identical to the pre-hoist `fire_core`.
 #[must_use]
+#[cfg(test)]
 pub fn fire_core(px: i32, py: i32, p: &FireFieldParams) -> FireCore {
     fire_core_px(px, py, p, &fire_precomp(p))
 }

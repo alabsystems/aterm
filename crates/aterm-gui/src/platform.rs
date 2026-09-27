@@ -98,7 +98,7 @@ pub(crate) trait AppRt {
     /// Default no-op: macOS/Linux do not take the early-reveal path today, and
     /// their compositors clear fresh windows to the layer/window background
     /// without a client-side erase anyway.
-    #[cfg_attr(not(windows), allow(dead_code))] // only the Windows early-reveal path calls it
+    #[cfg(windows)]
     fn window_flush_backdrop(&self, _window: &Window) {}
 
     /// M3 (colour-managed present): tag the window's GPU swapchain layer (the
@@ -300,6 +300,7 @@ pub(crate) trait AppRt {
     /// Bring another aterm instance's windows to the front by pid (the status
     /// menu's sibling rows). Default `false`: no cross-instance activation
     /// exists off macOS yet.
+    #[cfg(target_os = "macos")]
     fn activate_instance(&self, _pid: u32) -> bool {
         false
     }
@@ -340,9 +341,12 @@ pub(crate) trait AppRt {
     /// every platform).
     fn set_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle, tabs: ToolbarTabsModel<'_>);
 
-    /// Retired native-toolbar update seam. Current implementations are no-ops because
-    /// update state and its action live in the version menu. See `toolbar.rs`.
-    fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool);
+    /// Re-flow a window's native toolbar tab strip to the window's CURRENT width from
+    /// the state its chips already hold — no titles, no terminal reads. Called on every
+    /// window resize so the strip follows the edge instead of waiting for the next
+    /// title or chrome refresh. Default: nothing (no native strip, or one whose widgets
+    /// the toolkit lays out itself).
+    fn reflow_toolbar_tabs(&self, _handle: &toolbar::ToolbarHandle) {}
 
     /// Whether this platform could present the native rename editor, WITHOUT
     /// presenting it. `begin_tab_rename` installs the field as a side effect, so
@@ -496,7 +500,7 @@ impl SurfaceColorspace {
     /// toll-free-bridged NSString instead of linking the CG data symbols.
     // Consumed only by the macOS layer-tagging impl; the mapping is still
     // unit-tested (below) on every platform.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn cg_name(self) -> &'static str {
         match self {
             Self::Srgb => "kCGColorSpaceSRGB",
@@ -661,7 +665,9 @@ impl AppRt for AppRtMacOS {
     /// makes content and window the same space, so the conversion is skipped; the
     /// final space→panel mapping is done once by the WindowServer, not per app
     /// frame. aterm's framebuffer pixels are unchanged — only the redundant gamut
-    /// round-trip is removed. `$ATERM_NO_COLORSPACE_MATCH` opts out.
+    /// round-trip is removed. `$ATERM_NO_COLORSPACE_MATCH` opts out in a
+    /// development build only ([`aterm_types::dev_seam!`]) — the A/B lever for
+    /// profiling the conversion; a shipped binary always matches.
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme) {
         use aterm_objc::sel;
 
@@ -673,7 +679,7 @@ impl AppRt for AppRtMacOS {
         // Colour-space match (device-RGB) — see fn doc.
         // SAFETY: `+deviceRGBColorSpace` is `-(id)`, a shared immortal singleton;
         // `-setColorSpace:` is `-(void)(NSColorSpace *)` and retains it.
-        if std::env::var_os("ATERM_NO_COLORSPACE_MATCH").is_none() {
+        if aterm_types::dev_seam!("ATERM_NO_COLORSPACE_MATCH").is_none() {
             unsafe {
                 let cs = appkit::send_id(
                     aterm_objc::class(c"NSColorSpace").as_id(),
@@ -691,17 +697,11 @@ impl AppRt for AppRtMacOS {
         // NSAppearanceNameAqua, Auto -> leave the appearance UNSET so the window tracks
         // the OS `effectiveAppearance` (including live day-night switches). This
         // replaces the old unconditional dark force that left light-desktop users with
-        // permanently dark chrome. `ATERM_NO_DARK_CHROME` still forces Auto (no
-        // override) regardless of config, for callers that scripted the old opt-out.
+        // permanently dark chrome. `window_theme = "auto"` is the old opt-out's spelling.
         // SAFETY: `appearanceNamed:`/`setAppearance:`/`setTitlebarAppearsTransparent:`
         // are standard NSWindow/NSAppearance calls on the main thread; the appearance
         // object is autoreleased and used immediately within this pool.
-        let resolved = if std::env::var_os("ATERM_NO_DARK_CHROME").is_some() {
-            WindowTheme::Auto
-        } else {
-            theme
-        };
-        let appearance_name: Option<&str> = match resolved {
+        let appearance_name: Option<&str> = match theme {
             WindowTheme::Auto => None,
             WindowTheme::Light => Some("NSAppearanceNameAqua"),
             WindowTheme::Dark => Some("NSAppearanceNameDarkAqua"),
@@ -806,11 +806,11 @@ impl AppRt for AppRtMacOS {
 
     /// Apply `NSWindowStyleMaskFullSizeContentView` (1<<15) so the content view —
     /// and with it the GPU surface — spans under the titlebar. Best-effort like
-    /// the other chrome methods: no AppKit window → a silent no-op. Default ON;
-    /// `$ATERM_NO_FULLSIZE_CONTENT` is the escape hatch (a plain env opt-out, so
-    /// a misbehaving band never needs a rebuild to disable).
+    /// the other chrome methods: no AppKit window → a silent no-op. Always ON in a
+    /// shipped binary; `$ATERM_NO_FULLSIZE_CONTENT` turns it off in a development
+    /// build ([`aterm_types::dev_seam!`]) to A/B a misbehaving titlebar band.
     fn window_set_fullsize_content(&self, window: &Window) {
-        if std::env::var_os("ATERM_NO_FULLSIZE_CONTENT").is_some() {
+        if aterm_types::dev_seam!("ATERM_NO_FULLSIZE_CONTENT").is_some() {
             return;
         }
         let ns_window = ns_window_of(window);
@@ -1010,8 +1010,8 @@ impl AppRt for AppRtMacOS {
         toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
     }
 
-    fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool) {
-        toolbar::set_update_available(handle, available);
+    fn reflow_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle) {
+        toolbar::reflow_window_tabs(handle);
     }
 
     fn begin_tab_rename(
@@ -1229,6 +1229,11 @@ pub(crate) fn recent_user_input_event(within: std::time::Duration) -> bool {
     }
 }
 
+// FAILS OPEN, unlike the macOS arm (which reports input as recent when the
+// HID clock cannot be read). Harmless while the automatic apply lane is
+// macOS-only (Linux carries read-only update facts, `native_updater_service`).
+// If a non-macOS automatic apply lane ever lands, this must become
+// fail-closed (`true`) or read a real input clock.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn recent_user_input_event(_within: std::time::Duration) -> bool {
     false
@@ -1449,9 +1454,301 @@ mod user_input_probe_tests {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The X11 twin of the macOS queue age: how long the key event being dispatched
+/// took from the X server stamping it to this code running, in nanoseconds.
+///
+/// Until 2026-09-24 this was `None` everywhere off macOS ("winit exposes no event
+/// timestamp"), so on Linux `key_write`, `key_queue` and `input_present` all
+/// started their clocks AFTER the event loop had dequeued the key. Two real
+/// slices lived before that point and no instrument could see either:
+///
+///  * THE INPUT-METHOD ROUND TRIP. With `XMODIFIERS=@im=ibus` (Ubuntu's default)
+///    and IME allowed (every aterm window, `app_window.rs`), winit hands every
+///    KeyPress to `XFilterEvent`, which forwards it to `ibus-x11` → `ibus-daemon`
+///    → the engine and back before the key is delivered. Measured on the GB10
+///    host (2026-09-24, an unmapped probe window driving the same `XFilterEvent`
+///    path, 300-400 keys): p50 4.8 ms / p99 8.4 ms / max 15.4 ms at load 10, and
+///    p50 0.5 ms / max 10.1 ms with every core busy.
+///  * QUEUE RESIDENCE BEHIND A BUSY LOOP — the slice the macOS backdate exists for.
+///
+/// The server's `time` is `CLOCK_MONOTONIC` in milliseconds on a local Xorg
+/// (measured on the same host: a PropertyNotify stamp trails a client's
+/// `CLOCK_MONOTONIC` read by 1 ms, five of five), so the age is one subtraction.
+/// Fail-closed `None`, and the caller keeps its post-dequeue stamp, when no X11
+/// key is being dispatched (Wayland, a control-socket key, an IME commit) or the
+/// age is implausible — a replayed event, or a remote `DISPLAY` whose server
+/// clock is another machine's; [`x_event_max_age_ms`] says where "implausible"
+/// starts.
+#[cfg(target_os = "linux")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
-    // winit exposes no event timestamp off macOS; the post-dequeue stamp stands.
+    static MAX_AGE_MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let server_ms = winit::platform::x11::key_event_server_time()?;
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable `timespec`; CLOCK_MONOTONIC always exists.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) } != 0 {
+        return None;
+    }
+    let now_ns = u64::try_from(now.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(now.tv_nsec).ok()?)?;
+    let max_age_ms =
+        *MAX_AGE_MS.get_or_init(|| x_event_max_age_ms(std::env::var_os("DISPLAY").as_deref()));
+    x_server_event_age_ns(server_ms, now_ns, max_age_ms)
+}
+
+/// The oldest X server stamp [`current_event_queue_age_ns`] believes, by the
+/// `DISPLAY` the process connects to (winit's `XOpenDisplay(NULL)` reads
+/// exactly that variable).
+///
+/// A LOCAL server (`:N`, `unix:N`, or a socket path) stamps from this machine's
+/// `CLOCK_MONOTONIC`, so a large age is a real wait: 60 s, well past the 5 s
+/// release stall watchdog. It used to be 2 s for every display, copied from the
+/// macOS window, and that hid exactly the episodes the backdate exists to
+/// price: a key that sat 2.7 s behind a parked loop was rejected and booked
+/// `key_queue = 0`, so `max_key_queue` could never pass 2 s. Anything else
+/// (`host:N`, an ssh-forwarded `localhost:10`) is a server on ANOTHER machine's
+/// clock whose stamp compares with nothing here; it keeps the 2 s window, so a
+/// coincidental near-match is the most that can leak in.
+#[cfg(any(target_os = "linux", test))]
+fn x_event_max_age_ms(display: Option<&std::ffi::OsStr>) -> u32 {
+    const LOCAL_MAX_AGE_MS: u32 = 60_000;
+    const FOREIGN_MAX_AGE_MS: u32 = 2_000;
+    let local = display.is_some_and(|d| {
+        let d = d.as_encoded_bytes();
+        d.starts_with(b":") || d.starts_with(b"unix:") || d.starts_with(b"/")
+    });
+    if local {
+        LOCAL_MAX_AGE_MS
+    } else {
+        FOREIGN_MAX_AGE_MS
+    }
+}
+
+/// The age of an event stamped `server_ms` (the X server's wrapping 32-bit
+/// millisecond clock) at `now_ns` on the same clock in nanoseconds: `now` minus
+/// the stamp, the wrap undone against `now`'s own low 32 bits.
+///
+/// THE AGE READS HIGH, NEVER LOW, BY UP TO ABOUT 2 MS on a `CONFIG_HZ=1000`
+/// kernel such as this host's. Two biases stack. The stamp is a truncated
+/// millisecond (up to 1 ms). And Xorg's `GetTimeInMillis` reads
+/// `CLOCK_MONOTONIC_COARSE` whenever that clock's resolution is 1 ms or finer,
+/// which is one kernel tick at `CONFIG_HZ=1000`, so the stamp already trails
+/// `CLOCK_MONOTONIC` by up to one more tick before it is truncated; the
+/// five-of-five 1 ms trail measured above is that. At `CONFIG_HZ=250` the
+/// coarse clock is 4 ms, Xorg falls back to the fine clock, and only the
+/// truncation remains. The server stamps the key when IT processes the device
+/// event, so the kernel-to-Xorg leg is not in the age at all.
+///
+/// Up to 2 ms "in the future" reads as no queueing: nothing above makes a local
+/// stamp lead, so this is slack for a clock this function does not know about.
+/// Anything further in the future, or older than `max_age_ms`, is a clock that
+/// is not ours (fail closed). So is a stamp of `0`: that is X's `CurrentTime`,
+/// which a client's `XSendEvent` may carry, not a time the server read.
+#[cfg(any(target_os = "linux", test))]
+fn x_server_event_age_ns(server_ms: u32, now_ns: u64, max_age_ms: u32) -> Option<u64> {
+    const FUTURE_SLACK_MS: u32 = 2;
+    if server_ms == 0 {
+        return None;
+    }
+    let now_ms = now_ns / 1_000_000;
+    // Wrapping difference in the server's 32-bit ms space: small positive is a
+    // past stamp, near-2^32 is a stamp slightly in the future.
+    let behind_ms = (now_ms as u32).wrapping_sub(server_ms);
+    if behind_ms > max_age_ms {
+        let ahead_ms = server_ms.wrapping_sub(now_ms as u32);
+        return (ahead_ms <= FUTURE_SLACK_MS).then_some(0);
+    }
+    let stamp_ms = now_ms.checked_sub(u64::from(behind_ms))?;
+    Some(now_ns.saturating_sub(stamp_ms * 1_000_000))
+}
+
+#[cfg(test)]
+mod x_server_event_age_tests {
+    use std::ffi::OsStr;
+
+    use super::{x_event_max_age_ms, x_server_event_age_ns};
+
+    const MS: u64 = 1_000_000;
+    const LOCAL: u32 = 60_000;
+    const FOREIGN: u32 = 2_000;
+
+    #[test]
+    fn age_is_now_minus_the_stamp_with_the_sub_millisecond_remainder_kept() {
+        // Stamped at 1_000 ms; now is 1_004.25 ms.
+        assert_eq!(
+            x_server_event_age_ns(1_000, 1_004 * MS + MS / 4, LOCAL),
+            Some(4 * MS + MS / 4)
+        );
+        // Same millisecond: the truncated stamp reads up to 1 ms high, never low.
+        assert_eq!(
+            x_server_event_age_ns(1_000, 1_000 * MS + 600_000, LOCAL),
+            Some(600_000)
+        );
+    }
+
+    #[test]
+    fn the_32_bit_server_clock_wraps_about_every_49_days() {
+        // now = 2^32 + 3 ms on a 64-bit clock; the server stamped 2^32 - 2 ms.
+        let now_ns = ((1_u64 << 32) + 3) * MS;
+        assert_eq!(
+            x_server_event_age_ns(u32::MAX - 1, now_ns, LOCAL),
+            Some(5 * MS)
+        );
+        // A multi-second park across the wrap still reads as the park.
+        assert_eq!(
+            x_server_event_age_ns(u32::MAX - 2_699, now_ns, LOCAL),
+            Some(2_703 * MS)
+        );
+    }
+
+    #[test]
+    fn a_stamp_just_in_the_future_is_granularity_and_reads_as_no_queueing() {
+        assert_eq!(x_server_event_age_ns(1_002, 1_000 * MS, LOCAL), Some(0));
+        assert_eq!(x_server_event_age_ns(1_003, 1_000 * MS, LOCAL), None);
+    }
+
+    /// THE REVIEW FINDING THIS PINS. With one 2 s cap for every display, a key
+    /// that waited 2.7 s (the live window's `max_input_present` was 2721 ms)
+    /// was rejected and booked `key_queue = 0`: the instrument built to see a
+    /// parked loop could not see a park longer than 2 s. On a local server it
+    /// now can.
+    #[test]
+    fn a_local_server_prices_a_multi_second_park() {
+        let now_ns = 100_000 * MS;
+        assert_eq!(
+            x_server_event_age_ns(100_000 - 2_722, now_ns, LOCAL),
+            Some(2_722 * MS)
+        );
+        assert_eq!(
+            x_server_event_age_ns(100_000 - 60_000, now_ns, LOCAL),
+            Some(60_000 * MS)
+        );
+        // Past the local cap is past the stall watchdog too: fail closed.
+        assert_eq!(x_server_event_age_ns(100_000 - 60_001, now_ns, LOCAL), None);
+        // The same 2.7 s stamp from a foreign clock is still refused.
+        assert_eq!(
+            x_server_event_age_ns(100_000 - 2_722, now_ns, FOREIGN),
+            None
+        );
+    }
+
+    #[test]
+    fn a_foreign_server_keeps_the_two_second_window() {
+        assert_eq!(x_server_event_age_ns(1_000, 3_001 * MS, FOREIGN), None);
+        assert_eq!(
+            x_server_event_age_ns(1_000, 3_000 * MS, FOREIGN),
+            Some(2_000 * MS)
+        );
+        // Minutes in the future fails closed under either cap.
+        assert_eq!(x_server_event_age_ns(500_000, 1_000 * MS, FOREIGN), None);
+        assert_eq!(x_server_event_age_ns(500_000, 1_000 * MS, LOCAL), None);
+    }
+
+    #[test]
+    fn current_time_is_not_a_stamp() {
+        // `CurrentTime` (0) inside the first minute of the clock would otherwise
+        // read as a real wait under the local cap.
+        assert_eq!(x_server_event_age_ns(0, 30_000 * MS, LOCAL), None);
+        assert_eq!(
+            x_server_event_age_ns(1, 30_000 * MS, LOCAL),
+            Some(29_999 * MS)
+        );
+    }
+
+    #[test]
+    fn the_cap_follows_the_display_the_process_connects_to() {
+        for local in [":0", ":1", ":1.0", "unix:0", "/tmp/.X11-unix/X1"] {
+            assert_eq!(
+                x_event_max_age_ms(Some(OsStr::new(local))),
+                LOCAL,
+                "{local}"
+            );
+        }
+        for foreign in ["localhost:10.0", "host.example:0", "10.0.0.2:0", ""] {
+            assert_eq!(
+                x_event_max_age_ms(Some(OsStr::new(foreign))),
+                FOREIGN,
+                "{foreign}"
+            );
+        }
+        assert_eq!(x_event_max_age_ms(None), FOREIGN);
+    }
+}
+
+/// THE SEAM, DRIVEN (a review finding: only the arithmetic was tested, and the
+/// winit stamp that feeds it had never run). The stamp is published by the same
+/// winit function the X11 event processor wraps each non-synthetic key dispatch
+/// in, and read back here through the real [`current_event_queue_age_ns`], so a
+/// wiring break shows up as a red test instead of as `key_queue_p50 == 0` on a
+/// live window. What it cannot reach without an X server is the call site
+/// itself; that one line is `event_processor.rs`'s only use of the helper.
+#[cfg(all(test, target_os = "linux"))]
+mod x11_key_stamp_seam_tests {
+    use winit::platform::x11::{dispatch_with_key_event_server_time, key_event_server_time};
+
+    use super::current_event_queue_age_ns;
+
+    fn monotonic_ms() -> u32 {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid, writable `timespec`.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) },
+            0
+        );
+        (now.tv_sec as u64 * 1_000 + now.tv_nsec as u64 / 1_000_000) as u32
+    }
+
+    #[test]
+    fn a_key_stamp_reaches_the_age_for_exactly_one_dispatch() {
+        const MS: u64 = 1_000_000;
+        assert_eq!(key_event_server_time(), None);
+        assert_eq!(current_event_queue_age_ns(), None, "no key, no age");
+
+        // A key the server stamped 40 ms ago: inside either display's cap.
+        let stamp = monotonic_ms().wrapping_sub(40);
+        let age = dispatch_with_key_event_server_time(stamp, current_event_queue_age_ns)
+            .expect("the stamp must reach the age inside the dispatch");
+        assert!(
+            (40 * MS..1_000 * MS).contains(&age),
+            "age {age} ns for a 40 ms old stamp"
+        );
+        assert_eq!(
+            key_event_server_time(),
+            None,
+            "withdrawn after the dispatch"
+        );
+        assert_eq!(current_event_queue_age_ns(), None);
+
+        // `CurrentTime` is present to winit and refused by the age.
+        assert_eq!(
+            dispatch_with_key_event_server_time(0, key_event_server_time),
+            Some(0)
+        );
+        assert_eq!(
+            dispatch_with_key_event_server_time(0, current_event_queue_age_ns),
+            None
+        );
+
+        // A dispatch that unwinds withdraws the stamp too, so the NEXT key
+        // (or a control-socket key, which is never stamped) cannot inherit it.
+        let unwound = std::panic::catch_unwind(|| {
+            dispatch_with_key_event_server_time(stamp, || panic!("a key handler panicked"))
+        });
+        assert!(unwound.is_err());
+        assert_eq!(key_event_server_time(), None);
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
+    // winit exposes no event timestamp on this platform; the post-dequeue stamp stands.
     None
 }
 
@@ -1583,10 +1880,6 @@ impl AppRt for AppRtLinux {
             active,
         } = tabs;
         toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
-    }
-
-    fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool) {
-        toolbar::set_update_available(handle, available);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {

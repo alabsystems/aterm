@@ -6,10 +6,10 @@
 //!
 //! This first slice lands the **CONSISTENCY core**: the single, bounded,
 //! sequence-numbered event-log spine (§3.4) and the `apply`/`read_text`/
-//! `resolve`/`snapshot` verbs over it. It deliberately stops short of the full
-//! trait (read_image needs the Rasterizer, process needs world effects, spans &
-//! transact are the next slices) so the freeze (§4, M1) lands piece by verified
-//! piece rather than as a big bang.
+//! `snapshot`/`subscribe`/`transact` verbs over it. It deliberately stops short
+//! of the full trait (read_image needs the Rasterizer, process needs world
+//! effects; addressing and spans ship with the slice that has a consumer) so
+//! the freeze (§4, M1) lands piece by verified piece rather than as a big bang.
 //!
 //! Invariant proven here AND model-checked by the DERIVED kernel-family twins in
 //! `aterm-spec::derive` (Kernel/Subscribe/Snapshot/Transact/Ring — exhaustively
@@ -25,7 +25,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -68,10 +67,6 @@ pub struct BlobId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyframeId(pub u64);
 
-/// The addressing root (§3.3): a Surface is the namespace every Addr lives in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SurfaceId(pub NonZeroU64);
-
 /// A committed-line identity, stable across scroll/eviction (§3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LineId(pub u64);
@@ -88,35 +83,17 @@ pub enum OriginTag {
     System,
 }
 
-/// Capability witnesses — passed BY REFERENCE; a verb with no matching cap is
-/// unreachable, not "denied at runtime" (§4.3 clause 6, §5.4). These are
-/// placeholder attenuations of a real capability; the sealed mint lands in
-/// `aterm-cap` (§5.4).
+/// Capability witnesses — passed BY REFERENCE (§4.3 clause 6, §5.4). TODAY
+/// THEY ARE PLACEHOLDERS WITH NO TEETH: public unit structs any caller can
+/// construct, which the verbs ignore, so a missing cap is NOT yet unreachable.
+/// `aterm-cap`'s sealed mint has landed (§5.4); wiring these to
+/// `aterm_cap::Cap<E>` is the step `docs/design/P1_KERNEL_MIGRATION.md` §1b
+/// still owes. The signatures are already cap-by-reference, so that swap is
+/// non-breaking.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadCap;
 #[derive(Clone, Copy, Debug)]
 pub struct WriteCap;
-
-/// A typed address rooted at the Surface (§3.3), minimal first slice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Addr {
-    Surface(SurfaceId),
-    Line(SurfaceId, LineId),
-    Cell(SurfaceId, LineId, u32),
-}
-
-/// `resolve` is TOTAL — every address resolves to a first-class status, never a
-/// silently-wrong cell (§4.3 clause 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resolution {
-    Resolved(LineId, u32),
-    /// Below the scrollback horizon — gone, but never wrong.
-    Evicted,
-    /// Survived a width reflow; columns remapped.
-    Reflowed,
-    /// The live region it named was cleared/superseded.
-    Invalidated,
-}
 
 /// A half-open line range `[start, end)` for reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,14 +114,6 @@ pub enum Edit {
     ClearLine(LineId),
 }
 
-/// A content/structure predicate for `query` (§4.2 READ). search/grep/hit-test
-/// all compose over this one fold. First slice: substring match.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Predicate {
-    /// Lines whose text contains the needle.
-    TextContains(String),
-}
-
 /// The outcome of a `transact` (§4.2 COMPOSE): an atomic, isolated apply-group
 /// under optimistic concurrency control over a base snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,22 +130,19 @@ pub enum TxnOutcome {
 pub struct Event {
     pub seq: Seq,
     pub op: Op,
-    /// The recorded logical instant (B.4.2 Clock domain). Surface text/span ops
+    /// The recorded logical instant (B.4.2 Clock domain). Surface text ops
     /// (the legacy spine) use `Ticks(0)`; temporal ops appended via
     /// [`EventLog::append_at`] carry the real recorded tick.
     pub ts: Ticks,
 }
 
-/// High-level op summary recorded on the log (§3.4). Span mutations ride the
-/// SAME spine as cell edits — there is no second timeline (§4.3 clause 1).
+/// High-level op summary recorded on the log (§3.4) — the one spine every
+/// mutation rides (§4.3 clause 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     Append(LineId),
     Write(LineId),
     Clear(LineId),
-    SpanDefine(SpanId),
-    SpanRestyle(SpanId),
-    SpanDrop(SpanId),
     // --- temporal recording (B.9): handles, not payloads. The bulk bytes live
     // in the host-owned blob/keyframe stores; the spine stays small. ---
     /// Raw PTY input bytes were fed to the engine (`process`); payload in the
@@ -194,52 +160,6 @@ pub enum Op {
     /// A keyframe (serialized `TerminalCheckpoint`) was taken at a parser-ground
     /// boundary (B.3.3); referenced by [`KeyframeId`] in the keyframe store.
     Keyframe(KeyframeId),
-}
-
-/// STRUCTURE axis (§4.2): one anchored typed-span primitive. `mark` = zero-width,
-/// `region` = styled, `block` = provenance-typed (§5.7), `media` = pixel-backed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpanKind {
-    Mark,
-    Region,
-    Block,
-    Media,
-}
-
-/// A span's anchored extent over committed lines (half-open). A `Mark` is
-/// zero-width (`start == end`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Extent {
-    pub start: LineId,
-    pub end: LineId,
-}
-
-/// Opaque, kind-specific span payload (a style id, a block label, a media handle).
-/// First slice carries a small string; the typed variants land with the renderer.
-pub type SpanPayload = String;
-
-/// A first-class span id rooted at its Surface (§3.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SpanId(pub u64);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Span {
-    id: SpanId,
-    extent: Extent,
-    kind: SpanKind,
-    /// Reference-count the owned String rather than the bytes themselves: moving
-    /// a public `SpanPayload` here preserves its allocation, while detaching a
-    /// shared span spine clones only this pointer.
-    payload: Arc<String>,
-}
-
-/// The public view of a resolved span (§4.2 `span_resolve`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedSpan {
-    pub id: SpanId,
-    pub extent: Extent,
-    pub kind: SpanKind,
-    pub payload: SpanPayload,
 }
 
 /// A subscription cursor — the synchronous read-face of the event log (§3.4).
@@ -305,7 +225,7 @@ impl EventLog {
         (seq, evicted)
     }
 
-    /// Append a Surface text/span op (the legacy spine). Records at `Ticks(0)`;
+    /// Append a Surface text op (the legacy spine). Records at `Ticks(0)`;
     /// eviction follows the existing ring contract (the oldest entry is forgotten
     /// — the Surface/Snapshot text arm has its own scrollback). Temporal recording
     /// callers use [`append_at`](Self::append_at) and handle the spill seam.
@@ -379,33 +299,29 @@ impl EventLog {
 /// `aterm-grid` in the next slice.
 #[derive(Clone, Debug)]
 pub struct Surface {
-    id: SurfaceId,
     /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector
     /// only when a writer actually changes a retained line.
     lines: Arc<Vec<(LineId, Arc<String>)>>,
     next_line: u64,
     /// The sequence spine shared by snapshots until the next real event.
     log: Arc<EventLog>,
-    /// Spans are a SEPARATE decoration stream, not per-cell fields (§4.2).
-    spans: Arc<Vec<Span>>,
-    next_span: u64,
+}
+
+impl Default for Surface {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Surface {
-    pub fn new(id: SurfaceId) -> Self {
+    pub fn new() -> Self {
         Surface {
-            id,
             lines: Arc::new(Vec::new()),
             next_line: 0,
             log: Arc::new(EventLog::default()),
-            spans: Arc::new(Vec::new()),
-            next_span: 0,
         }
     }
 
-    pub fn id(&self) -> SurfaceId {
-        self.id
-    }
     pub fn log(&self) -> &EventLog {
         &self.log
     }
@@ -522,164 +438,13 @@ impl Surface {
         }
     }
 
-    /// READ — content/structure fold (§4.2). Returns the addresses of committed
-    /// lines satisfying the predicate, over a line range. search/grep compose
-    /// over this single verb (§4.4).
-    pub fn query(&self, _c: &ReadCap, r: Range, p: &Predicate) -> Vec<Addr> {
-        // Spelled as an explicit loop + push (identical fold, identical order)
-        // instead of filter/map/collect: the strict L0 gate cannot derive a
-        // bound for `collect`'s bulk allocation and cannot lower the borrowing
-        // closure aggregates, while this shape mirrors the proved `read_text`
-        // loop (push growth is bounded by the selected line range).
-        let mut out = Vec::new();
-        let (start, end) = self.line_range_bounds(r);
-        if let Some(lines) = self.lines.get(start..end) {
-            for (id, text) in lines {
-                let hit = match p {
-                    Predicate::TextContains(needle) => text.contains(needle.as_str()),
-                };
-                if hit {
-                    out.push(Addr::Line(self.id, *id));
-                }
-            }
-        }
-        out
-    }
-
-    /// ADDRESS — TOTAL resolution: every address maps to a first-class status
-    /// (§4.3 clause 3). Never returns a silently-wrong cell.
-    pub fn resolve(&self, a: Addr) -> Resolution {
-        match a {
-            Addr::Surface(s) | Addr::Line(s, _) | Addr::Cell(s, _, _) if s != self.id => {
-                Resolution::Invalidated
-            }
-            Addr::Surface(_) => Resolution::Resolved(LineId(0), 0),
-            Addr::Line(_, id) | Addr::Cell(_, id, _) => match self.line_index(id) {
-                Some(_) => {
-                    let col = if let Addr::Cell(_, _, c) = a { c } else { 0 };
-                    Resolution::Resolved(id, col)
-                }
-                // A LineId below our first live line was evicted; above is not-yet.
-                None if id.0 < self.first_line_id().map_or(0, |l| l.0) => Resolution::Evicted,
-                None => Resolution::Invalidated,
-            },
-        }
-    }
-
-    fn first_line_id(&self) -> Option<LineId> {
-        self.lines.first().map(|(l, _)| *l)
-    }
-
-    /// COMPOSE — O(1)-COW snapshot (§4.2). The immutable line, event-log and
-    /// span spines are shared; the first corresponding mutation detaches only
-    /// that spine via [`Arc::make_mut`].
+    /// COMPOSE — O(1)-COW snapshot (§4.2). The immutable line and event-log
+    /// spines are shared; the first corresponding mutation detaches only that
+    /// spine via [`Arc::make_mut`].
     pub fn snapshot(&self, _c: &ReadCap) -> Snapshot {
         Snapshot {
             at: self.seq(),
             surface: self.clone(),
-        }
-    }
-
-    // ===== STRUCTURE ===== one anchored typed-span primitive (§4.2).
-
-    /// Define a span; rides the spine like any mutation. Returns its stable id.
-    pub fn span_define(
-        &mut self,
-        _c: &WriteCap,
-        extent: Extent,
-        kind: SpanKind,
-        payload: SpanPayload,
-    ) -> SpanId {
-        let id = SpanId(self.next_span);
-        // Monotone id counter: 2^64 span definitions are unreachable, so the
-        // saturation can never fire on a real path (same L0 idiom as
-        // `next_line` in `apply` and `total` in `EventLog::append_at`).
-        self.next_span = self.next_span.saturating_add(1);
-        Arc::make_mut(&mut self.spans).push(Span {
-            id,
-            extent,
-            kind,
-            payload: Arc::new(payload),
-        });
-        Arc::make_mut(&mut self.log).append(Op::SpanDefine(id));
-        id
-    }
-
-    /// Locate a monotonically assigned span id without scanning the prefix.
-    fn span_index(&self, id: SpanId) -> Option<usize> {
-        let mut low = 0usize;
-        let mut high = self.spans.len();
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let candidate = self.spans.get(mid)?;
-            if candidate.id < id {
-                low = mid.saturating_add(1);
-            } else {
-                high = mid;
-            }
-        }
-        match self.spans.get(low) {
-            Some(span) if span.id == id => Some(low),
-            Some(_) | None => None,
-        }
-    }
-
-    /// Resolve a span to its public view, or `None` if dropped/unknown.
-    pub fn span_resolve(&self, _c: &ReadCap, id: SpanId) -> Option<ResolvedSpan> {
-        let index = self.span_index(id)?;
-        let span = self.spans.get(index)?;
-        Some(ResolvedSpan {
-            id: span.id,
-            extent: span.extent,
-            kind: span.kind,
-            payload: span.payload.as_ref().clone(),
-        })
-    }
-
-    /// Query spans of a kind overlapping a line range (§4.2). The span/query fold
-    /// search/hit-test/overlap all compose over this.
-    pub fn span_query(&self, _c: &ReadCap, r: Range, kind: SpanKind) -> Vec<SpanId> {
-        // Explicit loop + push (identical fold, identical order) for the same
-        // strict-gate reasons as `query`: no `collect` bulk-allocation
-        // recognizer, no closure aggregates to lower.
-        let mut out = Vec::new();
-        for s in self.spans.iter() {
-            if s.kind == kind && Self::overlaps(s.extent, r) {
-                out.push(s.id);
-            }
-        }
-        out
-    }
-
-    fn overlaps(e: Extent, r: Range) -> bool {
-        if e.start == e.end {
-            // zero-width mark: overlaps iff its point falls in [r.start, r.end)
-            e.start >= r.start && e.start < r.end
-        } else {
-            e.start < r.end && e.end > r.start
-        }
-    }
-
-    /// Restyle a span in place (no id change); rides the spine.
-    pub fn span_restyle(&mut self, _c: &WriteCap, id: SpanId, payload: SpanPayload) {
-        // Resolve before make_mut so an absent id copies neither shared spine.
-        if let Some(i) = self.span_index(id) {
-            let changed = match self.spans.get(i) {
-                Some(span) => span.payload.as_str() != payload.as_str(),
-                None => false,
-            };
-            if changed {
-                Arc::make_mut(&mut self.spans)[i].payload = Arc::new(payload);
-            }
-            Arc::make_mut(&mut self.log).append(Op::SpanRestyle(id));
-        }
-    }
-
-    /// Drop a span; rides the spine.
-    pub fn span_drop(&mut self, _c: &WriteCap, id: SpanId) {
-        if let Some(i) = self.span_index(id) {
-            Arc::make_mut(&mut self.spans).remove(i);
-            Arc::make_mut(&mut self.log).append(Op::SpanDrop(id));
         }
     }
 
@@ -760,29 +525,18 @@ impl Snapshot {
     pub fn read_text(&self, c: &ReadCap, r: Range) -> TextWithOrigin {
         self.surface.read_text(c, r)
     }
-    /// `branch` — a writable COW fork of the snapshot (§4.2). The fork is an
-    /// independent Surface under a fresh id.
-    pub fn branch(&self, new_id: SurfaceId) -> Surface {
-        let mut s = self.surface.clone();
-        s.id = new_id;
-        s
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sid(n: u64) -> SurfaceId {
-        SurfaceId(NonZeroU64::new(n).unwrap())
-    }
-
     /// THE kernel invariant (§4.3 clause 1), the executable twin of
     /// `Kernel.tla`'s `SeqIsLen` + `Monotonic`: every apply bumps seq by exactly
     /// one, the spine is gap-free, and seq == total events appended.
     #[test]
     fn event_log_is_gap_free_and_monotonic() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         assert_eq!(s.seq(), Seq(0));
         let mut prev = 0u64;
         for i in 0..1000 {
@@ -800,7 +554,7 @@ mod tests {
 
     #[test]
     fn apply_read_round_trips() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         s.apply(&WriteCap, Edit::AppendLine("hello".into()));
         s.apply(&WriteCap, Edit::AppendLine("world".into()));
         let got = s.read_text(
@@ -816,29 +570,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_is_total() {
-        let mut s = Surface::new(sid(1));
-        s.apply(&WriteCap, Edit::AppendLine("x".into()));
-        // A live line resolves.
-        assert!(matches!(
-            s.resolve(Addr::Line(sid(1), LineId(0))),
-            Resolution::Resolved(..)
-        ));
-        // A wrong surface never silently succeeds.
-        assert_eq!(
-            s.resolve(Addr::Line(sid(2), LineId(0))),
-            Resolution::Invalidated
-        );
-        // A not-yet line is a first-class status, never a wrong cell.
-        assert!(matches!(
-            s.resolve(Addr::Line(sid(1), LineId(99))),
-            Resolution::Invalidated | Resolution::Evicted
-        ));
-    }
-
-    #[test]
     fn snapshot_is_isolated_from_later_writes() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         s.apply(&WriteCap, Edit::AppendLine("frozen".into()));
         let snap = s.snapshot(&ReadCap);
         s.apply(&WriteCap, Edit::AppendLine("after".into()));
@@ -868,7 +601,7 @@ mod tests {
 
     #[test]
     fn snapshot_shares_line_allocation_until_replaced() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         let original = String::from("frozen allocation");
         let original_ptr = original.as_ptr();
         let original_capacity = original.capacity();
@@ -889,154 +622,83 @@ mod tests {
         assert_eq!(snap.surface.lines[0].1.as_str(), "frozen allocation");
     }
 
+    /// COW scope: a snapshot — and a writable copy taken from it — share the
+    /// line and log spines with the live surface until a line write, which
+    /// detaches exactly those two on the writer and nothing on the readers.
     #[test]
-    fn snapshot_and_branch_share_all_spines_until_corresponding_mutation() {
-        let mut live = Surface::new(sid(1));
+    fn snapshot_shares_the_line_and_log_spines_until_a_line_write() {
+        let mut live = Surface::new();
         live.apply(&WriteCap, Edit::AppendLine("frozen".into()));
-        let span = live.span_define(
-            &WriteCap,
-            Extent {
-                start: LineId(0),
-                end: LineId(1),
-            },
-            SpanKind::Region,
-            "bold".into(),
-        );
-        let untouched_payload = String::from("large untouched payload");
-        let untouched_ptr = untouched_payload.as_ptr();
-        let untouched_span = live.span_define(
-            &WriteCap,
-            Extent {
-                start: LineId(0),
-                end: LineId(1),
-            },
-            SpanKind::Mark,
-            untouched_payload,
-        );
-        assert_eq!(live.spans[1].payload.as_ptr(), untouched_ptr);
-
         let snap = live.snapshot(&ReadCap);
-        let mut branch = snap.branch(sid(2));
-        for candidate in [&snap.surface, &branch] {
+        let fork = snap.surface.clone();
+        for candidate in [&snap.surface, &fork] {
             assert!(Arc::ptr_eq(&live.lines, &candidate.lines));
             assert!(Arc::ptr_eq(&live.log, &candidate.log));
-            assert!(Arc::ptr_eq(&live.spans, &candidate.spans));
         }
 
-        // A line write detaches exactly lines + log. The snapshot and branch
-        // keep sharing the frozen line/span/log spines.
         live.apply(&WriteCap, Edit::SetLine(LineId(0), "live".into()));
         assert!(!Arc::ptr_eq(&live.lines, &snap.surface.lines));
         assert!(!Arc::ptr_eq(&live.log, &snap.surface.log));
-        assert!(Arc::ptr_eq(&live.spans, &snap.surface.spans));
-        assert!(Arc::ptr_eq(&snap.surface.lines, &branch.lines));
-        assert!(Arc::ptr_eq(&snap.surface.log, &branch.log));
-        assert!(Arc::ptr_eq(&snap.surface.spans, &branch.spans));
+        assert!(Arc::ptr_eq(&snap.surface.lines, &fork.lines));
+        assert!(Arc::ptr_eq(&snap.surface.log, &fork.log));
         assert_eq!(snap.surface.lines[0].1.as_ref(), "frozen");
         assert_eq!(live.lines[0].1.as_ref(), "live");
-
-        // A span write on the branch detaches spans + log, but not lines; the
-        // snapshot's payload remains isolated.
-        branch.span_restyle(&WriteCap, span, "italic".into());
-        assert!(Arc::ptr_eq(&branch.lines, &snap.surface.lines));
-        assert!(!Arc::ptr_eq(&branch.log, &snap.surface.log));
-        assert!(!Arc::ptr_eq(&branch.spans, &snap.surface.spans));
-        assert_eq!(untouched_span, SpanId(1));
-        assert!(Arc::ptr_eq(
-            &branch.spans[1].payload,
-            &snap.surface.spans[1].payload
-        ));
-        assert_eq!(
-            snap.surface.span_resolve(&ReadCap, span).unwrap().payload,
-            "bold"
-        );
-        assert_eq!(
-            branch.span_resolve(&ReadCap, span).unwrap().payload,
-            "italic"
-        );
     }
 
+    /// An edit naming an absent line still rides the one event spine, but must
+    /// not copy a shared line spine it cannot change (`apply` resolves the id
+    /// before `make_mut`).
     #[test]
-    fn absent_mutations_do_not_detach_untouched_shared_spines() {
-        let mut source = Surface::new(sid(1));
+    fn absent_line_edits_append_an_event_without_detaching_the_line_spine() {
+        let mut source = Surface::new();
         source.apply(&WriteCap, Edit::AppendLine("line".into()));
-        source.span_define(
-            &WriteCap,
-            Extent {
-                start: LineId(0),
-                end: LineId(1),
-            },
-            SpanKind::Region,
-            "payload".into(),
-        );
         let snap = source.snapshot(&ReadCap);
 
         for edit in [
             Edit::SetLine(LineId(99), "absent".into()),
             Edit::ClearLine(LineId(99)),
         ] {
-            let mut branch = snap.branch(sid(2));
-            branch.apply(&WriteCap, edit);
+            let mut fork = snap.surface.clone();
+            fork.apply(&WriteCap, edit);
             assert!(
-                Arc::ptr_eq(&branch.lines, &snap.surface.lines),
+                Arc::ptr_eq(&fork.lines, &snap.surface.lines),
                 "an absent line edit must not copy the shared line spine"
             );
             assert!(
-                !Arc::ptr_eq(&branch.log, &snap.surface.log),
-                "Set/Clear still append their existing one-spine event"
+                !Arc::ptr_eq(&fork.log, &snap.surface.log),
+                "Set/Clear still append their one-spine event"
             );
+            assert_eq!(fork.seq().0, snap.at.0 + 1);
         }
-
-        let mut restyle = snap.branch(sid(3));
-        restyle.span_restyle(&WriteCap, SpanId(99), "absent".into());
-        assert!(Arc::ptr_eq(&restyle.spans, &snap.surface.spans));
-        assert!(Arc::ptr_eq(&restyle.log, &snap.surface.log));
-
-        let mut drop_absent = snap.branch(sid(4));
-        drop_absent.span_drop(&WriteCap, SpanId(99));
-        assert!(Arc::ptr_eq(&drop_absent.spans, &snap.surface.spans));
-        assert!(Arc::ptr_eq(&drop_absent.log, &snap.surface.log));
     }
 
+    /// A write that changes nothing — the same text, or clearing an already
+    /// empty line — advances the log by one and leaves the line spine shared.
     #[test]
-    fn equal_mutations_advance_the_log_without_detaching_content_spines() {
-        let mut source = Surface::new(sid(1));
+    fn equal_line_edits_advance_the_log_without_detaching_the_line_spine() {
+        let mut source = Surface::new();
         source.apply(&WriteCap, Edit::AppendLine("same".into()));
         source.apply(&WriteCap, Edit::AppendLine(String::new()));
-        let span = source.span_define(
-            &WriteCap,
-            Extent {
-                start: LineId(0),
-                end: LineId(1),
-            },
-            SpanKind::Region,
-            "same style".into(),
-        );
         let snap = source.snapshot(&ReadCap);
 
-        let mut equal_set = snap.branch(sid(2));
-        equal_set.apply(&WriteCap, Edit::SetLine(LineId(0), "same".into()));
-        assert!(Arc::ptr_eq(&equal_set.lines, &snap.surface.lines));
-        assert!(!Arc::ptr_eq(&equal_set.log, &snap.surface.log));
-        assert_eq!(equal_set.seq().0, snap.at.0 + 1);
-
-        let mut empty_clear = snap.branch(sid(3));
-        empty_clear.apply(&WriteCap, Edit::ClearLine(LineId(1)));
-        assert!(Arc::ptr_eq(&empty_clear.lines, &snap.surface.lines));
-        assert!(!Arc::ptr_eq(&empty_clear.log, &snap.surface.log));
-        assert_eq!(empty_clear.seq().0, snap.at.0 + 1);
-
-        let mut equal_restyle = snap.branch(sid(4));
-        equal_restyle.span_restyle(&WriteCap, span, "same style".into());
-        assert!(Arc::ptr_eq(&equal_restyle.spans, &snap.surface.spans));
-        assert!(!Arc::ptr_eq(&equal_restyle.log, &snap.surface.log));
-        assert_eq!(equal_restyle.seq().0, snap.at.0 + 1);
+        for edit in [
+            Edit::SetLine(LineId(0), "same".into()),
+            Edit::ClearLine(LineId(1)),
+        ] {
+            let mut fork = snap.surface.clone();
+            fork.apply(&WriteCap, edit);
+            assert!(Arc::ptr_eq(&fork.lines, &snap.surface.lines));
+            assert!(!Arc::ptr_eq(&fork.log, &snap.surface.log));
+            assert_eq!(fork.seq().0, snap.at.0 + 1);
+        }
     }
 
+    /// Line lookup is an ordered lower bound, not a prefix scan: reading or
+    /// rewriting the tail of a long surface costs O(log lines) id comparisons.
     #[test]
     fn narrow_tail_line_operations_do_logarithmic_work() {
         const LINES: usize = 4096;
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         for i in 0..LINES {
             let text = if i + 1 == LINES {
                 "tail needle"
@@ -1057,15 +719,6 @@ mod tests {
         assert!(
             read_comparisons <= 2 * usize::BITS as usize,
             "tail read made {read_comparisons} id comparisons for {LINES} lines"
-        );
-
-        let hits = s.query(&ReadCap, tail, &Predicate::TextContains("needle".into()));
-        let query_comparisons = take_line_id_comparisons();
-        assert_eq!(hits, vec![Addr::Line(sid(1), LineId((LINES - 1) as u64))]);
-        assert!(query_comparisons > 0, "query must reach the lower bound");
-        assert!(
-            query_comparisons <= 2 * usize::BITS as usize,
-            "tail query made {query_comparisons} id comparisons for {LINES} lines"
         );
 
         s.apply(
@@ -1094,75 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn span_lifecycle_rides_the_one_spine() {
-        let mut s = Surface::new(sid(1));
-        for i in 0..5 {
-            s.apply(&WriteCap, Edit::AppendLine(format!("l{i}")));
-        }
-        let before = s.seq().0;
-        let id = s.span_define(
-            &WriteCap,
-            Extent {
-                start: LineId(1),
-                end: LineId(3),
-            },
-            SpanKind::Region,
-            "bold".into(),
-        );
-        // STRUCTURE mutations ride the SAME spine (§4.3 clause 1).
-        assert_eq!(s.seq().0, before + 1);
-
-        let rs = s.span_resolve(&ReadCap, id).unwrap();
-        assert_eq!(rs.kind, SpanKind::Region);
-        assert_eq!(rs.payload, "bold");
-
-        // query by kind + range overlap
-        assert_eq!(
-            s.span_query(
-                &ReadCap,
-                Range {
-                    start: LineId(0),
-                    end: LineId(2)
-                },
-                SpanKind::Region
-            ),
-            vec![id]
-        );
-        assert!(
-            s.span_query(
-                &ReadCap,
-                Range {
-                    start: LineId(0),
-                    end: LineId(2)
-                },
-                SpanKind::Block
-            )
-            .is_empty(),
-            "wrong kind"
-        );
-        assert!(
-            s.span_query(
-                &ReadCap,
-                Range {
-                    start: LineId(3),
-                    end: LineId(5)
-                },
-                SpanKind::Region
-            )
-            .is_empty(),
-            "non-overlapping range"
-        );
-
-        s.span_restyle(&WriteCap, id, "italic".into());
-        assert_eq!(s.span_resolve(&ReadCap, id).unwrap().payload, "italic");
-
-        s.span_drop(&WriteCap, id);
-        assert!(s.span_resolve(&ReadCap, id).is_none());
-    }
-
-    #[test]
     fn subscribe_pulls_new_events_then_drains() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         let cur = s.subscribe(&ReadCap); // positioned at head (seq 0)
         s.apply(&WriteCap, Edit::AppendLine("a".into()));
         s.apply(&WriteCap, Edit::AppendLine("b".into()));
@@ -1182,7 +768,7 @@ mod tests {
 
     #[test]
     fn slow_subscriber_gets_a_gap_and_never_blocks() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         let cur = s.subscribe(&ReadCap); // at seq 0
         // overflow the bounded ring so the oldest live event is past the cursor
         for i in 0..(MAX_LOG_EVENTS + 8) {
@@ -1283,28 +869,8 @@ mod tests {
     }
 
     #[test]
-    fn query_folds_content_to_addresses() {
-        let mut s = Surface::new(sid(1));
-        s.apply(&WriteCap, Edit::AppendLine("error: boom".into()));
-        s.apply(&WriteCap, Edit::AppendLine("all good".into()));
-        s.apply(&WriteCap, Edit::AppendLine("error: again".into()));
-        let hits = s.query(
-            &ReadCap,
-            Range {
-                start: LineId(0),
-                end: LineId(9),
-            },
-            &Predicate::TextContains("error".into()),
-        );
-        assert_eq!(
-            hits,
-            vec![Addr::Line(sid(1), LineId(0)), Addr::Line(sid(1), LineId(2))]
-        );
-    }
-
-    #[test]
     fn transact_is_atomic_and_cc_guarded() {
-        let mut s = Surface::new(sid(1));
+        let mut s = Surface::new();
         s.apply(&WriteCap, Edit::AppendLine("base".into()));
         let snap = s.snapshot(&ReadCap); // base = Seq(1)
 

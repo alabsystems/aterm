@@ -1,0 +1,40 @@
+# claude-code 2.1.282 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm 0.93.0 (180x50) · S2 one question single-select, `(Recommended)` on option 2, as first drawn (no key pressed) · user and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user0000000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this input (copy every string verbatim, change nothing, add nothing): {"questions": [{"question": "Which
+  color scheme should the demo page use?", "header": "Colors", "multiSelect": false, "options": [{"label": "Dark (Recommended)", "description": "A dark background with light text,
+  matching the terminal."}, {"label": "Light", "description": "A light background with dark text."}, {"label": "High contrast", "description": "Maximum contrast for
+  accessibility."}]}]}  After the tool returns, reply with only the word DONE.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which color scheme should the demo page use? → Dark (Recommended)
+
+⏺ DONE
+
+✻ Crunched for 4s · done 11:29 AM
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this input (copy every string verbatim, change nothing, add nothing): {"questions": [{"question": "Which test
+  runner should the demo project use?", "header": "Runner", "multiSelect": false, "options": [{"label": "Built-in runner", "description": "The language's own test harness, no
+  extra dependency."}, {"label": "Nextest (Recommended)", "description": "Faster parallel runs with per-test isolation."}, {"label": "Custom script", "description": "A shell
+  script that loops over the tests."}]}]}  After the tool returns, reply with only the word DONE.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Runner
+
+Which test runner should the demo project use?
+
+❯ 1. Built-in runner
+     The language's own test harness, no extra dependency.
+  2. Nextest (Recommended)
+     Faster parallel runs with per-test isolation.
+  3. Custom script
+     A shell script that loops over the tests.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -185,8 +185,9 @@ impl Class {
     }
 
     /// One line of `--help`-shaped prose.
+    #[cfg(test)]
     #[must_use]
-    pub fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Class::AtpkgGc => "package builds superseded by the live build",
             Class::ClaudeStaleVersions => {
@@ -312,16 +313,10 @@ pub struct StoreBuild {
     pub bytes_partial: bool,
 }
 
-/// What made the host re-measure. Two of the three are EVENTS, which is the
-/// §5.5 point: the tick is the floor, not the mechanism.
+/// What made the host re-measure. The tick and the update-done event of §5.5
+/// were never wired; the owner's verb is the one trigger that exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
-    /// The 6 h tick — the one timer the design keeps (§4.2 row 18).
-    Tick,
-    /// An `appstatus` row reported `kind=update phase=done`.
-    UpdateDone,
-    /// An `appstatus` row reported a toolchain install finishing.
-    ToolchainDone,
     /// The owner typed the verb.
     OnDemand,
 }
@@ -331,9 +326,6 @@ impl Trigger {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Trigger::Tick => "tick",
-            Trigger::UpdateDone => "update-done",
-            Trigger::ToolchainDone => "toolchain-done",
             Trigger::OnDemand => "on-demand",
         }
     }
@@ -534,14 +526,16 @@ pub struct Report {
 
 impl Report {
     /// Rows of one class.
+    #[cfg(test)]
     #[must_use]
-    pub fn rows_of(&self, class: Class) -> Vec<&Row> {
+    pub(crate) fn rows_of(&self, class: Class) -> Vec<&Row> {
         self.rows.iter().filter(|r| r.class == class).collect()
     }
 
     /// Bytes the removable rows of one class would free.
+    #[cfg(test)]
     #[must_use]
-    pub fn reclaimable(&self, class: Class) -> u64 {
+    pub(crate) fn reclaimable(&self, class: Class) -> u64 {
         self.rows
             .iter()
             .filter(|r| r.class == class && r.removable)
@@ -927,6 +921,7 @@ impl Refusal {
                 "report only: name a class to apply ({})",
                 Class::ALL
                     .iter()
+                    .filter(|c| c.delegate().is_none())
                     .map(|c| c.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")

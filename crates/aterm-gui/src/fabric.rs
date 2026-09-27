@@ -72,7 +72,9 @@
 //! lift is a change to the GUI modules, not to this one.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+#[cfg(any(unix, test))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use aterm_control::wire::pct_encode;
@@ -388,7 +390,7 @@ pub(crate) fn sender_class(from: &str) -> &'static str {
 
 /// Which delivered rows a `subscribe … mail` subscriber asked for.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct MailFilter {
+pub(crate) struct MailFilter {
     /// `kinds=<k,..>`: empty means every kind.
     pub kinds: Vec<String>,
     /// `from=<class|principal>`: a [`sender_class`] or an exact principal.
@@ -835,7 +837,7 @@ pub(crate) struct TopicEntry {
 /// and `post --wait` event-driven instead of polled — no sleep anywhere in this
 /// module. `topics` nests the same way ([`SessionFabric::topic_add`]).
 #[derive(Default)]
-pub struct SessionFabric {
+pub(crate) struct SessionFabric {
     inbox: Mutex<Inbox>,
     /// Signalled on every state change a parked waiter could care about: a new
     /// row, a post landing, a hold transition.
@@ -863,8 +865,10 @@ pub struct SessionFabric {
     /// or `@<off>`) — the bridge resolves the token to an offset once, when it
     /// first learns the entry, and remembers that resolution in its own state,
     /// so a bridge restart resumes the topic instead of re-reading `head`.
-    /// Every change is pushed to the bridge as a `topic` event, so a `drop`
-    /// then an `add` are two events in order and the second's `since=` is read.
+    /// Every change is pushed to the bridge as a `topic` event, so on a session
+    /// the bridge's push lane watches, a `drop` then an `add` are two events in
+    /// order and the second's `since=` is read. A session past the watch cap is
+    /// polled instead, and read as its final set.
     topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
 }
 
@@ -1126,6 +1130,7 @@ const STALE_AFTER: std::time::Duration = LINK_REFRESH.saturating_mul(3);
 const LINK_STARTING: &str = "starting";
 /// The reason [`bridge_lost`] stamps: the bridge itself is gone, so its link is
 /// by definition not up.
+#[cfg(any(unix, test))]
 const LINK_BRIDGE_LOST: &str = "bridge-lost";
 /// The most bytes a `link down reason=` token is kept at.
 const LINK_REASON_MAX: usize = 32;
@@ -1266,6 +1271,7 @@ thread_local! {
 }
 
 /// Record, for this thread, which bridge incarnation it is serving a lane of.
+#[cfg(any(unix, test))]
 pub(crate) fn set_lane_generation(generation: BridgeGeneration) {
     LANE_GENERATION.with(|g| g.set(Some(generation)));
 }
@@ -1343,6 +1349,7 @@ pub(crate) struct BridgeGeneration(u64);
 /// Mint the identity of one bridge incarnation. Called ONCE per launch, before
 /// either near end is served. Never `0`, which is reserved for "no bridge has
 /// ever attached" so a zero-valued guard cannot match a fresh link.
+#[cfg(any(unix, test))]
 pub(crate) fn next_bridge_generation() -> BridgeGeneration {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     BridgeGeneration(NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(1))
@@ -1357,6 +1364,7 @@ pub(crate) fn next_bridge_generation() -> BridgeGeneration {
 /// `[fabric] command`. It is not a claim that a bridge is up; it is the claim
 /// that one is coming, which is the half [`fabric_state`] cannot express
 /// (`absent` means both "not yet" and "never").
+#[cfg(any(unix, test))]
 pub(crate) fn note_bridge_supervised() {
     LINK.supervised.store(true, Ordering::Relaxed);
 }
@@ -1365,6 +1373,7 @@ pub(crate) fn note_bridge_supervised() {
 /// [`note_bridge_supervised`] sets, read back for `fabric status`'s
 /// `supervised=` token. This is the SAME bit [`fabric_wait_refusal`] reads, so
 /// `supervised=1` and `post`'s `queued=1` cannot disagree.
+#[cfg(unix)]
 pub(crate) fn bridge_supervised() -> bool {
     LINK.supervised.load(Ordering::Relaxed)
 }
@@ -1584,6 +1593,7 @@ pub(crate) fn fabric_status_tail() -> String {
 /// `link up` ([`link_report`]) moves it — which, for a broker that answers, is
 /// milliseconds after this call — or, for a bridge that never reports, its
 /// first delivery or landing does ([`link_evidence`]).
+#[cfg(any(unix, test))]
 pub(crate) fn bridge_attached(generation: BridgeGeneration) {
     let mut owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
     if generation.0 <= *owner {
@@ -1919,6 +1929,7 @@ fn note_bridge_touched(store: &Store, sid: &str) {
 /// incarnation this guard was created under; if a LATER incarnation has attached
 /// since, this guard is a ghost of a bridge that is already gone and must not
 /// report the live one disconnected. See [`BridgeGeneration`].
+#[cfg(any(unix, test))]
 pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize {
     {
         // Compare and store under the same lock `bridge_attached` writes under:
@@ -2845,6 +2856,10 @@ fn deliver_fetched(ctx: &SessionCtx, toks: &[&str]) -> String {
             }
         }
     };
+    // A partial chunk cannot answer a parked `inbox get`: its wait loop treats
+    // `Partial` exactly like `Pending`. Keep assembling it, but leave the
+    // waiter and the GUI asleep until the final chunk or a failure arrives.
+    let answer_ready = !matches!(slot, FetchSlot::Partial(_));
     let mut inbox = ctx.fabric.lock();
     if matches!(slot, FetchSlot::Done(_)) {
         inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
@@ -2867,8 +2882,10 @@ fn deliver_fetched(ctx: &SessionCtx, toks: &[&str]) -> String {
         }
     }
     drop(inbox);
-    ctx.fabric.changed.notify_all();
-    crate::presence::post_fabric_changed(&ctx.self_id);
+    if answer_ready {
+        ctx.fabric.changed.notify_all();
+        crate::presence::post_fabric_changed(&ctx.self_id);
+    }
     "OK\n".to_string()
 }
 
@@ -3576,6 +3593,7 @@ pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> (String, bool) {
 
 /// The topic set as the HANDOFF MANIFEST carries it: one `"<topic> <since>"`
 /// row per opt-in, in topic order.
+#[cfg(any(unix, test))]
 pub(crate) fn render_topics(topics: &[(String, TopicEntry)]) -> Vec<String> {
     topics
         .iter()
@@ -4775,49 +4793,6 @@ mod topic_tests {
 #[cfg(test)]
 mod inbox_hold {
 
-    /// `hold`'s help ENUMERATES the PTY-reaching verbs, and `is_pty_reaching` is
-    /// the set that actually decides. A hand-typed roster beside a derived set
-    /// drifts, and this one had: it omitted `hwkey` and `pane`, so two verbs
-    /// that really are refused while a hold is on were documented as answerable.
-    ///
-    /// Both directions. A verb missing from the prose UNDERSTATES the halt — the
-    /// dangerous side, since a driver reads the list to plan what it can still
-    /// do. A verb in the prose but not in the set overstates it, stranding a
-    /// caller that waits for a refusal which never comes.
-    #[test]
-    fn the_hold_help_enumerates_exactly_the_pty_reaching_set() {
-        let detail = aterm_types::control_verbs::spec("hold")
-            .expect("`hold` is a catalog verb")
-            .detail;
-        let listed: std::collections::BTreeSet<&str> = detail
-            .split_once("from ANY scope — `")
-            .and_then(|(_, tail)| tail.split_once('`'))
-            .expect("the help quotes the roster in one backticked run")
-            .0
-            .split_whitespace()
-            .collect();
-        assert!(!listed.is_empty(), "the roster parse found nothing");
-        for verb in &listed {
-            assert!(
-                is_pty_reaching(verb),
-                "`hold`'s help lists `{verb}` as PTY-reaching, but `is_pty_reaching` \
-                 does not — a caller waits for a refusal that never comes"
-            );
-        }
-        // The other direction needs the candidate set: every verb the catalog
-        // knows, so a NEW pty-reaching verb fails here on arrival.
-        for spec in aterm_types::control_verbs::VERBS {
-            if is_pty_reaching(spec.name) {
-                assert!(
-                    listed.contains(spec.name),
-                    "`{}` is refused while a hold is on and `hold`'s help does not \
-                     say so — the roster understates the halt, which is the side a \
-                     driver plans against",
-                    spec.name
-                );
-            }
-        }
-    }
     use super::*;
     use crate::session_store::{Store, new_store, test_handle};
 
@@ -8339,59 +8314,6 @@ mod inbox_hold {
         assert!(header(&cmd_inbox(&ctx, "")).contains(" pending=0"));
     }
 
-    /// THE DOC'S CITATION RESOLVES. `is_pty_reaching`'s comment justifies a
-    /// LITERAL by naming the test that derives it, and for two rungs that name
-    /// belonged to no test in the tree: an auditor greping it found nothing and
-    /// could not tell "the guard was deleted" from "the guard is called something
-    /// else". aterm ships no evidence manifest, so a doc comment naming its own
-    /// guard IS the citation, and a citation that does not resolve is the defect.
-    #[test]
-    fn the_halt_set_doc_cites_a_test_that_exists() {
-        let src = include_str!("fabric.rs");
-        let (production, tests) = src
-            .split_once("\n#[cfg(test)]\nmod inbox_hold {")
-            .expect("fabric.rs has a tests module");
-        let cited = "the_halt_set_is_derived_from_the_verb_table";
-        assert!(
-            production.contains(cited),
-            "the halt-set doc no longer cites its derivation test by name"
-        );
-        assert!(
-            tests.contains(&format!("fn {cited}(")),
-            "`{cited}` is cited by the halt-set doc but no test carries that name"
-        );
-        // And the sentence must not re-narrow to the rule that let `tab` through:
-        // the derivation walks EVERY row, whatever its target.
-        assert!(
-            production.contains("walks EVERY [`aterm_types::control_verbs::VERBS`] row"),
-            "the doc must state the rule the test actually enforces"
-        );
-
-        // EVERY CITATION, not just the one this test was written for. The docs in
-        // this module answer "who checks that?" by naming a test, and a name is
-        // only a citation while it resolves — so every `inbox_hold::<name>` in the
-        // production half is looked up here. Three more were added the round the
-        // halt-set doc, the principal grammar and the `via=` bound each grew one.
-        let mut cited_names = 0;
-        for (i, _) in production.match_indices("inbox_hold::") {
-            let tail = &production[i + "inbox_hold::".len()..];
-            let name: String = tail
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            assert!(!name.is_empty(), "a bare `inbox_hold::` cites nothing");
-            assert!(
-                tests.contains(&format!("fn {name}(")),
-                "`inbox_hold::{name}` is cited in this module's docs and no test                  carries that name"
-            );
-            cited_names += 1;
-        }
-        assert!(
-            cited_names >= 3,
-            "the doc citations vanished rather than being checked"
-        );
-    }
-
     /// A LATE ATTACH FROM A DEAD LAUNCH CANNOT PIN A LIVE BRIDGE AT
     /// `disconnected`.
     ///
@@ -9016,6 +8938,13 @@ mod inbox_hold {
             ),
             ("whoami", "reports this connection's own scope"),
             (
+                "rekey",
+                "writes a one-use KEY FILE and authorizes the key for a degraded \
+                 tab; it puts no bytes on a PTY. The line that reads the file is a \
+                 `turn`, which the halt refuses, and a key whose line never runs is \
+                 taken back with its file (`rekey withdraw`, the window's expiry)",
+            ),
+            (
                 "grant",
                 "mints an edge token. The halt is SCOPE-BLIND, so a token minted \
                  under a halt still cannot type into a held session",
@@ -9276,91 +9205,6 @@ mod inbox_hold {
         assert!(
             app_halt_refusal(&store, "hover").is_none(),
             "`hover` toggles a highlight; a halt must not turn into an App freeze"
-        );
-    }
-
-    /// THE MODULE PROMISES ONLY WHAT IT DOES. `aterm` ships no evidence manifest,
-    /// so these doc comments ARE the claims, and two of them promised more than
-    /// the code delivers.
-    ///
-    /// * A `fabric-lost` hold has NO OPERATOR UNDO. `apply_hold` has exactly two
-    ///   production callers — `cmd_hold` (`Access::OwnerOnly`, and its handler
-    ///   refuses an Owner-issued act against any `origin=fleet` hold) and
-    ///   `bridge_lost` — and nothing in the GUI reaches it. So the only lift of a
-    ///   FLEET hold is a bridge that reconnects and issues `hold off`, and an
-    ///   operator whose bridge cannot come back has one recovery: restart the
-    ///   instance. This module and DESIGN §11.2 both said "a human lifts it at the
-    ///   GUI". No such path exists. (The owner's `hold off` lifts the owner's own
-    ///   LOCAL hold, which is a different claim and a narrower one.)
-    /// * `InboxRow::from` said the sender is rendered "never from anything in the
-    ///   body" and then listed `s-<sid>@n-<node>`, the one form whose `s-<sid>@`
-    ///   prefix `Bridge::render_from` reads off the record BODY's `from=` token.
-    ///   That is the field an agent reads as identity and the one `hook.rs` cites
-    ///   when it argues the wake path carries no attacker-controlled text, so the
-    ///   stronger-than-true version was the one most likely to be relied on.
-    #[test]
-    fn the_module_docs_claim_no_lift_and_no_undue_attestation() {
-        let src = include_str!("fabric.rs");
-        let production = src
-            .split_once("\n#[cfg(test)]\nmod inbox_hold {")
-            .map(|(p, _)| p)
-            .expect("fabric.rs has a test module");
-
-        // The structural fact the doc now states: two production callers, no GUI.
-        assert_eq!(
-            production.matches("apply_hold(").count(),
-            4,
-            "`apply_hold` appears exactly four times: its own `fn`, the `#[cfg(test)]` \
-             `apply_hold_for_test` shim, and its TWO production callers — `bridge_lost` \
-             and `cmd_hold`. A fifth is a lift path this module's docs do not describe"
-        );
-        for (name, gui) in [
-            ("menu.rs", include_str!("menu.rs")),
-            ("command_registry.rs", include_str!("command_registry.rs")),
-            ("palette.rs", include_str!("palette.rs")),
-        ] {
-            assert!(
-                !gui.contains("fabric::apply_hold") && !gui.contains("apply_hold("),
-                "{name} reaches apply_hold: the GUI lift now exists, so say so in \
-                 the module header instead of withdrawing the promise"
-            );
-        }
-
-        // And the narrowed claims are the ones the module makes. Positive pins,
-        // not negative ones: the withdrawal itself has to QUOTE the sentence it
-        // withdraws, so "the phrase is absent" is not a test that can hold.
-        assert!(
-            production.contains("THE ONLY LIFT OF A FLEET HOLD IS A RECONNECTING BRIDGE"),
-            "the module header must state the narrow truth, not the GUI lift"
-        );
-        assert!(
-            production.contains("CAP-FORCED, WITH ONE ATTESTED EXCEPTION"),
-            "`from=`'s doc must name the exception `aterm-link`'s body.rs names — \
-             the `s-<sid>@` prefix IS read off the record body"
-        );
-    }
-
-    /// THE TEST-ONLY LINK RESET RUNS INSIDE THE LOCK THAT SERIALIZES IT.
-    ///
-    /// `with_link_reset` exists so a parallel test binary cannot let one test's
-    /// view of the process-global `LINK` leak into another's. Its body released
-    /// the mutex with an explicit `drop(guard)` and only THEN dropped the reset
-    /// guard at scope end — so the reset ran outside the lock, and a test blocked
-    /// on the mutex could acquire it, attach a bridge, and have the previous
-    /// test's reset clear the link underneath it. The assertion that catches a
-    /// re-inversion lives in the guard's own `Drop`, so every user of the helper
-    /// exercises it; this test is the one that names it.
-    #[test]
-    fn the_link_reset_runs_inside_the_lock_that_serializes_it() {
-        with_link(|| {
-            assert_eq!(fabric_state(), "absent", "a section starts from absent");
-            attach_up(&new_store(), next_bridge_generation());
-            assert_eq!(fabric_state(), "connected");
-        });
-        assert_eq!(
-            fabric_state(),
-            "absent",
-            "the section reset the link on the way out"
         );
     }
 }

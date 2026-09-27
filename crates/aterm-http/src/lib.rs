@@ -46,8 +46,8 @@
 //! * [`verifier`] — the FIRST-PARTY platform certificate verifier behind
 //!   [`Trust::PlatformVerifier`]: Security.framework on macOS, `crypt32` on
 //!   Windows, `/etc/ssl/certs` + webpki on Linux.
-//! * [`proxy`] — `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, and the rule that a
-//!   loopback endpoint is never proxied.
+//! * [`proxy`] — `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`; a caller keeps a
+//!   loopback endpoint off every proxy with [`ProxyMode::Direct`].
 //! * [`stream`] — TCP/TLS bytes, one global deadline, and the revocable
 //!   authority re-checked at every read and write.
 //! * [`client`] — request rendering and response parsing.

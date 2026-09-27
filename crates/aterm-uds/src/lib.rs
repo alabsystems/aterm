@@ -52,6 +52,10 @@ pub use win::{CtlListener, CtlStream};
 
 pub mod fdpass;
 pub mod latest;
+/// Unix-only: the descriptor a throwaway `--headless` instance watches so it ends
+/// with the process that started it — both ends. See [`lifeline`].
+#[cfg(unix)]
+pub mod lifeline;
 pub mod process;
 pub mod rand;
 /// trust-mc proofs for [`rand::hex_encode`] (compiled only under `cfg(kani)`).

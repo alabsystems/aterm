@@ -90,14 +90,18 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(run() as u8)
 }
 
+#[cfg(target_os = "macos")]
 const PASS: i32 = 0;
+#[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
 
 /// The signal a current libdispatch raises when it CATCHES a main-queue
 /// `dispatch_sync` re-entered from the main thread — see stage 2.
+#[cfg(target_os = "macos")]
 const SIGTRAP: i32 = 5;
 
 /// The env var that turns this binary into one of its own child probes.
+#[cfg(target_os = "macos")]
 const MODE: &str = "ATERM_OBJC_DISPATCH_DRIVE_MODE";
 
 /// How long the parent waits before declaring the naive child hung.
@@ -105,6 +109,7 @@ const MODE: &str = "ATERM_OBJC_DISPATCH_DRIVE_MODE";
 /// Generous on purpose: a FALSE "it deadlocked" would be the worst outcome this
 /// file could produce, and the `real` child in stage 3 proves the same budget
 /// is far more than the working path needs.
+#[cfg(target_os = "macos")]
 const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(not(target_os = "macos"))]

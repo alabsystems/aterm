@@ -5,9 +5,12 @@
 #[cfg(feature = "regex")]
 use crate::index::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT, REGEX_STEP_LIMIT};
 
+#[cfg(test)]
 use super::super::content::SearchContent;
 use super::super::error::SearchError;
-use super::super::types::{FilterMode, NavigationDirection, SearchState, StreamingMatch};
+#[cfg(test)]
+use super::super::types::StreamingMatch;
+use super::super::types::{FilterMode, NavigationDirection, SearchState};
 use super::StreamingSearch;
 
 #[cfg(kani)]
@@ -118,6 +121,7 @@ impl StreamingSearch {
     /// NOT a model action: pattern CONTENT is unbounded (no scalar twin); the
     /// observable effect is `Start` (restart) or `Cancel` (cleared). Kani covers
     /// it locally (`proofs_gaps.rs::update_pattern_*`, deliberately unanchored).
+    #[cfg(any(test, kani))]
     pub fn update_pattern(&mut self, new_pattern: &str) -> Result<(), SearchError> {
         if !matches!(
             self.state,
@@ -286,6 +290,7 @@ impl StreamingSearch {
     /// Joins consecutive wrapped rows into logical lines so that search
     /// queries spanning wrap boundaries can match (#7471).
     /// Note: Requires `&mut C` because disk-backed scrollback uses an LRU cache.
+    #[cfg(test)]
     pub fn scan_all<C: SearchContent>(&mut self, content: &mut C) {
         let max_rows = content.row_count();
 
@@ -521,6 +526,7 @@ impl StreamingSearch {
     /// NOT a model action: needs a nondeterministic in-range index
     /// (`Expr::InRange`, outside the `ty_model!` grammar — a hand-built Model
     /// extension is the tracked follow-up); local unit tests cover it.
+    #[cfg(test)]
     pub fn jump_to_match(&mut self, index: usize) {
         if self.state != SearchState::HasResults {
             return;
@@ -566,6 +572,7 @@ impl StreamingSearch {
     // ========================================================================
 
     /// Toggle wrap-around navigation.
+    #[cfg(test)]
     pub fn toggle_wrap(&mut self) {
         self.config.wrap_enabled = !self.config.wrap_enabled;
     }
@@ -573,6 +580,7 @@ impl StreamingSearch {
     /// Toggle case sensitivity.
     ///
     /// Note: Changing case sensitivity requires re-search and regex recompilation.
+    #[cfg(test)]
     pub fn toggle_case_sensitive(&mut self) {
         self.config.case_sensitive = !self.config.case_sensitive;
 
@@ -595,6 +603,7 @@ impl StreamingSearch {
     }
 
     /// Toggle highlight all matches.
+    #[cfg(test)]
     pub fn toggle_highlight_all(&mut self) {
         self.config.highlight_all = !self.config.highlight_all;
     }
@@ -602,6 +611,7 @@ impl StreamingSearch {
     /// Set the filter mode.
     ///
     /// Note: Changing mode requires re-search.
+    #[cfg(test)]
     pub fn set_filter_mode(&mut self, mode: FilterMode) -> Result<(), SearchError> {
         if mode == self.filter_mode {
             return Ok(());
@@ -710,6 +720,7 @@ impl StreamingSearch {
     /// - `HasResults` / `NoResults`: removes old matches and re-scans.
     ///
     /// Fixes #7244.
+    #[cfg(test)]
     pub fn content_modified(&mut self, row: usize, new_text: &str) {
         match self.state {
             SearchState::Searching => {

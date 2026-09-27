@@ -127,11 +127,11 @@ mod proofs {
         let mut row = Row::kani_mock(&mut cells);
         row.len = 8;
 
-        row.clear_range(start, end);
+        row.clear_range_with(start, end, Cell::EMPTY);
 
         kani::assert(
             (row.len as usize) <= 8,
-            "len stays within row width after clear_range",
+            "len stays within row width after clear_range_with",
         );
     }
 

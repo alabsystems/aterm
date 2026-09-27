@@ -94,7 +94,7 @@ impl PathTransform {
 
 /// Device-space coordinate bound: anything larger (or non-finite) is clamped/zeroed
 /// before rasterization, so degenerate assets stay safe and fast.
-pub const COORD_LIMIT: f32 = 1.0e6;
+pub(crate) const COORD_LIMIT: f32 = 1.0e6;
 
 /// Cubic flattening tolerance in device pixels (~0.15 px at target scale keeps the
 /// error invisible under the 4×4 supersampling).

@@ -559,3 +559,54 @@ fn stale_snapshot_and_clean_read_only_decisions_refine_the_model() {
         PREDECESSOR_SIGNATURE
     );
 }
+
+/// NEGATIVE CONTROL, replayed from history: before 8dbc4e967 `publish_roster`
+/// promoted the body, then the signature, with no redo record; a process death
+/// between the renames left the new body beside the old signature. This builds
+/// that exact disk, projects it, and shows the healthy model admits no
+/// transition to it while the `BuggyPromoteBodyWithoutRedo` mutant does — and
+/// that the real lock has nothing to replay, which is why the redo record exists.
+#[test]
+fn the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it() {
+    let fixture = Fixture::new("pre-redo-torn", true);
+    let predecessor = fixture.predecessor(true).unwrap();
+    let model = roster_pair_redo_model();
+    let buggy = interp::with_buggy(&model, 1);
+
+    let mut accepted = model.init_state();
+    assert!(model.fire("AcquireWriter", &mut accepted));
+    assert!(model.fire("AcceptSnapshot", &mut accepted));
+
+    // The death: the body renamed into place, no transaction ever committed.
+    std::fs::write(&fixture.roster, TARGET_BODY).unwrap();
+    let torn = project(
+        &model,
+        &fixture,
+        Some(&predecessor),
+        Events {
+            snapshot_checked: true,
+            writer_writes: 1,
+            crashes: 1,
+            ..Events::default()
+        },
+    );
+    assert_eq!((torn["body"], torn["signature"], torn["redo"]), (1, 0, 0));
+    assert_eq!(interp::admits(&model, &accepted, &torn), None);
+    assert!(
+        buggy
+            .successors("BuggyPromoteBodyWithoutRedo", &accepted)
+            .contains(&torn),
+        "Buggy=1 must reproduce the pre-redo torn pair"
+    );
+    assert!(!buggy.check_invariant("TargetHalfHasRedoAuthority", &torn));
+
+    // With no redo record the writer lock has nothing to complete: the pair stays
+    // torn, which every client refuses as "signature did not verify".
+    drop(lock_roster(fixture.roster_str()).expect("a torn pair still locks"));
+    assert_eq!(std::fs::read(&fixture.roster).unwrap(), TARGET_BODY);
+    assert_eq!(
+        std::fs::read(fixture.signature()).unwrap(),
+        PREDECESSOR_SIGNATURE
+    );
+    assert!(!fixture.transaction().exists());
+}

@@ -57,30 +57,6 @@ pub enum CharacterSet {
 }
 
 impl CharacterSet {
-    /// Create a character set from a serialized index (session restoration).
-    ///
-    /// Returns `None` for unrecognized indices.
-    #[must_use]
-    pub fn from_u8(index: u8) -> Option<Self> {
-        match index {
-            0 => Some(Self::Ascii),
-            1 => Some(Self::DecLineDrawing),
-            2 => Some(Self::DecSupplemental),
-            3 => Some(Self::UnitedKingdom),
-            4 => Some(Self::Dutch),
-            5 => Some(Self::Finnish),
-            6 => Some(Self::French),
-            7 => Some(Self::FrenchCanadian),
-            8 => Some(Self::German),
-            9 => Some(Self::Italian),
-            10 => Some(Self::NorwegianDanish),
-            11 => Some(Self::Spanish),
-            12 => Some(Self::Swedish),
-            13 => Some(Self::Swiss),
-            _ => None,
-        }
-    }
-
     /// Create a character set from the SCS final byte.
     ///
     /// Returns `None` for unrecognized final bytes.
@@ -496,31 +472,6 @@ impl CharacterSet96 {
         }
     }
 
-    /// Serialize to a byte for checkpoint storage (#7750).
-    #[must_use]
-    pub fn to_u8(self) -> u8 {
-        match self {
-            Self::IsoLatin1Supplemental => 1,
-            Self::IsoLatin2Supplemental => 2,
-            Self::IsoLatin5Supplemental => 3,
-            Self::IsoLatinCyrillic => 4,
-            Self::IsoLatinGreek => 5,
-        }
-    }
-
-    /// Deserialize from a checkpoint byte (#7750).
-    #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            1 => Some(Self::IsoLatin1Supplemental),
-            2 => Some(Self::IsoLatin2Supplemental),
-            3 => Some(Self::IsoLatin5Supplemental),
-            4 => Some(Self::IsoLatinCyrillic),
-            5 => Some(Self::IsoLatinGreek),
-            _ => None,
-        }
-    }
-
     /// Translate a 96-character set offset (0-95) to a Unicode codepoint.
     /// Offset 0 = position 0xA0, offset 95 = position 0xFF.
     /// Returns U+FFFD REPLACEMENT CHARACTER for out-of-range offsets.
@@ -679,86 +630,6 @@ impl CharacterSetState {
     /// Create a new character set state with defaults.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Construct from 94-character set designations only (no 96-char overrides).
-    ///
-    /// Provided for external callers that cannot use struct literals due to
-    /// private fields (`g1_96`, `g2_96`, `g3_96`).
-    #[must_use]
-    pub fn from_94(
-        g0: CharacterSet,
-        g1: CharacterSet,
-        g2: CharacterSet,
-        g3: CharacterSet,
-        gl: GlMapping,
-        single_shift: SingleShift,
-    ) -> Self {
-        Self {
-            g0,
-            g1,
-            g2,
-            g3,
-            gl,
-            single_shift,
-            gr: GrMapping::G2,
-            g1_96: None,
-            g2_96: None,
-            g3_96: None,
-        }
-    }
-
-    /// Construct with all fields including GR mapping and 96-char sets (#7750).
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_full(
-        g0: CharacterSet,
-        g1: CharacterSet,
-        g2: CharacterSet,
-        g3: CharacterSet,
-        gl: GlMapping,
-        single_shift: SingleShift,
-        gr: GrMapping,
-        g1_96: Option<CharacterSet96>,
-        g2_96: Option<CharacterSet96>,
-        g3_96: Option<CharacterSet96>,
-    ) -> Self {
-        Self {
-            g0,
-            g1,
-            g2,
-            g3,
-            gl,
-            single_shift,
-            gr,
-            g1_96,
-            g2_96,
-            g3_96,
-        }
-    }
-
-    /// Get the GR mapping (#7750).
-    #[must_use]
-    pub fn gr(&self) -> GrMapping {
-        self.gr
-    }
-
-    /// Get the G1 96-character set override (#7750).
-    #[must_use]
-    pub fn g1_96(&self) -> Option<CharacterSet96> {
-        self.g1_96
-    }
-
-    /// Get the G2 96-character set override (#7750).
-    #[must_use]
-    pub fn g2_96(&self) -> Option<CharacterSet96> {
-        self.g2_96
-    }
-
-    /// Get the G3 96-character set override (#7750).
-    #[must_use]
-    pub fn g3_96(&self) -> Option<CharacterSet96> {
-        self.g3_96
     }
 
     /// Get the effective character set for translation.

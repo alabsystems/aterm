@@ -8,11 +8,6 @@
 //! number of chunks, and untouched subtrees are structurally shared. `DocumentStore`
 //! lowers the resulting text through its authoritative `aterm_buffer::Surface` commit.
 
-#![allow(
-    dead_code,
-    reason = "native document renderer integration lands in stages"
-)]
-
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -96,18 +91,17 @@ impl TextRope {
         bytes(&self.root)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
+    #[cfg(test)]
     pub(crate) fn line_count(&self) -> usize {
         newlines(&self.root).saturating_add(1)
     }
 
+    #[cfg(test)]
     pub(crate) fn chunk_count(&self) -> usize {
         chunk_count(&self.root)
     }
 
+    #[cfg(test)]
     pub(crate) fn height(&self) -> u8 {
         height(&self.root)
     }
@@ -123,13 +117,6 @@ impl TextRope {
         let mut output = String::with_capacity(self.len());
         append_to(&self.root, &mut output);
         output
-    }
-
-    pub(crate) fn slice(&self, range: Range<usize>) -> Result<String, TextRopeError> {
-        self.validate(&range)?;
-        let mut output = String::with_capacity(range.end.saturating_sub(range.start));
-        append_range(&self.root, 0, &range, &mut output);
-        Ok(output)
     }
 
     pub(crate) fn replace(&self, range: Range<usize>, insert: &str) -> Result<Self, TextRopeError> {
@@ -160,25 +147,6 @@ impl TextRope {
             result = result.replace(range.clone(), insert)?;
         }
         Ok(result)
-    }
-
-    /// Zero-based logical line containing `offset`.
-    pub(crate) fn line_of_byte(&self, offset: usize) -> Result<usize, TextRopeError> {
-        if offset > self.len() || !self.is_char_boundary(offset) {
-            return Err(TextRopeError::InvalidRange);
-        }
-        Ok(count_newlines_before(&self.root, offset))
-    }
-
-    /// Byte start of a zero-based logical line; the one-past-final line returns `len`.
-    pub(crate) fn byte_of_line(&self, line: usize) -> Option<usize> {
-        if line == 0 {
-            return Some(0);
-        }
-        if line >= self.line_count() {
-            return None;
-        }
-        find_nth_newline(&self.root, line - 1).map(|offset| offset.saturating_add(1))
     }
 
     fn validate(&self, range: &Range<usize>) -> Result<(), TextRopeError> {
@@ -351,6 +319,7 @@ fn height(node: &Node) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn chunk_count(node: &Node) -> usize {
     match node {
         Node::Empty => 0,
@@ -387,60 +356,6 @@ fn append_to(node: &Node, output: &mut String) {
     }
 }
 
-fn append_range(node: &Node, base: usize, range: &Range<usize>, output: &mut String) {
-    let end = base.saturating_add(bytes(node));
-    if range.end <= base || range.start >= end {
-        return;
-    }
-    match node {
-        Node::Empty => {}
-        Node::Leaf { text, .. } => {
-            let start = range.start.saturating_sub(base).min(text.len());
-            let end = range.end.saturating_sub(base).min(text.len());
-            output.push_str(&text[start..end]);
-        }
-        Node::Branch { left, right, .. } => {
-            append_range(left, base, range, output);
-            append_range(right, base.saturating_add(bytes(left)), range, output);
-        }
-    }
-}
-
-fn count_newlines_before(node: &Node, offset: usize) -> usize {
-    match node {
-        Node::Empty => 0,
-        Node::Leaf { text, .. } => text[..offset].bytes().filter(|byte| *byte == b'\n').count(),
-        Node::Branch { left, right, .. } => {
-            let left_bytes = bytes(left);
-            if offset <= left_bytes {
-                count_newlines_before(left, offset)
-            } else {
-                newlines(left).saturating_add(count_newlines_before(right, offset - left_bytes))
-            }
-        }
-    }
-}
-
-fn find_nth_newline(node: &Node, target: usize) -> Option<usize> {
-    match node {
-        Node::Empty => None,
-        Node::Leaf { text, .. } => text
-            .bytes()
-            .enumerate()
-            .filter_map(|(index, byte)| (byte == b'\n').then_some(index))
-            .nth(target),
-        Node::Branch { left, right, .. } => {
-            let left_lines = newlines(left);
-            if target < left_lines {
-                find_nth_newline(left, target)
-            } else {
-                find_nth_newline(right, target - left_lines)
-                    .map(|offset| bytes(left).saturating_add(offset))
-            }
-        }
-    }
-}
-
 impl PartialEq for TextRope {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.root, &other.root) || self.to_flat_string() == other.to_flat_string()
@@ -471,7 +386,6 @@ mod tests {
         let changed = original.replace(6..10, "BETA!!!").unwrap();
         assert_eq!(original.to_flat_string(), "alpha\nbeta\ngamma");
         assert_eq!(changed.to_flat_string(), "alpha\nBETA!!!\ngamma");
-        assert_eq!(changed.slice(6..13).unwrap(), "BETA!!!");
     }
 
     #[test]
@@ -481,17 +395,6 @@ mod tests {
             .replace_many(&[(0..3, "1"), (4..7, "2"), (8..13, "3")])
             .unwrap();
         assert_eq!(changed.to_flat_string(), "1 2 3");
-    }
-
-    #[test]
-    fn line_lookup_crosses_chunk_boundaries() {
-        let source = (0..2_000).map(|_| "abc\n").collect::<String>();
-        let rope = TextRope::from(source.as_str());
-        for line in [0, 1, 999, 1_999] {
-            let byte = rope.byte_of_line(line).unwrap();
-            assert_eq!(byte, line * 4);
-            assert_eq!(rope.line_of_byte(byte).unwrap(), line);
-        }
     }
 
     #[test]

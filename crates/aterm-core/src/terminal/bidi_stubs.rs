@@ -12,7 +12,6 @@
 
 use super::Terminal;
 
-#[allow(dead_code, reason = "stub methods for disabled bidi feature")]
 #[allow(
     clippy::unused_self,
     reason = "stubs mirror the &mut self signatures of the real bidi methods so call sites are identical whether or not the feature is enabled"

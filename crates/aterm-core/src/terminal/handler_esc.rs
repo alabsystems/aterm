@@ -146,8 +146,6 @@ impl TerminalHandler<'_> {
     ///    - `ESC =/>`: DECKPAM/DECKPNM (keypad modes)
     /// 3. **With `#` intermediate**: DEC line attributes (DECDHL, DECDWL, DECALN)
     /// 4. **With `()*+` intermediates**: Character set designation (SCS)
-    ///
-    /// See `docs/ESCAPE_SEQUENCE_MATRIX.md` for complete ESC coverage.
     pub(super) fn esc_dispatch_core(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
@@ -180,10 +178,7 @@ impl TerminalHandler<'_> {
             b'7' => self.cursor_state().save_cursor_state(), // DECSC
             b'8' => self.cursor_state().restore_cursor_state(), // DECRC
             b'D' => {
-                // IND (Index) - Capture newline for CopyToClipboard
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\n');
-                }
+                // IND (Index)
                 // Defensive BCE template refresh (consistent with CSI S/T, #7522).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -207,10 +202,7 @@ impl TerminalHandler<'_> {
                     .reverse_line_feed_margined(self.modes.left_right_margin_mode);
             }
             b'E' => {
-                // NEL (Next Line) - Capture newline for CopyToClipboard
-                if let Some(state) = self.clipboard.copy_state.as_mut() {
-                    state.push('\n');
-                }
+                // NEL (Next Line)
                 // Defensive BCE template refresh (consistent with CSI S/T, #7522).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -421,24 +413,16 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "FullReset",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     fn reset_terminal_state(&mut self) {
         // RIS — delegates to shared reset_common_fields (#4114).
-        // Capture pre-reset state for callback notification.
-        let was_alt_screen = self.modes.alternate_screen;
-        let old_cursor_style = self.modes.cursor_style;
         // Preserve host-configured policy flags across mode reset (#7336, #7878, #7898, #7937).
         let allow_osc52_query = self.modes.allow_osc52_query;
         let allow_osc52_set = self.modes.allow_osc52_set;
         let allow_window_ops = self.modes.allow_window_ops;
         let allow_notifications = self.modes.allow_notifications;
-        // #7878 CF-010: session-memory recording is host policy; RIS
-        // must not let a rogue program clear it (DoS against AI
-        // retrieval) or set it (re-enable the poisoning channel
-        // after the host revoked).
-        let allow_session_memory = self.modes.allow_session_memory;
         // #7937 F01-3: palette reconfigure is host policy; RIS must not
         // let a rogue program clear it (DoS) or set it (privilege
         // escalation / palette takeover).
@@ -464,13 +448,11 @@ impl TerminalHandler<'_> {
             xterm_keyboard: self.xterm_keyboard,
             iterm2: self.iterm2,
             shell: self.shell,
-            semantic: self.semantic,
             #[cfg(feature = "sixel")]
             sixel: self.sixel,
             title: self.title,
             dcs: self.dcs,
             notifications: self.notifications,
-            clipboard: self.clipboard,
             marks_state: self.marks_state,
             taskbar_progress: self.taskbar_progress,
         };
@@ -507,7 +489,6 @@ impl TerminalHandler<'_> {
         self.modes.allow_osc52_set = allow_osc52_set;
         self.modes.allow_window_ops = allow_window_ops;
         self.modes.allow_notifications = allow_notifications;
-        self.modes.allow_session_memory = allow_session_memory;
         self.modes.allow_palette_reconfigure = allow_palette_reconfigure;
         self.modes.require_shell_integration_nonce = require_shell_integration_nonce;
         self.modes.kitty_keyboard_enabled = kitty_keyboard_enabled;
@@ -520,18 +501,6 @@ impl TerminalHandler<'_> {
         self.modes.cursor_style = *self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
         self.modes.cursor_blink = self.modes.cursor_style.blinks();
-
-        // Fire callbacks for state that changed and has UI side-effects.
-        if old_cursor_style != self.modes.cursor_style {
-            if let Some(callback) = self.cursor_style_callback {
-                callback(self.modes.cursor_style);
-            }
-        }
-        if was_alt_screen {
-            if let Some(callback) = self.buffer_activation_callback {
-                callback(false);
-            }
-        }
     }
 
     /// DECBI — Back Index (ESC 6, VT420+).

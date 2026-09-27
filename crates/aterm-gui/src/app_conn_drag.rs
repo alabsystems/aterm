@@ -303,6 +303,7 @@ impl App {
     /// `Wake::ConnDragBegin`: the native connector press crossed AppKit-side
     /// threshold. Resolves the STABLE tab id to today's index + session and
     /// starts the drag in screen space.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn conn_drag_native_begin(
         &mut self,
         window: WindowId,
@@ -321,6 +322,7 @@ impl App {
     }
 
     /// `Wake::ConnDragTo`: native tracking at winit-screen `(x, y)`.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn conn_drag_native_to(&mut self, window: WindowId, x: f64, y: f64) {
         let Some(mut state) = self.conn_drag.take() else {
             return;
@@ -336,6 +338,7 @@ impl App {
 
     /// `Wake::ConnDragDrop`: native release past the threshold — final
     /// position, then settle (drop into the confirm card / dissolve).
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn conn_drag_native_drop(&mut self, window: WindowId, x: f64, y: f64) {
         self.conn_drag_native_to(window, x, y);
         let Some(state) = self.conn_drag.take() else {
@@ -349,6 +352,7 @@ impl App {
     }
 
     /// `Wake::ConnDragCancel`: native abort (screen conversion failed).
+    #[cfg(target_os = "macos")]
     pub(crate) fn conn_drag_native_cancel(&mut self, window: WindowId) {
         if self
             .conn_drag
@@ -483,14 +487,12 @@ impl App {
                 cy: anchor.1,
                 r: 2.5,
                 color,
-                breathe: false,
             },
             crate::widget::DrawPrim::Dot {
                 cx: cursor.0,
                 cy: cursor.1,
                 r: 3.5,
                 color,
-                breathe: false,
             },
         ];
         // Crop the raster to the wire's bounds (plus the dot/AA margin), like

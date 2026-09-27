@@ -12,9 +12,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Scratch(PathBuf);
 
@@ -44,57 +44,69 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
     let socket = scratch.0.join("peer.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let reply = reply.to_vec();
-    let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut connection = loop {
-            match listener.accept() {
-                Ok((connection, _)) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "CLI never connected");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("accept: {error}"),
-            }
-        };
-        // macOS (like every BSD) hands `accept` a socket that INHERITS the
-        // listener's O_NONBLOCK, which would make the timeouts below dead
-        // letters: a CLI preempted between `connect` and its request write
-        // read as EAGAIN (`Os { code: 35, kind: WouldBlock }`) instead of
-        // waiting. Blocking reads bounded by the timeouts wait for a slow peer
-        // and still fail a peer that never speaks.
-        connection.set_nonblocking(false).unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        connection
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut request = String::new();
-        BufReader::new(&connection).read_line(&mut request).unwrap();
-        connection.write_all(&reply).unwrap();
-        connection.flush().unwrap();
-        request
-    });
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("ATERM_") {
             command.env_remove(key);
         }
     }
-    let output = command
+    // No `--timeout 2`: the CLI's exchange deadline is not what these tests
+    // judge, and 2 s of it timed how soon THIS process was scheduled to answer.
+    let mut cli = command
         .arg("--sock")
         .arg(&socket)
-        .args(["--timeout", "2", "@s-0123456789abcdef0123", verb])
+        .args(["@s-0123456789abcdef0123", verb])
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    // THE WAIT ENDS ON THE CLI, NEVER ON A CLOCK (2026-09-25). The peer's 5 s
+    // bound started before the spawn, so it charged the CLI's exec and start
+    // to "CLI never connected". The gate relinks `aterm-ctl`, and this file's
+    // tests are the first to exec it; a fresh executable's first exec parks in
+    // macOS's AppleSystemPolicy hook until syspolicyd assesses it (fresh test
+    // binaries included, docs/HANDOFF-intel-mac-2026-09-14.md §5; bc2918c70
+    // measured 0.4 s idle and ~13 s with the assessor busy), and six of them
+    // start at once on a loaded machine. The CLI cannot park before its
+    // `connect` (a listening Unix socket answers at once), so it either
+    // connects or exits: those two events end the wait.
+    let mut connection = loop {
+        match listener.accept() {
+            Ok((connection, _)) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(status) = cli.try_wait().unwrap() {
+                    let out = cli.wait_with_output().unwrap();
+                    panic!(
+                        "the CLI exited ({status}) without connecting: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept: {error}"),
+        }
+    };
+    // macOS (like every BSD) hands `accept` a socket that INHERITS the
+    // listener's O_NONBLOCK: a CLI preempted between `connect` and its request
+    // write would read as EAGAIN (`Os { code: 35, kind: WouldBlock }`). The
+    // read blocks with no timeout — it ends on the request line, or on EOF if
+    // the CLI exits without sending one.
+    connection.set_nonblocking(false).unwrap();
+    let mut request = String::new();
+    BufReader::new(&connection).read_line(&mut request).unwrap();
+    connection.write_all(reply).unwrap();
+    connection.flush().unwrap();
+    // Hang up after the reply, as the peer thread's return used to.
+    drop(connection);
+    let output = cli.wait_with_output().unwrap();
     let expected = std::iter::once("@s-0123456789abcdef0123")
         .chain(std::iter::once(verb))
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
-    assert_eq!(server.join().unwrap(), expected + "\n");
+    assert_eq!(request, expected + "\n");
     output
 }
 

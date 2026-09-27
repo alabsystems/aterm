@@ -166,20 +166,26 @@ fn gaps_for(w: &World, local: u64) -> Vec<u64> {
 /// backlog record, where a passing run publishes it (`title=-`) before.
 ///
 /// So the barrier is an observation: the session opts into [`WARM`] and the
-/// bridge must hold it. It learns that off the push lane — the
-/// `session-created` frame's sample or the `EVENT <local> topic` line (a
-/// broker re-attach re-samples too, and is not in play here). In the usual
-/// order the endpoint writes either only after the adoption has seeded the
-/// watch (one wake adopts, then drains the roster, then the watches). That is
-/// not a guarantee: adoption and the roster drain are two store reads, so a
-/// spawn landing between them is announced one wake before it is adopted, and
-/// a GAP on any other session makes the bridge re-read every session's topics,
-/// adopted or not. Either way the barrier can pass before the cursor exists.
-/// What follows is a possible 60 s hang, never a false pass, and the window is
-/// microseconds against a 250 ms tick. Holding [`WARM`] also means the bridge
-/// has SAMPLED this session, so once it is stopped the first-sighting sample
-/// cannot teach it the add; only a GAP's re-read can. [`Round::held`] does not
-/// lean on this barrier to be sound; the barrier is what makes the first
+/// bridge must hold it. It learns that off a `topic ls` read or the `EVENT
+/// <local> topic` line (a broker re-attach re-reads too, and is not in play
+/// here). Not every read comes after this session's watch was seeded: another
+/// session's `session-created`, or a GAP on any session, makes the bridge
+/// read every session it lists and has not read, adopted or not, and every
+/// 2 s roster round reads every session it holds no watch ack for — so it can
+/// hold [`WARM`] before this session's cursor exists. The watch's `sub
+/// <local> <sid>` ack, which the endpoint writes after the adoption seeded the
+/// watch (aterm-gui `subscribe.rs`, `drain_membership`), makes the bridge read
+/// the session again: in the bridge's `sub` arm, or — when the ack finds the
+/// session not yet listed, or the endpoint refuses that read — in the next
+/// read that lists it (the `session-created` arm right after, or a roster
+/// round). If that read is still owed when the bridge is stopped, the resumed
+/// bridge learns [`TOPIC`] from it, ahead of the GAP's. [`Round::held`] judges
+/// a round on the endpoint's GAP count alone, so such a round is never a
+/// false pass on the ENDPOINT's report — but it does not show that the GAP's
+/// re-read is what taught the bridge. Once that post-seed read is made, the
+/// bridge reads the session again only on a GAP, a re-attach or another ack of
+/// its watch, so once it is stopped only a GAP's re-read can teach it the add. [`Round::held`] does
+/// not lean on this barrier to be sound; the barrier is what makes the first
 /// round's premise hold.
 fn watched_session(w: &World) -> (String, u64) {
     let reply = w.verb("spawn");

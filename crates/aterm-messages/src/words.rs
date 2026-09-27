@@ -51,9 +51,63 @@ pub fn stamp_words(at_unix_ms: u64) -> String {
     out
 }
 
+/// When `at` was on the reader's LOCAL clock (design ruling 262), `offset_s`
+/// seconds from UTC: `Today 12:53:49 PM`, `Yesterday 9:02:11 AM`, else
+/// `2026-09-22 9:02:11 AM` — the local date the meta line of an expanded
+/// entry says, beside the relative words its row already shows. Copy keeps
+/// the UTC stamp ([`stamp_words`]). Pure: the host supplies the offset.
+#[must_use]
+pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
+    let local = |ms: u64| {
+        u64::try_from((i64::try_from(ms / 1000).unwrap_or(i64::MAX)).saturating_add(offset_s))
+            .unwrap_or(0)
+    };
+    let (at, now) = (local(at_unix_ms), local(now_unix_ms));
+    let (at_day, now_day) = (at / 86_400, now / 86_400);
+    let rem = at % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (h12, half) = match hh {
+        0 => (12, "AM"),
+        1..=11 => (hh, "AM"),
+        12 => (12, "PM"),
+        _ => (hh - 12, "PM"),
+    };
+    let mut clock = h12.to_string();
+    clock.push(':');
+    push_padded(&mut clock, mm, 2);
+    clock.push(':');
+    push_padded(&mut clock, ss, 2);
+    clock.push(' ');
+    clock.push_str(half);
+    let day = match now_day.checked_sub(at_day) {
+        Some(0) => "Today".to_string(),
+        Some(1) => "Yesterday".to_string(),
+        _ => date_words(at * 1000),
+    };
+    format!("{day} {clock}")
+}
+
+/// How long ago `at` was, SPOKEN (design ruling 262): [`relative_words`] with
+/// its abbreviations said whole — `6 hours ago`, `1 minute ago`, `just now`.
+#[must_use]
+pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
+    let words = relative_words(now_unix_ms, at_unix_ms);
+    let whole = |n: &str, unit: &str| {
+        let plural = if n == "1" { "" } else { "s" };
+        format!("{n} {unit}{plural} ago")
+    };
+    if let Some(n) = words.strip_suffix(" min ago") {
+        whole(n, "minute")
+    } else if let Some(n) = words.strip_suffix(" h ago") {
+        whole(n, "hour")
+    } else {
+        words
+    }
+}
+
 /// `YYYY-MM-DD` in UTC.
 #[must_use]
-pub fn date_words(at_unix_ms: u64) -> String {
+pub(crate) fn date_words(at_unix_ms: u64) -> String {
     let days = at_unix_ms / MS_PER_DAY;
     let (y, m, d) = civil_from_days(days);
     let mut out = String::with_capacity(10);
@@ -95,7 +149,7 @@ fn push_padded(out: &mut String, v: u64, width: usize) {
 /// leaves the path alone; a home given with a trailing slash names the
 /// same directory.
 #[must_use]
-pub fn home_abbreviate(path: &str, home: Option<&str>) -> String {
+pub(crate) fn home_abbreviate(path: &str, home: Option<&str>) -> String {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
         return path.to_string();
     };
@@ -111,7 +165,7 @@ pub fn home_abbreviate(path: &str, home: Option<&str>) -> String {
 /// abbreviated with [`home_abbreviate`]; the band prints `~/…` while the
 /// log keeps the absolute path (D4).
 #[must_use]
-pub fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
+pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
         return text.to_string();
     };
@@ -154,10 +208,35 @@ const FINISHED_VERBS: [(&str, &str); 15] = [
 /// v0.91.0` → `Downloaded aterm v0.91.0`, through [`FINISHED_VERBS`]. `None`
 /// when the first word is not in the table — the title keeps its words.
 #[must_use]
-pub fn finished_form(title: &str) -> Option<String> {
+pub(crate) fn finished_form(title: &str) -> Option<String> {
     let first = title.split(' ').next().unwrap_or(title);
     let (_, done) = FINISHED_VERBS.iter().find(|(ing, _)| *ing == first)?;
     Some(format!("{done}{}", &title[first.len()..]))
+}
+
+/// A work title that ended WITHOUT delivering (design ruling 259):
+/// `Indexing photo library` → `Indexing stopped`, through the same table as
+/// [`finished_form`]. `None` when the first word is not in it.
+#[must_use]
+pub(crate) fn stopped_form(title: &str) -> Option<String> {
+    let first = title.split(' ').next().unwrap_or(title);
+    FINISHED_VERBS
+        .iter()
+        .any(|(ing, _)| *ing == first)
+        .then(|| format!("{first} stopped"))
+}
+
+/// A work title that ended with NO outcome to claim (design ruling 265):
+/// `Indexing docs` → `Indexing ended`, through the same table as
+/// [`finished_form`] — a plain withdraw's record, whose live title read as
+/// still running. `None` when the first word is not in it.
+#[must_use]
+pub(crate) fn ended_form(title: &str) -> Option<String> {
+    let first = title.split(' ').next().unwrap_or(title);
+    FINISHED_VERBS
+        .iter()
+        .any(|(ing, _)| *ing == first)
+        .then(|| format!("{first} ended"))
 }
 
 /// What the page copies for one record: the title, then `<stamp> · <tag> ·
@@ -183,6 +262,29 @@ mod tests {
     use super::*;
     use crate::log::{LogRecord, LogState};
     use crate::model::{Glyph, MessageId, Origin, Severity, WallStamp, tags};
+
+    /// THE LOCAL CLOCK (ruling 262): today, yesterday, else the local date,
+    /// on a twelve-hour clock — the offset moves the day as well as the hour.
+    #[test]
+    fn local_words_say_the_readers_own_clock() {
+        // 2025-09-21 15:53:20 UTC.
+        let at = 1_758_470_000_000;
+        assert_eq!(local_words(at, at, 0), "Today 3:53:20 PM");
+        assert_eq!(local_words(at, at, -7 * 3600), "Today 8:53:20 AM");
+        assert_eq!(local_words(at + MS_PER_DAY, at, 0), "Yesterday 3:53:20 PM");
+        assert_eq!(
+            local_words(at + 3 * MS_PER_DAY, at, 0),
+            "2025-09-21 3:53:20 PM"
+        );
+        // Nine hours east, the same instant is past midnight: the next day.
+        assert_eq!(local_words(at, at, 9 * 3600), "Today 12:53:20 AM");
+        assert_eq!(
+            spoken_relative_words(at + 6 * MS_PER_HOUR, at),
+            "6 hours ago"
+        );
+        assert_eq!(spoken_relative_words(at + MS_PER_MIN, at), "1 minute ago");
+        assert_eq!(spoken_relative_words(at, at), "just now");
+    }
 
     #[test]
     fn relative_words_read_like_a_person_says_them() {
@@ -273,6 +375,22 @@ mod tests {
         ] {
             assert_eq!(finished_form(kept), None, "{kept:?} keeps its words");
         }
+    }
+
+    /// A plain withdraw's record (ruling 265): the leading participle and
+    /// `ended`, through the same closed table; anything else keeps its words.
+    #[test]
+    fn a_work_title_reads_ended_through_the_closed_table() {
+        assert_eq!(
+            ended_form("Indexing docs").as_deref(),
+            Some("Indexing ended")
+        );
+        assert_eq!(
+            ended_form("Installing ALab tools").as_deref(),
+            Some("Installing ended")
+        );
+        assert_eq!(ended_form("Paste stopped"), None);
+        assert_eq!(ended_form("Typing slowed by yes"), None);
     }
 
     #[test]

@@ -481,16 +481,6 @@ fn xterm_modify_other_keys_does_not_capture_keypad_keys() {
 // Key and NamedKey type constructors
 // =========================================================================
 
-#[test]
-fn key_character_constructor() {
-    assert_eq!(Key::character('x'), Key::Character('x'));
-}
-
-#[test]
-fn key_named_constructor() {
-    assert_eq!(Key::named(NamedKey::Enter), Key::Named(NamedKey::Enter));
-}
-
 // =========================================================================
 // NamedKey kitty codes: spot check a range of keys
 // =========================================================================

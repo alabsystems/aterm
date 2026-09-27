@@ -1,0 +1,19 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, _Ye() (`Ready to code?`: only a `ctrl+g to edit …` row under the options), on the measured 2.1.280/2.1.281 box geometry · leaving plan mode, no Esc footer, the plan's own numbered step above the options
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+
+   1. Do the thing
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+ ❯ 1. Yes, and use auto mode
+   2. Yes, manually approve edits
+   3. No, keep planning · shift+tab to approve with this feedback
+
+ ctrl+g to edit in VS Code · ~/.claude/plans/x.md

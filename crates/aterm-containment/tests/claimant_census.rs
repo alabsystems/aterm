@@ -13,7 +13,9 @@
 use std::path::Path;
 
 use aterm_containment::DrClass;
-use aterm_containment::consent::{Enumeration, classify_claimants, list_root, read_candidate};
+use aterm_containment::consent::{
+    Candidate, Claimant, Enumeration, classify_claimants, list_root, read_candidate, still_claims,
+};
 
 const ID: &str = "com.test.aterm-census";
 
@@ -87,5 +89,87 @@ fn the_real_census_tells_a_rollback_and_a_backup_from_the_running_copy() {
     assert!(
         census.retirable().is_empty(),
         "beside an unstable running copy nothing is retirable"
+    );
+}
+
+/// The Trash's last check before each move, on real bundles: `still_claims`
+/// holds for the copy the census read, and fails once that copy is re-signed
+/// (a new cdhash), when asked about another id, and once the copy is gone.
+#[test]
+fn still_claims_follows_the_bundle_on_disk() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("resolve tempdir");
+    lay_signed(&root, "aterm.app.rollback", "ROLLBACK");
+    let path = root.join("aterm.app.rollback");
+    let Candidate::Ours(id) = read_candidate(&path, ID, &[]) else {
+        panic!("the laid bundle claims {ID}");
+    };
+    let copy = Claimant {
+        path: path.clone(),
+        dr: id.dr,
+        dr_text: id.dr_text,
+        signing: id.signing,
+        team: id.team,
+        running: false,
+    };
+    assert!(still_claims(&copy, ID), "the copy the census read");
+    assert!(!still_claims(&copy, "com.test.someone-else"), "another id");
+
+    lay_signed(&root, "aterm.app.rollback", "RESIGNED");
+    assert!(!still_claims(&copy, ID), "re-signed: a different identity");
+
+    std::fs::remove_dir_all(&path).expect("remove");
+    assert!(!still_claims(&copy, ID), "gone");
+}
+
+/// An unsigned copy is told apart from a read that failed: both have no
+/// requirement text, but the failed read has no class and is never the copy.
+#[test]
+fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("resolve tempdir");
+    let path = root.join("aterm-unsigned.app");
+    let contents = path.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).expect("layout");
+    std::fs::write(
+        contents.join("Info.plist"),
+        format!(
+            "<plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>{ID}</string>\
+             <key>CFBundleExecutable</key><string>aterm</string></dict></plist>"
+        ),
+    )
+    .expect("plist");
+    std::fs::write(contents.join("MacOS/aterm"), "#!/bin/sh\necho UNSIGNED\n").expect("exe");
+    let Candidate::Ours(id) = read_candidate(&path, ID, &[]) else {
+        panic!("the unsigned bundle claims {ID}");
+    };
+    assert_eq!(id.dr, DrClass::Unsigned, "{id:?}");
+    assert!(id.dr_text.is_empty());
+    let copy = Claimant {
+        path: path.clone(),
+        dr: id.dr,
+        dr_text: id.dr_text,
+        signing: id.signing,
+        team: id.team,
+        running: false,
+    };
+    assert!(still_claims(&copy, ID), "the same unsigned copy");
+
+    // An unreadable executable makes `codesign` answer `Permission denied`: a
+    // read that failed, with no requirement text — which a text-only
+    // comparison would have taken for the unsigned copy. (Root reads it anyway.)
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let exe = contents.join("MacOS/aterm");
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o000)).expect("lock exe");
+    let failed_read_matches = still_claims(&copy, ID);
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("unlock exe");
+    assert!(
+        !failed_read_matches,
+        "codesign could not read it: no class, so not the copy"
     );
 }

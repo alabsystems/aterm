@@ -5,18 +5,19 @@
 //! loopback endpoint and a private managed home, launching and attesting the
 //! child, and terminating the process aterm itself spawned.
 
+#[cfg(target_os = "macos")]
+use super::max_response_bytes;
 use super::model_store::{AttestedManagedModel, attest_managed_model};
-use super::transport::{RequestWriteAuthority, build_client, loopback_socket};
-use super::{
-    EndpointOrigin, Job, TitleSummaryLocality, cancelled_error, job_is_authorized,
-    max_response_bytes,
-};
-// Both are consumed only inside macOS-gated regions in SOME compile targets —
-// gating the imports breaks the targets that do use them, so allow instead.
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+use super::transport::loopback_socket;
+#[cfg(target_os = "macos")]
+use super::transport::{RequestWriteAuthority, build_client};
+use super::{EndpointOrigin, Job, TitleSummaryLocality, cancelled_error, job_is_authorized};
+#[cfg(target_os = "macos")]
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+use std::sync::atomic::AtomicU64;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+use std::sync::atomic::Ordering;
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -123,7 +124,7 @@ impl ManagedOllamaController {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn owns_endpoint(&self, endpoint: &str, authority_epoch: u64) -> bool {
         self.endpoint_process(endpoint, authority_epoch).is_some()
     }
@@ -188,6 +189,7 @@ impl ManagedOllamaController {
             .flatten()
     }
 
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(super) fn install(
         &self,
         child: std::process::Child,
@@ -305,7 +307,7 @@ pub(super) fn managed_process_identity(pid: u32) -> Result<ManagedProcessIdentit
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), test))]
 pub(super) fn managed_process_identity(pid: u32) -> Result<ManagedProcessIdentity, String> {
     // Managed auto-launch is disabled off macOS. Keeping a PID-only identity here
     // lets lifecycle tests exercise the controller without claiming attestation.
@@ -318,7 +320,7 @@ pub(super) fn managed_process_identity(pid: u32) -> Result<ManagedProcessIdentit
     })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 pub(super) fn unix_process_group(pid: u32) -> Result<u32, String> {
     let pid = i32::try_from(pid).map_err(|_| "managed process ID is invalid".to_string())?;
     // SAFETY: getpgid only queries kernel process metadata.
@@ -326,7 +328,7 @@ pub(super) fn unix_process_group(pid: u32) -> Result<u32, String> {
     u32::try_from(group).map_err(|_| "could not resolve managed process group".to_string())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 fn unix_session_id(pid: u32) -> Result<u32, String> {
     let pid = i32::try_from(pid).map_err(|_| "managed process ID is invalid".to_string())?;
     // SAFETY: getsid only queries kernel process metadata.
@@ -334,6 +336,7 @@ fn unix_session_id(pid: u32) -> Result<u32, String> {
     u32::try_from(session).map_err(|_| "could not resolve managed process session".to_string())
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn finish_unadmitted_managed_child(
     mut child: std::process::Child,
     private_home: Option<std::path::PathBuf>,
@@ -363,6 +366,7 @@ fn finish_unadmitted_managed_child(
 /// always call `setsid` before exec, so a failed/fast-exiting leader can already have
 /// forked the actual server. Signal the verified/expected dedicated group first;
 /// never send a negative-PID signal when the child joined the caller's group.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn terminate_unadmitted_managed_child(
     mut child: std::process::Child,
     private_home: Option<std::path::PathBuf>,
@@ -395,8 +399,6 @@ pub(super) fn terminate_unadmitted_managed_child(
             None
         }
     };
-    #[cfg(not(unix))]
-    let _ = child.kill();
 
     let pending = Arc::new(Mutex::new(Some((child, private_home))));
     let reaper_pending = pending.clone();
@@ -646,7 +648,7 @@ impl ManagedOllama {
         let explicit_target = if automatic {
             None
         } else {
-            let (socket, bind) = loopback_socket(&job.settings.endpoint)
+            let socket = loopback_socket(&job.settings.endpoint)
                 .ok_or_else(|| "could not resolve the loopback Ollama endpoint".to_string())?;
             if std::net::TcpStream::connect_timeout(&socket, Duration::from_millis(100)).is_ok() {
                 if job.settings.allow_remote {
@@ -665,8 +667,8 @@ impl ManagedOllama {
             }
             Some(ManagedEndpointTarget {
                 endpoint: job.settings.endpoint.clone(),
+                #[cfg(any(target_os = "macos", test))]
                 socket,
-                bind,
             })
         };
         // Reserve before expensive closure/model attestation. The listener keeps
@@ -734,9 +736,7 @@ impl ManagedOllama {
         Err(last_error)
     }
 
-    // Off macOS the attested tail is configured out and several bindings are
-    // write-only on the refusal path.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    #[cfg(target_os = "macos")]
     fn launch_attested(
         &mut self,
         job: &Job,
@@ -748,7 +748,7 @@ impl ManagedOllama {
         let private_home = create_private_managed_home()?;
         let child = managed_ollama_command(
             &attested.binary,
-            &target.bind,
+            &target.socket.to_string(),
             &attested.models,
             &private_home,
         )
@@ -793,7 +793,6 @@ impl ManagedOllama {
             if let Ok(stream) =
                 std::net::TcpStream::connect_timeout(&target.socket, Duration::from_millis(100))
             {
-                #[cfg(target_os = "macos")]
                 if let Err(error) = attest_managed_server_stream(&stream, process) {
                     drop(stream);
                     self.controller
@@ -802,46 +801,44 @@ impl ManagedOllama {
                         "managed Ollama readiness stream failed ownership attestation: {error}"
                     ));
                 }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = stream;
+                drop(stream);
+                // Ollama lazily maps model weights on its first request. Warm it
+                // with fixed, non-terminal data and pin it in memory, then recheck
+                // the disk anchor. Thus no terminal context is the trigger for
+                // loading potentially substituted weights. Subsequent requests
+                // cheaply revalidate that same anchor before their write boundary.
+                if let Err(error) = warm_managed_model(
+                    job,
+                    authority_epoch,
+                    process,
+                    &target.endpoint,
+                    model_attestation,
+                ) {
                     self.controller
                         .stop_if_owned(&target.endpoint, job.authority_epoch);
-                    return Err(
-                        "managed Ollama stream attestation is unavailable on this platform"
-                            .to_string(),
-                    );
+                    return Err(error);
                 }
-                // The warm-and-return tail is the macOS continuation — the arm
-                // above already returned on every other platform, and leaving the
-                // tail bare would be an unreachable statement there.
-                #[cfg(target_os = "macos")]
-                {
-                    drop(stream);
-                    // Ollama lazily maps model weights on its first request. Warm it
-                    // with fixed, non-terminal data and pin it in memory, then recheck
-                    // the disk anchor. Thus no terminal context is the trigger for
-                    // loading potentially substituted weights. Subsequent requests
-                    // cheaply revalidate that same anchor before their write boundary.
-                    if let Err(error) = warm_managed_model(
-                        job,
-                        authority_epoch,
-                        process,
-                        &target.endpoint,
-                        model_attestation,
-                    ) {
-                        self.controller
-                            .stop_if_owned(&target.endpoint, job.authority_epoch);
-                        return Err(error);
-                    }
-                    return Ok(process);
-                }
+                return Ok(process);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         self.controller
             .stop_if_owned(&target.endpoint, job.authority_epoch);
         Err("managed Ollama did not become ready within 5 seconds".to_string())
+    }
+
+    /// Off macOS no managed model can be attested ([`attest_managed_model`]
+    /// refuses before this is reached), so no managed daemon is ever launched.
+    #[cfg(not(target_os = "macos"))]
+    fn launch_attested(
+        &mut self,
+        _job: &Job,
+        _authority_epoch: &Arc<AtomicU64>,
+        _attested: &AttestedManagedOllama,
+        _model_attestation: &AttestedManagedModel,
+        _target: &ManagedEndpointTarget,
+    ) -> Result<ManagedProcessIdentity, String> {
+        Err("managed Ollama dynamic code attestation is unavailable on this platform".to_string())
     }
 
     pub(super) fn invalidate_owned(&mut self, endpoint: &str, authority_epoch: u64) {
@@ -851,7 +848,7 @@ impl ManagedOllama {
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn warm_managed_model(
     job: &Job,
     authority_epoch: &Arc<AtomicU64>,
@@ -896,8 +893,9 @@ fn warm_managed_model(
 #[derive(Clone)]
 pub(super) struct ManagedEndpointTarget {
     pub(super) endpoint: String,
+    /// Only the macOS launch dials and binds the reserved endpoint.
+    #[cfg(any(target_os = "macos", test))]
     pub(super) socket: std::net::SocketAddr,
-    bind: String,
 }
 
 pub(super) struct ReservedManagedEndpoint {
@@ -928,14 +926,16 @@ pub(super) fn reserve_managed_endpoint() -> Result<ReservedManagedEndpoint, Stri
         listener,
         target: ManagedEndpointTarget {
             endpoint: format!("http://127.0.0.1:{port}/api/chat"),
+            #[cfg(any(target_os = "macos", test))]
             socket,
-            bind: socket.to_string(),
         },
     })
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 static MANAGED_HOME_NONCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn create_private_managed_home() -> Result<std::path::PathBuf, String> {
     #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt as _;
@@ -1002,6 +1002,7 @@ pub(super) fn cleanup_private_managed_home(path: Option<&std::path::Path>) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(super) fn managed_ollama_command(
     binary: &std::path::Path,
     bind: &str,
@@ -1040,7 +1041,7 @@ pub(super) fn managed_ollama_command(
     command
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 pub(super) fn configure_dedicated_process_session(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt as _;
 
@@ -1086,7 +1087,7 @@ pub(super) fn configure_dedicated_process_session(command: &mut std::process::Co
 /// 2026-08-11). A port and not a merge because main is ~2100 commits past that
 /// branch's base and nothing in it applies textually; this function and its
 /// use in [`run_command_bounded`] are re-expressed against today's file.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 pub(super) fn configure_dedicated_process_group(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
@@ -1105,6 +1106,7 @@ pub(super) fn configure_dedicated_process_group(command: &mut std::process::Comm
 /// environment back, which made a platform-neutral law testable only on POSIX.
 /// Writing through this trait lets the same law be observed exactly, on every
 /// host, with no child process at all.
+#[cfg(any(target_os = "macos", test))]
 pub(super) trait ChildEnvironment {
     /// Drop everything this process would otherwise pass down.
     fn clear_inherited(&mut self);
@@ -1112,6 +1114,7 @@ pub(super) trait ChildEnvironment {
     fn set(&mut self, key: &str, value: &std::ffi::OsStr);
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ChildEnvironment for std::process::Command {
     fn clear_inherited(&mut self) {
         self.env_clear();
@@ -1122,6 +1125,7 @@ impl ChildEnvironment for std::process::Command {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(super) fn configure_managed_ollama_environment(
     environment: &mut impl ChildEnvironment,
     bind: &str,
@@ -1274,19 +1278,17 @@ fn ollama_codesign_command(all_architectures: bool) -> Result<std::process::Comm
     Ok(command)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 #[derive(Debug)]
-// In the test-only compilation off macOS the fields are carried but unread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) struct BoundedCommandOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
+    pub(super) status: std::process::ExitStatus,
+    pub(super) stdout: Vec<u8>,
 }
 
 /// Execute a security helper without allowing an inherited tool failure to hang
 /// the title worker or allocate unbounded output. Unix helpers get a dedicated
 /// process group, and timeout paths never wait for an inherited stdout pipe.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn run_command_bounded(
     command: &mut std::process::Command,
     timeout: Duration,
@@ -1331,8 +1333,6 @@ pub(super) fn run_command_bounded(
             // that group and nothing outside it.
             let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
         }
-        #[cfg(not(unix))]
-        let _ = child.kill();
         let _ = child.wait();
     };
     let status = loop {
@@ -1870,11 +1870,6 @@ pub(super) fn attest_managed_ollama(
 pub(super) fn attest_running_managed_ollama(pid: u32) -> Result<(), String> {
     verify_running_ollama_code(pid)
         .map_err(|error| format!("spawned Ollama failed dynamic code attestation: {error}"))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(super) fn attest_running_managed_ollama(_pid: u32) -> Result<(), String> {
-    Err("managed Ollama dynamic code attestation is unavailable on this platform".to_string())
 }
 
 pub(super) fn managed_ollama_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {

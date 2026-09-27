@@ -1419,16 +1419,6 @@ fn finish_candidate(
     result
 }
 
-pub fn check_now(current_build: u64, source: &Source) -> crate::UpdateStatus {
-    let settings = crate::CheckSettings {
-        source: source.clone(),
-        auto_apply: true,
-    };
-    let provider: crate::CheckSettingsProvider =
-        std::sync::Arc::new(move || Some(settings.clone()));
-    check_with_settings(current_build, &provider, true)
-}
-
 fn automatic_check_due(state: &State, source: &Source, started: i64) -> bool {
     // Old and new executable mappings intentionally coexist after replacement.
     // Their alternating compiled build numbers must not reset the ONE install's
@@ -1597,23 +1587,6 @@ pub fn last_check_at(current_build: u64, source: &Source) -> Option<String> {
         && state.check_build == current_build
         && !state.updated_at.is_empty())
     .then_some(state.updated_at)
-}
-
-pub fn spawn_background_check(
-    current_build: u64,
-    source: crate::SourceProvider,
-    notify: Option<crate::HealthNotify>,
-) {
-    spawn_background_check_with_settings(
-        current_build,
-        std::sync::Arc::new(move || {
-            source().map(|source| crate::CheckSettings {
-                source,
-                auto_apply: true,
-            })
-        }),
-        notify,
-    )
 }
 
 pub(crate) fn spawn_background_check_with_settings(

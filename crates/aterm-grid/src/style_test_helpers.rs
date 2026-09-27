@@ -55,13 +55,6 @@ impl Color {
 }
 
 impl Style {
-    /// Create a new style with the given colors and attributes.
-    #[must_use]
-    #[inline]
-    pub const fn new(fg: Color, bg: Color, attrs: StyleAttrs) -> Self {
-        Self { fg, bg, attrs }
-    }
-
     /// Create a style with just foreground color.
     #[must_use]
     #[inline]

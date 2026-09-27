@@ -15,18 +15,6 @@ pub enum Key {
 }
 
 impl Key {
-    /// Create a character key.
-    #[must_use]
-    pub fn character(c: char) -> Self {
-        Key::Character(c)
-    }
-
-    /// Create a named key.
-    #[must_use]
-    pub fn named(key: NamedKey) -> Self {
-        Key::Named(key)
-    }
-
     /// The main-block key a KEYPAD key stands in for — `None` when `self` is
     /// not a keypad key, or is `NumpadBegin`, the one keypad key the main
     /// block has no twin for (xterm's `CSI E`).

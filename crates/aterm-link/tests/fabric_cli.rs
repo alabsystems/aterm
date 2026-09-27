@@ -101,7 +101,6 @@ fn fabric_cmd(s: &Scratch, env_cmd: Option<&str>, args: &[&str]) -> Command {
     cmd.arg("fabric")
         .args(args)
         .env_remove("ATERM_FABRIC_COMMAND")
-        .env_remove("ATERM_CONTROL_SOCK")
         .env("XDG_CONFIG_HOME", s.path("cfg"))
         .env("XDG_RUNTIME_DIR", s.path("run"))
         .stdin(Stdio::null());
@@ -366,8 +365,8 @@ fn with_no_command_the_fabric_is_off_says_where_it_looked_and_exits_2() {
     assert_eq!(
         out.trim(),
         format!(
-            "fabric is off: no [fabric] command in {} (and no $ATERM_FABRIC_COMMAND, no \
-             rendezvous file); `aterm fabric on` turns it on",
+            "fabric is off: no [fabric] command in {} (and no rendezvous file); \
+             `aterm fabric on` turns it on",
             s.config_path()
         )
     );
@@ -666,7 +665,7 @@ fn a_broker_that_refuses_the_read_is_not_reachable_yes() {
 
     let (code, out, _) = fabric(&s, Some(&cmd), &[]);
     assert!(
-        !out.contains("head query answered"),
+        !out.contains("reachable  yes (") && out.contains("yes, but the bus cannot be read"),
         "the head query did NOT answer:\n{out}"
     );
     assert!(

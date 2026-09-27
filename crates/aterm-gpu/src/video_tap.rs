@@ -168,6 +168,33 @@ pub struct CapturedFrame {
         project = "aterm_gpu::video_tap::ordered_capture_store_push"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "VideoTapSlot",
+        action = "BuggyHarvestCallbackOrder",
+        reason = "Buggy=1 negative control only; the push inserts by capture sequence, never at \
+                  the callback-order tail"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "VideoTapSlot",
+        action = "BuggyEvictNewest",
+        reason = "Buggy=1 negative control only; budget eviction pops the lowest sequence from \
+                  the front, keeping the newest tail"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "VideoTapSlot",
+        action = "BuggyEvictionUnreported",
+        reason = "Buggy=1 negative control only; every eviction increments the returned count \
+                  that becomes the take's head_truncated"
+    )
+)]
 pub fn ordered_capture_store_push(
     store: &mut VecDeque<CapturedFrame>,
     store_bytes: &mut usize,
@@ -318,6 +345,15 @@ pub struct VideoSlotDecision {
         project = "aterm_gpu::video_tap::video_slot_transition"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "VideoTapSlot",
+        action = "BuggyMapErrorLeaksSlot",
+        reason = "Buggy=1 negative control only; a map failure frees the slot as it counts the \
+                  loss"
+    )
+)]
 #[must_use]
 pub const fn video_slot_transition(
     phase: VideoSlotPhase,
@@ -357,6 +393,15 @@ pub enum VideoPresentDecision {
         machine = "VideoTapSlot",
         action = "RejectInvalidMetadata",
         project = "aterm_gpu::video_tap::video_present_decision"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "VideoTapSlot",
+        action = "BuggyRejectInvalidUncounted",
+        reason = "Buggy=1 negative control only; an accepted sample with invalid metadata is \
+                  classified as a counted loss, never as decimation"
     )
 )]
 #[must_use]
@@ -425,6 +470,7 @@ impl SlotBuf {
     /// Whether this slot stages through the wgpu arm — the cross-arm enqueue
     /// guards' neutral spelling (compiles on the wgpu-free build, where it is
     /// constantly false).
+    #[cfg(target_os = "macos")]
     fn is_wgpu(&self) -> bool {
         #[cfg(wgpu_arm)]
         {
@@ -452,8 +498,11 @@ impl SlotBuf {
 /// Per-window recording state. Owned by the window's GPU state; `None` = off.
 pub struct VideoTap {
     slots: Vec<Slot>,
-    /// Map-completion channel: the map_async callback sends its slot index.
+    /// Map-completion channel: the map_async callback sends its slot index
+    /// (the wgpu arm's readback; the Metal arm's slots complete in place).
+    #[cfg(wgpu_arm)]
     done_tx: mpsc::Sender<(usize, bool)>,
+    #[cfg(wgpu_arm)]
     done_rx: mpsc::Receiver<(usize, bool)>,
     store: VecDeque<CapturedFrame>,
     store_bytes: usize,
@@ -494,7 +543,9 @@ pub struct VideoTap {
     /// Dedicated conversion lane: the per-pixel decode/tonemap/downscale runs
     /// on this worker so `after_present` never pays per-pixel work on the
     /// present thread. `None` — spawn failed, or the worker died mid-take —
-    /// falls back to the old inline conversion.
+    /// falls back to the old inline conversion. There is no worker on wasm
+    /// (single-threaded; see `spawn_convert_worker`).
+    #[cfg(not(target_arch = "wasm32"))]
     worker: Option<ConvertWorker>,
 }
 
@@ -510,12 +561,14 @@ pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 /// far behind means conversion cannot keep pace with presents — the recorder
 /// discipline then counts a drop rather than ever blocking (or slowing) the
 /// present thread the way the old inline conversion did.
+#[cfg(not(target_arch = "wasm32"))]
 const CONVERT_BACKLOG: usize = RING;
 
 /// One mapped slot's RAW padded bytes en route to the conversion worker, with
 /// the per-frame facts the pure [`mapped_to_rgba8`] needs. Per-tap geometry
 /// and format travel in the worker's closure instead — they are fixed for a
 /// recording's lifetime (a mid-capture resize finalizes the tap).
+#[cfg(not(target_arch = "wasm32"))]
 struct ConvertJob {
     raw: Vec<u8>,
     seq: u64,
@@ -527,6 +580,7 @@ struct ConvertJob {
 /// as long as the tap (its job sender drops with the tap / at `finish`), runs
 /// [`mapped_to_rgba8`] per job, and answers with `Some(frame)` or `None` on a
 /// conversion error (adopted as one counted mid-stream loss).
+#[cfg(not(target_arch = "wasm32"))]
 struct ConvertWorker {
     job_tx: mpsc::Sender<ConvertJob>,
     result_rx: mpsc::Receiver<Option<CapturedFrame>>,
@@ -535,31 +589,15 @@ struct ConvertWorker {
     handle: std::thread::JoinHandle<()>,
 }
 
-/// The wasm arm of [`spawn_convert_worker`]: there is no worker, and the
-/// harvest converts inline on the present thread — exactly the fallback the
-/// non-wasm arm documents for a platform that cannot spawn.
-///
-/// A separate item rather than a branch inside one, because the wasm census's
-/// OB-12 reads thread vocabulary as a POSTURE claim: the shipped wasm closure
-/// is single-threaded, which is what makes its lock-order obligation vacuous.
-/// A `thread::Builder` token anywhere in that closure — even on a branch wasm
-/// never takes — is an unproven posture, and the census says so rather than
-/// guessing.
-#[cfg(target_arch = "wasm32")]
-fn spawn_convert_worker(
-    _src_w: u32,
-    _src_h: u32,
-    _padded_row: usize,
-    _format: crate::device_layer::TexelFormat,
-    _half_res: bool,
-) -> Option<ConvertWorker> {
-    None
-}
-
 /// Spawn the dedicated conversion worker for one recording. `None` when the
 /// platform cannot spawn a thread (thread exhaustion) — the harvest then
 /// falls back to converting inline on the present thread, the old behavior.
-/// wasm has no worker at all; see the arm above.
+///
+/// wasm has no worker at all: the harvest converts inline on the present
+/// thread. The whole lane is compiled out there rather than stubbed, because
+/// the wasm census's OB-12 reads thread vocabulary as a POSTURE claim — the
+/// shipped wasm closure is single-threaded, which is what makes its
+/// lock-order obligation vacuous.
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_convert_worker(
     src_w: u32,
@@ -568,7 +606,6 @@ fn spawn_convert_worker(
     format: crate::device_layer::TexelFormat,
     half_res: bool,
 ) -> Option<ConvertWorker> {
-    #[cfg(not(target_arch = "wasm32"))]
     {
         let (job_tx, job_rx) = mpsc::channel::<ConvertJob>();
         let (result_tx, result_rx) = mpsc::channel::<Option<CapturedFrame>>();
@@ -605,11 +642,6 @@ fn spawn_convert_worker(
             pending: 0,
             handle,
         })
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (src_w, src_h, padded_row, format, half_res);
-        None
     }
 }
 
@@ -826,9 +858,11 @@ impl VideoTap {
         let size = padded * src_h as u64;
         // A stride that does not fit `usize` cannot be converted on ANY thread;
         // the (unreachable in practice) fallback keeps the old inline path.
+        #[cfg(not(target_arch = "wasm32"))]
         let worker = usize::try_from(padded)
             .ok()
             .and_then(|row| spawn_convert_worker(src_w, src_h, row, format, opts.half_res));
+        #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
         let slots = (0..RING)
             .map(|i| Slot {
@@ -843,7 +877,9 @@ impl VideoTap {
             .collect();
         Ok(Self {
             slots,
+            #[cfg(wgpu_arm)]
             done_tx,
+            #[cfg(wgpu_arm)]
             done_rx,
             store: VecDeque::new(),
             store_bytes: 0,
@@ -864,6 +900,7 @@ impl VideoTap {
             mixed_capture_encoding: false,
             bpp,
             resized_early_stop: false,
+            #[cfg(not(target_arch = "wasm32"))]
             worker,
         })
     }
@@ -994,9 +1031,11 @@ impl VideoTap {
         let padded = padded_row_bytes(src_w, bpp);
         let size = usize::try_from(padded * u64::from(src_h))
             .map_err(|_| "video: staging size overflows usize".to_owned())?;
+        #[cfg(not(target_arch = "wasm32"))]
         let worker = usize::try_from(padded)
             .ok()
             .and_then(|row| spawn_convert_worker(src_w, src_h, row, format, opts.half_res));
+        #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
         let mut slots = Vec::with_capacity(RING);
         for _ in 0..RING {
@@ -1010,7 +1049,9 @@ impl VideoTap {
         }
         Ok(Self {
             slots,
+            #[cfg(wgpu_arm)]
             done_tx,
+            #[cfg(wgpu_arm)]
             done_rx,
             store: VecDeque::new(),
             store_bytes: 0,
@@ -1031,6 +1072,7 @@ impl VideoTap {
             mixed_capture_encoding: false,
             bpp,
             resized_early_stop: false,
+            #[cfg(not(target_arch = "wasm32"))]
             worker,
         })
     }
@@ -1501,6 +1543,7 @@ impl VideoTap {
         t_us: u64,
         capture_encoding: CaptureEncoding,
     ) -> Option<CapturedFrame> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(worker) = self.worker.as_mut() {
             if worker.pending >= CONVERT_BACKLOG {
                 self.dropped += 1;
@@ -1534,6 +1577,7 @@ impl VideoTap {
     /// ordered, budgeted store. A conversion failure is one counted mid-stream
     /// loss, exactly like a map failure.
     fn adopt_converted(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
         loop {
             let Some(worker) = self.worker.as_mut() else {
                 return;
@@ -1609,7 +1653,11 @@ impl VideoTap {
     /// synchronous harvest (a conversion failure later books a drop instead).
     #[must_use]
     pub fn frames_so_far(&self) -> usize {
-        self.store.len() + self.worker.as_ref().map_or(0, |worker| worker.pending)
+        #[cfg(not(target_arch = "wasm32"))]
+        let dispatched = self.worker.as_ref().map_or(0, |worker| worker.pending);
+        #[cfg(target_arch = "wasm32")]
+        let dispatched = 0;
+        self.store.len() + dispatched
     }
 
     /// Finalize: BLOCKING drain of in-flight maps and dispatched conversions
@@ -1673,6 +1721,7 @@ impl VideoTap {
     /// its queue dry and exit; every outstanding result is adopted here. A
     /// worker that died with jobs outstanding is counted honestly.
     fn drain_convert_lane(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(ConvertWorker {
             job_tx,
             result_rx,
@@ -1819,6 +1868,32 @@ pub struct PresentedFrameDecision {
         project = "aterm_gpu::video_tap::presented_frame_transition"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "PresentedFrameTap",
+        action = "BuggyMapErrorPublishesFrame",
+        reason = "Buggy=1 negative control only; the MapError arm completes with an Error, never \
+                  a Frame"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "PresentedFrameTap",
+        action = "BuggyRejectReservesSlot",
+        reason = "Buggy=1 negative control only; the RejectEnqueue arm completes the one-shot \
+                  instead of reserving the staging buffer"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "PresentedFrameTap",
+        action = "BuggyMapErrorWithoutOutcome",
+        reason = "Buggy=1 negative control only; every terminal arm carries its Frame or Error"
+    )
+)]
 #[must_use]
 pub const fn presented_frame_transition(
     phase: PresentedFramePhase,
@@ -1878,7 +1953,9 @@ impl PresentedFrameState {
 /// consuming or perturbing each other's state.
 pub(crate) struct PresentedFrameTap {
     buffer: SlotBuf,
+    #[cfg(wgpu_arm)]
     done_tx: mpsc::Sender<bool>,
+    #[cfg(wgpu_arm)]
     done_rx: mpsc::Receiver<bool>,
     state: PresentedFrameState,
     result: Option<Result<CapturedFrame, String>>,
@@ -1915,10 +1992,13 @@ impl PresentedFrameTap {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         }));
+        #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
         Ok(Self {
             buffer,
+            #[cfg(wgpu_arm)]
             done_tx,
+            #[cfg(wgpu_arm)]
             done_rx,
             state: PresentedFrameState::Armed,
             result: None,
@@ -1956,13 +2036,16 @@ impl PresentedFrameTap {
         }
         let size = usize::try_from(size)
             .map_err(|_| "presented snapshot: staging size overflows usize".to_string())?;
+        #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
         Ok(Self {
             buffer: SlotBuf::Metal {
                 buf: crate::metal::resources::SharedBuffer::new(mint.buffer(size)?),
                 probe: None,
             },
+            #[cfg(wgpu_arm)]
             done_tx,
+            #[cfg(wgpu_arm)]
             done_rx,
             state: PresentedFrameState::Armed,
             result: None,
@@ -2535,10 +2618,13 @@ mod tests {
     /// `should_capture` touch no slot/GPU state). `budget_bytes` is taken
     /// verbatim — no 16 MiB floor — so a tiny test budget actually evicts.
     fn test_tap(budget_bytes: usize, fps_cap: Option<u32>) -> VideoTap {
+        #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
         VideoTap {
             slots: Vec::new(),
+            #[cfg(wgpu_arm)]
             done_tx,
+            #[cfg(wgpu_arm)]
             done_rx,
             store: VecDeque::new(),
             store_bytes: 0,
@@ -2559,6 +2645,7 @@ mod tests {
             mixed_capture_encoding: false,
             bpp: 4,
             resized_early_stop: false,
+            #[cfg(not(target_arch = "wasm32"))]
             worker: None,
         }
     }

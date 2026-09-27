@@ -73,10 +73,13 @@ const CLAIMS_DIR: &str = "claims";
 /// must be parked ([`hold`]) for as long as the process answers to the id. It is
 /// deliberately not `Clone` — two holders is the bug.
 pub(crate) struct Claim {
-    /// The locked claim file, held open so the lock stays taken.
+    /// The locked claim file, held open so the lock stays taken. Unix reads it in
+    /// `Drop` to unlock; on Windows the open handle's share mode IS the claim.
+    #[cfg_attr(
+        windows,
+        expect(dead_code, reason = "held for its close: the open handle is the claim")
+    )]
     file: std::fs::File,
-    /// The id this claim covers, for diagnostics.
-    sid: String,
 }
 
 /// The drop releases the claim at once: `LOCK_UN`, not the close — a child another
@@ -87,14 +90,6 @@ impl Drop for Claim {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = self.file.unlock();
-    }
-}
-
-impl Claim {
-    /// The id this claim covers.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn sid(&self) -> &str {
-        &self.sid
     }
 }
 
@@ -205,10 +200,7 @@ pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
     // conclude anything from this pid: it is whatever process last won, which
     // after a crash is a process that no longer exists.
     let _ = write_pid(&file);
-    ClaimOutcome::Held(Claim {
-        file,
-        sid: sid.as_str().to_string(),
-    })
+    ClaimOutcome::Held(Claim { file })
 }
 
 /// Whether a session id is already served by a LIVE instance other than this one,
@@ -225,7 +217,7 @@ pub(crate) fn live_holder_in(dir: &Path, sid: &SessionId) -> Option<u32> {
 }
 
 /// The well-known per-user control directory, unmodified — the ONE place every
-/// instance contends, whatever `$ATERM_CONTROL_SOCK` says about where its own
+/// instance contends, whatever `--control-sock` says about where its own
 /// socket lives. Read-only: no `ensure_private_dir` here, so a probe on the
 /// dispatch path costs no `mkdir`/`chmod`/`stat`; [`claim_in`] tightens the
 /// subdirectory it actually writes into.
@@ -501,6 +493,19 @@ mod tests {
         aterm_tempfile::tempdir().expect("scratch control dir")
     }
 
+    /// A pid that is alive on every host and is never this process: 1
+    /// (init/launchd) on Unix. On Windows pid 1 is not a process at all —
+    /// `OpenProcess` fails with ERROR_INVALID_PARAMETER, so `pid_alive` reads it
+    /// dead (measured) — and 4, the System process, is the one every boot has
+    /// (its `OpenProcess` fails ERROR_ACCESS_DENIED, which `pid_alive` counts
+    /// as alive, as `kill(pid, 0)`'s `EPERM` is).
+    const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
+
+    /// A discovery entry a live foreign instance would have written.
+    fn live_foreign_entry() -> String {
+        format!("sock /nonexistent/aterm.sock\nnonce ab\npid {LIVE_FOREIGN_PID}\n")
+    }
+
     /// THE COLLISION, in one process: two aterms launched from the same shell read
     /// the SAME `$ATERM_SESSION_ID` premint, and only one of them may answer to it.
     ///
@@ -517,7 +522,6 @@ mod tests {
             ClaimOutcome::Held(c) => c,
             _ => panic!("the first claimant must win"),
         };
-        assert_eq!(first.sid(), sid.as_str());
         assert!(
             matches!(claim_in(d.path(), &sid), ClaimOutcome::Taken),
             "a second live claimant on one id must be refused, not served"
@@ -628,7 +632,7 @@ mod tests {
         // holder, so `holders` does not move.
         release_claims_for_test();
         // The successor is a DIFFERENT process, so its entry names a different
-        // live pid — pid 1 exists on every unix and is never us. Writing our
+        // live pid (`LIVE_FOREIGN_PID`, never us). Writing our
         // OWN pid here would prove nothing: an instance must not read its own
         // entry as a rival, which is the rule
         // `a_live_discovery_entry_holds_an_id_a_dead_one_does_not` pins, and a
@@ -637,7 +641,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("graph")).expect("graph dir");
         std::fs::write(
             d.path().join("graph").join(handed.as_str()),
-            "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n",
+            live_foreign_entry(),
         )
         .expect("plant the successor's entry");
         assert!(
@@ -760,13 +764,12 @@ mod tests {
             "an instance must not read its own discovery entry as a rival"
         );
 
-        // A LIVE foreign pid: pid 1 exists on every unix and is never us.
+        // A LIVE foreign pid (`LIVE_FOREIGN_PID`: alive on every host, never us).
         let foreign = d.path().join("graph").join(sid.as_str());
-        std::fs::write(&foreign, "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n")
-            .expect("plant a foreign entry");
+        std::fs::write(&foreign, live_foreign_entry()).expect("plant a foreign entry");
         assert_eq!(
             live_holder_in(d.path(), &sid),
-            Some(1),
+            Some(LIVE_FOREIGN_PID),
             "a live foreign holder must be reported"
         );
         assert!(

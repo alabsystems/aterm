@@ -68,11 +68,23 @@ pub enum Tier {
     /// `RuntimeFallback::embedded_decisions`. Reachable WHENEVER the runtime tier
     /// is enabled at all, sealed or not. THIS is the tier the tofu bug lost.
     RuntimeEmbedded = 6,
+    /// The LAST-RESORT fontless symbol synthesis (`crate::procedural::covers_symbol`):
+    /// media controls, geometric shapes, check marks — drawn from the cell
+    /// geometry only when every face above has missed (the `⏵⏵ bypass
+    /// permissions on` tofu: no installed face on a bare Linux covers U+23F5),
+    /// or when the only cover is the colour face's monochrome SILHOUETTE of a
+    /// default-text point (see `resolve_chain`: Noto's key-cap emoji make that
+    /// silhouette a solid square).
+    /// I/O-free and host-independent, so it is reachable under EVERY policy —
+    /// including the E1 no-runtime host, whose real miss is still REPORTED to
+    /// the host (`glyph_key_inner` records the missing class) so it can inject
+    /// a real face, which then outranks this tier on re-resolution.
+    Synthetic = 7,
 }
 
 impl Tier {
     /// Number of tiers — the exact bound on [`resolve_chain`]'s probe count.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// This tier's bit in a coverage bitvector.
     #[must_use]
@@ -220,7 +232,9 @@ pub const fn reachable_mask(policy: ChainPolicy) -> u8 {
         | Tier::Primary.bit()
         | Tier::Fallback.bit()
         | Tier::Symbol.bit()
-        | Tier::Color.bit();
+        | Tier::Color.bit()
+        // Fontless and I/O-free: no switch can close it.
+        | Tier::Synthetic.bit();
     if !policy.runtime_discovery {
         // The E1 host switch: no runtime tier at all, so a miss can reach
         // `take_missing_font_classes` and the host injects the face.
@@ -281,12 +295,22 @@ pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy)
     // ONE colour-vs-text policy place — the already-proven presentation gate.
     let color_has = probe.covers(Tier::Color);
     let face = crate::select_face(false, false, false, false, color_has, policy.wants_emoji);
+    // A default-TEXT point only the colour face covers would draw that face's
+    // monochrome SILHOUETTE. For a symbol the synthesis draws, the synthesis is
+    // the better stand-in: Noto Color Emoji — the Linux colour face — paints
+    // ⏸ ⏹ ⏺ ⏭ ⏮ ⏯ on a filled rounded-square key cap, so their silhouette is
+    // a SOLID SQUARE, and Claude Code's `⏺` tool bullet rendered as `■`
+    // (measured on the reporting host). Probing Synthetic here, and never again
+    // below, keeps P2's strict order (Color=4 → Synthetic=7).
+    if matches!(face, FaceId::ColorEmojiMono) && probe.covers(Tier::Synthetic) {
+        return Resolution::Face(FaceId::Procedural);
+    }
     if !matches!(face, FaceId::Primary) {
         return Resolution::Face(face);
     }
     // ---- the give-up path: the two INDEPENDENT gates, deliberately not merged ----
     if !policy.runtime_discovery {
-        return Resolution::Notdef;
+        return synthetic_or_notdef(probe);
     }
     if !policy.sealed && probe.covers(Tier::RuntimeDecisions) {
         return Resolution::Runtime(RuntimeLane::Decisions);
@@ -297,10 +321,21 @@ pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy)
     if probe.covers(Tier::RuntimeEmbedded) {
         return Resolution::Runtime(RuntimeLane::EmbeddedDecisions);
     }
-    Resolution::Notdef
+    synthetic_or_notdef(probe)
 }
 
-/// A symbolic/enumerable coverage oracle: coverage as a 7-bit vector, the two
+/// The chain's final tier, shared by both give-up exits: the fontless symbol
+/// synthesis, else the honest `.notdef`. It is the HIGHEST tier index, so
+/// probing it last keeps P2's strict order on either exit.
+fn synthetic_or_notdef<P: ChainProbe + ?Sized>(probe: &mut P) -> Resolution {
+    if probe.covers(Tier::Synthetic) {
+        Resolution::Face(FaceId::Procedural)
+    } else {
+        Resolution::Notdef
+    }
+}
+
+/// A symbolic/enumerable coverage oracle: coverage as an 8-bit vector, the two
 /// lazy-parse flags as 2 bits, plus the PROBE LOG that makes P2 checkable.
 /// Shared by the proofs and the Tier-1 lattice test so both check the same thing.
 #[derive(Clone, Copy, Debug)]
@@ -393,8 +428,8 @@ impl DecisionCells {
 /// so `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh` discharges them.
 ///
 /// Bounds and why they are complete, not a sample: the chain has exactly
-/// [`Tier::COUNT`] = 7 tiers, so coverage is a 7-bit symbolic vector (2^7);
-/// the lazy-parse state is 2 bits (2^2); the policy is 3 bools (2^3). 4096
+/// [`Tier::COUNT`] = 8 tiers, so coverage is an 8-bit symbolic vector (2^8);
+/// the lazy-parse state is 2 bits (2^2); the policy is 4 bools (2^4). 16384
 /// states — the WHOLE input space of the decision, with no abstraction gap on
 /// the policy side. The abstraction is only "a face either covers a code point
 /// or it does not", which is exactly what every real probe returns.
@@ -410,13 +445,14 @@ mod kani_proofs {
             runtime_discovery: kani::any(),
             sealed: kani::any(),
             wants_emoji: kani::any(),
+            prefers_symbol: kani::any(),
         }
     }
 
     fn any_covered() -> u8 {
-        let covered: u8 = kani::any();
-        kani::assume(covered < 1 << Tier::COUNT);
-        covered
+        // `Tier::COUNT` is 8, so every `u8` is a coverage vector.
+        const _: () = assert!(Tier::COUNT == 8);
+        kani::any()
     }
 
     fn any_pending() -> u8 {

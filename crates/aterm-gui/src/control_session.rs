@@ -21,7 +21,7 @@ use crate::input::InputEvent;
 use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::{ExitActor, SessionHandle, Store};
 use crate::session_timeline::{
-    MetaEdit, MetaField, MetaWriteError, apply_meta_value, write_session_meta,
+    MetaEdit, MetaField, MetaWriteError, QUESTIONS_USAGE, apply_meta_value, write_session_meta,
 };
 use crate::{SessionCtx, term_lock};
 
@@ -29,13 +29,15 @@ use crate::{SessionCtx, term_lock};
 /// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>
 /// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> identity=<name|->
 /// path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|->
-/// agent_rev=<n> agent_since_ms=<ms>`.
+/// agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|->
+/// path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|->
+/// upgrade=<-|<state>/<to>/<why>/<age>>`.
 /// On a single-session window this is exactly one line == the lone session (the
 /// zero-regression base case). The store snapshot is cloned out before formatting,
 /// so this never holds the registry lock across a `Terminal` lock.
 ///
 /// `meta=<1|0>` (session-metadata stage 1) is a TRAILING additive token: `1` iff
-/// any USER metadata (`meta set title|description|icon|role|attention`) is set, so a fleet
+/// any USER metadata (`meta set title|description|icon|role|attention|questions`) is set, so a fleet
 /// driver knows which sessions to `@<sid> meta` without N round-trips. Safe to
 /// append: the title token before it is pct-encoded (never contains a space) and
 /// the one shipping parser (aterm-ctl `ls`) prints the line verbatim, keying only
@@ -68,14 +70,24 @@ use crate::{SessionCtx, term_lock};
 /// session and `agent=-` for anything that is not an identified agent.
 ///
 /// `path=<frozen|live>` (2026-09-22) was the last column until then: whether the session's
-/// shell fronts aterm's managed `agents/` on PATH. `frozen` is the registry's
+/// shell fronts aterm's managed `agents/` on PATH. `frozen` began as the registry's
 /// adoption mark ([`crate::session_store::SessionStore::has_frozen_path`]): a
 /// shell spawned by a build before the self-healing sessions (2026-09-16) and
 /// carried across every update since, so `claude`/`codex` typed in it run the
-/// foreign copies until `. ~/.aterm/shell.d/00-atpkg.zsh` is typed there. It is
-/// an UPPER BOUND, the same one the managed-current row's "N tab(s) from before
-/// this update" count is: sourcing the hook is not reported back by the shell,
-/// so the mark leaves with the tab. Until this column, that count named no tab —
+/// foreign copies. It was an UPPER BOUND that only closing the tab lowered —
+/// until 2026-09-24, when a tab the live upgrade had healed a day earlier still
+/// read `frozen` (gap audit). Now it is MEASURED where it can be: the
+/// environment of a program the shell itself started names the PATH the shell
+/// exports; a live reading wins over the mark and lowers it, a frozen one is
+/// believed once a second job agrees and never raises the mark (one job's
+/// `PATH=` override reads frozen)
+/// ([`crate::session_timeline::SessionTimeline::owner_columns`]);
+/// `path_evidence=` says which (`measured:<ms>` ago, `unconfirmed:<ms>`,
+/// `carried`, `-`). `copy=`
+/// names which build an agent in front runs (`managed` from the store,
+/// `foreign` — the native install, a brew cask), and `upgrade=` the live
+/// upgrade of the conversation in the tab. Until the `path=` column, the
+/// managed row's count named no tab —
 /// an agent reading the roster could not tell WHICH session still ran the
 /// native `claude` without running `pkg doctor` inside each one (measured
 /// 2026-09-22: a tab from 2026-09-10, adopted through six updates, had run the
@@ -260,22 +272,26 @@ pub(crate) fn sessions_lines(
             .identity
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
-        let path = if frozen_path(h.local_id) {
-            "frozen"
-        } else {
-            "live"
-        };
         // THE PROGRAM AND THE AGENT VERDICT, after `path=`: the status sweep's
         // publication on the session timeline (a leaf lock, no hop), the same
         // five fields `status` prints — so a fleet read names every agent tab
-        // and what it waits on, adopted tabs included.
-        let agent = h
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent()
-            .wire_fields();
+        // and what it waits on, adopted tabs included. From the same read,
+        // `path=` itself — MEASURED where a child of the shell was read, else
+        // the carried mark — and the owner's columns that close the row
+        // (`path_evidence= copy= upgrade=`, gap audit 2026-09-24).
+        let (agent, (path, owner)) = {
+            let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                timeline.agent().wire_fields(),
+                timeline.owner_columns(frozen_path(h.local_id), crate::upgrade_host::now_s()),
+            )
+        };
+        // `human_ms=<ms|->`: how long since a PERSON last had a hand on the
+        // session through a window — the same atomic `status` reads.
+        let human = format!(
+            "human_ms={}",
+            h.ctx.human_input.wire(crate::metrics::now_us())
+        );
         // `supervisor=<holder|->` LAST: the live supervisor claim, so a fleet
         // read shows which agent tabs something is answering for.
         let supervisor = h
@@ -288,7 +304,7 @@ pub(crate) fn sessions_lines(
         out.push_str(&format!(
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
              wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
-             supervisor={supervisor}\n",
+             {human} supervisor={supervisor} {owner}\n",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -320,8 +336,8 @@ pub(crate) fn sessions_lines(
 /// so a session being driven reads `driving=<id> watchers>=1`. That is honest —
 /// the driver is watching for the reply — not double-counting an external peer.
 /// `fgpgid` is the PTY master's foreground process group, or `-` when the
-/// kernel cannot read it. The harness's upgrade sweep (`upgrade_drive`'s host
-/// roster) pairs it with a Claude process's own
+/// kernel cannot read it. The harness's live upgrade and relaunch
+/// (`upgrade_drive`'s host roster) pair it with a Claude process's own
 /// group and controlling-terminal foreground group; unlike the process's
 /// environment, these kernel identities remain readable on macOS.
 pub(crate) fn cmd_who(store: &Store, subscribers: &crate::subscribe::Subscribers) -> String {
@@ -1106,20 +1122,21 @@ const AGENT_WORDS: [&str; 7] = [
 /// `wall` for any `wall:<kind>` verdict, `wall:<kind>` for that one (the
 /// kinds are `aterm_phase::WallKind::name`'s: `usage-session`,
 /// `usage-weekly`, `model-bucket`, `spend`, `context`, `auth`, `api-error`,
-/// `overloaded`). A `<kind>` of the right shape that no wall carries parks to
+/// `overloaded`, `memory` — Claude Code's critical-memory banner — and the
+/// server's own `unresponsive`, a program that has stopped reading its
+/// input). A `<kind>` of the right shape that no wall carries parks to
 /// its timeout rather than being refused: a newer reader may name one this
-/// build does not. `limited` is kept as a DEPRECATED alias for the limit
-/// walls ([`crate::presence::wall_kind_is_limit`]: the usage windows, a model
-/// bucket, spend) — the verdict word it awaited before the walls were named,
-/// so a script written against it still latches where it used to.
+/// build does not. `limited`, the verdict word before the walls were named,
+/// is `ERR usage` like any unknown word: its deprecated alias meant the limit
+/// walls MINUS an API 429, which is neither what `level=limited` (any wall)
+/// nor the band's `limited` (the limit walls with a 429) means — `wall` or
+/// `wall:<kind>` says which.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AgentWord {
     /// One of [`AGENT_WORDS`].
     Verdict(&'static str),
     /// `wall` (`None`) or `wall:<kind>`.
     Wall(Option<String>),
-    /// The deprecated `limited`: any limit wall.
-    Limited,
 }
 
 impl AgentWord {
@@ -1128,9 +1145,6 @@ impl AgentWord {
             Self::Verdict(w) => *w == word,
             Self::Wall(None) => word.starts_with("wall:"),
             Self::Wall(Some(kind)) => word.strip_prefix("wall:") == Some(kind.as_str()),
-            Self::Limited => word
-                .strip_prefix("wall:")
-                .is_some_and(crate::presence::wall_kind_is_limit),
         }
     }
 }
@@ -1144,8 +1158,6 @@ fn parse_agent_words(list: &str) -> Option<Vec<AgentWord>> {
     for w in list.split(',') {
         let word = if w == "wall" {
             AgentWord::Wall(None)
-        } else if w == "limited" {
-            AgentWord::Limited
         } else if let Some(kind) = w.strip_prefix("wall:") {
             let ok = (1..=32).contains(&kind.len())
                 && kind.bytes().all(|b| {
@@ -1865,7 +1877,7 @@ pub(crate) fn cmd_turn_guarded(
     use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [yield=<floor>] <text>\n";
+    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [yield=<floor>] [if-gen=<epoch>.<seq>] <text>\n";
     /// Echo-settle window: the paste burst has been ingested and painted.
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     /// Echo phase cap — a busy app (spinner mid-turn) may never go echo-quiet;
@@ -1907,6 +1919,10 @@ pub(crate) fn cmd_turn_guarded(
     let mut typed = false;
     let mut cadence_ms = TYPED_CADENCE_MS;
     let mut yield_floor: Option<f32> = None;
+    // `if-gen=<epoch>.<seq>`: type only while the screen is still the
+    // generation the caller judged — checked after the yield, immediately
+    // before the paste. None => no precondition.
+    let mut if_gen: Option<crate::control::ScreenGen> = None;
     let mut text = rest.trim_start();
     loop {
         let (tok, tail) = match text.split_once(char::is_whitespace) {
@@ -1980,6 +1996,10 @@ pub(crate) fn cmd_turn_guarded(
             "yield" => match v.parse::<f32>() {
                 Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
                 _ => return USAGE.to_string(),
+            },
+            "if-gen" => match crate::control::ScreenGen::parse(v) {
+                Some(generation) => if_gen = Some(generation),
+                None => return USAGE.to_string(),
             },
             _ => break, // not an option: the message itself starts with `word=…`
         }
@@ -2135,6 +2155,32 @@ pub(crate) fn cmd_turn_guarded(
             MomentumWait::Exited => return "ERR exited\n".to_string(),
             MomentumWait::Unreadable(e) => return format!("ERR yield: {e}\n"),
         }
+        // The dispatch asked the unread-input gate when this turn ARRIVED; the
+        // yield can outlast `REFUSE_AFTER` (τ = 2 s), so a byte young then is
+        // stale now. Asked again before the first byte (2026-09-24, S4 review).
+        if let Some(refusal) = crate::input_stall::refusal(ctx, "turn", "", false) {
+            return refusal;
+        }
+    }
+
+    // ── the precondition: `if-gen=`. The caller read the screen, judged it
+    // (an empty composer, no box) and asked to type into THAT screen; any
+    // output since — a person's keystroke echoed, a box drawn, a repaint —
+    // moved the generation, and nothing is typed: the caller reads again.
+    // Checked AFTER the yield (a person typing during the park moves it too)
+    // and under the terminal lock, immediately before the paste is handed to
+    // the input seam. The seam's own write is not under that hold (it cannot
+    // be: the seam routes through the event loop or the source-blind sink),
+    // so what is left is the seam's hand-off — not the caller's whole
+    // read-judge-type round trip, which is what the fence closes. ──
+    if let Some(generation) = if_gen {
+        let terminal = term_lock(term);
+        if crate::control::screen_gen(&terminal) != generation {
+            let seq = terminal.content_seq();
+            return format!(
+                "OK 0 turn skipped reason=changed submitted=0 seq={seq} id={turn_id}\n"
+            );
+        }
     }
 
     // ── phase 1: type. Paste semantics by default; the seam strips control
@@ -2222,6 +2268,12 @@ pub(crate) fn cmd_turn_guarded(
                 .count()
         };
         for press_no in 0..presses {
+            // A re-press is for an Enter the program READ and swallowed; one
+            // still unread in its queue would only stack another behind it
+            // (2026-09-24, `input_stall::repress_would_queue`).
+            if press_no > 0 && crate::input_stall::repress_would_queue(&ctx.sink) {
+                break;
+            }
             let base_block = commands_started(&term_lock(term));
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
             // Arm BEFORE the press so the press's own content change latches it
@@ -2532,10 +2584,11 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 /// * bare `meta` (Read): one status line joining the ENGINE identity (live OSC
 ///   title, reported cwd, lifecycle state) with the USER identity (`meta set`
 ///   fields) — `OK title=<pct> user_title=<pct|-> description=<pct|-> icon=<pct|->
-///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`. Every free-text
-///   value is pct-encoded so the reply is always ONE line; `-` marks an unset
-///   optional.
-/// * `meta set <title|description|icon|role|attention> <text...>`
+///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`, then the additive
+///   tail `attention_owner= attention_owners= supervisor= questions=`. Every
+///   free-text value is pct-encoded so the reply is always ONE line; `-` marks
+///   an unset optional. Readers find a field BY KEY.
+/// * `meta set <title|description|icon|role|attention|questions> <text...>`
 ///   (write-escalated by the dispatch gate): stamp the operator's identity on
 ///   the session. Byte caps (after trim): title ≤ 120, description ≤ 1024,
 ///   icon ≤ 64, role ≤ 64, attention ≤ 256 — over-cap is a hard ERR, never a
@@ -2544,8 +2597,16 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 ///   characters are rejected rather than silently stored. The user title
 ///   OUTRANKS the OSC title in tab labels. `role operator` designates the
 ///   fleet operator to the menu-bar status item; a non-empty `attention` is
-///   the typed needs-human escalation it badges and lists.
-/// * `meta unset <field>` — clear a field (labels fall back down the chain).
+///   the typed needs-human escalation it badges and lists. `questions` is a
+///   CLOSED set, not text: `ask|recommended` (case folded, stored
+///   lowercase) — how the in-window supervisor treats this session's Claude
+///   Code question dialog, over `[harness] answer_questions` (`ask` hands it
+///   to a person, `recommended` answers it with its recommended option); any
+///   other value is `ERR usage: meta set questions …`
+///   ([`QUESTIONS_USAGE`]). Writing it is Owner-only
+///   ([`meta_questions_denied`], answered before this handler).
+/// * `meta unset <field>` — clear a field (labels fall back down the chain;
+///   `meta unset questions` hands the session back to the global setting).
 ///
 /// Returns `(reply, changed)`: `changed` is `true` only when a stored value
 /// ACTUALLY moved — the dispatch arm keys its side-effects (tab-strip repaint
@@ -2565,14 +2626,16 @@ pub(crate) fn cmd_meta(
         Some("set") => {
             let Some(field) = toks.next() else {
                 return (
-                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n"
+                    "ERR usage: meta set <title|description|icon|role|attention|questions> \
+                     <text...>\n"
                         .to_string(),
                     false,
                 );
             };
             let Some(typed) = MetaField::parse(field) else {
                 return (
-                    "ERR unknown meta field (title|description|icon|role|attention)\n".to_string(),
+                    "ERR unknown meta field (title|description|icon|role|attention|questions)\n"
+                        .to_string(),
                     false,
                 );
             };
@@ -2605,9 +2668,17 @@ pub(crate) fn cmd_meta(
             match write_session_meta(ctx, typed, MetaEdit::Set(value)) {
                 Ok(changed) => ("OK\n".to_string(), changed),
                 // On the wire `meta set title ""` is a USAGE ERROR, never a
-                // clear: clearing has its own explicit `meta unset` form.
+                // clear: clearing has its own explicit `meta unset` form. A
+                // bare `meta set questions` names its own closed set.
+                Err(MetaWriteError::NotAQuestionsPolicy) => {
+                    (format!("ERR {QUESTIONS_USAGE}\n"), false)
+                }
+                Err(MetaWriteError::Empty) if typed == MetaField::Questions => {
+                    (format!("ERR {QUESTIONS_USAGE}\n"), false)
+                }
                 Err(MetaWriteError::Empty) => (
-                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n"
+                    "ERR usage: meta set <title|description|icon|role|attention|questions> \
+                     <text...>\n"
                         .to_string(),
                     false,
                 ),
@@ -2628,7 +2699,8 @@ pub(crate) fn cmd_meta(
             };
             let Some(field) = MetaField::parse(field) else {
                 return (
-                    "ERR unknown meta field (title|description|icon|role|attention)\n".to_string(),
+                    "ERR unknown meta field (title|description|icon|role|attention|questions)\n"
+                        .to_string(),
                     false,
                 );
             };
@@ -2690,7 +2762,12 @@ fn attention_owned_reply(
     use crate::session_timeline::AttentionWriteError;
     match result {
         Ok(changed) => ("OK\n".to_string(), changed),
-        Err(AttentionWriteError::Meta(MetaWriteError::Empty)) => (
+        // `NotAQuestionsPolicy` is the `questions` field's refusal and never
+        // comes out of the attention ladder; it reads as the usage line here
+        // rather than a panic, should that ever change.
+        Err(AttentionWriteError::Meta(
+            MetaWriteError::Empty | MetaWriteError::NotAQuestionsPolicy,
+        )) => (
             "ERR usage: meta set attention owner=<k> <text...>\n".to_string(),
             false,
         ),
@@ -2794,6 +2871,25 @@ pub(crate) fn cmd_meta_supervisor(
     }
 }
 
+/// `meta set questions …` / `meta unset questions` from a connection that is
+/// not Owner-class: `ERR denied`. `None` for every other form, so the caller
+/// falls through to [`cmd_meta`], which validates and stores it.
+///
+/// The question policy decides whether the in-window supervisor answers
+/// Claude Code's question box FOR the person — the same authority class as
+/// the supervisor claim ([`cmd_meta_supervisor`]), and for the same reason:
+/// an edge token — even a write edge granted on the session — must not be
+/// able to switch the session's questions from `ask` to answered-without-you.
+/// Reading it (`meta`) stays open to every scope that reads metadata.
+pub(crate) fn meta_questions_denied(scope: Scope, rest: &str) -> Option<(String, bool)> {
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "set" | "unset") || toks.next() != Some("questions") {
+        return None;
+    }
+    (!scope.is_owner_class()).then(|| ("ERR denied\n".to_string(), false))
+}
+
 /// The bare-`meta` status line. Locks are strictly SEQUENTIAL leaves: meta,
 /// then term, then the store read — never nested, so this cannot deadlock
 /// against the render path (meta before term there too) or the registry.
@@ -2822,6 +2918,23 @@ fn meta_status(
         g.by_local(session)
             .map_or_else(|| "-".to_string(), |h| h.state.as_str().to_string())
     };
+    // The foreground program's OWN working directory, read from the OS (a
+    // leaf lock of its own, after the store: never nested). An agent's
+    // folder-trust dialog asks for exactly this folder, and a shell with no
+    // OSC 7 reports no `cwd=` at all (the harness audit, 2026-09-25).
+    let agent_cwd = {
+        let pgid = ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .program_pgid;
+        u32::try_from(pgid)
+            .ok()
+            .filter(|p| *p > 0)
+            .and_then(aterm_sysprobe::process_cwd)
+            .map(|p| p.to_string_lossy().into_owned())
+    };
     // A STORED value of exactly "-" must not read back as the unset sentinel:
     // pct_encode leaves '-' verbatim, so it is escaped here ("%2D") — any
     // percent-decoder recovers it, and `-` stays unambiguous as "unset".
@@ -2831,11 +2944,13 @@ fn meta_status(
         Some(v) => pct_encode(v),
     };
     // After `state=`, additive: which owner's entry `attention=` shows (the bare
-    // owner prints `%2D` by the rule above), how many owners hold one, and the
-    // live supervisor.
+    // owner prints `%2D` by the rule above), how many owners hold one, the
+    // live supervisor, the session's question policy word (2026-09-24), and
+    // the foreground program's own working directory (2026-09-27) — each
+    // appended LAST: every in-tree reader keys, none counts.
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
-         attention_owner={} attention_owners={} supervisor={}\n",
+         attention_owner={} attention_owners={} supervisor={} questions={} agent_cwd={}\n",
         pct_encode(&title),
         opt(meta.user_title.as_deref()),
         opt(meta.description.as_deref()),
@@ -2846,6 +2961,8 @@ fn meta_status(
         opt(attention_owner(&meta)),
         attention_owners(&meta),
         opt(meta.live_supervisor(crate::metrics::now_us())),
+        opt(meta.questions.as_deref()),
+        opt(agent_cwd.as_deref()),
     )
 }
 
@@ -3497,6 +3614,7 @@ pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
         // widen the `exits` wire with a fourth `by=` token, which §11.2 keeps as a
         // separate, low-priority item. `by=-` beside `reason=ctl-close` stays the
         // honest row until then.
+        #[cfg(any(unix, test))]
         Scope::Bridge => ExitActor::Unknown,
         Scope::Edge(presented) => target
             .edges
@@ -3521,6 +3639,7 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
         // The bridge learns it IS the bridge — the one thing a hand-started
         // `aterm-link serve --sock` (an Owner-token client, observer mode) cannot
         // see any other way, and the check it makes before claiming delivery.
+        #[cfg(any(unix, test))]
         Scope::Bridge => "bridge".to_string(),
         Scope::Edge(presented) => {
             let table = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
@@ -3812,6 +3931,8 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            rewrap_gauge: std::sync::Arc::default(),
+            human_input: Default::default(),
         });
         SessionHandle {
             sid,
@@ -3836,10 +3957,10 @@ mod tests {
         }
     }
 
-    /// The published program / agent columns and `supervisor=` (2026-09-23), elided by
-    /// [`tail`] and pinned on their own by
+    /// The published program / agent columns, `human_ms=` (2026-09-24) and
+    /// `supervisor=` (2026-09-23), elided by [`tail`] and pinned on their own by
     /// [`the_roster_carries_the_published_program_and_agent_verdict`].
-    const AGENT_COLUMNS: [&str; 8] = [
+    const AGENT_COLUMNS: [&str; 12] = [
         "program=",
         "agent=",
         "agent_detail=",
@@ -3847,7 +3968,11 @@ mod tests {
         "agent_since_ms=",
         "agent_gen=",
         "agent_fp=",
+        "human_ms=",
         "supervisor=",
+        "path_evidence=",
+        "copy=",
+        "upgrade=",
     ];
 
     /// The tail every line carries, after the sid and with the per-launch
@@ -3892,17 +4017,12 @@ mod tests {
         assert!(!words[2].matches(overloaded));
         // NEGATIVE CONTROL: `wall` is not a prefix match on everything.
         assert!(!words[1].matches("prompt") && !words[1].matches("wallpaper"));
-        // `limited`, the word before the walls were named, is a deprecated
-        // alias for the limit walls: a usage window latches it, a 529 does
-        // not (it never read `limited`).
-        let limited = parse_agent_words("limited").expect("the deprecated alias");
-        assert!(limited[0].matches(session));
-        assert!(limited[0].matches("wall:model-bucket") && limited[0].matches("wall:spend"));
-        assert!(!limited[0].matches(overloaded) && !limited[0].matches("wall:api-error"));
-        assert!(!limited[0].matches("limited") && !limited[0].matches("idle"));
+        // `limited`, the word before the walls were named, is refused like
+        // any unknown word: `wall` or `wall:<kind>` names what it meant.
         for bad in [
             "",
             "promt",
+            "limited",
             "limitd",
             "wall:",
             "wall:Rate",
@@ -3911,6 +4031,81 @@ mod tests {
         ] {
             assert_eq!(parse_agent_words(bad), None, "{bad:?}");
         }
+    }
+
+    /// `path=` IS MEASURED WHERE IT CAN BE (gap audit 2026-09-24: a tab the live
+    /// upgrade had healed a day earlier still read `path=frozen`, and its
+    /// foreign native `claude` showed nowhere). A carried adoption mark reads
+    /// `path=frozen path_evidence=carried` until a child of the shell is read;
+    /// a live reading then wins over the mark and says so, `copy=` names the
+    /// agent's build, and `upgrade=` the tab's live upgrade. NEGATIVE CONTROL:
+    /// a reading for a group no longer in front changes nothing.
+    #[test]
+    fn the_roster_path_is_measured_where_a_child_of_the_shell_was_read() {
+        use crate::session_status::program::PathVerdict;
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let h = handle(0, &t0);
+        let line = |h: &SessionHandle| {
+            sessions_lines(std::slice::from_ref(h), Err("no event loop"), |_| true)
+                .lines()
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        let carried = line(&h);
+        assert!(carried.contains(" path=frozen program=- "), "{carried}");
+        assert!(
+            carried.ends_with(" path_evidence=carried copy=- upgrade=-"),
+            "{carried}"
+        );
+        {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(7);
+            tl.set_leader(8, Some("managed"), Some(PathVerdict::Live));
+        }
+        let late = line(&h);
+        assert!(
+            late.contains(" path=frozen program=- ")
+                && late.ends_with(" path_evidence=carried copy=- upgrade=-"),
+            "a late reading for another group changes nothing: {late}"
+        );
+        {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            tl.set_program(7, Some("claude".into()));
+            tl.set_leader(7, Some("foreign"), Some(PathVerdict::Live));
+            tl.set_upgrade(Some(aterm_agent::harness::upgrade_drive::Row {
+                tab: h.sid.as_str().to_string(),
+                to: "2.1.282".into(),
+                phase: aterm_agent::harness::upgrade::Phase::Pending,
+                behind_since: crate::upgrade_host::now_s() - 120,
+                wait: "not-idle:busy".into(),
+                ..Default::default()
+            }));
+        }
+        let measured = line(&h);
+        assert!(
+            measured.contains(" path=live program=claude "),
+            "{measured}"
+        );
+        assert!(measured.contains(" path_evidence=measured:"), "{measured}");
+        assert!(
+            measured.ends_with(" copy=foreign upgrade=pending/2.1.282/not-idle:busy/2m"),
+            "{measured}"
+        );
+        // A live reading lowers the mark once, for the sweep to apply; a
+        // frozen one never raises it (one job's `PATH=` override reads so).
+        let mut tl = h.ctx.timeline.lock().unwrap();
+        assert!(tl.take_path_lowered(), "live: lower the mark");
+        assert!(!tl.take_path_lowered(), "owed once");
+        tl.set_leader(7, Some("foreign"), Some(PathVerdict::Frozen));
+        assert!(!tl.take_path_lowered(), "frozen: nothing is raised");
+        assert!(!tl.path_settled_frozen(), "one job is not the shell");
+        tl.note_foreground_group(9);
+        assert_eq!(tl.copy(), None, "the copy was the old leader's");
+        assert!(
+            tl.path_reading().is_some(),
+            "the PATH is the shell's: it outlives the job"
+        );
     }
 
     /// The five published columns ride every row LAST, after `path=`, read
@@ -3958,8 +4153,25 @@ mod tests {
             line.contains(" agent_gen=2.40 agent_fp=00000000000000ab "),
             "the verdict's stamp rides the row: {line}"
         );
-        // `supervisor=` closes the row.
-        assert!(line.ends_with(" supervisor=-"), "{line}");
+        // `human_ms=`, `supervisor=`, then the owner's three columns, close
+        // the row: no person has typed…
+        assert!(
+            line.ends_with(" human_ms=- supervisor=- path_evidence=- copy=- upgrade=-"),
+            "{line}"
+        );
+        // …and once one has, the row says how long ago.
+        crate::app_input::note_person(&h.ctx);
+        let out = sessions_lines(std::slice::from_ref(&h), Err("no event loop"), |_| false);
+        let line = out.lines().nth(1).unwrap();
+        let human = line
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("human_ms="))
+            .unwrap();
+        assert!(human.parse::<u64>().is_ok(), "{line}");
+        assert!(
+            line.ends_with(" supervisor=- path_evidence=- copy=- upgrade=-"),
+            "{line}"
+        );
     }
 
     /// With rows present, each line names its window, active-tab and front
@@ -4295,6 +4507,8 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             fabric: std::sync::Arc::default(),
+            rewrap_gauge: std::sync::Arc::default(),
+            human_input: Default::default(),
         }
     }
 

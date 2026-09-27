@@ -58,7 +58,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aterm_time::{Duration, Instant};
+use aterm_time::Duration;
+#[cfg(wgpu_arm)]
+use aterm_time::Instant;
 
 /// The exclusive legs of one cold GPU-renderer build.
 ///
@@ -157,6 +159,7 @@ pub fn record(leg: Leg, elapsed: Duration) {
 }
 
 /// Time `build` as `leg` and return its value. The scoped form of [`record`].
+#[cfg(wgpu_arm)]
 pub(crate) fn timed<T>(leg: Leg, build: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let built = build();
@@ -170,6 +173,7 @@ pub(crate) fn timed<T>(leg: Leg, build: impl FnOnce() -> T) -> T {
 /// A running split rather than a wrapper around each `create_render_pipeline`
 /// call: the twelve descriptors are 40-line literals, and threading a closure
 /// through each one would restate every one of them.
+#[cfg(wgpu_arm)]
 pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     let now = Instant::now();
     if let Some(slot) = CELL_PIPELINE_NS.get(index) {
@@ -219,6 +223,7 @@ static EFFECT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BUILT_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Book one demand-built effect pipeline (slot `index`) into the ledger.
+#[cfg(wgpu_arm)]
 pub(crate) fn record_effect_build(index: usize, elapsed: Duration) {
     EFFECT_BUILDS.fetch_add(1, Ordering::Relaxed);
     EFFECT_BUILD_NS.fetch_add(slot_ns(elapsed), Ordering::Relaxed);

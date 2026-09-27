@@ -1,0 +1,36 @@
+# claude-code 2.1.282 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm 0.93.0 (180x50) · S4 one question whose options carry `preview` (side-by-side layout), as first drawn · user and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.282
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user0000000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/cap/work · /rc
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /clear
+
+❯ Call the AskUserQuestion tool exactly once, right now, with exactly this input (copy every string verbatim, change nothing, add nothing): {"questions": [{"question": "Which
+  layout should the settings page use?", "header": "Layout", "multiSelect": false, "options": [{"label": "Sidebar (Recommended)", "description": "Sections listed in a left
+  sidebar.", "preview": "+----------+------------------+\n| General  | Font size: 13    |\n| Theme    | Theme: dark      |\n| Keys     |
+  |\n+----------+------------------+"}, {"label": "Tabs", "description": "Sections as tabs across the top.", "preview": "+-------+-------+------+\n|General| Theme | Keys
+  |\n+-------+-------+------+\n| Font size: 13        |\n+----------------------+"}, {"label": "Single scroll", "description": "One long scrolling page.", "preview": "General\n
+  Font size: 13\nTheme\n  Theme: dark\nKeys\n  ..."}]}]}  After the tool returns, reply with only the word DONE.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Layout
+
+Which layout should the settings page use?
+
+❯ 1. Sidebar (Recommended)        ┌──────────────────────────────────────────┐
+  2. Tabs                         │ +----------+------------------+          │
+  3. Single scroll                │ | General  | Font size: 13    |          │
+                                  │ | Theme    | Theme: dark      |          │
+                                  │ | Keys     |                  |          │
+                                  │ +----------+------------------+          │
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

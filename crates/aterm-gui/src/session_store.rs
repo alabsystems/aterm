@@ -41,7 +41,7 @@ use crate::SessionCtx;
 /// FIRST live iteration. A fast shell makes that window vanishingly short; a slow
 /// shell stays `Spawning` (and addressable) until its reader confirms live.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SessionState {
+pub(crate) enum SessionState {
     /// Registered, engine + PTY live, but the reader thread has not yet confirmed
     /// its first iteration — the brief pre-`Alive` window. Input is safe in this
     /// state (the PTY master + sink already exist; bytes buffer in the kernel).
@@ -63,14 +63,13 @@ impl SessionState {
         }
     }
 
-    /// Inverse of [`Self::as_str`] for the handoff manifest round-trip; unknown ⇒
-    /// `Spawning` (fail-safe: a restored session is addressable + input-safe).
-    // LOAD-BEARING WIRE FORMAT — see `SessionHandoff` below. Currently reached
-    // only from tests because `take_incoming` re-derives live state rather than
-    // trusting the carried string, but these spellings ARE the wire.
-    #[allow(dead_code)]
+    /// Inverse of [`Self::as_str`], for the tests that hold the handoff
+    /// manifest's spellings to a round trip; unknown ⇒ `Spawning`. Shipping
+    /// `take_incoming` re-derives live state rather than trusting the carried
+    /// string, but these spellings ARE the wire.
+    #[cfg(test)]
     #[must_use]
-    pub fn from_str(s: &str) -> Self {
+    pub(crate) fn from_str(s: &str) -> Self {
         match s {
             "alive" => SessionState::Alive,
             "exited" => SessionState::Exited,
@@ -83,7 +82,7 @@ impl SessionState {
 /// that must survive a seamless re-exec (the live `Arc`s + the raw `master` fd are
 /// re-established by the new process, not serialized). See [`SessionHandoff`].
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SessionRecord {
+pub(crate) struct SessionRecord {
     pub local_id: u64,
     pub sid: String,
     pub parent: Option<String>,
@@ -113,6 +112,11 @@ pub struct SessionRecord {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
+    /// The `meta set questions` policy word (2026-09-24; additive, absent
+    /// tolerated): in lockstep with the leaf carrier's field of the same name,
+    /// and for the same inspection-only reason as the five above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<String>,
     /// CONTROL CARRY (additive, absent tolerated; round 10): `"<len>
     /// <sha256hex>"` of this session's `seamless-<pid>-<nonce>.s<id>.ctl`
     /// sidecar — the turn ledger and the tail of the alt-screen archive
@@ -156,6 +160,77 @@ pub struct SessionRecord {
     /// manifest an older build or a rollback wrote cannot invent an opt-in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,
+    /// FOREGROUND HOLDER (additive, absent ⇒ none; the 2026-09-25 foreground
+    /// handback): the process group the outgoing PTY reader last saw holding
+    /// this session's terminal (`Session::fg_holder`, final because the readers
+    /// are parked). The adopting reader starts its foreground cutter from it,
+    /// so a job that died during the handoff is still a foreground edge at the
+    /// new reader's first sample, and its alt screen, mouse and kitty modes are
+    /// handed back instead of staying armed under the prompt.
+    ///
+    /// A plain scalar on the RECORD, never in the control-carry sidecar: that
+    /// sidecar is dropped for a session carried at the Sanitized or Repaint
+    /// rung, for one the receiver repaints, and for one past the 16 MiB
+    /// aggregate budget, and every one of those sessions still restores its
+    /// modes. The first cut rode the sidecar and lost the holder in all of them
+    /// (the 2026-09-25 review). In neither proof digest. `None` (and any value
+    /// that is not a pgid) is not written, so an older reader sees the wire it
+    /// always saw, and one that skips the key seeds its reader from a fresh
+    /// probe as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg_holder: Option<i32>,
+    /// RE-KEY CHANNEL (additive, absent ⇒ `false`; 2026-09-24): this session's
+    /// shell was spawned with `ATERM_REKEY_PATH` — by a build whose scripts check
+    /// that file at every prompt (`shell_rekey`). A successor that adopts it
+    /// without its nonce re-keys it through the file instead of leaving it
+    /// `integration=degraded` for good. Carried per record, like `frozen_path`,
+    /// so it survives every later handoff; a shell from before the channel never
+    /// has it, so nothing is written for a shell that would not read it. `false`
+    /// is not written, so an older reader sees the wire it always saw.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rekey: bool,
+    /// THE LOADER (additive, absent ⇒ `false`; 2026-09-26): this session's shell
+    /// runs an integration LOADER that reads a body pointer at every prompt
+    /// (`shell_body`) — spawned with `ATERM_INTEGRATION_POINTER`, or one that
+    /// took the typed upgrade (its carried revision says so too). A successor
+    /// points it at its own body; one adopted WITHOUT it (and with no carried
+    /// revision) runs a script from before loaders, and `status` says
+    /// `integration_rev=frozen`. Carried per record, like `rekey`, so it
+    /// survives every later handoff; `false` is not written, so an older reader
+    /// sees the wire it always saw.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loader: bool,
+    /// HISTORY CARRY (additive, absent tolerated; 2026-09-26): `"<len>
+    /// <sha256hex> <take>"` of this session's `seamless-<pid>-<nonce>.s<id>.hist`
+    /// sidecar — the scrollback OLDER than what the screen carry holds, whose
+    /// first `take` lines the successor imports after Commit
+    /// (`crate::handoff_history`). A plain string an older reader skips, in
+    /// neither proof digest, like `control`: a missing or mismatched sidecar
+    /// costs its `take` lines — counted, never the adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<String>,
+    /// History lines THIS handoff's outgoing process saw and could not carry
+    /// for the session (additive, absent ⇒ 0; 2026-09-26): its history had
+    /// changed since the export, or more output arrived after it than the
+    /// screen carry holds, or it was deeper than the export bound. What the
+    /// successor names on the band for this update. `0` is not written.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub history_dropped: u64,
+    /// The session's RUNNING count of history lines its handoffs could not
+    /// carry, this one's `history_dropped` included (additive, absent ⇒ 0;
+    /// 2026-09-26) — what `status` says as `history_lost=`. Per record, like
+    /// `frozen_path`, so it survives every later handoff. `0` is not written.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub history_lost: u64,
+}
+
+/// `skip_serializing_if` for a count whose absence reads as zero.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the field by reference"
+)]
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// THE BUILD WHOSE SESSIONS ALWAYS HAVE THE MANAGED `agents/` ON PATH
@@ -200,7 +275,7 @@ pub struct SessionRecord {
 /// wrong). A shell such a build itself adopted frozen rides the per-record
 /// [`SessionRecord::frozen_path`] instead.
 #[must_use]
-pub fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
+pub(crate) fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
     outgoing_build.is_none()
 }
 
@@ -223,7 +298,7 @@ pub fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
 /// say "never a blank partial adopt", and one unreadable screen then kept every
 /// shell on the old build, update after update.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ScreenCarry {
+pub(crate) struct ScreenCarry {
     /// Required by the modern two-phase protocol. `0` is accepted only by the
     /// explicit v0.52/v0.53 one-channel bridge.
     #[serde(default)]
@@ -257,14 +332,14 @@ pub struct ScreenCarry {
 }
 
 impl ScreenCarry {
-    pub const SCHEMA: u32 = 1;
+    pub(crate) const SCHEMA: u32 = 1;
 }
 
 /// Window-frame carry: the outgoing window's grid size and outer position, so
 /// the post-update window reappears exactly where (and how big) the old one
 /// was instead of at config defaults — the visible half of "seamless".
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct WindowCarry {
+pub(crate) struct WindowCarry {
     /// Grid rows of the handed-off session's window.
     pub rows: u16,
     /// Grid cols.
@@ -310,11 +385,13 @@ pub struct WindowCarry {
 /// The two message fields of a [`WindowCarry`] as one value — what
 /// `App::carried_messages` hands the two construction sites.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct MessagesCarry {
+#[cfg(any(unix, test))]
+pub(crate) struct MessagesCarry {
     pub messages: Vec<CarriedMessage>,
     pub next_message_id: u64,
 }
 
+#[cfg(any(unix, test))]
 impl From<&aterm_messages::Carry> for MessagesCarry {
     fn from(carry: &aterm_messages::Carry) -> Self {
         Self {
@@ -395,6 +472,11 @@ pub struct CarriedMessage {
     /// derives them from the title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished: Option<String>,
+    /// A record about a PREVIOUS RUN (`aterm_messages::Message::retrospective`,
+    /// design ruling 259), ranked one class lower. Absent — an older parent's
+    /// row, or one about now — reads `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retrospective: bool,
 }
 
 /// [`CarriedMessage::excerpt`]'s default: the excerpt is painted.
@@ -430,6 +512,7 @@ impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
             on_glass: m.on_glass,
             excerpt: m.excerpt,
             finished: m.finished.clone(),
+            retrospective: m.retrospective,
         }
     }
 }
@@ -453,6 +536,7 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             on_glass: m.on_glass,
             excerpt: m.excerpt,
             finished: m.finished.clone(),
+            retrospective: m.retrospective,
         }
     }
 }
@@ -465,7 +549,7 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
 /// adoption. The bearer token and launch nonce have no field here — the
 /// §1.4#3 "no secrets at rest" FATAL is unrepresentable, not merely checked.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ConnectionCarry {
+pub(crate) struct ConnectionCarry {
     pub src: String,
     pub dst: String,
     pub op: String,
@@ -479,7 +563,7 @@ pub struct ConnectionCarry {
 /// bind it to this concrete serializer, so the modeled property is the one the
 /// shipping code meets.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SessionHandoff {
+pub(crate) struct SessionHandoff {
     pub schema: u32,
     pub sessions: Vec<SessionRecord>,
     /// Window-frame carry (schema-1 additive; absent in pre-carry manifests).
@@ -530,15 +614,15 @@ pub struct SessionHandoff {
 // (`seamless::layout_wire_digest` / `seamless::screen_wire_digest`) — keep it
 // that way. Additive `#[serde(default, skip_serializing_if = "…")]` fields are
 // the safe shape; anything else needs a protocol-shape bump.
-#[allow(dead_code)]
 impl SessionHandoff {
     /// Current schema of the handoff manifest.
-    pub const SCHEMA: u32 = 1;
+    pub(crate) const SCHEMA: u32 = 1;
 
     /// Project a live [`SessionStore`] into the round-trippable manifest, in the
     /// store's stable `local_id` order (so restore preserves tab order).
     #[must_use]
-    pub fn from_store(store: &SessionStore) -> Self {
+    #[cfg(any(unix, test))]
+    pub(crate) fn from_store(store: &SessionStore) -> Self {
         let handles = store.snapshot();
         // CONNECTION CARRY (design §1.4#6): every live edge row across every
         // registered session's table, projected TOKENLESS — the same
@@ -598,6 +682,7 @@ impl SessionHandoff {
                         icon: meta.icon.clone(),
                         role: meta.role.clone(),
                         attention: meta.attention.clone(),
+                        questions: meta.questions.clone(),
                         // Attached by the seamless writer with its sidecar.
                         control: None,
                         // A shell this process itself adopted frozen goes on
@@ -609,6 +694,20 @@ impl SessionHandoff {
                         // The broadcast opt-ins, off the one live copy — the
                         // same leaf lock the `topic` verb takes.
                         topics: crate::fabric::render_topics(&h.ctx.fabric.topics()),
+                        // Stamped by the handoff's park capture, once the readers
+                        // that write `Session::fg_holder` are parked
+                        // (`app_update_handoff::stamp_fg_holders`).
+                        fg_holder: None,
+                        // Whether its shell reads a re-key file (`shell_rekey`).
+                        rekey: store.has_rekey_channel(h.local_id),
+                        // Whether its shell reads a body pointer (`shell_body`).
+                        loader: store.has_body_loader(h.local_id),
+                        // Named by the handoff worker with its sidecar
+                        // (`handoff_history::stamp_manifest`), which also adds
+                        // this handoff's own drop to the running count below.
+                        history: None,
+                        history_dropped: 0,
+                        history_lost: store.history_lost(h.local_id),
                     }
                 })
                 .collect(),
@@ -616,14 +715,15 @@ impl SessionHandoff {
     }
 
     /// Serialize to the handoff blob (TOML — same format the updater's markers use).
-    pub fn to_toml(&self) -> Result<String, String> {
+    #[cfg(any(unix, test))]
+    pub(crate) fn to_toml(&self) -> Result<String, String> {
         aterm_toml::to_string(self).map_err(|e| format!("serialize handoff: {e}"))
     }
 
     /// Parse a handoff blob; `None` on unreadable/incompatible input (fail-safe: the
     /// new process starts a fresh session rather than restoring a corrupt manifest).
     #[must_use]
-    pub fn from_toml(s: &str) -> Option<Self> {
+    pub(crate) fn from_toml(s: &str) -> Option<Self> {
         let h: Self = aterm_toml::from_str(s).ok()?;
         (h.schema == Self::SCHEMA).then_some(h)
     }
@@ -632,7 +732,8 @@ impl SessionHandoff {
     /// parse yields an identical manifest (no session lost, none fabricated, order
     /// preserved). Returns `true` iff the round-trip is the identity.
     #[must_use]
-    pub fn roundtrips(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn roundtrips(&self) -> bool {
         match self.to_toml() {
             Ok(text) => Self::from_toml(&text).as_ref() == Some(self),
             Err(_) => false,
@@ -650,19 +751,20 @@ impl SessionHandoff {
 /// are total + fail-safe: an unparseable entry is skipped (that tab cold-restarts) so a
 /// corrupt/spoofed value can never fabricate a session — it can only fail closed.
 // LOAD-BEARING: this is the LIVE `ATERM_SEAMLESS_FDS` channel. The handoff
-// worker builds it (`app_input`), `seamless::write_outgoing` encodes it, and
-// `seamless::take_incoming` decodes and joins it to the manifest on `local_id`.
-#[allow(dead_code)]
+// worker builds it (`app_update_handoff`) and `seamless::write_outgoing` encodes
+// it; the receiver parses each entry with `seamless`'s own stricter
+// `parse_fd_entry` and joins it to the manifest on `local_id`. `decode` and
+// `lookup` are this wire's test-side reading.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct HandoffFds {
+pub(crate) struct HandoffFds {
     /// `(local_id, master fd number, child pid)` for each session handed across the exec.
     pub entries: Vec<(u64, i32, i32)>,
 }
 
-#[allow(dead_code)]
 impl HandoffFds {
     /// Encode to the `ATERM_SEAMLESS_FDS` wire string.
     #[must_use]
+    #[cfg(any(unix, test))]
     pub fn encode(&self) -> String {
         self.entries
             .iter()
@@ -673,6 +775,7 @@ impl HandoffFds {
 
     /// Parse the wire string; malformed entries are SKIPPED (fail-safe), never fabricated.
     #[must_use]
+    #[cfg(test)]
     pub fn decode(s: &str) -> Self {
         let entries = s
             .split(',')
@@ -689,7 +792,8 @@ impl HandoffFds {
     /// The `(fd, pid)` for a manifest record's `local_id`, if handed off. `None` ⇒ that
     /// session must cold-restart a fresh shell (never silently dropped).
     #[must_use]
-    pub fn lookup(&self, local_id: u64) -> Option<(i32, i32)> {
+    #[cfg(test)]
+    pub(crate) fn lookup(&self, local_id: u64) -> Option<(i32, i32)> {
         self.entries
             .iter()
             .find(|(lid, _, _)| *lid == local_id)
@@ -704,14 +808,13 @@ impl HandoffFds {
 /// cross-session read is literally `handle.term.lock()` — zero new data path,
 /// fully live, zero-copy.
 #[derive(Clone)]
-pub struct SessionHandle {
+pub(crate) struct SessionHandle {
     /// Stable, pid-free fabric identity (the canonical registry key).
     pub sid: SessionId,
     /// This launch's nonce — an edge binds to it so a restart under a reused id
     /// fails closed (confused-deputy safe). The cross-session gate reads the live
     /// `ctx.nonce` (same value); this mirror is recorded for cross-process restart
     /// safety per the design and for audit.
-    #[allow(dead_code)]
     pub nonce: LaunchNonce,
     /// The process-local id the GUI's `Wake`/`Vec<Session>` routing uses.
     pub local_id: u64,
@@ -750,7 +853,7 @@ pub(crate) const ROSTER_JOURNAL_CAP: usize = 512;
 /// Exited` all leave the session registered and readable, and the roster the
 /// `sessions` stream reports is membership, not state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RosterChange {
+pub(crate) enum RosterChange {
     /// The sid entered the registry (first registration; a replace is not one).
     Created,
     /// The sid left the registry (`deregister_local`).
@@ -770,7 +873,7 @@ pub enum RosterChange {
 /// `close`, or the window went away. Every close path now says which, and
 /// `Unknown` is the honest answer for a path that did not (never a guess).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExitReason {
+pub(crate) enum ExitReason {
     /// The child ended on its own (reader EOF → `Wake::Exit`).
     ShellExit,
     /// A control-socket `close` retired it (`by=` names the caller's sid).
@@ -784,8 +887,9 @@ pub enum ExitReason {
     /// the process, ledger included, goes with it, so nothing deregisters
     /// through the store. A quit path that tears sessions down through the
     /// store is where this gets its first use; until then the `exits` and
-    /// `subscribe` entries say "reserved".
-    #[allow(dead_code)]
+    /// `subscribe` entries say "reserved", and only the wire-vocabulary test
+    /// spells it.
+    #[cfg(test)]
     AppQuit,
     /// The close path did not say.
     Unknown,
@@ -812,6 +916,7 @@ impl ExitReason {
             ExitReason::CtlClose => "ctl-close",
             ExitReason::UiClose => "ui-close",
             ExitReason::WindowClose => "window-close",
+            #[cfg(test)]
             ExitReason::AppQuit => "app-quit",
             ExitReason::Unknown => "unknown",
         }
@@ -822,7 +927,7 @@ impl ExitReason {
 /// caller's own session; a UI/window close is the human at the keyboard; a path
 /// that cannot say writes `-`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExitActor {
+pub(crate) enum ExitActor {
     /// The sid of the control connection that issued the close.
     Sid(String),
     /// The human, through the window chrome or a keyboard shortcut.
@@ -834,7 +939,7 @@ pub enum ExitActor {
 impl ExitActor {
     /// The stable wire token (`by=<sid|human|->`).
     #[must_use]
-    pub fn as_wire(&self) -> &str {
+    pub(crate) fn as_wire(&self) -> &str {
         match self {
             ExitActor::Sid(sid) => sid.as_str(),
             ExitActor::Human => "human",
@@ -845,7 +950,7 @@ impl ExitActor {
 
 /// One entry on the roster lifecycle journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RosterRecord {
+pub(crate) struct RosterRecord {
     /// Store-monotonic, gap-free, starting at 1. `0` is the "nothing has ever
     /// happened" watermark a fresh consumer can seed to safely.
     pub seq: u64,
@@ -903,7 +1008,7 @@ pub struct RosterRecord {
 /// seen — including both halves of a spawn/exit pair that landed inside one
 /// tick.
 #[derive(Default)]
-pub struct SessionStore {
+pub(crate) struct SessionStore {
     by_id: HashMap<SessionId, SessionHandle>,
     by_local: HashMap<u64, SessionId>,
     /// The bounded roster lifecycle journal, oldest-first (see the type doc).
@@ -927,15 +1032,37 @@ pub struct SessionStore {
     /// the managed-current row ([`Self::frozen_path_tabs`]). A side table for
     /// the same reason `exit_codes` is one: the handle's constructors are many.
     frozen_path: std::collections::HashSet<u64>,
+    /// Sessions whose shell carries the RE-KEY CHANNEL (`shell_rekey`): spawned
+    /// with `ATERM_REKEY_PATH`, or adopted from a record that said so. Marked at
+    /// registration, cleared by the deregister, projected into the next handoff
+    /// manifest — the `frozen_path` side-table shape, for the same reason.
+    rekey_channel: std::collections::HashSet<u64>,
+    /// Sessions whose shell runs an integration LOADER (`shell_body`, 2026-09-26):
+    /// spawned with `ATERM_INTEGRATION_POINTER`, or adopted from a record (or a
+    /// carried revision) that said so. The `rekey_channel` side-table shape.
+    body_loader: std::collections::HashSet<u64>,
+    /// Sessions ADOPTED with an integration from before loaders (`shell_body`):
+    /// no loader in their record and no revision carried — the shells no body
+    /// pointer reaches, `status integration_rev=frozen` until they sign a
+    /// revision (the typed upgrade). Not carried: the next successor finds the
+    /// same absence in the record and marks it again.
+    integration_frozen: std::collections::HashSet<u64>,
+    /// History lines each session's update handoffs could not carry, summed
+    /// over every handoff it crossed (2026-09-26): adopted from its record
+    /// (`SessionRecord::history_lost`), raised when this process's import of
+    /// its sidecar fails, answered by `status` as `history_lost=`, projected
+    /// into the next handoff manifest, cleared by the deregister. The
+    /// `frozen_path` side-table shape, for the same reason.
+    history_lost: HashMap<u64, u64>,
 }
 
 /// Shared handle to the registry, cloned into the control thread alongside the
 /// existing `ActiveHandle`.
-pub type Store = Arc<RwLock<SessionStore>>;
+pub(crate) type Store = Arc<RwLock<SessionStore>>;
 
 /// A new, empty, shared registry.
 #[must_use]
-pub fn new_store() -> Store {
+pub(crate) fn new_store() -> Store {
     Arc::new(RwLock::new(SessionStore::default()))
 }
 
@@ -944,7 +1071,7 @@ impl SessionStore {
     /// an existing `sid` (e.g. a relabel) keeps the `by_local` bridge consistent.
     /// A FIRST registration records the `spawned` event on the session's timeline
     /// (a replace does not — the session already lived; its birth is on record).
-    pub fn register(&mut self, handle: SessionHandle) {
+    pub(crate) fn register(&mut self, handle: SessionHandle) {
         let first = !self.by_id.contains_key(&handle.sid);
         if first {
             handle
@@ -1010,7 +1137,7 @@ impl SessionStore {
     /// refused, `false`). The request is a journal row the events lane pushes
     /// as `EVENT * fabric-retire <sid>`; the bridge re-checks hosting itself
     /// and publishes `exited` through its own producer sequence.
-    pub fn request_retire(&mut self, sid: &str) -> bool {
+    pub(crate) fn request_retire(&mut self, sid: &str) -> bool {
         if self.by_sid(&SessionId::new(sid.to_string())).is_some() {
             return false;
         }
@@ -1029,15 +1156,99 @@ impl SessionStore {
     /// field): an adopted shell that predates the self-healing sessions, or
     /// one the outgoing process carried as frozen. Idempotent; an unknown id is
     /// remembered too (the registration may follow in the same spawn seam).
-    pub fn mark_frozen_path(&mut self, local_id: u64) {
+    pub(crate) fn mark_frozen_path(&mut self, local_id: u64) {
         self.frozen_path.insert(local_id);
+    }
+
+    /// LOWER the mark: the shell's PATH was MEASURED live — the environment of
+    /// a child it started fronts aterm's `agents/`
+    /// (`session_status::program::leader_facts`, gap audit 2026-09-24). Until
+    /// then nothing lowered it, and a tab the live upgrade's relaunch line had
+    /// healed read `path=frozen` through seven handoffs, with the band telling
+    /// the owner to type the hook into it. Cleared here, the next handoff
+    /// carries `false` and the managed-current count drops it. Idempotent.
+    /// The only way a measurement moves the mark: a frozen reading never
+    /// raises it (`SessionTimeline::take_path_lowered`).
+    pub(crate) fn clear_frozen_path(&mut self, local_id: u64) {
+        self.frozen_path.remove(&local_id);
+    }
+
+    /// The local ids of every registered session whose shell has not exited,
+    /// sorted — the tabs a person can still type into.
+    #[must_use]
+    pub(crate) fn running_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .by_local
+            .keys()
+            .copied()
+            .filter(|id| !self.exit_codes.contains_key(id))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Add `lines` to the history `local_id`'s update handoffs could not
+    /// carry (see the field). Zero adds nothing and records nothing.
+    pub(crate) fn add_history_lost(&mut self, local_id: u64, lines: u64) {
+        if lines > 0 {
+            let lost = self.history_lost.entry(local_id).or_insert(0);
+            *lost = lost.saturating_add(lines);
+        }
+    }
+
+    /// The history lines `local_id`'s update handoffs could not carry, over
+    /// every handoff it crossed — `status`'s `history_lost=`.
+    #[must_use]
+    pub(crate) fn history_lost(&self, local_id: u64) -> u64 {
+        self.history_lost.get(&local_id).copied().unwrap_or(0)
     }
 
     /// Whether `local_id` was marked frozen ([`Self::mark_frozen_path`]) — what the
     /// next handoff manifest carries per record.
     #[must_use]
-    pub fn has_frozen_path(&self, local_id: u64) -> bool {
+    pub(crate) fn has_frozen_path(&self, local_id: u64) -> bool {
         self.frozen_path.contains(&local_id)
+    }
+
+    /// Mark the session with local id `local_id` as carrying the RE-KEY CHANNEL
+    /// (see the field). Idempotent; an unknown id is remembered too (the
+    /// registration may follow in the same spawn seam).
+    pub(crate) fn mark_rekey_channel(&mut self, local_id: u64) {
+        self.rekey_channel.insert(local_id);
+    }
+
+    /// Whether `local_id` carries the re-key channel
+    /// ([`Self::mark_rekey_channel`]) — what the next handoff record carries.
+    #[must_use]
+    pub(crate) fn has_rekey_channel(&self, local_id: u64) -> bool {
+        self.rekey_channel.contains(&local_id)
+    }
+
+    /// Mark the session with local id `local_id` as running an integration
+    /// LOADER (see the field). Idempotent, like [`Self::mark_rekey_channel`].
+    pub(crate) fn mark_body_loader(&mut self, local_id: u64) {
+        self.body_loader.insert(local_id);
+    }
+
+    /// Whether `local_id` runs an integration loader
+    /// ([`Self::mark_body_loader`]) — what the next handoff record carries.
+    #[must_use]
+    pub(crate) fn has_body_loader(&self, local_id: u64) -> bool {
+        self.body_loader.contains(&local_id)
+    }
+
+    /// Mark the session with local id `local_id` as ADOPTED with an integration
+    /// from before loaders (see the field).
+    pub(crate) fn mark_integration_frozen(&mut self, local_id: u64) {
+        self.integration_frozen.insert(local_id);
+    }
+
+    /// Whether `local_id` was adopted with an integration from before loaders
+    /// ([`Self::mark_integration_frozen`]) — what `status integration_rev=` reads
+    /// until the shell signs a revision.
+    #[must_use]
+    pub(crate) fn is_integration_frozen(&self, local_id: u64) -> bool {
+        self.integration_frozen.contains(&local_id)
     }
 
     /// HOW MANY LIVE TABS STILL RUN A FROZEN SHELL: marked frozen, still
@@ -1053,14 +1264,29 @@ impl SessionStore {
     /// and a rollback-then-update handed back without `outgoing_build` — see
     /// `seamless::take_incoming`): the hook there is a no-op, the tab still
     /// counts, and closing it is what retires the note. Honest as a bound, and
-    /// cheap; a shell proving itself unfrozen (an OSC from the live path) is
-    /// the design that would lower it, not taken this day.
+    /// cheap. Since 2026-09-24 a shell PROVES itself unfrozen another way than
+    /// the OSC this once named: a child it starts is read, and a live PATH in
+    /// that child's environment lowers the mark ([`Self::clear_frozen_path`]).
+    /// A shell sitting at its prompt is not measured (its environment is
+    /// hidden), so the bound still holds for it.
     #[must_use]
-    pub fn frozen_path_tabs(&self) -> usize {
-        self.frozen_path
+    pub(crate) fn frozen_path_tabs(&self) -> usize {
+        self.frozen_path_ids().len()
+    }
+
+    /// The local ids [`Self::frozen_path_tabs`] counts, sorted: the managed
+    /// record splits them by what runs in front (an agent is never handed the
+    /// hook to type — `App::tabs_behind`).
+    #[must_use]
+    pub(crate) fn frozen_path_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .frozen_path
             .iter()
+            .copied()
             .filter(|id| self.by_local.contains_key(id) && !self.exit_codes.contains_key(id))
-            .count()
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Note the exited child's status for the session with local id `local_id`,
@@ -1068,7 +1294,7 @@ impl SessionStore {
     /// the status is answerable (`Wake::Exit`, before teardown reaps and discards
     /// it); the deregister that follows moves it onto the journal row. A `None`
     /// records nothing — the row then says `exit_code=-`, which is the truth.
-    pub fn note_exit_code(&mut self, local_id: u64, code: Option<i32>) {
+    pub(crate) fn note_exit_code(&mut self, local_id: u64, code: Option<i32>) {
         if let Some(code) = code {
             self.exit_codes.insert(local_id, code);
         }
@@ -1083,7 +1309,7 @@ impl SessionStore {
     /// for the lifecycle fixtures, and its `cfg(test)` is what keeps a new
     /// production path from deregistering without saying why.
     #[cfg(test)]
-    pub fn deregister_local(&mut self, local_id: u64) -> Option<SessionId> {
+    pub(crate) fn deregister_local(&mut self, local_id: u64) -> Option<SessionId> {
         self.deregister_local_as(local_id, ExitReason::Unknown, ExitActor::Unknown)
     }
 
@@ -1108,7 +1334,7 @@ impl SessionStore {
     /// stops resolving in this very write; only a request that resolved its ctx
     /// just before it can still read the row — and the journal row (`exits`) is
     /// where the same facts stay answerable afterwards.
-    pub fn deregister_local_as(
+    pub(crate) fn deregister_local_as(
         &mut self,
         local_id: u64,
         reason: ExitReason,
@@ -1120,6 +1346,10 @@ impl SessionStore {
         let exit_code = self.exit_codes.remove(&local_id);
         // A closed frozen tab is no longer a tab the row must name.
         self.frozen_path.remove(&local_id);
+        self.rekey_channel.remove(&local_id);
+        self.body_loader.remove(&local_id);
+        self.integration_frozen.remove(&local_id);
+        self.history_lost.remove(&local_id);
         let sid = self.by_local.remove(&local_id)?;
         // The death mark, written WHILE the handle is still registered: the
         // timeline is Arc-shared, so a holder that kept the ctx (pool teardown
@@ -1160,7 +1390,7 @@ impl SessionStore {
     /// Mark the session's lifecycle state (e.g. `Exited` on `Wake::Exit`). A no-op
     /// if the id is unknown. An ACTUAL transition (not a same-state re-mark) is
     /// recorded on the session timeline as a `state-change` event.
-    pub fn set_state(&mut self, local_id: u64, state: SessionState) {
+    pub(crate) fn set_state(&mut self, local_id: u64, state: SessionState) {
         if let Some(sid) = self.by_local.get(&local_id)
             && let Some(h) = self.by_id.get_mut(sid)
             && h.state != state
@@ -1181,7 +1411,7 @@ impl SessionStore {
     /// readiness signal) is left untouched. Returns `true` IFF this call performed
     /// the transition; an unknown id or any non-`Spawning` state returns `false`.
     /// Idempotent: a second `Wake::Ready` for the same session is a cheap no-op.
-    pub fn mark_alive(&mut self, local_id: u64) -> bool {
+    pub(crate) fn mark_alive(&mut self, local_id: u64) -> bool {
         if let Some(sid) = self.by_local.get(&local_id)
             && let Some(h) = self.by_id.get_mut(sid)
             && h.state == SessionState::Spawning
@@ -1203,7 +1433,7 @@ impl SessionStore {
     /// An actual change is also recorded on the session timeline (`title-change`,
     /// pct-encoded) — the change-gate above it is what keeps the ring at human/
     /// program relabel rate, never the redraw rate.
-    pub fn set_title(&mut self, local_id: u64, title: &str) {
+    pub(crate) fn set_title(&mut self, local_id: u64, title: &str) {
         if let Some(sid) = self.by_local.get(&local_id)
             && let Some(h) = self.by_id.get_mut(sid)
             && h.title != title
@@ -1224,28 +1454,28 @@ impl SessionStore {
     /// Look up a handle by its stable [`SessionId`]. Total + fail-closed: an
     /// unknown id returns `None`.
     #[must_use]
-    pub fn by_sid(&self, sid: &SessionId) -> Option<&SessionHandle> {
+    pub(crate) fn by_sid(&self, sid: &SessionId) -> Option<&SessionHandle> {
         self.by_id.get(sid)
     }
 
     /// Look up a handle by its process-local `u64` id. Total + fail-closed.
     #[must_use]
-    pub fn by_local(&self, local_id: u64) -> Option<&SessionHandle> {
+    pub(crate) fn by_local(&self, local_id: u64) -> Option<&SessionHandle> {
         self.by_local
             .get(&local_id)
             .and_then(|sid| self.by_id.get(sid))
     }
 
     /// Number of registered sessions.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)] // used by tests + the forward-compat subscribe cap (P1.3)
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
 
     /// Whether the registry is empty.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)] // used by tests
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
@@ -1254,7 +1484,7 @@ impl SessionStore {
     /// the caller can drop the store guard before formatting (and never holds it
     /// across a `Terminal` lock). Sorted by `local_id` for a stable listing.
     #[must_use]
-    pub fn snapshot(&self) -> Vec<SessionHandle> {
+    pub(crate) fn snapshot(&self) -> Vec<SessionHandle> {
         let mut v: Vec<SessionHandle> = self.by_id.values().cloned().collect();
         v.sort_by_key(|h| h.local_id);
         v
@@ -1265,7 +1495,7 @@ impl SessionStore {
     /// Unlike `snapshot`, this does not clone a terminal or session context;
     /// callers never need a placement hop or a per-session lock.
     #[must_use]
-    pub fn bridge_roster(&self) -> Vec<(u64, SessionId, aterm_session::LaunchNonce)> {
+    pub(crate) fn bridge_roster(&self) -> Vec<(u64, SessionId, aterm_session::LaunchNonce)> {
         let mut rows: Vec<_> = self
             .by_id
             .values()
@@ -1280,7 +1510,7 @@ impl SessionStore {
     /// subscriber. Unlike [`snapshot`](Self::snapshot) it clones only the sid strings
     /// (not whole handles) and does not sort — a set needs neither.
     #[must_use]
-    pub fn live_sids(&self) -> std::collections::HashSet<String> {
+    pub(crate) fn live_sids(&self) -> std::collections::HashSet<String> {
         self.by_id
             .values()
             .map(|h| h.sid.as_str().to_string())
@@ -1295,7 +1525,7 @@ impl SessionStore {
     /// of every live sid and running two set differences over it — per
     /// subscriber, per 250 ms wake, forever.
     #[must_use]
-    pub fn roster_seq(&self) -> u64 {
+    pub(crate) fn roster_seq(&self) -> u64 {
         self.roster_seq
     }
 
@@ -1307,7 +1537,7 @@ impl SessionStore {
     /// recovery path is the whole-set diff this journal replaced, which is still
     /// exactly right for the job, just no longer paid on every tick.
     #[must_use]
-    pub fn roster_low_seq(&self) -> Option<u64> {
+    pub(crate) fn roster_low_seq(&self) -> Option<u64> {
         self.roster.front().map(|r| r.seq)
     }
 
@@ -1320,7 +1550,7 @@ impl SessionStore {
     /// the retained low-water yields everything retained — callers must test
     /// [`roster_low_seq`](Self::roster_low_seq) first if they need to know that
     /// the prefix was lossy (see its doc).
-    pub fn roster_since(&self, after: u64) -> impl Iterator<Item = &RosterRecord> {
+    pub(crate) fn roster_since(&self, after: u64) -> impl Iterator<Item = &RosterRecord> {
         let start = self.roster.partition_point(|r| r.seq <= after);
         self.roster.range(start..)
     }
@@ -1334,7 +1564,7 @@ impl SessionStore {
     /// unspecified BECAUSE it is `HashMap` order — a caller that needs a stable
     /// listing wants `snapshot`, and saying so here keeps the two from being
     /// confused.
-    pub fn live_handles(&self) -> impl Iterator<Item = &SessionHandle> {
+    pub(crate) fn live_handles(&self) -> impl Iterator<Item = &SessionHandle> {
         self.by_id.values()
     }
 }
@@ -1499,18 +1729,26 @@ impl crate::App {
 /// handle shape, which is the failure mode a lifecycle test can least afford.
 #[cfg(test)]
 pub(crate) fn test_handle(local_id: u64) -> SessionHandle {
-    handle_alive(local_id, None)
+    handle_alive(local_id, None, -1)
+}
+
+/// [`test_handle`] over a REAL master fd — a test's own pty pair — so a test
+/// reads the sink's kernel probes (`SinkWriter::input_backlog`) through the
+/// handle production builds. The caller owns and closes `master`.
+#[cfg(test)]
+pub(crate) fn test_handle_on(local_id: u64, master: i32) -> SessionHandle {
+    handle_alive(local_id, None, master)
 }
 
 #[cfg(test)]
-fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
+fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> SessionHandle {
     use aterm_session::EdgeTable;
     use aterm_session::sink::SinkWriter;
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
     let ctx = Arc::new(SessionCtx {
-        sink: Arc::new(SinkWriter::new(-1)),
+        sink: Arc::new(SinkWriter::new(master)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         modes: crate::mode_mirror_of(&term),
         ui_waiting: Arc::default(),
@@ -1530,6 +1768,8 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
             crate::session_timeline::SessionTimeline::default(),
         )),
         fabric: std::sync::Arc::default(),
+        rewrap_gauge: std::sync::Arc::default(),
+        human_input: Default::default(),
     });
     SessionHandle {
         sid,
@@ -1539,7 +1779,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         state: SessionState::Alive,
         title: format!("tab-{local_id}"),
         term,
-        master: -1,
+        master,
         ctx,
         identity: None,
     }
@@ -1558,7 +1798,7 @@ mod tests {
         parent: Option<SessionId>,
         state: SessionState,
     ) -> SessionHandle {
-        let mut h = handle_alive(local_id, parent);
+        let mut h = handle_alive(local_id, parent, -1);
         h.state = state;
         h
     }
@@ -1705,6 +1945,96 @@ title = \"zsh\"
             Some("worker"),
             "and the registry answers the label by local id — what `@<sid> spawn` inherits"
         );
+    }
+
+    /// The re-key channel rides per record like `frozen_path`: an old manifest
+    /// (no key) reads `false`, a marked session projects `rekey = true` and only
+    /// it, the wire round-trips, and a deregister forgets the mark — so a later
+    /// session reusing the local id is not taken for one with the channel.
+    #[test]
+    fn the_rekey_channel_rides_per_record_and_absent_reads_false() {
+        let old_wire = "schema = 1
+
+[[sessions]]
+local_id = 3
+sid = \"s-old\"
+state = \"alive\"
+title = \"zsh\"
+";
+        let read = SessionHandoff::from_toml(old_wire).expect("this build reads an old manifest");
+        assert!(!read.sessions[0].rekey, "absent reads false");
+
+        let mut store = SessionStore::default();
+        store.register(handle(0, None));
+        store.register(handle(1, None));
+        store.mark_rekey_channel(1);
+        let manifest = SessionHandoff::from_store(&store);
+        assert_eq!(
+            manifest
+                .sessions
+                .iter()
+                .map(|r| r.rekey)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        let wire = manifest.to_toml().expect("serializes");
+        assert_eq!(
+            wire.matches("rekey").count(),
+            1,
+            "false stays off the wire: {wire}"
+        );
+        assert!(manifest.roundtrips());
+        let back = SessionHandoff::from_toml(&wire).expect("round-trips");
+        assert!(back.sessions[1].rekey);
+        store.deregister_local(1);
+        assert!(!store.has_rekey_channel(1), "a closed session forgets it");
+    }
+
+    /// The LOADER rides per record like the re-key channel (2026-09-26): an old
+    /// manifest (no key) reads `false` — a shell from before loaders — a marked
+    /// session projects `loader = true` and only it, `false` stays off the wire,
+    /// and a deregister forgets the mark and the frozen one alike.
+    #[test]
+    fn the_loader_rides_per_record_and_absent_reads_false() {
+        let old_wire = "schema = 1
+
+[[sessions]]
+local_id = 3
+sid = \"s-old\"
+state = \"alive\"
+title = \"zsh\"
+";
+        let read = SessionHandoff::from_toml(old_wire).expect("this build reads an old manifest");
+        assert!(!read.sessions[0].loader, "absent reads false");
+
+        let mut store = SessionStore::default();
+        store.register(handle(0, None));
+        store.register(handle(1, None));
+        store.mark_body_loader(1);
+        store.mark_integration_frozen(0);
+        let manifest = SessionHandoff::from_store(&store);
+        assert_eq!(
+            manifest
+                .sessions
+                .iter()
+                .map(|r| r.loader)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        let wire = manifest.to_toml().expect("serializes");
+        assert_eq!(
+            wire.matches("loader").count(),
+            1,
+            "false stays off the wire: {wire}"
+        );
+        assert!(manifest.roundtrips());
+        let back = SessionHandoff::from_toml(&wire).expect("round-trips");
+        assert!(back.sessions[1].loader);
+        assert!(store.is_integration_frozen(0));
+        store.deregister_local(1);
+        store.deregister_local(0);
+        assert!(!store.has_body_loader(1), "a closed session forgets it");
+        assert!(!store.is_integration_frozen(0), "and the frozen mark");
     }
 
     #[test]

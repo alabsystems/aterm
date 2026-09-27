@@ -288,10 +288,9 @@ fn datetimes_round_trip_through_serde() {
 
 /// `Table: FromStr` and `Value` indexing — the untyped path.
 ///
-/// `aterm-containment` parses its allowlist straight into a `Table`, and the
-/// art-asset suites read a parsed document with `doc["layer"][0]["role"]`.
-/// Neither goes through a derived model, so neither is covered by the typed
-/// cases above; both are checked against the oracle here.
+/// The art-asset suites read a parsed document with `doc["layer"][0]["role"]`,
+/// which goes through no derived model, so it is not covered by the typed
+/// cases above; it is checked against the oracle here.
 #[test]
 fn the_untyped_table_and_index_surface_matches_toml() {
     const SOURCE: &str = "\

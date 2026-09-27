@@ -39,13 +39,9 @@ pub const TEXT_CAP: usize = 1024;
 /// `attested` label (identity attestation is `from=`, not trust) and no
 /// downgrade-only rule to police, because no sender ever writes the label.
 ///
-/// A DUPLICATE, DELIBERATELY NAMED. `bridge.rs` holds the same three lines for
-/// the record it is about to `deliver`, and the two must never disagree — the
-/// bridge's copy is private. The follow-up is for the bridge to call THIS one;
-/// until it does, both files carry the same table and both carry a test that
-/// pins it. Round 21 moved this copy out of `tui.rs` and deleted that module,
-/// so the reason the follow-up was deferred — that A8 did not own `bridge.rs` —
-/// is gone with it.
+/// THE ONE COPY: `bridge.rs` labels the record it is about to `deliver` with
+/// this function, and the fabric report labels what it prints with it, so the
+/// two can never disagree (the bridge carried a private twin until 2026-09-26).
 #[must_use]
 pub fn trust_of(src: &str, relayed: bool) -> &'static str {
     if relayed {
@@ -124,9 +120,10 @@ pub fn safe(text: &str, cap: usize) -> String {
 mod tests {
     use super::*;
 
-    /// The same table `bridge.rs` pins for the label it puts on a delivered row.
-    /// The two functions must answer identically; when the bridge learns to call
-    /// this one, this test becomes the only copy.
+    /// TRUST IS COMPUTED, from the two things a sender cannot choose: the
+    /// cap-forced class of its `<src>` segment, and whether the record went
+    /// through a relay. Nothing in a body can reach it. It is the label the
+    /// bridge puts on every delivered row.
     #[test]
     fn trust_is_a_function_of_the_address_and_nothing_else() {
         assert_eq!(trust_of("h-andrew", false), "human");

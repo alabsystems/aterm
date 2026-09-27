@@ -78,7 +78,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.93.0"
+version = "0.94.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -224,7 +224,6 @@ aterm-messages = { path = "crates/aterm-messages" }
 # plain data. Every platform cfg of the feature lives here, so the host adds
 # none; it holds no timer — the host asks, on the probe thread.
 aterm-sysprobe = { path = "crates/aterm-sysprobe" }
-aterm-suggest = { path = "crates/aterm-suggest" }
 aterm-core = { path = "crates/aterm-core" }
 # The headless half of the control protocol: verb bodies over a `SessionHost`
 # trait, so a non-GUI host answers the same wire (no winit in its closure).
@@ -477,6 +476,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# LINE TABLES, NOT FULL DWARF (2026-09-25, decided under the owner's standing
+# direction; AGENTS.md "Concurrent sessions & build coordination" rule 5).
+# Backtraces keep file:line; what goes is variable-level DWARF. Each dev and
+# test binary shrinks accordingly — less for tccd and Gatekeeper to hash the
+# first time a fresh test binary reaches WindowServer, and less disk per
+# worktree when several sessions build in parallel. `[profile.dev.build-override]`
+# below moves with it (crates/aterm-verify/tests/profile_pin.rs holds them equal).
+[profile.dev]
+debug = "line-tables-only"
+
 # aterm-census is a DEV-ONLY lexical scanner (11k lines of pure std over the
 # 1425 .rs files under crates/) that never ships — nothing in `expose` or
 # `bundle` depends on it. It is also on the critical path of every local gate
@@ -527,7 +536,8 @@ opt-level = 2
 [profile.dev.package.aterm-regex]
 opt-level = 2
 
-# HOST CODE AT THE SAME DEBUGINFO AS EVERYTHING ELSE (2026-09-13, gate speed).
+# HOST CODE AT THE SAME DEBUGINFO AS EVERYTHING ELSE (2026-09-13, gate speed;
+# line tables for both since 2026-09-25, [profile.dev] above).
 # Unset, build-override compiles build scripts, proc-macros and their deps at
 # debuginfo 0, while the same crates compiled as ordinary deps get full
 # debuginfo — so a crate reachable both ways (syn, quote, proc-macro2, and all
@@ -542,7 +552,7 @@ opt-level = 2
 # target dir rehashes most units once. Pinned by
 # crates/aterm-verify/tests/profile_pin.rs.
 [profile.dev.build-override]
-debug = 2
+debug = "line-tables-only"
 
 [profile.release]
 # Aggressive size+speed, functionality-preserving: fat LTO (whole-program

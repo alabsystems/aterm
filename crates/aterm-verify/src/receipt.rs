@@ -1,53 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE GATE DECIDED ABOUT ONE TREE, written where a hook can read it in
+//! WHAT THE GATE DECIDED ABOUT ONE TREE, written where a tool can read it in
 //! milliseconds.
 //!
-//! WHY (2026-09-17). aterm has no CI by owner decision: the merge contract is
-//! `tools/verify.sh --fast` passing locally before a slice enters main. The
-//! only thing standing between an ungated commit and `origin/main` was
-//! `.githooks/pre-push`, and that hook has been ADVISORY since 2026-08-24 — it
-//! prints a suggestion and pushes anyway. Three defects shipped green through
-//! that gap in August alone. So "the push gate" named a thing that did not
-//! exist, and the repo's own answer was to correct the SENTENCE in twenty
-//! places rather than the gap.
+//! WHO READS IT, TODAY (2026-09-25): the release cutter, INLINE.
+//! `crates/aterm-release/src/gates.rs`'s `receipt_report` walks the commit a
+//! cut builds back to the newest one a receipt vouches for and states the
+//! ungated range in the cut's transcript, before the ledger claim — the gate
+//! living in the tool being run, which is where the owner put every quality
+//! gate: "I DONT WANT HOOKS! NO HOOKS NO CI" (2026-07-06). No git hook reads
+//! a receipt; there is none.
 //!
-//! The hook was demoted for two measured reasons, and both are about RUNNING
-//! THE GATE inside the hook:
-//!
-//!  * it took twelve minutes once `tools/paint_guard.sh` joined the lane, and
-//!    "a hook slow enough to be bypassed is worse than none";
-//!  * it could not WIN — `main` advanced twice during one gate, so a green
-//!    verdict still ended in `[remote rejected] cannot lock ref`.
-//!
-//! Neither is a reason a hook cannot CHECK A RESULT. A receipt is the result:
-//! the gate already knows the tree it verified (`identity::TreeState`) and
-//! whether that run discharged the whole merge contract
-//! ([`crate::verdict::Verdict::claims_merge_contract`]), so it writes both,
-//! keyed by the commit, into the gate-state directory. The hook reads one
-//! small file per pushed ref and decides in microseconds. It never compiles,
-//! never races another push, and cannot teach the bypass.
+//! WHY RECEIPTS EXIST (2026-09-17). aterm has no CI by owner decision: the
+//! merge contract is `tools/verify.sh` passing locally before a slice
+//! enters main. A `.githooks/pre-push`, re-added on 2026-07-16 without the
+//! owner's sign-off, had been ADVISORY since 2026-08-24, and receipts were
+//! first written so that hook could gate again by CHECKING A RESULT instead
+//! of running the gate. The hook was deleted on 2026-09-25, restoring the
+//! mandate; the receipts stayed, because what they record — the tree a run
+//! verified (`identity::TreeState`) and whether it discharged the whole merge
+//! contract ([`crate::verdict::Verdict::claims_merge_contract`]), keyed by the
+//! commit — is exactly what a reader after the fact needs, and it costs one
+//! small file per run.
 //!
 //! WHAT A RECEIPT IS NOT. It is a record the gate wrote, not evidence anyone
 //! can check — the same standing the snapshot marker has, and for the same
 //! reason (`crate::snapshot::marker_state`): whoever can write a file can write
-//! one. It stops the accident it is about — pushing a commit no gate ever ran
-//! on — and claims nothing against someone editing their own state directory.
+//! one. It records the accident it is about — a commit no gate ever ran on —
+//! and claims nothing against someone editing their own state directory.
 //!
 //! ONLY A CLEAN TREE GETS ONE. A run over HEAD plus uncommitted work verified
 //! bytes no commit holds, so it records nothing: its receipt could only ever
-//! refuse, and keyed by HEAD it would stand where HEAD's own receipt belongs.
+//! say "not gated", and keyed by HEAD it would stand where HEAD's own receipt
+//! belongs.
 //!
 //! ONE RECEIPT STORE PER REPOSITORY: receipts live under the git COMMON dir
 //! ([`dir`]), which every worktree of a repository shares, so a PASS written
-//! from the worktree an agent gated in reaches the checkout that pushes.
+//! from the worktree an agent gated in reaches every other checkout — the
+//! release cutter's cut tree among them.
 //!
 //! A WEAKER RECEIPT NEVER REPLACES A WHOLE-TREE ONE ([`write`]). The file is
 //! keyed by commit and the store is shared, so without this a `--changed` or
 //! `--scope` run, or a flaky FAIL, on a commit that already carries a
 //! merge-contract receipt — from any worktree sitting at that commit —
-//! destroyed the one receipt that admits it. A whole-tree PASS on these exact
+//! destroyed the one receipt that vouches for it. A whole-tree PASS on these exact
 //! bytes is a fact no later run unmakes; among receipts that admit nothing,
 //! the newest wins.
 
@@ -61,8 +58,9 @@ pub const RECEIPT_DIR: &str = "aterm-verify/receipts";
 /// treat the file as no receipt at all, never as a permissive one.
 ///
 /// Format 2 (2026-09-23) dropped `tree` — only a clean tree gets a receipt —
-/// and `base`. A format-1 file is not a receipt: it admits nothing, and the
-/// hook says so in one sentence.
+/// and `base`. A format-1 file is not a receipt: it vouches for nothing, and
+/// the cutter's reader (`aterm-release` `gates::receipt_field`) checks this
+/// line before any other.
 pub const MAGIC: &str = "aterm-verify receipt 2";
 
 /// How many receipts are kept. One store serves every worktree of the
@@ -82,7 +80,7 @@ pub struct Receipt {
     /// `PASS`, `FAIL` or `COULD-NOT-RUN`.
     pub verdict: String,
     /// Did this run discharge the WHOLE merge contract? The one predicate a
-    /// push may be decided on, and it is [`crate::verdict::claims_contract`]'s,
+    /// commit is counted as gated on, and it is [`crate::verdict::claims_contract`]'s,
     /// not a second opinion: whole tree, nothing skipped, nothing failed, not a
     /// selftest.
     pub merge_contract: bool,
@@ -97,8 +95,8 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    /// The file a hook reads. One `key value` per line, so `grep` is enough and
-    /// no hook needs a parser.
+    /// The file a reader reads. One `key value` per line, so `grep` is enough and
+    /// no reader needs a parser.
     #[must_use]
     pub fn render(&self) -> String {
         let mut s = String::from(MAGIC);
@@ -118,7 +116,8 @@ impl Receipt {
     }
 
     /// Read one back. `None` for anything that is not a receipt this version
-    /// wrote — an unknown format is NOT a receipt, so it can never admit a push.
+    /// wrote — an unknown format is NOT a receipt, so it can never vouch for a
+    /// commit.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let mut lines = text.lines();
@@ -144,12 +143,13 @@ impl Receipt {
 }
 
 /// `<git common dir of root>/aterm-verify/receipts` — the one receipt store
-/// every worktree of the repository shares, and the one `.githooks/pre-push`
-/// reads (it asks git the same question).
+/// every worktree of the repository shares, and the one the release cutter's
+/// receipt report reads (it asks git the same question).
 ///
 /// # Errors
 /// When git cannot say where `root`'s common dir is: not a repository, or git
-/// failing. No receipt is written then, which costs the next push a refusal.
+/// failing. No receipt is written then, which leaves the commit counted as
+/// ungated.
 pub fn dir(root: &Path) -> std::io::Result<PathBuf> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -185,7 +185,8 @@ pub enum Written {
 /// write past the check.
 ///
 /// Best effort in one direction only: a receipt that cannot be written costs
-/// the NEXT push a refusal, never this run its verdict. The gate says so on
+/// the commit its record — the cutter then counts it as ungated — never this
+/// run its verdict. The gate says so on
 /// stderr rather than failing, because a read-only state directory is an
 /// operator's problem with their disk and not a finding about their change.
 pub fn write(root: &Path, r: &Receipt) -> std::io::Result<Written> {
@@ -341,8 +342,8 @@ mod tests {
     }
 
     /// AN UNREADABLE RECEIPT IS NO RECEIPT. The one direction this must never
-    /// fail in: a file the hook cannot understand must refuse the push, never
-    /// wave it through.
+    /// fail in: a file a reader cannot understand vouches for nothing, never
+    /// for a pass.
     #[test]
     fn anything_that_is_not_this_format_parses_as_nothing() {
         let body = "head x\nmode fast\nscope workspace\nverdict PASS\nmerge-contract yes\n\

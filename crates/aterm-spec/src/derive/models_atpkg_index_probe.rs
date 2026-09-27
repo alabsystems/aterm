@@ -5,6 +5,56 @@
 
 use super::*;
 
+/// One GUI index-hint worker takes a network tick before it writes the shared
+/// 30-second cooldown stamp. The next local worker must be paced from that
+/// completion, not its earlier start: otherwise its first due check falls
+/// inside the shared cooldown and the real HEADs run a second interval later.
+/// Tier-1 drives the GUI's owned worker and its completion timestamp.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn atpkg_index_probe_completion_cadence_model() -> Model {
+    crate::ty_model! {
+        AtpkgIndexProbeCompletionCadence {
+            const Buggy = 0;
+            const Interval = 6;
+            const MaxAge = 7;
+            // 0 idle, 1 network in flight, 2 stamped and waiting, 3 next probe.
+            var phase = 0;
+            // Five-second ticks since worker start and shared-stamp completion.
+            var start_age = 0;
+            var stamp_age = 0;
+            var checked_early = 0;
+
+            action Start when (phase == 0) {
+                phase = 1;
+            }
+            action NetworkTick when (phase == 1 && start_age == 0) {
+                start_age = 1;
+            }
+            action Complete when (phase == 1 && start_age == 1) {
+                phase = 2;
+                stamp_age = 0;
+            }
+            action Tick when (phase == 2 && stamp_age <= MaxAge - 1) {
+                start_age = if start_age <= MaxAge - 1 { start_age + 1 } else { start_age };
+                stamp_age = stamp_age + 1;
+            }
+            action LocalCheck when (
+                phase == 2 && start_age > Interval - 1 && checked_early == 0
+            ) {
+                phase = if Buggy == 1 || stamp_age > Interval - 1 { 3 } else { 2 };
+                checked_early = 1;
+            }
+            action DueCheck when (phase == 2 && stamp_age > Interval - 1) {
+                phase = 3;
+            }
+
+            invariant NoProbeBeforeSharedStampExpires:
+                phase <= 2 || stamp_age > Interval - 1;
+        }
+    }
+}
+
 /// The GUI package lane owns at most one asynchronous index probe across park
 /// slices. A positive HEAD may be offered while the probe's other HEAD is still
 /// out; its final answer cannot offer that same build twice. A
@@ -192,7 +242,7 @@ pub fn atpkg_index_pending_park_model() -> Model {
 /// One `Probe*` action is one locked attempt — the pair of HEADs, `floor + 1` and
 /// `floor + 2` — before its single stamp is written. `age` advances in 30-second ticks
 /// (`atpkg::index_probe::INTERVAL`); a missing pair and a published hint cool for one
-/// tick, an error (the download host's 429 included) for ten. A changed durable floor
+/// tick, an error (the download host's 429 included) for two. A changed durable floor
 /// bypasses an old stamp immediately. Tier-1 drives `atpkg::index_probe::probe_next` and
 /// its real lock/stamp file.
 ///
@@ -216,8 +266,8 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
     crate::ty_model! {
         AtpkgIndexProbeCooldown {
             const Buggy = 0;
-            // Saturates past the longest cooldown (an error's ten ticks).
-            const MaxAge = 11;
+            // Saturates past the longest cooldown (an error's two ticks).
+            const MaxAge = 3;
             // 0 unlocked, 1 lock held before stamp decision, 2 decided/written.
             var phase = 0;
             var floor = 1;
@@ -225,7 +275,7 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
             // marker: 0 absent, 1 missing, 2 error, 3 published.
             var marker = 0;
             var ttl = 0;
-            var age = 11;
+            var age = 3;
             var duplicate = 0;
 
             action Acquire when (
@@ -278,7 +328,7 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
                 };
                 stamp_floor = floor;
                 marker = 2;
-                ttl = if Buggy == 1 { 1 } else { 10 };
+                ttl = if Buggy == 1 { 1 } else { 2 };
                 age = 0;
                 phase = 2;
             }
@@ -302,7 +352,7 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
             invariant StampMatchesOutcome:
                 (marker == 0 && ttl == 0) ||
                 (marker == 1 && ttl == 1) ||
-                (marker == 2 && ttl == 10) ||
+                (marker == 2 && ttl == 2) ||
                 (marker == 3 && ttl == 1);
         }
     }

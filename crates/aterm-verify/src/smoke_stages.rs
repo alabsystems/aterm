@@ -14,7 +14,7 @@
 //!    only a real window can measure pacing. The 2026-07-05 incident build
 //!    presented at ~5/s with 190-530 ms input→present; a healthy build does 30+/s
 //!    under 15 ms. Skips automatically without a WindowServer session (CI/SSH), or
-//!    with `ATERM_SKIP_GUI_SMOKE=1`.
+//!    with `--skip-gui-smoke`.
 //!
 //!    It drives TWO bursts. The controller burst (`ctl key`) is born already
 //!    dequeued: it never arms the key-arrival stamp, so it cannot see OS event-queue
@@ -161,6 +161,9 @@ struct Sandbox {
     cfgdir: PathBuf,
     gui_log: PathBuf,
     child: Option<Child>,
+    /// The headless child's lifeline ([`arm_lifeline`]): dropped by `teardown`
+    /// after the child is retired, and closed by the kernel if this gate dies first.
+    lifeline: Option<std::fs::File>,
 }
 
 impl Sandbox {
@@ -206,6 +209,7 @@ impl Sandbox {
             cfgdir,
             gui_log,
             child: None,
+            lifeline: None,
         })
     }
 
@@ -223,8 +227,50 @@ impl Sandbox {
                 r.fail("smoke: child cleanup/reap failed");
             }
         }
+        self.lifeline.take();
         std::fs::remove_dir_all(&self.tmp).ok();
     }
+}
+
+/// Arm a HEADLESS smoke child with a lifeline — `--lifeline-fd 0` on a FIFO this
+/// gate holds the one writer of — so a gate run that is killed outright (no
+/// teardown, no `Drop`) does not leave its instance running (gap #36: a leaked
+/// headless instance ran for eleven days). The protocol and its measurements are
+/// `aterm_uds::lifeline`'s; this is the same launcher end in std alone, because
+/// this crate has no dependencies by charter: `mkfifo(1)` makes the node, and the
+/// held end is opened read-write (never blocks: it is its own reader), the far
+/// end read-only (a writer exists), both close-on-exec from birth, the name
+/// unlinked at once. Call it before any `-e` payload.
+///
+/// # Errors
+/// The FIFO could not be made or opened; nothing is left behind.
+#[cfg(unix)]
+fn arm_lifeline(cmd: &mut Command, dir: &Path) -> std::io::Result<std::fs::File> {
+    let fifo = dir.join("lifeline");
+    let mkfifo = ["/usr/bin/mkfifo", "/bin/mkfifo"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap_or("mkfifo");
+    let made = Command::new(mkfifo)
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !made.success() {
+        return Err(std::io::Error::other(format!("mkfifo exited {made}")));
+    }
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .and_then(|held| std::fs::File::open(&fifo).map(|far| (held, far)));
+    std::fs::remove_file(&fifo).ok();
+    let (held, far) = opened?;
+    cmd.arg("--lifeline-fd").arg("0").stdin(far);
+    Ok(held)
 }
 
 #[cfg(unix)]
@@ -313,15 +359,24 @@ fn bring_up(
         .env("HOME", sb.tmp.join("home"))
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir)
-        .env("ATERM_CONTROL_SOCK", sb.sock())
         .env("SHELL", "/bin/sh")
         .stdout(log)
         .stderr(log2);
-    // Headless via the FLAG — the canonical arming ($ATERM_HEADLESS is an exact
-    // equivalent, but a flag is visible in the spawn line and cannot be lost to
-    // an env-inheritance rule between here and exec).
+    // The socket and headless are launch FLAGS — the one spelling; no environment
+    // variable selects either (2026-09-24).
+    cmd.arg("--control-sock").arg(sb.sock());
     if headless {
         cmd.arg("--headless");
+        // Unix only, like the flag: Windows has no lifeline, and its child is
+        // retired by `teardown` as before.
+        #[cfg(unix)]
+        match arm_lifeline(&mut cmd, &sb.tmp) {
+            Ok(held) => sb.lifeline = Some(held),
+            Err(e) => {
+                r.cannot_run(format!("{tag}: cannot arm the instance's lifeline ({e})"));
+                return Ready::Stopped;
+            }
+        }
     }
     match cmd.spawn() {
         Ok(c) => sb.child = Some(c),
@@ -363,13 +418,12 @@ fn child_exited(sb: &mut Sandbox) -> bool {
 /// One `aterm-ctl` round trip inside the sandbox, stdout and stderr merged the
 /// way `$(… 2>&1)` merged them.
 fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
+    // `--sock` pins this exact socket; ctl reads its token beside it (there is
+    // no token/token-file/cap environment override).
     let cmd = Cmd::new(ctl_bin)
+        .arg("--sock")
+        .arg(sb.sock())
         .args(args.iter().copied())
-        // Current ctl reads its token beside this exact socket; there is no
-        // token/token-file/cap environment override. Defeat the independent
-        // ambient disable selector too, without changing product auth tests.
-        .env("ATERM_CONTROL_SOCK", sb.sock())
-        .env("ATERM_NO_CONTROL_SOCK", "0")
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir);
     capture_reply(&cmd, ctx.exec_env())
@@ -377,9 +431,9 @@ fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
 
 fn ctl_quiet(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) {
     let cmd = Cmd::new(ctl_bin)
+        .arg("--sock")
+        .arg(sb.sock())
         .args(args.iter().copied())
-        .env("ATERM_CONTROL_SOCK", sb.sock())
-        .env("ATERM_NO_CONTROL_SOCK", "0")
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir)
         .capture(Capture::Silent);
@@ -518,8 +572,8 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
 /// Every honest reason this stage cannot measure anything, in the script's order.
 /// Each is a SKIP: the machine cannot present, which says nothing about the code.
 fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
-    if ctx.env.skip_gui_smoke.as_deref() == Some("1") {
-        return Some("gui smoke (ATERM_SKIP_GUI_SMOKE)".into());
+    if ctx.skip_gui_smoke {
+        return Some("gui smoke (--skip-gui-smoke)".into());
     }
     if std::env::consts::OS != "macos" {
         return Some("gui smoke (macOS only)".into());
@@ -1302,17 +1356,17 @@ mod tests {
     #[test]
     fn the_gui_smoke_skips_honestly_when_the_machine_cannot_present() {
         let mut c = ctx();
-        c.env.skip_gui_smoke = Some("1".into());
+        c.skip_gui_smoke = true;
         assert_eq!(
             gui_smoke_unavailable(&c).as_deref(),
-            Some("gui smoke (ATERM_SKIP_GUI_SMOKE)")
+            Some("gui smoke (--skip-gui-smoke)")
         );
 
-        // …and the opt-out is exact: any other value is not the opt-out.
-        c.env.skip_gui_smoke = Some("0".into());
+        // …and without the flag it is not the opt-out.
+        c.skip_gui_smoke = false;
         assert_ne!(
             gui_smoke_unavailable(&c).as_deref(),
-            Some("gui smoke (ATERM_SKIP_GUI_SMOKE)")
+            Some("gui smoke (--skip-gui-smoke)")
         );
     }
 
@@ -1375,7 +1429,13 @@ mod tests {
                 .spawn()
                 .expect("spawn"),
         );
-        std::thread::sleep(Duration::from_millis(50));
+        // Its own exit, witnessed before teardown's TERM — a 50 ms nap let a
+        // starved `sh` be killed first, a death teardown DID cause.
+        let pid = sb.child.as_ref().expect("child").id();
+        assert!(
+            crate::smoke::exited_on_its_own(pid),
+            "`exit 7` never exited within 30 s"
+        );
         let mut r = Report::new("t");
         sb.teardown(&mut r);
         assert_eq!(

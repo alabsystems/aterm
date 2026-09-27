@@ -32,7 +32,8 @@
 //! `task` ([`task`]) posts `kind=task` from the manager's session — the body
 //! travels by mail, never through the PTY — then types
 //! the one-line nudge `Inbox: task @<off>` as a `turn` ONLY when the worker
-//! is idle, and with `--wait` parks `await inbox` for the `answer|report|ack`
+//! is idle — its Enter guarded on the composer's caret row holding the
+//! nudge (`submit=guarded:`), so it never lands in a box — and with `--wait` parks `await inbox` for the `answer|report|ack`
 //! that carries `re=<off>` — re-armed while time is left, since the host
 //! clamps one wait at 600 s and a bound above that (`--deadline 900`) gets
 //! the host's `OK timeout` with time to spare.
@@ -43,15 +44,17 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use super::phase::{Phase, worker_phase};
-use super::run::{Ctl, CtlReply, EXIT_TIMEOUT, Session};
+use super::run::{Ctl, CtlReply, EXIT_TIMEOUT, Session, composer_guard};
 
 /// `--report-window`'s default: how long before its `EVENT idle` a worker's
 /// `report` mail may have come to be folded into it when the loop cannot
 /// tell which turn it belongs to ([`MailOpts::report_window`]).
 pub const DEFAULT_REPORT_WINDOW: Duration = Duration::from_secs(120);
 /// `--idle-grace`'s default: how long an idle point waits for the worker's
-/// report before it is said as `EVENT idle-no-report`.
-pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(180);
+/// report before it is said as `EVENT idle-no-report`. Bound the manager's
+/// handoff delay: a late report still arrives on its own `MAIL` line, and
+/// callers waiting for a slow reporter can extend this with `--idle-grace`.
+pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(5);
 /// The selector of the manager's own session, unless `--inbox` names one.
 pub const SELF: &str = "@self";
 /// Every kind the endpoint delivers, so a lone `note` wakes the lane too
@@ -537,6 +540,17 @@ pub struct TaskOpts {
 /// among them, are the instruction — when the worker could not be read, or
 /// when the nudge's turn was refused.
 pub fn task<C: Ctl>(ctl: &mut C, opts: &TaskOpts, out: &mut dyn Write) -> Result<u8, String> {
+    task_with_clock(ctl, opts, out, Instant::now)
+}
+
+/// The shipping deadline loop with its monotonic clock supplied separately so
+/// scripted host timeouts can exercise it without depending on OS scheduling.
+fn task_with_clock<C: Ctl>(
+    ctl: &mut C,
+    opts: &TaskOpts,
+    out: &mut dyn Write,
+    mut now: impl FnMut() -> Instant,
+) -> Result<u8, String> {
     let since = match opts.wait {
         Some(_) => {
             let r = ctl.call(&[&opts.inbox, "inbox", "1", "--peek", "--meta"])?;
@@ -578,11 +592,39 @@ pub fn task<C: Ctl>(ctl: &mut C, opts: &TaskOpts, out: &mut dyn Write) -> Result
     match Session::new(ctl, Some(opts.worker.clone())).read_screen() {
         Err(why) => refused = Some(format!("cannot read the worker for the nudge: {why}")),
         Ok(screen) if worker_phase(&screen.rows) == Phase::Idle => {
+            // The Enter is GUARDED on the composer's caret row holding the
+            // nudge: a box that the read missed, or that came up since, has
+            // no such row, so the nudge's Enter can never choose its
+            // focused option (the harness final review r3 of 2026-09-24,
+            // blocking: a live box misread as idle took the plain Enter as
+            // its `❯ 1. Yes`).
             let nudge = format!("{NUDGE}{off}");
-            let r = ctl.call(&[&opts.worker, "turn", NUDGE_IDLE, NUDGE_TIMEOUT, &nudge])?;
+            // Claude Code's caret: the nudge is typed only over the idle
+            // screen `worker_phase` (Claude Code's grammar) reads.
+            let submit = format!("submit=guarded:{}", composer_guard('❯', &nudge));
+            let r = ctl.call(&[
+                &opts.worker,
+                "turn",
+                &submit,
+                NUDGE_IDLE,
+                NUDGE_TIMEOUT,
+                &nudge,
+            ])?;
             nudged = r.submitted();
             if !nudged && !r.timed_out() {
-                refused = Some(format!("nudge refused: {}", r.err_text()));
+                refused = Some(if r.unknown_form() {
+                    format!(
+                        "nudge not typed: the worker's aterm is too old for a guarded nudge: {}",
+                        r.err_text()
+                    )
+                } else if r.ok() {
+                    format!(
+                        "nudge not submitted; `{nudge}` may be left typed: {}",
+                        r.turn_verdict().unwrap_or(r.stdout.trim())
+                    )
+                } else {
+                    format!("nudge refused: {}", r.err_text())
+                });
             }
         }
         Ok(_) => {}
@@ -594,12 +636,12 @@ pub fn task<C: Ctl>(ctl: &mut C, opts: &TaskOpts, out: &mut dyn Write) -> Result
     let Some(bound) = opts.wait else {
         return Ok(0);
     };
-    let deadline = Instant::now() + bound;
+    let deadline = now() + bound;
     let mut since = since;
     loop {
         // The wire's unit is the millisecond: a remainder under one is the
         // bound spent, not a `timeout 0` to arm and re-arm until it passes.
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.saturating_duration_since(now());
         let ms = left.as_millis();
         if ms == 0 {
             break;
@@ -719,15 +761,19 @@ mod tests {
     }
     use super::super::prompt::fixtures::{composer, rows};
     use super::*;
+    use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
-    /// A scripted client: every request pops the next reply (`OK` with none
-    /// left) and is recorded. An `await` answered with a timeout PARKS first,
-    /// for the timeout asked or [`Script::PARK`], whichever is shorter — as
-    /// the host does — so a wait's bound is spent by waiting, not by spinning.
+    /// A scripted client: every request pops the next reply and is recorded;
+    /// an unexpected request fails instead of spinning on an exhausted script.
+    /// An `await` answered with a timeout advances the
+    /// shared monotonic clock by the timeout asked or [`Script::PARK`], whichever
+    /// is shorter — the host's bounded wait, independent of test scheduling.
     struct Script {
         requests: Vec<String>,
         replies: VecDeque<CtlReply>,
+        now: Rc<Cell<Instant>>,
     }
 
     impl Script {
@@ -737,6 +783,7 @@ mod tests {
             Self {
                 requests: Vec::new(),
                 replies: replies.into(),
+                now: Rc::new(Cell::new(Instant::now())),
             }
         }
     }
@@ -745,12 +792,15 @@ mod tests {
         fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
             let line = args.join(" ");
             self.requests.push(line.clone());
-            let reply = self.replies.pop_front().unwrap_or_else(|| ok("OK\n"));
+            let reply = self
+                .replies
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected control request: {line}"));
             if reply.timed_out() && line.contains(" await ") {
                 let asked = num(&line, "timeout")
                     .or_else(|| line.rsplit(' ').next().and_then(|ms| ms.parse().ok()))
                     .map_or(Self::PARK, Duration::from_millis);
-                std::thread::sleep(asked.min(Self::PARK));
+                self.now.set(self.now.get() + asked.min(Self::PARK));
             }
             Ok(reply)
         }
@@ -811,7 +861,8 @@ mod tests {
     }
     fn run_task(s: &mut Script, opts: &TaskOpts) -> (Result<u8, String>, Vec<String>) {
         let mut out: Vec<u8> = Vec::new();
-        let code = task(s, opts, &mut out);
+        let now = Rc::clone(&s.now);
+        let code = task_with_clock(s, opts, &mut out, || now.get());
         let text = String::from_utf8(out).expect("utf-8");
         (code, text.lines().map(str::to_string).collect())
     }
@@ -869,14 +920,81 @@ mod tests {
         let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(code, Ok(0));
         assert_eq!(lines, ["task @91 nudged=1"]);
+        let guard = composer_guard('❯', "Inbox: task @91");
+        assert!(guard.starts_with("^❯\\s"), "{guard}");
         assert_eq!(
             s.requests,
             [
-                "@self post to=@s-1 kind=task dl=600000 run the suite and report",
-                "@s-1 text --json tail=40",
-                "@s-1 turn idle=600 timeout=2500 Inbox: task @91",
+                "@self post to=@s-1 kind=task dl=600000 run the suite and report".to_string(),
+                "@s-1 text --json tail=40".to_string(),
+                format!("@s-1 turn submit=guarded:{guard} idle=600 timeout=2500 Inbox: task @91"),
             ]
         );
+    }
+
+    /// The harness final review r3 of 2026-09-24 (blocking): a live box
+    /// whose body holds a `⎿` row over a blank row — a heredoc writing a
+    /// transcript, a skill's or an option's description — read as idle, and
+    /// the nudge's plain Enter chose its focused `❯ 1. Yes`. Such a box is
+    /// read as a box, so no nudge is typed at all, whole or through the
+    /// 40-row tail; and where a nudge IS typed, a guard that misses (a box
+    /// came up between the read and the Enter) is `nudged=0` and said, not
+    /// an Enter. The control: the idle screen is nudged.
+    #[test]
+    fn a_nudge_never_lands_in_a_live_box() {
+        let rule = "─".repeat(120);
+        let mut heredoc = rows(&[
+            "⏺ Writing the fixture.",
+            "",
+            &rule,
+            " Bash command",
+            "",
+            "   cat > fixture.txt <<'EOF'",
+        ]);
+        for k in 0..30 {
+            heredoc.push(format!("   line {k}"));
+        }
+        heredoc.extend(rows(&[
+            "   ⏺ Bash(ls)",
+            "     ⎿  a.txt",
+            "",
+            "   ⏺ Done.",
+            "   EOF",
+            "   Write the transcript fixture",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ]));
+        let tail = heredoc[heredoc.len() - 40..].to_vec();
+        for (name, r) in [("whole", heredoc), ("tail 40", tail)] {
+            assert_ne!(worker_phase(&r), Phase::Idle, "{name}");
+            let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&r)]);
+            let (code, lines) = run_task(&mut s, &task_opts(None));
+            assert_eq!(code, Ok(0), "{name}");
+            assert_eq!(lines, ["task @91 nudged=0"], "{name}");
+            assert!(
+                !s.requests.iter().any(|q| q.contains("turn")),
+                "{name}: {:?}",
+                s.requests
+            );
+        }
+        // The guard missed: nothing submitted, said, and no second Enter.
+        let mut s = Script::new(vec![
+            ok("OK 3 off=91\n"),
+            screen(&idle_screen()),
+            ok("OK 0 turn skipped reason=guard submitted=0 seq=9 id=1\n"),
+        ]);
+        let (code, lines) = run_task(&mut s, &task_opts(None));
+        assert_eq!(lines, ["task @91 nudged=0"]);
+        let why = code.expect_err("a missed guard is said");
+        assert!(
+            why.contains("not submitted") && why.contains("reason=guard"),
+            "{why}"
+        );
+        assert_eq!(s.requests.len(), 3, "{:?}", s.requests);
     }
 
     /// A busy worker gets the mail only: no nudge is typed into a running
@@ -980,20 +1098,15 @@ mod tests {
             timeout(),
         ]);
         let bound = Duration::from_millis(60);
-        let started = Instant::now();
+        let started = s.now.get();
         let (code, lines) = run_task(&mut s, &task_opts(Some(bound)));
-        // THE BOUND IS SPENT BY WAITING, measured against a clock that rounds.
-        // A sleep of `bound` can return a hair early — 59.714 ms against 60 ms in
-        // this release's gate — because the sleep's own timer and `Instant` are
-        // not the same clock and neither promises the other's resolution. The
-        // slop is a TIMER tolerance, not a licence to return early: a waiter that
-        // skipped its wait misses by milliseconds, not microseconds, and still
-        // fails here.
-        const TIMER_SLOP: Duration = Duration::from_millis(1);
-        assert!(
-            started.elapsed() + TIMER_SLOP >= bound,
-            "the wait returned {:?} short of its {bound:?} bound",
-            bound.saturating_sub(started.elapsed())
+        // The bound is spent by host waits. A real 25 ms sleep may resume after
+        // all 60 ms have passed on a loaded machine, legitimately needing just
+        // one await; this clock instead makes all three waits observable.
+        assert_eq!(
+            s.now.get().duration_since(started),
+            bound,
+            "the timeout must consume the bound, not just the first host wait"
         );
         assert_eq!(code, Ok(EXIT_TIMEOUT));
         assert_eq!(
@@ -1003,15 +1116,20 @@ mod tests {
                 "TIMEOUT no answer, report or ack re=91 within 0.06 s",
             ]
         );
-        let awaits: Vec<&String> = s
+        let awaits: Vec<&str> = s
             .requests
             .iter()
-            .filter(|r| r.contains("await inbox since=4 "))
+            .filter(|r| r.contains(" await "))
+            .map(String::as_str)
             .collect();
-        assert!(
-            (2..=4).contains(&awaits.len()),
-            "re-armed until the bound: {:?}",
-            s.requests
+        assert_eq!(
+            awaits,
+            [
+                "@self await inbox since=4 kinds=answer,report,ack timeout 60",
+                "@self await inbox since=4 kinds=answer,report,ack timeout 35",
+                "@self await inbox since=4 kinds=answer,report,ack timeout 10",
+            ],
+            "re-arm the same watermark with only the remaining bound"
         );
         assert_eq!(secs(Duration::from_secs(30)), "30");
         assert_eq!(secs(Duration::from_millis(1500)), "1.5");
@@ -1129,7 +1247,13 @@ mod tests {
                 pause_max: Duration::from_millis(5),
             };
             s.spawn(|| lane.run(Some("@s-1"), &say, tx, &stop));
-            let got = rx.recv_timeout(Duration::from_millis(500));
+            // A hang bound, not a latency one: the delivery returns this the
+            // moment it is sent, and a lane that never hears the successor
+            // (parked on `since=4`, or off after its reconnect window) fails
+            // at any finite bound. 500 ms here was ~7 ms of work plus however
+            // long a loaded gate left this thread unscheduled (the
+            // load-sensitive test audit of 2026-09-27).
+            let got = rx.recv_timeout(Duration::from_secs(30));
             stop.store(true, Ordering::Relaxed);
             got
         });

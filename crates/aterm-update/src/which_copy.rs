@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! running: /Applications/aterm.app
-//! another copy: /Users//ana/Applications/aterm.app (0.60.0) — not the one running; the updater updates only this one
+//! another copy: /Users//ana/Applications/aterm.app (0.60.0) — the updater leaves it alone
 //! ```
 //!
 //! Reuse, not reimplementation: the running bundle is [`crate::bundle::layout_of`]
@@ -45,8 +45,8 @@ pub use crate::install_posture::InstallPosture;
 #[cfg(target_os = "macos")]
 pub use crate::bundle::posture_from;
 
-/// What the running copy IS — decides whether the updater's promise ("the updater
-/// updates only this one") may be made at all.
+/// What the running copy IS — decides whether the other-copy clause ("the updater
+/// leaves it alone") may be made at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Running {
     /// An installed `.app` the updater may replace (`bundle::resolve` semantics).
@@ -82,7 +82,7 @@ pub struct WhichCopy {
 
 impl WhichCopy {
     /// The running copy's row value: the path — plus, for a bundle the updater never
-    /// touches, the reason the "updates only this one" promise is absent.
+    /// touches, the reason the other rows' "the updater leaves it alone" is absent.
     #[must_use]
     pub fn running_detail(&self) -> String {
         match self.kind {
@@ -94,19 +94,17 @@ impl WhichCopy {
         }
     }
 
-    /// One other copy's row value:
-    /// `<path> (<version>) — not the one running; the updater updates only this one`.
-    /// The updater clause is made only when the running copy is an installed bundle
-    /// the updater owns — from a bare binary or an inert bundle it updates neither.
+    /// One other copy's row value: `<path> (<version>) — the updater leaves it alone`.
+    /// The row's label (`another copy`) already says it is not the one running. The
+    /// updater clause is made only when the running copy is an installed bundle the
+    /// updater owns — from a bare binary or an inert bundle it updates neither, and the
+    /// value is `<path> (<version>)` alone.
     #[must_use]
     pub fn other_detail(&self, other: &OtherCopy) -> String {
         let version = other.version.as_deref().unwrap_or("version unknown");
-        let mut detail = format!(
-            "{} ({version}) \u{2014} not the one running",
-            other.path.display()
-        );
+        let mut detail = format!("{} ({version})", other.path.display());
         if self.kind == Running::InstalledApp {
-            detail.push_str("; the updater updates only this one");
+            detail.push_str(" \u{2014} the updater leaves it alone");
         }
         detail
     }
@@ -145,6 +143,58 @@ fn observe_from(exe: &Path) -> WhichCopy {
     survey(exe, &usual_app_locations())
 }
 
+/// What kind of copy THIS process runs from — [`observe`]'s `kind` alone, without
+/// probing the usual places for other copies: one canonicalize and, for a bundle,
+/// one bounded `Info.plist` read. For a caller that must decide at launch whether
+/// it is the installed app (the crash marker's owner — `aterm-gui`'s
+/// `crash_signal::Arming`), where [`observe`]'s directory probes are work nobody
+/// asked for. [`Running::Binary`] when the executable path is unknown.
+#[must_use]
+pub fn running_kind() -> Running {
+    let Ok(exe) = std::env::current_exe() else {
+        return Running::Binary;
+    };
+    // The same deliberate shim resolution as [`observe`].
+    #[cfg(unix)]
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    kind_of(&exe)
+}
+
+/// [`running_kind`]'s pure core, for a given executable path.
+#[must_use]
+pub fn kind_of(exe: &Path) -> Running {
+    #[cfg(target_os = "macos")]
+    {
+        classify(exe).1
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe;
+        Running::Binary
+    }
+}
+
+/// The running copy's root and kind: the `.app` root and whether the updater owns
+/// it, or the bare executable.
+#[cfg(target_os = "macos")]
+fn classify(exe: &Path) -> (PathBuf, Running) {
+    match crate::bundle::layout_of(exe) {
+        Some(bundle) => {
+            let owned = crate::bundle::resolve_from(exe)
+                .is_some_and(|b| !crate::bundle::is_dev_marked(&b.app_root));
+            (
+                bundle.app_root,
+                if owned {
+                    Running::InstalledApp
+                } else {
+                    Running::InertApp
+                },
+            )
+        }
+        None => (exe.to_path_buf(), Running::Binary),
+    }
+}
+
 /// Off macOS there is no bundle and no updater lane: the executable path is the
 /// whole answer.
 #[cfg(not(target_os = "macos"))]
@@ -165,21 +215,7 @@ fn observe_from(exe: &Path) -> WhichCopy {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn survey(exe: &Path, candidates: &[PathBuf]) -> WhichCopy {
-    let (running, kind) = match crate::bundle::layout_of(exe) {
-        Some(bundle) => {
-            let owned = crate::bundle::resolve_from(exe)
-                .is_some_and(|b| !crate::bundle::is_dev_marked(&b.app_root));
-            (
-                bundle.app_root,
-                if owned {
-                    Running::InstalledApp
-                } else {
-                    Running::InertApp
-                },
-            )
-        }
-        None => (exe.to_path_buf(), Running::Binary),
-    };
+    let (running, kind) = classify(exe);
     let mut others: Vec<OtherCopy> = Vec::new();
     for candidate in candidates {
         if !is_real_dir(candidate) {
@@ -342,11 +378,11 @@ mod tests {
             installed.lines(),
             vec![
                 "running: /Applications/aterm.app".to_string(),
-                "another copy: /Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one \
-                 running; the updater updates only this one"
+                "another copy: /Users//ana/Applications/aterm.app (0.60.0) \u{2014} the updater \
+                 leaves it alone"
                     .to_string(),
                 "another copy: /opt/homebrew/Caskroom/aterm/0.59.0/aterm.app (version unknown) \
-                 \u{2014} not the one running; the updater updates only this one"
+                 \u{2014} the updater leaves it alone"
                     .to_string(),
             ]
         );
@@ -371,9 +407,7 @@ mod tests {
             binary.lines(),
             vec![
                 "running: /Users//ana/aterm/target/release/aterm".to_string(),
-                "another copy: /Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one \
-                 running"
-                    .to_string(),
+                "another copy: /Users//ana/Applications/aterm.app (0.60.0)".to_string(),
             ]
         );
         let inert = WhichCopy {
@@ -386,9 +420,7 @@ mod tests {
             vec![
                 "running: /Volumes/aterm/aterm.app (the updater leaves this copy alone)"
                     .to_string(),
-                "another copy: /Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one \
-                 running"
-                    .to_string(),
+                "another copy: /Users//ana/Applications/aterm.app (0.60.0)".to_string(),
             ]
         );
     }
@@ -532,18 +564,15 @@ mod tests {
                 vec![
                     format!("running: {}", running_app.display()),
                     format!(
-                        "another copy: {} (0.60.0) \u{2014} not the one running; the updater \
-                         updates only this one",
+                        "another copy: {} (0.60.0) \u{2014} the updater leaves it alone",
                         home_app.display()
                     ),
                     format!(
-                        "another copy: {} (version unknown) \u{2014} not the one running; the \
-                         updater updates only this one",
+                        "another copy: {} (version unknown) \u{2014} the updater leaves it alone",
                         cask_app.display()
                     ),
                     format!(
-                        "another copy: {} (version unknown) \u{2014} not the one running; the \
-                         updater updates only this one",
+                        "another copy: {} (version unknown) \u{2014} the updater leaves it alone",
                         odd.display()
                     ),
                 ]
@@ -569,10 +598,7 @@ mod tests {
                 report.lines(),
                 vec![
                     format!("running: {}", exe.display()),
-                    format!(
-                        "another copy: {} (0.60.0) \u{2014} not the one running",
-                        installed.display()
-                    ),
+                    format!("another copy: {} (0.60.0)", installed.display()),
                 ]
             );
             let _ = std::fs::remove_dir_all(root);

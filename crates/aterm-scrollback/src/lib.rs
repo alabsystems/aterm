@@ -124,13 +124,11 @@ pub(crate) use codec::{
 // round-trip unit test. With `zstd` but not `disk-tier` it has no production
 // caller, so suppress the unused-import lint in that configuration.
 #[cfg(feature = "zstd")]
-#[cfg_attr(not(feature = "disk-tier"), allow(unused_imports))]
 pub(crate) use codec::decode_zstd_bounded;
 // Single source of truth for the cold-tier zstd level, shared by the in-memory
 // cold tier (codec.rs) and the disk `.dtrm` rewrite/compaction paths so all
 // eviction sites compress at the same CPU/ratio tradeoff.
 #[cfg(feature = "zstd")]
-#[cfg_attr(not(feature = "disk-tier"), allow(unused_imports))]
 pub(crate) use codec::COLD_ZSTD_LEVEL;
 pub(crate) use cold_tier::ColdTier;
 #[cfg(feature = "disk-tier")]
@@ -141,7 +139,7 @@ pub use disk_backed::{DiskBackedScrollback, DiskBackedScrollbackConfig};
 pub(crate) use disk_format::DiskColdConfig;
 pub use error::ScrollbackError;
 pub(crate) use hot_tier::HotTier;
-pub use iter::{ScrollbackIter, ScrollbackRevIter};
+pub use iter::ScrollbackIter;
 pub use line::{AttrRunCursor, CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
 // Block codec, public for `TerminalCheckpoint` grid-body encode/decode (B.3.2).
 pub use line::{
@@ -194,10 +192,6 @@ pub(crate) use watermark::{
 /// // Iterate oldest to newest
 /// let lines: Vec<_> = sb.iter().map(|l| l.to_string()).collect();
 /// assert_eq!(lines, vec!["Line A", "Line B", "Line C"]);
-///
-/// // Iterate newest to oldest
-/// let recent: Vec<_> = sb.iter_rev().take(2).map(|l| l.to_string()).collect();
-/// assert_eq!(recent, vec!["Line C", "Line B"]);
 /// ```
 ///
 /// Setting a line limit:
@@ -375,6 +369,7 @@ impl Scrollback {
     /// Get the number of lines in hot tier.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn hot_line_count(&self) -> usize {
         self.hot.len()
     }

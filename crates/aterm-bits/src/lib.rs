@@ -13,12 +13,7 @@
 //! | `bytemuck::Zeroable` (trait)    | [`Zeroable`]                    |
 //! | `bytemuck::cast_slice`          | [`cast_slice`]                  |
 //! | `bytemuck::try_cast_slice`      | [`try_cast_slice`]              |
-//! | `bytemuck::cast_slice_mut`      | [`cast_slice_mut`]              |
 //! | `bytemuck::bytes_of`            | [`bytes_of`]                    |
-//! | `bytemuck::bytes_of_mut`        | [`bytes_of_mut`]                |
-//! | `bytemuck::from_bytes`          | [`from_bytes`]                  |
-//! | `bytemuck::from_bytes_mut`      | [`from_bytes_mut`]              |
-//! | `bytemuck::pod_read_unaligned`  | [`pod_read_unaligned`]          |
 //!
 //! # Deriving
 //!
@@ -105,9 +100,11 @@ macro_rules! impl_pod_zeroable_primitive {
             // patterns of the appropriate size are valid values of the type,
             // and the all-zero bit pattern corresponds to the value `0` /
             // `0.0` which is always valid.
+
             unsafe impl Zeroable for $t {}
             // SAFETY: see above — `$t` is `Copy + 'static`, has a canonical
             // layout, and every bit pattern is a valid value.
+
             unsafe impl Pod for $t {}
         )*
     };
@@ -119,17 +116,21 @@ impl_pod_zeroable_primitive!(f32, f64);
 
 // SAFETY: `()` is a ZST; there are no bytes, so trivially every bit pattern
 // (i.e. the empty one) is valid and all-zero is sound.
+
 unsafe impl Zeroable for () {}
 // SAFETY: see above.
+
 unsafe impl Pod for () {}
 
 // Arrays of Pod are Pod (arrays of Zeroable are Zeroable) for all lengths.
 // SAFETY: `[T; N]` has layout `T` repeated `N` times with no extra padding
 // (stable guarantee). If every `T` byte pattern is valid, so is every
 // `[T; N]` byte pattern. Same argument for `Zeroable`.
+
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 // SAFETY: see above; additionally `[T; N]: Copy` when `T: Copy`, and `[T; N]`
 // is `'static` when `T: 'static`.
+
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
 // ---------------------------------------------------------------------------
@@ -216,20 +217,6 @@ pub fn cast_slice<A: Pod, B: Pod>(src: &[A]) -> &[B] {
     }
 }
 
-/// Cast `&mut [A]` to `&mut [B]` where both are `Pod`.
-///
-/// # Panics
-///
-/// See [`cast_slice`].
-#[inline]
-#[must_use]
-pub fn cast_slice_mut<A: Pod, B: Pod>(src: &mut [A]) -> &mut [B] {
-    match try_cast_slice_mut(src) {
-        Ok(out) => out,
-        Err(err) => panic_cast_failed!("cast_slice_mut", err),
-    }
-}
-
 /// Fallible [`cast_slice`] — returns [`PodCastError`] instead of panicking.
 ///
 /// The size/alignment checks are written inline (rather than shared through
@@ -298,44 +285,6 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
     Ok(unsafe { slice::from_raw_parts(ptr_b, out_len) })
 }
 
-/// Fallible [`cast_slice_mut`] — returns [`PodCastError`] instead of panicking.
-#[inline]
-pub fn try_cast_slice_mut<A: Pod, B: Pod>(src: &mut [A]) -> Result<&mut [B], PodCastError> {
-    let a_size = size_of::<A>();
-    let b_size = size_of::<B>();
-    let byte_len = size_of_val(&*src);
-    // Pure cast chain from the unique reference — see `try_cast_slice`.
-    let ptr_b = core::ptr::from_mut(src).cast::<B>();
-
-    // Identical check sequence to `try_cast_slice` (kept inline for the same
-    // modular-verification reason).
-    if a_size == 0 || b_size == 0 {
-        if a_size == b_size {
-            return Ok(&mut []);
-        }
-        return Err(PodCastError::SizeMismatch);
-    }
-    if !ptr_b.addr().is_multiple_of(align_of::<B>()) {
-        return Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned);
-    }
-    if !byte_len.is_multiple_of(b_size) {
-        return Err(PodCastError::OutputSliceWouldHaveSlop);
-    }
-
-    let out_len = byte_len / b_size;
-    if ptr_b.is_null() {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged.
-        return Ok(&mut []);
-    }
-    // SAFETY: identical reasoning to `try_cast_slice`, plus: the source is
-    // `&mut [A]` so we uniquely own the memory and can hand out `&mut [B]` —
-    // `ptr_b` was derived from the unique reference, so it carries unique
-    // write provenance over the whole slice.
-    Ok(unsafe { slice::from_raw_parts_mut(ptr_b, out_len) })
-}
-
 // ---------------------------------------------------------------------------
 // Single-value views
 // ---------------------------------------------------------------------------
@@ -359,128 +308,6 @@ pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
     // with a well-defined layout. The returned slice borrows from `value`,
     // so its lifetime is bounded correctly.
     unsafe { slice::from_raw_parts(ptr, size_of::<T>()) }
-}
-
-/// View a single `Pod` value's raw bytes mutably.
-#[inline]
-#[must_use]
-pub fn bytes_of_mut<T: Pod>(value: &mut T) -> &mut [u8] {
-    // Pure cast chain from the unique reference — see `bytes_of`.
-    let ptr = core::ptr::from_mut(value).cast::<u8>();
-    if ptr.is_null() {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged.
-        return &mut [];
-    }
-    // SAFETY: same argument as `bytes_of`. The unique `&mut T` means we can
-    // produce a unique `&mut [u8]` over the same bytes — `Pod` types have
-    // no invalid bit patterns, so arbitrary writes through the byte slice
-    // cannot produce an invalid `T`.
-    unsafe { slice::from_raw_parts_mut(ptr, size_of::<T>()) }
-}
-
-/// Interpret `bytes` as a single `Pod` value.
-///
-/// # Panics
-///
-/// Panics if `bytes.len() != size_of::<T>()` or if `bytes` is not aligned to
-/// `align_of::<T>()`. Use [`try_from_bytes`] to handle these cases.
-#[inline]
-#[must_use]
-pub fn from_bytes<T: Pod>(bytes: &[u8]) -> &T {
-    match try_from_bytes(bytes) {
-        Ok(v) => v,
-        Err(err) => panic_cast_failed!("from_bytes", err),
-    }
-}
-
-/// Interpret `bytes` as a single `Pod` value mutably.
-///
-/// # Panics
-///
-/// See [`from_bytes`].
-#[inline]
-#[must_use]
-pub fn from_bytes_mut<T: Pod>(bytes: &mut [u8]) -> &mut T {
-    match try_from_bytes_mut(bytes) {
-        Ok(v) => v,
-        Err(err) => panic_cast_failed!("from_bytes_mut", err),
-    }
-}
-
-/// Fallible [`from_bytes`].
-#[inline]
-pub fn try_from_bytes<T: Pod>(bytes: &[u8]) -> Result<&T, PodCastError> {
-    if bytes.len() != size_of::<T>() {
-        return Err(PodCastError::SizeMismatch);
-    }
-    // Pure cast chain from the slice reference (no opaque `as_ptr` call) so
-    // the verifier can connect the pointer to `bytes`' allocation; `addr()`
-    // rather than `as usize` because it strips provenance instead of
-    // exposing it, which the verifier can model.
-    let ptr = core::ptr::from_ref(bytes).cast::<T>();
-    if !ptr.addr().is_multiple_of(align_of::<T>()) {
-        return Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned);
-    }
-    if ptr.is_null() {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged (no real path reports this
-        // error).
-        return Err(PodCastError::SizeMismatch);
-    }
-    // SAFETY: the length check above ensures exactly `size_of::<T>()`
-    // initialized bytes are reachable from `ptr` (it is `bytes`' own data
-    // pointer, non-null by the guard above); the alignment check ensures it
-    // is aligned for `T`; and `T: Pod` ensures any bit pattern is a valid
-    // `T`. The returned reference borrows `bytes`, bounding its lifetime.
-    Ok(unsafe { &*ptr })
-}
-
-/// Fallible [`from_bytes_mut`].
-#[inline]
-pub fn try_from_bytes_mut<T: Pod>(bytes: &mut [u8]) -> Result<&mut T, PodCastError> {
-    if bytes.len() != size_of::<T>() {
-        return Err(PodCastError::SizeMismatch);
-    }
-    // Pure cast chain from the unique slice reference — see `try_from_bytes`.
-    let ptr = core::ptr::from_mut(bytes).cast::<T>();
-    if !ptr.addr().is_multiple_of(align_of::<T>()) {
-        return Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned);
-    }
-    if ptr.is_null() {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged (no real path reports this
-        // error).
-        return Err(PodCastError::SizeMismatch);
-    }
-    // SAFETY: same argument as `try_from_bytes`, plus `&mut [u8]` gives us
-    // unique access (`ptr` was derived from the unique reference), so
-    // handing out a unique `&mut T` over the same bytes is sound.
-    Ok(unsafe { &mut *ptr })
-}
-
-/// Read a `Pod` value from a potentially unaligned byte slice.
-///
-/// Unlike [`from_bytes`], this copies through `ptr::read_unaligned`, so no
-/// alignment is required. The resulting value is owned.
-///
-/// # Panics
-///
-/// Panics if `bytes.len() < size_of::<T>()`.
-#[inline]
-#[must_use]
-pub fn pod_read_unaligned<T: Pod>(bytes: &[u8]) -> T {
-    assert!(
-        bytes.len() >= size_of::<T>(),
-        "pod_read_unaligned: slice shorter than size_of::<T>()",
-    );
-    // SAFETY: length check above ensures `size_of::<T>()` initialized bytes
-    // are reachable. `ptr::read_unaligned` tolerates any alignment. `T: Pod`
-    // means the resulting bit pattern is a valid `T`.
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,19 +335,6 @@ mod kani_proofs {
                 );
             }
         }
-    }
-
-    /// `bytes_of` -> `pod_read_unaligned` must be a round-trip for any u64.
-    #[kani::proof]
-    fn bytes_of_pod_read_roundtrip_u64() {
-        let original: u64 = kani::any();
-        let bytes = bytes_of(&original);
-        kani::assert(bytes.len() == 8, "u64 is 8 bytes");
-        let recovered: u64 = pod_read_unaligned(bytes);
-        kani::assert(
-            recovered == original,
-            "bytes_of -> pod_read_unaligned must round-trip",
-        );
     }
 
     /// `try_cast_slice::<u8, u32>` must reject misaligned slices without UB.
@@ -583,8 +397,10 @@ mod tests {
     }
 
     // SAFETY: Vec4 is `#[repr(C)]` with 4×f32 fields, no padding, no niches.
+
     unsafe impl Zeroable for Vec4 {}
     // SAFETY: see Zeroable impl; additionally `Copy + 'static`.
+
     unsafe impl Pod for Vec4 {}
 
     #[test]
@@ -624,16 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn cast_slice_mut_modifies_source() {
-        let mut src: [u32; 2] = [0, 0];
-        {
-            let bytes: &mut [u8] = cast_slice_mut(&mut src);
-            bytes[0] = 0x01;
-        }
-        assert_eq!(src[0] & 0xff, 0x01);
-    }
-
-    #[test]
     fn try_cast_slice_misaligned_returns_err() {
         // Build an `[u8; 16]` (align 1) and slice at offset 1 — guaranteed
         // misaligned for u32 (align 4).
@@ -663,87 +469,6 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(bytes.try_into().unwrap()), v);
     }
 
-    #[test]
-    fn bytes_of_mut_single_value() {
-        let mut v: u32 = 0;
-        {
-            let bytes = bytes_of_mut(&mut v);
-            bytes.copy_from_slice(&0x0102_0304u32.to_ne_bytes());
-        }
-        assert_eq!(v, 0x0102_0304);
-    }
-
-    #[test]
-    fn from_bytes_reads_vec4() {
-        let original = Vec4 {
-            x: 1.0,
-            y: 2.0,
-            z: 3.0,
-            w: 4.0,
-        };
-        let bytes = bytes_of(&original);
-        let recovered: &Vec4 = from_bytes(bytes);
-        assert_eq!(*recovered, original);
-    }
-
-    #[test]
-    fn from_bytes_mut_updates_vec4() {
-        let mut v = Vec4 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            w: 0.0,
-        };
-        {
-            let bytes = bytes_of_mut(&mut v);
-            let other = Vec4 {
-                x: 9.0,
-                y: 8.0,
-                z: 7.0,
-                w: 6.0,
-            };
-            bytes.copy_from_slice(bytes_of(&other));
-        }
-        assert_eq!(
-            v,
-            Vec4 {
-                x: 9.0,
-                y: 8.0,
-                z: 7.0,
-                w: 6.0
-            }
-        );
-    }
-
-    #[test]
-    fn pod_read_unaligned_handles_offset() {
-        // Build a buffer where the u32 we want starts at offset 1 — using
-        // `from_bytes` here would panic for misalignment, but
-        // `pod_read_unaligned` must succeed.
-        let mut buf = [0u8; 5];
-        buf[1..5].copy_from_slice(&0xCAFE_BABEu32.to_ne_bytes());
-        let v: u32 = pod_read_unaligned(&buf[1..5]);
-        assert_eq!(v, 0xCAFE_BABE);
-    }
-
-    #[test]
-    #[should_panic(expected = "pod_read_unaligned: slice shorter")]
-    fn pod_read_unaligned_panics_on_short_slice() {
-        let buf = [0u8; 3];
-        let _: u32 = pod_read_unaligned(&buf);
-    }
-
-    #[test]
-    #[should_panic(expected = "cast_slice failed")]
-    fn cast_slice_panics_on_slop() {
-        let buf: [u32; 2] = [0, 0];
-        let bytes: &[u8] = cast_slice(&buf);
-        let truncated = &bytes[..6];
-        let _: &[u32] = cast_slice(truncated);
-    }
-
-    /// Captures the panic message of `f` (which must panic with a string
-    /// payload).
     fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         let payload = std::panic::catch_unwind(f).expect_err("closure must panic");
         if let Some(s) = payload.downcast_ref::<&str>() {
@@ -773,12 +498,11 @@ mod tests {
         );
 
         let size = panic_message(|| {
-            let bytes = [0u8; 3];
-            let _ = from_bytes::<u32>(&bytes);
+            let _ = cast_slice::<(), u8>(&[()]);
         });
         assert_eq!(
             size,
-            format!("from_bytes failed: {}", PodCastError::SizeMismatch)
+            format!("cast_slice failed: {}", PodCastError::SizeMismatch)
         );
 
         let align = panic_message(|| {
@@ -790,15 +514,24 @@ mod tests {
             } else {
                 1
             };
-            let _ = from_bytes::<u32>(&buf[off..off + 4]);
+            let _ = cast_slice::<u8, u32>(&buf[off..off + 4]);
         });
         assert_eq!(
             align,
             format!(
-                "from_bytes failed: {}",
+                "cast_slice failed: {}",
                 PodCastError::TargetAlignmentGreaterAndInputNotAligned
             )
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "cast_slice failed")]
+    fn cast_slice_panics_on_slop() {
+        let buf: [u32; 2] = [0, 0];
+        let bytes: &[u8] = cast_slice(&buf);
+        let truncated = &bytes[..6];
+        let _: &[u32] = cast_slice(truncated);
     }
 
     #[test]

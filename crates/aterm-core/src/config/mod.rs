@@ -32,14 +32,8 @@
 
 mod types;
 
-/// Builder pattern for constructing [`TerminalConfig`].
-pub mod builder;
-
 #[cfg(test)]
 #[path = "../../test_support/config/tests.rs"]
 mod tests;
 
-pub use builder::ConfigBuilder;
-pub use types::{
-    BiDiConfig, BiDiMode, ConfigChange, DiskBackendConfig, ScrollbackBackend, TerminalConfig,
-};
+pub use types::{BiDiConfig, BiDiMode, ConfigChange, TerminalConfig};

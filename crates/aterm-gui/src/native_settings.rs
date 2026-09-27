@@ -545,16 +545,61 @@ pub(crate) struct SettingsViewState {
     /// The copies an owner press of *Move to Trash* asked for, not yet handed
     /// to `App::begin_claimant_retire` (drained like the warm-up request).
     claimant_retire_request: Option<Vec<std::path::PathBuf>>,
+    /// The last line this block's buttons put on `feedback`, so it — and only
+    /// it — can be cleared when the privacy checks or the warm-up are switched
+    /// on or off under it.
+    macos_access_feedback: Option<String>,
+    /// The line the last *Ask again* press put on `feedback`: it goes when the
+    /// report it came with is dropped, and no other line does.
+    reset_feedback: Option<String>,
+    /// A line that says the warm-up is under way: it goes once the warm-up is
+    /// neither running nor waiting for the park — it ended, or its start was
+    /// refused — so it cannot outlive what it describes.
+    warmup_feedback: Option<String>,
+    /// The same for a move to the Trash.
+    retire_feedback: Option<String>,
+    /// The owner's recent declines of this block's alerts — one record for the
+    /// whole process, which the host arms into every view
+    /// ([`SettingsViewState::arm_owner_quiet`]); see
+    /// [`SettingsViewState::owner_confirms`].
+    owner_quiet: SharedOwnerQuiet,
     /// Settings ▸ Messages: which chip is down (design §4.2). View-local;
     /// `navigate` clears it.
     pub(crate) messages_filter: MessagesFilter,
     /// Settings ▸ Messages: the entry expanded in place, by raw id.
     pub(crate) messages_selected: Option<u64>,
-    /// What the last Messages render measured, so the deep link's reducer
-    /// can page to an entry the way the renderer seats it — the
+    /// The compact page's tag pop-up is open (design ruling 262).
+    pub(crate) messages_tag_menu: bool,
+    /// The stop the last Messages render drew at the top of its list (the
+    /// log is one scrolling list, design ruling 264) — the
     /// `result_page_limit` discipline: layout-derived reducer state through
-    /// interior mutability, never a change to the rendered projection.
-    messages_page_facts: Cell<Option<MessagesPageFacts>>,
+    /// interior mutability, never a change to the rendered projection. The
+    /// reducer adopts it where a landing was left to the render
+    /// ([`Self::messages_reveal`]).
+    messages_drawn: Cell<Option<usize>>,
+    /// The width class and viewport the last Messages render laid out in, so
+    /// the reducer measures the list exactly as the renderer seats it — for
+    /// the filter and the open entry it just set ([`messages_plan`], rulings
+    /// 263 and 264).
+    messages_page_geometry: Cell<Option<(SettingsWidth, LogicalRect)>>,
+    /// A deep link arrived before any render measured the page (a Settings
+    /// view opened for it): the next render lands the selected entry itself,
+    /// and the reducer adopts the stop it drew ([`Self::messages_drawn`])
+    /// before it moves the list again.
+    messages_reveal: bool,
+    /// How many list stops the last render showed at once — the page Page Up
+    /// and Page Down move by (design ruling 267): the compact category list's
+    /// rows, a field page's settings, one slice on every page that pages by
+    /// slice ([`Self::record_result_page_limit`]). `None` where the render
+    /// authored no such window; the key then keeps its old eight. Reset at
+    /// every render, so a page that shows none never inherits another's.
+    page_window: Cell<Option<usize>>,
+    /// The Messages page's status line (`Copied`, `Opening the log
+    /// folder…`) is TRANSIENT (ruling 267): `Some(None)` from the moment an
+    /// action on the page sets it, `Some(Some(t))` once a projection
+    /// published at `t` has seen it; it clears on the first projection five
+    /// seconds after that, at the next action on the page, or on leaving it.
+    messages_feedback_since: Option<Option<u64>>,
 }
 
 impl SettingsViewState {
@@ -588,7 +633,13 @@ impl SettingsViewState {
         let legacy =
             SettingsState::from_config_with_trail_pack_ids(config, &assets.trail_packs.ids);
         let field_index = build_field_index(&legacy.fields);
+        // Production (`from_snapshot`) replaces this with the snapshot's generic
+        // TOML projection before anything reads it, so only the test constructors
+        // pay for — and read — the hand-maintained fallback.
+        #[cfg(test)]
         let raw_values = fallback_raw_values(config, &legacy.fields);
+        #[cfg(not(test))]
+        let raw_values = BTreeMap::new();
         let environment_overrides = legacy
             .fields
             .iter()
@@ -634,9 +685,19 @@ impl SettingsViewState {
             consent_warmup_requests: 0,
             consent_open_requests: 0,
             claimant_retire_request: None,
+            macos_access_feedback: None,
+            reset_feedback: None,
+            warmup_feedback: None,
+            retire_feedback: None,
+            owner_quiet: SharedOwnerQuiet::default(),
             messages_filter: MessagesFilter::default(),
             messages_selected: None,
-            messages_page_facts: Cell::new(None),
+            messages_tag_menu: false,
+            messages_drawn: Cell::new(None),
+            messages_page_geometry: Cell::new(None),
+            messages_reveal: false,
+            page_window: Cell::new(None),
+            messages_feedback_since: None,
         }
     }
 
@@ -771,8 +832,68 @@ impl SettingsViewState {
         self.page_scroll = settings_page_scroll_transition(self.page_scroll, limit, command);
     }
 
+    /// Where this view's transient Messages status line stands — what the
+    /// host's publish clock owes it (ruling 267): `Some(false)` set and not
+    /// yet seen by a projection (the next publish starts its clock),
+    /// `Some(true)` seen and waiting out [`MESSAGES_FEEDBACK_MS`] (the
+    /// publish after that clears it), `None` nothing transient. Only a view
+    /// on the Messages route clears it.
+    pub(crate) fn messages_feedback_clock(&self) -> Option<bool> {
+        self.messages_feedback_since
+            .filter(|_| self.route == SettingsRoute::Messages)
+            .map(|since| since.is_some())
+    }
+
+    /// Put `text` on the Messages page's status line as an action would.
+    #[cfg(test)]
+    pub(crate) fn show_messages_feedback_for_test(&mut self, text: &str) {
+        self.feedback = Some(text.to_string());
+        self.mark_messages_feedback();
+    }
+
+    /// Move the status line's clock `ms` into the past — the wall clock a
+    /// host test cannot wait out.
+    #[cfg(test)]
+    pub(crate) fn age_messages_feedback_for_test(&mut self, ms: u64) {
+        if let Some(Some(since)) = self.messages_feedback_since.as_mut() {
+            *since = since.saturating_sub(ms);
+        }
+    }
+
+    /// A completion (a copy, a pressed entry button) set the Messages page's
+    /// status line: it is transient from here ([`Self::messages_feedback_since`]).
+    fn mark_messages_feedback(&mut self) {
+        if self.route == SettingsRoute::Messages && self.feedback.is_some() {
+            self.messages_feedback_since = Some(None);
+        }
+    }
+
+    /// Adopt the stop the last Messages render drew where it landed a deep
+    /// link itself ([`Self::messages_reveal`], ruling 264), so the list moves
+    /// on from what the reader saw. A no-op on every other page, and before
+    /// that render.
+    fn settle_messages_scroll(&mut self) {
+        if !self.messages_reveal {
+            return;
+        }
+        if let Some(top) = self.messages_drawn.get() {
+            self.page_scroll = top;
+            self.messages_reveal = false;
+        }
+    }
+
+    /// A page that bounds the reducer by its slice count indexes
+    /// `page_scroll` by SLICE — About's sections, Software Update's cards,
+    /// the compact Packages pages, a landscape field page's one setting — so
+    /// its window is one slice unless its renderer records a wider one
+    /// ([`Self::page_window`], ruling 267; round 16: Page Down on the compact
+    /// Packages page went from page 1 of 13 to page 9). A window already
+    /// recorded this render is kept.
     fn record_result_page_limit(&self, limit: usize) {
         self.result_page_limit.set(Some(limit));
+        if self.page_window.get().is_none() {
+            self.page_window.set(Some(1));
+        }
     }
 
     /// THE ONE COUNT. A results page bounds the page-scroll reducer with the
@@ -851,9 +972,54 @@ impl SettingsViewState {
     /// App owns the cached probe and calls this only on a real change; native
     /// Settings remains an IO-free projection and never asks the OS a consent
     /// question while painting.
-    pub(crate) fn replace_macos_access(&mut self, access: MacosAccess) -> bool {
+    pub(crate) fn replace_macos_access(&mut self, mut access: MacosAccess) -> bool {
+        // The last *Ask again* report belongs to this view: the reducer ran it
+        // and the host never has one to publish, so a republish keeps it while
+        // it is still news — with the privacy checks on, no warm-up under way,
+        // and the warm-up's answers unchanged since (a pass whose answers
+        // differ has answered it) — and never after the view leaves the page
+        // (`navigate`).
+        // Its advice is worded at render time for the warm-up switch as it is.
+        if access.reset.is_none()
+            && access.enabled
+            && !access.warmup_live
+            && self
+                .macos_access
+                .as_ref()
+                .is_some_and(|old| old.warmup_rows == access.warmup_rows)
+        {
+            access.reset = self.macos_access.as_ref().and_then(|a| a.reset.clone());
+        }
+        // A line one of this block's buttons wrote may give advice that no
+        // longer holds — if it is still the line on the bar: any of them goes
+        // when the switches under it change, and the *Ask again* line when the
+        // report it came with is dropped.
+        let old = self.macos_access.as_ref();
+        let switched = old.is_some_and(|old| {
+            (old.enabled, old.warmup_offered) != (access.enabled, access.warmup_offered)
+        });
+        let report_dropped = old.is_some_and(|old| old.reset.is_some()) && access.reset.is_none();
+        let warmup_settled = !access.warmup_live && self.consent_warmup_requests == 0;
+        let retire_settled = !access.retire_live && self.claimant_retire_request.is_none();
+        let cleared = self.feedback.is_some()
+            && ((switched && self.feedback == self.macos_access_feedback)
+                || (report_dropped && self.feedback == self.reset_feedback)
+                || (warmup_settled && self.feedback == self.warmup_feedback)
+                || (retire_settled && self.feedback == self.retire_feedback));
+        if cleared {
+            self.feedback = None;
+            self.macos_access_feedback = None;
+            self.reset_feedback = None;
+            self.warmup_feedback = None;
+            self.retire_feedback = None;
+        }
         if self.macos_access.as_ref() == Some(&access) {
-            return false;
+            // A line that went is a change the host must draw.
+            if cleared {
+                self.common.presentation_revision =
+                    self.common.presentation_revision.saturating_add(1);
+            }
+            return cleared;
         }
         self.macos_access = Some(access);
         self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
@@ -887,6 +1053,80 @@ impl SettingsViewState {
     /// Drain the *Move to Trash* press: the copies it was pressed for.
     pub(crate) fn take_claimant_retire_request(&mut self) -> Option<Vec<std::path::PathBuf>> {
         self.claimant_retire_request.take()
+    }
+
+    /// The decline record this view holds, for the host's sharing test.
+    #[cfg(test)]
+    pub(crate) const fn owner_quiet_for_test(&self) -> &SharedOwnerQuiet {
+        &self.owner_quiet
+    }
+
+    /// Record a confirmed *Move to Trash* press, as the reducer does, for the
+    /// host's drain tests.
+    #[cfg(test)]
+    pub(crate) fn record_claimant_retire_for_test(&mut self, plan: Vec<std::path::PathBuf>) {
+        self.claimant_retire_request = Some(plan);
+    }
+
+    /// Record a confirmed warm-up press, as the reducer does, for the host's
+    /// drain tests.
+    #[cfg(test)]
+    pub(crate) fn record_consent_warmup_for_test(&mut self) {
+        self.consent_warmup_requests = 1;
+        self.feedback = Some("Asking macOS about the items listed here.".to_string());
+        self.warmup_feedback = self.feedback.clone();
+    }
+
+    /// The host could not start the warm-up this view's owner confirmed: say
+    /// why on the bar, in place of the *Asking macOS…* line, and whether the
+    /// page must be drawn again. Only on the Security page it was confirmed
+    /// from — a view that has left it gets no line on another page. The line
+    /// is not under way, and it is not one the switches under it withdraw: a
+    /// refusal because a switch went off explains that switch, so it stays
+    /// until the view leaves the page or another line replaces it.
+    pub(crate) fn note_warmup_refused(&mut self, why: &str) -> bool {
+        if self.route != SettingsRoute::Security {
+            return false;
+        }
+        self.feedback = Some(format!("Nothing was asked: {why}."));
+        self.macos_access_feedback = None;
+        self.warmup_feedback = None;
+        self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
+        true
+    }
+
+    /// Share the process's record of the owner's declines with this view, so a
+    /// view opened after a decline is as quiet as the one it was declined in.
+    pub(crate) fn arm_owner_quiet(&mut self, quiet: SharedOwnerQuiet) {
+        self.owner_quiet = quiet;
+    }
+
+    /// Ask the owner before a gesture that changes this Mac. A control client can
+    /// queue presses behind an open alert and keep sending more, so a decline
+    /// quiets all three gestures — in every view — for a while that doubles with
+    /// each decline in a row ([`OwnerQuiet`]); a quieted press asks nothing.
+    fn owner_confirms(&mut self, title: &str, body: &str, proceed: &str) -> OwnerAnswer {
+        if self
+            .owner_quiet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .quiet_at(QuietStamp::now())
+        {
+            return OwnerAnswer::Quiet;
+        }
+        let answer = self.consent_gestures.confirm(title, body, proceed);
+        let mut quiet = self.owner_quiet.lock().unwrap_or_else(|p| p.into_inner());
+        match answer {
+            Some(true) => {
+                quiet.accepted();
+                OwnerAnswer::Yes
+            }
+            Some(false) => {
+                quiet.declined(QuietStamp::now());
+                OwnerAnswer::No
+            }
+            None => OwnerAnswer::NotAsked,
+        }
     }
 
     fn is_explicit(&self, key: &str) -> bool {
@@ -1050,11 +1290,19 @@ impl SettingsViewState {
         if self.route == route && !search_cleared && !self.compact_navigation {
             return;
         }
+        if self.route != route
+            && let Some(access) = self.macos_access.as_mut()
+        {
+            access.reset = None;
+        }
         self.route = route;
         self.invalidate_result_page_limit();
         self.compact_navigation = false;
         self.messages_filter = MessagesFilter::default();
         self.messages_selected = None;
+        self.messages_tag_menu = false;
+        self.messages_reveal = false;
+        self.messages_feedback_since = None;
         self.common.last_focus = self.presented_route_focus(route).or_else(|| {
             if from_compact_navigation {
                 Some(UiKey::new("settings/compact-navigation"))
@@ -1068,6 +1316,10 @@ impl SettingsViewState {
         });
         self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
         self.feedback = None;
+        self.macos_access_feedback = None;
+        self.reset_feedback = None;
+        self.warmup_feedback = None;
+        self.retire_feedback = None;
         self.choice_picker = None;
         self.reset_all_confirmation = false;
         self.draft_discard_confirmation = false;
@@ -1371,7 +1623,7 @@ impl SettingsApp {
         let submit = matches!(event, TextInputEvent::Submit);
         let cancel = matches!(event, TextInputEvent::Cancel);
         match event {
-            TextInputEvent::Preedit(text) => input.set_preedit(text, None),
+            TextInputEvent::Preedit { text, selection } => input.set_preedit(text, selection),
             TextInputEvent::Commit(text) => input.commit_preedit(&text),
             TextInputEvent::Backspace => input.delete_backward(),
             TextInputEvent::Delete => input.delete_forward(),
@@ -1756,6 +2008,7 @@ impl SettingsApp {
         }
 
         if action == "settings/page-up" {
+            view.settle_messages_scroll();
             let limit = settings_page_scroll_limit(
                 view,
                 &self.update.projection(),
@@ -1766,6 +2019,7 @@ impl SettingsApp {
             return EventResult::Handled;
         }
         if action == "settings/page-down" {
+            view.settle_messages_scroll();
             let limit = settings_page_scroll_limit(
                 view,
                 &self.update.projection(),
@@ -1776,6 +2030,7 @@ impl SettingsApp {
             return EventResult::Handled;
         }
         if action == "settings/page-scroll" {
+            view.settle_messages_scroll();
             if let Some(SemanticInput::Number(offset)) = invocation.value {
                 let limit = settings_page_scroll_limit(
                     view,
@@ -2550,10 +2805,13 @@ impl SettingsApp {
             // `app act` refuses them (`MACOS_ACCESS_GESTURE_PREFIX`). `key`
             // drives this page like a hand, by design, so the warm-up, the
             // reset and *Move to Trash* also ask the owner in an AppKit alert
-            // (`ConsentGestures::confirm`) that no control verb can answer — a
-            // consent-raising or destructive action a program inside a session
-            // could fire would be a surface an agent controls, which is the
-            // rule §3.5 and §3.7 share.
+            // that no control verb can answer and whose default is Cancel
+            // (`SettingsViewState::owner_confirms`), and the two Open buttons —
+            // which only bring System Settings forward — record nothing that
+            // replaces the owner's answer to the access card. A consent-raising
+            // or destructive action a program inside a session could fire would
+            // be a surface an agent controls, which is the rule §3.5 and §3.7
+            // share.
             // ---------------------------------------------------------------
             MACOS_ACCESS_OPEN_FDA | MACOS_ACCESS_OPEN_FILES => {
                 let pane = if action == MACOS_ACCESS_OPEN_FDA {
@@ -2568,22 +2826,29 @@ impl SettingsApp {
                 // `openURL:` reports that System Settings TOOK the URL, never
                 // that it scrolled to the row — so the route in words goes out
                 // on every outcome, not only the degraded ones.
-                view.feedback = Some(match (view.consent_gestures.open_settings)(pane) {
-                    crate::menu::SettingsOpen::Anchored | crate::menu::SettingsOpen::PaneRoot => {
-                        format!("Opened System Settings \u{2014} look under {words}.")
-                    }
-                    crate::menu::SettingsOpen::Refused => {
-                        format!("System Settings did not open. The setting is at {words}.")
-                    }
+                view.feedback = Some(if (view.consent_gestures.open_settings)(pane).opened() {
+                    format!("Opened System Settings \u{2014} look under {words}.")
+                } else {
+                    format!("System Settings did not open. The setting is at {words}.")
                 });
+                view.macos_access_feedback = view.feedback.clone();
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
             MACOS_ACCESS_WARM_UP => {
-                let live = view
-                    .macos_access
-                    .as_ref()
-                    .is_some_and(|access| access.warmup_live);
+                // Under way from the owner's yes, not only from the published
+                // projection: a press queued behind that alert arrives before
+                // the park drains the request, and must not ask again.
+                let live = view.consent_warmup_requests > 0
+                    || view
+                        .owner_quiet
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .warmup_confirmed
+                    || view
+                        .macos_access
+                        .as_ref()
+                        .is_some_and(|access| access.warmup_live);
                 if live {
                     // A second press starts no second worker. Walking the
                     // folders in sequence is the whole design (§3.5): a second
@@ -2591,21 +2856,35 @@ impl SettingsApp {
                     view.feedback = Some(
                         "aterm is already asking macOS about the items listed here.".to_string(),
                     );
-                } else if view.consent_gestures.confirm(
-                    "Ask macOS for access now?",
-                    "macOS shows its own question for each item listed on this page, one at a \
-                     time.",
-                    "Ask Now",
-                ) {
-                    view.consent_warmup_requests = 1;
-                    view.feedback = Some(
-                        "Asking macOS about the items listed here, one at a time. macOS decides \
-                         when it puts its question on screen."
-                            .to_string(),
-                    );
+                    view.warmup_feedback = view.feedback.clone();
                 } else {
-                    view.feedback = Some("Nothing was asked.".to_string());
+                    let answer = view.owner_confirms(
+                        "Ask macOS for access now?",
+                        "aterm opens each folder listed on this page, one at a time. macOS asks \
+                         about a folder only if it has no answer for it yet.",
+                        "Ask Now",
+                    );
+                    if answer == OwnerAnswer::Yes {
+                        view.consent_warmup_requests = 1;
+                        view.owner_quiet
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .warmup_confirmed = true;
+                    }
+                    view.feedback = Some(
+                        if answer == OwnerAnswer::Yes {
+                            "Asking macOS about the items listed here, one at a time. macOS \
+                             decides when it puts its question on screen."
+                        } else {
+                            answer.refusal("Nothing was asked.")
+                        }
+                        .to_string(),
+                    );
+                    if answer == OwnerAnswer::Yes {
+                        view.warmup_feedback = view.feedback.clone();
+                    }
                 }
+                view.macos_access_feedback = view.feedback.clone();
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
@@ -2617,62 +2896,94 @@ impl SettingsApp {
                 let Some(plan) = plan else {
                     view.feedback =
                         Some("There is no saved answer aterm can ask macOS to clear.".to_string());
+                    view.macos_access_feedback = view.feedback.clone();
                     cx.repaint(crate::native_app::DamageRegion::All);
                     return EventResult::Handled;
                 };
-                if view.consent_gestures.confirm(
+                let answer = view.owner_confirms(
                     "Clear macOS's saved answers for aterm?",
                     "macOS forgets the refusals for the folders listed on this page and asks \
                      again the next time aterm needs one.",
                     "Ask Again",
-                ) {
+                );
+                if answer == OwnerAnswer::Yes {
                     let attempts = (view.consent_gestures.run_reset)(&plan);
                     let report = MacosAccessReset::from_attempts(&attempts);
                     view.feedback = Some(
-                        macos_access_reset_lines(&report)
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "Nothing was changed.".to_string()),
+                        macos_access_reset_lines(
+                            &report,
+                            view.macos_access.as_ref().is_some_and(|a| a.warmup_offered),
+                        )
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "Nothing was changed.".to_string()),
                     );
                     if let Some(access) = view.macos_access.as_mut() {
                         access.reset = Some(report);
                     }
+                    view.reset_feedback = view.feedback.clone();
                     view.common.presentation_revision =
                         view.common.presentation_revision.saturating_add(1);
                 } else {
-                    view.feedback = Some("Nothing was changed.".to_string());
+                    view.feedback = Some(answer.refusal("Nothing was changed.").to_string());
                 }
+                view.macos_access_feedback = view.feedback.clone();
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
             MACOS_ACCESS_TRASH => {
                 // The plan is the one the button was drawn from; the worker
                 // re-checks each copy against a fresh census before moving it.
+                // Under way from the owner's yes too, as for the warm-up.
                 let access = view.macos_access.as_ref();
+                let live = view.claimant_retire_request.is_some()
+                    || view
+                        .owner_quiet
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .retire_confirmed
+                    || access.is_some_and(|a| a.retire_live);
                 let plan = access.map(MacosAccess::retire_plan).unwrap_or_default();
-                view.feedback = Some(if access.is_some_and(|a| a.retire_live) {
+                let said = if live {
                     "aterm is already moving those copies.".to_string()
                 } else if plan.is_empty() {
                     "There is no other copy aterm can move to the Trash.".to_string()
                 } else {
                     let count = plan.len();
-                    let copies = if count == 1 { "copy" } else { "copies" };
+                    let (copies, stay) = if count == 1 {
+                        ("copy", "It stays")
+                    } else {
+                        ("copies", "They stay")
+                    };
                     let listed = plan
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| owner_path(path))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if view.consent_gestures.confirm(
+                    match view.owner_confirms(
                         &format!("Move {count} other {copies} of aterm to the Trash?"),
-                        &format!("{listed}\n\nThey stay in the Trash until you empty it."),
+                        &format!("{listed}\n\n{stay} in the Trash until you empty it."),
                         "Move to Trash",
                     ) {
-                        view.claimant_retire_request = Some(plan);
-                        format!("Moving {count} other {copies} of aterm to the Trash\u{2026}")
-                    } else {
-                        "Nothing was moved.".to_string()
+                        // The block's own status row says how the move goes
+                        // (`MacosAccess::retire_status`), so the page-wide bar
+                        // carries nothing that could outlive it.
+                        OwnerAnswer::Yes => {
+                            view.claimant_retire_request = Some(plan);
+                            view.owner_quiet
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .retire_confirmed = true;
+                            String::new()
+                        }
+                        answer => answer.refusal("Nothing was moved.").to_string(),
                     }
-                });
+                };
+                view.feedback = (!said.is_empty()).then_some(said);
+                if live {
+                    view.retire_feedback = view.feedback.clone();
+                }
+                view.macos_access_feedback = view.feedback.clone();
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
@@ -2943,9 +3254,7 @@ impl SettingsApp {
                     feedback.push(constraint);
                 }
                 for (variable, effective) in application.environment_overrides {
-                    feedback.push(format!(
-                        "${variable} remains active (effective {effective})"
-                    ));
+                    feedback.push(format!("{variable} remains active (effective {effective})"));
                 }
                 if undo.is_some() {
                     feedback.push("Undo available".to_string());
@@ -2999,7 +3308,6 @@ impl SettingsApp {
         view.feedback = Some(match outcome {
             ExternalOpenOutcome::Opened => "Project site opened".to_string(),
             ExternalOpenOutcome::Denied { message } => format!("Open denied: {message}"),
-            ExternalOpenOutcome::Failed { message } => format!("Couldn’t open site: {message}"),
         });
     }
 
@@ -3027,10 +3335,17 @@ impl SettingsApp {
             return;
         }
         view.feedback = Some(match outcome {
-            UpdateOutcome::Accepted => "Update request accepted".to_string(),
-            UpdateOutcome::InstalledNeedsRelaunch { build, message } => {
-                format!("Build {build} installed · {message}")
+            // Accepted = the worker is running, and it is the ONLY completion this
+            // request gets: how an install or check ends reaches the headline, never
+            // this footer. So the footer says nothing (ruling 265, as for packages) —
+            // a kept "Installing…" would outlive a failed install. A check's headline
+            // says `Checking for updates…`; an install's row says `Installing aterm vX`.
+            UpdateOutcome::Accepted => {
+                view.feedback = None;
+                return;
             }
+            #[cfg(any(unix, test))]
+            UpdateOutcome::InstalledNeedsRelaunch { message, .. } => message,
             UpdateOutcome::Deferred { reason } => {
                 format!("Update retained until terminal activity settles · {reason}")
             }
@@ -3038,6 +3353,7 @@ impl SettingsApp {
                 format!("Before it can apply: {}", reasons.join(" · "))
             }
             UpdateOutcome::Failed { message } => format!("Update failed: {message}"),
+            #[cfg(any(unix, test))]
             UpdateOutcome::CaptureRefused { message } => {
                 format!("A tab could not be carried; retries when it changes · {message}")
             }
@@ -3055,13 +3371,18 @@ impl SettingsApp {
         ) {
             return;
         }
-        view.feedback = Some(match outcome {
+        view.feedback = match outcome {
             // Accepted = the worker is running; its completion arrives through
-            // the packages projection revision, which repaints the status card.
-            PackagesOutcome::Accepted => "Packages request accepted".to_string(),
-            PackagesOutcome::Blocked { message } => format!("Packages: {message}"),
-            PackagesOutcome::Failed { message } => format!("Packages request failed: {message}"),
-        });
+            // the packages projection revision, which repaints the status card
+            // — its headline says `Checking…` and then how it ended, so the
+            // footer says nothing (ruling 265: `Packages request accepted`
+            // and a third `Package check completed` were CYA).
+            PackagesOutcome::Accepted => None,
+            PackagesOutcome::Blocked { message } => Some(format!("Packages: {message}")),
+            PackagesOutcome::Failed { message } => {
+                Some(format!("Packages request failed: {message}"))
+            }
+        };
     }
 
     fn finish_clipboard(
@@ -3076,7 +3397,6 @@ impl SettingsApp {
         };
         view.feedback = Some(match outcome {
             ClipboardOutcome::Copied => copied.to_string(),
-            ClipboardOutcome::Denied { message } => format!("Copy denied: {message}"),
             ClipboardOutcome::Failed { message } => format!("Couldn’t copy: {message}"),
         });
     }
@@ -3119,17 +3439,34 @@ impl SettingsApp {
         let Some(rest) = action.strip_prefix(MESSAGES_ACTION_PREFIX) else {
             return EventResult::Bubble;
         };
+        // Every arm moves on from the stop the reader saw (ruling 264); the
+        // deep link lands afresh.
+        if rest != "select" {
+            view.settle_messages_scroll();
+        }
+        // The page's last confirmation was about the LAST action: the next
+        // one says its own or nothing (ruling 267).
+        if view.messages_feedback_since.take().is_some() {
+            view.feedback = None;
+        }
         match rest {
+            // The severity and the tag COMBINE (ruling 262): each press sets its
+            // own filter and keeps the other.
             "filter/all" => {
-                view.messages_filter = MessagesFilter::default();
+                view.messages_filter.warn_only = false;
                 view.page_scroll = 0;
             }
             "filter/warn" => {
-                view.messages_filter = MessagesFilter {
-                    tag: None,
-                    warn_only: true,
-                };
+                view.messages_filter.warn_only = true;
                 view.page_scroll = 0;
+            }
+            "filter/tags-all" => {
+                view.messages_filter.tag = None;
+                view.messages_tag_menu = false;
+                view.page_scroll = 0;
+            }
+            "tag-menu" => {
+                view.messages_tag_menu = !view.messages_tag_menu;
             }
             "select" => {
                 let Some(SemanticInput::Text(id)) = value else {
@@ -3154,7 +3491,10 @@ impl SettingsApp {
                     text,
                     sensitive: false,
                 });
-                view.pending.insert(operation, PendingAction::Clipboard);
+                // Its completion says `Copied` — never the About page's
+                // `Build information copied` (ruling 267).
+                view.pending.insert(operation, PendingAction::MessageCopy);
+                view.messages_feedback_since = Some(None);
                 view.feedback = Some(format!(
                     "Copying {} message{}\u{2026}",
                     shown.len(),
@@ -3174,6 +3514,7 @@ impl SettingsApp {
                     Some(folder) => format!("The log folder is {folder}"),
                     None => "The log folder is not available.".to_string(),
                 });
+                view.messages_feedback_since = Some(None);
                 cx.repaint(crate::native_app::DamageRegion::All);
                 return EventResult::Handled;
             }
@@ -3185,7 +3526,12 @@ impl SettingsApp {
                     // any of it (else the All chip: an empty filter would be a
                     // blank page).
                     view.navigate(SettingsRoute::Messages);
-                    view.messages_filter = if self.messages.tags.iter().any(|(t, _)| t == tag) {
+                    view.messages_filter = if self
+                        .messages
+                        .tags
+                        .iter()
+                        .any(|(t, _)| messages_same_chip(t, tag))
+                    {
                         MessagesFilter {
                             tag: Some(tag.to_string()),
                             warn_only: false,
@@ -3195,10 +3541,8 @@ impl SettingsApp {
                     };
                     view.page_scroll = 0;
                 } else if let Some(tag) = rest.strip_prefix("filter/tag/") {
-                    view.messages_filter = MessagesFilter {
-                        tag: Some(tag.to_string()),
-                        warn_only: false,
-                    };
+                    view.messages_filter.tag = Some(tag.to_string());
+                    view.messages_tag_menu = false;
                     view.page_scroll = 0;
                 } else if let Some(row) = rest.strip_prefix("row/") {
                     let Some((id, verb)) = row.split_once('/') else {
@@ -3239,6 +3583,17 @@ impl SettingsApp {
                 } else {
                     Some(id)
                 };
+                // An entry opened low in the view is read whole: the list
+                // takes the least scroll that shows it (ruling 264).
+                if view.messages_selected == Some(id)
+                    && let Some((width, viewport)) = view.messages_page_geometry.get()
+                {
+                    let visible = messages_visible(&self.messages, &view.messages_filter);
+                    if let Some(index) = visible.iter().position(|e| e.id == id) {
+                        let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+                        view.page_scroll = plan.reveal(index, view.page_scroll);
+                    }
+                }
                 true
             }
             "copy" => {
@@ -3284,38 +3639,140 @@ impl SettingsApp {
         }
     }
 
-    /// THE DEEP LINK (design §4.5): expand `id`, drop a chip that hides it,
-    /// and page to it — the row index on a page that scrolls by row, the
-    /// section the last render would seat it in on a compact page (the
-    /// facts that render recorded; before any render the row index, which
-    /// the first render then seats). An id the ring no longer holds is
-    /// selected all the same: the page shows what it has.
+    /// Move the keyboard from the focused message row `lines` rows down (up
+    /// when negative), the list following it by the least scroll that shows
+    /// the row (rulings 262 and 264). `false` — the ordinary scroll — when the
+    /// focus is not on a message row.
+    fn step_message_focus(&self, view: &mut SettingsViewState, lines: i32) -> bool {
+        if view.route != SettingsRoute::Messages {
+            return false;
+        }
+        let Some(id) = view.common.last_focus.as_ref().and_then(|focus| {
+            focus
+                .as_str()
+                .strip_prefix("settings/messages/row/")?
+                .strip_suffix("/title")?
+                .parse::<u64>()
+                .ok()
+        }) else {
+            return false;
+        };
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        let Some(index) = visible.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        let target = if lines < 0 {
+            index.saturating_sub(lines.unsigned_abs() as usize)
+        } else {
+            (index + lines as usize).min(visible.len().saturating_sub(1))
+        };
+        let next = visible[target].id;
+        view.common.last_focus = Some(UiKey::new(format!("settings/messages/row/{next}/title")));
+        if let Some((width, viewport)) = view.messages_page_geometry.get() {
+            let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+            view.page_scroll = plan.reveal(target, view.page_scroll);
+        }
+        true
+    }
+
+    /// The page Page Up / Page Down move by (ruling 267): on Messages the stops
+    /// the view from here shows — the compact header items it seats and the
+    /// entries — measured as the renderer seats them; elsewhere the window the
+    /// last render recorded ([`SettingsViewState::page_window`]); else the
+    /// historical eight. Never less than one.
+    fn shown_page(&self, view: &SettingsViewState) -> usize {
+        if view.route == SettingsRoute::Messages
+            && !view.compact_navigation
+            && view.search.trim().is_empty()
+            && let Some((width, viewport)) = view.messages_page_geometry.get()
+        {
+            let visible = messages_visible(&self.messages, &view.messages_filter);
+            let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+            let shown = plan.view(view.page_scroll.min(plan.limit()));
+            return (shown.header.len() + shown.rows.len()).max(1);
+        }
+        view.page_window.get().unwrap_or(8).max(1)
+    }
+
+    /// FOCUS NEVER SCROLLS AWAY (ruling 267). A compact Messages page scrolls
+    /// its header — the switch, the filters, the report buttons — away with
+    /// the log, and a control that is no longer seated is no longer in the
+    /// tree: the keyboard went with it (round 16: Down on a filter chip left
+    /// no focused node and no ring). When the scroll just unseated the
+    /// focused control, the keyboard moves to the first entry the view shows
+    /// (or, with none, the first header item still seated).
+    fn keep_message_focus_seated(&self, view: &mut SettingsViewState) {
+        if view.route != SettingsRoute::Messages || view.compact_navigation {
+            return;
+        }
+        let Some(focus) = view.common.last_focus.clone() else {
+            return;
+        };
+        if focus.as_str().starts_with("settings/messages/row/") {
+            return;
+        }
+        let Some((width, viewport)) = view.messages_page_geometry.get() else {
+            return;
+        };
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+        if !plan.compact {
+            return;
+        }
+        let Some(item) = plan
+            .header
+            .iter()
+            .position(|(node, _)| ui_node_holds(node, focus.as_str()))
+        else {
+            return;
+        };
+        let shown = plan.view(view.page_scroll.min(plan.limit()));
+        if shown.header.contains(&item) {
+            return;
+        }
+        view.common.last_focus = if let Some(entry) = visible.get(shown.rows.start) {
+            Some(UiKey::new(format!(
+                "settings/messages/row/{}/title",
+                entry.id
+            )))
+        } else {
+            plan.header
+                .get(shown.header.start)
+                .and_then(|(node, _)| first_focusable_key(node))
+        };
+    }
+
+    /// THE DEEP LINK (design §4.5; ruling 264): expand `id`, drop a chip that
+    /// hides it, and LAND on it — where the view already shows it whole, the
+    /// list stays; else the entry at the top of the list, as far as the list
+    /// scrolls — measured for the filter and the open entry the link leaves
+    /// (ruling 263). Before any render has measured the page the render lands
+    /// it ([`SettingsViewState::messages_reveal`]). An id the ring no longer
+    /// holds is selected all the same: the list shows what it has, from the
+    /// top.
     fn reveal_message(&self, view: &mut SettingsViewState, id: u64) {
         view.messages_selected = Some(id);
+        view.messages_reveal = false;
         let Some(entry) = self.messages.entry(id) else {
             view.page_scroll = 0;
             return;
         };
         if !view.messages_filter.admits(entry) {
             view.messages_filter = MessagesFilter::default();
+            view.page_scroll = 0;
         }
         let visible = messages_visible(&self.messages, &view.messages_filter);
         let Some(index) = visible.iter().position(|e| e.id == id) else {
             view.page_scroll = 0;
             return;
         };
-        view.page_scroll = match view.messages_page_facts.get() {
-            Some(facts) if facts.compact => {
-                let (items, heads) =
-                    messages_compact_items(facts.header, &visible, Some(id), facts);
-                let item = heads[index];
-                messages_sections(&items, facts.capacity)
-                    .iter()
-                    .position(|section| section.contains(&item))
-                    .unwrap_or(0)
+        match view.messages_page_geometry.get() {
+            Some((width, viewport)) => {
+                let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+                view.page_scroll = plan.land(index, view.page_scroll);
             }
-            _ => index,
-        };
+            None => view.messages_reveal = true,
+        }
     }
 }
 
@@ -3875,6 +4332,10 @@ enum AdvancedEffectPath {
     SessionRuntime,
     SecurityPolicy,
     PackageRuntime,
+    /// The in-GUI Claude Code supervisor host (`harness_host`), which re-reads
+    /// `[harness]` on every config reload and starts, stops or re-policies the
+    /// supervisor of every Claude Code session the moment the file is saved.
+    HarnessRuntime,
 }
 
 /// Deliberately small native Advanced surface. Everything outside this map
@@ -3989,6 +4450,7 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_TONE_MELODY
         | prefs::EDIT_TRAIL_SOUND_BED
         | prefs::EDIT_TRAIL_SOUND_RIFF
+        | prefs::EDIT_CHOICE_SOUND
         | prefs::EDIT_SPARKLE_BONK
         | prefs::EDIT_SPARKLE_BONK_DETONATION => Some(Effect::EffectsRuntime),
         // THE AUDIBLE BEL. Unlike every key above it is NOT a synth voice —
@@ -4001,6 +4463,18 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
             cfg!(any(target_os = "macos", windows)).then_some(Effect::TerminalRuntime)
         }
         prefs::EDIT_RESTORE_SESSION => Some(Effect::SessionRuntime),
+        // THE HARNESS (owner decision of 2026-09-24: every permission box is
+        // approved "unless there is a setting added later by the user
+        // explicitly to NOT do this"). Both rows are live through
+        // `harness_host` (their timing labels say so). Without this arm the
+        // limit was Modified-only — reachable only once `approve` was
+        // already written — and a search for "approve" offered nothing but the
+        // Manual count, so a user starting from the default could never limit
+        // it here (the harness round-3 review of 2026-09-24, major). The
+        // question answer (2026-09-25) is live the same way.
+        prefs::EDIT_HARNESS_ENABLED
+        | prefs::EDIT_HARNESS_APPROVE
+        | prefs::EDIT_HARNESS_ANSWER_QUESTIONS => Some(Effect::HarnessRuntime),
         prefs::EDIT_PACKAGES_ENABLED | prefs::EDIT_PACKAGES_AUTO_INSTALL => {
             Some(Effect::PackageRuntime)
         }
@@ -4093,6 +4567,7 @@ impl NativeAppModel for SettingsApp {
                 view.invalidate_result_page_limit();
                 true
             }
+            #[cfg(any(a11y_tree, test))]
             AppEvent::InsertText(text) => {
                 if view
                     .editing_field
@@ -4160,17 +4635,61 @@ impl NativeAppModel for SettingsApp {
                 view.cancel_transient();
                 true
             }
+            // THE SEVERITY SEGMENTS ARE ONE CONTROL (ruling 267): Left and
+            // Right move between `All` and `Problems` and press the one they
+            // land on, as a segmented control's arrows do; Tab still leaves.
+            AppEvent::TextInput(
+                arrow @ (TextInputEvent::Left { .. } | TextInputEvent::Right { .. }),
+            ) if messages_segment_focused(view) => {
+                let right = matches!(arrow, TextInputEvent::Right { .. });
+                let key = if right {
+                    "settings/messages/filter/warn"
+                } else {
+                    "settings/messages/filter/all"
+                };
+                let _ = self.reduce_messages_action(view, key, None, cx);
+                view.common.last_focus = Some(UiKey::new(key));
+                true
+            }
             AppEvent::TextInput(event) => {
                 self.reduce_text_input(view, event, cx);
                 true
             }
             AppEvent::ScrollLines(lines) => {
-                let limit = settings_page_scroll_limit(
-                    view,
-                    &self.update.projection(),
-                    &self.packages.projection(),
-                );
-                view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
+                // THE LOG'S ARROW KEYS (rulings 262 and 264): on a message row
+                // they move between rows and the list follows; Space and
+                // Return open and close it. Elsewhere — the wheel, a screen
+                // reader's scroll on the list — the list scrolls by entry,
+                // and a control the compact page scrolls away hands the
+                // keyboard to the list (ruling 267).
+                view.settle_messages_scroll();
+                if !self.step_message_focus(view, lines) {
+                    let limit = settings_page_scroll_limit(
+                        view,
+                        &self.update.projection(),
+                        &self.packages.projection(),
+                    );
+                    view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
+                    self.keep_message_focus_seated(view);
+                }
+                true
+            }
+            AppEvent::ScrollPage(direction) => {
+                // PAGE UP / PAGE DOWN MOVE BY THE PAGE SHOWN (ruling 267):
+                // the compact category list's six rows are six, not eight.
+                view.settle_messages_scroll();
+                let direction = direction.signum();
+                let page = self.shown_page(view);
+                let lines = direction.saturating_mul(i32::try_from(page).unwrap_or(i32::MAX));
+                if !self.step_message_focus(view, lines) {
+                    let limit = settings_page_scroll_limit(
+                        view,
+                        &self.update.projection(),
+                        &self.packages.projection(),
+                    );
+                    view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
+                    self.keep_message_focus_seated(view);
+                }
                 true
             }
             AppEvent::ConfigChanged(snapshot) => {
@@ -4223,16 +4742,9 @@ impl NativeAppModel for SettingsApp {
             }
             AppEvent::PackagesChanged { revision } => {
                 self.packages_revision = self.packages_revision.max(revision);
-                // The synchronous PackagesFinished event reports admission
-                // only. Once the worker's typed completion reaches the shared
-                // projection, replace that temporary status with the real
-                // process result; never leave “request accepted” visible after
-                // a non-zero exit or launch failure.
-                if view.feedback.as_deref() == Some("Packages request accepted")
-                    && let Some(feedback) = self.packages.projection().command_feedback
-                {
-                    view.feedback = Some(feedback);
-                }
+                // The worker's typed completion reaches the card's headline
+                // and detail (a failure names its cause there); the footer
+                // never repeats it (ruling 265).
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
                 true
@@ -4259,16 +4771,29 @@ impl NativeAppModel for SettingsApp {
             }
             AppEvent::MessagesChanged { revision } => {
                 self.messages_revision = self.messages_revision.max(revision);
+                let now = self.messages.now_unix_ms;
+                match view.messages_feedback_since {
+                    Some(None) => view.messages_feedback_since = Some(Some(now)),
+                    Some(Some(since)) if now.saturating_sub(since) >= MESSAGES_FEEDBACK_MS => {
+                        view.messages_feedback_since = None;
+                        if view.route == SettingsRoute::Messages {
+                            view.feedback = None;
+                        }
+                    }
+                    _ => {}
+                }
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
                 true
             }
             AppEvent::MessageActFinished { operation, outcome } => {
                 Self::finish_message_act(view, operation, outcome);
+                view.mark_messages_feedback();
                 true
             }
             AppEvent::ClipboardFinished { operation, outcome } => {
                 Self::finish_clipboard(view, operation, outcome);
+                view.mark_messages_feedback();
                 true
             }
             _ => false,
@@ -4468,10 +4993,11 @@ fn build_field_index(fields: &[EditField]) -> aterm_hash::FxHashMap<&'static str
     index
 }
 
-/// Best-effort raw projection for callers that only have the parsed `Config`
-/// (principally unit tests and recovery fallback). Production views are seeded
-/// from `ConfigSnapshot`, whose generic TOML projection covers every present
-/// key—including future editable fields—without another hand-maintained list.
+/// Best-effort raw projection for the test constructors, which only have the
+/// parsed `Config`. Production views are seeded from `ConfigSnapshot`, whose
+/// generic TOML projection covers every present key—including future editable
+/// fields—without another hand-maintained list.
+#[cfg(test)]
 fn fallback_raw_values(config: &Config, fields: &[EditField]) -> BTreeMap<String, String> {
     fields
         .iter()
@@ -4486,6 +5012,7 @@ fn fallback_raw_values(config: &Config, fields: &[EditField]) -> BTreeMap<String
         .collect()
 }
 
+#[cfg(test)]
 fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
     let sparkle = config.sparkle_words.as_ref();
     let profanity = sparkle.and_then(|s| s.profanity.as_ref());
@@ -5371,23 +5898,6 @@ fn preview_terminal_theme(
     candidate
 }
 
-#[cfg(test)]
-fn preview_reduced_motion(
-    state: &SettingsViewState,
-    motion: crate::native_app::ViewMotionCx,
-) -> bool {
-    if motion.serious {
-        return true;
-    }
-    let mode = crate::motion::MotionMode::parse(&field_text(state, prefs::EDIT_MOTION, "auto"));
-    let load_shed = motion.performance_reduced
-        && field_bool(state, prefs::EDIT_LOAD_ADAPTIVE_MOTION, true)
-        && mode == crate::motion::MotionMode::Auto;
-    load_shed
-        || crate::motion::MotionPolicy::resolve(mode, motion.system_reduced, motion.focused)
-            == crate::motion::MotionPolicy::Reduced
-}
-
 fn renderer_preview(
     state: &SettingsViewState,
     phase_ms: u64,
@@ -5911,6 +6421,7 @@ fn settings_tree(
     messages: &MessagesState,
     cx: &ViewCx<'_>,
 ) -> UiTree {
+    state.page_window.set(None);
     state.record_runtime_presentation(cx.motion, packages);
     let mut width = SettingsWidth::for_viewport(cx.viewport.width);
     let watch_status_height = config_watch_status_bar_height(state);
@@ -7319,6 +7830,7 @@ fn compact_navigation_page(
     if budget.side_by_side_pager {
         let start = state.page_scroll.min(routes.len().saturating_sub(1));
         let end = start + 1;
+        state.page_window.set(Some(1));
         let route = routes[start];
         let section = UiNode::new(
             "settings/categories/routes",
@@ -7368,6 +7880,7 @@ fn compact_navigation_page(
     let capacity = capacity.max(1);
     let start = state.page_scroll.min(routes.len().saturating_sub(1));
     let end = start.saturating_add(capacity).min(routes.len());
+    state.page_window.set(Some(capacity));
     let mut out = page_heading("All Settings", "Choose a settings pane.");
     if start > 0 || end < routes.len() {
         out.push(page_navigation_node(
@@ -7506,11 +8019,6 @@ fn special_page_scroll_limit(view: &SettingsViewState) -> Option<usize> {
         | SettingsRoute::Messages => Some(view.result_page_limit.get().unwrap_or(0)),
         _ => None,
     }
-}
-
-#[cfg(test)]
-fn compact_about_section_count() -> usize {
-    if settings_text_scale() > 1.25 { 4 } else { 3 }
 }
 
 /// A visible and semantic escape hatch for every bounded virtual window.
@@ -8464,7 +8972,6 @@ fn choice_picker_node(
 fn compact_landscape_choice_page(
     state: &SettingsViewState,
     mut preview: Option<UiNode>,
-    status: Option<UiNode>,
     budget: CompactPageBudget,
     viewport_width: f32,
 ) -> Option<Vec<UiNode>> {
@@ -8635,11 +9142,7 @@ fn compact_landscape_choice_page(
     right_children.extend(option_rows);
     let right_height = right_children.len() as f32 * row_height
         + right_children.len().saturating_sub(1) as f32 * 4.0;
-    let status_height = status
-        .as_ref()
-        .map_or(0.0, |_| top_environment_override_status_height());
-    let status_gap = if status.is_some() { 4.0 } else { 0.0 };
-    let choice_height_budget = (budget.content_height - status_height - status_gap).max(0.0);
+    let choice_height_budget = budget.content_height.max(0.0);
     let picker_node = UiNode::new(
         format!("settings/choice-picker/{}", picker.key),
         UiContent::Group(
@@ -8674,22 +9177,7 @@ fn compact_landscape_choice_page(
             .clipped(),
     )
     .children(children);
-    if let Some(status) = status {
-        Some(vec![
-            UiNode::new(
-                "settings/choice-landscape/with-status",
-                UiContent::Group(GroupSpec::new("Live choice preview, picker, and override")),
-            )
-            .layout(
-                Layout::column()
-                    .height(Length::Fixed(choice_height + status_gap + status_height))
-                    .gap(status_gap),
-            )
-            .children(vec![choice, status]),
-        ])
-    } else {
-        Some(vec![choice])
-    }
+    Some(vec![choice])
 }
 
 const TOP_SETTING_SECTIONS: usize = 6;
@@ -9241,58 +9729,6 @@ fn top_serious_mode_disclosure_height() -> f32 {
     28.0_f32.max(16.0 * settings_text_scale())
 }
 
-fn top_environment_override_status_height() -> f32 {
-    18.0_f32.max(12.0 * settings_text_scale())
-}
-
-fn top_environment_override_status(
-    state: &SettingsViewState,
-    key: &str,
-    narrow: bool,
-) -> Option<UiNode> {
-    let active = state.environment_override(key)?;
-    let effective = setting_choice_label(key, &active.effective);
-    let semantic = format!(
-        "${} is active and overrides the saved setting. Preview uses {effective}.",
-        active.variable
-    );
-    let visual = if narrow {
-        format!("Override → {effective}")
-    } else {
-        format!("${} active · Preview uses {effective}", active.variable)
-    };
-    Some(
-        UiNode::new(
-            format!("settings/top/environment-override/{}", key_fragment(key)),
-            UiContent::Group(GroupSpec {
-                label: Some(semantic),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(top_environment_override_status_height())),
-        )
-        .children(vec![
-            UiNode::new(
-                format!(
-                    "settings/top/environment-override/{}/visual",
-                    key_fragment(key)
-                ),
-                UiContent::Text(TextSpec {
-                    text: visual,
-                    role: SemanticRole::Status,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only(),
-        ]),
-    )
-}
-
 fn top_serious_mode_disclosure() -> UiNode {
     UiNode::new(
         "settings/top/serious-mode",
@@ -9380,12 +9816,7 @@ fn top_section_card(
             None,
         ),
         1 => {
-            let mut rows = row(prefs::EDIT_WINDOW_THEME, None);
-            rows.extend(top_environment_override_status(
-                state,
-                prefs::EDIT_WINDOW_THEME,
-                width == SettingsWidth::Compact,
-            ));
+            let rows = row(prefs::EDIT_WINDOW_THEME, None);
             top_card(
                 "system-appearance",
                 "Window appearance",
@@ -9581,23 +10012,7 @@ fn top_settings_landscape_section(
                 .clipped(),
         )
         .children(vec![preview, row]);
-        if let Some(status) = top_environment_override_status(state, key, true) {
-            let height = preview_row_height + 4.0 + top_environment_override_status_height();
-            (
-                UiNode::new(
-                    format!("settings/top/landscape/{}/with-status", key_fragment(key)),
-                    UiContent::Group(GroupSpec::new(format!(
-                        "{} preview and active override",
-                        key
-                    ))),
-                )
-                .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
-                .children(vec![preview_row, status]),
-                height,
-            )
-        } else {
-            (preview_row, preview_row_height)
-        }
+        (preview_row, preview_row_height)
     } else if section == 3
         && let Some(reason) = top_music_suppression_reason(state, cx.motion)
     {
@@ -10091,11 +10506,9 @@ fn top_settings_page(
             .then(|| top_preview(state, key, "settings/top/choice-preview", 96.0, cx))
             .flatten()
         });
-        let status = key.and_then(|key| top_environment_override_status(state, key, true));
         if let Some(mut page) = compact_landscape_choice_page(
             state,
             preview,
-            status,
             compact_budget.expect("checked compact budget"),
             cx.viewport.width,
         ) {
@@ -10137,11 +10550,6 @@ fn top_settings_page(
             } else {
                 renderer_preview_height(width).min(112.0)
             };
-            if let Some(status) =
-                top_environment_override_status(state, key, width == SettingsWidth::Compact)
-            {
-                out.push(status);
-            }
             if let Some(preview) = top_preview(
                 state,
                 key,
@@ -10220,11 +10628,6 @@ fn top_settings_page(
                 None,
                 width,
                 cx.viewport,
-            ));
-            rows.extend(top_environment_override_status(
-                state,
-                prefs::EDIT_WINDOW_THEME,
-                false,
             ));
             top_card(
                 "theme",
@@ -10643,7 +11046,7 @@ fn manual_override_disclosure(
     }
     if let Some(active) = state.environment_override(&authored.key) {
         parts.push(format!(
-            "${} remains active; effective {}",
+            "{} remains active; effective {}",
             active.variable, active.effective
         ));
     } else if let Some(precedence) = prefs::environment_precedence(&authored.key) {
@@ -11534,13 +11937,9 @@ fn settings_fields_page(
                     SettingsWidth::Compact,
                 )
             });
-            if let Some(page) = compact_landscape_choice_page(
-                state,
-                preview.flatten(),
-                None,
-                budget,
-                cx.viewport.width,
-            ) {
+            if let Some(page) =
+                compact_landscape_choice_page(state, preview.flatten(), budget, cx.viewport.width)
+            {
                 return page;
             }
         }
@@ -12025,6 +12424,9 @@ fn settings_fields_page(
         start + leading_results
     };
     let range_end = end + leading_results;
+    state
+        .page_window
+        .set(Some(end.saturating_sub(start).max(1)));
     if range_start > 0 || range_end < total {
         out.push(page_navigation_node(
             "settings/results-window",
@@ -12284,6 +12686,7 @@ struct SettingEffectProjection {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ConfigApplicationProjection {
     application_timings: BTreeSet<&'static str>,
+    /// Each active launch-flag override (`--font-px`) and its effective value.
     environment_overrides: BTreeSet<(&'static str, String)>,
     unavailable_notes: BTreeSet<String>,
     suppression_notes: BTreeSet<String>,
@@ -12750,6 +13153,7 @@ fn platform_unavailability(
         | prefs::EDIT_TONE_MELODY
         | prefs::EDIT_TRAIL_SOUND_BED
         | prefs::EDIT_TRAIL_SOUND_RIFF
+        | prefs::EDIT_CHOICE_SOUND
         | prefs::EDIT_SPARKLE_BONK
         | prefs::EDIT_SPARKLE_BONK_DETONATION
             if !availability.trail_audio =>
@@ -12951,6 +13355,7 @@ fn parent_or_motion_inactivity(
             | prefs::EDIT_TRAIL_SOUND_BED
             | prefs::EDIT_TRAIL_SOUND_RIFF
             | prefs::EDIT_BELL_SOUND
+            | prefs::EDIT_CHOICE_SOUND
     ) && serious_mode_active(state, patch, motion)
     {
         return Some(inactive(
@@ -12971,6 +13376,19 @@ fn parent_or_motion_inactivity(
     {
         return Some(inactive(
             "The sing-along riff is saved but inactive while Music effects is Off",
+            "Inactive · Music effects Off",
+            "Currently inactive: Music effects is Off",
+        ));
+    }
+
+    // THE CHOICE CHIME's gate: a synth voice under the Music effects master
+    // (`App::chose_chime` reads `trail_sounds` before `choice_sound`), and
+    // gated on nothing trail-shaped — so its row states this and only this.
+    if key == prefs::EDIT_CHOICE_SOUND
+        && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
+    {
+        return Some(inactive(
+            "The question choice chime is saved but inactive while Music effects is Off",
             "Inactive · Music effects Off",
             "Currently inactive: Music effects is Off",
         ));
@@ -13384,13 +13802,49 @@ fn parent_or_motion_inactivity(
         });
         if !complete {
             return Some(inactive(
-                "The network listener remains disabled until net.listen, net.cert, and net.key all resolve to non-empty values; environment overrides may supply any member",
+                "The network listener remains disabled until net.listen, net.cert, and net.key are all set to non-empty values",
                 "Inactive · Listener triad incomplete",
                 "Listener inactive; net.listen, net.cert, and net.key are all required",
             ));
         }
     }
     None
+}
+
+/// The `[harness]` policy the saved table writes, with `patch`'s
+/// `harness.*` edits applied, read by
+/// [`crate::app_config::HarnessPolicy::read`] — the supervisor's one reader —
+/// so the words Settings shows cannot disagree with what the host runs. The
+/// table is rebuilt from its dotted leaves (a `[harness]` header and a root
+/// `harness.<key> = …` project alike), each semantic value re-typed as TOML
+/// and carried as a string when it is not TOML (a string's semantic value is
+/// bare).
+fn harness_table_policy(
+    state: &SettingsViewState,
+    patch: Option<&ConfigPatch>,
+) -> crate::app_config::HarnessPolicy {
+    let mut leaves: BTreeMap<&str, Option<&str>> = state
+        .raw_values
+        .iter()
+        .filter_map(|(key, value)| Some((key.strip_prefix("harness.")?, Some(value.as_str()))))
+        .collect();
+    for edit in patch.into_iter().flat_map(|patch| &patch.edits) {
+        if let Some(leaf) = edit.key.strip_prefix("harness.") {
+            leaves.insert(leaf, edit.value.as_deref());
+        }
+    }
+    let mut table = aterm_toml::edit::Table::new();
+    for (leaf, value) in leaves {
+        let Some(value) = value else { continue };
+        let value = value
+            .parse::<aterm_toml::edit::Value>()
+            .unwrap_or_else(|_| value.into());
+        table.insert(leaf, aterm_toml::edit::Item::Value(value));
+    }
+    let mut doc = aterm_toml::edit::DocumentMut::new();
+    doc.as_table_mut()
+        .insert("harness", aterm_toml::edit::Item::Table(table));
+    crate::app_config::HarnessPolicy::read(&doc.to_string())
 }
 
 fn cross_field_constraints(
@@ -13402,6 +13856,19 @@ fn cross_field_constraints(
     let constraint = |semantic: String, visual: String, feedback: String| {
         EffectDisclosure::new(EffectNoteKind::Constraint, semantic, visual, feedback)
     };
+
+    // THE HARNESS ROW SPEAKS THE RULE (owner, 2026-09-24: "batteries included,
+    // on by default, configuration limits power"): beside its switch the row
+    // says what supervision IS — `Automatic`, or which written keys limit it —
+    // read from the `[harness]` table by the supervisor's own reader.
+    if key == prefs::EDIT_HARNESS_ENABLED {
+        let words = harness_table_policy(state, patch).words();
+        constraints.push(constraint(
+            format!("Agent supervision: {words}"),
+            words.clone(),
+            format!("Agent supervision: {words}"),
+        ));
+    }
 
     if matches!(
         key,
@@ -13630,6 +14097,7 @@ fn visual_application_timing(key: &str) -> Option<&'static str> {
         "Applies next launch" => "Next launch",
         "Applies to new sessions" => "New sessions",
         prefs::HARNESS_TIMING => "Supervision now · launcher: new sessions",
+        prefs::HARNESS_APPROVE_TIMING => "Supervision now",
         "Disabling applies now; enabling may require a new window" => "Off now · On in new window",
         "Applies when closing or next launch" => "On close / next launch",
         "Applies on the next package operation" => "Next package operation",
@@ -14171,6 +14639,10 @@ pub(crate) struct MacosAccess {
     pub(crate) retire_live: bool,
     /// The last *Move to Trash*, per copy, if one has run in this process.
     pub(crate) retired: Option<crate::consent_retire::RetireReport>,
+    /// One line on how the latest *Move to Trash* press is going or went: under
+    /// way, refused before it started, or its summary. Host-owned, so it is
+    /// never left behind by a press that has since finished.
+    pub(crate) retire_status: Option<String>,
 }
 
 impl Default for MacosAccess {
@@ -14200,6 +14672,7 @@ impl Default for MacosAccess {
             trash_tool: false,
             retire_live: false,
             retired: None,
+            retire_status: None,
         }
     }
 }
@@ -14212,12 +14685,9 @@ impl MacosAccess {
         let Some(census) = self.claimants.as_ref().filter(|_| self.trash_tool) else {
             return Vec::new();
         };
-        let offered = census.retirable();
         census
-            .conflicting()
+            .offered_for_trash()
             .into_iter()
-            .take(aterm_containment::consent::MAX_CLAIMANT_ROWS)
-            .filter(|copy| offered.contains(copy))
             .map(|copy| copy.path.clone())
             .collect()
     }
@@ -14271,7 +14741,10 @@ impl MacosAccess {
     /// button and the plan can never disagree.
     pub(crate) fn reset_plan(&self) -> Option<ResetPlan> {
         let denied = self.denied_folders();
-        if denied.is_empty() {
+        // With the privacy checks off *Ask Again* is withdrawn: the headline
+        // claims nothing, and a destructive repair is not drawn beside it. The
+        // rows and *Open Files & Folders…* stay.
+        if !self.enabled || denied.is_empty() {
             return None;
         }
         ResetPlan::for_offer(self.reset_inputs(), &denied)
@@ -14303,11 +14776,12 @@ pub(crate) struct ConsentGestures {
     /// attempt per folder. No retry, no loop: the plan carries each folder
     /// exactly once and this walks it exactly once.
     run_reset: fn(&ResetPlan) -> Vec<ResetAttempt>,
-    /// The owner's yes before a gesture that changes this Mac (the warm-up, the
-    /// reset, *Move to Trash*): an AppKit alert. `key` drives this page exactly
-    /// like a hand, so the alert — which no control verb can answer — is what
-    /// keeps these gestures the owner's.
-    confirm: fn(&str, &str, &str) -> bool,
+    /// The owner's answer before a gesture that changes this Mac (the warm-up,
+    /// the reset, *Move to Trash*): an AppKit alert. `key` drives this page
+    /// exactly like a hand, so the alert — which no control verb can answer — is
+    /// what keeps these gestures the owner's. `None` when no alert could be
+    /// shown: nobody was asked, which is not a decline.
+    confirm: fn(&str, &str, &str) -> Option<bool>,
     live: bool,
 }
 
@@ -14317,7 +14791,7 @@ impl ConsentGestures {
         Self {
             open_settings: crate::menu::open_privacy_settings,
             run_reset: run_tccutil_reset,
-            confirm: owner_confirms,
+            confirm: live_confirm,
             live: true,
         }
     }
@@ -14354,7 +14828,7 @@ impl ConsentGestures {
     }
 
     /// Ask the owner before a gesture that changes this Mac.
-    fn confirm(&self, title: &str, body: &str, proceed: &str) -> bool {
+    fn confirm(&self, title: &str, body: &str, proceed: &str) -> Option<bool> {
         (self.confirm)(title, body, proceed)
     }
 
@@ -14398,9 +14872,9 @@ impl PartialEq for ConsentGestures {
 
 impl Eq for ConsentGestures {}
 
-/// The live confirmation: an AppKit alert on macOS, refused elsewhere (the
-/// block is never published off macOS).
-fn owner_confirms(title: &str, body: &str, proceed: &str) -> bool {
+/// The live confirmation: an AppKit alert on macOS; off macOS nobody is asked
+/// (the block is never published there).
+fn live_confirm(title: &str, body: &str, proceed: &str) -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
         crate::menu::confirm_owner(title, body, proceed)
@@ -14408,18 +14882,18 @@ fn owner_confirms(title: &str, body: &str, proceed: &str) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (title, body, proceed);
-        false
+        None
     }
 }
 
-/// The inert confirmation: nobody was asked, so the answer is no.
-const fn inert_confirm(_title: &str, _body: &str, _proceed: &str) -> bool {
-    false
+/// The inert confirmation: nobody is asked.
+const fn inert_confirm(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
+    None
 }
 
 #[cfg(test)]
-const fn test_confirm_yes(_title: &str, _body: &str, _proceed: &str) -> bool {
-    true
+const fn test_confirm_yes(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
+    Some(true)
 }
 
 /// The inert open: nothing is contacted, and the answer is the same
@@ -14548,6 +15022,8 @@ pub(crate) struct MacosAccessCopy {
     pub(crate) claimants: Vec<String>,
     /// What the last *Move to Trash* did, one line per copy.
     pub(crate) retired: Vec<String>,
+    /// How the latest *Move to Trash* is going or went.
+    pub(crate) retire_status: Option<String>,
 }
 
 impl MacosAccessCopy {
@@ -14571,6 +15047,7 @@ impl MacosAccessCopy {
         out.extend(self.folders.iter().map(String::as_str));
         out.extend(self.repair.iter().map(String::as_str));
         out.extend(self.claimants.iter().map(String::as_str));
+        out.extend(self.retire_status.as_deref());
         out.extend(self.retired.iter().map(String::as_str));
         out
     }
@@ -14619,11 +15096,13 @@ fn macos_access_row_label(folder: Folder, row: crate::consent_warmup::WarmupRow)
     match row {
         crate::consent_warmup::WarmupRow::Unknown => "not asked by this aterm process".to_string(),
         crate::consent_warmup::WarmupRow::Asking => "asking\u{2026}".to_string(),
+        #[cfg(any(target_os = "macos", test))]
         crate::consent_warmup::WarmupRow::Allowed => "allowed".to_string(),
         crate::consent_warmup::WarmupRow::Denied => format!(
             "denied \u{2014} macOS is not asking again for this {}",
             folder.noun()
         ),
+        #[cfg(any(target_os = "macos", test))]
         crate::consent_warmup::WarmupRow::Error => "could not be read".to_string(),
     }
 }
@@ -14852,14 +15331,21 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     let mut repair = Vec::new();
     let denied = access.denied_folders();
     if !denied.is_empty() {
+        // Worded by what the block offers: *Ask Again* is not drawn with the
+        // checks off, without `tccutil`, or for an identity it cannot repair.
         repair.push(
-            "macOS is not asking again for the folders above. Both ways out of that are yours to \
-             start, and neither happens on its own."
-                .to_string(),
+            if access.shows_reset_button() {
+                "macOS is not asking again for the folders above. Both ways out of that are \
+                 yours to start, and neither happens on its own."
+            } else {
+                "macOS is not asking again for the folders above. The way out is yours to take \
+                 in Files & Folders, and it does not happen on its own."
+            }
+            .to_string(),
         );
     }
     if let Some(report) = access.reset.as_ref() {
-        repair.extend(macos_access_reset_lines(report));
+        repair.extend(macos_access_reset_lines(report, access.warmup_offered));
     }
     MacosAccessCopy {
         headline: headline.to_string(),
@@ -14882,6 +15368,7 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             .flatten()
             .map(|(path, outcome)| macos_access_retired_line(path, outcome))
             .collect(),
+        retire_status: access.retire_status.clone(),
     }
 }
 
@@ -14906,10 +15393,10 @@ fn macos_access_claimant_lines(access: &MacosAccess) -> Vec<String> {
         let signed = match (copy.signing, copy.team.as_deref()) {
             ("adhoc", _) => "signed ad hoc".to_string(),
             ("unsigned", _) => "not signed".to_string(),
-            (_, Some(team)) => format!("signed by team {team}"),
+            (_, Some(team)) => format!("signed by team {}", owner_text(team)),
             _ => "signature unreadable".to_string(),
         };
-        lines.push(format!("{} \u{2014} {signed}", copy.path.display()));
+        lines.push(format!("{} \u{2014} {signed}", owner_path(&copy.path)));
     }
     if conflicting.len() > MAX_CLAIMANT_ROWS {
         lines.push(format!(
@@ -14935,7 +15422,7 @@ fn macos_access_retired_line(
     outcome: &aterm_containment::consent::Retired,
 ) -> String {
     use aterm_containment::consent::Retired;
-    let path = path.display();
+    let path = owner_path(path);
     match outcome {
         Retired::Moved => format!("Moved to the Trash: {path}."),
         Retired::NotOffered => {
@@ -14944,7 +15431,7 @@ fn macos_access_retired_line(
         Retired::InUse => {
             format!("Left in place: {path} \u{2014} aterm could not rule out that it is in use.")
         }
-        Retired::Failed(reason) => format!("Not moved: {path} \u{2014} {reason}"),
+        Retired::Failed(reason) => format!("Not moved: {path} \u{2014} {}", owner_text(reason)),
     }
 }
 
@@ -14952,7 +15439,19 @@ fn macos_access_retired_line(
 /// Only [`ResetOutcome::AllReset`] speaks for the whole set; a partial success
 /// names the folders it actually cleared, and every nonzero invocation gets its
 /// own line with the exit status.
-fn macos_access_reset_lines(report: &MacosAccessReset) -> Vec<String> {
+fn macos_access_reset_lines(report: &MacosAccessReset, warmup_offered: bool) -> Vec<String> {
+    // The advice names the warm-up button only where it is drawn.
+    let (again, again_those) = if warmup_offered {
+        (
+            "Ask for folder access now to let it ask again.",
+            "Ask for folder access now to let it ask again about those.",
+        )
+    } else {
+        (
+            "macOS asks again the next time aterm opens one.",
+            "macOS asks again about those the next time aterm opens one.",
+        )
+    };
     let names = |folders: &[Folder]| {
         folders
             .iter()
@@ -14963,13 +15462,11 @@ fn macos_access_reset_lines(report: &MacosAccessReset) -> Vec<String> {
     let mut out = Vec::new();
     match report.outcome {
         ResetOutcome::AllReset => out.push(format!(
-            "macOS cleared its saved answer for every folder asked: {}. Ask for folder access now \
-             to let it ask again.",
+            "macOS cleared its saved answer for every folder asked: {}. {again}",
             names(&report.reset)
         )),
         ResetOutcome::Partial => out.push(format!(
-            "macOS cleared its saved answer for {} only. Ask for folder access now to let it ask \
-             again about those.",
+            "macOS cleared its saved answer for {} only. {again_those}",
             names(&report.reset)
         )),
         ResetOutcome::NoneReset => {
@@ -15011,6 +15508,194 @@ pub(crate) const MACOS_ACCESS_WARM_UP: &str = "settings/macos-access/warm-up";
 pub(crate) const MACOS_ACCESS_ASK_AGAIN: &str = "settings/macos-access/ask-again";
 pub(crate) const MACOS_ACCESS_TRASH: &str = "settings/macos-access/trash-copies";
 
+/// The first decline's quiet; each decline in a row doubles it, up to
+/// [`OWNER_QUIET_MAX`].
+const OWNER_QUIET_FIRST: std::time::Duration = std::time::Duration::from_secs(10);
+/// The longest quiet.
+const OWNER_QUIET_MAX: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// A decline this long after the last quiet ended starts the doubling over.
+const OWNER_QUIET_FORGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The owner's recent answers to the block's alerts, one record for every
+/// view: the declines in a row that quiet the gestures (see
+/// [`SettingsViewState::owner_confirms`]), and the yeses the park has not yet
+/// taken up.
+#[derive(Debug, Default)]
+pub(crate) struct OwnerQuiet {
+    until: Option<QuietStamp>,
+    declines: u32,
+    /// A warm-up the owner said yes to, in any view, that the park has not
+    /// taken up yet: a press queued in ANOTHER view behind that alert reads it
+    /// and does not ask again.
+    warmup_confirmed: bool,
+    /// The same for a move to the Trash.
+    retire_confirmed: bool,
+}
+
+/// A moment on two clocks. `Instant` stops while the Mac sleeps, so a quiet
+/// timed by it alone would outlast a night asleep, and the wall clock can be
+/// set back; a quiet ends when EITHER clock says it has. A wall clock set
+/// forward only ends one early, and the alert is still the fence.
+#[derive(Clone, Copy, Debug)]
+struct QuietStamp {
+    awake: std::time::Instant,
+    wall: std::time::SystemTime,
+}
+
+impl QuietStamp {
+    fn now() -> Self {
+        Self {
+            awake: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+
+    fn after(self, span: std::time::Duration) -> Self {
+        Self {
+            awake: self.awake + span,
+            wall: self.wall + span,
+        }
+    }
+
+    /// Whether this is before `other` on both clocks.
+    fn before(self, other: Self) -> bool {
+        self.awake < other.awake && self.wall < other.wall
+    }
+
+    /// How long after `earlier` this is, by whichever clock says longer.
+    fn since(self, earlier: Self) -> std::time::Duration {
+        let wall = self.wall.duration_since(earlier.wall).unwrap_or_default();
+        self.awake
+            .saturating_duration_since(earlier.awake)
+            .max(wall)
+    }
+}
+
+/// One [`OwnerQuiet`] for the whole process, armed into every Settings view.
+pub(crate) type SharedOwnerQuiet = std::sync::Arc<std::sync::Mutex<OwnerQuiet>>;
+
+impl OwnerQuiet {
+    fn quiet_at(&self, now: QuietStamp) -> bool {
+        self.until.is_some_and(|until| now.before(until))
+    }
+
+    fn declined(&mut self, now: QuietStamp) {
+        if self
+            .until
+            .is_some_and(|until| now.since(until) > OWNER_QUIET_FORGET)
+        {
+            self.declines = 0;
+        }
+        self.declines = self.declines.saturating_add(1);
+        let doubled = OWNER_QUIET_FIRST
+            .checked_mul(1 << self.declines.saturating_sub(1).min(16))
+            .unwrap_or(OWNER_QUIET_MAX);
+        self.until = Some(now.after(doubled.min(OWNER_QUIET_MAX)));
+    }
+
+    fn accepted(&mut self) {
+        self.until = None;
+        self.declines = 0;
+    }
+
+    /// The park has taken up every confirmed gesture (started it, or said why
+    /// not): what is under way is the projection's to say from here.
+    pub(crate) fn settle_confirmed(&mut self) {
+        self.warmup_confirmed = false;
+        self.retire_confirmed = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_both_for_test(&mut self) {
+        self.warmup_confirmed = true;
+        self.retire_confirmed = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn has_confirmed_for_test(&self) -> bool {
+        self.warmup_confirmed || self.retire_confirmed
+    }
+}
+
+/// How [`SettingsViewState::owner_confirms`] came out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerAnswer {
+    Yes,
+    No,
+    /// Not asked: one of these alerts was declined recently.
+    Quiet,
+    /// Not asked: no alert could be shown.
+    NotAsked,
+}
+
+impl OwnerAnswer {
+    /// The block's feedback for every answer but yes.
+    fn refusal(self, declined: &'static str) -> &'static str {
+        match self {
+            Self::Yes | Self::No => declined,
+            Self::Quiet => {
+                "You declined one of these a moment ago, so aterm did not ask again yet."
+            }
+            Self::NotAsked => "Nothing was changed: aterm could not show its question.",
+        }
+    }
+}
+
+/// A path as the owner reads it in this block and its alerts; see
+/// [`owner_text`].
+fn owner_path(path: &std::path::Path) -> String {
+    owner_text(&path.to_string_lossy())
+}
+
+/// Text the owner reads in this block and its alerts that someone else chose —
+/// a copy's folder name, its signing team, or a system message quoting it.
+/// Control characters, the line and paragraph separators, the interlinear
+/// annotation marks, the Egyptian format controls, and every Unicode
+/// `Default_Ignorable_Code_Point` (the direction, joiner, filler, variation and
+/// tag characters among them) are shown escaped, so it cannot start a new line,
+/// reorder the text around it, or carry any of those invisible characters.
+fn owner_text(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_control()
+            || matches!(
+                c,
+                // Default_Ignorable_Code_Point (DerivedCoreProperties.txt),
+                // whole: the assigned and the reserved ranges alike, through
+                // U+E0FFF below.
+                '\u{00AD}'
+                    | '\u{034F}'
+                    | '\u{061C}'
+                    | '\u{115F}'..='\u{1160}'
+                    | '\u{17B4}'..='\u{17B5}'
+                    | '\u{180B}'..='\u{180F}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}'
+                    | '\u{3164}'
+                    | '\u{FE00}'..='\u{FE0F}'
+                    | '\u{FEFF}'
+                    | '\u{FFA0}'
+                    | '\u{FFF0}'..='\u{FFF8}'
+                    | '\u{1BCA0}'..='\u{1BCA3}'
+                    | '\u{1D173}'..='\u{1D17A}'
+                    | '\u{E0000}'..='\u{E0FFF}'
+                    // Not default-ignorable, but format controls drawn as
+                    // nothing (Egyptian hieroglyph joiners), or characters that
+                    // break or annotate a line.
+                    | '\u{13430}'..='\u{1343F}'
+                    | '\u{2028}'..='\u{2029}'
+                    | '\u{FFF9}'..='\u{FFFB}'
+            )
+        {
+            out.push_str(&format!("\\u{{{:04X}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Whether the Security page carries the block right now. It exists only when
 /// the host has PUBLISHED a posture — a headless instance, a unit test, and
 /// every non-macOS build publish nothing, so the block is simply absent rather
@@ -15030,16 +15715,18 @@ fn macos_access_height(access: &MacosAccess, compact: bool) -> f32 {
     let copy = macos_access_copy(access);
     let lines = if compact {
         // Short landscape and maximum Dynamic Type keep the state line, the
-        // coverage claim and the trade; everything else is on the same page one
-        // scroll away, and clipping all three would be worse than shedding the
-        // rest.
-        3 + usize::from(copy.rebuild.is_some())
+        // coverage claim and the trade, plus the rebuild line and the Trash's
+        // status row when there is one; everything else — the per-copy Trash
+        // outcomes among it — is shed, since clipping all of them would be
+        // worse than shedding the rest.
+        3 + usize::from(copy.rebuild.is_some()) + usize::from(copy.retire_status.is_some())
     } else {
         9 + usize::from(copy.rebuild.is_some())
             + copy.services.len()
             + copy.folders.len()
             + copy.repair.len()
             + copy.claimants.len()
+            + usize::from(copy.retire_status.is_some())
             + copy.retired.len()
     };
     heading_height + lines as f32 * line_height + scaled_control_height() + 12.0 + 24.0
@@ -15198,6 +15885,16 @@ fn macos_access_card(access: &MacosAccess, compact: bool) -> UiNode {
                 },
             ));
         }
+    }
+    if let Some(status) = copy.retire_status.clone() {
+        children.push(line(
+            "settings/macos-access/retire-status".to_string(),
+            status,
+            SemanticRole::Status,
+            StyleRef::Primary,
+        ));
+    }
+    if !compact {
         for (index, retired) in copy.retired.iter().enumerate() {
             children.push(line(
                 format!("settings/macos-access/retired/{index}"),
@@ -15503,7 +16200,7 @@ fn setting_row(
     }
     if let Some(active) = environment_override {
         setting_description.push_str(&format!(
-            " · ${} remains active; effective value {}",
+            " · {} remains active; effective value {}",
             active.variable, active.effective
         ));
     }
@@ -15533,7 +16230,7 @@ fn setting_row(
     }
     if let Some(active) = environment_override {
         semantic_field_label.push_str(&format!(
-            " · overridden by ${}; effective {}",
+            " · overridden by {}; effective {}",
             active.variable, active.effective
         ));
     }
@@ -15693,7 +16390,7 @@ fn setting_row(
     }
     if let Some(active) = environment_override {
         label.push_str(&format!(
-            "  ·  ${} active → {}",
+            "  ·  {} active → {}",
             active.variable, active.effective
         ));
     }
@@ -16259,16 +16956,13 @@ fn about_page(
         UiContent::Text(TextSpec {
             text: if large_type_narrow {
                 "Fast and native.".to_string()
-            } else if width == SettingsWidth::Compact {
-                // A phone-width identity column gives this line ~206pt; the
-                // serial "and" pushed it to ~212 even in the UI face, so the
-                // asyndeton keeps every word whole (2026-08 settings audit).
-                "Fast, hardened, introspectable.".to_string()
             } else {
-                value(
-                    "tagline",
-                    "A fast, introspectable terminal built as one trustworthy native surface.",
-                )
+                // One sentence at every width. A phone-width identity column gives
+                // this line ~206pt; the serial "and" pushed it to ~212 even in the
+                // UI face, so the asyndeton keeps every word whole (2026-08 settings
+                // audit). Not the build info's `tagline` row: that is a lowercase
+                // clipboard value, not a sentence.
+                "Fast, hardened, introspectable.".to_string()
             },
             role: SemanticRole::Text,
             style: StyleRef::Plain,
@@ -17432,6 +18126,9 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
         "Ready".to_string()
     } else if update.failing_persistent {
         "Failing".to_string()
+    } else if update.dev_build {
+        // Left alone on purpose (gap #30): the headline says where it stands.
+        "Dev build".to_string()
     } else if !update.installable {
         // Not "Current": nothing was compared, and this copy could not take a newer
         // build if one existed (2026-08-19 round-6 audit).
@@ -17475,6 +18172,8 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
         "Ready to install.".to_string()
     } else if update.failing_persistent {
         "Updates are failing.".to_string()
+    } else if update.dev_build {
+        "A dev build is left alone.".to_string()
     } else if !update.installable {
         "This copy cannot be replaced in place.".to_string()
     } else if update.channel_unreadable {
@@ -17492,7 +18191,18 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
 /// stays the card's semantic value; this is only what paints.
 pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String {
     if update.linux_host && !update.checking {
-        return "See status.".to_string();
+        // The page's one step, where it has one (`UpdateState::detail`'s Linux
+        // direction); every other Linux state is the compact headline's to say.
+        let downloaded = update
+            .linux
+            .as_ref()
+            .is_some_and(|status| status.staged_build.is_some());
+        return if update.installable && downloaded {
+            "Run update apply."
+        } else {
+            ""
+        }
+        .to_string();
     }
     if let Some(trouble) = update.apply_trouble.as_ref().filter(|_| !update.checking) {
         // The tersest rung keeps the COUNT rather than a mood word: "2 tries failed"
@@ -17509,6 +18219,8 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
         "Ready."
     } else if update.failing_persistent {
         "Checks failing."
+    } else if update.dev_build {
+        "Dev build."
     } else if !update.installable {
         "Reinstall only."
     } else if update.channel_unreadable {
@@ -17558,6 +18270,9 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
         // Beside the Danger "Failing" headline; "None staged" there read as a
         // second, contradicting verdict (2026-08-19 audit).
         "Checks failing"
+    } else if update.dev_build {
+        // Beside the "Dev build" headline: why nothing moves it, not the same words.
+        "Not auto-updated"
     } else if !update.installable {
         "Not installable"
     } else if update.channel_unreadable {
@@ -17869,7 +18584,7 @@ fn update_action_node(update: &UpdateProjection, width: SettingsWidth, height: f
         "Update to Latest Now"
     };
     let visual_label = if update.linux_host {
-        "Use terminal to apply"
+        "Install in a terminal"
     } else {
         update_action_label(compact_large_type)
     };
@@ -17907,7 +18622,7 @@ fn update_action_node(update: &UpdateProjection, width: SettingsWidth, height: f
 /// of "nothing new".
 fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
     if update.linux_host {
-        return vec!["Linux update downloads are authenticated before installation. Use `aterm update status` to inspect this copy; no release notes are available here.".to_string()];
+        return vec!["No release notes on Linux.".to_string()];
     }
     if !update.changelog.is_empty() {
         return update.changelog.clone();
@@ -17925,8 +18640,11 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         // NEVER "is the latest build" on the same page whose headline says this Mac
         // cannot update: with nothing staged this branch was unconditional, so the
         // card contradicted the card above it every time (2026-08-19 round-5 audit).
-        "Release notes appear here when an update is ready. Updates can\u{2019}t be checked \
-         right now \u{2014} the cause is above."
+        "Release notes appear here when an update is ready.".to_string()
+    } else if update.dev_build {
+        // A dev build is left alone on purpose (gap #30); the cause is above too.
+        "Release notes appear here when an update is ready. A dev build isn\u{2019}t \
+         updated by aterm \u{2014} the headline above says where it stands."
             .to_string()
     } else if !update.installable {
         // The headline above already says this copy can never replace itself, and
@@ -17936,6 +18654,12 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         "Release notes appear here when an update is ready. This copy of aterm can\u{2019}t \
          update itself \u{2014} the cause is above."
             .to_string()
+    } else if update.enabled && (update.channel_unreadable || update.checked_at.is_none()) {
+        // NEVER "is the newest version" without a comparison behind it: a stranded
+        // machine records zero ledger failures, so the failing_persistent arm above
+        // never catches it, and before any check completes the status card says
+        // "Not checked yet."
+        "Release notes appear here when an update is ready.".to_string()
     } else if update.enabled {
         format!(
             "aterm {} is the newest version. Notes for the next one appear here when it\u{2019}s ready.",
@@ -17965,7 +18689,7 @@ impl StatusLineBudget {
 
     /// The desktop ladder, longest first: the outcome steps down to one line, then the
     /// detail does. The outcome goes first because the detail is the headline's own
-    /// sentence, while one line of "Last check: check failed (network)…" still names the
+    /// sentence, while one line of "check failed (network)…" still names the
     /// cause (its whole text stays the node's semantic value). Neither goes below one.
     fn desktop_ladder() -> impl Iterator<Item = Self> {
         let outcome = (1..=MAX_UPDATE_OUTCOME_LINES).rev().map(|outcome| Self {
@@ -18301,11 +19025,9 @@ fn update_outcome_line(update: &UpdateProjection) -> Option<String> {
         return None;
     }
     // The ledger stores authored prose that may span lines; the status line
-    // takes the whole of it as one bounded sentence.
-    Some(format!(
-        "Last check: {}",
-        outcome.split('\n').collect::<Vec<_>>().join(" ")
-    ))
+    // takes the whole of it as one bounded sentence. No "Last check:" label: the
+    // apply lane and the reducer write this field too, and each sentence names its subject.
+    Some(outcome.split('\n').collect::<Vec<_>>().join(" "))
 }
 
 /// The one platform-true sentence for a build whose in-app updater lane does
@@ -18320,7 +19042,7 @@ fn update_outcome_line(update: &UpdateProjection) -> Option<String> {
 /// workbench, where the card's text measure is ~320pt.
 fn platform_update_lane_sentence(availability: SettingsAvailability) -> &'static str {
     if availability.windows {
-        "Reinstall from the Windows package lane to update."
+        "Rebuild and reinstall with apps/aterm-win to update."
     } else {
         "Reinstall through your package manager to update."
     }
@@ -18374,8 +19096,7 @@ fn update_automatic_caption(
     } else if compact {
         "Updater unavailable \u{b7} no effect here."
     } else {
-        "This platform has no native updater \u{2014} these switches have no effect \
-         here. The saved values are kept for portability."
+        "These switches do nothing here."
     }
     .to_string()
 }
@@ -18823,7 +19544,7 @@ fn update_page(
     }
     // A DESKTOP STATUS CARD FITS THE SECTION IT IS WINDOWED INTO (2026-09-24 post-push
     // review), as the automatic card's caption steps down within the same budget. On
-    // macOS at the medium workbench a non-routine "Last check: …" outcome under the
+    // macOS at the medium workbench a non-routine outcome line under the
     // switch's three-line timing sentence, above the action row and the Settings ▸
     // Messages link's own row, made the card 360pt in a 327pt section: the link button
     // was cut to 23 of its 36pt. The outcome steps down first, then the detail
@@ -19046,7 +19767,7 @@ fn update_page(
     let section_heights = workbench_height + notes.len() as f32 * notes_height;
     let authored_children = 2 + sections.len();
     let subtitle = if update.linux_host {
-        "Authenticated Linux updates; existing terminals keep running."
+        "Updating keeps open terminals running."
     } else {
         update_page_subtitle(width, availability.macos)
     };
@@ -19546,9 +20267,7 @@ fn compact_packages_summary(packages: &PackagesProjection) -> (UiNode, f32) {
             UiNode::new(
                 "packages/detail",
                 UiContent::Text(TextSpec {
-                    text: packages.detail.clone().unwrap_or_else(|| {
-                        "Signed ALab tools, kept up to date by aterm.".to_string()
-                    }),
+                    text: packages.detail.clone().unwrap_or_default(),
                     role: SemanticRole::Text,
                     style: StyleRef::Quiet,
                 }),
@@ -19610,7 +20329,7 @@ fn compact_packages_status_row(
 }
 
 // ---------------------------------------------------------------------------
-// Settings ▸ Messages (design §4).
+// Settings ▸ Messages (design §4; the log's form, ruling 262).
 // ---------------------------------------------------------------------------
 
 /// Every action the Messages page authors starts here; the reducer routes
@@ -19627,6 +20346,47 @@ pub(crate) const MESSAGES_SELECT: &str = "settings/messages/select";
 /// the chip a press on it would set, after the navigation that clears the
 /// filter. Software Update's "View Messages" link is the update chip.
 pub(crate) const MESSAGES_SHOW_UPDATE: &str = "settings/messages/show/update";
+
+/// The most lines the Messages filters take as chips on a wider page
+/// (ruling 262); past it the tags go in the pop-up (ruling 267).
+const MESSAGES_FILTER_LINES_MAX: usize = 2;
+
+/// How long the Messages page's status line stands at least, once a
+/// projection has seen it (ruling 267). The host arms the publish that
+/// clears it (`App::messages_publish_due_at`), so it stands about this long,
+/// not until the next minute tick.
+pub(crate) const MESSAGES_FEEDBACK_MS: u64 = 5_000;
+
+/// Whether the keyboard is on one of the two severity segments.
+fn messages_segment_focused(view: &SettingsViewState) -> bool {
+    view.route == SettingsRoute::Messages
+        && view.common.last_focus.as_ref().is_some_and(|focus| {
+            matches!(
+                focus.as_str(),
+                "settings/messages/filter/all" | "settings/messages/filter/warn"
+            )
+        })
+}
+
+/// Whether `node` or anything under it is keyed `key`.
+fn ui_node_holds(node: &UiNode, key: &str) -> bool {
+    node.key.as_str() == key || node.children.iter().any(|child| ui_node_holds(child, key))
+}
+
+/// The first control under `node` a person can focus, in authoring order.
+fn first_focusable_key(node: &UiNode) -> Option<UiKey> {
+    let focusable = matches!(
+        node.content,
+        UiContent::Button(_)
+            | UiContent::Switch(_)
+            | UiContent::Slider(_)
+            | UiContent::TextField(_)
+    );
+    if focusable && !node.paint_only {
+        return Some(node.key.clone());
+    }
+    node.children.iter().find_map(first_focusable_key)
+}
 
 /// The link Settings ▸ Software Update carries to its record: Settings ▸ Messages with
 /// the update chip down ([`MESSAGES_SHOW_UPDATE`], the chip a press on it would set) —
@@ -19660,95 +20420,41 @@ fn messages_link_width() -> f32 {
 /// The page's one-line invitation when the log is empty.
 const MESSAGES_EMPTY: &str = "Nothing yet.";
 
-/// The most rows one page seats, whatever the height (design §4.4) — and,
-/// on a compact page, the most items one section seats.
-const MESSAGES_ROWS_PER_PAGE_MAX: usize = 20;
-
-/// The gap between rows inside a compact section, and between the chips'
-/// rows.
-const MESSAGES_ROW_GAP: f32 = 6.0;
-
-/// Which chip is down (design §4.2): one tag, the warnings-and-errors set,
-/// or neither — All. A chip press is a radio; the three never combine.
+/// What the filters let through (design ruling 262): a SEVERITY — All, or
+/// Problems (warnings and errors together, ruling 264) — AND a TAG, or every
+/// tag. The two combine: "updates that failed" is the Updates chip and
+/// Problems together. A tag is
+/// matched by the chip it shows under ([`crate::messages_host::tag_words`]),
+/// so `fabric` and `harness` are one Agents chip and `toolchain` and
+/// `packages` one ALab tools chip, and a deep link to either tag of a pair
+/// selects that chip; the wire keeps each tag.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MessagesFilter {
-    /// Only this tag.
+    /// Only this tag's chip.
     pub(crate) tag: Option<String>,
     /// Only Warn and Error.
     pub(crate) warn_only: bool,
 }
 
 impl MessagesFilter {
-    /// Whether `entry` passes the chip.
+    /// Whether `entry` passes both filters.
     fn admits(&self, entry: &MessageView) -> bool {
-        (!self.warn_only || entry.alarm()) && self.tag.as_ref().is_none_or(|t| *t == entry.tag)
+        (!self.warn_only || entry.alarm())
+            && self
+                .tag
+                .as_ref()
+                .is_none_or(|t| messages_same_chip(t, &entry.tag))
     }
 
-    /// The All chip.
+    /// Neither filter is down.
     fn is_all(&self) -> bool {
         self.tag.is_none() && !self.warn_only
     }
 }
 
-/// What the last render measured, so the reducer's deep link seats an entry
-/// exactly where the renderer will: the page packs rows by their authored
-/// heights, and the expanded one is charged at its expanded height (the
-/// Packages `reason_lines` lesson), so "the page holding this entry" is a
-/// layout question. Recorded through a `Cell` (the `result_page_limit`
-/// discipline); read only by `SettingsApp::reveal_message`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MessagesPageFacts {
-    /// A compact page is a run of sections, one per page; every other width
-    /// scrolls by row under a range pager.
-    compact: bool,
-    /// The height one page's items get — a compact section's whole height,
-    /// or the wide page below its heading, chips, status line and pager.
-    capacity: f32,
-    /// The items a compact page seats BEFORE the rows (the wider pages seat
-    /// them above the rows and record nothing here).
-    header: MessagesHeaderFacts,
-    /// The measure a detail line wraps to.
-    text_width: f32,
-}
-
-/// The compact page's leading items — every chip row, the status line, the
-/// empty-log invitation — as heights, so the reducer can re-pack the same
-/// list the renderer packed.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct MessagesHeaderFacts {
-    /// How many rows the chips wrapped into.
-    chip_rows: usize,
-    /// One chip row's height.
-    chip_height: f32,
-    /// The status line's height.
-    status_height: f32,
-    /// The not-saved note's height; zero when the log has a writer.
-    unsaved_height: f32,
-    /// The invitation's height; zero when the log has entries.
-    empty_height: f32,
-}
-
-impl MessagesHeaderFacts {
-    /// The header items' heights, in page order.
-    fn heights(self) -> Vec<f32> {
-        let mut out = vec![self.chip_height; self.chip_rows];
-        out.push(self.status_height);
-        if self.unsaved_height > 0.0 {
-            out.push(self.unsaved_height);
-        }
-        if self.empty_height > 0.0 {
-            out.push(self.empty_height);
-        }
-        out
-    }
-
-    /// How many items precede the first row.
-    fn len(self) -> usize {
-        self.chip_rows
-            + 1
-            + usize::from(self.unsaved_height > 0.0)
-            + usize::from(self.empty_height > 0.0)
-    }
+/// Whether two tags show under ONE chip (their plain words are the same).
+fn messages_same_chip(a: &str, b: &str) -> bool {
+    crate::messages_host::tag_words(a) == crate::messages_host::tag_words(b)
 }
 
 /// The not-saved note (design ruling 65): what a page over an in-memory ring
@@ -19756,89 +20462,51 @@ impl MessagesHeaderFacts {
 const MESSAGES_NOT_SAVED: &str =
     "These messages are kept only until aterm quits: the log file could not be opened.";
 
-/// The reporting buttons (design ruling 65): Copy All — the shown entries and
-/// the build information, ready for a report — and Open Log Folder, which the
-/// host opens itself. Beside the status line on the wider pages; on a compact
-/// page a column of their own AFTER the list, the last item — seated there
-/// rather than in the header so the header's items, and so the section a deep
-/// link pages to, are what they were (an expanded entry keeps its head and
-/// its first lines together). The palette carries both commands on every
-/// page size.
-fn messages_report_buttons(compact: bool, width: f32) -> (UiNode, f32) {
-    let control_h = scaled_control_height();
-    let button = |key: &str, label: &str, semantic: &str, width: Length| {
-        UiNode::new(
-            key.to_string(),
-            UiContent::Button(
-                Control::new(
-                    ButtonSpec::new(semantic).visual_label(label),
-                    ActionId::new(key.to_string()),
-                )
-                .style(StyleRef::Secondary),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(width)
-                .height(Length::Fixed(control_h)),
-        )
-    };
-    let scale = settings_text_scale().min(1.5);
-    let (layout, height, widths) = if compact {
-        (
-            Layout::column().gap(8.0),
-            2.0 * control_h + 8.0,
-            (Length::Fill, Length::Fill),
-        )
-    } else {
-        (
-            Layout::row().gap(8.0),
-            control_h,
-            (
-                Length::Fixed((112.0 * scale).min(width)),
-                Length::Fixed((156.0 * scale).min(width)),
-            ),
-        )
-    };
-    let node = UiNode::new(
-        "settings/messages/report",
-        UiContent::Group(GroupSpec::new("Report")),
-    )
-    .layout(layout.width(Length::Fill).height(Length::Fixed(height)))
-    .children(vec![
-        button(
-            MESSAGES_COPY_ALL,
-            "Copy All",
-            "Copy the shown messages",
-            widths.0,
-        ),
-        button(
-            MESSAGES_OPEN_FOLDER,
-            "Open Log Folder",
-            "Open the log folder",
-            widths.1,
-        ),
-    ]);
-    (node, height)
-}
-
 /// Copy All's action: the shown entries, newest first, and the build
 /// information on top.
 const MESSAGES_COPY_ALL: &str = "settings/messages/copy-all";
 /// Open Log Folder's action: the host opens the log directory itself.
 const MESSAGES_OPEN_FOLDER: &str = "settings/messages/open-folder";
+/// The compact page's tag pop-up (`Tag: All ▾`): opens the tag list in place.
+const MESSAGES_TAG_MENU: &str = "settings/messages/tag-menu";
+/// The tag list's first chip: every tag.
+const MESSAGES_TAGS_ALL: &str = "settings/messages/filter/tags-all";
 
-/// A collapsed row's height: 44·s pt (design §4.3).
+/// The caption under the "Explain heavy load" switch (design ruling 262).
+const MESSAGES_EXPLAIN_LOAD_CAPTION: &str =
+    "Show a line on the band when the Mac is too busy to keep up.";
+
+/// A collapsed entry: one line, 30·s pt (design ruling 262).
 fn messages_row_height() -> f32 {
-    44.0 * settings_text_scale()
+    30.0 * settings_text_scale()
 }
 
-/// One meta or detail line: 24·s pt.
+/// One meta or sentence line of an expanded entry: 22·s pt.
 fn messages_line_height() -> f32 {
-    24.0 * settings_text_scale()
+    22.0 * settings_text_scale()
 }
 
-/// The entries the chip admits, newest first (the projection's order).
+/// One technical-details line: the caption step's monospace, 18·s pt.
+fn messages_code_line_height() -> f32 {
+    18.0 * settings_text_scale()
+}
+
+/// A small secondary button (an entry's footer, Copy All, Open Log Folder):
+/// a pointer target, never a slab.
+fn messages_small_button_height() -> f32 {
+    28.0_f32.max(26.0 * settings_text_scale().min(1.6))
+}
+
+/// The gap between the items of a compact page's section.
+const MESSAGES_ROW_GAP: f32 = 6.0;
+
+/// The gap between an expanded entry's text and its buttons.
+const MESSAGES_FOOTER_GAP: f32 = 12.0;
+
+/// The list container's inner padding, top and bottom.
+const MESSAGES_LIST_PAD: f32 = 4.0;
+
+/// The entries the filters admit, newest first (the projection's order).
 fn messages_visible<'a>(
     messages: &'a MessagesState,
     filter: &MessagesFilter,
@@ -19850,306 +20518,29 @@ fn messages_visible<'a>(
         .collect()
 }
 
-/// The height of an expanded entry's action row: every authored button and
-/// Copy, side by side on the wider pages and stacked on a compact one.
-fn messages_actions_height(entry: &MessageView, compact: bool) -> f32 {
-    let buttons = entry.actions.len() + 1;
-    if compact {
-        buttons as f32 * scaled_control_height() + buttons.saturating_sub(1) as f32 * 8.0
-    } else {
-        scaled_control_height()
-    }
-}
-
-/// The expanded entry's meta line, wrapped to the page's measure: `crash ·
-/// error · 2026-09-21 10:22:07 UTC · folded after 2 min · ×2`.
-fn messages_meta_lines(entry: &MessageView, text_width: f32) -> Vec<String> {
-    // Plain words (design ruling 66): the tag's chip name and the severity in
-    // a person's words; the stamp says it is UTC (ruling 23). Copy keeps the
-    // wire's words.
-    let mut meta = format!(
-        "{} \u{00b7} {} \u{00b7} {} \u{00b7} {}",
-        crate::messages_host::tag_words(&entry.tag),
-        entry.severity_words(),
-        aterm_messages::words::stamp_words(entry.at_unix_ms),
-        entry.state_words()
-    );
-    if entry.repeats > 1 {
-        meta.push_str(&format!(" \u{00b7} \u{00d7}{}", entry.repeats));
-    }
-    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
-    wrapped_copy_lines(&meta, px, text_width)
-}
-
-/// Whether an entry's detail is a DIAGRAM: rows laid out by column, like a
-/// `toml` parse error's source row and the caret row under it (design ruling
-/// 36). Such a row opens on whitespace, which prose never does here — a
-/// reporter's lines are sentences, and a `notice post` line is trimmed on
-/// the wire — and the whitespace is what `diagnostic_lines` kept so the
-/// caret stays under the column it points at.
-fn messages_detail_is_diagram(entry: &MessageView) -> bool {
-    entry
-        .detail
-        .iter()
-        .any(|line| line.starts_with(char::is_whitespace))
-}
-
-/// The style an entry's detail lines paint in: the monospace face for a
-/// DIAGRAM ([`messages_detail_is_diagram`]), where a column must be a column,
-/// else the page's body face.
-fn messages_detail_style(entry: &MessageView) -> StyleRef {
-    if messages_detail_is_diagram(entry) {
-        StyleRef::Code
-    } else {
-        StyleRef::Primary
-    }
-}
-
-/// One diagram row CUT to the measure, never reflowed: a reflow re-breaks at
-/// spaces and trims, which moves a caret off its column; a cut keeps the
-/// row's leading whitespace and carries the overflow to a row of its own.
-/// Measured in the face the painter draws `StyleRef::Code` in, one grapheme
-/// at a time, so no piece is wider than the box and the painter elides none.
-fn cut_code_lines(line: &str, available_width: f32) -> Vec<String> {
-    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Code);
-    let advance = |grapheme: &str| {
-        if face == crate::widget::TextFace::Mono {
-            crate::tray_raster::measure_text(grapheme, px, crate::widget::TextWeight::Regular)
-        } else {
-            crate::tray_raster::ui_text_width_for(face, grapheme, px)
-        }
-    };
-    let available_width = available_width.max(48.0);
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut width = 0.0_f32;
-    for grapheme in line.graphemes() {
-        let step = advance(grapheme);
-        if !row.is_empty() && width + step > available_width {
-            rows.push(std::mem::take(&mut row));
-            width = 0.0;
-        }
-        row.push_str(grapheme);
-        width += step;
-    }
-    rows.push(row);
-    rows
-}
-
-/// The expanded entry's detail lines, each wrapped host-side to the page's
-/// measure at the size the painter draws them (the phone overflow audit's
-/// rule: copy is wrapped by its author, never ellipsized by the painter), at
-/// most `max_lines` — then `… (N more lines)` in the last slot, so the
-/// reader is told the copy ran out of room instead of finding it silently
-/// ending early. The whole record is one Copy away. A DIAGRAM's rows are
-/// cut in the monospace face instead ([`cut_code_lines`]).
-fn messages_detail_lines(entry: &MessageView, text_width: f32, max_lines: usize) -> Vec<String> {
-    let mut lines: Vec<String> = if messages_detail_is_diagram(entry) {
-        entry
-            .detail
-            .iter()
-            .flat_map(|line| cut_code_lines(line, text_width))
-            .collect()
-    } else {
-        let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-        entry
-            .detail
-            .iter()
-            .flat_map(|line| wrapped_copy_lines(line, px, text_width))
-            .collect()
-    };
-    let cap = max_lines.clamp(1, aterm_messages::DETAIL_LINES_CAP);
-    if lines.len() > cap {
-        let hidden = lines.len() - (cap - 1);
-        lines.truncate(cap - 1);
-        lines.push(format!("\u{2026} ({hidden} more lines)"));
-    }
-    lines
-}
-
-/// How many wrapped detail lines an expanded entry may show: on a compact
-/// page every line is an item of its own and pages by itself, so the log's
-/// cap; on the wider pages what fits `facts.capacity` after the head, the
-/// meta lines and the action row — at least one, at most the cap.
-fn messages_max_detail_lines(entry: &MessageView, facts: MessagesPageFacts) -> usize {
-    if facts.compact {
-        return aterm_messages::DETAIL_LINES_CAP;
-    }
-    let line_h = messages_line_height();
-    let meta = messages_meta_lines(entry, facts.text_width).len() as f32;
-    let fixed = messages_row_height()
-        + meta * line_h
-        + messages_actions_height(entry, facts.compact)
-        + 12.0;
-    let room = facts.capacity - fixed;
-    ((room / line_h).floor().max(1.0) as usize).min(aterm_messages::DETAIL_LINES_CAP)
-}
-
-/// The authored height of one row: collapsed, or expanded with its meta
-/// lines, its wrapped detail lines and its action row plus a 12 pt foot
-/// (design §4.3).
-fn messages_row_authored_height(
-    entry: &MessageView,
-    expanded: bool,
-    facts: MessagesPageFacts,
-) -> f32 {
-    if !expanded {
-        return messages_row_height();
-    }
-    let max_lines = messages_max_detail_lines(entry, facts);
-    let lines = messages_meta_lines(entry, facts.text_width).len()
-        + messages_detail_lines(entry, facts.text_width, max_lines).len();
-    messages_row_height()
-        + lines as f32 * messages_line_height()
-        + messages_actions_height(entry, facts.compact)
-        + 12.0
-}
-
-/// Every visible row's authored height on the wider pages, the selected one
-/// expanded — the list the range pager's page is packed from.
-fn messages_row_heights(
-    visible: &[&MessageView],
-    selected: Option<u64>,
-    facts: MessagesPageFacts,
-) -> Vec<f32> {
-    visible
-        .iter()
-        .map(|entry| messages_row_authored_height(entry, selected == Some(entry.id), facts))
-        .collect()
-}
-
-/// The rows a page seats from `first`: as many as fit `capacity` with `gap`
-/// between them, at least one, at most [`MESSAGES_ROWS_PER_PAGE_MAX`].
-/// Returns the end index.
-fn messages_fit_from(heights: &[f32], first: usize, capacity: f32, gap: f32) -> usize {
-    let mut used = 0.0;
-    let mut end = first;
-    while end < heights.len() && end - first < MESSAGES_ROWS_PER_PAGE_MAX {
-        let extra = heights[end] + if end > first { gap } else { 0.0 };
-        if end > first && used + extra > capacity {
-            break;
-        }
-        used += extra;
-        end += 1;
-    }
-    end
-}
-
-/// A compact page's sections over ITEMS — every chip row, the status line,
-/// the invitation, then the rows (`MessagesHeaderFacts::heights` followed by
-/// the row heights): each section seats as many items as fit `capacity`
-/// with [`MESSAGES_ROW_GAP`] between them, at least one, so nothing is
-/// unreachable and nothing is clipped — the `atomic_compact_sections`
-/// discipline, packed rather than one per page. An empty item list is one
-/// empty section.
-fn messages_sections(heights: &[f32], capacity: f32) -> Vec<std::ops::Range<usize>> {
-    let mut sections = Vec::new();
-    let mut start = 0;
-    loop {
-        let end = messages_fit_from(heights, start, capacity, MESSAGES_ROW_GAP);
-        sections.push(start..end);
-        if end >= heights.len() {
-            return sections;
-        }
-        start = end;
-    }
-}
-
-/// A compact page's head for one entry: two lines — the glyph and the
-/// title, then when and the tag — since four columns do not fit a phone at
-/// large type.
-fn messages_compact_head_height() -> f32 {
-    messages_row_height() + messages_line_height()
-}
-
-/// One entry's items on a compact page, as heights: its head, and — expanded
-/// — each meta line, each detail line, each button and Copy, every one an
-/// item that pages by itself (the `atomic_compact_sections` discipline), so
-/// an entry taller than a section is read across sections, never clipped.
-fn messages_compact_entry_heights(
-    entry: &MessageView,
-    expanded: bool,
-    facts: MessagesPageFacts,
-) -> Vec<f32> {
-    let mut out = vec![messages_compact_head_height()];
-    if expanded {
-        let line_h = messages_line_height();
-        let lines = messages_meta_lines(entry, facts.text_width).len()
-            + messages_detail_lines(
-                entry,
-                facts.text_width,
-                messages_max_detail_lines(entry, facts),
-            )
-            .len();
-        out.extend(std::iter::repeat_n(line_h, lines));
-        out.extend(std::iter::repeat_n(
-            scaled_control_height(),
-            entry.actions.len() + 1,
-        ));
-    }
-    out
-}
-
-/// The compact page's item heights — the header's, then every visible
-/// entry's ([`messages_compact_entry_heights`]) — and, per entry, the index
-/// of its head among them (the deep link pages to that item).
-fn messages_compact_items(
-    header: MessagesHeaderFacts,
-    visible: &[&MessageView],
-    selected: Option<u64>,
-    facts: MessagesPageFacts,
-) -> (Vec<f32>, Vec<usize>) {
-    let mut items = header.heights();
-    let mut heads = Vec::with_capacity(visible.len());
-    for entry in visible {
-        heads.push(items.len());
-        items.extend(messages_compact_entry_heights(
-            entry,
-            selected == Some(entry.id),
-            facts,
-        ));
-    }
-    (items, heads)
-}
-
 /// The page's subtitle: what the log is (design §10.11). Most messages are
 /// records that were never on the band, so the log is what aterm REPORTED, not
-/// only what it told you; the wide form points at Packages, whose updates keep
-/// their own page. The compact line fits the 286.5 pt phone page
-/// (`page_subtitles_fit_compact_and_minimum_medium_content_measure`).
-fn messages_page_subtitle(width: SettingsWidth) -> &'static str {
-    if width == SettingsWidth::Compact {
-        "Everything aterm reported, newest first."
-    } else {
-        "Everything aterm reported, newest first. Package updates are in Settings \u{25b8} Packages."
-    }
+/// only what it told you. One line at every width (it fits the 286.5 pt phone
+/// page, `page_subtitles_fit_compact_and_minimum_medium_content_measure`).
+fn messages_page_subtitle(_width: SettingsWidth) -> &'static str {
+    "Everything aterm reported, newest first."
 }
 
-/// The status line: `87 messages`, `12 of 87`, `No messages yet`, with the
-/// compact page's `· page 2 of 8`.
-fn messages_status_words(
-    total: usize,
-    shown: usize,
-    all: bool,
-    page: Option<(usize, usize)>,
-) -> String {
-    let mut words = if total == 0 {
-        "No messages yet".to_string()
-    } else if all {
+/// The count line's words: `42 messages`, or `12 of 42` under a filter. The
+/// log is one scrolling list (ruling 264): the count is the whole of what
+/// the filters admit, never a page.
+fn messages_status_words(total: usize, shown: usize, all: bool) -> String {
+    if all || total == 0 {
         format!("{total} message{}", if total == 1 { "" } else { "s" })
     } else {
         format!("{shown} of {total}")
-    };
-    if let Some((page, pages)) = page.filter(|(_, pages)| *pages > 1) {
-        words.push_str(&format!(" \u{00b7} page {} of {pages}", page + 1));
     }
-    words
 }
 
 /// A status-sized line whose WHOLE text is the semantic node's label and
 /// whose painted child is fitted to `width` (the pager's own pattern), so a
-/// narrow page at large type paints `40 messages · page 2 o…` rather than
-/// overflowing its box.
+/// narrow page at large type paints `12 of 4…` rather than overflowing its
+/// box.
 fn messages_fitted_status(key: &str, words: String, width: Length, fit_width: f32) -> UiNode {
     let visual = crate::native_ui::fit_native_status_label(&words, (fit_width - 4.0).max(24.0));
     UiNode::new(
@@ -20175,15 +20566,228 @@ fn messages_fitted_status(key: &str, words: String, width: Length, fit_width: f3
     ])
 }
 
-/// The status line's node.
-fn messages_status_node(words: String, width: f32) -> UiNode {
-    let mut node = messages_fitted_status("settings/messages/status", words, Length::Fill, width);
-    node.layout.height = Length::Fixed(messages_line_height());
-    node
+/// A small secondary button: `label` painted, `semantic` its name, measured
+/// to its label (never full-width, ruling 262).
+fn messages_small_button(key: &str, label: &str, semantic: &str, enabled: bool) -> (UiNode, f32) {
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let width =
+        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px) + 24.0;
+    let node = UiNode::new(
+        key.to_string(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(semantic).visual_label(label),
+                ActionId::new(key.to_string()),
+            )
+            .state(ControlState {
+                enabled,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Secondary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(messages_small_button_height())),
+    );
+    (node, width)
 }
 
-/// One filter chip: a `Navigation` button with a measured slot (so it paints
-/// as a toolbar chip, centred), `selected` while its filter is down.
+/// THE COUNT LINE (ruling 262): the count on the left, Copy All and Open Log
+/// Folder small on the right. An empty log has no count, and nothing to copy.
+fn messages_count_line(words: Option<String>, content_width: f32) -> (UiNode, f32) {
+    let empty = words.is_none();
+    let (copy, copy_w) = messages_small_button(
+        MESSAGES_COPY_ALL,
+        "Copy All",
+        "Copy the shown messages",
+        !empty,
+    );
+    let (folder, folder_w) = messages_small_button(
+        MESSAGES_OPEN_FOLDER,
+        "Open Log Folder",
+        "Open the log folder",
+        true,
+    );
+    let button_h = messages_small_button_height();
+    let (spx, sface) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let words_w = words.as_deref().map_or(0.0, |w| {
+        crate::tray_raster::ui_text_width_for(sface, w, spx) + 8.0
+    });
+    // The buttons beside the count where both fit; else under it, right-aligned.
+    let beside = words_w + copy_w + folder_w + 16.0 <= content_width;
+    let status_w = if beside {
+        (content_width - copy_w - folder_w - 16.0).max(24.0)
+    } else {
+        content_width
+    };
+    let status = match words {
+        Some(words) => {
+            messages_fitted_status("settings/messages/status", words, Length::Fill, status_w)
+        }
+        None => UiNode::new(
+            "settings/messages/status-spacer",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+    };
+    let row = |key: &str, children: Vec<UiNode>| {
+        UiNode::new(
+            key.to_string(),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::row()
+                .width(Length::Fill)
+                .height(Length::Fixed(button_h))
+                .gap(8.0),
+        )
+        .children(children)
+    };
+    if beside {
+        return (
+            row("settings/messages/header", vec![status, copy, folder]),
+            button_h,
+        );
+    }
+    let spacer = |key: &str| {
+        UiNode::new(
+            key.to_string(),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+    };
+    // Under the count: both buttons on one row where they fit, else one each.
+    let button_rows = if copy_w + folder_w + 8.0 <= content_width {
+        vec![row(
+            "settings/messages/report",
+            vec![spacer("settings/messages/report/spacer"), copy, folder],
+        )]
+    } else {
+        vec![
+            row(
+                "settings/messages/report",
+                vec![spacer("settings/messages/report/spacer"), copy],
+            ),
+            row(
+                "settings/messages/report/folder",
+                vec![spacer("settings/messages/report/folder-spacer"), folder],
+            ),
+        ]
+    };
+    let line_h = messages_line_height();
+    let mut status = status;
+    status.layout.height = Length::Fixed(line_h);
+    let height = line_h + button_rows.len() as f32 * (6.0 + button_h);
+    let mut children = vec![status];
+    children.extend(button_rows);
+    (
+        UiNode::new(
+            "settings/messages/header",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(height))
+                .gap(6.0),
+        )
+        .children(children),
+        height,
+    )
+}
+
+/// THE SEVERITY FILTER (ruling 262): `All · 42 | Problems · 23`, a segmented
+/// control whose counts are what a press would show under the tag that is
+/// down. Independent of the tag, and combined with it. "Problems" is the
+/// warnings and the errors together, and it is that one word everywhere — the
+/// painted label and the accessible name alike (ruling 264).
+fn messages_severity_segments(
+    messages: &MessagesState,
+    filter: &MessagesFilter,
+    content_width: f32,
+    height: f32,
+) -> (UiNode, f32) {
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let measure = |label: &str| {
+        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px) + 28.0
+    };
+    let tagged = |e: &&MessageView| {
+        filter
+            .tag
+            .as_ref()
+            .is_none_or(|t| messages_same_chip(t, &e.tag))
+    };
+    let all = messages.entries.iter().filter(tagged).count();
+    let alarms = messages
+        .entries
+        .iter()
+        .filter(tagged)
+        .filter(|e| e.alarm())
+        .count();
+    let segments = [
+        (
+            "settings/messages/filter/all",
+            format!("All \u{00b7} {all}"),
+            !filter.warn_only,
+        ),
+        (
+            "settings/messages/filter/warn",
+            format!("Problems \u{00b7} {alarms}"),
+            filter.warn_only,
+        ),
+    ];
+    let widths: Vec<f32> = segments.iter().map(|(_, l, _)| measure(l)).collect();
+    let total: f32 = widths.iter().sum::<f32>() + 8.0;
+    // One segmented row where both fit; stacked, each its own width, where not.
+    // "Problems" is short enough to need no short form (ruling 264).
+    let stacked = total > content_width;
+    let children = segments
+        .into_iter()
+        .zip(widths)
+        .map(|((key, label, selected), width)| {
+            let mut chip = messages_chip(key, &label, selected, width.min(content_width - 8.0));
+            if stacked {
+                chip.layout.height = Length::Fixed(height - 6.0);
+            }
+            chip
+        })
+        .collect();
+    let (layout, node_h) = if stacked {
+        (
+            Layout::column()
+                .width(Length::Fill)
+                .gap(2.0)
+                .padding(Insets::symmetric(4.0, 3.0)),
+            2.0 * (height - 6.0) + 2.0 + 6.0,
+        )
+    } else {
+        (
+            Layout::row()
+                .width(Length::Fixed(total))
+                .padding(Insets::symmetric(4.0, 3.0))
+                .gap(0.0),
+            height,
+        )
+    };
+    (
+        UiNode::new(
+            "settings/messages/severity",
+            UiContent::Group(GroupSpec {
+                label: Some("Severity".to_string()),
+                role: SemanticRole::Group,
+                style: StyleRef::Secondary,
+            }),
+        )
+        .layout(layout.height(Length::Fixed(node_h)))
+        .children(children),
+        node_h,
+    )
+}
+
+/// One chip: a `Navigation` button with a measured slot (so it paints as a
+/// toolbar chip, centred), `selected` while its filter is down.
 fn messages_chip(key: &str, label: &str, selected: bool, width: f32) -> UiNode {
     UiNode::new(
         key.to_string(),
@@ -20206,367 +20810,437 @@ fn messages_chip(key: &str, label: &str, selected: bool, width: f32) -> UiNode {
     )
 }
 
-/// The chips (design §4.3): All · Warnings & errors · one per tag PRESENT in
-/// [`crate::messages_host::TAG_ORDER`], each `tag · N`, packed left to right
-/// into as many rows as `content_width` needs — the layout vocabulary has no
-/// wrapping row, so the wrap is authored here from the labels' measured
-/// widths (in the semibold face a down chip wears, so no chip grows past
-/// its slot when pressed). Returns the rows and one row's height: the wider
-/// pages seat them in one group ([`messages_filters_group`]); a compact page
-/// seats each row as an item of its own, so a tall chip grid pages rather
-/// than clips.
-fn messages_filter_chip_rows(
+/// The TAG chips (ruling 262): `All tags`, then one chip per chip-name present
+/// — `fabric` and `harness` under Agents, `toolchain` and `packages` under ALab
+/// tools, a script's own tag verbatim — each with its count under the severity
+/// that is down, packed left to right into as few rows as `content_width`
+/// needs. A resting chip wears a faint outline so it reads as a button. Returns
+/// the rows and one row's height.
+fn messages_tag_chip_rows(
     messages: &MessagesState,
     filter: &MessagesFilter,
     content_width: f32,
-    compact: bool,
-) -> (Vec<UiNode>, f32) {
+    chip_h: f32,
+    first: Option<(UiNode, f32)>,
+) -> Vec<UiNode> {
     let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
     let measure = |label: &str| {
         crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px).max(
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px),
-        ) + 32.0
+        ) + 26.0
     };
-    let chip_h = if compact {
-        scaled_control_height()
-    } else {
-        32.0_f32.max(28.0 * settings_text_scale())
-    };
-    let mut chips: Vec<(String, String, bool)> = vec![
-        (
-            "settings/messages/filter/all".to_string(),
-            "All".to_string(),
-            filter.is_all(),
-        ),
-        (
-            "settings/messages/filter/warn".to_string(),
-            "Warnings & errors".to_string(),
-            filter.warn_only,
-        ),
-    ];
-    chips.extend(messages.tags.iter().map(|(tag, count)| {
+    // One chip per chip NAME, keyed by the first tag that shows under it.
+    let mut groups: Vec<(String, String, usize)> = Vec::new();
+    for (tag, _) in &messages.tags {
+        let words = crate::messages_host::tag_words(tag).into_owned();
+        let count = messages
+            .entries
+            .iter()
+            .filter(|e| messages_same_chip(tag, &e.tag) && (!filter.warn_only || e.alarm()))
+            .count();
+        if !groups.iter().any(|(_, w, _)| *w == words) {
+            groups.push((tag.clone(), words, count));
+        }
+    }
+    let mut chips: Vec<(String, String, bool)> = vec![(
+        MESSAGES_TAGS_ALL.to_string(),
+        "All tags".to_string(),
+        filter.tag.is_none(),
+    )];
+    chips.extend(groups.into_iter().map(|(tag, words, count)| {
         (
             format!("settings/messages/filter/tag/{tag}"),
-            format!("{} \u{00b7} {count}", crate::messages_host::tag_words(tag)),
-            filter.tag.as_deref() == Some(tag.as_str()),
+            format!("{words} \u{00b7} {count}"),
+            filter
+                .tag
+                .as_deref()
+                .is_some_and(|t| messages_same_chip(t, &tag)),
         )
     }));
-    let mut rows: Vec<Vec<UiNode>> = vec![Vec::new()];
-    let mut used = 0.0_f32;
+    // The severity segments lead the first row where the page seats them
+    // there (the wider pages: filters in at most two rows, ruling 262).
+    let (mut rows, mut used): (Vec<Vec<UiNode>>, f32) = match first {
+        Some((node, width)) => (vec![vec![node]], width + 6.0),
+        None => (vec![Vec::new()], 0.0),
+    };
     for (key, label, selected) in chips {
         let width = measure(&label).min(content_width.max(48.0));
-        let leading = if rows.last().is_some_and(Vec::is_empty) {
-            0.0
-        } else {
-            8.0
-        };
-        if used + leading + width > content_width && !rows.last().is_some_and(Vec::is_empty) {
+        if used + 6.0 + width > content_width && !rows.last().is_some_and(Vec::is_empty) {
             rows.push(Vec::new());
             used = 0.0;
         }
-        used += if used > 0.0 { 8.0 } else { 0.0 } + width;
+        used += if used > 0.0 { 6.0 } else { 0.0 } + width;
         rows.last_mut()
             .expect("a row")
-            .push(messages_chip(&key, &label, selected, width));
+            .push(messages_tag_chip(&key, &label, selected, width));
     }
-    let rows = rows
-        .into_iter()
+    rows.into_iter()
         .enumerate()
         .map(|(index, chips)| {
             UiNode::new(
                 format!("settings/messages/filters/row/{index}"),
-                UiContent::Group(GroupSpec::new("Message filters")),
+                UiContent::Group(GroupSpec::new("Tags")),
             )
             .layout(
                 Layout::row()
                     .width(Length::Fill)
-                    .height(Length::Fixed(chip_h))
-                    .gap(8.0),
+                    .height(Length::Fixed(chip_h + 6.0))
+                    .padding(Insets {
+                        top: 3.0,
+                        right: 0.0,
+                        bottom: 3.0,
+                        left: 0.0,
+                    })
+                    .gap(6.0),
             )
             .children(chips)
         })
-        .collect();
-    (rows, chip_h)
+        .collect()
 }
 
-/// The chip rows as one group, for the pages that seat them above the rows.
-fn messages_filters_group(rows: Vec<UiNode>, chip_h: f32) -> (UiNode, f32) {
-    let row_count = rows.len();
-    let height = row_count as f32 * chip_h + row_count.saturating_sub(1) as f32 * MESSAGES_ROW_GAP;
-    let group = UiNode::new(
-        "settings/messages/filters",
-        UiContent::Group(GroupSpec::new("Message filters")),
+/// A tag chip: a Secondary button while it rests (the faint outline that says
+/// it is a button, ruling 262), the selected navigation chip while down.
+fn messages_tag_chip(key: &str, label: &str, selected: bool, width: f32) -> UiNode {
+    if selected {
+        return messages_chip(key, label, true, width);
+    }
+    UiNode::new(
+        key.to_string(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(label).visual_label(label),
+                ActionId::new(key.to_string()),
+            )
+            .style(StyleRef::Quiet),
+        ),
     )
     .layout(
-        Layout::column()
-            .width(Length::Fill)
-            .height(Length::Fixed(height))
-            .gap(MESSAGES_ROW_GAP),
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fill),
     )
-    .children(rows);
-    (group, height)
 }
 
-/// One entry's row on the wider pages (design §4.3): the severity glyph,
-/// when, the tag and the title — a Plain button, the SELECT control,
-/// `selected` while expanded — and, expanded, the meta line, the wrapped
-/// detail lines and the action row beneath that head. Every leaf keeps its
-/// designed key whether or not the row is expanded
-/// (`settings/messages/row/<id>/title` and the rest); the expanded row is a
-/// column whose first child is the head.
-fn messages_row_node(
-    entry: &MessageView,
-    expanded: bool,
-    facts: MessagesPageFacts,
-    content_width: f32,
-    now_unix_ms: u64,
-) -> UiNode {
-    let scale = settings_text_scale();
-    let row_h = messages_row_height();
-    let line_h = messages_line_height();
-    let key = format!("settings/messages/row/{}", entry.id);
-    let (quiet_px, quiet_face) =
-        crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
-    let (code_px, code_face) =
-        crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Code);
-    let when = aterm_messages::words::relative_words(now_unix_ms, entry.at_unix_ms);
-    // One fixed column for every row's `when`, so the titles align: the
-    // widest form the words take, measured.
-    let when_w = ["yesterday", "2026-09-22", "59 min ago", when.as_str()]
-        .into_iter()
-        .map(|sample| crate::tray_raster::ui_text_width_for(quiet_face, sample, quiet_px))
-        .fold(0.0_f32, f32::max)
-        + 4.0;
-    // The tag is code: measured in the face the painter draws it in.
-    let tag_w = if code_face == crate::widget::TextFace::Mono {
-        crate::tray_raster::measure_text(&entry.tag, code_px, crate::widget::TextWeight::Regular)
-    } else {
-        crate::tray_raster::ui_text_width_for(code_face, &entry.tag, code_px)
-    } + 8.0;
-    let glyph_w = 22.0 * scale;
-    let gap = 6.0;
-    let title_w = (content_width - glyph_w - when_w - tag_w - 3.0 * gap).max(48.0);
-    let text = |key: String, text: String, style: StyleRef, width: Length| {
-        UiNode::new(
-            key,
-            UiContent::Text(TextSpec {
-                text,
-                role: SemanticRole::Text,
-                style,
-            }),
-        )
-        .layout(Layout::default().width(width).height(Length::Fill))
-    };
-    let head_children = vec![
-        text(
-            format!("{key}/severity"),
-            entry.glyph.to_string(),
-            messages_severity_style(entry.severity),
-            Length::Fixed(glyph_w),
-        ),
-        text(
-            format!("{key}/when"),
-            when.clone(),
-            StyleRef::Quiet,
-            Length::Fixed(when_w),
-        ),
-        text(
-            format!("{key}/tag"),
-            entry.tag.clone(),
-            StyleRef::Code,
-            Length::Fixed(tag_w),
-        ),
-        messages_title_button(entry, expanded, &when, title_w),
-    ];
-    let head_layout = Layout::row().width(Length::Fill).gap(gap);
-    if !expanded {
-        return UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
-            .layout(head_layout.height(Length::Fixed(row_h)))
-            .children(head_children);
-    }
-    let max_lines = messages_max_detail_lines(entry, facts);
-    let mut children = vec![
-        UiNode::new(
-            format!("{key}/head"),
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(head_layout.height(Length::Fixed(row_h)))
-        .children(head_children),
-    ];
-    let meta_lines = messages_meta_lines(entry, facts.text_width);
-    let meta_count = meta_lines.len();
-    children.extend(meta_lines.into_iter().enumerate().map(|(index, words)| {
-        messages_line_node(format!("{key}/meta/{index}"), words, StyleRef::Quiet)
-    }));
-    let detail_lines = messages_detail_lines(entry, facts.text_width, max_lines);
-    let detail_count = detail_lines.len();
-    let detail_style = messages_detail_style(entry);
-    children.extend(detail_lines.into_iter().enumerate().map(|(index, words)| {
-        messages_line_node(format!("{key}/detail/{index}"), words, detail_style)
-    }));
-    let mut actions: Vec<UiNode> = entry
-        .actions
-        .iter()
-        .map(|action| {
-            messages_action_button(
-                format!("{key}/action/{}", action.index),
-                action.label,
-                action.index == 0,
-                action.still_actionable,
-                false,
-            )
-        })
-        .collect();
-    actions.push(messages_action_button(
-        format!("{key}/copy"),
-        "Copy",
-        false,
-        true,
-        false,
-    ));
-    let actions_h = messages_actions_height(entry, false);
-    children.push(
-        UiNode::new(
-            format!("{key}/actions"),
-            UiContent::Group(GroupSpec::new("Message actions")),
-        )
-        .layout(Layout::row().height(Length::Fixed(actions_h)).gap(8.0))
-        .children(actions),
+/// The compact page's TAG POP-UP (ruling 262): one `Tag: All ▾` control; open,
+/// the tag chips are listed under it and a press on one closes it.
+fn messages_tag_popup(filter: &MessagesFilter, open: bool, width: f32, height: f32) -> UiNode {
+    let current = filter.tag.as_deref().map_or_else(
+        || "All".to_string(),
+        |t| crate::messages_host::tag_words(t).into_owned(),
     );
-    let height = row_h + (meta_count + detail_count) as f32 * line_h + actions_h + 12.0;
-    UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
+    let label = format!("Tag: {current}");
+    UiNode::new(
+        MESSAGES_TAG_MENU,
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(format!("Filter by tag: {current}"))
+                    .visual_label(label)
+                    .trailing_icon(ButtonIcon::ChevronDown),
+                ActionId::new(MESSAGES_TAG_MENU),
+            )
+            .state(ControlState {
+                expanded: Some(open),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Secondary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height)),
+    )
+}
+
+/// The "Explain heavy load" SETTINGS ROW (design ruling 262, the strain row's
+/// switch, ruling 212): the label on the left and a plain switch on the same
+/// line on the right — no boxed `On` — one caption line under it, and a
+/// hairline setting it apart from the log. `None` when the field is absent.
+fn messages_explain_load_block(
+    state: &SettingsViewState,
+    text_width: f32,
+) -> Option<(UiNode, f32)> {
+    let key = prefs::EDIT_EXPLAIN_HEAVY_LOAD;
+    let field = state.field_by_key(key)?;
+    let value = SettingsState::display_value(field)
+        .parse::<bool>()
+        .unwrap_or(false);
+    let pending = state.config_key_pending(key);
+    let focused = state
+        .common
+        .last_focus
+        .as_ref()
+        .is_some_and(|focus| focus.as_str() == format!("settings/control/{key}"));
+    let semantic_label = prefs::application_timing(key).map_or_else(
+        || field.label.to_string(),
+        |timing| format!("{} · {timing}", field.label),
+    );
+    let description = format!("{MESSAGES_EXPLAIN_LOAD_CAPTION} ({key})");
+    let scale = settings_text_scale();
+    let row_h = 32.0_f32.max(30.0 * scale);
+    let label = UiNode::new(
+        format!("settings/label/{key}"),
+        UiContent::Text(TextSpec {
+            text: field.label.to_string(),
+            role: SemanticRole::Text,
+            style: StyleRef::Primary,
+        }),
+    )
+    .layout(Layout::default().width(Length::Fill).height(Length::Fill));
+    let control = UiNode::new(
+        format!("settings/control/{key}"),
+        UiContent::Switch(
+            Control::new(
+                SwitchSpec {
+                    label: semantic_label,
+                    description: Some(description),
+                },
+                ActionId::new(format!("settings/set/{key}")),
+            )
+            .value(SemanticValue::Bool(value))
+            .state(ControlState {
+                enabled: !pending,
+                focused,
+                busy: pending,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Quiet),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(60.0))
+            .height(Length::Fill),
+    );
+    // The label and the switch on one line where the label fits beside it;
+    // else the label on its own line and the switch under it, on the right.
+    let (lpx, lface) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let fits = crate::tray_raster::ui_text_width_for(lface, field.label, lpx) + 72.0 <= text_width;
+    let (line, row_h) = if fits {
+        (
+            UiNode::new(
+                format!("{MESSAGES_EXPLAIN_LOAD}/line"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(row_h))
+                    .gap(12.0),
+            )
+            .children(vec![label, control]),
+            row_h,
+        )
+    } else {
+        let mut label = label;
+        label.layout.height = Length::Fixed(row_h);
+        (
+            UiNode::new(
+                format!("{MESSAGES_EXPLAIN_LOAD}/line"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::column()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(2.0 * row_h))
+                    .gap(0.0),
+            )
+            .children(vec![
+                label,
+                UiNode::new(
+                    format!("{MESSAGES_EXPLAIN_LOAD}/controls"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(
+                    Layout::row()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(row_h)),
+                )
+                .children(vec![
+                    messages_spacer(&format!("{MESSAGES_EXPLAIN_LOAD}/control-spacer"), row_h),
+                    control,
+                ]),
+            ]),
+            2.0 * row_h,
+        )
+    };
+    let (caption, caption_h) = wrapped_copy_node(
+        &format!("{MESSAGES_EXPLAIN_LOAD}/caption"),
+        MESSAGES_EXPLAIN_LOAD_CAPTION,
+        SemanticRole::Text,
+        StyleRef::Quiet,
+        text_width,
+        20.0_f32.max(18.0 * scale),
+        Some(2),
+    );
+    let rule = messages_rule(&format!("{MESSAGES_EXPLAIN_LOAD}/rule"));
+    let height = row_h + 2.0 + caption_h + 8.0 + 1.0;
+    Some((
+        UiNode::new(
+            MESSAGES_EXPLAIN_LOAD,
+            UiContent::Group(GroupSpec::new(field.label)),
+        )
         .layout(
             Layout::column()
                 .width(Length::Fill)
                 .height(Length::Fixed(height))
-                .padding(Insets {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 12.0,
-                    left: 0.0,
-                })
-                .clipped(),
+                .gap(0.0),
         )
-        .children(children)
+        .children(vec![
+            line,
+            messages_spacer(&format!("{MESSAGES_EXPLAIN_LOAD}/gap"), 2.0),
+            caption,
+            messages_spacer(&format!("{MESSAGES_EXPLAIN_LOAD}/pad"), 8.0),
+            rule,
+        ]),
+        height,
+    ))
 }
 
-/// One line of an expanded entry, as a page item.
-fn messages_line_node(key: String, text: String, style: StyleRef) -> UiNode {
+/// A fixed-height blank.
+fn messages_spacer(key: &str, height: f32) -> UiNode {
     UiNode::new(
-        key,
-        UiContent::Text(TextSpec {
-            text,
-            role: SemanticRole::Text,
-            style,
+        key.to_string(),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(height)),
+    )
+}
+
+/// A 1 pt hairline ([`crate::native_ui::MESSAGES_RULE_AUDIT`]): decoration only.
+fn messages_rule(key: &str) -> UiNode {
+    UiNode::new(
+        key.to_string(),
+        UiContent::Custom(crate::native_ui::AuditedCustomNode {
+            audit_id: crate::native_ui::MESSAGES_RULE_AUDIT,
+            role: SemanticRole::Group,
+            label: String::new(),
+            value: None,
+            action: None,
+            focusable: false,
         }),
     )
     .layout(
         Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(messages_line_height())),
+            .height(Length::Fixed(1.0)),
     )
+    .paint_only()
 }
 
-/// One of an expanded entry's buttons: the authored intent at `k`
-/// (`StyleRef::Primary` for the first), enabled while the projection says
-/// it can still be pressed, or Copy. Fill-wide and a control tall on a
-/// compact page; measured to its label beside its siblings on the others.
-fn messages_action_button(
-    key: String,
-    label: &str,
-    primary: bool,
-    enabled: bool,
-    compact: bool,
-) -> UiNode {
-    let button_px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
-    let width = if compact {
-        Length::Fill
-    } else {
-        Length::Fixed(
-            (crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, button_px)
-                + 32.0)
-                .max(96.0),
-        )
-    };
-    UiNode::new(
-        key.clone(),
-        UiContent::Button(
-            Control::new(ButtonSpec::new(label), ActionId::new(key))
-                .state(ControlState {
-                    enabled,
-                    ..ControlState::default()
-                })
-                .style(if primary {
-                    StyleRef::Primary
-                } else {
-                    StyleRef::Secondary
-                }),
-        ),
-    )
-    .layout(Layout::default().width(width).height(if compact {
-        Length::Fixed(scaled_control_height())
-    } else {
-        Length::Fill
-    }))
+/// THE LEAD COLUMN (ruling 262): the severity mark, when, and the tag's chip
+/// name — one fixed width for every row of the page, so every title begins at
+/// the same x. `when` is the widest the relative words take (measured); `tag`
+/// the longest chip name the log holds, capped at about twelve ems and
+/// ellipsized past it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MessagesLead {
+    mark: f32,
+    when: f32,
+    tag: f32,
+    gap: f32,
 }
 
-/// The severity glyph's ink: Success / Danger / Primary (warn) / Quiet.
-fn messages_severity_style(severity: &str) -> StyleRef {
-    match severity {
-        "success" => StyleRef::Success,
-        "error" => StyleRef::Danger,
-        "warn" => StyleRef::Primary,
-        _ => StyleRef::Quiet,
+impl MessagesLead {
+    fn measure(
+        visible: &[&MessageView],
+        now_unix_ms: u64,
+        compact: bool,
+        content_width: f32,
+    ) -> Self {
+        let scale = settings_text_scale();
+        let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+        let width = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px);
+        // Each distinct word measured once: a full ring (512 entries, ruling
+        // 264) says a few dozen times and a handful of tags.
+        let whens: std::collections::BTreeSet<String> = visible
+            .iter()
+            .map(|e| aterm_messages::words::relative_words(now_unix_ms, e.at_unix_ms))
+            .collect();
+        let when = ["yesterday", "2026-09-22", "59 min ago", "23 h ago"]
+            .into_iter()
+            .chain(whens.iter().map(String::as_str))
+            .map(width)
+            .fold(0.0_f32, f32::max)
+            + 4.0;
+        let cap = if compact { 7.0 } else { 12.0 } * px;
+        let tags: std::collections::BTreeSet<&str> =
+            visible.iter().map(|e| e.tag.as_str()).collect();
+        let tag = tags
+            .into_iter()
+            .map(|t| width(&crate::messages_host::tag_words(t)))
+            .fold(0.0_f32, f32::max)
+            .min(cap)
+            + 4.0;
+        let mut lead = Self {
+            mark: 28.0 * scale,
+            when,
+            tag,
+            gap: 8.0,
+        };
+        // A title keeps at least two fifths of the row: where the column would
+        // take more, the tag column goes first (the row's name says it), then
+        // the time column narrows to its own words.
+        if lead.title_x() > content_width * 0.6 {
+            lead.tag = 0.0;
+        }
+        lead
+    }
+
+    /// Where every title begins, from the row's left edge.
+    fn title_x(self) -> f32 {
+        let columns = if self.tag > 0.0 { 3.0 } else { 2.0 };
+        self.mark + self.when + self.tag + columns * self.gap
     }
 }
 
-/// The title as its SELECT control: a Plain button carrying the whole title
-/// (a screen reader says it, with when · tag · severity as its description),
-/// fitted visually to `width`, `selected` while the entry is expanded.
-fn messages_title_button(entry: &MessageView, expanded: bool, when: &str, width: f32) -> UiNode {
-    let key = format!("settings/messages/row/{}/title", entry.id);
-    UiNode::new(
-        key.clone(),
+/// An entry's name for a screen reader beyond its title (ruling 262): its
+/// severity, its chip name and when, in words — `Warning, ALab tools, 6 hours
+/// ago` — never the wire's `warn · toolchain`.
+fn messages_description(entry: &MessageView, now_unix_ms: u64) -> String {
+    format!(
+        "{}, {}, {}",
+        entry.severity_words(),
+        crate::messages_host::tag_words(&entry.tag),
+        aterm_messages::words::spoken_relative_words(now_unix_ms, entry.at_unix_ms)
+    )
+}
+
+/// One entry's ONE LINE (ruling 262): a flush DISCLOSURE control the whole
+/// row wide — its name the title, its description the plain words, expanded
+/// or collapsed — under the painted lead column and title. Hover, press and
+/// open paint a quiet wash; the chevron says which way it opens.
+fn messages_head_node(
+    entry: &MessageView,
+    expanded: bool,
+    lead: MessagesLead,
+    content_width: f32,
+    now_unix_ms: u64,
+) -> UiNode {
+    let key = format!("settings/messages/row/{}", entry.id);
+    let row_h = messages_row_height();
+    let title_key = format!("{key}/title");
+    let button = UiNode::new(
+        title_key.clone(),
         UiContent::Button(
             Control::new(
                 ButtonSpec {
-                    description: Some(format!(
-                        "{when} \u{00b7} {} \u{00b7} {}",
-                        entry.tag, entry.severity
-                    )),
-                    ..ButtonSpec::new(entry.title.clone()).visual_label(
-                        crate::native_ui::fit_native_button_label(
-                            &entry.title,
-                            (width - 20.0).max(24.0),
-                        ),
-                    )
+                    description: Some(messages_description(entry, now_unix_ms)),
+                    ..ButtonSpec::new(entry.title.clone()).visual_label(String::new())
                 },
-                ActionId::new(key),
+                ActionId::new(title_key),
             )
             .state(ControlState {
-                selected: expanded,
+                expanded: Some(expanded),
                 ..ControlState::default()
             })
             .style(StyleRef::Plain),
         ),
     )
-    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-}
-
-/// A compact page's head for one entry ([`messages_compact_head_height`]):
-/// the glyph and the title on one line, when and the tag beneath — the
-/// same leaf keys as the wider pages' single-line head.
-fn messages_compact_head_node(
-    entry: &MessageView,
-    expanded: bool,
-    content_width: f32,
-    now_unix_ms: u64,
-) -> UiNode {
-    let scale = settings_text_scale();
-    let key = format!("settings/messages/row/{}", entry.id);
-    let when = aterm_messages::words::relative_words(now_unix_ms, entry.at_unix_ms);
-    let glyph_w = 22.0 * scale;
-    let gap = 6.0;
+    .layout(Layout::default().width(Length::Fill).height(Length::Fill));
     let text = |key: String, text: String, style: StyleRef, width: Length| {
         UiNode::new(
             key,
@@ -20577,454 +21251,1103 @@ fn messages_compact_head_node(
             }),
         )
         .layout(Layout::default().width(width).height(Length::Fill))
+        .paint_only()
     };
-    let title_line = UiNode::new(
+    let (quiet_px, quiet_face) =
+        crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    let fit = |s: &str, w: f32| {
+        let s = s.to_string();
+        if crate::tray_raster::ui_text_width_for(quiet_face, &s, quiet_px) <= w - 2.0 {
+            s
+        } else {
+            crate::native_ui::fit_native_text_label(&s, (w - 2.0).max(8.0))
+        }
+    };
+    let title_w = (content_width - lead.title_x() - 36.0).max(24.0);
+    let mark = UiNode::new(
+        format!("{key}/severity"),
+        UiContent::Custom(crate::native_ui::AuditedCustomNode {
+            audit_id: crate::native_ui::MESSAGES_SEVERITY_AUDIT,
+            role: SemanticRole::Group,
+            label: String::new(),
+            // `severity:glyph` — the icon is the row's own glyph's, as the
+            // band draws it; the colour and the rail are the severity's.
+            value: Some(format!("{}:{}", entry.severity, entry.glyph)),
+            action: None,
+            focusable: false,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(lead.mark))
+            .height(Length::Fill),
+    )
+    .paint_only();
+    let visual = UiNode::new(
+        format!("{key}/lead"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::row()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .gap(lead.gap),
+    )
+    .paint_only()
+    .children({
+        let mut children = vec![
+            mark,
+            text(
+                format!("{key}/when"),
+                aterm_messages::words::relative_words(now_unix_ms, entry.at_unix_ms),
+                StyleRef::Quiet,
+                Length::Fixed(lead.when),
+            ),
+        ];
+        if lead.tag > 0.0 {
+            children.push(text(
+                format!("{key}/tag"),
+                fit(&crate::messages_host::tag_words(&entry.tag), lead.tag),
+                StyleRef::Quiet,
+                Length::Fixed(lead.tag),
+            ));
+        }
+        children.push(text(
+            format!("{key}/label"),
+            crate::native_ui::fit_native_text_label(&entry.title, title_w),
+            StyleRef::Primary,
+            Length::Fixed(title_w),
+        ));
+        children
+    });
+    UiNode::new(
         format!("{key}/head"),
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
     )
     .layout(
-        Layout::row()
+        Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(messages_row_height()))
-            .gap(gap),
+            .height(Length::Fixed(row_h)),
     )
-    .children(vec![
-        text(
-            format!("{key}/severity"),
-            entry.glyph.to_string(),
-            messages_severity_style(entry.severity),
-            Length::Fixed(glyph_w),
-        ),
-        messages_title_button(entry, expanded, &when, content_width - glyph_w - gap),
-    ]);
-    // When and the tag, status-sized, each fitted to its column so a phone
-    // at large type elides rather than overflows: when takes its measure up
-    // to half the line, the tag the rest.
-    let (status_px, status_face) =
-        crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
-    let when_w = (crate::tray_raster::ui_text_width_for(status_face, &when, status_px) + 8.0)
-        .min((content_width * 0.5).max(24.0));
-    let tag_w = (content_width - when_w - gap).max(24.0);
-    let stamp_line = UiNode::new(
-        format!("{key}/stamp"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::row()
-            .width(Length::Fill)
-            .height(Length::Fixed(messages_line_height()))
-            .gap(gap),
-    )
-    .children(vec![
-        messages_fitted_status(&format!("{key}/when"), when, Length::Fixed(when_w), when_w),
-        messages_fitted_status(
-            &format!("{key}/tag"),
-            entry.tag.clone(),
-            Length::Fill,
-            tag_w,
-        ),
-    ]);
-    UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
+    .children(vec![button, visual])
+}
+
+/// The label an entry's button carries on the page: a destination reads as
+/// where it goes (`Open Packages`, ruling 262); a verb stays itself.
+fn messages_button_label(label: &str) -> String {
+    match label {
+        "Packages" | "Software Update" | "Manual" | "Appearance" | "Messages" | "Settings" => {
+            format!("Open {label}")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// An expanded entry's body, laid out (ruling 262): the meta line (the local
+/// time, and the state where it says something), the plain sentence — the
+/// cause and the next step, `detail[0]` — the buttons in a footer, and the
+/// technical details in small monospace last.
+#[derive(Clone, Debug, PartialEq)]
+struct MessagesBody {
+    meta: Vec<String>,
+    sentence: Vec<String>,
+    technical: Vec<String>,
+    /// The footer's buttons, row by row (one row where they fit).
+    footer: Vec<Vec<MessagesButton>>,
+}
+
+/// One button of an expanded entry's footer.
+#[derive(Clone, Debug, PartialEq)]
+struct MessagesButton {
+    key: String,
+    label: String,
+    primary: bool,
+    enabled: bool,
+    width: f32,
+}
+
+impl MessagesBody {
+    /// The body of `entry` at `text_width`, its technical details bounded to
+    /// `room` points (at least one line; `… (N more lines)` where cut).
+    fn of(entry: &MessageView, text_width: f32, utc_offset_s: i64, now_unix_ms: u64) -> Self {
+        let (qpx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+        let (ppx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+        let mut meta =
+            aterm_messages::words::local_words(now_unix_ms, entry.at_unix_ms, utc_offset_s);
+        let state = entry.state_words();
+        meta.push_str(" \u{00b7} ");
+        meta.push_str(&state);
+        if entry.repeats > 1 {
+            meta.push_str(&format!(" \u{00b7} \u{00d7}{}", entry.repeats));
+        }
+        // A diagram (a caret under a column) is technical whole; else the first
+        // line is the sentence and the rest the details. The `shown for` line a
+        // record carries is the meta line's already.
+        let diagram = entry
+            .detail
+            .iter()
+            .any(|l| l.starts_with(char::is_whitespace));
+        let shown = entry.shown_line();
+        let mut lines = entry
+            .detail
+            .iter()
+            .map(String::as_str)
+            .filter(|l| Some(*l) != shown);
+        let sentence = if diagram {
+            Vec::new()
+        } else {
+            lines
+                .next()
+                .map(|first| {
+                    let mut wrapped = wrapped_copy_lines(first, ppx, text_width);
+                    if wrapped.len() > 3 {
+                        wrapped.truncate(3);
+                        if let Some(last) = wrapped.pop() {
+                            wrapped.push(elide_wrapped_copy_tail(
+                                &last,
+                                ppx,
+                                crate::widget::TextFace::Ui,
+                                text_width,
+                            ));
+                        }
+                    }
+                    wrapped
+                })
+                .unwrap_or_default()
+        };
+        // A diagram's rows are CUT (a column stays a column); a prose line in
+        // the monospace face wraps at its spaces.
+        let technical = lines
+            .flat_map(|line| {
+                if diagram {
+                    messages_cut_code(line, text_width)
+                } else {
+                    messages_wrap_code(line, text_width)
+                }
+            })
+            .collect();
+        // The buttons, packed right to left into as few rows as the measure
+        // needs — never full-width.
+        let key = format!("settings/messages/row/{}", entry.id);
+        let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+        let measure = |label: &str| {
+            crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px) + 24.0
+        };
+        // The FIRST button offered is the Primary (ruling 265): an intent
+        // whose moment passed is not offered at all, so the next one leads.
+        let mut buttons: Vec<MessagesButton> = entry
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(k, action)| {
+                let label = messages_button_label(action.label);
+                MessagesButton {
+                    key: format!("{key}/action/{}", action.index),
+                    width: measure(&label).min(text_width),
+                    label,
+                    primary: k == 0,
+                    enabled: action.still_actionable,
+                }
+            })
+            .collect();
+        buttons.push(MessagesButton {
+            key: format!("{key}/copy"),
+            label: "Copy".to_string(),
+            primary: false,
+            enabled: true,
+            width: measure("Copy").min(text_width),
+        });
+        let mut footer: Vec<Vec<MessagesButton>> = vec![Vec::new()];
+        let mut used = 0.0_f32;
+        for button in buttons {
+            if used + 8.0 + button.width > text_width && !footer.last().is_some_and(Vec::is_empty) {
+                footer.push(Vec::new());
+                used = 0.0;
+            }
+            used += if used > 0.0 { 8.0 } else { 0.0 } + button.width;
+            footer.last_mut().expect("a row").push(button);
+        }
+        Self {
+            meta: wrapped_copy_lines(&meta, qpx, text_width),
+            sentence,
+            technical,
+            footer,
+        }
+    }
+
+    /// The technical lines bounded to `lines` (at least one): the last kept
+    /// line says how many more there are. Copy keeps them all.
+    fn bound(&mut self, lines: usize) {
+        let cap = lines.max(1);
+        if self.technical.len() > cap {
+            let hidden = self.technical.len() - (cap - 1);
+            self.technical.truncate(cap - 1);
+            self.technical
+                .push(format!("\u{2026} ({hidden} more lines)"));
+        }
+    }
+
+    /// The body's height below the head with `actions` buttons.
+    fn height(&self) -> f32 {
+        let line = messages_line_height();
+        let tech = if self.technical.is_empty() {
+            0.0
+        } else {
+            8.0 + line + self.technical.len() as f32 * messages_code_line_height()
+        };
+        let rows = self.footer.len().max(1) as f32;
+        (self.meta.len() + self.sentence.len()) as f32 * line
+            + MESSAGES_FOOTER_GAP
+            + rows * messages_small_button_height()
+            + (rows - 1.0) * 6.0
+            + tech
+            + 10.0
+    }
+
+    /// Fit the body into `avail` points, giving up what matters least first:
+    /// technical lines (to one, then the block — Copy keeps every line), then
+    /// sentence lines to one, then meta lines to one. The footer stays.
+    fn fit(&mut self, avail: f32) {
+        let code_h = messages_code_line_height();
+        if self.height() > avail && !self.technical.is_empty() {
+            let over = self.height() - avail;
+            let drop = (over / code_h).ceil() as usize;
+            if self.technical.len() > drop {
+                self.bound(self.technical.len() - drop);
+            } else {
+                self.technical.clear();
+            }
+        }
+        while self.height() > avail && self.sentence.len() > 1 {
+            self.sentence.pop();
+        }
+        while self.height() > avail && self.meta.len() > 1 {
+            self.meta.pop();
+        }
+    }
+}
+
+/// One technical line CUT to the measure in the monospace face it paints in
+/// (a column stays a column: never reflowed), one grapheme at a time.
+fn messages_cut_code(line: &str, available_width: f32) -> Vec<String> {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Code);
+    let advance = |grapheme: &str| {
+        if face == crate::widget::TextFace::Mono {
+            crate::tray_raster::measure_text(grapheme, px, crate::widget::TextWeight::Regular)
+        } else {
+            crate::tray_raster::ui_text_width_for(face, grapheme, px)
+        }
+    };
+    let available_width = available_width.max(48.0);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut width = 0.0_f32;
+    for grapheme in line.graphemes() {
+        let step = advance(grapheme);
+        if !row.is_empty() && width + step > available_width {
+            rows.push(std::mem::take(&mut row));
+            width = 0.0;
+        }
+        row.push_str(grapheme);
+        width += step;
+    }
+    rows.push(row);
+    rows
+}
+
+/// One technical line WRAPPED at its spaces to the measure in the monospace
+/// face it paints in; a word longer than the measure is cut.
+fn messages_wrap_code(line: &str, available_width: f32) -> Vec<String> {
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Code);
+    let width =
+        |s: &str| crate::tray_raster::measure_text(s, px, crate::widget::TextWeight::Regular);
+    let available_width = available_width.max(48.0);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in line.split(' ') {
+        let candidate = if row.is_empty() {
+            word.to_string()
+        } else {
+            format!("{row} {word}")
+        };
+        if width(&candidate) <= available_width {
+            row = candidate;
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        if width(word) <= available_width {
+            row = word.to_string();
+        } else {
+            let mut pieces = messages_cut_code(word, available_width);
+            row = pieces.pop().unwrap_or_default();
+            rows.extend(pieces);
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// An expanded entry's body node, inside the log's card, indented to `indent`.
+fn messages_body_node(entry: &MessageView, body: &MessagesBody, indent: f32) -> UiNode {
+    let key = format!("settings/messages/row/{}", entry.id);
+    let line_h = messages_line_height();
+    let line = |key: String, text: String, role: SemanticRole, style: StyleRef, height: f32| {
+        UiNode::new(key, UiContent::Text(TextSpec { text, role, style })).layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(height)),
+        )
+    };
+    let mut children: Vec<UiNode> = Vec::new();
+    for (index, words) in body.meta.iter().enumerate() {
+        children.push(line(
+            format!("{key}/meta/{index}"),
+            words.clone(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+            line_h,
+        ));
+    }
+    for (index, words) in body.sentence.iter().enumerate() {
+        children.push(line(
+            format!("{key}/detail/{index}"),
+            words.clone(),
+            SemanticRole::Text,
+            StyleRef::Primary,
+            line_h,
+        ));
+    }
+    children.push(messages_spacer(
+        &format!("{key}/footer-gap"),
+        MESSAGES_FOOTER_GAP,
+    ));
+    // The footer: the buttons right-aligned, never full-width.
+    let button_h = messages_small_button_height();
+    let rows = body.footer.len().max(1);
+    let footer_rows: Vec<UiNode> = body
+        .footer
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let mut buttons: Vec<UiNode> = vec![
+                UiNode::new(
+                    format!("{key}/footer-spacer/{r}"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            ];
+            for b in row {
+                buttons.push(
+                    UiNode::new(
+                        b.key.clone(),
+                        UiContent::Button(
+                            Control::new(
+                                ButtonSpec::new(b.label.clone()),
+                                ActionId::new(b.key.clone()),
+                            )
+                            .state(ControlState {
+                                enabled: b.enabled,
+                                ..ControlState::default()
+                            })
+                            .style(if b.primary {
+                                StyleRef::Primary
+                            } else {
+                                StyleRef::Secondary
+                            }),
+                        ),
+                    )
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fixed(b.width))
+                            .height(Length::Fixed(button_h)),
+                    ),
+                );
+            }
+            UiNode::new(
+                format!("{key}/actions/{r}"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(button_h))
+                    .gap(8.0),
+            )
+            .children(buttons)
+        })
+        .collect();
+    children.push(
+        UiNode::new(
+            format!("{key}/actions"),
+            UiContent::Group(GroupSpec::new("Message actions")),
+        )
         .layout(
             Layout::column()
                 .width(Length::Fill)
-                .height(Length::Fixed(messages_compact_head_height()))
-                .clipped(),
+                .height(Length::Fixed(
+                    rows as f32 * button_h + (rows - 1) as f32 * 6.0,
+                ))
+                .gap(6.0),
         )
-        .children(vec![title_line, stamp_line])
-}
-
-/// One entry's items on a compact page ([`messages_compact_entry_heights`],
-/// as nodes, in the same order): its head, then — expanded — every meta
-/// line, every detail line, every button and Copy.
-fn messages_compact_entry_items(
-    entry: &MessageView,
-    expanded: bool,
-    facts: MessagesPageFacts,
-    content_width: f32,
-    now_unix_ms: u64,
-) -> Vec<UiNode> {
-    let key = format!("settings/messages/row/{}", entry.id);
-    let mut out = vec![messages_compact_head_node(
-        entry,
-        expanded,
-        content_width,
-        now_unix_ms,
-    )];
-    if !expanded {
-        return out;
+        .children(footer_rows),
+    );
+    if !body.technical.is_empty() {
+        children.push(messages_spacer(&format!("{key}/tech-gap"), 8.0));
+        children.push(line(
+            format!("{key}/technical"),
+            "Technical details".to_string(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+            line_h,
+        ));
+        let code_h = messages_code_line_height();
+        for (index, words) in body.technical.iter().enumerate() {
+            children.push(line(
+                format!("{key}/code/{index}"),
+                words.clone(),
+                SemanticRole::Status,
+                StyleRef::Code,
+                code_h,
+            ));
+        }
     }
-    out.extend(
-        messages_meta_lines(entry, facts.text_width)
-            .into_iter()
-            .enumerate()
-            .map(|(index, words)| {
-                messages_line_node(format!("{key}/meta/{index}"), words, StyleRef::Quiet)
-            }),
-    );
-    out.extend(
-        messages_detail_lines(
-            entry,
-            facts.text_width,
-            messages_max_detail_lines(entry, facts),
-        )
-        .into_iter()
-        .enumerate()
-        .map(|(index, words)| {
-            messages_line_node(
-                format!("{key}/detail/{index}"),
-                words,
-                messages_detail_style(entry),
-            )
-        }),
-    );
-    out.extend(entry.actions.iter().map(|action| {
-        messages_action_button(
-            format!("{key}/action/{}", action.index),
-            action.label,
-            action.index == 0,
-            action.still_actionable,
-            true,
-        )
-    }));
-    out.push(messages_action_button(
-        format!("{key}/copy"),
-        "Copy",
-        false,
-        true,
-        true,
-    ));
-    out
+    UiNode::new(
+        format!("{key}/body"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(body.height()))
+            .padding(Insets {
+                top: 0.0,
+                right: 12.0,
+                bottom: 10.0,
+                left: indent,
+            })
+            .clipped(),
+    )
+    .children(children)
 }
 
-/// SETTINGS ▸ MESSAGES (design §4.3–4.4): heading, chips, status, the
-/// rows, newest first. The wider pages seat as many rows as fit under a
-/// range pager and scroll by ROW (the field pages' law: `page_scroll` is
-/// the first visible entry and the reducer's bound is the entry count — so
-/// `every_settings_page_bounds_the_reducer_with_the_count_its_pager_reports`
-/// holds by construction); a compact page is a run of SECTIONS, one per
-/// page, the chips and the status line in the first section's header
-/// (`compact_paginated_section`), so the compact sweeps hold. The expanded
-/// row is charged at its expanded height and the page never promises a row
-/// it clips. What the render measured is recorded for the deep link.
+/// The log's CARD (rulings 262 and 264): the entries the view shows, one line
+/// each with hairlines between them, the open one with its body under it —
+/// its technical details already bounded to the room by the plan that seated
+/// it ([`MessagesPlan::view`]), so the card is exactly as tall as the plan
+/// measured. The card is the screen reader's scrolling list
+/// ([`SemanticRole::List`]).
+fn messages_list_node(
+    rows: &[&MessageView],
+    plan: &MessagesPlan,
+    selected: Option<u64>,
+    now_unix_ms: u64,
+) -> (UiNode, f32) {
+    let row_h = messages_row_height();
+    let indent = plan.indent();
+    let mut children: Vec<UiNode> = vec![messages_spacer(
+        "settings/messages/list/top",
+        MESSAGES_LIST_PAD,
+    )];
+    let mut height = 2.0 * MESSAGES_LIST_PAD;
+    for (k, entry) in rows.iter().enumerate() {
+        if k > 0 {
+            children.push(messages_rule(&format!(
+                "settings/messages/row/{}/rule",
+                entry.id
+            )));
+            height += 1.0;
+        }
+        let expanded = selected == Some(entry.id);
+        let head = messages_head_node(entry, expanded, plan.lead, plan.content_width, now_unix_ms);
+        let key = format!("settings/messages/row/{}", entry.id);
+        match plan
+            .body
+            .as_ref()
+            .filter(|(id, _)| expanded && *id == entry.id)
+        {
+            Some((_, b)) => {
+                let h = row_h + b.height();
+                children.push(
+                    UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
+                        .layout(
+                            Layout::column()
+                                .width(Length::Fill)
+                                .height(Length::Fixed(h))
+                                .clipped(),
+                        )
+                        .children(vec![head, messages_body_node(entry, b, indent)]),
+                );
+                height += h;
+            }
+            None => {
+                children.push(
+                    UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
+                        .layout(
+                            Layout::column()
+                                .width(Length::Fill)
+                                .height(Length::Fixed(row_h)),
+                        )
+                        .children(vec![head]),
+                );
+                height += row_h;
+            }
+        }
+    }
+    children.push(messages_spacer(
+        "settings/messages/list/bottom",
+        MESSAGES_LIST_PAD,
+    ));
+    let node = UiNode::new(
+        "settings/messages/list",
+        UiContent::Group(GroupSpec {
+            label: Some("Messages".to_string()),
+            role: SemanticRole::List,
+            style: StyleRef::Secondary,
+        }),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(height))
+            .clipped(),
+    )
+    .children(children);
+    (node, height)
+}
+
+/// The card with its SCROLL INDICATOR laid over it (ruling 264): where the
+/// view shows only some of the `total` entries, a thin thumb down the card's
+/// trailing edge says that the list scrolls and where the view is
+/// ([`crate::native_ui::MESSAGES_SCROLL_AUDIT`], paint-only); where it shows
+/// them all, the card alone.
+fn messages_scroll_node(
+    card: UiNode,
+    height: f32,
+    rows: std::ops::Range<usize>,
+    total: usize,
+) -> UiNode {
+    if rows.start == 0 && rows.end >= total {
+        return card;
+    }
+    let thumb = UiNode::new(
+        "settings/messages/scroll/thumb",
+        UiContent::Custom(crate::native_ui::AuditedCustomNode {
+            audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
+            role: SemanticRole::Group,
+            label: String::new(),
+            value: Some(format!("{},{},{total}", rows.start, rows.len())),
+            action: None,
+            focusable: false,
+        }),
+    )
+    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+    .paint_only();
+    UiNode::new(
+        "settings/messages/scroll",
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(height)),
+    )
+    .children(vec![card, thumb])
+}
+
+/// The filters and the count (ruling 262), top to bottom, with their heights:
+/// the severity segments; the tag chips (wide), or the `Tag: …` pop-up and,
+/// open, its chips (compact); and the count line. An empty log has neither
+/// filters nor count — only the report buttons.
+fn messages_filter_items(
+    state: &SettingsViewState,
+    messages: &MessagesState,
+    visible: usize,
+    content_width: f32,
+    compact: bool,
+) -> Vec<(UiNode, f32)> {
+    let filter = &state.messages_filter;
+    let total = messages.entries.len();
+    let mut items = Vec::new();
+    let chip_h = 30.0_f32.max(26.0 * settings_text_scale());
+    if total > 0 {
+        let (segments, segments_h) =
+            messages_severity_segments(messages, filter, content_width, chip_h + 6.0);
+        // THE FILTERS STAY IN TWO LINES (ruling 262): a wider page lays its
+        // tags out as chips only while the segments and the chips fit in two;
+        // past that — a script can name any tag it likes, and day two's seven
+        // made three lines of chips at 60 columns — it takes the compact
+        // page's `Tag: …` pop-up, which holds any number (ruling 267).
+        let popup_form = compact || {
+            let lead = (segments_h <= chip_h + 6.0).then(|| {
+                let width = match segments.layout.width {
+                    Length::Fixed(width) => width,
+                    _ => content_width,
+                };
+                (segments.clone(), width)
+            });
+            let own_line = usize::from(lead.is_none());
+            let rows = messages_tag_chip_rows(messages, filter, content_width, chip_h, lead).len();
+            rows + own_line > MESSAGES_FILTER_LINES_MAX
+        };
+        let tag_rows = if popup_form {
+            // The pop-up measured to its words and its chevron; beside the
+            // severity segments where both fit on one line.
+            let current = filter.tag.as_deref().map_or_else(
+                || "All".to_string(),
+                |t| crate::messages_host::tag_words(t).into_owned(),
+            );
+            let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+            let popup_w = (crate::tray_raster::ui_text_width_for(
+                crate::widget::TextFace::Ui,
+                &format!("Tag: {current}"),
+                px,
+            ) + 56.0)
+                .min(content_width);
+            let popup = messages_tag_popup(filter, state.messages_tag_menu, popup_w, chip_h);
+            let segments_w = match segments.layout.width {
+                Length::Fixed(width) => width,
+                _ => content_width,
+            };
+            if segments_h <= chip_h + 6.0 && segments_w + 8.0 + popup_w <= content_width {
+                let mut popup = popup;
+                popup.layout.height = Length::Fixed(chip_h);
+                items.push((
+                    UiNode::new(
+                        "settings/messages/filters/line",
+                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                    )
+                    .layout(
+                        Layout::row()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(chip_h + 6.0))
+                            .gap(8.0),
+                    )
+                    .children(vec![
+                        segments,
+                        UiNode::new(
+                            "settings/messages/filters/popup",
+                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                        )
+                        .layout(
+                            Layout::column()
+                                .width(Length::Fixed(popup_w))
+                                .height(Length::Fill)
+                                .padding(Insets {
+                                    top: 3.0,
+                                    right: 0.0,
+                                    bottom: 3.0,
+                                    left: 0.0,
+                                }),
+                        )
+                        .children(vec![popup]),
+                    ]),
+                    chip_h + 6.0,
+                ));
+            } else {
+                items.push((segments, segments_h));
+                items.push((popup, chip_h));
+            }
+            if state.messages_tag_menu {
+                messages_tag_chip_rows(messages, filter, content_width, chip_h, None)
+            } else {
+                Vec::new()
+            }
+        } else if segments_h <= chip_h + 6.0 {
+            // The segments lead the tag chips' first row.
+            let width = match segments.layout.width {
+                Length::Fixed(width) => width,
+                _ => content_width,
+            };
+            let mut segments = segments;
+            segments.layout.height = Length::Fill;
+            segments.layout.padding = Insets::symmetric(4.0, 0.0);
+            messages_tag_chip_rows(
+                messages,
+                filter,
+                content_width,
+                chip_h,
+                Some((segments, width)),
+            )
+        } else {
+            items.push((segments, segments_h));
+            messages_tag_chip_rows(messages, filter, content_width, chip_h, None)
+        };
+        items.extend(tag_rows.into_iter().map(|row| (row, chip_h + 6.0)));
+    }
+    let words = (total > 0).then(|| messages_status_words(total, visible, filter.is_all()));
+    items.push(messages_count_line(words, content_width));
+    items
+}
+
+/// THE LOG IS ONE SCROLLING LIST (design ruling 264 — a default the
+/// supervisor took; the owner can overrule it): no pages and no pager. The
+/// list scrolls by STOP — one per entry, and on a compact page one per header
+/// item before them, because there the switch and the filters scroll away
+/// with the log — and `page_scroll` is the stop at the top of the view. On
+/// the wider pages the heading and the header stay; the card under them
+/// scrolls. What a Messages render seats before it builds a node: the header
+/// items, the room the list has, the lead column, and every admitted entry's
+/// height in the card, the open one with its body fitted to the room. One
+/// function for the renderer and the reducer — a reveal that drops a chip or
+/// opens an entry measures the list it leaves, never the last render's
+/// (ruling 263).
+struct MessagesPlan {
+    compact: bool,
+    content_width: f32,
+    /// The header items, top to bottom, with their heights.
+    header: Vec<(UiNode, f32)>,
+    item_gap: f32,
+    /// The gap between the header and the log's card.
+    gap: f32,
+    /// The height the scrolling region has: the whole section on a compact
+    /// page, the room under the pinned heading and header on the wider ones.
+    room: f32,
+    lead: MessagesLead,
+    /// Each admitted entry's height in the card, newest first.
+    heights: Vec<f32>,
+    /// The open entry and its body, fitted to the room.
+    body: Option<(u64, MessagesBody)>,
+}
+
+/// What the list shows with one stop at its top: the header items it seats
+/// (a compact page's; the wider pages' header is always there) and the
+/// entries, by index among those the filters admit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessagesView {
+    header: std::ops::Range<usize>,
+    rows: std::ops::Range<usize>,
+}
+
+impl MessagesPlan {
+    /// The stops before the entries: the compact page's header items, which
+    /// scroll with the list.
+    fn lead_stops(&self) -> usize {
+        if self.compact { self.header.len() } else { 0 }
+    }
+
+    /// Every stop the list has.
+    fn stops(&self) -> usize {
+        self.lead_stops() + self.heights.len()
+    }
+
+    /// Where every row's body text begins, from the card's left edge.
+    fn indent(&self) -> f32 {
+        if self.compact {
+            self.lead.mark + self.lead.gap
+        } else {
+            self.lead.title_x()
+        }
+    }
+
+    /// The card's height holding `rows`: its padding, the rows, a hairline
+    /// between each two.
+    fn card_height(&self, rows: std::ops::Range<usize>) -> f32 {
+        if rows.is_empty() {
+            return 0.0;
+        }
+        let hairlines = rows.len() - 1;
+        2.0 * MESSAGES_LIST_PAD + self.heights[rows].iter().sum::<f32>() + hairlines as f32
+    }
+
+    /// What the list shows with stop `top` at its top: on a compact page the
+    /// header items from there that fit (at least one), then — once every
+    /// header item is seated — the entries that fit under them; else the
+    /// entries from `top`, at least one. An entry is seated whole or not at
+    /// all.
+    fn view(&self, top: usize) -> MessagesView {
+        let lead = self.lead_stops();
+        let n = self.heights.len();
+        let top = top.min(self.stops().saturating_sub(1));
+        let (header, first, room) = if top < lead {
+            let (mut end, mut used) = (top, 0.0_f32);
+            for k in top..lead {
+                let h = self.header[k].1 + if k > top { self.item_gap } else { 0.0 };
+                if k > top && used + h > self.room + 0.01 {
+                    break;
+                }
+                used += h;
+                end = k + 1;
+            }
+            let room = if end == lead {
+                self.room - used - self.gap
+            } else {
+                f32::NEG_INFINITY
+            };
+            (top..end, 0, room)
+        } else {
+            (0..0, top - lead, self.room)
+        };
+        let mut end = first;
+        while end < n {
+            let fits = self.card_height(first..end + 1) <= room + 0.01;
+            // The list's top entry is shown whatever its height.
+            let heads = end == first && header.is_empty();
+            if !(fits || heads) {
+                break;
+            }
+            end += 1;
+        }
+        MessagesView {
+            header,
+            rows: first..end,
+        }
+    }
+
+    /// Whether the view from `top` reaches the list's end.
+    fn reaches_end(&self, top: usize) -> bool {
+        let view = self.view(top);
+        if self.heights.is_empty() {
+            view.header.end == self.lead_stops()
+        } else {
+            view.rows.end == self.heights.len()
+        }
+    }
+
+    /// The last stop the list scrolls to: the least whose view reaches the
+    /// end, so the list never scrolls past its last entry.
+    fn limit(&self) -> usize {
+        let mut top = self.stops().saturating_sub(1);
+        while top > 0 && self.reaches_end(top - 1) {
+            top -= 1;
+        }
+        top
+    }
+
+    /// The least scroll from `top` that shows entry `index` whole: `top`
+    /// itself where it does; up to the entry where it is above; else down,
+    /// stop by stop, to the first view that holds it.
+    fn reveal(&self, index: usize, top: usize) -> usize {
+        let limit = self.limit();
+        let top = top.min(limit);
+        let view = self.view(top);
+        if view.rows.contains(&index) {
+            return top;
+        }
+        let stop = self.lead_stops() + index;
+        if index < view.rows.start {
+            return stop.min(limit);
+        }
+        let mut next = top + 1;
+        while next < stop && !self.view(next).rows.contains(&index) {
+            next += 1;
+        }
+        next.min(limit)
+    }
+
+    /// A DEEP LINK'S LANDING: where the view from `top` already shows entry
+    /// `index` whole, there; else the entry at the top of the list, as far
+    /// as the list scrolls.
+    fn land(&self, index: usize, top: usize) -> usize {
+        let limit = self.limit();
+        let top = top.min(limit);
+        if self.view(top).rows.contains(&index) {
+            top
+        } else {
+            (self.lead_stops() + index).min(limit)
+        }
+    }
+}
+
+/// [`MessagesPlan`] for the `visible` entries under `state`'s filter, the
+/// entry `state` has open fitted to the room.
+fn messages_plan(
+    state: &SettingsViewState,
+    messages: &MessagesState,
+    visible: &[&MessageView],
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> MessagesPlan {
+    let compact = width == SettingsWidth::Compact;
+    let maximum = page_maximum(SettingsRoute::Messages, width);
+    let content_width = settings_page_content_width(viewport.width, width, maximum);
+    let total = messages.entries.len();
+    let text_width = (content_width - 24.0).max(48.0);
+    let item_gap = 8.0;
+    // The header items: the setting row, the not-saved note, the filters and
+    // the count, the invitation of an empty log.
+    let mut header: Vec<(UiNode, f32)> = Vec::new();
+    if let Some(block) = messages_explain_load_block(state, text_width) {
+        header.push(block);
+    }
+    if !messages.saved {
+        header.push(wrapped_copy_node(
+            "settings/messages/not-saved",
+            MESSAGES_NOT_SAVED,
+            SemanticRole::Text,
+            StyleRef::Quiet,
+            text_width,
+            messages_line_height(),
+            None,
+        ));
+    }
+    header.extend(messages_filter_items(
+        state,
+        messages,
+        visible.len(),
+        content_width,
+        compact,
+    ));
+    if total == 0 {
+        header.push(wrapped_copy_node(
+            "settings/messages/empty",
+            MESSAGES_EMPTY,
+            SemanticRole::Text,
+            StyleRef::Quiet,
+            text_width,
+            messages_line_height(),
+            None,
+        ));
+    }
+    // The room the list has: a compact page's whole section (its items
+    // `MESSAGES_ROW_GAP` apart); on the wider pages the page's column under
+    // the heading and the header, each its own gap apart.
+    let (room, gap) = if compact {
+        (
+            compact_page_budget(state, viewport).content_height,
+            MESSAGES_ROW_GAP,
+        )
+    } else {
+        let gap = responsive_page_gap(width, viewport.height);
+        let header_h: f32 = header.iter().map(|(_, h)| *h).sum::<f32>()
+            + header.len().saturating_sub(1) as f32 * item_gap;
+        let heading_h = page_heading_height() + page_subtitle_height() + 2.0 * gap;
+        (
+            noncompact_page_content_height(state, width, viewport.width, viewport.height, maximum)
+                - heading_h
+                - header_h
+                - gap,
+            gap,
+        )
+    };
+    let lead = MessagesLead::measure(visible, messages.now_unix_ms, compact, content_width);
+    let row_h = messages_row_height();
+    let mut plan = MessagesPlan {
+        compact,
+        content_width,
+        header,
+        item_gap,
+        gap,
+        room,
+        lead,
+        heights: Vec::new(),
+        body: None,
+    };
+    // The open entry's body at the card's measure, bounded to what the card
+    // has with the entry alone in it: it is read whole wherever the list
+    // shows it.
+    let body_width = (content_width - plan.indent() - 16.0).max(48.0);
+    plan.body = state
+        .messages_selected
+        .and_then(|id| visible.iter().find(|entry| entry.id == id))
+        .map(|entry| {
+            let mut body = MessagesBody::of(
+                entry,
+                body_width,
+                messages.utc_offset_s,
+                messages.now_unix_ms,
+            );
+            body.fit(room - row_h - 2.0 * MESSAGES_LIST_PAD);
+            (entry.id, body)
+        });
+    plan.heights = visible
+        .iter()
+        .map(|entry| match &plan.body {
+            Some((id, body)) if *id == entry.id => row_h + body.height(),
+            _ => row_h,
+        })
+        .collect();
+    plan
+}
+
+/// SETTINGS ▸ MESSAGES (design §4; rulings 262 and 264): the "Explain heavy
+/// load" setting row, the filters, the count line with the report buttons,
+/// and the log — ONE dense scrolling list, newest first, in one card of
+/// one-line entries with hairlines between them; the filters narrow it and
+/// there is no pager. On the wider pages the heading and the header stay and
+/// the card scrolls under them; on a compact page the header scrolls away
+/// with the list. An open entry grows its card in place. What the render
+/// measured is recorded for the reducer: the limit the list scrolls to, the
+/// stop it drew, and the geometry it laid out in.
 fn messages_page(
     state: &SettingsViewState,
     messages: &MessagesState,
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> Vec<UiNode> {
-    let compact = width == SettingsWidth::Compact;
-    let maximum = page_maximum(SettingsRoute::Messages, width);
-    let content_width = settings_page_content_width(viewport.width, width, maximum);
     let visible = messages_visible(messages, &state.messages_filter);
-    let total = messages.entries.len();
+    let plan = messages_plan(state, messages, &visible, width, viewport);
+    let limit = plan.limit();
+    state.record_result_page_limit(limit);
+    state.messages_page_geometry.set(Some((width, viewport)));
     let selected = state
         .messages_selected
         .filter(|id| visible.iter().any(|entry| entry.id == *id));
-    let line_h = messages_line_height();
-
-    if compact {
-        let budget = compact_page_budget(state, viewport);
-        let section_height = if budget.side_by_side_pager {
-            budget.content_height
-        } else {
-            (budget.content_height - page_navigation_height() - 10.0).max(scaled_control_height())
-        };
-        let section_width = if budget.side_by_side_pager {
-            (content_width - compact_side_pager_width() - 10.0).max(48.0)
-        } else {
-            content_width
-        };
-        let text_width = (section_width - 24.0).max(48.0);
-        let (chip_rows, chip_h) =
-            messages_filter_chip_rows(messages, &state.messages_filter, section_width, true);
-        let empty = (total == 0).then(|| {
-            wrapped_copy_node(
-                "settings/messages/empty",
-                MESSAGES_EMPTY,
-                SemanticRole::Text,
-                StyleRef::Quiet,
-                text_width,
-                line_h,
-                None,
-            )
-        });
-        let (report, report_h) = messages_report_buttons(true, section_width);
-        let switch = messages_explain_load_row(state, width);
-        let unsaved = (!messages.saved).then(|| {
-            wrapped_copy_node(
-                "settings/messages/not-saved",
-                MESSAGES_NOT_SAVED,
-                SemanticRole::Text,
-                StyleRef::Quiet,
-                text_width,
-                line_h,
-                None,
-            )
-        });
-        let header = MessagesHeaderFacts {
-            chip_rows: chip_rows.len(),
-            chip_height: chip_h,
-            status_height: line_h,
-            unsaved_height: unsaved.as_ref().map_or(0.0, |(_, height)| *height),
-            empty_height: empty.as_ref().map_or(0.0, |(_, height)| *height),
-        };
-        let facts = MessagesPageFacts {
-            compact: true,
-            capacity: section_height,
-            header,
-            text_width,
-        };
-        state.messages_page_facts.set(Some(facts));
-        let (mut items, heads) = messages_compact_items(header, &visible, selected, facts);
-        let entries_end = items.len();
-        // The reporting buttons: the list's last item (their doc) — then, on
-        // a compact page, the "Explain heavy load" switch, so the first
-        // section still opens on the newest message (the wide page seats it
-        // at the top).
-        items.push(report_h);
-        if switch.is_some() {
-            items.push(width.row_height());
-        }
-        let sections = messages_sections(&items, section_height);
-        let pages = sections.len();
-        state.record_result_page_limit(pages.saturating_sub(1));
-        let section = state.page_scroll.min(pages.saturating_sub(1));
-        // The items, in page order: the chip rows, the status line, the
-        // invitation, the rows — built only for the section on show.
-        let status = messages_status_node(
-            messages_status_words(
-                total,
-                visible.len(),
-                state.messages_filter.is_all(),
-                Some((section, pages)),
-            ),
-            section_width,
-        );
-        let mut leading: Vec<Option<UiNode>> = chip_rows.into_iter().map(Some).collect();
-        leading.push(Some(status));
-        if let Some((node, _)) = unsaved {
-            leading.push(Some(node));
-        }
-        if let Some((node, _)) = empty {
-            leading.push(Some(node));
-        }
-        debug_assert_eq!(leading.len(), header.len());
-        let header_len = header.len();
-        let range = sections[section].clone();
-        let mut children: Vec<UiNode> = Vec::with_capacity(range.len());
-        for item in range.clone().filter(|item| *item < header_len) {
-            children.push(
-                leading[item]
-                    .take()
-                    .expect("each leading item is seated once"),
-            );
-        }
-        // The entries whose items fall in this section: each is built once
-        // and sliced to the part the section shows.
-        for (index, entry) in visible.iter().enumerate() {
-            let first = heads[index];
-            let count = heads.get(index + 1).copied().unwrap_or(entries_end) - first;
-            let last = first + count;
-            if last <= range.start || first >= range.end {
-                continue;
-            }
-            let nodes = messages_compact_entry_items(
-                entry,
-                selected == Some(entry.id),
-                facts,
-                section_width,
-                messages.now_unix_ms,
-            );
-            debug_assert_eq!(nodes.len(), count);
-            children.extend(
-                nodes
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(k, _)| range.contains(&(first + k)))
-                    .map(|(_, node)| node),
-            );
-        }
-        if range.contains(&entries_end) {
-            children.push(report);
-        }
-        if let Some(switch) = switch
-            && range.contains(&(entries_end + 1))
-        {
-            children.push(switch);
-        }
-        let section_node = UiNode::new(
-            format!("settings/messages/section/{section}"),
-            UiContent::Group(GroupSpec::new("Messages")),
+    // A deep link that came before any render lands here, once.
+    let top = match selected.and_then(|id| visible.iter().position(|entry| entry.id == id)) {
+        Some(index) if state.messages_reveal => plan.land(index, state.page_scroll),
+        _ => state.page_scroll.min(limit),
+    };
+    state.messages_drawn.set(Some(top));
+    let view = plan.view(top);
+    let shown: Vec<&MessageView> = visible[view.rows.clone()].to_vec();
+    let list = (!shown.is_empty()).then(|| {
+        let (card, height) = messages_list_node(&shown, &plan, selected, messages.now_unix_ms);
+        messages_scroll_node(card, height, view.rows.clone(), visible.len())
+    });
+    let MessagesPlan {
+        compact,
+        header,
+        item_gap,
+        gap,
+        room,
+        ..
+    } = plan;
+    // The header items this view seats: every one on the wider pages, whose
+    // header stays; on a compact page the ones the list has not scrolled past.
+    let header: Vec<(UiNode, f32)> = header
+        .into_iter()
+        .enumerate()
+        .filter(|(k, _)| !compact || view.header.contains(k))
+        .map(|(_, item)| item)
+        .collect();
+    let controls = (!header.is_empty()).then(|| {
+        let height = header.iter().map(|(_, h)| *h).sum::<f32>()
+            + header.len().saturating_sub(1) as f32 * item_gap;
+        UiNode::new(
+            "settings/messages/controls",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
         .layout(
             Layout::column()
                 .width(Length::Fill)
-                .height(Length::Fixed(section_height))
-                .gap(MESSAGES_ROW_GAP)
-                .clipped(),
+                .height(Length::Fixed(height))
+                .gap(item_gap),
         )
-        .children(children);
-        return compact_paginated_section(
-            "settings/messages",
-            "Messages",
-            "settings/messages/range",
-            PageWindow {
-                start: section,
-                end: section + 1,
-                total: pages,
-            },
-            section_node,
-            section_height,
-            budget,
-        );
+        .children(header.into_iter().map(|(node, _)| node).collect())
+    });
+    if compact {
+        let mut children: Vec<UiNode> = controls.into_iter().collect();
+        children.extend(list);
+        return vec![
+            UiNode::new(
+                "settings/messages/section",
+                UiContent::Group(GroupSpec::new("Messages")),
+            )
+            .layout(
+                Layout::column()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(room.max(messages_row_height())))
+                    .gap(gap)
+                    .clipped(),
+            )
+            .children(children),
+        ];
     }
-
-    let text_width = (content_width - 24.0).max(48.0);
-    let gap = responsive_page_gap(width, viewport.height);
-    let content_height =
-        noncompact_page_content_height(state, width, viewport.width, viewport.height, maximum);
     let mut out = page_heading("Messages", messages_page_subtitle(width));
-    // The page's top switch: the strain row's (design §10.14, ruling 212).
-    let mut switch_h = 0.0;
-    if let Some(switch) = messages_explain_load_row(state, width) {
-        switch_h = width.row_height() + gap;
-        out.push(switch);
-    }
-    let (chip_rows, chip_h) =
-        messages_filter_chip_rows(messages, &state.messages_filter, content_width, false);
-    let (chips, chips_h) = messages_filters_group(chip_rows, chip_h);
-    out.push(chips);
-    // The status line and the reporting buttons share one row (design ruling
-    // 64): the status takes what the buttons leave, fitted to it.
-    let (report, _) = messages_report_buttons(false, content_width);
-    let report_w: f32 = report
-        .children
-        .iter()
-        .map(|button| match button.layout.width {
-            Length::Fixed(width) => width,
-            _ => 0.0,
-        })
-        .sum::<f32>()
-        + 2.0 * 8.0;
-    let status_w = (content_width - report_w).max(48.0);
-    let header_h = line_h.max(scaled_control_height());
-    let header = |words: String| {
-        let mut status =
-            messages_fitted_status("settings/messages/status", words, Length::Fill, status_w);
-        status.layout.height = Length::Fixed(header_h);
-        let mut children = vec![status];
-        children.extend(report.children.clone());
-        UiNode::new(
-            "settings/messages/header",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(
-            Layout::row()
-                .width(Length::Fill)
-                .height(Length::Fixed(header_h))
-                .gap(8.0),
-        )
-        .children(children)
-    };
-    let status_index = out.len();
-    out.push(header(String::new()));
-    let mut unsaved_h = 0.0;
-    if !messages.saved {
-        let (note, height) = wrapped_copy_node(
-            "settings/messages/not-saved",
-            MESSAGES_NOT_SAVED,
-            SemanticRole::Text,
-            StyleRef::Quiet,
-            text_width,
-            line_h,
-            None,
-        );
-        unsaved_h = height + gap;
-        out.push(note);
-    }
-    // Heading, subtitle, chips, the status-and-buttons row (and the not-saved
-    // note): the children and the gaps between them; the rows and the pager add
-    // one gap each.
-    let fixed = page_heading_height()
-        + page_subtitle_height()
-        + switch_h
-        + chips_h
-        + header_h
-        + unsaved_h
-        + 3.0 * gap;
-    if total == 0 {
-        let (empty, _) = wrapped_copy_node(
-            "settings/messages/empty",
-            MESSAGES_EMPTY,
-            SemanticRole::Text,
-            StyleRef::Quiet,
-            text_width,
-            line_h,
-            None,
-        );
-        out.push(empty);
-        out[status_index] = header(messages_status_words(0, 0, true, None));
-        state.messages_page_facts.set(Some(MessagesPageFacts {
-            compact: false,
-            capacity: (content_height - fixed - gap).max(0.0),
-            header: MessagesHeaderFacts::default(),
-            text_width,
-        }));
-        state.record_result_page_limit(0);
-        return out;
-    }
-    state.record_result_total(visible.len());
-    let status_words =
-        messages_status_words(total, visible.len(), state.messages_filter.is_all(), None);
-    out[status_index] = header(status_words);
-    let first = state.page_scroll.min(visible.len().saturating_sub(1));
-    // Without a pager first: a list that fits whole from the top needs none.
-    let plain_capacity = (content_height - fixed - gap).max(0.0);
-    let plain_facts = MessagesPageFacts {
-        compact: false,
-        capacity: plain_capacity,
-        header: MessagesHeaderFacts::default(),
-        text_width,
-    };
-    let plain_heights = messages_row_heights(&visible, selected, plain_facts);
-    let fits_whole =
-        first == 0 && messages_fit_from(&plain_heights, 0, plain_capacity, gap) == visible.len();
-    let (facts, heights, end, paged) = if fits_whole {
-        (plain_facts, plain_heights, visible.len(), false)
-    } else {
-        let capacity = (plain_capacity - page_navigation_height() - gap).max(0.0);
-        let facts = MessagesPageFacts {
-            capacity,
-            ..plain_facts
-        };
-        let heights = messages_row_heights(&visible, selected, facts);
-        let end = messages_fit_from(&heights, first, capacity, gap);
-        (facts, heights, end, true)
-    };
-    debug_assert_eq!(heights.len(), visible.len());
-    state.messages_page_facts.set(Some(facts));
-    let start = if paged { first } else { 0 };
-    out.extend((start..end).map(|index| {
-        let entry = visible[index];
-        messages_row_node(
-            entry,
-            selected == Some(entry.id),
-            facts,
-            content_width,
-            messages.now_unix_ms,
-        )
-    }));
-    if paged {
-        out.push(page_navigation_node(
-            "settings/messages/pagination",
-            "settings/messages/range",
-            "Messages",
-            start,
-            end,
-            visible.len(),
-        ));
-    }
+    out.extend(controls);
+    out.extend(list);
     out
 }
 
@@ -21218,8 +22541,8 @@ fn packages_switch_row(
 
 /// One registry-backed Switch row on a SPECIAL page, its row node keyed
 /// `row_key` and its compact wrappers under `prefix`: the Packages page's
-/// switches ([`packages_switch_row`]) and Settings ▸ Messages's "Explain heavy
-/// load" ([`messages_explain_load_row`]). The control is the ordinary
+/// switches ([`packages_switch_row`]). (Settings ▸ Messages's "Explain heavy
+/// load" is a plain setting row of its own, [`messages_explain_load_block`].) The control is the ordinary
 /// `settings/control/<key>` / `settings/set/<key>` pair either way.
 fn registry_switch_row(
     state: &SettingsViewState,
@@ -21355,20 +22678,6 @@ fn registry_switch_row(
 /// row's own key.
 pub(crate) const MESSAGES_EXPLAIN_LOAD: &str = "settings/messages/explain-load";
 
-/// Settings ▸ Messages's top switch, "Explain heavy load"
-/// (`explain_heavy_load`, design §10.14, ruling 212): the strain row's
-/// switch, on the page that lists what that row records. `None` when the
-/// registry has no such field (never, in a shipped build).
-fn messages_explain_load_row(state: &SettingsViewState, width: SettingsWidth) -> Option<UiNode> {
-    registry_switch_row(
-        state,
-        prefs::EDIT_EXPLAIN_HEAVY_LOAD,
-        width,
-        MESSAGES_EXPLAIN_LOAD.to_string(),
-        "settings/messages",
-    )
-}
-
 /// The switches the Packages page carries: "Automatic updates" — `[packages] enabled`,
 /// THE switch, with the retired `auto_update` folded in (2026-09-23), applied LIVE by the
 /// window's package loop (Phase 4) — the one install consent (`auto_install`, the retired
@@ -21475,7 +22784,7 @@ fn packages_activity_rows(
     if start == end {
         return single(
             "packages/activity/empty",
-            "No package activity recorded yet — every update, check and failure is listed here.",
+            "No package activity recorded yet.",
         );
     }
     let wrap = packages_reason_wrap_chars(width);
@@ -21639,7 +22948,7 @@ fn packages_page(
         ),
         action_button(
             "packages/install-default",
-            "Install ALab Tools",
+            "Install ALab Tools Now",
             PackagesBusy::Install,
             false,
         ),
@@ -21712,10 +23021,7 @@ fn packages_page(
         UiNode::new(
             "packages/detail",
             UiContent::Text(TextSpec {
-                text: packages
-                    .detail
-                    .clone()
-                    .unwrap_or_else(|| "Signed ALab tools, kept up to date by aterm.".to_string()),
+                text: packages.detail.clone().unwrap_or_default(),
                 role: SemanticRole::Text,
                 style: StyleRef::Quiet,
             }),
@@ -21773,9 +23079,9 @@ fn packages_page(
     // — off stands the loop down, on resumes it, no relaunch. The install consent is the
     // one key it names (the retired `seed_install` folded in), and the reroute's
     // announcement is the third row.
-    const PACKAGE_CONSENT_NOTE: &str = "Automatic updates keeps ALab tools, Claude Code and Codex up to date in the background, without interrupting you; switching it takes effect at once, and Check & Update Now always works. aterm installs ALab tools by default and keeps them complete; Remove ALab Tools undoes that. Installing can download several GB, so Install ALab tools is where you say yes to that; it applies at the next package check.";
+    const PACKAGE_CONSENT_NOTE: &str = "Automatic updates keeps ALab tools, Claude Code and Codex up to date; switching it takes effect at once, and Check & Update Now always works. aterm installs ALab tools by default; Remove ALab Tools undoes that. Install ALab tools lets aterm download them \u{2014} several GB \u{2014} at the next package check.";
     const PACKAGE_CONSENT_LINES: [&str; 2] = [
-        "Automatic updates: takes effect at once; Update Now always works.",
+        "Automatic updates: at once; Check & Update Now always works.",
         "Install ALab tools: next check; can download several GB.",
     ];
     let mut consent_children = vec![
@@ -22369,7 +23675,7 @@ fn key_fragment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_app::{AppEffect, AppViewState, NativeApp, NativeRuntime, WorkOwner};
+    use crate::native_app::{AppEffect, AppViewState, NativeApp, NativeRuntime};
     use crate::native_config_service::{
         ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ConfigSnapshot, ExpectedValue,
         VersionedConfigService,
@@ -22929,13 +24235,6 @@ mod tests {
                 "{key} starts no config transaction"
             );
         }
-    }
-
-    #[test]
-    fn controller_starts_at_the_canonical_config_snapshot_revision() {
-        let update = UpdateState::from_status(1, "test", None, false);
-        let app = SettingsApp::new_at_config_revision(update, 37);
-        assert_eq!(app.config_revision, 37);
     }
 
     #[test]
@@ -23723,7 +25022,6 @@ mod tests {
         assert!(!serious.post_fx.hdr_glow);
         assert_eq!(serious.post_fx.sdr_boost, 0.0);
         assert_eq!(serious.animation(), PreviewAnimation::None);
-        assert!(preview_reduced_motion(&state, serious_motion));
         assert_ne!(active.paint_fingerprint(), serious.paint_fingerprint());
     }
 
@@ -24127,60 +25425,10 @@ mod tests {
     #[test]
     fn music_effects_discloses_effective_motion_suppression_without_rewriting_toggle() {
         let auto = SettingsViewState::new(&Config::default());
-        if crate::trail_audio::output_available() {
-            let mut system_reduced = crate::native_app::ViewMotionCx {
-                system_reduced: true,
-                ..crate::native_app::ViewMotionCx::default()
-            };
-            assert_eq!(
-                top_music_suppression_reason(&auto, system_reduced),
-                Some("On, currently suppressed by system Reduce Motion.")
-            );
-            system_reduced.performance_reduced = true;
-            system_reduced.system_reduced = false;
-            assert_eq!(
-                top_music_suppression_reason(&auto, system_reduced),
-                Some("On, currently suppressed by adaptive performance mode.")
-            );
-
-            let reduced = SettingsViewState::new(&Config {
-                motion: Some("reduced".to_string()),
-                ..Config::default()
-            });
-            assert_eq!(
-                top_music_suppression_reason(&reduced, crate::native_app::ViewMotionCx::default()),
-                Some("On, currently suppressed by Motion: Reduced.")
-            );
-            let full = SettingsViewState::new(&Config {
-                motion: Some("full".to_string()),
-                ..Config::default()
-            });
-            assert_eq!(
-                top_music_suppression_reason(
-                    &full,
-                    crate::native_app::ViewMotionCx {
-                        system_reduced: true,
-                        performance_reduced: true,
-                        ..crate::native_app::ViewMotionCx::default()
-                    }
-                ),
-                None,
-                "explicit Full overrides system/adaptive reduction while focused"
-            );
-        } else {
-            assert_eq!(
-                top_music_suppression_reason(&auto, crate::native_app::ViewMotionCx::default()),
-                Some("Saved On for macOS; audio output is unavailable on this platform.")
-            );
-            let off = SettingsViewState::new(&Config {
-                trail_sounds: Some(false),
-                ..Config::default()
-            });
-            assert_eq!(
-                top_music_suppression_reason(&off, crate::native_app::ViewMotionCx::default()),
-                Some("Saved Off; audio output is unavailable on this platform.")
-            );
-        }
+        // Every resolver row (adaptive, Motion: Reduced, explicit Full, and the
+        // no-output Saved On / Saved Off lines) is pinned host-independently by
+        // `music_suppression_resolver_covers_every_reason_and_priority`; this test
+        // is the render half, where system Reduce Motion reaches the compact page.
         assert!(
             top_projected_music_value(&auto),
             "authored switch remains On"
@@ -24361,6 +25609,21 @@ mod tests {
             )));
         };
 
+        // The SHIPPING Motion preview's verdict, not a test-side restatement of it.
+        let preview_reduced_motion =
+            |state: &SettingsViewState, motion: crate::native_app::ViewMotionCx| {
+                renderer_preview_spec_for_key_with_font(
+                    state,
+                    prefs::EDIT_MOTION,
+                    100,
+                    motion,
+                    13.0,
+                    aterm_render::Theme::default(),
+                    None,
+                )
+                .expect("the Motion row has a live preview")
+                .reduced_motion
+            };
         let constrained = crate::native_app::ViewMotionCx {
             system_reduced: true,
             performance_reduced: true,
@@ -24548,8 +25811,6 @@ mod tests {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         ViewCx {
             viewport: LogicalRect::new(0.0, 0.0, width, height),
-            config_revision: 1,
-            update_revision: 1,
             animation_phase_ms: 720,
             motion: crate::native_app::ViewMotionCx::default(),
             terminal_font_px: 12.0,
@@ -24655,6 +25916,7 @@ mod tests {
             trash_tool: true,
             retire_live: false,
             retired: None,
+            retire_status: None,
         }
     }
 
@@ -24816,21 +26078,505 @@ mod tests {
         assert!(retired[3].ends_with("The operation couldn’t be completed."));
     }
 
+    /// A declined owner alert quiets the block's gestures: presses queued
+    /// behind the alert (a control client can queue `key space`) in the SAME
+    /// view get no second alert and say why, and so does a view opened
+    /// afterwards holding the same record; each decline in a row doubles the
+    /// quiet, up to a cap, and a yes clears it.
+    #[test]
+    fn a_decline_quiets_every_view_and_doubles_in_a_row() {
+        use aterm_containment::FdaScope;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        fn counting_no(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
+            ASKED.fetch_add(1, Ordering::AcqRel);
+            Some(false)
+        }
+        ASKED.store(0, Ordering::Release);
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        let shared = SharedOwnerQuiet::default();
+        let open_view = || {
+            let (mut runtime, instance, view) = setup();
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Security);
+                state.replace_macos_access(access.clone());
+                state.arm_consent_gestures(ConsentGestures {
+                    confirm: counting_no,
+                    ..ConsentGestures::inert()
+                });
+                state.arm_owner_quiet(std::sync::Arc::clone(&shared));
+            }
+            (runtime, instance, view)
+        };
+        let press = |runtime: &mut NativeRuntime, instance, view, action: &'static str| {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(action),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.feedback.clone().unwrap_or_default()
+        };
+        let quieted = OwnerAnswer::Quiet.refusal("");
+        let (mut runtime, instance, view) = open_view();
+        assert_eq!(
+            press(&mut runtime, instance, view, MACOS_ACCESS_ASK_AGAIN),
+            "Nothing was changed."
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                press(&mut runtime, instance, view, MACOS_ACCESS_ASK_AGAIN),
+                quieted,
+                "the same view, a queued press"
+            );
+        }
+        let (mut later, later_instance, later_view) = open_view();
+        assert_eq!(
+            press(&mut later, later_instance, later_view, MACOS_ACCESS_WARM_UP),
+            quieted,
+            "a view opened after the decline, another gesture"
+        );
+        assert_eq!(ASKED.load(Ordering::Acquire), 1, "one alert, then quiet");
+
+        let start = QuietStamp::now();
+        let mut quiet = OwnerQuiet::default();
+        quiet.declined(start);
+        assert!(quiet.quiet_at(start.after(OWNER_QUIET_FIRST / 2)));
+        assert!(!quiet.quiet_at(start.after(OWNER_QUIET_FIRST)));
+        let second = start.after(OWNER_QUIET_FIRST);
+        quiet.declined(second);
+        assert!(
+            quiet.quiet_at(second.after(OWNER_QUIET_FIRST * 3 / 2)),
+            "doubled"
+        );
+        for n in 0..20 {
+            quiet.declined(second.after(OWNER_QUIET_FIRST * n));
+        }
+        let last = second.after(OWNER_QUIET_FIRST * 19);
+        assert!(quiet.quiet_at(last.after(OWNER_QUIET_MAX / 2)));
+        assert!(!quiet.quiet_at(last.after(OWNER_QUIET_MAX)), "capped");
+
+        // A night asleep: the awake clock barely moved, the wall clock moved
+        // eight hours. The quiet is over, and the next decline starts the
+        // doubling over rather than quieting for the capped length again.
+        let hours = std::time::Duration::from_secs(8 * 60 * 60);
+        let woke = QuietStamp {
+            awake: last.awake + std::time::Duration::from_secs(1),
+            wall: last.wall + hours,
+        };
+        assert!(!quiet.quiet_at(woke), "the wall clock ends it");
+        quiet.declined(woke);
+        assert!(quiet.quiet_at(woke.after(OWNER_QUIET_FIRST / 2)));
+        assert!(
+            !quiet.quiet_at(woke.after(OWNER_QUIET_FIRST)),
+            "first again"
+        );
+        // A wall clock set back does not extend a quiet the awake clock ended.
+        let set_back = QuietStamp {
+            awake: woke.awake + OWNER_QUIET_FIRST,
+            wall: woke.wall - hours,
+        };
+        assert!(!quiet.quiet_at(set_back), "the awake clock ends it");
+        quiet.accepted();
+        assert!(!quiet.quiet_at(last));
+    }
+
+    /// The *Ask again* report is the view's: the host's next republish, which
+    /// never carries one, does not wipe it.
+    #[test]
+    fn the_ask_again_report_survives_the_hosts_next_republish() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            state.replace_macos_access(access.clone());
+            state.arm_consent_gestures(ConsentGestures::confirming());
+        }
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_ASK_AGAIN),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        let report = state.macos_access_for_test().and_then(|a| a.reset.clone());
+        assert!(report.is_some(), "the press left a report");
+        assert!(access.reset.is_none(), "the host never publishes one");
+        state.replace_macos_access(access);
+        assert_eq!(
+            state.macos_access_for_test().and_then(|a| a.reset.clone()),
+            report
+        );
+    }
+
+    /// The *Ask again* report lasts while it is still advice: a warm-up under
+    /// way, or leaving the page, drops it. And the *Move to Trash* status row is
+    /// drawn in both layouts, so the outcome of a press is never only in rows a
+    /// compact card leaves out.
+    #[test]
+    fn the_reset_report_expires_and_the_trash_status_shows_in_every_layout() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        let report = MacosAccessReset::from_attempts(&[]);
+        let (mut runtime, _instance, view) = setup();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Security);
+        state.replace_macos_access(MacosAccess {
+            reset: Some(report),
+            ..access.clone()
+        });
+        state.replace_macos_access(access.clone());
+        assert!(
+            state
+                .macos_access_for_test()
+                .is_some_and(|a| a.reset.is_some())
+        );
+        state.replace_macos_access(MacosAccess {
+            warmup_live: true,
+            ..access.clone()
+        });
+        assert!(
+            state
+                .macos_access_for_test()
+                .is_some_and(|a| a.reset.is_none()),
+            "a warm-up under way follows the report's advice"
+        );
+        state.replace_macos_access(MacosAccess {
+            reset: Some(MacosAccessReset::from_attempts(&[])),
+            ..access.clone()
+        });
+        state.navigate(SettingsRoute::Appearance);
+        state.navigate(SettingsRoute::Security);
+        state.replace_macos_access(access.clone());
+        assert!(
+            state
+                .macos_access_for_test()
+                .is_some_and(|a| a.reset.is_none()),
+            "leaving the page drops it"
+        );
+
+        let status = MacosAccess {
+            retire_status: Some("Moved 1 copy to the Trash.".to_string()),
+            ..access
+        };
+        for compact in [true, false] {
+            let card = macos_access_card(&status, compact);
+            fn has(node: &UiNode, key: &str) -> bool {
+                node.key.as_str() == key || node.children.iter().any(|c| has(c, key))
+            }
+            assert!(
+                has(&card, "settings/macos-access/retire-status"),
+                "compact={compact}"
+            );
+        }
+        assert!(
+            macos_access_height(&status, true)
+                > macos_access_height(
+                    &MacosAccess {
+                        retire_status: None,
+                        ..status.clone()
+                    },
+                    true
+                )
+        );
+    }
+
+    /// Text someone else chose is shown with every default-ignorable code
+    /// point, control and line separator escaped; ordinary text is untouched.
+    #[test]
+    fn owner_text_escapes_what_draws_as_nothing_and_keeps_the_rest() {
+        for hidden in [
+            '\u{00AD}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{2028}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FFF0}',
+            '\u{FFFA}',
+            '\u{1BCA0}',
+            '\u{1D173}',
+            '\u{E0041}',
+            '\u{E0FFF}',
+            '\u{13430}',
+            '\u{1343F}',
+            '\n',
+            '\u{7F}',
+        ] {
+            let shown = owner_text(&format!("a{hidden}b"));
+            assert!(
+                !shown.contains(hidden),
+                "{hidden:?} passed through: {shown}"
+            );
+            assert!(
+                shown.starts_with("a\\u{") && shown.ends_with("}b"),
+                "{shown}"
+            );
+        }
+        let plain = "/Users/é/日本/aterm (dev).app";
+        assert_eq!(owner_text(plain), plain);
+    }
+
+    /// With the privacy checks off the block offers no *Ask again*, and the
+    /// advice it gave goes with the switch; without the warm-up its report
+    /// does not name the warm-up button.
+    #[test]
+    fn switching_privacy_off_takes_the_ask_again_offer_and_its_advice() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        assert!(access.reset_plan().is_some());
+        assert!(
+            MacosAccess {
+                enabled: false,
+                ..access.clone()
+            }
+            .reset_plan()
+            .is_none()
+        );
+        let report = MacosAccessReset {
+            outcome: ResetOutcome::AllReset,
+            reset: vec![Folder::Documents],
+            declined: Vec::new(),
+        };
+        assert!(macos_access_reset_lines(&report, true)[0].contains("Ask for folder access now"));
+        let partial = MacosAccessReset {
+            outcome: ResetOutcome::Partial,
+            ..report.clone()
+        };
+        assert!(
+            macos_access_reset_lines(&partial, true)[0]
+                .ends_with("Ask for folder access now to let it ask again about those."),
+            "{:?}",
+            macos_access_reset_lines(&partial, true)
+        );
+        assert!(!macos_access_reset_lines(&report, false)[0].contains("Ask for folder access now"));
+
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            state.replace_macos_access(access.clone());
+            state.arm_consent_gestures(ConsentGestures::confirming());
+        }
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_ASK_AGAIN),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert!(state.feedback.is_some());
+        state.replace_macos_access(MacosAccess {
+            enabled: false,
+            ..access
+        });
+        assert_eq!(state.feedback, None, "the advice went with the switch");
+        assert!(
+            state
+                .macos_access_for_test()
+                .is_some_and(|a| a.reset.is_none())
+        );
+
+        // A warm-up pass whose answers differ drops the report, and this
+        // block's line with it; a warm-up-only switch change clears the line.
+        {
+            let mut rows = denied_rows();
+            let denied = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+            state.replace_macos_access(MacosAccess {
+                warmup_rows: rows.clone(),
+                reset: Some(report.clone()),
+                ..denied.clone()
+            });
+            // The warm-up's own line is not the report's, and survives the drop …
+            state.feedback = Some("Asking macOS about the items listed here".to_string());
+            state.macos_access_feedback = state.feedback.clone();
+            state.reset_feedback = Some("the report's line".to_string());
+            let mut changed = rows.clone();
+            changed[1].1 = crate::consent_warmup::WarmupRow::Allowed;
+            state.replace_macos_access(MacosAccess {
+                warmup_rows: changed,
+                ..denied.clone()
+            });
+            assert!(state.feedback.is_some(), "the warm-up's line survives");
+            // … while the report's own line goes with it.
+            state.replace_macos_access(MacosAccess {
+                warmup_rows: rows.clone(),
+                reset: Some(report.clone()),
+                ..denied.clone()
+            });
+            state.feedback = Some("the block's line".to_string());
+            state.macos_access_feedback = state.feedback.clone();
+            state.reset_feedback = state.feedback.clone();
+            rows[0].1 = crate::consent_warmup::WarmupRow::Allowed;
+            state.replace_macos_access(MacosAccess {
+                warmup_rows: rows,
+                ..denied
+            });
+            assert!(
+                state
+                    .macos_access_for_test()
+                    .is_some_and(|a| a.reset.is_none())
+            );
+            assert_eq!(state.feedback, None, "the line went with its report");
+
+            state.feedback = Some("the block's line".to_string());
+            state.macos_access_feedback = state.feedback.clone();
+            state.replace_macos_access(MacosAccess {
+                warmup_offered: false,
+                ..state.macos_access_for_test().cloned().expect("published")
+            });
+            assert_eq!(state.feedback, None, "the warm-up switch took it");
+        }
+
+        // With the warm-up switched to never, a report is kept (its failure
+        // lines are still news) and its advice no longer names the button.
+        let never = MacosAccess {
+            warmup_offered: false,
+            ..access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown)
+        };
+        state.replace_macos_access(MacosAccess {
+            reset: Some(report.clone()),
+            ..never.clone()
+        });
+        state.replace_macos_access(never);
+        let kept = state.macos_access_for_test().cloned().expect("published");
+        assert_eq!(kept.reset, Some(report), "kept across the republish");
+        assert!(
+            macos_access_copy(&kept)
+                .repair
+                .iter()
+                .all(|line| !line.contains("Ask for folder access now")),
+            "worded for the warm-up switch as it is"
+        );
+    }
+
+    /// The *Move to Trash* alert names each copy with control and direction
+    /// characters escaped, so a planted folder name cannot write lines of its
+    /// own into the owner's alert, and one copy reads in the singular.
+    #[test]
+    fn the_trash_alert_escapes_planted_names_and_counts_its_copies() {
+        use aterm_containment::FdaScope;
+        use aterm_containment::consent::{Claimant, Claimants, Enumeration, classify_dr};
+        static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        fn record_no(title: &str, body: &str, _proceed: &str) -> Option<bool> {
+            SEEN.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((title.to_string(), body.to_string()));
+            Some(false)
+        }
+        SEEN.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let planted =
+            "/Users//a/Applications/x\n\u{2028}\u{2029}Nothing leaves this Mac.\u{202E}ppa.app";
+        let dev_id = "designated => identifier \"x\" and anchor apple generic and certificate \
+                      leaf[subject.OU] = \"T\"";
+        let copy = |path: &str, dr_text: &str, running: bool| Claimant {
+            path: std::path::PathBuf::from(path),
+            dr: classify_dr(dr_text),
+            dr_text: dr_text.to_string(),
+            signing: if running { "developer-id" } else { "adhoc" },
+            team: None,
+            running,
+        };
+        let mut access = access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+        access.claimants = Some(Claimants {
+            found: vec![
+                copy("/Applications/aterm.app", dev_id, true),
+                copy(planted, "designated => cdhash H\"aa\"", false),
+            ],
+            enumeration: Enumeration::Complete,
+        });
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            state.replace_macos_access(access.clone());
+            state.arm_consent_gestures(ConsentGestures {
+                confirm: record_no,
+                ..ConsentGestures::inert()
+            });
+        }
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_TRASH),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let seen = SEEN.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(seen.len(), 1);
+        let (title, body) = &seen[0];
+        assert_eq!(title, "Move 1 other copy of aterm to the Trash?");
+        assert_eq!(
+            body,
+            "/Users//a/Applications/x\\u{000A}\\u{2028}\\u{2029}Nothing leaves this Mac.\\u{202E}ppa.app\n\n\
+             It stays in the Trash until you empty it."
+        );
+        assert!(
+            macos_access_copy(&access)
+                .claimants
+                .iter()
+                .all(|line| !line.contains(['\n', '\u{2028}', '\u{2029}', '\u{202E}'])),
+            "the panel rows escape it too"
+        );
+    }
+
     /// A gesture that changes this Mac waits for the owner's yes. With no
-    /// answer (the inert arm: no window, or a control client driving the page
-    /// with `key`) the warm-up, the reset and *Move to Trash* do nothing and say
-    /// so.
+    /// alert to ask in (the inert arm: no window) the warm-up, the reset and
+    /// *Move to Trash* do nothing, say so, and record no decline — a second
+    /// press in the same view says the same, not "you declined".
     #[test]
     fn an_unconfirmed_owner_gesture_changes_nothing() {
         use aterm_containment::FdaScope;
         let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
         access.warmup_rows = denied_rows();
         access.claimants = Some(census_fixture(true));
-        for (action, said) in [
-            (MACOS_ACCESS_WARM_UP, "Nothing was asked."),
-            (MACOS_ACCESS_ASK_AGAIN, "Nothing was changed."),
-            (MACOS_ACCESS_TRASH, "Nothing was moved."),
+        for action in [
+            MACOS_ACCESS_WARM_UP,
+            MACOS_ACCESS_ASK_AGAIN,
+            MACOS_ACCESS_TRASH,
         ] {
+            let said = "Nothing was changed: aterm could not show its question.";
             let (mut runtime, instance, view) = setup();
             {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -24861,11 +26607,261 @@ mod tests {
                 "{action}"
             );
             assert_eq!(state.feedback.as_deref(), Some(said), "{action}");
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(action),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            assert_eq!(
+                state.feedback.as_deref(),
+                Some(said),
+                "{action}: not asked is not a decline, so the next press is not quieted"
+            );
         }
     }
 
-    /// The press records the plan for the host and says what it is doing; with
-    /// nothing to move, or a worker already out, it records nothing.
+    /// A press queued behind an alert the owner said yes to arrives before the
+    /// park drains that request: it is the same gesture already under way, so
+    /// it raises no second alert and says so.
+    #[test]
+    fn a_press_queued_behind_a_confirmed_alert_asks_nothing() {
+        use aterm_containment::FdaScope;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        fn counting_yes(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
+            ASKED.fetch_add(1, Ordering::AcqRel);
+            Some(true)
+        }
+        let mut trash = access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+        trash.claimants = Some(census_fixture(true));
+        let warm_up = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        for (action, access, under_way) in [
+            (MACOS_ACCESS_WARM_UP, warm_up, "already asking"),
+            (MACOS_ACCESS_TRASH, trash, "already moving"),
+        ] {
+            ASKED.store(0, Ordering::Release);
+            let (mut runtime, instance, view) = setup();
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Security);
+                state.replace_macos_access(access);
+                state.arm_consent_gestures(ConsentGestures {
+                    confirm: counting_yes,
+                    ..ConsentGestures::inert()
+                });
+            }
+            for _ in 0..2 {
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new(action),
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+            }
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            assert_eq!(
+                ASKED.load(Ordering::Acquire),
+                1,
+                "{action}: one alert for two presses"
+            );
+            assert!(
+                state
+                    .feedback
+                    .as_deref()
+                    .is_some_and(|line| line.contains(under_way)),
+                "{action}: {:?}",
+                state.feedback
+            );
+            // The park drains the request and publishes. While the work runs
+            // the line stays; once nothing is under way — it ended, or its
+            // start was refused — the line goes with it.
+            let _ = state.take_consent_warmup_request();
+            let _ = state.take_claimant_retire_request();
+            let mut running = state.macos_access.clone().expect("published");
+            running.warmup_live = true;
+            running.retire_live = true;
+            state.replace_macos_access(running.clone());
+            assert!(
+                state
+                    .feedback
+                    .as_deref()
+                    .is_some_and(|line| line.contains(under_way)),
+                "{action}: kept while it runs"
+            );
+            // The OTHER gesture still running does not hold the line up; its
+            // own ending does, and the host is told to draw that.
+            if action == MACOS_ACCESS_WARM_UP {
+                running.retire_live = true;
+                running.warmup_live = false;
+            } else {
+                running.warmup_live = true;
+                running.retire_live = false;
+            }
+            assert!(
+                state.replace_macos_access(running.clone()),
+                "{action}: the line going is a change to draw"
+            );
+            assert_eq!(state.feedback, None, "{action}: gone once it is not");
+            assert!(
+                !state.replace_macos_access(running),
+                "{action}: and nothing more changes"
+            );
+        }
+    }
+
+    /// A warm-up the host could not start says why on the page it was
+    /// confirmed from, and is drawn — the revision moves, since the host wrote
+    /// it outside the reducer. The switch that refused it going off under it
+    /// does not take the reason away, and a view that has left the page gets
+    /// no line at all.
+    #[test]
+    fn a_warm_up_refusal_is_drawn_and_outlasts_the_switch_that_caused_it() {
+        use aterm_containment::FdaScope;
+        let (mut runtime, _instance, view) = setup();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Security);
+        let access = MacosAccess {
+            warmup_offered: true,
+            ..access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown)
+        };
+        state.replace_macos_access(access.clone());
+        state.record_consent_warmup_for_test();
+        assert!(state.take_consent_warmup_request());
+        let revision = state.common.presentation_revision;
+        assert!(state.note_warmup_refused("the warm-up is off"));
+        assert!(state.common.presentation_revision > revision, "drawn");
+        let line = state.feedback.clone();
+        assert_eq!(
+            line.as_deref(),
+            Some("Nothing was asked: the warm-up is off.")
+        );
+        state.replace_macos_access(MacosAccess {
+            enabled: false,
+            warmup_offered: false,
+            ..access
+        });
+        assert_eq!(state.feedback, line, "the reason outlasts the switch");
+        state.navigate(SettingsRoute::Appearance);
+        assert!(!state.note_warmup_refused("the warm-up is off"));
+        assert_eq!(state.feedback, None, "no line on another page");
+    }
+
+    /// A yes in one view is seen by every view before the park takes it up: a
+    /// press queued in ANOTHER Settings view behind that alert raises no second
+    /// alert; once the park settles the yes, a new press asks again.
+    #[test]
+    fn a_press_in_another_view_behind_a_confirmed_alert_asks_nothing() {
+        use aterm_containment::FdaScope;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        fn counting_yes(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
+            ASKED.fetch_add(1, Ordering::AcqRel);
+            Some(true)
+        }
+        let mut trash = access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+        trash.claimants = Some(census_fixture(true));
+        let warm_up = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        for (action, access, under_way) in [
+            (MACOS_ACCESS_WARM_UP, warm_up, "already asking"),
+            (MACOS_ACCESS_TRASH, trash, "already moving"),
+        ] {
+            ASKED.store(0, Ordering::Release);
+            let shared = SharedOwnerQuiet::default();
+            let open_view = || {
+                let (mut runtime, instance, view) = setup();
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Security);
+                state.replace_macos_access(access.clone());
+                state.arm_consent_gestures(ConsentGestures {
+                    confirm: counting_yes,
+                    ..ConsentGestures::inert()
+                });
+                state.arm_owner_quiet(std::sync::Arc::clone(&shared));
+                (runtime, instance, view)
+            };
+            let press = |runtime: &mut NativeRuntime, instance, view| {
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new(action),
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.feedback.clone().unwrap_or_default()
+            };
+            let (mut first, first_instance, first_view) = open_view();
+            let (mut second, second_instance, second_view) = open_view();
+            let _ = press(&mut first, first_instance, first_view);
+            let said = press(&mut second, second_instance, second_view);
+            assert_eq!(ASKED.load(Ordering::Acquire), 1, "{action}: one alert");
+            assert!(said.contains(under_way), "{action}: {said}");
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .settle_confirmed();
+            let _ = press(&mut second, second_instance, second_view);
+            assert_eq!(
+                ASKED.load(Ordering::Acquire),
+                2,
+                "{action}: settled, a new press asks"
+            );
+        }
+    }
+
+    /// A line that goes is a change the host must draw, even when the posture
+    /// published with it is the one already shown — a refused start leaves the
+    /// posture as it was.
+    #[test]
+    fn a_line_that_goes_is_a_change_to_draw() {
+        use aterm_containment::FdaScope;
+        let (mut runtime, _instance, view) = setup();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Security);
+        let access = access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+        state.replace_macos_access(access.clone());
+        state.feedback = Some("aterm is already moving those copies.".to_string());
+        state.retire_feedback = state.feedback.clone();
+        let revision = state.common.presentation_revision;
+        assert!(state.replace_macos_access(access.clone()));
+        assert_eq!(state.feedback, None);
+        assert!(state.common.presentation_revision > revision);
+        assert!(
+            !state.replace_macos_access(access),
+            "and nothing more changes"
+        );
+    }
+
+    /// A confirmed press records the plan for the host and leaves the page-wide
+    /// bar empty (the block's status row reports the move); with nothing to
+    /// move, or a worker already out, it records nothing and says why.
     #[test]
     fn the_trash_press_records_its_plan_once() {
         use aterm_containment::FdaScope;
@@ -24904,8 +26900,8 @@ mod tests {
             )])
         );
         assert_eq!(
-            said.as_deref(),
-            Some("Moving 1 other copy of aterm to the Trash\u{2026}")
+            said, None,
+            "the block's status row says how the move goes, not the page-wide bar"
         );
 
         let (plan, said) = press(MacosAccess {
@@ -25023,6 +27019,10 @@ mod tests {
             .collect()
     }
 
+    /// Unix-only: the fixture's running program is a macOS bundle path, and
+    /// the route quotes the bundle root `app_bundle_root` re-joins from its
+    /// components — with `\` on Windows, where this macOS card is never shown.
+    #[cfg(unix)]
     #[test]
     fn macos_access_recovery_names_the_bundle_without_claiming_adopted_access() {
         let access = access_fixture(
@@ -25428,6 +27428,20 @@ mod tests {
             "neither repair is automatic: {:?}",
             copy.repair
         );
+        // Where *Ask Again* is not offered — here, with the checks off — the
+        // sentence names only the way that is left.
+        let off = MacosAccess {
+            enabled: false,
+            ..access.clone()
+        };
+        assert!(!off.shows_reset_button());
+        let left = macos_access_copy(&off).repair;
+        assert!(
+            left.iter()
+                .any(|line| line.contains("The way out is yours to take in Files & Folders"))
+                && !left.iter().any(|line| line.contains("Both ways")),
+            "{left:?}"
+        );
 
         // Both repairs are drawn, and both are buttons — nothing runs without a
         // press.
@@ -25591,7 +27605,7 @@ mod tests {
             ResetAttempt::from_exit_status(Folder::Desktop, Some(0)),
         ]);
         assert_eq!(all.outcome, ResetOutcome::AllReset);
-        let lines = macos_access_reset_lines(&all);
+        let lines = macos_access_reset_lines(&all, true);
         assert!(lines[0].contains("every folder asked"));
         assert_eq!(lines.len(), 1, "nothing declined, so no failure line");
 
@@ -25601,7 +27615,7 @@ mod tests {
             ResetAttempt::from_exit_status(Folder::Downloads, None),
         ]);
         assert_eq!(partial.outcome, ResetOutcome::Partial);
-        let lines = macos_access_reset_lines(&partial);
+        let lines = macos_access_reset_lines(&partial, true);
         assert!(
             !lines[0].contains("every folder"),
             "a partial success never speaks for the set: {}",
@@ -25618,7 +27632,7 @@ mod tests {
             Some(70),
         )]);
         assert_eq!(none.outcome, ResetOutcome::NoneReset);
-        assert!(macos_access_reset_lines(&none)[0].contains("cleared no saved answer"));
+        assert!(macos_access_reset_lines(&none, true)[0].contains("cleared no saved answer"));
 
         let absent =
             MacosAccessReset::from_attempts(&[ResetAttempt::tool_absent(Folder::Documents)]);
@@ -25632,7 +27646,7 @@ mod tests {
             MacosAccessReset::from_attempts(&[]).outcome,
             ResetOutcome::NotAttempted
         );
-        assert!(macos_access_reset_lines(&MacosAccessReset::from_attempts(&[])).is_empty());
+        assert!(macos_access_reset_lines(&MacosAccessReset::from_attempts(&[]), true).is_empty());
     }
 
     /// The block is absent until the HOST publishes a posture, and the gesture
@@ -25992,6 +28006,40 @@ mod tests {
         );
     }
 
+    /// The children the two ceiling tests below need, spelled per host. Unix
+    /// has `/usr/bin/true`, `/usr/bin/false` and `/bin/sleep`; Windows has no
+    /// `/usr/bin`, so `cmd /c exit <n>` answers the two exit codes and a long
+    /// `ping` is the child that never exits on its own — ONE process, because
+    /// `Child::kill` is `TerminateProcess` on the handle it holds, and a
+    /// `cmd /c` wrapper would die leaving its real sleeper orphaned.
+    fn exiting_child(code: i32) -> std::process::Command {
+        if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/c", &format!("exit {code}")]);
+            cmd
+        } else {
+            std::process::Command::new(if code == 0 {
+                "/usr/bin/true"
+            } else {
+                "/usr/bin/false"
+            })
+        }
+    }
+
+    fn never_exiting_child() -> std::process::Command {
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("ping");
+            cmd.args(["-n", "31", "127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("/bin/sleep");
+            cmd.arg("30");
+            cmd
+        };
+        cmd.stdout(std::process::Stdio::null());
+        cmd
+    }
+
     /// The main thread may never wait on `tccd` without a ceiling. A child that
     /// never exits must be killed, reaped, and reported as a DECLINE — never as
     /// a success, and never as `ToolAbsent` (the tool did run).
@@ -26003,8 +28051,7 @@ mod tests {
     #[test]
     fn a_reset_invocation_can_never_hold_the_main_thread_open_ended() {
         let ceiling = std::time::Duration::from_millis(150);
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
+        let mut child = never_exiting_child()
             .spawn()
             .expect("spawn a child that will not exit on its own");
 
@@ -26016,9 +28063,13 @@ mod tests {
             waited < std::time::Duration::from_secs(5),
             "the bounded wait returned after {waited:?}; it must give up at the ceiling"
         );
+        // Unix: a signalled child has no exit code. Windows: `Child::kill` is
+        // `TerminateProcess(handle, 1)`, so the killed child reports code 1 —
+        // still non-zero, still a decline, never a success.
+        let killed = if cfg!(windows) { Some(1) } else { None };
         assert_eq!(
-            code, None,
-            "a killed child reports no exit code, which folds to a decline"
+            code, killed,
+            "a killed child reports what the host's kill leaves, which folds to a decline"
         );
         // The kill must also REAP: a second wait on a reaped child cannot block.
         assert!(
@@ -26031,14 +28082,10 @@ mod tests {
     /// ceiling is a ceiling, not a delay.
     #[test]
     fn a_prompt_invocation_is_reported_by_its_own_exit_code() {
-        let mut ok = std::process::Command::new("/usr/bin/true")
-            .spawn()
-            .expect("spawn /usr/bin/true");
+        let mut ok = exiting_child(0).spawn().expect("spawn the exit-0 child");
         assert_eq!(wait_bounded(&mut ok, RESET_INVOCATION_CEILING), Some(0));
 
-        let mut bad = std::process::Command::new("/usr/bin/false")
-            .spawn()
-            .expect("spawn /usr/bin/false");
+        let mut bad = exiting_child(1).spawn().expect("spawn the exit-1 child");
         let code = wait_bounded(&mut bad, RESET_INVOCATION_CEILING);
         assert!(matches!(code, Some(n) if n != 0), "got {code:?}");
         assert!(!ResetAttempt::from_exit_status(Folder::Desktop, code).is_reset());
@@ -26062,6 +28109,7 @@ mod tests {
         const RESET_ENTRY_POINTS: &[&str] = &["run_tccutil_reset", "wait_bounded", "ResetPlan"];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut checked = 0usize;
+        let mut saw_app_control = false;
         for entry in std::fs::read_dir(&dir).expect("read aterm-gui/src") {
             let path = entry.expect("dir entry").path();
             let name = path
@@ -26069,10 +28117,14 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if !name.starts_with("control") || !name.ends_with(".rs") {
+            // `app_control.rs` hosts `app act`, the generic semantic-press
+            // dispatcher, so it is scanned beside the control modules.
+            if !(name.starts_with("control") || name == "app_control.rs") || !name.ends_with(".rs")
+            {
                 continue;
             }
             checked += 1;
+            saw_app_control |= name == "app_control.rs";
             let src = std::fs::read_to_string(&path).expect("read a control module");
             for token in RESET_ENTRY_POINTS {
                 assert!(
@@ -26083,9 +28135,10 @@ mod tests {
             }
         }
         assert!(
-            checked >= 2,
-            "expected to scan several control*.rs modules, scanned {checked} — \
-             the fence is vacuous if it matched nothing"
+            saw_app_control && checked >= 3,
+            "expected to scan app_control.rs and several control*.rs modules, scanned \
+             {checked} (app_control.rs: {saw_app_control}) — the fence is vacuous if it \
+             matched nothing"
         );
 
         // And the fence must be checking something real: the control surface
@@ -28090,32 +30143,6 @@ mod tests {
     }
 
     #[test]
-    fn config_patch_is_service_owned_and_survives_view_close() {
-        let (mut runtime, instance, view) = setup();
-        let outcome = runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("settings/set/copy_on_select"),
-                    value: Some(SemanticInput::Bool(true)),
-                }),
-            )
-            .unwrap();
-        let reply = outcome
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                AppEffect::ConfigPatch { reply, .. } => Some(reply.clone()),
-                _ => None,
-            })
-            .expect("config effect");
-        assert!(matches!(reply.work_owner, WorkOwner::Service { .. }));
-        runtime.remove_view(view).unwrap();
-        assert!(runtime.completion_is_current(&reply));
-    }
-
-    #[test]
     fn pointer_activation_opens_choice_surface_then_selection_patches() {
         let (mut runtime, instance, view) = setup();
         let outcome = runtime
@@ -28407,110 +30434,6 @@ mod tests {
         );
     }
 
-    /// THE CAT'S PAGE IS WIRED, NOT DECORATIVE (owner ask, 2026-08-10: "fix the
-    /// settings and add a page for this").
-    ///
-    /// `cursor_trail_style` is a TOP SETTING, so `settings_field_is_visible`
-    /// keeps every ordinary category page from drawing it — which is exactly why
-    /// the Cursor Kitty page owns the row through its showcase card. This proves
-    /// the SAVE rather than the pixels: activating the card's control emits the
-    /// same one atomic `ConfigPatch` the Top Settings trail card does, carrying
-    /// the style AND the `cursor_trail` master, so a chosen cat can never land
-    /// behind an off switch. A test that only asserted the row renders would
-    /// pass for a control wired to nothing — the defect commit 9adbc571 was
-    /// written to end.
-    #[test]
-    fn the_cursor_kitty_page_saves_the_companion_and_arms_the_trail_master() {
-        let (mut runtime, instance, view) = setup();
-        {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.navigate(SettingsRoute::CursorKitty);
-        }
-        let cx = view_cx_at(1_024.0, 768.0);
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        // One row, because there is one: the companion picker is the reason
-        // this page exists. It was a two-row sweep until `cursor_trail_wake_ms`
-        // was retired (2026-09-16).
-        assert!(
-            compiled
-                .semantic(&UiKey::new(format!(
-                    "settings/control/{}",
-                    prefs::EDIT_CURSOR_TRAIL_STYLE
-                )))
-                .is_some(),
-            "the companion picker must paint on the Cursor Kitty page"
-        );
-
-        let outcome = runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
-                    value: Some(SemanticInput::Text(
-                        prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
-                    )),
-                }),
-            )
-            .unwrap();
-        let patch = emitted_config_patch(&outcome);
-        let written = |key: &str| -> Option<String> {
-            patch
-                .edits
-                .iter()
-                .find(|edit| edit.key == key)
-                .unwrap_or_else(|| panic!("{key} is missing from the Cursor Kitty page's patch"))
-                .value
-                .clone()
-        };
-        assert_eq!(
-            written(prefs::EDIT_CURSOR_TRAIL_STYLE).as_deref(),
-            Some(prefs::DEFAULT_CURSOR_TRAIL_STYLE),
-            "the chosen companion is what gets written"
-        );
-        assert_eq!(
-            written(prefs::EDIT_CURSOR_TRAIL).as_deref(),
-            Some("true"),
-            "choosing a cat arms the trail master in the SAME patch"
-        );
-    }
-
-    /// THE RETIRED TYPING-WAKE ROW IS OFF THE KITTY PAGE, AND OFF EVERY OTHER
-    /// ONE. Its predecessor here — `the_rainbow_wake_row_lands_on_the_kitty_page
-    /// _and_reaches_the_glow` — asserted the dial "must arrive at
-    /// `GlowConfig::wake_persist_s` — the field `cursor_glow` reads when it lays
-    /// the typing plume", and it went on passing for ten days after the v2
-    /// rewrite deleted that reader, because arriving at a field is not being
-    /// read. This is the same law pointed the honest way: the key is a RETIRED
-    /// config key, it is not an editable field anywhere, and the Cursor Kitty
-    /// page's content is its showcase card.
-    #[test]
-    fn the_retired_typing_wake_key_is_no_longer_a_settings_row_anywhere() {
-        let retired = crate::native_config_language::retired_config_key("cursor_trail_wake_ms")
-            .expect("the typing-wake dial is a retired config key");
-        assert_eq!(retired.feature, "Rainbow kitty typing wake");
-        assert_eq!(retired.effect_label, "No effect");
-        assert!(crate::native_config_language::is_compatibility_only_key(
-            "cursor_trail_wake_ms"
-        ));
-        assert!(
-            crate::native_config_language::config_schema_entry("cursor_trail_wake_ms").is_none(),
-            "a retired key is not an active Manual schema entry"
-        );
-        assert!(
-            prefs::editable_fields(&Config::default())
-                .iter()
-                .all(|field| field.key != "cursor_trail_wake_ms"),
-            "a retired key must not be an editable row on any page"
-        );
-        assert!(
-            !prefs::VISUAL_PREVIEW_KEYS.contains(&"cursor_trail_wake_ms"),
-            "a preview key must move something on the glass"
-        );
-    }
-
     /// THE CURSOR KITTY PAGE IS ITS SHOWCASE CARD. Retiring the wake dial left
     /// the page with no ordinary registry row at all, and that is correct: the
     /// companion picker is the reason the page exists (`cursor_kitty_card`),
@@ -28518,6 +30441,17 @@ mod tests {
     /// filesystem-backed asset source Manual owns. This pins the shape so the
     /// page can never quietly become empty: the section holds exactly those two
     /// keys, neither paints an ordinary row, and the card paints.
+    ///
+    /// AND THE CARD IS WIRED, NOT DECORATIVE (owner ask, 2026-08-10: "fix the
+    /// settings and add a page for this"). `cursor_trail_style` is a TOP SETTING,
+    /// so `settings_field_is_visible` keeps every ordinary category page from
+    /// drawing it — which is exactly why this page owns the row through its
+    /// showcase card. The tail proves the SAVE rather than the pixels: activating
+    /// the card's control emits the same one atomic `ConfigPatch` the Top Settings
+    /// trail card does, carrying the style AND the `cursor_trail` master, so a
+    /// chosen cat can never land behind an off switch. A test that only asserted
+    /// the row renders would pass for a control wired to nothing — the defect
+    /// commit 9adbc571 was written to end.
     #[test]
     fn the_cursor_kitty_page_is_its_showcase_card() {
         let filed = prefs::VISUAL_PREVIEW_KEYS
@@ -28561,6 +30495,39 @@ mod tests {
                 )))
                 .is_some(),
             "the companion picker is what makes this page non-empty"
+        );
+
+        let outcome = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
+                    value: Some(SemanticInput::Text(
+                        prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
+                    )),
+                }),
+            )
+            .unwrap();
+        let patch = emitted_config_patch(&outcome);
+        let written = |key: &str| -> Option<String> {
+            patch
+                .edits
+                .iter()
+                .find(|edit| edit.key == key)
+                .unwrap_or_else(|| panic!("{key} is missing from the Cursor Kitty page's patch"))
+                .value
+                .clone()
+        };
+        assert_eq!(
+            written(prefs::EDIT_CURSOR_TRAIL_STYLE).as_deref(),
+            Some(prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+            "the chosen companion is what gets written"
+        );
+        assert_eq!(
+            written(prefs::EDIT_CURSOR_TRAIL).as_deref(),
+            Some("true"),
+            "choosing a cat arms the trail master in the SAME patch"
         );
     }
 
@@ -28919,153 +30886,6 @@ mod tests {
                 .is_some(),
             "the window appearance picker keeps its own live specimen"
         );
-    }
-
-    #[test]
-    fn top_window_appearance_override_is_visible_on_cards_previews_and_picker() {
-        const CHILD: &str = "ATERM_SETTINGS_OVERRIDE_STATUS_CHILD";
-        const SCALE: &str = "ATERM_SETTINGS_OVERRIDE_STATUS_SCALE";
-        const EXACT: &str = "native_settings::tests::top_window_appearance_override_is_visible_on_cards_previews_and_picker";
-        if std::env::var_os(CHILD).is_none() {
-            for scale in ["1.0", "1.5", "2.0"] {
-                let status = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", EXACT, "--nocapture"])
-                    .env(CHILD, "1")
-                    .env(SCALE, scale)
-                    .env("RUST_TEST_THREADS", "1")
-                    .status()
-                    .expect("launch isolated window-appearance override audit");
-                assert!(status.success(), "override audit failed at {scale}×");
-            }
-            return;
-        }
-        let scale = std::env::var(SCALE).unwrap().parse::<f32>().unwrap();
-        crate::native_appearance::install_preferences(
-            crate::native_appearance::AppearancePreferences {
-                text_scale: scale,
-                ..crate::native_appearance::current_preferences()
-            },
-        );
-
-        let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.environment_overrides.insert(
-            prefs::EDIT_WINDOW_THEME.to_string(),
-            crate::app_config::ActiveEnvironmentOverride {
-                variable: "ATERM_NO_DARK_CHROME",
-                effective: "auto".to_string(),
-            },
-        );
-        let status_key = UiKey::new("settings/top/environment-override/window-theme");
-        let assert_status = |compiled: &crate::native_ui::CompiledUi, context: &str| {
-            assert_zero_top_paint(compiled, context);
-            let status = compiled
-                .semantic(&status_key)
-                .unwrap_or_else(|| panic!("{context}: missing override status"));
-            assert!(status.label.contains("$ATERM_NO_DARK_CHROME"));
-            assert!(status.label.contains("Preview uses Automatic"));
-            assert!(compiled.paint.iter().any(|node| {
-                node.key.as_str() == "settings/top/environment-override/window-theme/visual"
-                    && matches!(
-                        &node.content,
-                        UiContent::Text(spec)
-                            if spec.text.contains("Automatic")
-                                && (spec.text.contains("ATERM_NO_DARK_CHROME")
-                                    || spec.text.contains("Override"))
-                    )
-            }));
-        };
-
-        for (context, width, height) in [
-            ("wide Top card override", 1_224.0, 722.0),
-            ("compact Top card override", 568.0, 658.0),
-            ("landscape Top card override", 568.0, 320.0),
-        ] {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = 1;
-            let cx = view_cx_at(width, height);
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            assert_status(&compiled, context);
-        }
-
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new(format!("settings/set/{}", prefs::EDIT_WINDOW_THEME)),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        let picker = state.choice_picker.as_mut().unwrap();
-        let dark = picker
-            .options
-            .iter()
-            .position(|option| option.value.as_deref() == Some("dark"))
-            .unwrap();
-        let page_size = picker.page_size.get();
-        picker.offset.set((dark / page_size) * page_size);
-        state.common.last_focus = Some(UiKey::new(format!(
-            "settings/choice/{}/{dark}",
-            prefs::EDIT_WINDOW_THEME
-        )));
-        for (context, width, height) in [
-            ("wide appearance picker override", 1_224.0, 722.0),
-            ("compact appearance picker override", 568.0, 658.0),
-            ("landscape appearance picker override", 568.0, 320.0),
-        ] {
-            let cx = view_cx_at(width, height);
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            assert_status(&compiled, context);
-            assert!(
-                compiled
-                    .semantic(&UiKey::new("settings/top/choice-preview"))
-                    .is_some(),
-                "{context}: override still has live preview evidence",
-            );
-        }
-    }
-
-    #[test]
-    fn view_owned_external_open_goes_stale_when_view_closes() {
-        let (mut runtime, instance, view) = setup();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: route_action(SettingsRoute::About),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let outcome = runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("about/open-site"),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let reply = outcome.effects.iter().find_map(|effect| match effect {
-            AppEffect::OpenExternal { reply, .. } => Some(reply.clone()),
-            _ => None,
-        });
-        if let Some(reply) = reply {
-            assert!(matches!(reply.work_owner, WorkOwner::View { .. }));
-            runtime.remove_view(view).unwrap();
-            assert!(!runtime.completion_is_current(&reply));
-        }
     }
 
     #[test]
@@ -30697,131 +32517,6 @@ mod tests {
         }
     }
 
-    /// VISUAL CAPTURE of Settings ▸ Software Update — the wide and medium workbench, the
-    /// compact page's sections, and the 568x320 landscape host at 2x text where the card
-    /// splits in two, with "Check for updates automatically" on and off — dumped as PNGs
-    /// so the Automatic updates card's two switches can be read as PIXELS, every page the
-    /// pager counts and no more. The `linux-` rows project an enrolled Linux copy
-    /// (`UpdateProjection::linux_host`), so the Linux card's caption and live switches
-    /// can be read on any host — in the Linux ladder's own faces (Noto Sans, else DejaVu
-    /// Sans) where the host can read them, else in its own UI face. Not a gate:
-    /// `#[ignore]`d (it needs a real UI face) and asserted only for "it produced a frame".
-    ///
-    /// ```sh
-    /// SETTINGS_UPDATE_PNG_DIR=/tmp/update ATERM_TEST_LINUX_UI_FONTS=/path/to/noto \
-    ///     targo --unverified test -p aterm-gui --lib \
-    ///     settings_software_update_visual_capture -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "visual capture: needs a system UI face; run with --ignored"]
-    fn settings_software_update_visual_capture() {
-        let dir = std::env::var("SETTINGS_UPDATE_PNG_DIR").map_or_else(
-            |_| std::env::temp_dir().join("settings-update"),
-            std::path::PathBuf::from,
-        );
-        std::fs::create_dir_all(&dir).expect("output dir");
-        let theme = aterm_render::Theme::default();
-        let surface = crate::settings::Roles::from_theme(theme).surface;
-        let restore = crate::native_appearance::current_preferences();
-        // `(running, saved)`: the automatic-checks switch as this process runs it and as
-        // saved; the `-stopping` / `-starting` rows are a saved flip awaiting next launch.
-        for (name, width, height, text_scale, (running, saved), linux) in [
-            ("wide", 1_200.0_f32, 820.0_f32, 1.0_f32, (true, true), false),
-            ("wide-off", 1_200.0, 820.0, 1.0, (false, false), false),
-            ("wide-stopping", 1_200.0, 820.0, 1.0, (true, false), false),
-            ("medium", 849.0, 513.0, 1.0, (true, true), false),
-            ("medium-off", 849.0, 513.0, 1.0, (false, false), false),
-            ("medium-starting", 849.0, 513.0, 1.0, (false, true), false),
-            ("compact", 568.0, 900.0, 1.0, (true, true), false),
-            ("compact-stopping", 568.0, 900.0, 1.0, (true, false), false),
-            ("compact-short", 600.0, 560.0, 1.0, (true, true), false),
-            ("short-starting", 600.0, 560.0, 1.0, (false, true), false),
-            ("landscape-2x", 568.0, 320.0, 2.0, (true, true), false),
-            ("linux-wide-off", 1_200.0, 820.0, 1.0, (false, false), true),
-            ("linux-medium", 849.0, 513.0, 1.0, (true, true), true),
-            ("linux-medium-off", 849.0, 513.0, 1.0, (false, false), true),
-            ("linux-compact", 568.0, 900.0, 1.0, (true, true), true),
-            ("linux-short-off", 600.0, 560.0, 1.0, (false, false), true),
-        ] {
-            crate::native_appearance::install_preferences(
-                crate::native_appearance::AppearancePreferences {
-                    text_scale,
-                    ..restore
-                },
-            );
-            let mut pages = 1;
-            let mut page = 0;
-            while page < pages {
-                let mut status = update_status(false);
-                status.updated_at = "2026-01-01T00:00:00Z".to_string();
-                if linux {
-                    status.linux = Some(aterm_update::LinuxUpdateStatus {
-                        installed_build: 1,
-                        staged_build: None,
-                        staged_version: None,
-                        staged_commit: None,
-                        trial_phase: None,
-                        trial_starts: 0,
-                        trial_healthy: false,
-                    });
-                }
-                let update = UpdateState::from_status(1, "0.1.0", Some(&status), false)
-                    .with_automatic_checks(running, saved);
-                let (mut runtime, instance, view) = setup_with_update(update);
-                if !saved {
-                    replace_settings_source(
-                        &mut runtime,
-                        view,
-                        "[update]\nenabled = false\n".to_string(),
-                    );
-                }
-                {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                        unreachable!();
-                    };
-                    state.navigate(SettingsRoute::SoftwareUpdate);
-                    state.page_scroll = page;
-                }
-                // A `linux-` row measures and paints in the Linux ladder's faces where this
-                // host can read them (`ATERM_TEST_LINUX_UI_FONTS`), else in its own.
-                let cx = if linux {
-                    linux_layout_cx(LinuxLayoutFace::LinuxLadder, width, height)
-                } else {
-                    None
-                }
-                .unwrap_or_else(|| view_cx_at(width, height));
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                // The pager's own count, where the page has one.
-                if compiled.semantic(&UiKey::new("updates/range")).is_some() {
-                    pages = pager_total(&compiled, "updates/range");
-                }
-                let scale = 2.0;
-                let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
-                    &compiled.tray(theme, 13.0).prims,
-                    width as u32,
-                    height as u32,
-                    scale,
-                    [surface[0], surface[1], surface[2], 255],
-                );
-                let mut out = Vec::new();
-                {
-                    let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
-                    enc.set_color(aterm_png::ColorType::Rgba);
-                    enc.set_depth(aterm_png::BitDepth::Eight);
-                    enc.write_header()
-                        .expect("png header")
-                        .write_image_data(&rgba)
-                        .expect("png data");
-                }
-                let path = dir.join(format!("{name}-{page}.png"));
-                std::fs::write(&path, &out).expect("write png");
-                crate::logging::stderr_line!("wrote {} ({pw}x{ph})", path.display());
-                page += 1;
-            }
-        }
-        crate::native_appearance::install_preferences(restore);
-    }
-
     /// ONE "Automatic updates" switch, LIVE (Phase 4; the one-path collapse, 2026-09-23):
     /// `[packages] enabled` off paints the switch off and the service line says nothing
     /// updates by itself — no "next launch", and no retired `auto_update` row beside it
@@ -31325,7 +33020,7 @@ mod tests {
                     assert!(service.starts_with("On \u{2014}"), "{context}: {service}");
                 } else {
                     assert!(
-                        service.contains("Update Now still works"),
+                        service.contains("Check & Update Now still works"),
                         "{context}: {service}"
                     );
                 }
@@ -31940,7 +33635,9 @@ mod tests {
             unreachable!();
         };
         assert!(state.pending.is_empty());
-        assert!(state.feedback.as_deref().unwrap().contains("accepted"));
+        // Admission says nothing in the footer (ruling 265): the card's
+        // headline already says the verb is running.
+        assert_eq!(state.feedback, None);
 
         // Busy with the apply itself: a second press is refused without an effect.
         assert!(runtime.replace_settings_packages(
@@ -32136,7 +33833,9 @@ mod tests {
             unreachable!();
         };
         assert!(state.pending.is_empty());
-        assert!(state.feedback.as_deref().unwrap().contains("accepted"));
+        // Admission says nothing in the footer (ruling 265): the card's
+        // headline already says the verb is running.
+        assert_eq!(state.feedback, None);
 
         // The worker later exits non-zero while status.toml still contains an
         // older success. Typed completion must replace the admission message.
@@ -32147,9 +33846,17 @@ mod tests {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!();
         };
-        assert_eq!(
-            state.feedback.as_deref(),
-            Some("Package check failed: atpkg update exited with status 7")
+        // The failure is the card's headline and detail, not a footer that
+        // repeats them (ruling 265).
+        assert_eq!(state.feedback, None);
+        let card = failed_packages_state().projection();
+        assert_eq!(card.headline, "Package check failed");
+        assert!(
+            card.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("atpkg update exited with status 7")),
+            "{:?}",
+            card.detail
         );
 
         // Busy: the second verb is refused without a second effect.
@@ -32372,8 +34079,9 @@ mod tests {
     /// The program list (§17.2 states verbatim): one flat list with no group headings and
     /// no Install controls — the Extras and Needs-admin groups went with the extras and the
     /// OS-installer protocols (design 2026-09-22 §5.3(b)/(c), 2026-09-24). A vendor row
-    /// names its version and source; a row an older atpkg wrote in a retired spelling
-    /// rides verbatim; and a retired row action id dispatches nothing.
+    /// names its version and source, and a row an older atpkg wrote in a retired
+    /// spelling rides verbatim. (No install id reaches the reducer: its packages arms
+    /// are exact matches and `PackagesRequest` has no install-one variant.)
     #[test]
     fn packages_rows_are_one_list_with_no_install_controls() {
         let mut programs = std::collections::BTreeMap::new();
@@ -32455,41 +34163,6 @@ mod tests {
             packages_program_row_count(&projection, SettingsWidth::Wide),
             lines.len()
         );
-
-        // A retired row action id is no action at all.
-        let (mut runtime, instance, view) = setup();
-        assert!(runtime.replace_settings_packages(state, 2));
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: route_action(SettingsRoute::Packages),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        for id in [
-            "packages/extras/install/vendorx",
-            "packages/admin/install/clt",
-        ] {
-            let out = runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: ActionId::new(id),
-                        value: None,
-                    }),
-                )
-                .unwrap();
-            assert!(
-                !out.effects
-                    .iter()
-                    .any(|effect| matches!(effect, AppEffect::Packages { .. })),
-                "{id}"
-            );
-        }
     }
 
     /// The two switches on the special page are ordinary registry rows: activation
@@ -33381,12 +35054,6 @@ mod tests {
                 .is_some(),
             "the automatic-updates switch is bound to the update.auto_apply leaf"
         );
-        for key in ["updates/detail-card", "updates/process"] {
-            assert!(
-                updates.semantic(&UiKey::new(key)).is_none(),
-                "{key} is retired"
-            );
-        }
 
         let compact = view_cx_at(600.0, 820.0);
         let compact_updates = runtime
@@ -33398,11 +35065,6 @@ mod tests {
             .semantic(&UiKey::new("updates/hero"))
             .unwrap();
         assert!(compact_status.rect.bottom() <= compact.viewport.bottom());
-        assert!(
-            compact_updates
-                .semantic(&UiKey::new("updates/detail-card"))
-                .is_none()
-        );
         // Both controls are small enough to share the first narrow page, so
         // nobody has to page past an empty screen to reach the switch.
         let compact_automatic = compact_updates
@@ -33675,7 +35337,8 @@ mod tests {
         assert!(!caption.label.contains("no effect"));
 
         let mut trial = facts(None);
-        trial.trial_phase = Some("Pending".into());
+        trial.installed_build = 2;
+        trial.trial_phase = Some("Installed".into());
         trial.trial_starts = 1;
         let mut attention = update_status(false);
         attention.linux = Some(facts(None));
@@ -33829,7 +35492,7 @@ mod tests {
 
     /// THE macOS STATUS CARD FITS ITS SECTION BESIDE A FAILED CHECK, UNDER EVERY SWITCH
     /// STATE (2026-09-24 post-push review). The merge fitted the Linux card and left the
-    /// macOS one: at the medium workbench a non-routine "Last check: …" outcome under the
+    /// macOS one: at the medium workbench a non-routine outcome line under the
     /// switch's three-line timing sentence, above the action row and main's Settings ▸
     /// Messages link row, made the card 360pt in a 327pt section — the link button cut
     /// to 23 of its 36pt. The card now steps its outcome, then its detail, down to the
@@ -33957,7 +35620,7 @@ mod tests {
 
     /// A LINUX PAGE IN THE SHORT-LANDSCAPE PAGER STILL PAINTS A FAILED CHECK'S CAUSE
     /// (2026-09-24 post-push review). The full Linux status card carries the updater
-    /// outcome in its detail, so it paints no second "Last check: …" line; but the pager's
+    /// outcome in its detail, so it paints no second outcome line; but the pager's
     /// two-column summary says only "See terminal status", and the outcome's own section
     /// there is the one place the cause paints. The merge had silenced it on every Linux
     /// page.
@@ -34003,7 +35666,7 @@ mod tests {
         assert!(
             painted
                 .iter()
-                .any(|text| text.starts_with("Last check:") && text.contains("503")),
+                .any(|text| text.starts_with("linux-update:") && text.contains("503")),
             "some page of the short-landscape pager paints the failed check's cause: \
              {painted:?}"
         );
@@ -34178,7 +35841,7 @@ mod tests {
                     .semantic(&UiKey::new("updates/automatic/caption"))
                     .expect("the desktop card keeps its caption");
                 assert!(
-                    caption.label.contains("no native updater") && !caption.label.contains("macOS"),
+                    caption.label.contains("do nothing here") && !caption.label.contains("macOS"),
                     "the caption says why the switches are inert, without calling the \
                      updater macOS-only (Linux has one too): {:?}",
                     caption.label
@@ -34259,7 +35922,51 @@ mod tests {
         let projection = UpdateState::from_status(1, "0.1.0", Some(&status), false).projection();
         assert_eq!(
             update_outcome_line(&projection).as_deref(),
-            Some("Last check: no release carries an update manifest")
+            Some("no release carries an update manifest")
+        );
+    }
+
+    /// THE NOTES CARD CLAIMS "NEWEST VERSION" ONLY AFTER A COMPARISON (2026-09-27 audit).
+    /// A stranded machine records zero ledger failures and falls past the failing arm;
+    /// a copy no check has completed on beside "Not checked yet." has compared nothing.
+    /// Neither says "is the newest version". A persistent failure whose checks work (an
+    /// install streak) never says checks can't run. A checked, healthy page still says
+    /// "newest" (the negative control).
+    #[test]
+    fn the_notes_card_says_newest_only_after_a_check() {
+        let notes = |edit: &dyn Fn(&mut aterm_update::UpdateStatus)| {
+            let mut status = update_status(false);
+            status.updated_at = "2026-09-23T12:00:00Z".to_string();
+            edit(&mut status);
+            update_notes_lines(
+                &UpdateState::from_status(1, "0.1.0", Some(&status), false).projection(),
+            )
+            .join(" ")
+        };
+        let only_when_ready = "Release notes appear here when an update is ready.";
+
+        assert_eq!(
+            notes(&|_| {}),
+            "aterm 0.1.0 is the newest version. Notes for the next one appear here when \
+             it\u{2019}s ready."
+        );
+        assert_eq!(notes(&|s| s.channel_unreadable = true), only_when_ready);
+        assert_eq!(notes(&|s| s.updated_at = String::new()), only_when_ready);
+        assert_eq!(
+            notes(&|s| {
+                s.failing_persistent = true;
+                s.failing_kind = "apply".into();
+                s.failing_applies = 3;
+            }),
+            only_when_ready
+        );
+        assert_eq!(
+            notes(&|s| {
+                s.enabled = false;
+                s.updated_at = String::new();
+            }),
+            "Update checks are unavailable for this installation, so no release notes can \
+             be shown."
         );
     }
 
@@ -34359,15 +36066,6 @@ mod tests {
         ] {
             assert!(seen.contains(key), "missing paged Medium update node {key}");
         }
-        for key in [
-            "updates/check",
-            "updates/install-relaunch",
-            "updates/install-when-safe",
-            "updates/detail-card",
-            "updates/process",
-        ] {
-            assert!(!seen.contains(key), "retired Medium update node {key}");
-        }
     }
 
     #[test]
@@ -34456,7 +36154,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        status.outcome = "\t  Update remains ready; the last apply attempt stopped safely because live terminals and visible screens remain attached;\u{2003}\u{2003}review the sessions before retrying the handoff.\n\nThe protected live-PTY and visible-screen handoff keeps every session running until an explicit retry is safe."
+        status.outcome = "\t  The update is still ready; the install stopped: live terminals and visible screens remain attached;\u{2003}\u{2003}review the sessions before retrying the handoff.\n\nThe protected live-PTY and visible-screen handoff keeps every session running until an explicit retry is safe."
             .to_string();
         let expected_outcome = status.outcome.clone();
         let without_whitespace = |text: &str| {
@@ -34565,10 +36263,8 @@ mod tests {
                 outcome_line_keys.len(),
             );
             let painted = without_whitespace(&painted_outcome);
-            let complete = without_whitespace(&format!(
-                "Last check: {}",
-                expected_outcome.split('\n').collect::<Vec<_>>().join(" ")
-            ));
+            let complete =
+                without_whitespace(&expected_outcome.split('\n').collect::<Vec<_>>().join(" "));
             let shown = painted.trim_end_matches('\u{2026}');
             assert!(
                 complete.starts_with(shown) && !shown.is_empty(),
@@ -36478,7 +38174,16 @@ mod tests {
                 )
                 .unwrap();
             let mut about_keys = BTreeSet::new();
-            let about_sections = compact_about_section_count();
+            // The section count is the pager's own, never a hard-coded guess: the
+            // About rows (build, signature, claimant copies) vary by machine.
+            let about_sections = pager_total(
+                &runtime
+                    .render(instance, view, &cx)
+                    .unwrap()
+                    .compile(cx.viewport)
+                    .unwrap(),
+                "about/range",
+            );
             for section in 0..about_sections {
                 let compiled = runtime
                     .render(instance, view, &cx)
@@ -36614,60 +38319,47 @@ mod tests {
                 );
             }
 
-            // Settings ▸ Messages: one section per page, the chips and the
-            // status line in the first, every row reachable, nothing clipped.
+            // Settings ▸ Messages: ONE scrolling list (ruling 264) — the chips
+            // and the status line at its top, every row reachable by the
+            // scroll a screen reader sends the list, nothing clipped.
             let (mut runtime, instance, view) = setup_with_messages();
             let mut messages_keys = BTreeSet::new();
-            let messages_sections = pager_total(
-                &compile_settings_view(&runtime, instance, view, &cx),
-                "settings/messages/range",
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let list = compiled
+                .semantic(&UiKey::new("settings/messages/list"))
+                .expect("the log's list");
+            assert_eq!(
+                list.role,
+                SemanticRole::List,
+                "a list a screen reader scrolls"
             );
             assert!(
-                messages_sections > 1,
-                "forty rows page at {viewport_width}x568"
+                compiled
+                    .semantic(&UiKey::new("settings/messages/pagination"))
+                    .is_none(),
+                "no pager at {viewport_width}x568"
             );
-            for section in 0..messages_sections {
-                let compiled = runtime
-                    .render(instance, view, &cx)
-                    .unwrap()
-                    .compile(cx.viewport)
-                    .unwrap();
-                compiled.validate_parity().unwrap();
-                for node in &compiled.semantics {
-                    if node.key.as_str().starts_with("settings/messages/") {
-                        assert!(
-                            node.rect.bottom() <= cx.viewport.bottom() + 0.01,
-                            "{} is clipped at {viewport_width}x568: {:?}",
-                            node.key.as_str(),
-                            node.rect
-                        );
-                        messages_keys.insert(node.key.as_str().to_string());
+            let views =
+                scroll_messages_through(&mut runtime, instance, view, &cx, 3, |compiled, _| {
+                    compiled.validate_parity().unwrap();
+                    for node in &compiled.semantics {
+                        if node.key.as_str().starts_with("settings/messages/") {
+                            assert!(
+                                node.rect.bottom() <= cx.viewport.bottom() + 0.01,
+                                "{} is clipped at {viewport_width}x568: {:?}",
+                                node.key.as_str(),
+                                node.rect
+                            );
+                            messages_keys.insert(node.key.as_str().to_string());
+                        }
                     }
-                }
-                if section + 1 < messages_sections {
-                    let next = compiled
-                        .hits
-                        .iter()
-                        .find(|hit| hit.key.as_str() == "settings/messages/pagination/next")
-                        .expect("Messages exposes a semantic Next action")
-                        .action
-                        .clone();
-                    runtime
-                        .dispatch(
-                            instance,
-                            view,
-                            AppEvent::Action(ActionInvocation {
-                                id: next,
-                                value: None,
-                            }),
-                        )
-                        .unwrap();
-                }
-            }
+                });
+            assert!(views > 1, "forty rows scroll at {viewport_width}x568");
             for key in [
                 "settings/messages/filter/all",
                 "settings/messages/filter/warn",
-                "settings/messages/filter/tag/config",
+                // On a compact page the tags are one pop-up (ruling 262).
+                "settings/messages/tag-menu",
                 "settings/messages/status",
                 "settings/messages/row/40/title",
                 "settings/messages/row/39/title",
@@ -37162,23 +38854,14 @@ mod tests {
                         "Update missing {key}: {staged} {scale}× {variant}"
                     );
                 }
-                // The retired multi-button, service-card and explainer surfaces
-                // must not come back at any width or Dynamic Type step.
-                for key in [
-                    "updates/check",
-                    "updates/install-relaunch",
-                    "updates/install-when-safe",
-                    "updates/service/service/value",
-                    "updates/service/running/value",
-                    "updates/service/staged/value",
-                    "updates/detail-card",
-                    "updates/process",
-                ] {
-                    assert!(
-                        !keys.contains(key),
-                        "retired Update surface {key} reappeared: {staged} {scale}× {variant}"
-                    );
-                }
+                // The page has ONE button (3c2154ae0, 2026-08-06, retired the
+                // three-button page). `updates/check` is still a live reducer arm
+                // and palette command, so this is the one guard against its
+                // button coming back, at any width or Dynamic Type step.
+                assert!(
+                    !keys.contains("updates/check"),
+                    "the retired Check button reappeared: {staged} {scale}× {variant}"
+                );
             }
 
             // Packages uses the same stable atomic-page contract for status,
@@ -38100,35 +39783,37 @@ mod tests {
         };
 
         // Settings ▸ Messages, its longest entry expanded (the crash record's
-        // absolute path and its second line), through every section.
+        // absolute path and its second line), through every view the list
+        // scrolls through (ruling 264): every chip, row, meta and detail line
+        // fits its box — no renderer text overflow, no semantic node clipped
+        // below the viewport, paint and semantics in parity — and the expanded
+        // entry's detail, action and Copy, and the next entry, are all reached.
         {
             let (mut runtime, instance, view) = setup_with_messages();
             select_message(&mut runtime, instance, view, 40);
-            for page in 0..64 {
-                let compiled = runtime
-                    .render(instance, view, &cx)
-                    .unwrap()
-                    .compile(cx.viewport)
-                    .unwrap();
-                assert_fits(&compiled, &format!("Messages page {}", page + 1));
-                let Some(next) = compiled
-                    .hits
-                    .iter()
-                    .find(|hit| hit.key.as_str() == "settings/messages/pagination/next")
-                    .map(|hit| hit.action.clone())
-                else {
-                    break;
-                };
-                runtime
-                    .dispatch(
-                        instance,
-                        view,
-                        AppEvent::Action(ActionInvocation {
-                            id: next,
-                            value: None,
-                        }),
-                    )
-                    .unwrap();
+            let mut seen = BTreeSet::new();
+            scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
+                compiled.validate_parity().unwrap();
+                assert_fits(compiled, &format!("Messages view {k}"));
+                for node in &compiled.semantics {
+                    if node.key.as_str().starts_with("settings/messages/") {
+                        assert!(
+                            node.rect.bottom() <= cx.viewport.bottom() + 0.01,
+                            "{} is clipped in view {k} at {scale}\u{00d7}: {:?}",
+                            node.key.as_str(),
+                            node.rect
+                        );
+                        seen.insert(node.key.as_str().to_string());
+                    }
+                }
+            });
+            for key in [
+                "settings/messages/row/40/detail/0",
+                "settings/messages/row/40/action/0",
+                "settings/messages/row/40/copy",
+                "settings/messages/row/1/title",
+            ] {
+                assert!(seen.contains(key), "missing {key} at {scale}\u{00d7}");
             }
         }
 
@@ -39445,6 +41130,48 @@ mod tests {
             state.feedback.as_deref(),
             Some("Before it can apply: two sessions are still running")
         );
+        // An install the updater took: the press's line goes with the `Accepted`,
+        // the only completion the request gets — kept, it would still say
+        // "Installing…" above a failed install's headline.
+        let again = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("updates/install-now"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let again_operation = again
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::Update { reply, .. } => Some(reply.operation),
+                _ => None,
+            })
+            .expect("the second press emits a typed updater request");
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view")
+        };
+        assert_eq!(
+            state.feedback.as_deref(),
+            Some("Installing the latest version…")
+        );
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::UpdateFinished {
+                    operation: again_operation,
+                    outcome: UpdateOutcome::Accepted,
+                },
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view")
+        };
+        assert_eq!(state.feedback.as_deref(), None);
 
         // …and with nothing staged the SAME button goes and looks, so the user
         // never has to know which updater stage they are in.
@@ -39495,7 +41222,47 @@ mod tests {
         let Some(AppViewState::Settings(state)) = idle_runtime.view_state(idle_view) else {
             panic!("Settings view")
         };
-        assert_eq!(state.feedback.as_deref(), Some("Update request accepted"));
+        // The check's own headline says it is running and then how it ended: the
+        // footer says nothing (ruling 265).
+        assert_eq!(state.feedback.as_deref(), None);
+
+        // Retry IS a check (`execute_native_update` maps it to one): its press's
+        // "Retrying update…" goes with the `Accepted` too.
+        let retry = idle_runtime
+            .dispatch(
+                idle_instance,
+                idle_view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("updates/retry"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let retry_operation = retry
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::Update { request, reply } => {
+                    assert_eq!(*request, UpdateRequest::Retry);
+                    Some(reply.operation)
+                }
+                _ => None,
+            })
+            .expect("retry emits a typed updater request");
+        idle_runtime
+            .dispatch(
+                idle_instance,
+                idle_view,
+                AppEvent::UpdateFinished {
+                    operation: retry_operation,
+                    outcome: UpdateOutcome::Accepted,
+                },
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = idle_runtime.view_state(idle_view) else {
+            panic!("Settings view")
+        };
+        assert_eq!(state.feedback.as_deref(), None);
     }
 
     #[test]
@@ -39578,7 +41345,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_motion_packages_and_update_copy_has_zero_real_paint_overflow() {
+    fn wide_motion_and_package_copy_has_zero_real_paint_overflow() {
         let cx = view_cx_at(1_200.0, 822.0);
 
         let (mut motion_runtime, motion_instance, motion_view) = setup();
@@ -39639,10 +41406,10 @@ mod tests {
             .expect("complete package consent semantics");
         // Phase 4: the switch is live — "takes effect at once", never "next launch".
         for expected in [
-            "in the background",
+            "Claude Code and Codex",
             "takes effect at once",
+            "Remove ALab Tools",
             "several GB",
-            "where you say yes",
             "next package check",
         ] {
             assert!(consent.label.contains(expected), "{}", consent.label);
@@ -39717,51 +41484,8 @@ mod tests {
             "{}",
             compact_audit.join("\n")
         );
-
-        let status = update_status(false);
-        let update_state = UpdateState::from_status(1, "0.1.0", Some(&status), false);
-        let (mut update_runtime, update_instance, update_view) = setup_with_update(update_state);
-        let Some(AppViewState::Settings(state)) = update_runtime.view_state_mut(update_view) else {
-            unreachable!();
-        };
-        state.navigate(SettingsRoute::SoftwareUpdate);
-        let update = compile_settings_view(&update_runtime, update_instance, update_view, &cx);
-        // Every painted string the simplified Update page authors — the status
-        // card, the one action, the automatic-updates switch row and its
-        // caption, and the release notes — must fit the box it was measured
-        // into. This replaced an audit of the retired "How aterm updates"
-        // explainer, whose three headings and three details were the only copy
-        // on the page dense enough to overflow.
-        let update_audit = update
-            .paint_audit_lines()
-            .into_iter()
-            .filter(|line| line.contains("paint-text key=\"updates/"))
-            .collect::<Vec<_>>();
-        let update_geometry = update
-            .paint
-            .iter()
-            .filter(|node| node.key.as_str().starts_with("updates/"))
-            .map(|node| {
-                format!(
-                    "{} rect={:?} clip={:?}",
-                    node.key.as_str(),
-                    node.rect,
-                    node.clip
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            update_audit.len() >= 5,
-            "the Update page authors status, action, switch and notes copy: {update_audit:?}"
-        );
-        assert!(
-            update_audit
-                .iter()
-                .all(|line| line.contains("overflow=false")),
-            "{}\n{}",
-            update_audit.join("\n"),
-            update_geometry.join("\n")
-        );
+        // The Update page's copy at this width is held — overflow AND clipping —
+        // by `the_update_card_carries_both_switches_and_their_labels_fit`'s wide row.
     }
 
     #[test]
@@ -40658,12 +42382,6 @@ mod tests {
         ] {
             assert!(compiled.semantic(&UiKey::new(key)).is_some(), "{key}");
         }
-        assert!(
-            compiled
-                .semantic(&UiKey::new("settings/home/hero"))
-                .is_none(),
-            "the removed marketing hero is not in the native tree"
-        );
 
         let medium_cx = view_cx_at(900.0, 820.0);
         let medium = runtime
@@ -41997,6 +43715,8 @@ enabled = true
             "trail_sound_bed",
             "trail_sound_riff",
             "bell_sound",
+            // The supervisor's choice chime — a synth voice like the rest.
+            "choice_sound",
             "sparkle_words.profanity.bonk",
             "sparkle_words.profanity.bonk_detonation",
             // PRISM WAKE's output pip — audible, so it owes the same routing.
@@ -42012,7 +43732,7 @@ enabled = true
         // Nothing NON-audible smuggled itself into the routing list.
         assert_eq!(
             prefs::SOUND_MENU_KEYS.len(),
-            10,
+            11,
             "the Sound menu's membership changed: {:?}",
             prefs::SOUND_MENU_KEYS
         );
@@ -42036,6 +43756,8 @@ enabled = true
             prefs::EDIT_TRAIL_SOUND_RIFF,
             prefs::EDIT_SPARKLE_BONK,
             prefs::EDIT_SPARKLE_BONK_DETONATION,
+            // The supervisor's choice chime (the question-policy contract).
+            prefs::EDIT_CHOICE_SOUND,
         ] {
             assert!(
                 shown.contains(&required),
@@ -42194,6 +43916,33 @@ enabled = true
             assert!(!music_off.has_live_effect, "{key}");
         }
 
+        // The CHOICE CHIME is a synth voice under the Music master too
+        // (`App::chose_chime` reads `trail_sounds` before `choice_sound`).
+        // NON-VACUOUS: with the master on, the row carries no such note.
+        let chime_music_off = projected_effect(
+            "trail_sounds = false\n",
+            &[],
+            prefs::EDIT_CHOICE_SOUND,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&chime_music_off, "Music effects is Off"),
+            "{chime_music_off:?}"
+        );
+        assert!(!chime_music_off.has_live_effect);
+        let chime_music_on = projected_effect(
+            "trail_sounds = true\n",
+            &[],
+            prefs::EDIT_CHOICE_SOUND,
+            availability,
+            motion,
+        );
+        assert!(
+            !effect_note_contains(&chime_music_on, "Music effects is Off"),
+            "{chime_music_on:?}"
+        );
+
         // Platform truth: with no audio device the synth voices say so, while
         // the terminal bell — an OS alert sound, not a synth voice — does not.
         let silent = SettingsAvailability {
@@ -42204,6 +43953,11 @@ enabled = true
         assert!(
             effect_note_contains(&muted_riff, "Audio unavailable"),
             "{muted_riff:?}"
+        );
+        let muted_chime = projected_effect("", &[], prefs::EDIT_CHOICE_SOUND, silent, motion);
+        assert!(
+            effect_note_contains(&muted_chime, "Audio unavailable"),
+            "the choice chime is a synth voice: {muted_chime:?}"
         );
         let bell = projected_effect("", &[], prefs::EDIT_BELL_SOUND, silent, motion);
         assert!(
@@ -42241,6 +43995,9 @@ enabled = true
             prefs::EDIT_TRAIL_SOUND_BED,
             prefs::EDIT_TRAIL_SOUND_RIFF,
             prefs::EDIT_BELL_SOUND,
+            // The supervisor's choice chime: `App::chose_chime` reads serious
+            // mode first.
+            prefs::EDIT_CHOICE_SOUND,
             // The bonks take the same note from the keyword-toy branch; pinning
             // them here keeps the BOX's promise whole rather than one branch's.
             prefs::EDIT_SPARKLE_BONK,
@@ -42462,6 +44219,7 @@ enabled = true
         let render = include_str!("app_render.rs");
         let host = include_str!("lib.rs");
         let input = include_str!("app_input.rs");
+        let presence = include_str!("app_presence.rs");
 
         // Precondition: the sources really loaded. An `include_str!` of a
         // renamed file would not compile, but an emptied one would make every
@@ -42543,6 +44301,12 @@ enabled = true
                 &[render][..],
             ),
             (prefs::EDIT_BELL_SOUND, "bell_sound_or_default", &[host][..]),
+            // The supervisor's choice chime (`App::chose_chime`).
+            (
+                prefs::EDIT_CHOICE_SOUND,
+                "choice_sound_or_default",
+                &[presence][..],
+            ),
             // The two BONK keys are `[sparkle_words]` leaves in the FILE but
             // SFX in the UI; their accessors are named after the feature, not
             // the key path.
@@ -42639,6 +44403,21 @@ enabled = true
         assert!(
             gate < fire,
             "`bell_sound` must short-circuit BEFORE the rate limiter consumes a token"
+        );
+        // The CHOICE CHIME's limiter mutates the same way: its switch and the
+        // Music master are read BEFORE its token is spent (the behavioural
+        // proof is `app_presence`'s `a_muted_choice_chime_does_not_spend_its_rate_limit`).
+        let chime = presence
+            .find("fn chose_chime(")
+            .expect("the choice chime moved");
+        let chime_fire = presence[chime..]
+            .find("self.chose_chime_gate.try_fire(now)")
+            .expect("the chime's rate limiter moved; re-locate the gate");
+        let chime_gate = &presence[chime..chime + chime_fire];
+        assert!(
+            chime_gate.contains("choice_sound_or_default")
+                && chime_gate.contains("trail_sounds_or_default"),
+            "`choice_sound` and the Music master must short-circuit BEFORE the chime's token"
         );
 
         // THE TWO PATHS ARE INDEPENDENT — the fact the "Sound" footnote states.
@@ -42758,96 +44537,6 @@ enabled = true
                     .filter_map(SettingsRoute::section)
                     .any(|section| section == prefs::section_of(field.key))
         };
-        let ordinary_count = fields
-            .iter()
-            .filter(|field| ordinary_advanced_field(field))
-            .count();
-        // 2026-07-24 UX audit: +3 on every platform — `cursor_trail_intensity`,
-        // `trail_sound_volume`, `trail_sound_style`. This pin exists to force a
-        // CONSCIOUS decision about the Advanced surface, so: all three already
-        // shipped, all three are consumed by a live subsystem (`cursor_glow`
-        // reads `cfg.intensity`; `trail_audio` reads both sound keys), and all
-        // three were reachable ONLY from Manual. The audit found the owner
-        // filing bugs — "too bright", "too quiet" — that these exact dials
-        // answer. A knob a user cannot find is not restraint; it is a defect.
-        //
-        // THE SOUND MENU (owner ask: "add the volume and SFX menu to settings"):
-        // +5 on every platform, +1 more where the beep exists.
-        //   * `tone_melody`, `trail_sound_bed` — shipped, consumed by
-        //     `app_render`/`app_input` every frame, Manual-only until now;
-        //   * `sparkle_words.profanity.bonk` + `.bonk_detonation` — shipped and
-        //     consumed by `drain_curse_bonk_cues`; they were hidden by the
-        //     blanket keyword-toy rule even though they are SFX, not toy
-        //     internals;
-        //   * `trail_sound_riff` — NEW. The sing-along riff is TIER 5, the
-        //     loudest voice in the engine, and had no switch but the master and
-        //     the master volume;
-        //   * `bell_sound` — NEW, macOS/Windows only. The audible BEL had no key
-        //     at all and is not covered by `trail_sound_volume` (an OS alert
-        //     sound is not a synth voice), so it was the one genuinely
-        //     unreachable sound in the product.
-        //
-        // BOTH NEW KEYS ARE READ AT THEIR CONSUMERS — that is what makes this a
-        // +2 on the surface rather than +2 lies
-        // (`sound_menu_keys_are_read_at_their_consumers`, plus the behavioural
-        // pins `app_render::sing_riff_gain_tests` and
-        // `a_silenced_bell_never_consumes_the_audible_rate_limit_lane`).
-        //
-        // NOT counted, deliberately: `serious_mode`. It is a real gate on every
-        // audible path but a whole-product policy with escape semantics, so it
-        // stays a Top Effect control with its own "Effect policy" box and
-        // reaches this box as a per-row disclosure instead — the reasoning is
-        // recorded in full at `prefs::SOUND_MENU_KEYS`.
-        //
-        // THE RAINBOW WAKE DIAL was +1 on every platform from 2026-08-10 to
-        // 2026-09-16, admitted on "carried every frame through
-        // `GlowConfig::wake_persist_s`" and kept after that stopped being true.
-        // It is retired; the count is one lower on every platform, and the
-        // Cursor Kitty page carries its picker card and nothing else — which
-        // `native_config_language::RETIRED_CONFIG_KEYS` and
-        // `the_cursor_kitty_page_is_its_showcase_card` now say out loud.
-        // THE TYPING-MOMENTUM GLOW (2026-09-08): +1 on every platform. The
-        // owner asked for it by name ("the blinking cursor is annoying, I want
-        // some momentum glow for typing faster that cools down"), it ships
-        // DEFAULT ON, and `cursor_momentum_glow` is read at its consumer every
-        // frame — `app_render`'s cursor-body tick reads
-        // `cursor_momentum_glow_or_default()` — so the switch is a real one,
-        // not a Manual-only expert key. It sits in the Cursor box beside
-        // `cursor_blink`, the row it partly replaces (a warm cursor does not
-        // blink), and is searchable as "blink".
-        // THE [MACHINE] HOST SETTINGS (2026-09-14): +2 on macOS only. The owner
-        // asked for "a settings panel for these checks to show confirmation":
-        // `universal_control` and `spotlight_noindex` are applied by the
-        // co-located atpkg's `machine apply` (as the window opens, by a terminal
-        // session once a day, and at a pass after an edit) and by the Security
-        // page's Apply now, and the page's "This Mac" card confirms what the
-        // machine measured. Both actuate only on macOS (`defaults`, Spotlight),
-        // so elsewhere they stay Modified/Manual-only like `font_thicken`.
-        assert_eq!(
-            ordinary_count,
-            if cfg!(target_os = "macos") {
-                57
-            } else if cfg!(windows) {
-                52
-            } else {
-                50
-            },
-            // +1 on every platform (2026-08-21): allow_osc52_query became an
-            // ordinary Advanced switch when the GUI's clipboard callback
-            // learned to answer authorized queries — a LIVE policy joins the
-            // audited surface; anything still inert belongs in Manual.
-            // +1 on Linux (2026-08-23): `confirm_multiline_paste` stopped being
-            // hidden there when the pastejacking guard grew its in-window
-            // banner (`paste_banner`) — the switch now actuates a real
-            // confirmation on every platform, so it joins the audited surface
-            // instead of the platform-unavailable shelf.
-            // +1 on every platform (2026-08-27): `split_focus_mark`, the mark
-            // that says which pane of a split takes keystrokes. Its consumer is
-            // the split COMPOSITOR, which reads it while seeding the divider
-            // grid on every composed frame, so it is live everywhere a split is
-            // — not an expert knob for Manual.
-            "the audited Advanced surface changed; new expert keys belong in Manual"
-        );
         let ordinary_groups = fields
             .iter()
             .filter(|field| ordinary_advanced_field(field))
@@ -43177,7 +44866,7 @@ enabled = true
         state.environment_overrides.insert(
             prefs::EDIT_FONT_PX.to_string(),
             crate::app_config::ActiveEnvironmentOverride {
-                variable: "ATERM_FONT_PX",
+                variable: "--font-px",
                 effective: "22".to_string(),
             },
         );
@@ -43204,7 +44893,7 @@ enabled = true
                 prefs::EDIT_FONT_PX
             )))
             .unwrap();
-        assert!(control.label.contains("overridden by $ATERM_FONT_PX"));
+        assert!(control.label.contains("overridden by --font-px"));
         assert!(control.label.contains("effective 22"));
         let preview = renderer_preview_spec_for_key_with_font(
             &state,
@@ -43228,7 +44917,7 @@ enabled = true
         runtime_state.environment_overrides.insert(
             prefs::EDIT_FONT_PX.to_string(),
             crate::app_config::ActiveEnvironmentOverride {
-                variable: "ATERM_FONT_PX",
+                variable: "--font-px",
                 effective: "22".to_string(),
             },
         );
@@ -43268,7 +44957,7 @@ enabled = true
         };
         assert_eq!(
             runtime_state.feedback.as_deref(),
-            Some("Saved · $ATERM_FONT_PX remains active (effective 22)")
+            Some("Saved · --font-px remains active (effective 22)")
         );
     }
 
@@ -43284,7 +44973,7 @@ enabled = true
             crate::app_config::ActiveEnvironmentOverride {
                 // A fixture label: no `[packages]` key has a real environment
                 // override (2026-09-23); the disclosure's rendering is the subject.
-                variable: "ATERM_FIXTURE_OVERRIDE",
+                variable: "$ATERM_FIXTURE_OVERRIDE",
                 effective: "machine-owner".to_string(),
             },
         );
@@ -44513,8 +46202,9 @@ enabled = true
         let motion = crate::native_app::ViewMotionCx::default();
         // THE THREE RESOLUTIONS THAT REALLY DO LEAVE A TUNING ROW DARK. An
         // unknown style is NOT among them any more — it resolves to the default
-        // style and renders — so it is asserted separately below and pinned in
-        // full by `an_unknown_trail_style_leaves_the_tuning_rows_live`.
+        // style and renders, so every tuning row stays live and names the
+        // fallback — pinned in full by
+        // `an_unknown_trail_style_leaves_the_tuning_rows_live`.
         let cases = [
             (
                 "cursor_trail = true\ncursor_trail_style = \"pack:missing\"\n",
@@ -44543,22 +46233,6 @@ enabled = true
             );
             assert!(!projected.has_live_effect);
         }
-
-        // An unknown style substitutes the default and DRAWS, so the crown
-        // radius it is tuning is on screen: the row stays live and its note
-        // names the fallback rather than claiming the radius is unregistered.
-        let unknown = projected_effect(
-            "cursor_trail = true\ncursor_trail_style = \"not-a-style\"\n",
-            &[(prefs::EDIT_CURSOR_TRAIL_RADIUS, "1.0")],
-            prefs::EDIT_CURSOR_TRAIL_RADIUS,
-            availability,
-            motion,
-        );
-        assert!(
-            effect_note_contains(&unknown, "this tuning applies to that fallback trail"),
-            "{unknown:?}"
-        );
-        assert!(unknown.has_live_effect, "{unknown:?}");
 
         for (value, expected) in [
             ("not-a-style", "style is unknown"),
@@ -45235,6 +46909,73 @@ enabled = true
         assert!(mixed.suppression_notes.contains(&inactive.feedback));
     }
 
+    /// SETTINGS ▸ HARNESS SPEAKS THE RULE: the row reads `Automatic` while
+    /// every key is at its full-power default, names each written key as the
+    /// limit it is, and `Off` once the switch is — saved or in a pending patch.
+    /// NEGATIVE CONTROL: a written key AT its default limits nothing.
+    #[test]
+    fn the_harness_row_says_automatic_and_names_each_limit() {
+        let words = |source: &str, patch: Option<&ConfigPatch>| {
+            let snapshot = VersionedConfigService::new(source.to_string())
+                .unwrap()
+                .snapshot();
+            let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+            let notes = cross_field_constraints(&state, patch, prefs::EDIT_HARNESS_ENABLED);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert_eq!(notes[0].kind, EffectNoteKind::Constraint);
+            notes[0].visual.clone()
+        };
+        assert_eq!(words("", None), "Automatic");
+        assert_eq!(
+            words(
+                "[harness]\nenabled = true\ncontinue = true\napprove = \"all\"\n",
+                None
+            ),
+            "Automatic",
+            "a key written at its default limits nothing"
+        );
+        assert_eq!(
+            words(
+                "[harness]\napprove = \"safe\"\ncontinue = false\ncontinue_per_hour = 3\n",
+                None
+            ),
+            "Automatic \u{b7} limited: approve: safe \u{b7} continue: off \u{b7} continue_per_hour: 3"
+        );
+        assert_eq!(
+            words("harness.relaunch = false\n", None),
+            "Automatic \u{b7} limited: relaunch: off",
+            "a dotted key at the root is the same table"
+        );
+        assert_eq!(
+            words("[harness]\nenabled = false\n", None),
+            "Off: no agent session is supervised"
+        );
+        let switch_off = ConfigPatch {
+            base_revision: 1,
+            edits: vec![ConfigEdit {
+                key: prefs::EDIT_HARNESS_ENABLED.to_string(),
+                expected: ExpectedConfigValue::Any,
+                value: Some("false".to_string()),
+            }],
+        };
+        assert_eq!(
+            words("[harness]\napprove = \"safe\"\n", Some(&switch_off)),
+            "Off: no agent session is supervised"
+        );
+        let reset = ConfigPatch {
+            base_revision: 1,
+            edits: vec![ConfigEdit {
+                key: "harness.approve".to_string(),
+                expected: ExpectedConfigValue::Any,
+                value: None,
+            }],
+        };
+        assert_eq!(
+            words("[harness]\napprove = \"safe\"\n", Some(&reset)),
+            "Automatic"
+        );
+    }
+
     #[test]
     fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
         let source = "window_padding = 12\nwindow_padding_top = 64\n";
@@ -45415,6 +47156,98 @@ enabled = true
                 ..
             } if key == "matrix_rain.materialize"
         )));
+    }
+
+    /// THE OPT-OUT IS A SWITCH (the harness round-3 review of 2026-09-24,
+    /// major). The owner decision approves every Claude Code permission box
+    /// "unless there is a setting added later by the user explicitly to NOT do
+    /// this", and every shipped surface tells the user to search Settings for
+    /// "approve". From the DEFAULT config (the key absent) that search must
+    /// draw the `harness.approve` row as a native control — and the
+    /// harness master switch with it — not only the Manual count: before the
+    /// fix the row appeared under Modified alone, once the key was already
+    /// written. Negative control: the Manual sweep no longer counts the key
+    /// (a native row and a Manual match for one key would be two answers).
+    /// The question answer (2026-09-25) is a native switch the same way: from
+    /// the default config a search for "question" draws it, its effect is the
+    /// harness runtime, and the Manual sweep does not count it too.
+    #[test]
+    fn a_search_for_question_draws_the_answer_questions_switch() {
+        let key = prefs::EDIT_HARNESS_ANSWER_QUESTIONS;
+        let state = SettingsViewState::new(&Config::default());
+        assert!(!state.is_explicit(key));
+        assert!(settings_field_is_visible(key, false, true));
+        assert!(matches!(
+            native_advanced_effect(key),
+            Some(AdvancedEffectPath::HarnessRuntime)
+        ));
+        assert!(
+            !manual_search_matching_keys(&state, "question")
+                .iter()
+                .any(|k| k == key),
+            "the key is a native row, not a Manual match"
+        );
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text("question".to_string())),
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .expect("a search for \"question\" draws the answer-questions switch");
+        assert!(
+            control
+                .label
+                .contains("Answer questions with the recommended option"),
+            "{}",
+            control.label
+        );
+    }
+
+    #[test]
+    fn a_search_for_approve_draws_the_approve_row() {
+        let state = SettingsViewState::new(&Config::default());
+        assert!(!state.is_explicit(prefs::EDIT_HARNESS_APPROVE));
+        for key in [prefs::EDIT_HARNESS_APPROVE, prefs::EDIT_HARNESS_ENABLED] {
+            assert!(settings_field_is_visible(key, false, true), "{key}");
+            assert!(native_advanced_effect(key).is_some(), "{key}");
+        }
+        assert!(
+            !manual_search_matching_keys(&state, "approve")
+                .iter()
+                .any(|key| key == prefs::EDIT_HARNESS_APPROVE),
+            "the key is a native row, not a Manual match"
+        );
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text("approve".to_string())),
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+        let control = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_HARNESS_APPROVE
+            )))
+            .expect("a search for \"approve\" draws the approve row");
+        assert!(
+            control.label.contains("Approve permission boxes"),
+            "{}",
+            control.label
+        );
     }
 
     #[test]
@@ -45754,53 +47587,6 @@ enabled = true
         }
     }
 
-    #[test]
-    fn native_about_paints_exact_author_and_company_byline_at_every_width() {
-        let (mut runtime, instance, view) = setup();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: route_action(SettingsRoute::About),
-                    value: None,
-                }),
-            )
-            .unwrap();
-
-        for (viewport_width, viewport_height) in [(1_200.0, 820.0), (474.0, 658.0)] {
-            let cx = view_cx_at(viewport_width, viewport_height);
-            let compiled = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
-            let byline = compiled
-                .semantic(&UiKey::new("about/byline"))
-                .expect("native About exposes its attribution semantically");
-            // Author · company · site — where aterm comes from, on the hero itself.
-            let want = format!(
-                "By Andrew Yates \u{00b7} ALab \u{00b7} {}",
-                aterm_types::identity::SITE
-            );
-            assert_eq!(byline.label, want);
-            assert!(compiled.paint.iter().any(|node| {
-                node.key == UiKey::new("about/byline")
-                    && matches!(
-                        &node.content,
-                        UiContent::Text(TextSpec { text, .. })
-                            if *text == want
-                    )
-            }));
-            assert!(
-                compiled
-                    .semantic(&UiKey::new("about/provenance/row/company"))
-                    .is_none(),
-                "company is part of the shared byline, not build metadata"
-            );
-        }
-    }
-
     /// The byline steps down a fixed ladder — author · company · site, then
     /// author · company, then the author, then the author's short form — to the
     /// longest form its hero column really fits, so no width or text scale ever
@@ -46024,6 +47810,38 @@ enabled = true
                 rungs_seen[1] > 0,
                 "the 1× sweep crosses from the whole byline to author and company: {rungs_seen:?}"
             );
+            // The wide window AND the 474pt compact hero (a width the 7.5pt sweep
+            // steps over) paint the WHOLE byline — author · company · site, where
+            // aterm comes from, on the hero itself. Spelled as a literal rather
+            // than read from the constants the ladder is built from, so a reworded
+            // separator or a dropped company fails here. Company is part of that
+            // shared byline, not a build-metadata row.
+            let whole = format!(
+                "By Andrew Yates \u{00b7} ALab \u{00b7} {}",
+                aterm_types::identity::SITE
+            );
+            for (width, height) in [(1_200.0_f32, 820.0_f32), (474.0, 658.0)] {
+                let hero = byline_at(width, height).expect("the About hero paints");
+                let (text, audit, label) = hero.painted.expect("the hero keeps a byline");
+                assert_eq!(text, whole, "{width}x{height}: the whole byline, rung 0");
+                assert_eq!(label.as_deref(), Some(whole.as_str()), "{width}x{height}");
+                assert!(
+                    audit.contains(" overflow=false "),
+                    "{width}x{height}: {audit}"
+                );
+                let cx = view_cx_at(width, height);
+                let compiled = runtime
+                    .render(instance, view, &cx)
+                    .unwrap()
+                    .compile(cx.viewport)
+                    .unwrap();
+                assert!(
+                    compiled
+                        .semantic(&UiKey::new("about/provenance/row/company"))
+                        .is_none(),
+                    "{width}x{height}: company is part of the shared byline, not build metadata"
+                );
+            }
         }
 
         if scale == 2.0 {
@@ -46241,7 +48059,7 @@ enabled = true
         let range = compiled
             .semantic(&UiKey::new("settings/results-range"))
             .expect("search results always disclose their visible window");
-        assert_eq!(range.label, "2 native controls · 6 Manual config keys");
+        assert_eq!(range.label, "2 native controls · 9 Manual config keys");
         // Later pages keep the classic one-result-per-step window (the audit
         // found only page 1 broken).
         runtime
@@ -46541,6 +48359,7 @@ enabled = true
             ],
             log_folder: Some("/Users//w/Library/Logs/aterm".to_string()),
             saved: true,
+            utc_offset_s: 0,
         }
     }
 
@@ -46631,24 +48450,48 @@ enabled = true
         }
     }
 
+    /// THE LOG SCROLLED END TO END (ruling 264): compile the page at `cx`,
+    /// hand each view to `visit` with its index, and scroll `step` entries on
+    /// — the `ScrollLines` the wheel, the arrow keys and a screen reader's
+    /// scroll on the list all send — until the list stops at its end.
+    /// Returns how many views it visited.
+    fn scroll_messages_through(
+        runtime: &mut NativeRuntime,
+        instance: crate::native_app::AppInstanceId,
+        view: crate::native_app::ViewId,
+        cx: &ViewCx<'_>,
+        step: i32,
+        mut visit: impl FnMut(&crate::native_ui::CompiledUi, usize),
+    ) -> usize {
+        for k in 0..600 {
+            let compiled = compile_settings_view(runtime, instance, view, cx);
+            visit(&compiled, k);
+            let before = messages_view_state(runtime, view)
+                .messages_drawn
+                .get()
+                .expect("the render drew a stop");
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(step))
+                .unwrap();
+            if messages_view_state(runtime, view).page_scroll == before {
+                return k + 1;
+            }
+        }
+        panic!("the list never reached its end");
+    }
+
     /// Settings ▸ Messages's TOP switch (design §10.14, ruling 212): "Explain
     /// heavy load" — the registry's `explain_heavy_load` Bool, resolved ON by
     /// default — at its deep-link key, with a visible label the pixel tray
     /// keeps, an accessible name, and the ordinary `settings/set/<key>`
-    /// action, at the top of the wide page and at the end of the compact one
-    /// (whose first section stays the newest messages).
+    /// action, at the top of the page at every width, above the log.
     #[test]
     fn the_messages_page_carries_the_explain_heavy_load_switch() {
         let key = prefs::EDIT_EXPLAIN_HEAVY_LOAD;
         for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
-            let (mut runtime, instance, view) = setup_with_messages();
-            if width < 400.0 {
-                // The compact pager clamps to its last section.
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    panic!("a Settings view");
-                };
-                state.page_scroll = usize::MAX;
-            }
+            // On a compact page the switch heads the list's top and scrolls
+            // away with it (rulings 262 and 264).
+            let (runtime, instance, view) = setup_with_messages();
             let cx = view_cx_at(width, height);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             compiled.validate_parity().unwrap();
@@ -46692,12 +48535,111 @@ enabled = true
                 )),
                 "the label survives lowering into the pixel tray ({at})"
             );
+            // A plain switch: no boxed `On` beside it.
+            assert!(
+                !tray.prims.iter().any(|prim| matches!(
+                    prim,
+                    crate::widget::DrawPrim::Text { s, .. } if s == "On" || s == "Off"
+                )),
+                "no On pill ({at})"
+            );
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new(format!("{MESSAGES_EXPLAIN_LOAD}/caption")))
+                    .map(|node| node.label.as_str()),
+                Some(MESSAGES_EXPLAIN_LOAD_CAPTION),
+                "its one caption line ({at})"
+            );
+            let first_row = compiled
+                .semantics
+                .iter()
+                .filter(|node| node.key.as_str().ends_with("/title"))
+                .find(|node| node.key.as_str().starts_with("settings/messages/row/"))
+                .map(|node| node.rect.y);
+            let row_y = first_row.unwrap_or_else(|| panic!("the log under it ({at})"));
+            assert!(
+                row.rect.bottom() <= row_y,
+                "the switch above the log ({at})"
+            );
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("settings/messages/pagination"))
+                    .is_none(),
+                "no pager ({at})"
+            );
         }
         assert_eq!(
             prefs::section_of(key),
             prefs::Section::Performance,
             "no ordinary page double-lists it; Search and Modified find it"
         );
+    }
+
+    /// A SCREEN READER SCROLLS THE LOG (ruling 264): with no pager, the log's
+    /// card is a `List` carrying accesskit's scroll actions, and a scroll on
+    /// it routes to the same `ScrollLines` the wheel sends — the list moves
+    /// by those entries, and the rows that come into view are disclosure
+    /// buttons named by their titles, as before.
+    #[cfg(a11y_tree)]
+    #[test]
+    fn a_screen_reader_scrolls_the_log_list() {
+        use crate::native_accessibility::{
+            PublishedNativeAccessibility, RoutedAccessibilityAction, project_native_accessibility,
+            route_accessibility_action,
+        };
+        use accesskit::{Action, Role, TreeId};
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+        let list = projection
+            .id_for_key(&UiKey::new("settings/messages/list"))
+            .expect("the list is published");
+        let node = projection
+            .update()
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == list)
+            .map(|(_, node)| node.clone())
+            .expect("the list's node");
+        assert_eq!(node.role(), Role::List);
+        assert_eq!(node.label(), Some("Messages"));
+        assert!(node.supports_action(Action::ScrollDown));
+        assert!(node.supports_action(Action::ScrollUp));
+        let (_, routes) = projection.into_update_and_routes();
+        let published = PublishedNativeAccessibility::new(view, 1, routes);
+        let routed = route_accessibility_action(
+            &published,
+            &accesskit::ActionRequest {
+                action: Action::ScrollDown,
+                target_tree: TreeId::ROOT,
+                target_node: list,
+                data: None,
+            },
+        )
+        .expect("a scroll on the list routes");
+        let RoutedAccessibilityAction::Scroll { lines, .. } = routed else {
+            panic!("{routed:?}");
+        };
+        let before = message_rows(&compiled);
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(lines))
+            .unwrap();
+        let after = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
+        let step = usize::try_from(lines).unwrap();
+        assert_eq!(
+            after[0], before[step],
+            "scrolled {lines} entries: {before:?} → {after:?}"
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let last = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/messages/row/{}/title",
+                after[after.len() - 1]
+            )))
+            .expect("the row scrolled into view");
+        assert_eq!(last.role, SemanticRole::Button);
+        assert_eq!(last.state.and_then(|state| state.expanded), Some(false));
     }
 
     /// The page is the log newest first; the chips are the tags PRESENT, in
@@ -46753,26 +48695,66 @@ enabled = true
         assert_eq!(
             chips(&compiled),
             [
-                ("All".to_string(), true),
-                ("Warnings & errors".to_string(), false),
+                ("All \u{00b7} 40".to_string(), true),
+                ("Problems \u{00b7} 38".to_string(), false),
+                ("All tags".to_string(), true),
                 ("Crashes \u{00b7} 1".to_string(), false),
                 ("Config \u{00b7} 37".to_string(), false),
                 ("Updates \u{00b7} 1".to_string(), false),
                 ("ALab tools \u{00b7} 1".to_string(), false),
             ],
-            "plain chip names (design ruling 66); the action keys keep the tags"
+            "the severity segments, then the tags' plain chip names (rulings 66 and \
+             262); the action keys keep the tags"
         );
-        // The pager scrolls by row and its bound is the entry count — the
-        // one-count law every Settings page keeps.
+        // ONE SCROLLING LIST (ruling 264): no pages and no pager; the
+        // reducer's bound is the stop the list scrolls to, where its view
+        // ends on the oldest entry.
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/messages/pagination"))
+                .is_none()
+                && compiled
+                    .semantic(&UiKey::new("settings/messages/range"))
+                    .is_none(),
+            "no pager"
+        );
+        assert!(
+            shown.len() >= 14,
+            "at least fourteen one-line rows at 1200\u{00d7}820: {}",
+            shown.len()
+        );
+        let limit = messages_view_state(&runtime, view)
+            .result_page_limit
+            .get()
+            .expect("the render bounds the reducer");
         assert_eq!(
-            pager_total(&compiled, "settings/messages/range"),
-            40,
-            "forty rows behind the range pager"
+            limit,
+            40 - shown.len(),
+            "the list scrolls until its oldest entry is its last row"
         );
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.page_scroll = limit;
+        }
+        let end = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
+        assert_eq!(end.last(), Some(&1), "the oldest entry closes the list");
+        assert_eq!(end.len(), shown.len(), "a full view at the end: {end:?}");
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(3))
+            .unwrap();
         assert_eq!(
-            messages_view_state(&runtime, view).result_page_limit.get(),
-            Some(39)
+            messages_view_state(&runtime, view).page_scroll,
+            limit,
+            "never scrolled past its end"
         );
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.page_scroll = 0;
+        }
 
         messages_action(
             &mut runtime,
@@ -46796,11 +48778,30 @@ enabled = true
                 .any(|(label, selected)| label == "Config \u{00b7} 37" && *selected)
         );
 
+        // The severity COMBINES with the tag (ruling 262): config's
+        // warnings, the crash (another tag) out.
         messages_action(
             &mut runtime,
             instance,
             view,
             "settings/messages/filter/warn",
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let shown = message_rows(&compiled);
+        assert_eq!(shown[0], 37, "config's newest warning");
+        assert!(!shown.contains(&40), "the crash is another tag: {shown:?}");
+        assert!(
+            chips(&compiled)
+                .iter()
+                .any(|(label, selected)| label == "Config \u{00b7} 37" && *selected),
+            "the tag stays down"
+        );
+        // Every tag, the severity kept: the warnings set.
+        messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/filter/tags-all",
         );
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let shown = message_rows(&compiled);
@@ -46848,16 +48849,177 @@ enabled = true
                 .map(|node| node.label.as_str()),
             Some(MESSAGES_EMPTY)
         );
-        assert_eq!(
+        // An empty log hides the filters and the count, and has nothing to
+        // copy (ruling 262).
+        assert!(
             compiled
                 .semantic(&UiKey::new("settings/messages/status"))
-                .map(|node| node.label.as_str()),
-            Some("No messages yet")
+                .is_none()
         );
+        assert!(
+            !compiled
+                .semantics
+                .iter()
+                .any(|node| node.key.as_str().starts_with("settings/messages/filter/")),
+            "no filters over nothing"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(MESSAGES_COPY_ALL))
+                .and_then(|node| node.state)
+                .is_some_and(|state| !state.enabled),
+            "Copy All has nothing to copy"
+        );
+        // One subtitle at every width: the package records are listed here.
+        assert_eq!(
+            messages_page_subtitle(SettingsWidth::Medium),
+            messages_page_subtitle(SettingsWidth::Compact)
+        );
+        assert!(!messages_page_subtitle(SettingsWidth::Medium).contains("Packages"));
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/messages/range"))
                 .is_none()
+        );
+    }
+
+    /// THE LOG'S LEAD COLUMN (design ruling 262): every row's title begins at
+    /// the same x — the severity mark, when and the tag's chip name take one
+    /// fixed width, measured once per page — the tag reads as its chip's plain
+    /// words in the page's own face, and a screen reader hears the row's
+    /// severity, chip and time in words, never the wire's.
+    #[test]
+    fn the_log_rows_share_one_lead_column_and_speak_plain_words() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let rows = message_rows(&compiled);
+        assert!(rows.len() >= 14, "{rows:?}");
+        let paint = |key: String| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .unwrap_or_else(|| panic!("{key} paints"))
+                .clone()
+        };
+        let origins: Vec<f32> = rows
+            .iter()
+            .map(|id| paint(format!("settings/messages/row/{id}/label")).rect.x)
+            .collect();
+        assert!(
+            origins.iter().all(|x| (x - origins[0]).abs() < 0.01),
+            "one title origin: {origins:?}"
+        );
+        // The tag as its chip's words, in the body face (never monospace).
+        let tag = paint(format!("settings/messages/row/{}/tag", rows[0]));
+        match &tag.content {
+            UiContent::Text(spec) => {
+                assert_eq!(spec.text, "Crashes");
+                assert_ne!(spec.style, StyleRef::Code);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The severity mark is the band's drawn icon, decorative.
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!(
+                    "settings/messages/row/{}/severity",
+                    rows[0]
+                )))
+                .is_none(),
+            "the mark is paint-only"
+        );
+        let tray = compiled.tray(aterm_render::Theme::default(), 13.0);
+        assert!(
+            tray.prims.iter().any(|prim| matches!(
+                prim,
+                crate::widget::DrawPrim::BandIcon {
+                    icon: aterm_render::BandIcon::Error,
+                    ..
+                }
+            )),
+            "the crash row draws the band's cross"
+        );
+        assert!(
+            tray.prims.iter().any(|prim| matches!(
+                prim,
+                crate::widget::DrawPrim::BandIcon {
+                    icon: aterm_render::BandIcon::Download,
+                    ..
+                }
+            )),
+            "the toolchain row draws its own glyph's icon, as the band does (ruling 263)"
+        );
+        // The description: plain words.
+        let title = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/messages/row/{}/title",
+                rows[0]
+            )))
+            .expect("the title control");
+        assert_eq!(title.state.and_then(|state| state.expanded), Some(false));
+        let described = compiled
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Button(control)
+                    if node.key.as_str() == format!("settings/messages/row/{}/title", rows[0]) =>
+                {
+                    control.spec.description.clone()
+                }
+                _ => None,
+            })
+            .expect("a description");
+        assert!(
+            described.starts_with("Error, Crashes, ") && !described.contains('\u{00b7}'),
+            "{described}"
+        );
+        // The arrow keys move between rows: the focus steps down, and a
+        // step past the view's last row scrolls the list by that one row
+        // (ruling 264).
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.common.last_focus = Some(UiKey::new(format!(
+                "settings/messages/row/{}/title",
+                rows[0]
+            )));
+        }
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
+            .unwrap();
+        assert_eq!(
+            messages_view_state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .map(UiKey::as_str),
+            Some(format!("settings/messages/row/{}/title", rows[1]).as_str())
+        );
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.common.last_focus = Some(UiKey::new(format!(
+                "settings/messages/row/{}/title",
+                rows[rows.len() - 1]
+            )));
+        }
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
+            .unwrap();
+        assert_eq!(
+            messages_view_state(&runtime, view).page_scroll,
+            1,
+            "the list follows the focus by one row"
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            message_rows(&compiled).last(),
+            Some(&(rows[rows.len() - 1] - 1)),
+            "the newly focused row is the view's last"
         );
     }
 
@@ -46868,6 +49030,7 @@ enabled = true
     fn selecting_a_row_expands_its_detail_lines_and_actions() {
         let (mut runtime, instance, view) = setup_with_messages();
         let cx = view_cx();
+        let before = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
         messages_action(
             &mut runtime,
             instance,
@@ -46886,19 +49049,34 @@ enabled = true
                 .map(|node| node.label.clone())
                 .unwrap_or_else(|| panic!("{key} renders"))
         };
-        assert!(
+        // A DISCLOSURE (ruling 262): expanded, never `selected`.
+        let title = compiled
+            .semantic(&UiKey::new("settings/messages/row/39/title"))
+            .and_then(|node| node.state)
+            .expect("the title is the disclosure control");
+        assert_eq!(title.expanded, Some(true));
+        assert!(!title.selected);
+        assert_eq!(
             compiled
-                .semantic(&UiKey::new("settings/messages/row/39/title"))
+                .semantic(&UiKey::new("settings/messages/row/40/title"))
                 .and_then(|node| node.state)
-                .is_some_and(|state| state.selected),
-            "the title is the select control, and it is selected"
+                .and_then(|state| state.expanded),
+            Some(false),
+            "a closed entry says so"
         );
+        // The meta line: the reader's local time and the state; the lead
+        // column already says the tag and the severity.
         let meta = label("settings/messages/row/39/meta/0");
         assert!(
-            meta.starts_with(
-                "Updates \u{00b7} Done \u{00b7} 2025-09-21 15:51:20 UTC \u{00b7} waiting to show"
-            ),
+            meta.ends_with("3:51:20 PM \u{00b7} waiting to show") && !meta.contains("UTC"),
             "{meta}"
+        );
+        // The page's bounds do not move: the same entries, the open one grown.
+        let after = message_rows(&compiled);
+        assert_eq!(after.first(), before.first(), "{before:?} → {after:?}");
+        assert!(
+            after.iter().all(|id| before.contains(id)),
+            "{before:?} → {after:?}"
         );
         assert_eq!(
             label("settings/messages/row/39/detail/0"),
@@ -46918,7 +49096,8 @@ enabled = true
         );
         assert_eq!(
             label("settings/messages/row/39/action/1"),
-            "Software Update"
+            "Open Software Update",
+            "a destination reads as where it goes (ruling 262)"
         );
         assert!(enabled("settings/messages/row/39/action/1"));
         assert_eq!(label("settings/messages/row/39/copy"), "Copy");
@@ -47012,6 +49191,20 @@ enabled = true
             )
             .unwrap();
         let cx = view_cx();
+        // A diagram is TECHNICAL whole (ruling 262): its rows are the entry's
+        // technical-details lines, in the small monospace.
+        let painted_code = |compiled: &crate::native_ui::CompiledUi, id: u64| {
+            let prefix = format!("settings/messages/row/{id}/code/");
+            compiled
+                .paint
+                .iter()
+                .filter(|node| node.key.as_str().starts_with(prefix.as_str()))
+                .map(|node| match &node.content {
+                    UiContent::Text(spec) => (spec.text.clone(), spec.style),
+                    other => panic!("{prefix} paints something other than text: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
         let painted_detail = |compiled: &crate::native_ui::CompiledUi, id: u64| {
             let prefix = format!("settings/messages/row/{id}/detail/");
             compiled
@@ -47027,13 +49220,17 @@ enabled = true
         select_message(&mut runtime, instance, view, 41);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         compiled.validate_parity().unwrap();
-        let rows = painted_detail(&compiled, 41);
+        let rows = painted_code(&compiled, 41);
         assert_eq!(
             rows.iter()
                 .map(|(text, _)| text.clone())
                 .collect::<Vec<_>>(),
             msg.detail,
             "row for row, none reflowed or trimmed"
+        );
+        assert!(
+            painted_detail(&compiled, 41).is_empty(),
+            "no prose sentence"
         );
         assert!(rows.iter().any(|(text, _)| *text == caret), "{rows:?}");
         assert!(
@@ -47056,9 +49253,9 @@ enabled = true
             "{prose:?}"
         );
         // Too narrow for the row: CUT, the pieces joining back to it.
-        let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Code);
+        let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Code);
         let long = format!("{caret}{}", " here".repeat(40));
-        let pieces = cut_code_lines(&long, 120.0);
+        let pieces = messages_cut_code(&long, 120.0);
         assert!(pieces.len() > 1, "{pieces:?}");
         assert_eq!(pieces.concat(), long);
         assert!(pieces[0].starts_with(char::is_whitespace), "{pieces:?}");
@@ -47069,12 +49266,59 @@ enabled = true
         }
     }
 
-    /// THE DEEP LINK (design §4.5): `settings/messages/select` expands the
-    /// entry, drops a chip that would hide it, and pages to it — by row on
-    /// the wide page, by section on a compact one, where the section is the
-    /// one the render seats the entry in.
+    /// THE DEEP LINK MEASURES THE LIST IT LEAVES (rulings 263 and 264): a
+    /// chip showing one entry is a list of one, which never scrolls; a reveal
+    /// that drops the chip lands by the whole log's list, so an entry deep in
+    /// it is on the reader's screen, open — the stale list would land it at
+    /// the top, where it is not.
     #[test]
-    fn the_deep_link_selects_and_pages_to_the_entry() {
+    fn the_deep_link_lands_by_the_filter_it_leaves() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx();
+        messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/filter/tag/crash",
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            messages_view_state(&runtime, view).result_page_limit.get(),
+            Some(0),
+            "a list of one never scrolls"
+        );
+        // Entries run newest first: id 5 is the thirty-sixth row.
+        select_message(&mut runtime, instance, view, 5);
+        let top = {
+            let state = messages_view_state(&runtime, view);
+            assert!(state.messages_filter.is_all(), "the chip is dropped");
+            state.page_scroll
+        };
+        assert!(top > 0, "landed deep in the whole log, not at its top");
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert!(
+            message_rows(&compiled).contains(&5),
+            "entry 5 is on the screen: {:?}",
+            message_rows(&compiled)
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/messages/row/5/detail/0"))
+                .is_some(),
+            "expanded"
+        );
+    }
+
+    /// THE DEEP LINK (design §4.5; ruling 264): `settings/messages/select`
+    /// expands the entry, drops a chip that would hide it, and LANDS on it —
+    /// the list stays where the entry is already on the screen, else scrolls
+    /// it to the top as far as the list scrolls — on the wide page and on a
+    /// compact one, whose header scrolls away with the list. A link that
+    /// comes before any render (a Settings view opened for it) is landed by
+    /// that render, and the list moves on from where it drew.
+    #[test]
+    fn the_deep_link_selects_and_lands_on_the_entry() {
         let (mut runtime, instance, view) = setup_with_messages();
         let cx = view_cx();
         let _ = compile_settings_view(&runtime, instance, view, &cx);
@@ -47092,17 +49336,25 @@ enabled = true
                 state.messages_filter.is_all(),
                 "the config chip would have hidden the crash: dropped"
             );
-            assert_eq!(state.page_scroll, 0, "the newest entry heads the page");
+            assert_eq!(
+                state.page_scroll, 0,
+                "the newest entry is on the first screen"
+            );
         }
         select_message(&mut runtime, instance, view, 5);
-        assert_eq!(
-            messages_view_state(&runtime, view).page_scroll,
-            35,
-            "entry 5 is the thirty-sixth row: the page scrolls to it"
-        );
+        let (top, limit) = {
+            let state = messages_view_state(&runtime, view);
+            (state.page_scroll, state.result_page_limit.get())
+        };
+        assert!(top > 0);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         compiled.validate_parity().unwrap();
-        assert_eq!(message_rows(&compiled)[0], 5, "…and it heads the page");
+        let rows = message_rows(&compiled);
+        assert!(rows.contains(&5), "…and it is on the screen: {rows:?}");
+        assert!(
+            rows.first() == Some(&5) || rows.last() == Some(&1),
+            "at the top of the list, or the list at its end: {rows:?} ({top} of {limit:?})"
+        );
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/messages/row/5/detail/0"))
@@ -47112,29 +49364,30 @@ enabled = true
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/messages/range"))
-                .is_some_and(|node| node.label.starts_with("36\u{2013}")),
-            "the pager says where the page is"
+                .is_none(),
+            "no pager says where: the list is where it is"
         );
-        // An id the ring no longer holds: selected, the page at its top.
+        // An id the ring no longer holds: selected, the list at its top.
         select_message(&mut runtime, instance, view, 999);
         let state = messages_view_state(&runtime, view);
         assert_eq!(state.messages_selected, Some(999));
         assert_eq!(state.page_scroll, 0);
 
-        // Compact: sections. The render records how it seats the rows; the
-        // link pages to the section the entry lands in, and the next render
-        // shows it there, expanded.
+        // Compact: the header scrolls with the list; the link lands the entry
+        // on the screen, open.
         let (mut runtime, instance, view) = setup_with_messages();
         let cx = view_cx_at(320.0, 568.0);
         let _ = compile_settings_view(&runtime, instance, view, &cx);
         select_message(&mut runtime, instance, view, 5);
-        let section = messages_view_state(&runtime, view).page_scroll;
-        assert!(section > 0, "entry 5 is deep in the log");
+        assert!(
+            messages_view_state(&runtime, view).page_scroll > 0,
+            "entry 5 is deep in the log"
+        );
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         compiled.validate_parity().unwrap();
         assert!(
             message_rows(&compiled).contains(&5),
-            "the section holding the entry: {:?}",
+            "the view holding the entry: {:?}",
             message_rows(&compiled)
         );
         assert!(
@@ -47142,11 +49395,39 @@ enabled = true
                 .semantic(&UiKey::new("settings/messages/row/5/detail/0"))
                 .is_some()
         );
-        assert!(
-            compiled
-                .semantic(&UiKey::new("settings/messages/range"))
-                .is_some_and(|node| node.label.starts_with(&format!("Page {} of ", section + 1))),
-        );
+
+        // Before any render: the render lands it, and the next scroll moves
+        // on from the stop it drew.
+        for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
+            let (mut runtime, instance, view) = setup_with_messages();
+            select_message(&mut runtime, instance, view, 5);
+            assert!(
+                messages_view_state(&runtime, view).messages_reveal,
+                "no render has measured the page yet"
+            );
+            let cx = view_cx_at(width, height);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            assert!(
+                message_rows(&compiled).contains(&5),
+                "{width}: the first render lands it: {:?}",
+                message_rows(&compiled)
+            );
+            let drawn = messages_view_state(&runtime, view)
+                .messages_drawn
+                .get()
+                .expect("the render drew a stop");
+            assert!(drawn > 0, "{width}");
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(-1))
+                .unwrap();
+            let state = messages_view_state(&runtime, view);
+            assert!(!state.messages_reveal, "{width}: adopted");
+            assert_eq!(
+                state.page_scroll,
+                drawn - 1,
+                "{width}: one up from the drawn stop"
+            );
+        }
     }
 
     /// The page names an entry and a button by IDENTITY (design §4.4): the
@@ -47438,86 +49719,344 @@ enabled = true
         );
     }
 
-    /// The exact phone page at 2× Dynamic Type, the crash entry expanded:
-    /// every chip, row, meta and detail line fits its box through every
-    /// section — no renderer text overflow, nothing clipped.
+    /// ROUND 16, DAY TWO (ruling 267): Page Down on the compact category list
+    /// moved a fixed eight rows through a list that shows six — `1–6`, `9–14`,
+    /// `17–17` — so Packages and Messages were never shown. It moves by the
+    /// page shown now: every category is seen, no page skips one, and Page Up
+    /// comes back the same way.
     #[test]
-    fn messages_page_rows_fit_at_286x558_at_2x() {
-        const CHILD: &str = "ATERM_SETTINGS_MESSAGES_PHONE_CHILD";
-        const EXACT: &str = "native_settings::tests::messages_page_rows_fit_at_286x558_at_2x";
-        if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", EXACT, "--nocapture"])
-                .env(CHILD, "1")
-                .env("RUST_TEST_THREADS", "1")
-                .status()
-                .expect("launch isolated 2× Messages audit");
-            assert!(status.success(), "Messages phone audit failed at 2×");
-            return;
-        }
-        crate::native_appearance::install_preferences(
-            crate::native_appearance::AppearancePreferences {
-                text_scale: 2.0,
-                ..crate::native_appearance::current_preferences()
-            },
-        );
-        let cx = view_cx_at(286.5, 558.0);
-        let (mut runtime, instance, view) = setup_with_messages();
-        select_message(&mut runtime, instance, view, 40);
-        let mut seen = BTreeSet::new();
-        for page in 0..64 {
+    fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
+        let (mut runtime, instance, view) = setup();
+        let cx = view_cx_at(474.0, 572.0);
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.compact_navigation = true;
+        let shown = |compiled: &crate::native_ui::CompiledUi| -> Vec<usize> {
+            SettingsRoute::ALL
+                .iter()
+                .enumerate()
+                .filter(|(_, route)| {
+                    compiled
+                        .semantic(&UiKey::new(format!("settings/categories{}", route.path())))
+                        .is_some()
+                })
+                .map(|(k, _)| k)
+                .collect()
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pages = Vec::new();
+        for _ in 0..SettingsRoute::ALL.len() {
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            compiled.validate_parity().unwrap();
-            let audit = compiled.paint_audit_lines();
-            let overflow = audit
-                .iter()
-                .filter(|line| line.contains("overflow=true"))
-                .cloned()
-                .collect::<Vec<_>>();
-            assert!(
-                overflow.is_empty(),
-                "Messages page {} at 2\u{00d7} has renderer text overflow:\n{}",
-                page + 1,
-                overflow.join("\n")
-            );
-            for node in &compiled.semantics {
-                if node.key.as_str().starts_with("settings/messages/") {
-                    assert!(
-                        node.rect.bottom() <= cx.viewport.bottom() + 0.01,
-                        "{} is clipped on page {}: {:?}",
-                        node.key.as_str(),
-                        page + 1,
-                        node.rect
-                    );
-                    seen.insert(node.key.as_str().to_string());
-                }
-            }
-            let Some(next) = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str() == "settings/messages/pagination/next")
-                .map(|hit| hit.action.clone())
-            else {
+            let rows = shown(&compiled);
+            assert!(!rows.is_empty());
+            seen.extend(rows.iter().copied());
+            let last = *rows.last().unwrap();
+            pages.push(rows);
+            if last + 1 == SettingsRoute::ALL.len() {
                 break;
-            };
+            }
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollPage(1))
+                .unwrap();
+        }
+        assert!(
+            pages[0].len() < SettingsRoute::ALL.len(),
+            "the list pages at this size"
+        );
+        assert_eq!(
+            seen.len(),
+            SettingsRoute::ALL.len(),
+            "every category shown: {pages:?}"
+        );
+        for pair in pages.windows(2) {
+            assert!(
+                pair[1][0] <= pair[0].last().unwrap() + 1,
+                "no category skipped between pages: {pages:?}"
+            );
+        }
+        // Page Up walks back to the top.
+        for _ in 0..pages.len() {
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollPage(-1))
+                .unwrap();
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(shown(&compiled), pages[0]);
+    }
+
+    /// ROUND 16 REVIEW (ruling 267): a page that shows ONE section per page —
+    /// the compact Packages pages, About's sections — indexes `page_scroll` by
+    /// page, and Page Down still moved it eight: from page 1 of 13 on the
+    /// compact Packages page it landed on page 9. Every Page Down now turns
+    /// one page, and Page Up turns it back.
+    #[test]
+    fn page_keys_turn_one_page_on_pages_that_show_one_section() {
+        for (route, status_key) in [
+            (SettingsRoute::Packages, "packages/range"),
+            (SettingsRoute::About, "about/range"),
+        ] {
+            let (mut runtime, instance, view) = setup();
+            assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(route);
+            }
+            let cx = view_cx_at(474.0, 320.0);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let total = pager_total(&compiled, status_key);
+            assert!(total > 2, "{route:?} pages at this size: {total}");
+            let page = |runtime: &NativeRuntime| messages_view_state(runtime, view).page_scroll;
+            for expected in 1..total {
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollPage(1))
+                    .unwrap();
+                assert_eq!(
+                    page(&runtime),
+                    expected,
+                    "{route:?}: Page Down turns one page"
+                );
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                assert_eq!(pager_total(&compiled, status_key), total);
+            }
+            for expected in (0..total - 1).rev() {
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollPage(-1))
+                    .unwrap();
+                assert_eq!(
+                    page(&runtime),
+                    expected,
+                    "{route:?}: Page Up turns one back"
+                );
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+            }
+        }
+    }
+
+    /// ROUND 16, DAY TWO (ruling 267): on the compact page the header scrolls
+    /// away with the log, and Down on a filter chip scrolled it — the chip
+    /// left the tree and the keyboard with it (no focused node, no ring). The
+    /// keyboard is on a control the page SHOWS after every step, and moves
+    /// into the list when its control scrolls away.
+    #[test]
+    fn the_keyboard_never_scrolls_away_with_the_compact_header() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx_at(474.0, 572.0);
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new("settings/messages/filter/all"))),
+            )
+            .unwrap();
+        let mut reached_a_row = false;
+        for step in 0..12 {
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(1))
+                .unwrap();
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let focus = messages_view_state(&runtime, view)
+                .common
+                .last_focus
+                .clone()
+                .expect("a focused control");
+            assert!(
+                compiled.semantic(&focus).is_some(),
+                "step {step}: the focused {focus:?} is on the page"
+            );
+            reached_a_row |= focus.as_str().starts_with("settings/messages/row/");
+        }
+        assert!(reached_a_row, "the keyboard went into the list");
+    }
+
+    /// ROUND 16, DAY TWO (ruling 267): Left and Right on the severity
+    /// segments did nothing. They move between `All` and `Problems` and press
+    /// the one they land on.
+    #[test]
+    fn left_and_right_move_between_the_severity_segments() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx_at(474.0, 572.0);
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new("settings/messages/filter/all"))),
+            )
+            .unwrap();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Right { extend: false }),
+            )
+            .unwrap();
+        let state = messages_view_state(&runtime, view);
+        assert!(state.messages_filter.warn_only, "Problems is down");
+        assert_eq!(
+            state.common.last_focus.as_ref().map(UiKey::as_str),
+            Some("settings/messages/filter/warn")
+        );
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Left { extend: false }),
+            )
+            .unwrap();
+        let state = messages_view_state(&runtime, view);
+        assert!(!state.messages_filter.warn_only, "All is down again");
+        assert_eq!(
+            state.common.last_focus.as_ref().map(UiKey::as_str),
+            Some("settings/messages/filter/all")
+        );
+    }
+
+    /// ROUND 16, DAY TWO (ruling 267): `Copied` stood on the page for five
+    /// minutes and across filters. The next action on the page clears it, and
+    /// so does the first projection five seconds after one has seen it; a
+    /// copy of the shown messages says `Copied`, never the About page's
+    /// `Build information copied`.
+    #[test]
+    fn the_messages_pages_confirmation_is_transient() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let copy = |runtime: &mut NativeRuntime| {
+            let effects = messages_action(runtime, instance, view, "settings/messages/copy-all");
+            let operation = effects
+                .iter()
+                .find_map(|effect| match effect {
+                    AppEffect::Clipboard { reply, .. } => Some(reply.operation),
+                    _ => None,
+                })
+                .expect("one clipboard effect");
             runtime
                 .dispatch(
                     instance,
                     view,
-                    AppEvent::Action(ActionInvocation {
-                        id: next,
-                        value: None,
-                    }),
+                    AppEvent::ClipboardFinished {
+                        operation,
+                        outcome: ClipboardOutcome::Copied,
+                    },
                 )
                 .unwrap();
+        };
+        copy(&mut runtime);
+        assert_eq!(
+            messages_view_state(&runtime, view).feedback.as_deref(),
+            Some("Copied")
+        );
+        // The next action says its own words or none.
+        let _ = messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/filter/warn",
+        );
+        assert_eq!(messages_view_state(&runtime, view).feedback, None);
+        // Left alone: the projection that first sees it starts the clock, one
+        // five seconds on clears it.
+        copy(&mut runtime);
+        let publish = |runtime: &mut NativeRuntime, now: u64, revision: u64| {
+            let mut state = sample_messages();
+            state.now_unix_ms = now;
+            state.revision = revision;
+            assert!(runtime.replace_settings_messages(state, revision));
+            runtime
+                .dispatch(instance, view, AppEvent::MessagesChanged { revision })
+                .unwrap();
+        };
+        let base = sample_messages().now_unix_ms;
+        publish(&mut runtime, base + 60_000, 8);
+        assert_eq!(
+            messages_view_state(&runtime, view).feedback.as_deref(),
+            Some("Copied"),
+            "the first projection only starts the clock"
+        );
+        publish(&mut runtime, base + 62_000, 9);
+        assert!(messages_view_state(&runtime, view).feedback.is_some());
+        publish(&mut runtime, base + 65_000, 10);
+        assert_eq!(messages_view_state(&runtime, view).feedback, None);
+    }
+
+    /// ROUND 16, DAY TWO (ruling 267): every script tag is a filter, and a
+    /// wider page lays its tags out as chips — seven script tags made three
+    /// lines of them. Past two lines the page takes the `Tag: …` pop-up, which
+    /// holds any number; the fixture's four tags stay chips.
+    #[test]
+    fn a_wide_pages_tags_move_to_the_pop_up_past_two_lines() {
+        let cx = view_cx_at(760.0, 820.0);
+        let (runtime, instance, view) = setup_with_messages();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/messages/filter/tag/config"))
+                .is_some(),
+            "four tags are chips"
+        );
+        assert!(compiled.semantic(&UiKey::new(MESSAGES_TAG_MENU)).is_none());
+        let (mut runtime, instance, view) = setup_with_messages();
+        let mut state = sample_messages();
+        for k in 0..12u64 {
+            let mut entry = state.entries[3].clone();
+            entry.id = 100 + k;
+            entry.tag = format!("feed{k}");
+            state.entries.insert(0, entry);
+            state.tags.push((format!("feed{k}"), 1));
         }
-        for key in [
-            "settings/messages/row/40/detail/0",
-            "settings/messages/row/40/action/0",
-            "settings/messages/row/40/copy",
-            "settings/messages/row/1/title",
-        ] {
-            assert!(seen.contains(key), "missing {key} at 2\u{00d7}");
+        assert!(runtime.replace_settings_messages(state, 8));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled.semantic(&UiKey::new(MESSAGES_TAG_MENU)).is_some(),
+            "the pop-up holds sixteen tags"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/messages/filter/tag/feed0"))
+                .is_none(),
+            "no chip wall"
+        );
+    }
+
+    /// ROUND 16, DAY TWO (ruling 267): a row's description (`Error, Crashes,
+    /// …`) and its disclosure state reached no observer but the paint node —
+    /// not the accessibility projection, not `inspect … tree`. Both carry
+    /// them now.
+    #[test]
+    fn a_rows_description_and_disclosure_reach_every_observer() {
+        let (runtime, instance, view) = setup_with_messages();
+        let cx = view_cx_at(1_200.0, 820.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let title = compiled
+            .semantic(&UiKey::new("settings/messages/row/40/title"))
+            .expect("the crash row");
+        let description = title.description.clone().expect("a description");
+        assert!(description.starts_with("Error, Crashes, "), "{description}");
+        assert_eq!(title.state.and_then(|state| state.expanded), Some(false));
+        let lines = crate::app_control::semantic_tree_lines_for_test(&compiled);
+        let line = lines
+            .iter()
+            .find(|line| line.contains("key=\"settings/messages/row/40/title\""))
+            .expect("the row in the tree");
+        assert!(line.contains(" expanded=false"), "{line}");
+        assert!(
+            line.contains(&format!(" description={description:?}")),
+            "{line}"
+        );
+        #[cfg(a11y_tree)]
+        {
+            let projection =
+                crate::native_accessibility::project_native_accessibility(&compiled, None).unwrap();
+            assert!(
+                projection
+                    .update()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.description() == Some(description.as_str())),
+                "the reader hears it"
+            );
         }
     }
 
@@ -47531,25 +50070,22 @@ enabled = true
     /// live on the headless 80×24 instance: the expanded entry's Copy laid
     /// out at 38 pt (a control is 44), and the fourth head of a full page
     /// hanging past the section with its stamp line cut. Every item the
-    /// packer seats must end inside its section at its authored height —
-    /// the page's own law ("never promises a row it clips", design §4.4).
+    /// list seats, in every view it scrolls through (ruling 264), must end
+    /// inside its section at its authored height — the page's own law
+    /// ("never promises a row it clips", design §4.4).
     #[test]
     fn messages_page_seats_no_item_it_clips_at_584x348() {
         let cx = view_cx_at(584.0, 348.0);
         let (mut runtime, instance, view) = setup_with_messages();
         select_message(&mut runtime, instance, view, 40);
-        let control = scaled_control_height();
-        let head = messages_compact_head_height();
+        let control = messages_small_button_height();
+        let head = messages_row_height();
         let line = messages_line_height();
-        let mut pages = 0;
-        for page in 0..64 {
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let views = scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
             compiled.validate_parity().unwrap();
             let section = compiled
-                .semantics
-                .iter()
-                .find(|node| node.key.as_str().starts_with("settings/messages/section/"))
-                .expect("the 80\u{d7}24 window is a compact host: one section per page");
+                .semantic(&UiKey::new("settings/messages/section"))
+                .expect("the 80\u{d7}24 window is a compact host: one scrolling section");
             let bottom = section.rect.bottom();
             for node in &compiled.semantics {
                 let key = node.key.as_str();
@@ -47558,17 +50094,13 @@ enabled = true
                 };
                 assert!(
                     node.rect.bottom() <= bottom + 0.01,
-                    "{key} hangs past its section on page {}: {:?} (section {:?})",
-                    page + 1,
+                    "{key} hangs past its section in view {k}: {:?} (section {:?})",
                     node.rect,
                     section.rect
                 );
-                let authored = if !rest.contains('/') {
+                let authored = if !rest.contains('/') || rest.ends_with("/title") {
                     Some(("a head", head))
-                } else if rest.ends_with("/stamp")
-                    || rest.contains("/meta/")
-                    || rest.contains("/detail/")
-                {
+                } else if rest.contains("/meta/") || rest.contains("/detail/") {
                     Some(("a line", line))
                 } else if rest.ends_with("/copy") || rest.contains("/action/") {
                     Some(("a control", control))
@@ -47578,34 +50110,782 @@ enabled = true
                 if let Some((what, height)) = authored {
                     assert!(
                         node.rect.height >= height - 0.01,
-                        "{key} is laid out short of its authored height on page {}: {:?} \
+                        "{key} is laid out short of its authored height in view {k}: {:?} \
                          ({what} is {height} pt; section {:?})",
-                        page + 1,
                         node.rect,
                         section.rect
                     );
                 }
             }
-            pages = page + 1;
-            let Some(next) = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str() == "settings/messages/pagination/next")
-                .map(|hit| hit.action.clone())
-            else {
-                break;
-            };
+        });
+        assert!(views > 1, "the sample log scrolls at 584\u{d7}348");
+    }
+
+    /// A log at its RING CAP ([`aterm_messages::LOG_CAP`], 512 records): the
+    /// sample log's crash, update and toolchain records renumbered to the
+    /// newest three, over 509 config warnings a minute apart.
+    fn full_ring_messages() -> MessagesState {
+        let mut state = sample_messages();
+        let cap = aterm_messages::LOG_CAP as u64;
+        let template = state.entries[3].clone();
+        state.entries.truncate(3);
+        for (k, entry) in state.entries.iter_mut().enumerate() {
+            entry.id = cap - k as u64;
+        }
+        let newest = template.at_unix_ms;
+        state
+            .entries
+            .extend((1..=cap - 3).rev().map(|id| MessageView {
+                id,
+                at_unix_ms: newest - (cap - 3 - id) * 60_000,
+                title: format!("config warning {id}"),
+                ..template.clone()
+            }));
+        for (tag, count) in &mut state.tags {
+            if tag == "config" {
+                *count = (cap - 3) as usize;
+            }
+        }
+        state
+    }
+
+    /// THE RING AT ITS CAP IS ONE LIST, BUILT ONLY WHERE IT IS SEEN (ruling
+    /// 264): 512 entries lay out with only the rows the view shows built —
+    /// the page's semantic tree is the size of the forty-entry log's — at the
+    /// wide and the compact width; Cmd-End scrolls to the oldest entry, and a
+    /// deep link to it lands it on the screen, open. The render's CPU work,
+    /// measured against the forty-entry page's, stays within twice it.
+    #[test]
+    fn the_log_at_its_ring_cap_builds_only_the_rows_in_view() {
+        // This checks the work done by one render, not time taken off-CPU
+        // while other tests (or the OS) schedule this thread. A parallel GUI
+        // test run once measured 28 ms against 8 ms in wall time while the
+        // same compiled test took 2.3 ms against 1.9 ms in isolation.
+        fn render_clock() -> std::time::Duration {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let mut stamp = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // SAFETY: `stamp` is initialized and writable for this call.
+                assert_eq!(
+                    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut stamp) },
+                    0
+                );
+                std::time::Duration::new(
+                    u64::try_from(stamp.tv_sec).unwrap(),
+                    u32::try_from(stamp.tv_nsec).unwrap(),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                START.get_or_init(std::time::Instant::now).elapsed()
+            }
+        }
+
+        let full = full_ring_messages();
+        assert_eq!(full.entries.len(), aterm_messages::LOG_CAP);
+        let open = |state: MessagesState| {
+            let (mut runtime, instance, view) = setup();
+            assert!(runtime.replace_settings_messages(state, 9));
             runtime
                 .dispatch(
                     instance,
                     view,
                     AppEvent::Action(ActionInvocation {
-                        id: next,
+                        id: route_action(SettingsRoute::Messages),
                         value: None,
                     }),
                 )
                 .unwrap();
+            (runtime, instance, view)
+        };
+        for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
+            let cx = view_cx_at(width, height);
+            // The best of nine renders of each page, taken in alternation,
+            // compares their own CPU work even when other tests are running.
+            let (small_runtime, small_instance, small_view) = open(sample_messages());
+            let (mut runtime, instance, view) = open(full.clone());
+            let (mut small_t, mut big_t) = (std::time::Duration::MAX, std::time::Duration::MAX);
+            let (mut small, mut big) = (None, None);
+            for _ in 0..9 {
+                let started = render_clock();
+                small = Some(compile_settings_view(
+                    &small_runtime,
+                    small_instance,
+                    small_view,
+                    &cx,
+                ));
+                small_t = small_t.min(render_clock().saturating_sub(started));
+                let started = render_clock();
+                big = Some(compile_settings_view(&runtime, instance, view, &cx));
+                big_t = big_t.min(render_clock().saturating_sub(started));
+            }
+            let (small, big) = (small.expect("rendered"), big.expect("rendered"));
+            crate::logging::stderr_line!(
+                "Messages at {width}x{height}: 40 entries {small_t:?} ({} semantic nodes), \
+                 512 entries {big_t:?} ({} semantic nodes)",
+                small.semantics.len(),
+                big.semantics.len()
+            );
+            let rows = message_rows(&big);
+            assert_eq!(
+                rows.len(),
+                message_rows(&small).len(),
+                "{width}: the view holds what it held"
+            );
+            assert!(
+                big.semantics.len() <= small.semantics.len() + 2,
+                "{width}: virtual — only the rows in view are built: {} vs {}",
+                big.semantics.len(),
+                small.semantics.len()
+            );
+            // Measured (debug build): 4.4 ms at 512 entries beside 3.5 ms
+            // at 40 on the wall clock, 2.4 ms beside 2.0 ms of thread CPU
+            // (2026-09-27) — each distinct lead word is measured once.
+            assert!(
+                big_t <= small_t * 2 + std::time::Duration::from_millis(10),
+                "{width}: 512 entries render in {big_t:?}, 40 in {small_t:?}"
+            );
+            assert_eq!(
+                big.semantic(&UiKey::new("settings/messages/status"))
+                    .map(|node| node.label.as_str()),
+                Some("512 messages")
+            );
+            // Cmd-End: the list's end, the oldest entry its last row.
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(10_000))
+                .unwrap();
+            let end = compile_settings_view(&runtime, instance, view, &cx);
+            assert_eq!(message_rows(&end).last(), Some(&1), "{width}");
+            // Home again, then a deep link to the oldest: landed, open.
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+                .unwrap();
+            assert_eq!(messages_view_state(&runtime, view).page_scroll, 0);
+            select_message(&mut runtime, instance, view, 1);
+            let landed = compile_settings_view(&runtime, instance, view, &cx);
+            assert!(message_rows(&landed).contains(&1), "{width}");
+            assert!(
+                landed
+                    .semantic(&UiKey::new("settings/messages/row/1/detail/0"))
+                    .is_some(),
+                "{width}: open"
+            );
         }
-        assert!(pages > 1, "the sample log pages at 584\u{d7}348");
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings ▸ Messages, captured (round 14).
+    // -----------------------------------------------------------------------
+
+    /// A LOG AS A WORKING MAC KEEPS IT (round 14 capture): about forty
+    /// records from every family, each built by its real reporter (or, for a
+    /// script, parsed by the wire's own `notice` grammar) and posted into a
+    /// headless App's center at its own minute over the last few hours; the
+    /// page's state is then the host's own projection (`App::messages_state`).
+    /// Two facts a headless App cannot have are set on the projection as the
+    /// host publishes them on a Mac that wrote its logs: the log folder, and
+    /// a crash log that is still on disk (so `Open log` can be pressed).
+    fn realistic_messages() -> MessagesState {
+        use crate::message_reporters::{self as rep, ConfigFamily, ConfigWarnings, PackagesVerb};
+        use crate::{toolchain_words, update_words};
+        use aterm_messages::{
+            Hold, Message, Meter, PIECE_SEP, STRAIN_KEY, Severity, WallStamp, tags,
+        };
+        let mut app = crate::App::headless_for_test();
+        app.clear_messages_for_test();
+        let now = crate::messages_host::wall_stamp_now().unix_ms;
+        let stamp = |minutes_ago: u64| WallStamp {
+            unix_ms: now - minutes_ago * 60_000,
+        };
+        let strain_record = |severity: Severity, title: &str, lines: &[String]| {
+            Message::new(tags::SYSTEM, severity, title)
+                .key(STRAIN_KEY)
+                .hold(Hold::LogOnly)
+                .lines(lines.iter().cloned())
+        };
+        let sep = PIECE_SEP;
+        let mut config = ConfigWarnings::default();
+        config.push(
+            ConfigFamily::Keybindings,
+            "config keybindings: skipping \"ctrl+x\": unknown action \"foo\"".into(),
+        );
+        config.push(
+            ConfigFamily::IgnoredKeys,
+            "config line 3: windw_padding \u{2014} did you mean \"window_padding\"? \
+             (unknown to this aterm build; preserved for forward compatibility)"
+                .into(),
+        );
+        config.push(
+            ConfigFamily::UnacceptedValues,
+            "config cursor_style: \"blob\" is not one of block, bar, underline; ignored".into(),
+        );
+        for key in ["trail_length", "trail_fade"] {
+            config.push(
+                ConfigFamily::CursorTrail,
+                format!("config {key}: out of range; the default is used"),
+            );
+        }
+        config.push(
+            ConfigFamily::Restart,
+            "gpu applies on next launch (the renderer backend is chosen at startup)".into(),
+        );
+        // Oldest first: (minutes ago, message).
+        let mut posts: Vec<(u64, Message)> = vec![
+            (
+                412,
+                rep::crash_message(&crate::logging::CrashEvidence {
+                    path: std::path::PathBuf::from(
+                        "/Users//ana/Library/Logs/aterm/crash-signal-11-1758461234.log.seen",
+                    ),
+                    head: vec![
+                        "fatal signal 11 (SIGSEGV) in thread 'render'".into(),
+                        "at aterm_render::glyph_cache::GlyphCache::insert+0x1f4".into(),
+                    ],
+                }),
+            ),
+            (
+                410,
+                update_words::landed("0.91.0", 1233, 3, Some(std::time::Duration::from_secs(42))),
+            ),
+            (
+                405,
+                toolchain_words::managed_current(
+                    "claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)",
+                    0,
+                    true,
+                    toolchain_words::HookDialect::Zsh,
+                )
+                .expect("a managed-current record"),
+            ),
+            (
+                398,
+                rep::session_connection_created(
+                    "\u{21c6} Connected to m3.local \u{2014} 2 sessions shared",
+                ),
+            ),
+            (390, rep::file_access_question()),
+            (388, rep::file_access_granted()),
+            (
+                372,
+                // The plain sentence first — the cause and the next step — the
+                // raw error and its stderr last (ruling 262).
+                toolchain_words::failed(
+                    "Disk full. Free about 3 GB, then retry from Packages. Build 5519 \
+                     still works.\n\
+                     ay stage failed: could not extract trust-5520.tar.zst into \
+                     ~/.atpkg/store/trust/5520: No space left on device (os error 28)\n\
+                     stderr: tar: trust-5520/lib/rustlib/aarch64-apple-darwin/lib/\
+                     librustc_driver.dylib: Cannot write: No space left on device",
+                ),
+            ),
+            (
+                366,
+                toolchain_words::first_run_short(
+                    toolchain_words::FirstRunShort::Failed,
+                    "could not reach the index: dns error: failed to lookup address \
+                     information: nodename nor servname provided, or not known",
+                ),
+            ),
+            (360, rep::packages_verb_row(PackagesVerb::Check)),
+            (
+                344,
+                strain_record(
+                    Severity::Info,
+                    "Typing slowed by 'yes' in tab 2 for 2m 10s",
+                    &[
+                        format!("top: 'yes' in tab 2 7.9 cores{sep}'cargo' 1.2{sep}aterm 0.3"),
+                        format!("typing: 14 of 40 keys over 60 ms{sep}worst 620 ms"),
+                        format!("memory: pressure normal{sep}17.8 GB in use"),
+                        format!("heat: fair{sep}Low Power Mode off"),
+                        "shown for 2m 0s".into(),
+                    ],
+                ),
+            ),
+            (
+                331,
+                rep::new_tab_failed("fork: Resource temporarily unavailable (os error 35)"),
+            ),
+            (
+                330,
+                rep::split_refused(
+                    "Split refused: this pane is 20x5 cells; a vertical split needs at least 20x7",
+                ),
+            ),
+            (
+                322,
+                rep::presence_not_saved(
+                    "window-state.json",
+                    "window positions",
+                    "Permission denied (os error 13)",
+                    false,
+                ),
+            ),
+            (315, rep::gpu_lost()),
+            (
+                314,
+                rep::backdrop_declined(
+                    "Backdrop image not shown",
+                    "~/Pictures/dunes.heic is 9600x6400; the limit is 8192 px a side",
+                ),
+            ),
+            (
+                300,
+                rep::a11y_publisher_dead("the accessibility bridge thread exited", true),
+            ),
+            (
+                288,
+                rep::fabric_failure(
+                    "post",
+                    "Couldn't deliver a message",
+                    &[
+                        "peer @m3 did not answer in 10 s",
+                        "queued; it retries on reconnect",
+                    ],
+                ),
+            ),
+            (
+                286,
+                rep::fabric_status("hold", "Session held", "the fleet holds it", true),
+            ),
+            (
+                285,
+                rep::hold_refused("only the session's owner can lift a hold"),
+            ),
+            (
+                270,
+                rep::harness_note("claude: reviewing diff in tab 3 (12 files)"),
+            ),
+            (
+                262,
+                rep::shell_lost_in_update("the pty handed over was closed (os error 9)"),
+            ),
+            (
+                261,
+                rep::restored_tab_failed("fork: Resource temporarily unavailable (os error 35)"),
+            ),
+            (255, rep::keystrokes_dropped(3)),
+            (
+                240,
+                strain_record(
+                    Severity::Warn,
+                    "Typing slowed by low memory for 45 s",
+                    &[
+                        format!("top: 'Google Chrome' 6.0 GB{sep}'Docker' 4.1 GB{sep}aterm 1.2 GB"),
+                        format!("typing: 9 of 22 keys over 60 ms{sep}worst 1400 ms"),
+                        format!("memory: pressure critical{sep}23.6 GB in use{sep}swap 38 MB/s"),
+                        "shown for 41 s".into(),
+                    ],
+                ),
+            ),
+            (
+                226,
+                update_words::health_warning(
+                    aterm_update::health_failing_title("pipeline"),
+                    "20 failed checks in a row since 2026-08-27T22:04:36Z: release manifests \
+                     exist but cannot be downloaded. Run `aterm ctl update status` for details.",
+                ),
+            ),
+            (
+                214,
+                update_words::download_failed(
+                    "0.92.0",
+                    "the download stopped at 46 MB of 74 MB: connection reset by peer",
+                ),
+            ),
+            (
+                190,
+                toolchain_words::appnotice(
+                    tags::TOOLCHAIN,
+                    "aterm pkg install claude: claude 2.1.281 installed",
+                ),
+            ),
+            (
+                150,
+                strain_record(
+                    Severity::Info,
+                    "Typing slowed by Spotlight indexing for 1m 5s",
+                    &[
+                        "top: Spotlight indexing 3.4 cores".into(),
+                        "disk: I/O stall 38%".into(),
+                        "not shown: no typing".into(),
+                    ],
+                ),
+            ),
+            (
+                96,
+                update_words::needs_install_because(
+                    "Couldn't install aterm v0.92.0",
+                    update_words::short_cause("rename: No space left on device (os error 28)"),
+                    update_words::INSTALL_FROM_MENU,
+                    Severity::Warn,
+                    1234,
+                ),
+            ),
+            (
+                40,
+                update_words::staged(
+                    "0.92.0",
+                    1234,
+                    Some(update_words::ApplyPosture::ManualByConfig),
+                ),
+            ),
+            (
+                12,
+                Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
+                    .key(STRAIN_KEY)
+                    .hold(Hold::Live {
+                        stale_after: aterm_messages::STALE_STRAIN,
+                    })
+                    .meter(Meter::level(740, "6 of 8 cores"))
+                    .no_excerpt()
+                    .line(format!("top: 'yes' in tab 2 5.9 cores{sep}aterm 0.4")),
+            ),
+        ];
+        for (k, msg) in config.into_messages().into_iter().enumerate() {
+            posts.push((420 - k as u64, msg));
+        }
+        posts.push((
+            380,
+            rep::font_family_rejected(
+                "config font_family_bold: \"Nope\" is not an admissible font (not found); ignored",
+            ),
+        ));
+        for (k, msg) in toolchain_words::machine_settings(
+            "spotlight-noindex 73 dir(s) migrated; universal-control disabled",
+        )
+        .into_iter()
+        .enumerate()
+        {
+            posts.push((404 - k as u64, msg));
+        }
+        posts.sort_by_key(|(minutes, _)| std::cmp::Reverse(*minutes));
+        // Scripts, through the wire's own grammar (`aterm ctl notice …`),
+        // interleaved with the reporters' posts in time order.
+        let scripts: [(u64, &str); 3] = [
+            (
+                180,
+                "post deploy sev=warn Deploy to staging failed -- exit status 2\\nsee deploy.log",
+            ),
+            (
+                120,
+                "post backup Nightly backup finished -- 4.2 GB in 3m 12s\\nto /Volumes/Archive",
+            ),
+            (60, "progress index pct=40 Indexing the photo library"),
+        ];
+        let mut scripts = scripts.into_iter().peekable();
+        let wire = |app: &mut crate::App, minutes: u64, line: &str| {
+            let req = aterm_messages::wire::NoticeRequest::parse(line).expect("a notice line");
+            let applied = aterm_messages::wire::apply(
+                &mut app.messages,
+                &mut app.wire_gate,
+                req,
+                stamp(minutes),
+                std::time::Instant::now(),
+            );
+            assert!(applied.reply.starts_with("OK"), "{line}: {}", applied.reply);
+        };
+        for (minutes, msg) in posts {
+            while let Some((at, line)) = scripts.next_if(|(at, _)| *at > minutes) {
+                wire(&mut app, at, line);
+            }
+            app.post_message_at(msg, stamp(minutes));
+        }
+        for (at, line) in scripts {
+            wire(&mut app, at, line);
+        }
+        let mut state = app.messages_state();
+        state.log_folder = Some("/Users//ana/Library/Logs/aterm".to_string());
+        state.saved = true;
+        for entry in &mut state.entries {
+            if entry.tag == "crash" {
+                for action in &mut entry.actions {
+                    action.still_actionable = true;
+                }
+            }
+        }
+        state
+    }
+
+    /// A Settings controller holding `messages`, its view on Messages.
+    fn setup_with_these_messages(
+        messages: MessagesState,
+    ) -> (
+        NativeRuntime,
+        crate::native_app::AppInstanceId,
+        crate::native_app::ViewId,
+    ) {
+        let (mut runtime, instance, view) = setup();
+        let revision = messages.revision.max(1);
+        assert!(runtime.replace_settings_messages(messages, revision));
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Messages);
+        (runtime, instance, view)
+    }
+
+    /// Navigate the view to `route` by its own action, as the rail does.
+    fn go_to_route(
+        runtime: &mut NativeRuntime,
+        instance: crate::native_app::AppInstanceId,
+        view: crate::native_app::ViewId,
+        route: SettingsRoute,
+    ) {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(route),
+                    value: None,
+                }),
+            )
+            .unwrap();
+    }
+
+    /// Rasterize the view as it compiles now at `width`×`height` in `theme`
+    /// and write it to `path` (2× pixels).
+    fn shoot_settings(
+        runtime: &NativeRuntime,
+        instance: crate::native_app::AppInstanceId,
+        view: crate::native_app::ViewId,
+        (width, height): (f32, f32),
+        theme: aterm_render::Theme,
+        path: &std::path::Path,
+    ) -> crate::native_ui::CompiledUi {
+        let surface = crate::settings::Roles::from_theme(theme).surface;
+        let compiled = compile_settings_view(runtime, instance, view, &view_cx_at(width, height));
+        let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
+            &compiled.tray(theme, 13.0).prims,
+            width as u32,
+            height as u32,
+            2.0,
+            [surface[0], surface[1], surface[2], 255],
+        );
+        let mut out = Vec::new();
+        {
+            let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
+            enc.write_header()
+                .expect("png header")
+                .write_image_data(&rgba)
+                .expect("png data");
+        }
+        std::fs::write(path, &out).expect("write png");
+        crate::logging::stderr_line!("wrote {} ({pw}x{ph})", path.display());
+        compiled
+    }
+
+    /// VISUAL CAPTURE of Settings ▸ Messages (round 14): on the default dark
+    /// theme and GitHub Light, at a wide and a compact window — the empty
+    /// page; the realistic log ([`realistic_messages`]) as one scrolling list
+    /// — its top, middle and end, and one notch of the wheel (ruling 264); each
+    /// chip selected; a crash, a long toolchain failure and a strain record
+    /// expanded to their details; the "Explain heavy load" switch; and the
+    /// deep link's landing from Software Update (`settings/messages/show/update`).
+    /// Not a gate: `#[ignore]`d (it needs a real UI face).
+    ///
+    /// ```sh
+    /// SETTINGS_MESSAGES_PNG_DIR=<dir> targo --unverified test -p aterm-gui --lib \
+    ///     settings_messages_visual_capture -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "visual capture: needs a system UI face; run with --ignored"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one list of page states, read top to bottom"
+    )]
+    fn settings_messages_visual_capture() {
+        let dir = std::env::var("SETTINGS_MESSAGES_PNG_DIR").map_or_else(
+            |_| std::env::temp_dir().join("settings-messages"),
+            std::path::PathBuf::from,
+        );
+        std::fs::create_dir_all(&dir).expect("output dir");
+        let light = {
+            let parts = aterm_types::scheme::builtin("GitHub Light")
+                .expect("a builtin scheme")
+                .to_theme_parts();
+            aterm_render::Theme {
+                fg: parts.fg,
+                bg: parts.bg,
+                cursor: parts.cursor,
+                selection: parts.selection,
+            }
+        };
+        let log = realistic_messages();
+        crate::logging::stderr_line!(
+            "realistic log: {} entries, tags {:?}",
+            log.entries.len(),
+            log.tags
+        );
+        let find = |pred: &dyn Fn(&MessageView) -> bool, what: &str| {
+            log.entries
+                .iter()
+                .find(|entry| pred(entry))
+                .unwrap_or_else(|| panic!("the log holds {what}"))
+                .id
+        };
+        let crash = find(&|e| e.tag == "crash", "a crash");
+        let toolchain = find(
+            &|e| e.tag == "toolchain" && e.severity == "warn" && e.detail.len() > 2,
+            "a long toolchain failure",
+        );
+        let strain = find(
+            &|e| e.tag == "system" && e.title.starts_with("Typing slowed by low memory"),
+            "a strain record",
+        );
+        let empty = MessagesState {
+            entries: Vec::new(),
+            tags: Vec::new(),
+            ..log.clone()
+        };
+        for (ground, theme) in [("dark", aterm_render::Theme::default()), ("light", light)] {
+            for (size, width, height) in
+                [("wide", 1_200.0_f32, 820.0_f32), ("compact", 568.0, 820.0)]
+            {
+                let at = (width, height);
+                let path = |name: &str| dir.join(format!("{name}-{ground}-{size}.png"));
+                // 01: the empty page.
+                let (runtime, instance, view) = setup_with_these_messages(empty.clone());
+                shoot_settings(&runtime, instance, view, at, theme, &path("s01-empty"));
+                // 02: the log as ONE scrolling list (ruling 264): its top, its
+                // middle and its end — the scroll thumb says where the view is.
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+                let limit = messages_view_state(&runtime, view)
+                    .result_page_limit
+                    .get()
+                    .expect("the render bounds the list");
+                for (slug, top) in [("top", 0), ("middle", limit / 2), ("end", limit)] {
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        state.page_scroll = top;
+                    }
+                    let compiled = shoot_settings(
+                        &runtime,
+                        instance,
+                        view,
+                        at,
+                        theme,
+                        &path(&format!("s02-log-{slug}")),
+                    );
+                    assert!(
+                        compiled
+                            .semantic(&UiKey::new("settings/messages/pagination"))
+                            .is_none(),
+                        "no pager ({size})"
+                    );
+                    if slug == "end" {
+                        assert_eq!(
+                            message_rows(&compiled).last(),
+                            log.entries.last().map(|entry| entry.id).as_ref(),
+                            "the end of the list is the oldest entry ({size})"
+                        );
+                    }
+                }
+                // 02b: one notch of the wheel from the top: one entry on.
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollLines(1))
+                    .unwrap();
+                shoot_settings(
+                    &runtime,
+                    instance,
+                    view,
+                    at,
+                    theme,
+                    &path("s02b-log-after-one-notch"),
+                );
+                // 03: each chip.
+                let mut chips = vec![
+                    ("all".to_string(), "filter/all".to_string()),
+                    ("warn".to_string(), "filter/warn".to_string()),
+                ];
+                chips.extend(
+                    log.tags
+                        .iter()
+                        .map(|(tag, _)| (format!("tag-{tag}"), format!("filter/tag/{tag}"))),
+                );
+                for (slug, action) in chips {
+                    let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                    messages_action(
+                        &mut runtime,
+                        instance,
+                        view,
+                        &format!("{MESSAGES_ACTION_PREFIX}{action}"),
+                    );
+                    shoot_settings(
+                        &runtime,
+                        instance,
+                        view,
+                        at,
+                        theme,
+                        &path(&format!("s03-chip-{slug}")),
+                    );
+                }
+                // 04: an entry expanded to its details, as the band's
+                // `Details ›` lands on it (the deep link pages to it).
+                for (slug, id) in [
+                    ("crash", crash),
+                    ("toolchain-failure", toolchain),
+                    ("strain-record", strain),
+                ] {
+                    let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                    // One render first, so the link lands as a person's does.
+                    compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+                    select_message(&mut runtime, instance, view, id);
+                    shoot_settings(
+                        &runtime,
+                        instance,
+                        view,
+                        at,
+                        theme,
+                        &path(&format!("s04-expanded-{slug}")),
+                    );
+                }
+                // 05: the "Explain heavy load" switch — the top of the page at
+                // every width (ruling 262), the compact page's tag pop-up open.
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                if size == "compact" {
+                    messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+                }
+                let compiled = shoot_settings(
+                    &runtime,
+                    instance,
+                    view,
+                    at,
+                    theme,
+                    &path("s05-explain-heavy-load"),
+                );
+                assert!(
+                    compiled
+                        .semantic(&UiKey::new(MESSAGES_EXPLAIN_LOAD))
+                        .is_some(),
+                    "the switch is on the page ({size})"
+                );
+                // 06: the deep link from Software Update's "View Messages".
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                go_to_route(&mut runtime, instance, view, SettingsRoute::SoftwareUpdate);
+                messages_action(&mut runtime, instance, view, MESSAGES_SHOW_UPDATE);
+                assert_eq!(
+                    messages_view_state(&runtime, view).route,
+                    SettingsRoute::Messages
+                );
+                shoot_settings(
+                    &runtime,
+                    instance,
+                    view,
+                    at,
+                    theme,
+                    &path("s06-deep-link-update"),
+                );
+            }
+        }
     }
 }

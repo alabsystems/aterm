@@ -61,17 +61,6 @@ impl DocumentMut {
         &mut self.root
     }
 
-    /// Trailing whitespace and comments.
-    #[must_use]
-    pub fn trailing(&self) -> &RawString {
-        &self.trailing
-    }
-
-    /// Replace the trailing whitespace and comments.
-    pub fn set_trailing(&mut self, trailing: impl Into<RawString>) {
-        self.trailing = trailing.into();
-    }
-
     /// Top-level entries in authored order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Item)> {
         self.as_table().iter()
@@ -83,37 +72,9 @@ impl DocumentMut {
         self.as_table().get(key)
     }
 
-    /// The top-level entry for `key`, mutably.
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Item> {
-        self.as_table_mut().get_mut(key)
-    }
-
-    /// Is `key` a top-level entry?
-    #[must_use]
-    pub fn contains_key(&self, key: &str) -> bool {
-        self.as_table().contains_key(key)
-    }
-
-    /// Set a top-level entry.
-    pub fn insert(&mut self, key: &str, item: Item) -> Option<Item> {
-        self.as_table_mut().insert(key, item)
-    }
-
     /// Delete a top-level entry.
     pub fn remove(&mut self, key: &str) -> Option<Item> {
         self.as_table_mut().remove(key)
-    }
-
-    /// Number of top-level entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.as_table().len()
-    }
-
-    /// Has the document no top-level entries?
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.as_table().is_empty()
     }
 }
 

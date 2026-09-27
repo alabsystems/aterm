@@ -260,12 +260,19 @@ fn the_same_verb_off_a_terminal_still_refuses_at_once() {
         "{:?}",
         text(&screen)
     );
+    // The regression is a TEN-MINUTE wait, so the bound is two minutes: it was
+    // the grace plus 8 s, and that interval also holds the spawn and the first
+    // exec of a freshly linked dev binary, which macOS assesses before it runs —
+    // 0.2-3.5 s under a loaded gate, 26 s measured once (the load-sensitive test
+    // audit of 2026-09-27). The refusal's own promptness is the no-spinner
+    // assert below, which no clock can flake.
     assert!(
-        started.elapsed() < atpkg::lock::WAIT_ANNOUNCE_GRACE + Duration::from_secs(8),
+        started.elapsed() < Duration::from_secs(120),
         "no ten-minute wait"
     );
-    // The reader may still be draining; give it a moment to see the refusal.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The reader may still be draining; give it a moment to see the refusal
+    // (a poll for text already written: generous costs nothing when it is there).
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !text(&screen).contains("holds the store lock") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }

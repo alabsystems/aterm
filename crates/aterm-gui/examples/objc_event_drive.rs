@@ -113,13 +113,13 @@
 //! the stage as a gate FAILURE, not as could-not-run — the opposite of its
 //! siblings, and deliberately: for this driver the abort IS the answer.
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const PASS: i32 = 0;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
 const NOT_RUN: i32 = 2;
 /// A row aborted; the driver's own signal trap turned the abort into this exit.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 const ABORTED: i32 = 3;
 
 #[cfg(not(target_os = "macos"))]

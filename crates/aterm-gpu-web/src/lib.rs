@@ -137,13 +137,10 @@ pub struct AtermGpuTerminal {
     cpu: Renderer,
     rows: usize,
     cols: usize,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     theme: Theme,
-    // Read only by the wasm GPU paths (`init` rebuilds the face from these). On the
-    // native verification target they are stored-but-unread.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    // Read only by the wasm GPU paths (`init` rebuilds the face from these).
     font_bytes: Vec<u8>,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(target_arch = "wasm32")]
     px: f32,
     // GPU side: None until `init` succeeds. Once set, `render` presents on the GPU;
     // the host wires `render` into a requestAnimationFrame loop.
@@ -151,11 +148,11 @@ pub struct AtermGpuTerminal {
     // Offscreen readback cache: the last `render_offscreen` frame, expanded to
     // RGBA8 (width*height*4 bytes), so an e2e harness can pixel-compare GPU vs CPU
     // without reading the live canvas. Mirrors `the aterm-wasm crate`'s `rgba` buffer.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(target_arch = "wasm32")]
     rgba: Vec<u8>,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(target_arch = "wasm32")]
     fb_width: usize,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(target_arch = "wasm32")]
     fb_height: usize,
     // Built-in smart-selection rules (url/file_path/email/...) for scroll-correct
     // link detection via smart_word_at; reused across link_at calls. Mirrors
@@ -167,29 +164,23 @@ pub struct AtermGpuTerminal {
     // lost. Empty until the host calls `set_fallback_font` / `set_emoji_font`.
     // INTERNED Arc (shared across panes via aterm_render::intern_font_bytes_slice) so
     // this reinit-retention isn't a per-pane ~180MB (emoji) / ~100MB (CJK) duplicate.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fallback_font: Option<std::sync::Arc<Vec<u8>>>,
     // ADDITIONAL fallback faces appended via `add_fallback_font` (most-preferred
     // first), kept so `init` can re-apply the whole chain to the fresh GPU CPU
     // face. Interned Arcs (shared across panes) so this retention isn't a per-pane
     // duplicate. Empty until the host appends a second fallback face.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fallback_chain_extra: Vec<std::sync::Arc<Vec<u8>>>,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     emoji_font: Option<std::sync::Arc<Vec<u8>>>,
     // Host-injected REAL bold weight, kept so `init` re-applies it to the fresh GPU
     // CPU face (built from `font_bytes`, which lacks the bold variant otherwise).
     // Interned Arc (shared across panes). None until `set_bold_font`.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     bold_font: Option<std::sync::Arc<Vec<u8>>>,
     // Host-injected SYMBOL fallback face, kept so `init` re-applies it to the fresh
     // GPU CPU face (built from `font_bytes`, which lacks the symbol face otherwise).
     // Interned Arc (shared across panes). None until `set_symbol_font`.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     symbol_font: Option<std::sync::Arc<Vec<u8>>>,
     // Live line-height multiplier (the host's terminalLineHeight), re-applied to the
     // fresh GPU CPU face at `init`. `1.0` until the host calls `set_line_height`.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     line_height: f32,
     // Host-selected text shaping (ligatures + OpenType `font_features`). Applied to
     // both the CPU face and the live GPU face by `set_ligatures`/`set_font_features`,
@@ -203,7 +194,6 @@ pub struct AtermGpuTerminal {
     // container Vecs + a per-row inner Vec for each row) every frame — mirrors the
     // native windowed frontend's kept `input_scratch`. On the native verification
     // target the present paths are unused, so the field is stored-but-unread.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     frame_scratch: RenderInput,
     // The shared visual-effects pipeline (cursor aurora/trail + sparkle words) —
     // the SAME state machines the native app drives, host-clocked via
@@ -360,7 +350,6 @@ struct GpuState {
     // Per-window present state (prior-frame snapshot for the scissored dirty-row
     // present path). One per surface, per aterm-gpu's design. Drives the
     // `present_input` (canvas) and `render_input` (offscreen readback) paths.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     win: WindowGpu,
 }
 
@@ -461,7 +450,6 @@ impl AtermGpuTerminal {
     /// coherent even when a present fails, and stay testable without a GPU.
     /// The two frame-boundary pumps are NOT here — they belong to
     /// `open_frame`, which runs them on every tick including gated ones.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn build_frame(&mut self) {
         // Refill the kept scratch in place rather than allocating a fresh snapshot
         // each rAF frame; `term`, `frame_scratch`, and `gpu` are disjoint fields, so
@@ -500,7 +488,6 @@ impl AtermGpuTerminal {
     /// Refill every engine-owned frame channel. `cell_frame_into` includes the
     /// live implicit background and cursor colour, so sparse tails, OSC
     /// 10/11/12 resets, and DECSCNM remain one coherent terminal snapshot.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn refill_frame_scratch(&mut self) {
         self.term
             .cell_frame_into(&mut self.frame_scratch, self.rows, self.cols);
@@ -611,10 +598,14 @@ impl AtermGpuTerminal {
             cols,
             theme,
             font_bytes: font_bytes.to_vec(),
+            #[cfg(target_arch = "wasm32")]
             px,
             gpu: None,
+            #[cfg(target_arch = "wasm32")]
             rgba: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
             fb_width: 0,
+            #[cfg(target_arch = "wasm32")]
             fb_height: 0,
             smart: SmartSelection::with_builtin_rules(),
             fallback_font: None,
@@ -1551,7 +1542,6 @@ impl AtermGpuTerminal {
     /// compile-verification target, where tests drive it directly). After the
     /// grace window, ONE budgeted step per frame — never the whole job in a
     /// single frame (that was the point of the stepping seam).
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
             return;
@@ -1716,8 +1706,8 @@ impl AtermGpuTerminal {
     ///     checkpoints), or the block never reached its output phase.
     ///
     /// `&self` — the read rides `Terminal::last_completed_block`, which was added
-    /// alongside this binding precisely so the facade does not need the `&mut`
-    /// `output_blocks()` (`make_contiguous`) path.
+    /// alongside this binding precisely so the facade needs no `&mut`
+    /// (`make_contiguous`) read of the block ledger.
     pub fn last_command_output(&self) -> Option<String> {
         let block = self.term.last_completed_block()?;
         match self.term.block_output_text(block) {
@@ -3119,10 +3109,14 @@ impl AtermGpuTerminal {
             cols,
             theme,
             font_bytes: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
             px,
             gpu: None,
+            #[cfg(target_arch = "wasm32")]
             rgba: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
             fb_width: 0,
+            #[cfg(target_arch = "wasm32")]
             fb_height: 0,
             smart: SmartSelection::with_builtin_rules(),
             fallback_font: None,

@@ -220,6 +220,7 @@ fn entry_text(entry: &TabMenuEntry) -> &str {
         TabMenuEntry::Separator => "",
         TabMenuEntry::Action { label, .. } => label,
         TabMenuEntry::ConnectionAction { label, .. } => label,
+        TabMenuEntry::Upgrade { label, .. } => label,
     }
 }
 
@@ -233,6 +234,7 @@ pub(crate) fn is_selectable(entry: &TabMenuEntry) -> bool {
         entry,
         TabMenuEntry::Action { enabled: true, .. }
             | TabMenuEntry::ConnectionAction { enabled: true, .. }
+            | TabMenuEntry::Upgrade { .. }
     )
 }
 
@@ -567,12 +569,16 @@ pub(crate) fn paint(
             TabMenuEntry::Header(_) => (c.band.label, false),
             TabMenuEntry::Action { enabled: false, .. }
             | TabMenuEntry::ConnectionAction { enabled: false, .. } => (c.disabled, false),
-            TabMenuEntry::Action { .. } | TabMenuEntry::ConnectionAction { .. } if selected => {
+            TabMenuEntry::Action { .. }
+            | TabMenuEntry::ConnectionAction { .. }
+            | TabMenuEntry::Upgrade { .. }
+                if selected =>
+            {
                 (c.sel_fg, true)
             }
-            TabMenuEntry::Action { .. } | TabMenuEntry::ConnectionAction { .. } => {
-                (c.band.value, false)
-            }
+            TabMenuEntry::Action { .. }
+            | TabMenuEntry::ConnectionAction { .. }
+            | TabMenuEntry::Upgrade { .. } => (c.band.value, false),
             TabMenuEntry::Separator => unreachable!("handled above"),
         };
         let mut row = vec![chrome_band::cell(' ', fg, bg, false, false); w];
@@ -676,6 +682,23 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
                 *enabled,
             )
                 .hash(&mut h),
+            // An upgrade row's identity is the session and the build it
+            // names as well as its word.
+            TabMenuEntry::Upgrade {
+                label,
+                sid,
+                to,
+                word,
+            } => {
+                (
+                    4u8,
+                    label.as_str(),
+                    sid.as_str(),
+                    to.as_str(),
+                    word.as_str(),
+                )
+                    .hash(&mut h);
+            }
         }
     }
     rect.hash(&mut h);

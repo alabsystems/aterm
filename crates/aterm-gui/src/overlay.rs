@@ -250,22 +250,6 @@ impl Overlay {
         }
     }
 
-    /// The active surface's model as a mutable trait object.
-    #[allow(
-        dead_code,
-        reason = "part of the OverlayModel surface; mutators go through the concrete accessor shims today"
-    )]
-    pub(crate) fn model_mut(&mut self) -> &mut dyn OverlayModel {
-        match self {
-            #[cfg(test)]
-            Overlay::Settings(s) => s,
-            Overlay::Palette(p) => p,
-            Overlay::ConnCard(c) => c,
-            Overlay::SessionPicker(p) => p,
-            Overlay::ConnectionMap(m) => m,
-        }
-    }
-
     /// Which surface this slot holds.
     pub(crate) fn kind(&self) -> OverlayKind {
         match self {

@@ -35,7 +35,7 @@
 //!
 //! let shell = ShellType::detect("/bin/zsh");
 //! if let Ok(Some(injection)) = prepare(shell) {
-//!     // Add injection.env_add to SpawnConfig.env before fork
+//!     // Add injection.env_add to the child's environment before fork
 //!     // Use injection.argv_override if Some (bash --rcfile)
 //! }
 //! ```
@@ -60,6 +60,73 @@ pub mod scripts {
     /// PowerShell / pwsh shell integration (OSC 7/133; no macOS bundle
     /// counterpart — the Windows/pwsh path ships from the Rust binary only).
     pub const POWERSHELL: &str = include_str!("scripts/aterm_shell_integration.ps1");
+
+    /// The comment that opens the BODY of the zsh, bash and fish scripts (the
+    /// LOADER / BODY split, 2026-09-26): everything from the line it starts to
+    /// the line [`BODY_END`] starts is the part a shell that is ALREADY RUNNING
+    /// re-sources when its host points it at a newer build's folder. See "THE
+    /// LOADER" in the zsh script.
+    pub const BODY_BEGIN: &str = "# @@ATERM-INTEGRATION-BODY-BEGIN@@";
+
+    /// The comment that closes the BODY ([`BODY_BEGIN`]).
+    pub const BODY_END: &str = "# @@ATERM-INTEGRATION-BODY-END@@";
+
+    /// The BODY of `script` — one of [`ZSH`], [`BASH`], [`FISH`]: the text from
+    /// the start of its [`BODY_BEGIN`] line through the end of its [`BODY_END`]
+    /// line, byte for byte what the loaded script runs there. `None` for a
+    /// script with no body (PowerShell) or markers out of order.
+    #[must_use]
+    pub fn body(script: &str) -> Option<&str> {
+        let begin = script.find(BODY_BEGIN)?;
+        let end = begin + script[begin..].find(BODY_END)?;
+        let end = script[end..]
+            .find('\n')
+            .map_or(script.len(), |nl| end + nl + 1);
+        Some(&script[begin..end])
+    }
+}
+
+/// What opens every body file ([`scripts::body`] written alone,
+/// `aterm_shell_integration_body.<ext>`): a comment, the same in all three
+/// shells.
+const BODY_FILE_HEADER: &str = "\
+# aterm shell integration — the BODY alone (the LOADER / BODY split, 2026-09-26).
+#
+# The text between the markers of aterm_shell_integration.<ext> in this folder,
+# byte for byte. A running shell's loader sources it when the host that owns the
+# shell points it at this folder (`__aterm_body_check`); it relies on the
+# loader's state, so it is never sourced by hand.
+";
+
+/// The file name of the BODY of the shell whose script is named
+/// `aterm_shell_integration.<ext>`: `aterm_shell_integration_body.<ext>`, in the
+/// same content-addressed folder.
+pub const BODY_FILE_STEM: &str = "aterm_shell_integration_body";
+
+/// The environment variable that names a session's BODY POINTER (2026-09-26):
+/// set by the host at spawn, captured and scrubbed by the zsh/bash/fish loaders,
+/// checked at every prompt (`__aterm_body_check`). The file, when the host
+/// writes it, holds the 16-hex address of a script folder under the same cache
+/// root — whose body the shell sources at its next prompt.
+pub const BODY_POINTER_VAR: &str = "ATERM_INTEGRATION_POINTER";
+
+/// The OSC 633 `P` property the body signs before every prompt:
+/// `633;P;AtermIntegration=<16-hex folder address>;id=<nonce>` — which body the
+/// shell runs (`status integration_rev=`).
+pub const INTEGRATION_REV_KEY: &str = "AtermIntegration";
+
+/// The shells whose scripts have a LOADER that re-sources a newer body — the
+/// ones a host exports [`BODY_POINTER_VAR`] to.
+#[must_use]
+pub const fn has_body_loader(shell: ShellType) -> bool {
+    matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
+}
+
+/// Whether `rev` is a script folder's address as the loaders accept it: exactly
+/// 16 lowercase hex digits ([`script_set_address`]).
+#[must_use]
+pub fn is_integration_rev(rev: &str) -> bool {
+    is_address(rev)
 }
 
 /// Shell type detected from the command path.
@@ -128,9 +195,10 @@ impl ShellType {
     ///
     /// Unix / git-bash: `$SHELL`. Native Windows never sets `$SHELL` (and under an
     /// inherited git-bash env it holds a POSIX path `CreateProcessW` can't exec),
-    /// so there we mirror the PTY seam's `select_shell()`: an `ATERM_SHELL` override,
-    /// else PowerShell — the shell aterm actually spawns (`pwsh`/`powershell`, both in
-    /// System32, resolve before any `cmd` fallback). Returning PowerShell here is what
+    /// so there we mirror the PTY seam's `select_shell()` with no override given:
+    /// PowerShell — the shell aterm actually spawns (`pwsh`/`powershell`, both in
+    /// System32, resolve before any `cmd` fallback). A configured `shell` /
+    /// `--shell` is the caller's hint and never reaches this default. Returning PowerShell here is what
     /// makes the `-ExecutionPolicy Bypass` + OSC 7/133 injection reach the spawned
     /// shell; the previous `$SHELL`-only body returned `Unknown` on Windows, so NOTHING
     /// was injected and a policy-restricted box failed with "running scripts is disabled".
@@ -145,9 +213,6 @@ impl ShellType {
         }
         #[cfg(windows)]
         {
-            if let Some(sh) = std::env::var_os("ATERM_SHELL").filter(|s| !s.is_empty()) {
-                return Self::detect(&sh.to_string_lossy());
-            }
             Self::PowerShell
         }
     }
@@ -169,6 +234,7 @@ pub struct InjectionEnv {
 pub const SHELL_NONCE_BYTES: usize = 32;
 
 /// Hex-encoded length of the shell-integration nonce (#7960).
+#[cfg(any(unix, windows))]
 pub const SHELL_NONCE_HEX_LEN: usize = SHELL_NONCE_BYTES * 2;
 
 /// A freshly generated 32-byte CSPRNG nonce for OSC 133/633 gating (#7960, #7987).
@@ -183,12 +249,6 @@ pub struct ShellNonce {
 }
 
 impl ShellNonce {
-    /// Raw 32-byte nonce to pass to `Terminal::authorize_shell_integration`.
-    #[must_use]
-    pub const fn raw(&self) -> &[u8; SHELL_NONCE_BYTES] {
-        &self.raw
-    }
-
     /// 64-char lowercase hex encoding to set as `ATERM_SHELL_NONCE` in the
     /// child shell environment.
     #[must_use]
@@ -196,9 +256,9 @@ impl ShellNonce {
         &self.hex
     }
 
-    /// Consume the nonce and return both halves. Callers typically use
-    /// [`raw`](Self::raw) to authorize the terminal, then [`hex`](Self::hex)
-    /// to inject into the child environment.
+    /// Consume the nonce and return both halves: the raw bytes authorize the
+    /// terminal (`Terminal::authorize_shell_integration`), the hex is injected
+    /// into the child environment.
     #[must_use]
     pub fn into_parts(self) -> ([u8; SHELL_NONCE_BYTES], String) {
         (self.raw, self.hex)
@@ -285,6 +345,7 @@ fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
 /// that wire a caller-provided nonce (e.g. test fixtures that want
 /// deterministic bytes).
 #[must_use]
+#[cfg(any(unix, windows))]
 pub fn hex_encode(bytes: &[u8; SHELL_NONCE_BYTES]) -> String {
     let mut out = String::with_capacity(SHELL_NONCE_HEX_LEN);
     // Trust: bind each byte BY VALUE (`&b` pattern) rather than shifting the
@@ -302,6 +363,9 @@ pub fn hex_encode(bytes: &[u8; SHELL_NONCE_BYTES]) -> String {
     out
 }
 
+// Not platform-gated: `script_set_address` (every platform) names its folder
+// with it, and the wasm32 cell failed to type-check without it (gate cells,
+// 2026-09-26).
 const fn nibble_to_hex(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
@@ -340,33 +404,193 @@ pub fn augment_with_nonce(injection: &mut InjectionEnv, hex: &str) {
         .push(("ATERM_SHELL_NONCE".to_string(), hex.to_string()));
 }
 
-/// Base directory whose scripts were last successfully written by
-/// [`prepare`] in this process. The script bodies are compile-time
-/// constants, so a base written once never needs rewriting within a run;
-/// keyed by path (not a bare flag) because [`cache_dir`] depends on
-/// containment mode and XDG env, either of which could change the target.
+/// The environment variable that names a session's RE-KEY file: set by the
+/// host at spawn, captured and scrubbed by the zsh/bash/fish scripts, checked at
+/// every prompt (`__aterm_rekey_check`). The file, when the host writes it, holds
+/// one fresh 64-hex nonce the host has already authorized.
+pub const REKEY_PATH_VAR: &str = "ATERM_REKEY_PATH";
+
+/// The shells whose scripts carry the re-key hook — the ones a host exports
+/// [`REKEY_PATH_VAR`] to.
+#[must_use]
+pub const fn has_rekey_hook(shell: ShellType) -> bool {
+    matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
+}
+
+/// THE TYPED RE-KEY (2026-09-26): what a line typed at a shell's prompt runs to
+/// take a new nonce from the one-use file `quoted_path` — a word the caller has
+/// already quoted for `shell` — and remove the file, for a shell spawned BEFORE
+/// the re-key channel, whose script has no `__aterm_rekey_check` and so never
+/// reads [`REKEY_PATH_VAR`]. The live agent upgrade types it in front of its
+/// relaunch line: the one moment such a shell, not the agent, holds the
+/// terminal. `None` for a shell with no such script.
+///
+/// It sets the two globals every script since `f93cf3ba1` (2026-08-16) signs
+/// its marks from, and every emitter reads them when it runs, never at source
+/// time: `__aterm_shell_nonce` (`typeset -g` in zsh, a plain global in bash,
+/// `set -g` in fish) and `__aterm_id_suffix_str` (`;id=<nonce>`) — measured in
+/// the scripts of the builds that spawned the owner's degraded tabs (0.91 and
+/// the 2026-09-10 build; `git show v0.91.0:crates/aterm-shell-integration/src/scripts/…`),
+/// and pinned for this build's by `the_typed_rekey_sets_the_globals_the_marks_read`.
+/// The key never enters the typed text, argv (`read` is a builtin), the
+/// scrollback or history: only the path does. A file that is gone by the time
+/// the line runs changes nothing — the `read` fails (quietly in zsh and bash;
+/// fish may print its redirection warning), the nonce keeps its value, and the
+/// suffix is rebuilt from it — so a withdrawn key cannot strand the command the
+/// line goes on to run.
+///
+/// Bash's one mark baked at a prompt's setup (the `133;B` inside a custom
+/// `ATERM_PROMPT_STYLE` prompt) keeps the old id until that prompt is rebuilt,
+/// exactly as after the channel's own re-key; every other mark reads the new one.
+///
+/// This is the KEY-ONLY form, which reads the file's first line and nothing
+/// else. [`typed_rekey_with_loader`] also sources a newer build's loader; the
+/// caller types that one where it fits and this one where only this fits.
+#[must_use]
+pub fn typed_rekey(shell: ShellType, quoted_path: &str) -> Option<String> {
+    let p = quoted_path;
+    match shell {
+        ShellType::Zsh | ShellType::Bash => Some(format!(
+            "{{ read -r __aterm_shell_nonce <{p}; }} 2>/dev/null; command rm -f -- {p}; \
+             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\";"
+        )),
+        ShellType::Fish => Some(format!(
+            "read -g __aterm_shell_nonce <{p} 2>/dev/null; command rm -f -- {p}; \
+             set -g __aterm_id_suffix_str \";id=$__aterm_shell_nonce\";"
+        )),
+        _ => None,
+    }
+}
+
+/// [`typed_rekey`] that ALSO UPGRADES THE SHELL'S INTEGRATION IN PLACE
+/// (2026-09-26): what a line typed at the prompt of a shell spawned BEFORE
+/// loaders existed runs, so that its integration — fixed at spawn, and reached
+/// by no body pointer — becomes this build's, with the loader that takes every
+/// later build's body at a prompt.
+///
+/// The one-use file holds up to three lines, all written by the window
+/// (`shell_rekey::typed` in aterm-gui): the key (the fresh one of a degraded
+/// shell, or the one a healthy shell already signs with — never an empty line
+/// the old key-only text would take for a key), then the folder of this build's
+/// scripts and the session's body pointer path when the shell has no loader.
+/// The line reads them into short-lived globals with builtins, removes the
+/// file, sources — only when a folder was named and holds this shell's loader —
+/// that loader with the pointer path in hand, and only THEN takes the key as
+/// [`typed_rekey`] does. The loader recognises the shell as its own (it holds
+/// `__aterm_shell_nonce`, which no other shell can have inherited, and which
+/// the line has not assigned yet) and upgrades it in place: the hooks it already
+/// has are kept, the body and the trampoline are replaced, the nonce it signs
+/// with is kept until the line hands it the file's. A NESTED shell — started in
+/// the tab, so it inherited the guard and ran no integration of its own — holds
+/// no nonce, and the loader stops at the guard.
+///
+/// Nothing in the text is a path but the file's own; the folder and the pointer
+/// never appear in typed text, argv, scrollback or history. A file that is gone
+/// changes nothing, quietly: the reads sit behind the file's redirection, which
+/// sits INSIDE the group whose stderr is silenced (zsh reports a failed
+/// redirection on the shell's own stderr unless it is nested so; measured on zsh
+/// 5.9) — fish reads it through `cat`, as fish warns on the screen of any
+/// redirection from a missing file — and every variable is read `-`-guarded, so
+/// a user's `set -u` cannot abort the line before the command it goes on to run.
+#[must_use]
+pub fn typed_rekey_with_loader(shell: ShellType, quoted_path: &str) -> Option<String> {
+    let p = quoted_path;
+    let loader = match shell {
+        ShellType::Zsh => "aterm_shell_integration.zsh",
+        ShellType::Bash => "aterm_shell_integration.bash",
+        ShellType::Fish => "aterm_shell_integration.fish",
+        _ => return None,
+    };
+    // Four short-lived globals — the key, the folder, the pointer and the loader
+    // path — named short because the line shares the tty's bound with the
+    // relaunch it carries, and unset at its end; every read is `-`-guarded.
+    //
+    // The loader is sourced BEFORE the key is assigned (review finding
+    // 2026-09-26). The loader takes `__aterm_shell_nonce` as its proof that the
+    // shell is its own, and the harness types this line into whichever shell
+    // leads the tab's foreground group — a NESTED shell too (a `bash` typed in
+    // the tab, a `nix develop`), which inherited the exported guard and holds no
+    // nonce. Assigned first, the key WAS that proof: the nested shell was
+    // "upgraded in place" — every zsh hook wired, a bash's PATH re-fronted by the
+    // body — and signed `integration_rev=current` for a tab whose own shell was
+    // still frozen. Sourced first, the loader sees the shell as it was, and a
+    // nested one stops at the guard. fish reads the file through `cat`: a
+    // redirection from a file that is gone prints two warnings on the user's
+    // screen whatever stderr says (measured on fish 4.9.3), and a withdrawn file
+    // must change nothing, quietly.
+    Some(match shell {
+        ShellType::Fish => format!(
+            "command cat {p} 2>/dev/null | begin; read -g __atk; read -g __atd; read -g __atp; \
+             end; command rm -f -- {p}; set -g __atl \"$__atd/{loader}\"; \
+             test -f \"$__atl\"; and begin; \
+             set -g ATERM_INTEGRATION_POINTER $__atp; source \"$__atl\"; end; \
+             test -n \"$__atk\"; and set -g __aterm_shell_nonce $__atk; \
+             set -g __aterm_id_suffix_str \";id=$__aterm_shell_nonce\"; \
+             set -e __atk __atd __atp __atl;"
+        ),
+        _ => format!(
+            "{{ {{ read -r __atk; read -r __atd; read -r __atp; }} <{p}; }} 2>/dev/null; \
+             command rm -f -- {p}; __atl=\"${{__atd-}}/{loader}\"; [ -f \"$__atl\" ] && \
+             {{ ATERM_INTEGRATION_POINTER=${{__atp-}}; . \"$__atl\"; }}; \
+             [ -n \"${{__atk-}}\" ] && __aterm_shell_nonce=$__atk; \
+             __aterm_id_suffix_str=\";id=$__aterm_shell_nonce\"; \
+             unset __atk __atd __atp __atl;"
+        ),
+    })
+}
+
+/// This build's script folder, once [`prepare`] has installed or verified it in
+/// this process. The script bodies are compile-time constants, so a folder
+/// verified once never needs rewriting within a run; keyed by path (not a bare
+/// flag) because [`cache_dir`] depends on containment mode and XDG env, either
+/// of which could change the target.
 static SCRIPTS_WRITTEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Prepare shell integration for the given shell type.
 ///
-/// Writes embedded scripts to a cache directory and returns the
-/// environment modifications needed to auto-load them at shell startup.
-/// The script writes are memoized per process (they are compile-time
-/// constants), so repeated calls — one per spawned tab/split, on the UI
-/// thread — cost a single stat instead of six file writes.
+/// Installs this build's scripts in ITS OWN folder under the cache directory —
+/// `<cache>/<content address>/` ([`script_set_address`]) — and returns the
+/// environment modifications that make a new shell load them from there. The
+/// install is memoized per process, so repeated calls — one per spawned
+/// tab/split, on the UI thread — cost a single stat.
+///
+/// WHY A FOLDER PER SCRIPT SET, NEVER ONE SHARED FOLDER (measured 2026-09-24 on
+/// the owner's Mac, 0.93.0): every aterm used to write the same flat
+/// `~/.cache/aterm/shell-integration/`, once per process, and afterwards only
+/// checked that the file existed. `stat` showed the scripts rewritten 20 ms after
+/// a foreign GUI-mode start (pid 87172, not the daily driver) armed its crash
+/// marker; from then on every NEW tab of the running window sourced whatever that
+/// start had written, for the window's whole life, with no signal. The same
+/// happens for the dev bundle (0.91) or a stale test binary whose scripts differ
+/// — and they do differ: 0.91 → 0.93 renamed the reroute passthrough variable.
+/// A folder named by its contents is written once (temp dir + rename, never
+/// overwritten), so another build can only ever write ITS folder, and this
+/// build's tabs keep sourcing this build's bytes. The legacy flat files are left
+/// where they are: older builds still write and read them.
 ///
 /// Returns `None` for unknown shell types.
 pub fn prepare(shell: ShellType) -> Result<Option<InjectionEnv>, std::io::Error> {
     prepare_cached(shell, cache_dir(), &SCRIPTS_WRITTEN)
 }
 
-/// [`prepare`] body with the memoization state injected for testability.
+/// This build's script folder, installed (or verified) as [`prepare`] installs
+/// it: `<cache>/<content address>/`, holding every loader and every body. What
+/// a host names to a RUNNING shell — the body pointer it writes carries the
+/// folder's address, and a typed upgrade names the folder itself — so the folder
+/// is made sure of first, and a shell is never pointed at bytes that are not
+/// this build's.
+pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
+    ensure_cached(cache_dir(), &SCRIPTS_WRITTEN)
+}
+
+/// [`prepare`] body with the cache root and the memoization state injected for
+/// testability.
 ///
-/// Skips [`ensure_scripts`] only when `written` records a successful write
-/// to this exact `base` AND the primary script still exists on disk — the
-/// stat preserves self-healing when the cache dir is deleted mid-run
-/// (partial deletion of only a wrapper file is not repaired). The base is
-/// recorded only on `Ok`, so an I/O failure retries on the next spawn.
+/// Skips [`install_script_set`] only when `written` records this exact folder
+/// AND its primary script still exists on disk — the stat preserves self-healing
+/// when the folder is deleted mid-run (by a person, or another build's garbage
+/// collection of a folder older than [`GC_MIN_AGE`]). The folder is recorded
+/// only on `Ok`, so an I/O failure retries on the next spawn.
 // Skip: `Option<PathBuf>::as_deref` dispatches PathBuf's Deref through the
 // generic trait path (PathBuf is not yet in the std-wrapper deref sentinel
 // set); every I/O path returns Err (fail-closed) and the cache contract is
@@ -374,18 +598,244 @@ pub fn prepare(shell: ShellType) -> Result<Option<InjectionEnv>, std::io::Error>
 #[cfg_attr(trust_verify, trust::skip)]
 fn prepare_cached(
     shell: ShellType,
-    base: PathBuf,
+    root: PathBuf,
     written: &Mutex<Option<PathBuf>>,
 ) -> Result<Option<InjectionEnv>, std::io::Error> {
+    let base = ensure_cached(root, written)?;
+    Ok(injection_for(shell, &base))
+}
+
+/// The install half of [`prepare_cached`]: this build's folder under `root`,
+/// installed unless `written` records it and its primary script is still there.
+// Skip: as `prepare_cached` — `Option<PathBuf>::as_deref` through the generic
+// trait path; every I/O path returns Err.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ensure_cached(
+    root: PathBuf,
+    written: &Mutex<Option<PathBuf>>,
+) -> Result<PathBuf, std::io::Error> {
+    let base = root.join(script_set_address());
     let mut written = written.lock().unwrap_or_else(PoisonError::into_inner);
     let cached = written.as_deref() == Some(base.as_path())
         && base.join("aterm_shell_integration.zsh").exists();
     if !cached {
-        ensure_scripts(&base)?;
+        install_script_set(&root)?;
         *written = Some(base.clone());
+        drop(written);
+        // wasm-clock-guard: allow — script installation runs only for a shell a
+        // host spawns (`prepare`'s one caller is aterm-gui spawn.rs); a browser
+        // spawns none and has no filesystem, and this clock is compared with
+        // file mtimes, which are std's.
+        collect_old_script_sets(&root, std::time::SystemTime::now());
+    } else {
+        drop(written);
     }
-    drop(written);
-    Ok(injection_for(shell, &base))
+    Ok(base)
+}
+
+/// Every file of a script folder, relative to it, with its bytes — the ONE list
+/// [`ensure_scripts`] writes, [`script_set_address`] hashes and
+/// [`script_set_matches`] verifies, so the three cannot disagree about what a
+/// script set is.
+///
+/// Each POSIX shell's BODY rides beside its loader
+/// (`aterm_shell_integration_body.<ext>`, [`body_file`]): a running shell's
+/// loader sources it from a folder like this one when its host points it here.
+/// A body is part of the set, so it is part of the address, and a folder that
+/// names a body holds exactly the bytes that address says.
+fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 10] {
+    [
+        ("aterm_shell_integration.zsh", lf_only(scripts::ZSH)),
+        ("aterm_shell_integration.bash", lf_only(scripts::BASH)),
+        ("aterm_shell_integration.fish", lf_only(scripts::FISH)),
+        ("aterm_shell_integration_body.zsh", body_file(scripts::ZSH)),
+        (
+            "aterm_shell_integration_body.bash",
+            body_file(scripts::BASH),
+        ),
+        (
+            "aterm_shell_integration_body.fish",
+            body_file(scripts::FISH),
+        ),
+        // No BOM on purpose: the script is ASCII-only so Windows PowerShell 5.1
+        // (which decodes BOM-less source as ANSI) reads it correctly.
+        (
+            "aterm_shell_integration.ps1",
+            std::borrow::Cow::Borrowed(scripts::POWERSHELL),
+        ),
+        // zsh: ZDOTDIR wrapper .zshenv
+        ("zdotdir/.zshenv", std::borrow::Cow::Borrowed(ZSH_WRAPPER)),
+        // bash: rcfile wrapper
+        ("bash/rcfile", std::borrow::Cow::Borrowed(BASH_WRAPPER)),
+        // fish: XDG vendor conf.d structure
+        (
+            "fish-xdg/fish/vendor_conf.d/aterm_shell_integration.fish",
+            lf_only(scripts::FISH),
+        ),
+    ]
+}
+
+/// A loader's BODY as its own file: [`BODY_FILE_HEADER`], then the text between
+/// the loader's markers ([`scripts::body`]), LF-normalised like the loader.
+///
+/// # Panics
+/// When `script` has no body markers — a build whose zsh/bash/fish script lost
+/// them would ship folders with no body a running shell could take, so it fails
+/// at its first `prepare` (and in this crate's tests) instead.
+fn body_file(script: &'static str) -> std::borrow::Cow<'static, str> {
+    let body = scripts::body(script).expect("a zsh/bash/fish script carries its body markers");
+    std::borrow::Cow::Owned(format!("{BODY_FILE_HEADER}{}", lf_only(body)))
+}
+
+/// The name of this build's script folder: the first 16 hex digits of a SHA-256
+/// over every (path, bytes) pair of [`script_set`], length-prefixed so no two
+/// sets can concatenate alike. Computed once per process.
+#[must_use]
+pub fn script_set_address() -> &'static str {
+    static ADDRESS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ADDRESS.get_or_init(|| {
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm shell-integration script set v1\0");
+        for (path, bytes) in script_set() {
+            for part in [path.as_bytes(), bytes.as_bytes()] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part);
+            }
+        }
+        let digest = hash.finalize();
+        let mut out = String::with_capacity(16);
+        for &b in &digest[..8] {
+            out.push(nibble_to_hex(b >> 4));
+            out.push(nibble_to_hex(b & 0x0F));
+        }
+        out
+    })
+}
+
+/// Whether `dir` holds exactly this build's script set — every file present,
+/// byte for byte. A partial or foreign folder is not.
+fn script_set_matches(dir: &Path) -> bool {
+    script_set()
+        .iter()
+        .all(|(path, bytes)| std::fs::read(dir.join(path)).is_ok_and(|b| b == bytes.as_bytes()))
+}
+
+/// A suffix no other writer's scratch folder shares: the process, the clock,
+/// and a count within the process — the clock alone is not enough, because
+/// macOS's ticks in microseconds and two threads installing at once (a window
+/// restoring its tabs) read the same tick and wrote into ONE scratch folder,
+/// the first rename taking it away from under the second (`NotFound`).
+fn scratch_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // wasm-clock-guard: allow — only for a scratch folder beside the script
+    // sets, which exist only where a host spawns shells (see `prepare`).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{n}", std::process::id())
+}
+
+/// Install this build's script set as `<root>/<address>/` and return that path.
+///
+/// WRITE-ONCE: an existing folder that already matches is used as it is; a new
+/// one is written in full under a scratch name (`.tmp-…`) and renamed into place,
+/// so no shell ever sources a half-written file and no racing writer's folder is
+/// ever overwritten. A folder that exists but does NOT match (a person edited it,
+/// a disk filled mid-write under an older scheme) is moved aside and replaced.
+fn install_script_set(root: &Path) -> Result<PathBuf, std::io::Error> {
+    let address = script_set_address();
+    let dir = root.join(address);
+    if script_set_matches(&dir) {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(root)?;
+    let tmp = root.join(format!(".tmp-{address}-{}", scratch_suffix()));
+    if let Err(e) = ensure_scripts(&tmp) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    for _ in 0..2 {
+        // `rename(2)` over an EMPTY directory replaces it; over a non-empty one
+        // it fails, which is what makes a winner's folder immune to a loser.
+        if std::fs::rename(&tmp, &dir).is_ok() {
+            return Ok(dir);
+        }
+        if script_set_matches(&dir) {
+            // Another process installed the same set first.
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Ok(dir);
+        }
+        let stale = root.join(format!(".stale-{address}-{}", scratch_suffix()));
+        if std::fs::rename(&dir, &stale).is_ok() {
+            let _ = std::fs::remove_dir_all(&stale);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    Err(std::io::Error::other(format!(
+        "could not install the shell-integration scripts at {}",
+        dir.display()
+    )))
+}
+
+/// Script folders younger than this are never collected: a shell spawned from
+/// one may still be starting, and a window that spawned it may spawn another.
+pub const GC_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// The newest script folders always kept, whatever their age.
+pub const GC_KEEP_NEWEST: usize = 5;
+
+/// Scratch folders (`.tmp-…`/`.stale-…`) older than this belong to a writer
+/// that died mid-install.
+const GC_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// A content folder's name: exactly 16 lowercase hex digits.
+fn is_address(name: &str) -> bool {
+    name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Remove OTHER builds' script folders under `root` that are older than
+/// [`GC_MIN_AGE`], always keeping the [`GC_KEEP_NEWEST`] newest and this build's
+/// own, plus dead writers' scratch folders. A running shell reads its own folder
+/// only while it starts (the loaders source it once), so an old folder's last
+/// reader is a tab opened from that build within the last two weeks; a window of
+/// that build that opens a tab later re-installs its folder ([`prepare_cached`]
+/// stats it on every spawn). A running shell reads ANOTHER folder only when its
+/// host points it there — at the host's own folder, installed right before
+/// ([`ensure_script_set`]); a body collected before the shell's next prompt
+/// leaves it on the body it runs, which `status integration_rev=` still names.
+/// The legacy flat files are never touched. Best effort: every failure leaves
+/// the entry in place.
+fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let own = script_set_address();
+    let mut sets: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or_default();
+        if name.starts_with(".tmp-") || name.starts_with(".stale-") {
+            if age >= GC_SCRATCH_AGE {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        } else if is_address(name) && name != own {
+            sets.push((modified, entry.path()));
+        }
+    }
+    sets.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (modified, path) in sets.into_iter().skip(GC_KEEP_NEWEST) {
+        if now.duration_since(modified).unwrap_or_default() >= GC_MIN_AGE {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 /// Prepare shell integration using a specific base directory.
@@ -515,48 +965,17 @@ fn lf_only(contents: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Write embedded scripts and wrapper files to the cache directory.
+/// Write embedded scripts and wrapper files ([`script_set`], LF-normalised —
+/// see `lf_only`) into `base`.
 fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(base)?;
-
-    // Write canonical scripts (LF-normalised — see `lf_only`).
-    write_script(
-        &base.join("aterm_shell_integration.zsh"),
-        &lf_only(scripts::ZSH),
-    )?;
-    write_script(
-        &base.join("aterm_shell_integration.bash"),
-        &lf_only(scripts::BASH),
-    )?;
-    write_script(
-        &base.join("aterm_shell_integration.fish"),
-        &lf_only(scripts::FISH),
-    )?;
-    // No BOM on purpose: the script is ASCII-only so Windows PowerShell 5.1
-    // (which decodes BOM-less source as ANSI) reads it correctly.
-    write_script(
-        &base.join("aterm_shell_integration.ps1"),
-        scripts::POWERSHELL,
-    )?;
-
-    // zsh: ZDOTDIR wrapper .zshenv
-    let zdotdir = base.join("zdotdir");
-    std::fs::create_dir_all(&zdotdir)?;
-    write_script(&zdotdir.join(".zshenv"), ZSH_WRAPPER)?;
-
-    // bash: rcfile wrapper
-    let bash_dir = base.join("bash");
-    std::fs::create_dir_all(&bash_dir)?;
-    write_script(&bash_dir.join("rcfile"), BASH_WRAPPER)?;
-
-    // fish: XDG vendor conf.d structure
-    let fish_conf = base.join("fish-xdg").join("fish").join("vendor_conf.d");
-    std::fs::create_dir_all(&fish_conf)?;
-    write_script(
-        &fish_conf.join("aterm_shell_integration.fish"),
-        &lf_only(scripts::FISH),
-    )?;
-
+    for (path, bytes) in script_set() {
+        let path = base.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_script(&path, &bytes)?;
+    }
     Ok(())
 }
 
@@ -967,6 +1386,7 @@ fn prepare_cmd() -> InjectionEnv {
 #[cfg(test)]
 mod tests {
     include!("tests.rs");
+    include!("tests_loader.rs");
 
     /// Regression test for #5959/#5960: `autoload -Uz add-zsh-hook` must
     /// appear before any `add-zsh-hook` call in the zsh script. Violating

@@ -34,7 +34,12 @@
 //! (a source-only release) or a tag this client does not install from — is recorded as
 //! exactly that ("channel head <tag> has no app manifest yet") and the check ends: the
 //! publisher owns `latest`, and the next check reads the head again. Nothing lists the
-//! catalog to look past it.
+//! catalog to look past it. A source-only head whose tag outranks the last one the
+//! ledger authorized for this source is an APP BUILD IN FLIGHT ([`app_build_in_flight`]): the
+//! publication train mints the release source-first and the app cut attaches its
+//! assets minutes later, so the next checks come on `cadence::IN_FLIGHT_RETRY` (2, 4,
+//! 8 minutes) instead of a whole interval, counted machine-wide on the check receipt
+//! ([`head_in_flight`]).
 //!
 //! The lane is not a trust decision. Artifact trust is the master-signed roster, the
 //! pinned Team ID and the manifest sha256 — none of which the transport touches.
@@ -51,6 +56,52 @@ use crate::{Source, bundle, install, paths::Staging};
 /// down (a 429 or a 5xx). Read by the background loop to LENGTHEN the next wait without
 /// recording a failure: weather, not a broken updater.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
+
+/// The channel head whose APP BUILD the check in progress found in flight
+/// ([`app_build_in_flight`]) and, once the check receipt has counted it, how many
+/// consecutive completed checks machine-wide have found it so. Set by
+/// `check_and_stage_inner`, counted by [`check_and_stage`], read by the background
+/// loop through [`head_in_flight`] to take the quick `cadence::IN_FLIGHT_RETRY` ladder
+/// instead of a whole interval. Cleared at every check's start.
+static HEAD_IN_FLIGHT: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_head_in_flight(value: Option<(String, u32)>) {
+    *HEAD_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
+/// After a check: the head whose app build it found in flight, and how many
+/// consecutive completed checks machine-wide (this one included) have found it so —
+/// `None` when the last check did not, or recorded no receipt. The loop hands the
+/// count to `Cadence::succeeded`.
+#[must_use]
+pub(crate) fn head_in_flight() -> Option<(String, u32)> {
+    HEAD_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Whether `head` — a channel head whose release carries no `aterm-appcast.toml` yet
+/// — is an APP BUILD IN FLIGHT: a release tag this client installs from whose rank is
+/// above `known`, the last tag the ledger authorized for this source, whichever build
+/// recorded it (`status::authorized_tag`: every build on the machine gets the same
+/// answer, as the machine-wide count needs), or any tag at all when none is. The publication train mints the release
+/// source-first and the app cut attaches its assets minutes later (~19 minutes on an
+/// ordinary promote, 2026-09-10). A head at or below `known` — GitHub's `latest`
+/// names the most recently PUBLISHED release, which a re-published older tag can be —
+/// is no release this client is waiting for, and neither is a tag it does not
+/// install from.
+fn app_build_in_flight(head: &str, known: Option<&str>) -> bool {
+    let Ok(TagKind::Candidate(rank)) = parse_numeric_tag(head) else {
+        return false;
+    };
+    match known.map(parse_numeric_tag) {
+        Some(Ok(TagKind::Candidate(known))) => rank > known,
+        _ => true,
+    }
+}
 
 /// Whether this process has already logged which channel it reads. Once per process: it
 /// is a standing condition, not an event.
@@ -124,7 +175,7 @@ fn cadence_note() -> String {
 /// on the web host, so all three are named. The channel is read with no credential, so
 /// no credential is offered as a remedy. A REPOINTED source (a development build's
 /// `[update] owner`/`repo`) adds the one cause only it can have.
-fn unreadable_explanation(code: u16, source: &Source) -> String {
+fn unreadable_explanation(source: &Source) -> String {
     let repointed = if is_default_channel(source) {
         String::new()
     } else {
@@ -137,12 +188,11 @@ fn unreadable_explanation(code: u16, source: &Source) -> String {
         )
     };
     format!(
-        "aterm cannot read its release channel github.com/{}/{} (HTTP {code}): the channel \
-         has no published release, or the repository is private, was renamed, or does not \
-         exist. Updates are read with no credential, so this machine will NEVER receive an \
-         update until the channel is repaired at github.com/{}/{}, or aterm is reinstalled \
-         from the channel's new location.{repointed}",
-        source.owner, source.repo, source.owner, source.repo
+        "aterm cannot read its release channel github.com/{}/{}: it has no published \
+         release, or the repository is private, renamed or gone. This machine stays on its \
+         current version until the channel is fixed; if aterm moved, reinstall it from its \
+         new location.{repointed}",
+        source.owner, source.repo
     )
 }
 
@@ -1045,8 +1095,10 @@ fn stage_backoff(
 }
 
 /// The exact asset names a release carries for the updater. The roster chain looks
-/// them up by name; the check DERIVES their URLs from them ([`web_release`]).
-const APPCAST_ASSET: &str = "aterm-appcast.toml";
+/// them up by name; the check DERIVES their URLs from them ([`web_release`]). The
+/// appcast's is one constant with the dev build's look at the channel
+/// ([`crate::dev_channel`]), so the two can never HEAD different names.
+const APPCAST_ASSET: &str = crate::dev_channel::APPCAST_ASSET;
 const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 
 // ---------------------------------------------------------------------------------
@@ -1131,6 +1183,20 @@ fn record_head_without_app(staging: &Staging, current_build: u64, tag: &str) {
     );
 }
 
+/// THE SOURCE-ONLY HEAD — the pointer named a canonical app tag whose appcast answers
+/// 404 — said as a head with no app manifest yet ([`record_head_without_app`]), and,
+/// when its tag outranks the last one the ledger authorized for this source, latched
+/// as an APP BUILD IN FLIGHT ([`app_build_in_flight`]): its assets are minutes away, so
+/// [`check_and_stage`] counts it on the receipt and the loop re-checks on the quick
+/// ladder instead of a whole interval.
+fn record_source_only_head(staging: &Staging, current_build: u64, source: &Source, tag: &str) {
+    let known = crate::status::authorized_tag(staging, source);
+    if app_build_in_flight(tag, known.as_deref()) {
+        set_head_in_flight(Some((tag.to_string(), 0)));
+    }
+    record_head_without_app(staging, current_build, tag);
+}
+
 /// ONE unmetered HEAD, and the decision it yields: a redirect to a canonical tag is the
 /// head; the ledger's `latest_tag` decides whether anything else is fetched; a 404 is
 /// the loud standing state; a 429 or 5xx is a deferral; a redirect to a tag this client
@@ -1158,11 +1224,7 @@ fn resolve_web_head(
     let pointer = match pointer {
         Ok(pointer) => pointer,
         Err(PointerError::NoRelease { .. }) => {
-            crate::unreadable::announce(
-                staging,
-                current_build,
-                &unreadable_explanation(404, source),
-            );
+            crate::unreadable::announce(staging, current_build, &unreadable_explanation(source));
             return Ok(WebHead::Ended);
         }
         Err(error @ PointerError::Transient { .. }) => {
@@ -1302,6 +1364,7 @@ enum Acquisition {
 /// compare EQUAL on the numeric triple — a version test could not tell them
 /// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
 pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
+    set_head_in_flight(None);
     if bundle::resolve().is_none() {
         return Ok(None);
     }
@@ -1334,12 +1397,43 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
             detail: error.clone(),
         });
     }
-    if check_leaves_a_receipt(&result, rate_limited())
-        && let Some(staging) = Staging::resolve()
-    {
-        crate::check_receipt::record(&staging, current_build, source, rate_limited());
-    }
+    let found = head_in_flight().map(|(tag, _)| tag);
+    set_head_in_flight(Staging::resolve().and_then(|staging| {
+        stamp_receipt(
+            &staging,
+            current_build,
+            source,
+            &result,
+            rate_limited(),
+            found,
+        )
+    }));
     result
+}
+
+/// Stamp the check receipt for the check that just ended, when it owes one
+/// ([`check_leaves_a_receipt`]), and answer the head in flight it counted: `found` —
+/// the head whose app build the check found in flight — with the machine-wide count
+/// of consecutive checks that have found it so, this one included. Only a completed
+/// check that is not a deferral counts one: a host that asked us to slow down holds
+/// to the deferral's own window, never the quick ladder. A failed check leaves the
+/// receipt untouched, so it neither counts nor ends the run — the next completed
+/// check that finds the same head carries the count on.
+fn stamp_receipt(
+    staging: &Staging,
+    current_build: u64,
+    source: &Source,
+    result: &Result<Option<String>, String>,
+    deferred: bool,
+    found: Option<String>,
+) -> Option<(String, u32)> {
+    if !check_leaves_a_receipt(result, deferred) {
+        return None;
+    }
+    let found = found.filter(|_| result.is_ok() && !deferred);
+    let checks =
+        crate::check_receipt::record(staging, current_build, source, deferred, found.as_deref());
+    found.filter(|_| checks > 0).map(|tag| (tag, checks))
 }
 
 /// Whether the check that just ended owes the shared check receipt a stamp.
@@ -1494,7 +1588,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // recorded as authorized, so the next check reads it again and the app cut that
     // attaches its appcast is picked up then.
     if fetched.appcast_missing {
-        record_head_without_app(&staging, current_build, &web_tag);
+        record_source_only_head(&staging, current_build, source, &web_tag);
         return Ok(None);
     }
     // THE URL CROSS-CHECK, after every signature has been verified and the version
@@ -1883,11 +1977,12 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let part = staging.download.join(format!("{}.part", artifact.name));
     let container_path = staging.download.join(&artifact.name);
     sweep_download_scratch(&staging);
-    // LIVE PROGRESS for a host that shows it (the aterm window's status bar): a
-    // sibling poller stats the growing `.part` (the download host declares no size up
-    // front, which the host renders as "unknown"). Joined on drop, so it cannot
-    // outlive the download it watches.
-    let download_watch = crate::progress::watch_download(&part, &manifest.version);
+    // LIVE PROGRESS for a host that shows it (the aterm window's band row): a
+    // sibling poller stats the growing `.part`, and a HEAD of the same derived URL,
+    // run beside the download and never before it, gives the total its fill and ETA
+    // are drawn from (design ruling 226; the digest below still proves the bytes).
+    // The poller is joined on drop, so it cannot outlive the download it watches.
+    let download_watch = crate::progress::watch_download(&part, &manifest.version, &asset.url);
     // A failed download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
     let downloaded = aterm_update_core::download_to(
@@ -2092,19 +2187,22 @@ mod tests {
     #[test]
     fn an_unreadable_channel_is_loud_and_actionable_not_idle() {
         let source = test_source();
-        let text = unreadable_explanation(404, &source);
-        assert!(text.contains("NEVER receive an update"), "{text}");
+        let text = unreadable_explanation(&source);
+        assert!(text.contains("stays on its current version"), "{text}");
         assert!(text.contains("github.com/alabsystems/aterm"), "{text}");
-        assert!(text.contains("HTTP 404"), "{text}");
+        assert!(
+            !text.contains("HTTP") && !text.contains("NEVER"),
+            "the status code is mechanism, and the latch clears on a readable check: {text}"
+        );
         // Every cause the web host cannot distinguish.
         assert!(
             text.contains("no published release"),
             "cause 1 missing: {text}"
         );
         assert!(text.contains("private"), "cause 2 missing: {text}");
-        assert!(text.contains("does not exist"), "cause 3 missing: {text}");
+        assert!(text.contains("renamed or gone"), "cause 3 missing: {text}");
         assert!(
-            text.contains("reinstalled"),
+            text.contains("reinstall it from its new location"),
             "the remedy is missing: {text}"
         );
         assert!(
@@ -2120,7 +2218,7 @@ mod tests {
             owner: "someone-else".to_string(),
             repo: "private-aterm".to_string(),
         };
-        let text = unreadable_explanation(404, &overridden);
+        let text = unreadable_explanation(&overridden);
         assert!(
             text.contains("github.com/someone-else/private-aterm"),
             "{text}"
@@ -4000,7 +4098,7 @@ mod tests {
         assert!(crate::unreadable::is_stranded());
         let text = std::fs::read_to_string(&staging.status).unwrap();
         assert!(text.contains("cannot read its release channel"), "{text}");
-        assert!(text.contains("HTTP 404"), "{text}");
+        assert!(text.contains("no published release"), "{text}");
         assert!(
             !staging.health().exists(),
             "a standing state is not a fault"
@@ -4512,6 +4610,174 @@ mod tests {
         assert!(
             matches!(outcome, Ok(Acquisition::Proceed(_))),
             "{outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE HEAD IN FLIGHT (measured 2026-09-24: v0.92.0 published source-first, the
+    /// 12:38:35 check met its appcast's 404, and the next came a whole interval later
+    /// at 13:13:10, which found the assets). A source-only head that OUTRANKS the last
+    /// tag authorized for its source — or any tag, when none is — is an app
+    /// build in flight, and the check latches it for the receipt to count. Negative
+    /// controls: a head at or below the authorized tag (GitHub's `latest` can name a
+    /// re-published older release), a tag this client does not install from, and a
+    /// retired two-component tag are not; the other-tag pointer latches nothing.
+    #[test]
+    fn a_source_only_head_above_the_authorized_tag_is_an_app_build_in_flight() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(app_build_in_flight("v0.92.0", Some("v0.91.0")));
+        assert!(app_build_in_flight("v0.92.0", None));
+        assert!(!app_build_in_flight("v0.91.0", Some("v0.91.0")));
+        assert!(!app_build_in_flight("v0.90.0", Some("v0.91.0")));
+        assert!(!app_build_in_flight("atpkg-index-46", None));
+        assert!(!app_build_in_flight("v0.61", None));
+
+        let staging = Staging::scratch("head-in-flight");
+        let source = test_source();
+        crate::status::clear_check_note();
+        for (authorized, latched) in [
+            ("v0.9.0", Some((WEB_TAG.to_string(), 0))),
+            ("v0.11.0", None),
+        ] {
+            write_ledger(&staging, authorized, WEB_BUILD, "alabsystems/aterm");
+            set_head_in_flight(None);
+            record_source_only_head(&staging, WEB_BUILD, &source, WEB_TAG);
+            assert_eq!(head_in_flight(), latched, "authorized {authorized}");
+            let text = std::fs::read_to_string(&staging.status).unwrap();
+            assert!(
+                text.contains("channel head v0.10.0 has no app manifest yet"),
+                "{text}"
+            );
+        }
+        let _ = std::fs::remove_file(&staging.status);
+        set_head_in_flight(None);
+        record_source_only_head(&staging, WEB_BUILD, &source, WEB_TAG);
+        assert_eq!(
+            head_in_flight(),
+            Some((WEB_TAG.to_string(), 0)),
+            "none authorized"
+        );
+
+        set_head_in_flight(None);
+        let (outcome, _) = acquire_web(&staging, None, || {
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(tag_url("atpkg-index-44", APPCAST_ASSET)),
+            })
+        });
+        assert!(matches!(outcome, Ok(Acquisition::Ended)), "{outcome:?}");
+        assert_eq!(
+            head_in_flight(),
+            None,
+            "a tag this client does not install from"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// EVERY BUILD ON THE MACHINE CALLS THE SAME HEAD IN FLIGHT (the review of
+    /// 2026-09-25, F7). The count the quick ladder keys on is machine-wide, so
+    /// the predicate it counts must be too: decided against the tag the ledger
+    /// authorized for THIS build only (`status::latest_tag`), every build but
+    /// the one that recorded it read no tag and called ANY source-only head in
+    /// flight — so with the ledger at v0.93.0 (build 42) and GitHub's `latest`
+    /// naming a re-published source-only v0.92.0, build 41 counted the head
+    /// (rung 1, two minutes) and build 42 reset the count, 0, 1, 0, 1, never
+    /// past the first rung. Now both call it what it is — below the authorized
+    /// tag, not in flight — and a head ABOVE it is in flight for both (the
+    /// positive control). Another source's authorized tag decides nothing.
+    #[test]
+    fn every_build_calls_the_same_head_in_flight() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("head-in-flight-builds");
+        let source = test_source();
+        crate::status::clear_check_note();
+        let latched = |build: u64, head: &str| {
+            set_head_in_flight(None);
+            record_source_only_head(&staging, build, &source, head);
+            head_in_flight().is_some()
+        };
+        // The ledger: build 42 authorized v0.93.0.
+        write_ledger(&staging, "v0.93.0", 42, "alabsystems/aterm");
+        assert!(!latched(42, "v0.92.0"), "the recording build");
+        assert!(!latched(41, "v0.92.0"), "another build, the same answer");
+        assert!(latched(42, "v0.94.0"));
+        assert!(latched(41, "v0.94.0"));
+        // Through the receipt: the two builds' checks no longer alternate a
+        // count of 0 and 1 on a head below the authorized tag.
+        let counts: Vec<u32> = [42, 41, 42, 41]
+            .into_iter()
+            .map(|build| {
+                set_head_in_flight(None);
+                record_source_only_head(&staging, build, &source, "v0.92.0");
+                let found = head_in_flight().map(|(tag, _)| tag);
+                stamp_receipt(&staging, build, &source, &Ok(None), false, found)
+                    .map_or(0, |(_, n)| n)
+            })
+            .collect();
+        assert_eq!(counts, [0, 0, 0, 0]);
+        // Another repository's authorized tag is no answer about this one.
+        write_ledger(&staging, "v0.93.0", 42, "someone/else");
+        assert!(latched(41, "v0.92.0"));
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// The count the quick ladder keys on is the RECEIPT's, machine-wide: consecutive
+    /// completed checks that found the same head in flight count up; a deferral, a
+    /// check that found none and a different head each end the run. A FAILED check
+    /// writes no receipt, so it neither counts nor ends the run: the next completed
+    /// check carries the count on (1, fail, 2 — erring toward fewer quick checks).
+    #[test]
+    fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("head-in-flight-receipt");
+        let source = test_source();
+        let healthy: Result<Option<String>, String> = Ok(None);
+        let stamp =
+            |result: &Result<Option<String>, String>, deferred: bool, head: Option<&str>| {
+                stamp_receipt(
+                    &staging,
+                    WEB_BUILD,
+                    &source,
+                    result,
+                    deferred,
+                    head.map(str::to_owned),
+                )
+            };
+        let v92 = Some("v0.92.0");
+        assert_eq!(stamp(&healthy, false, v92), Some(("v0.92.0".into(), 1)));
+        assert_eq!(stamp(&healthy, false, v92), Some(("v0.92.0".into(), 2)));
+        assert_eq!(
+            stamp(&Ok(Some("0.91.0".into())), false, v92),
+            Some(("v0.92.0".into(), 3)),
+            "a check that staged something still counts the head it found"
+        );
+        // A deferral records its own window and no head; the next run starts over.
+        assert_eq!(stamp(&healthy, true, v92), None);
+        assert_eq!(stamp(&healthy, false, v92), Some(("v0.92.0".into(), 1)));
+        // A failed check leaves the receipt alone, and answers no head.
+        let before = std::fs::read(crate::check_receipt::path(&staging)).unwrap();
+        assert_eq!(stamp(&Err("dns".into()), false, v92), None);
+        assert_eq!(
+            std::fs::read(crate::check_receipt::path(&staging)).unwrap(),
+            before
+        );
+        assert_eq!(stamp(&healthy, false, v92), Some(("v0.92.0".into(), 2)));
+        // A different head is a different release in flight.
+        assert_eq!(
+            stamp(&healthy, false, Some("v0.93.0")),
+            Some(("v0.93.0".into(), 1))
+        );
+        // A check that found none ends the run.
+        assert_eq!(stamp(&healthy, false, None), None);
+        assert_eq!(
+            stamp(&healthy, false, Some("v0.93.0")),
+            Some(("v0.93.0".into(), 1))
         );
         let _ = std::fs::remove_dir_all(&staging.root);
     }

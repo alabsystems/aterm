@@ -1,0 +1,16 @@
+# claude-code (unrecorded) · HAND-BUILT (synthetic) 2026-09-24 from the incident tab's `text tail=40` rows (the spinner, banner and rule rows as read; the transcript above them and the draft's words made up, the draft quoting the banner as the incident's did): a 144-column screen, the spinner 36 minutes into a turn, Claude Code's critical-memory banner right-aligned alone on the row under it (column 67, ending two columns short of the rule), and a composer draft QUOTING the banner — the negative control
+⏺ Running the full reflow suite under the new ledger before I touch the drainer.
+
+⏺ Bash(targo --unverified test -p aterm-session --lib 2>&1 | tail -5)
+  ⎿  Running…
+
+· Gesticulating… (36m 1s)
+                                                                   Critical memory usage (140.4GB) — restart and resume with claude --continue
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ the tab above says "Critical memory usage (140.4GB) — restart and resume with claude --continue" and it has not read a key since the Enter I
+  pressed at 10:12. is the worker frozen, or only slow? if it is frozen, stop it with signal term and resume it with claude --continue,
+  then check that the queued Enter did not land in the shell. the supervisor badge still says to answer the box, which is stale; the
+  box it names was answered hours ago. keep this draft until the restart is done, then send it to the new session so it knows what
+  happened.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt

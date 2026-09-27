@@ -43,7 +43,10 @@ fn invariant_violated(out: &str) -> bool {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // payload strings are surfaced via the Debug print of each row
+#[expect(
+    dead_code,
+    reason = "payload strings are surfaced via the Debug print of each row"
+)]
 enum Verdict {
     Proved,
     ProvedNoDial,

@@ -36,7 +36,7 @@
 use crate::{SealedStream, KEY_LEN};
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 const SHA256_BLOCK: usize = 64;
 const SHA256_OUT: usize = 32;
@@ -74,8 +74,9 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_OUT] {
 /// HKDF-SHA256 (RFC 5869) producing exactly 32 bytes (a single expand block,
 /// L = 32 ≤ 255·32). Extract then Expand, ours over `hmac_sha256`.
 pub(crate) fn hkdf_sha256_32(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
-    let mut prk = hmac_sha256(salt, ikm); // Extract
-                                          // Expand, N = 1: T(1) = HMAC(PRK, T(0)=<empty> ‖ info ‖ 0x01).
+    // Extract.
+    let mut prk = hmac_sha256(salt, ikm);
+    // Expand, N = 1: T(1) = HMAC(PRK, T(0)=<empty> ‖ info ‖ 0x01).
     let mut t1_input = Vec::with_capacity(info.len() + 1);
     t1_input.extend_from_slice(info);
     t1_input.push(0x01);
@@ -145,7 +146,14 @@ fn derive_session_key(
 /// The raw ephemeral X25519 shared secret against `their_pub`, rejecting a
 /// non-contributory (low-order) point that would force a zero output. Shared by
 /// the PSK handshake and the identity handshake.
-pub(crate) fn x25519_shared(secret: &StaticSecret, their_pub: &[u8; 32]) -> io::Result<[u8; 32]> {
+///
+/// Returned as `x25519-dalek`'s own type, which wipes itself on drop: a copy
+/// into a plain array would outlive the handshake in memory, and this value
+/// (with the PSK, if any) is all a later reader needs to decrypt the session.
+pub(crate) fn x25519_shared(
+    secret: &StaticSecret,
+    their_pub: &[u8; 32],
+) -> io::Result<SharedSecret> {
     let shared = secret.diffie_hellman(&PublicKey::from(*their_pub));
     if !shared.was_contributory() {
         return Err(io::Error::new(
@@ -153,7 +161,7 @@ pub(crate) fn x25519_shared(secret: &StaticSecret, their_pub: &[u8; 32]) -> io::
             "astream handshake: non-contributory X25519 (low-order point)",
         ));
     }
-    Ok(*shared.as_bytes())
+    Ok(shared)
 }
 
 /// Complete the DH and derive the PSK-authenticated session key.
@@ -165,14 +173,20 @@ fn agree(
     server_pub: &[u8; 32],
 ) -> io::Result<[u8; KEY_LEN]> {
     let dh = x25519_shared(secret, their_pub)?;
-    Ok(derive_session_key(psk, &dh, client_pub, server_pub))
+    Ok(derive_session_key(
+        psk,
+        dh.as_bytes(),
+        client_pub,
+        server_pub,
+    ))
 }
 
 /// The bytes both sides bind into every record's AAD: the ephemeral public keys in
 /// a fixed order (client, then server), as THIS side observed them. An active MITM
 /// that relays different ephemerals to each leg produces different transcripts, so
-/// its records fail to open on the far side.
-fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 64] {
+/// its records fail to open on the far side. The identity handshake binds the same
+/// bytes, which are also what its peers sign.
+pub(crate) fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 64] {
     let mut t = [0u8; 64];
     t[..32].copy_from_slice(client_pub);
     t[32..].copy_from_slice(server_pub);

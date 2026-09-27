@@ -388,30 +388,6 @@ pub fn claim(stamp: &Path, now_unix: i64, every_secs: u64) -> bool {
     true
 }
 
-/// The `last_success_at` value of a `status.toml` text, or `None` when the key is
-/// absent or empty. A TOML parse failure reads as absent: a record this reader
-/// cannot parse is a record that proves no success.
-#[must_use]
-pub fn last_success_at(status_toml: &str) -> Option<String> {
-    let value: aterm_toml::Value = status_toml.parse().ok()?;
-    value
-        .get("last_success_at")
-        .and_then(aterm_toml::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// Whether `status_toml_path` proves that NO atpkg pass has ever succeeded: the
-/// file is absent, unreadable, unparseable, or carries no `last_success_at`.
-#[must_use]
-pub fn never_checked(status_toml_path: &Path) -> bool {
-    match std::fs::read_to_string(status_toml_path) {
-        Ok(text) => last_success_at(&text).is_none(),
-        Err(_) => true,
-    }
-}
-
 /// `YYYY-MM-DDTHH:MM:SSZ` (any trailing fraction/offset ignored) → unix seconds.
 /// The same strict shape the roster's date parser reads; a stamp that does not fit
 /// it is `None`.
@@ -449,39 +425,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("status.toml")
-    }
-
-    /// The contract: absent file, no key, empty key ⇒ never checked; a stamped
-    /// key ⇒ checked. `updated_at` alone proves nothing — it is a last-WRITE stamp,
-    /// moved by failed passes and row rewrites alike (2026-09-10 audit).
-    #[test]
-    fn never_checked_reads_only_last_success_at() {
-        let p = scratch("never");
-        assert!(never_checked(&p), "absent file");
-        std::fs::write(
-            &p,
-            "schema = 1\nupdated_at = \"2026-09-10T06:40:53Z\"\noutcome = \"up to date\"\n",
-        )
-        .unwrap();
-        assert!(
-            never_checked(&p),
-            "updated_at is a last-write stamp, not a success"
-        );
-        std::fs::write(&p, "schema = 1\nlast_success_at = \"\"\n").unwrap();
-        assert!(never_checked(&p), "an empty stamp is no stamp");
-        std::fs::write(&p, "not = [valid toml").unwrap();
-        assert!(never_checked(&p), "unparseable proves no success");
-        std::fs::write(
-            &p,
-            "schema = 1\nupdated_at = \"2026-09-10T07:00:00Z\"\nlast_success_at = \"2026-09-10T06:40:53Z\"\n",
-        )
-        .unwrap();
-        assert!(!never_checked(&p));
-        assert_eq!(
-            last_success_at(&std::fs::read_to_string(&p).unwrap()).as_deref(),
-            Some("2026-09-10T06:40:53Z")
-        );
-        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     /// The stamps a scheduler reads: the success, the attempt (the end the last full pass

@@ -8,7 +8,9 @@
 //! another: stable [`SessionId`]s + per-launch [`LaunchNonce`]s ([`id`]); the
 //! per-edge, op-scoped, fail-closed authority table ([`Op`]/[`Edge`]/[`EdgeToken`]/
 //! [`EdgeTable`]/[`decide_edge`]); and the single byte sink that serializes every
-//! writer to one PTY master with whole-frame atomicity ([`sink::SinkWriter`]).
+//! writer to one PTY master with whole-frame atomicity ([`sink::SinkWriter`]),
+//! which also dates the input the program at that master has not read yet
+//! ([`input_backlog`], added 2026-09-24 for a frozen reader).
 //!
 //! It performs NO filesystem or socket I/O itself — the GUI owns those (headless
 //! invariant). It is the policy + serialization core that the control socket and
@@ -16,9 +18,11 @@
 //!
 //! ## Status
 //!
-//! Design-proposed (Phase 0). The COARSE compile-time class gate lives in
-//! `aterm_cap::effects::{ReadScreen, WriteInput, SignalEdge}`; the FINE per-edge
-//! object identity (which `src → dst` for which op) is here. Per §7.7, cross-session
+//! Design-proposed (Phase 0). The per-edge object identity (which `src → dst`
+//! for which op) is here, and it is the whole gate: the COARSE compile-time class
+//! markers the design paired it with (`aterm_cap::effects::{ReadScreen,
+//! WriteInput, SignalEdge}`) were never required by any seam and were deleted on
+//! 2026-09-25 — `Spawn` is the one effect marker a seam requires. Per §7.7, cross-session
 //! `WriteInput` by untrusted IN-PROCESS code was blocked on no-mint-reachability
 //! (§5.4); that is now GREEN — the `aterm_cap::Authority` mint is sealed behind the
 //! `launcher-mint` feature and `ty`-proven (`aterm_spec::derive::mint_reachability_model`),
@@ -36,6 +40,7 @@
 
 mod edge;
 mod id;
+pub mod input_backlog;
 pub mod sink;
 
 pub use edge::{ConnectionKind, Edge, EdgeDecision, EdgeTable, EdgeToken, Op, decide_edge};

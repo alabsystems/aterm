@@ -433,6 +433,7 @@ impl Line {
     /// Check if this line has styled content (non-default attributes).
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn has_attrs(&self) -> bool {
         self.attrs.is_some()
     }
@@ -546,6 +547,7 @@ impl Line {
     /// Check if this line has any underline colours.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn has_underline_colors(&self) -> bool {
         // Closure-free match over the plain slice (see `has_hyperlinks`).
         match self.underline_colors() {
@@ -557,6 +559,7 @@ impl Line {
     /// Get the number of underline-colour spans.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn underline_color_count(&self) -> usize {
         // Closure-free match over the plain slice (see `hyperlink_count`).
         match self.underline_colors() {
@@ -594,6 +597,7 @@ impl Line {
         clippy::manual_find,
         reason = "explicit slice loop is the lowerable form for the strict Trust gate; the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
     )]
+    #[cfg(test)]
     pub fn get_image(&self, col: u16) -> Option<&ImageSpan> {
         // Explicit slice loop for the same strict-gate reason as
         // `get_hyperlink` (identical result to `.iter().find(..)`).
@@ -805,6 +809,7 @@ impl Line {
 
     /// Calculate the number of attribute runs (for compression stats).
     #[must_use]
+    #[cfg(test)]
     pub fn attr_run_count(&self) -> usize {
         // `runs.len()` IS `run_count()` (its exact definition), via the
         // strict-gate-provable fn-item access shape (see `attr_runs`); the

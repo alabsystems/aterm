@@ -8,7 +8,7 @@
 //! in a single call — hundreds of milliseconds at deep scrollback, which blocks
 //! the caller's event loop (the wasm render worker cannot answer input while
 //! it runs). [`BudgetedSearch`] splits that work into row-sized units the
-//! caller feeds incrementally: each [`feed_row`](BudgetedSearch::feed_row)
+//! caller feeds incrementally: each `feed_row`
 //! indexes ONE row (via [`SearchIndex::index_line`] — the index's native
 //! incremental construction) and verifies matches on that row immediately, so
 //! a caller can stop after any number of rows, yield, and RESUME without
@@ -67,7 +67,7 @@ enum RowMatcher {
 ///
 /// Construct with the query + options and the window `[base_row, base_row +
 /// total_rows)`, then feed each row's text in ascending order via
-/// [`feed_row`](Self::feed_row) — as few or as many per call as the caller's
+/// `feed_row` — as few or as many per call as the caller's
 /// budget allows. [`is_complete`](Self::is_complete) reports whether every row
 /// has been consumed; [`results`](Self::results) returns the accumulated
 /// [`SearchResults`] (partial until complete). See the module docs for the
@@ -181,6 +181,7 @@ impl BudgetedSearch {
     /// this row is absolute `base_row + rows_fed()`. Feeding past the window
     /// is a no-op (the caller's completion check races nothing, so tolerate it
     /// rather than panic).
+    #[cfg(test)]
     pub fn feed_row(&mut self, text: &str) {
         self.feed_row_cow(Cow::Borrowed(text));
     }
@@ -188,7 +189,7 @@ impl BudgetedSearch {
     /// Index and verify one owned row without copying its text into the cache.
     ///
     /// This has the same ordering and completion contract as
-    /// [`feed_row`](Self::feed_row), but moves `text` into the index.
+    /// `feed_row`, but moves `text` into the index.
     pub fn feed_row_owned(&mut self, text: String) {
         self.feed_row_cow(Cow::Owned(text));
     }

@@ -172,7 +172,7 @@ fn until_field(w: &World, sid: &str, key: &str, want: &str, budget: Duration) ->
 }
 
 /// The fake Claude: Claude Code's live zone painted by `printf`, advanced by
-/// Enter. 120 columns (the harness's `ATERM_COLUMNS`), so the rules are
+/// Enter. 120 columns (the harness's `--columns`), so the rules are
 /// full-width and the context indicator ends two columns short of them,
 /// where Claude Code parks it.
 ///

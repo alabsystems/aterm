@@ -84,31 +84,6 @@ pub(super) struct WindowOpsCapability {
     _seal: (),
 }
 
-impl WindowOpsCapability {
-    /// Provenance ceremony: lift this window-ops capability into a
-    /// [`aterm_provenance::HostAuthorizationToken`] borrowed for the
-    /// capability's lifetime.
-    ///
-    /// Part of the #8001 `authorize_*` wiring (design §6 migration table).
-    /// Holding a `WindowOpsCapability` proves that the host's
-    /// `allow_window_ops` policy bit was set when the XTWINOPS dispatch
-    /// minted the capability; the returned token lets downstream
-    /// `authorize_pty_to_host` consumers lift Pty-origin XTWINOPS
-    /// arguments (rows/cols from `CSI t`) into `Host`-origin values.
-    ///
-    /// The token is borrowed by reference against `&self`, so it cannot
-    /// outlive the XTWINOPS dispatch frame.
-    #[allow(
-        dead_code,
-        reason = "audit-only provenance ceremony retained until production callers consume the host-authorization token directly"
-    )]
-    #[must_use]
-    pub(crate) fn as_host_auth_token(&self) -> aterm_provenance::HostAuthorizationToken<'_> {
-        let _ = self;
-        aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
-    }
-}
-
 /// Zero-sized minting authority for [`WindowOpsCapability`].
 ///
 /// Held implicitly by the terminal module (no field on
@@ -323,20 +298,5 @@ mod tests {
             )
             .is_some()
         );
-    }
-
-    /// #8001 ceremony: a minted `WindowOpsCapability` lifts
-    /// `Provenance<_, Pty>` to `Provenance<_, Host>`.
-    #[test]
-    fn as_host_auth_token_lifts_pty_to_host() {
-        use aterm_provenance::{OriginTag, Provenance, authorize_pty_to_host};
-
-        let auth = WindowMintAuthority::new();
-        let cap = auth.try_mint(true).expect("policy allows window ops");
-        let tok = cap.as_host_auth_token();
-        let pty: Provenance<u32, aterm_provenance::Pty> = Provenance::from_pty(42);
-        let host = authorize_pty_to_host(pty, tok);
-        assert_eq!(host.tag(), OriginTag::Host);
-        assert_eq!(*host.as_ref(), 42);
     }
 }

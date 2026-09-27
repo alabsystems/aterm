@@ -34,23 +34,14 @@
 //! assert_eq!(input, uncompressed);
 //! ```
 //!
-//! # Feature flags
+//! # Safety
 //!
-//! - `safe-encode` — safe-only encoder path (enabled by default).
-//! - `safe-decode` — the bounds-checked decoder (enabled by default, and
-//!   required: the upstream raw-pointer decoder is not carried).
-//! - `checked-decode` — extra bounds checks during decompression (enabled by
-//!   default).
-//! - `std` — depend on the standard library (enabled by default); disable
-//!   for `no_std + alloc` environments.
-//!
-//! With the defaults, this crate forbids `unsafe` code.
+//! Only upstream's safe paths are carried: the safe-only encoder and the
+//! bounds-checked decoder (upstream's `safe-encode` / `safe-decode` /
+//! `checked-decode` defaults, the only configuration any consumer ever built).
+//! The crate forbids `unsafe` code.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(
-    all(feature = "safe-encode", feature = "safe-decode"),
-    forbid(unsafe_code)
-)]
+#![forbid(unsafe_code)]
 // The files under `src/block/`, `src/sink.rs`, and `src/fastcpy.rs`
 // derive from upstream `lz4_flex` 0.11.5. Upstream
 // does not currently enforce the stricter clippy lints the rest of the aterm
@@ -73,77 +64,15 @@
 
 extern crate alloc;
 
-// Local re-implementations of the upstream `more-asserts` macros that are
-// used by the vendored `compress.rs` test block. Defined at the crate root
-// so they are in scope for the `#[cfg(test)]` modules inside `src/block/`
-// without needing an external dev-dep. Only the four macros actually
-// referenced by the vendored tests are provided.
-#[cfg(test)]
-#[allow(unused_macros)]
-macro_rules! assert_le {
-    ($left:expr, $right:expr $(,)?) => {
-        assert!(
-            $left <= $right,
-            "assertion failed: `left <= right` (left: `{:?}`, right: `{:?}`)",
-            $left,
-            $right
-        );
-    };
-}
-
-#[cfg(test)]
-#[allow(unused_macros)]
-macro_rules! assert_lt {
-    ($left:expr, $right:expr $(,)?) => {
-        assert!(
-            $left < $right,
-            "assertion failed: `left < right` (left: `{:?}`, right: `{:?}`)",
-            $left,
-            $right
-        );
-    };
-}
-
-#[cfg(test)]
-#[allow(unused_macros)]
-macro_rules! assert_gt {
-    ($left:expr, $right:expr $(,)?) => {
-        assert!(
-            $left > $right,
-            "assertion failed: `left > right` (left: `{:?}`, right: `{:?}`)",
-            $left,
-            $right
-        );
-    };
-}
-
-#[cfg(test)]
-#[allow(unused_macros)]
-macro_rules! assert_ge {
-    ($left:expr, $right:expr $(,)?) => {
-        assert!(
-            $left >= $right,
-            "assertion failed: `left >= right` (left: `{:?}`, right: `{:?}`)",
-            $left,
-            $right
-        );
-    };
-}
-
 pub mod block;
 
-#[allow(dead_code)]
 mod fastcpy;
 
-#[cfg_attr(
-    all(feature = "safe-encode", feature = "safe-decode"),
-    forbid(unsafe_code)
-)]
 pub(crate) mod sink;
 
 // Convenience re-exports at the crate root: these match the two entry points
 // used by every in-tree consumer of lz4 block mode.
 pub use block::{
-    CompressError, DecompressError, compress, compress_into, compress_prepend_size, decompress,
-    decompress_into, decompress_size_prepended, uncompressed_size,
+    DecompressError, compress, compress_prepend_size, decompress, decompress_into,
+    decompress_size_prepended, uncompressed_size,
 };

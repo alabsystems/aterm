@@ -222,36 +222,13 @@ pub struct TerminalModes {
     /// required before parser-origin OSC 9/99/777 sequences can reach the
     /// callback or generate a response. Parallel to `allow_osc52_set` (#2341).
     pub allow_notifications: bool,
-    /// Allow OSC 133 / OSC 633 shell-integration markers to record into
-    /// `SessionMemory` (#7878 CF-010).
+    /// Retired OSC 133 / OSC 633 `SessionMemory` recording gate (#7878
+    /// CF-010).
     ///
-    /// Gates the recording sink reached from `OSC 133 C` (command
-    /// execution start), `OSC 133 D` (command finished), and the OSC
-    /// 633 C/D/prompt-finalization path that captures command output
-    /// blocks. When disabled, the parser path cannot mint a
-    /// [`super::super::session_memory_auth::SessionMemoryCapability`]
-    /// — `SessionMemory::record_command_start` /
-    /// `record_command_complete` / `index_output_block` remain
-    /// unreachable regardless of whether the host has wired a
-    /// `SessionMemory` backend via
-    /// [`super::super::Terminal::set_session_memory`].
-    ///
-    /// **Default: `false` (fail-closed).** Hosts that want AI features
-    /// to retrieve context from OSC 133/633-asserted commands must
-    /// explicitly opt in via
-    /// [`super::super::Terminal::authorize_session_memory`] (or the
-    /// mirror setter `set_allow_session_memory(true)`) after wiring
-    /// the memory backend. This matches the "host policy bit" posture
-    /// used for `allow_notifications` (CF-009) and `allow_osc52_set`
-    /// (#7782): the recording backend is one signal, but a second
-    /// explicit policy call is required before a PTY-origin OSC
-    /// 133/633 sequence can poison the AI-visible index.
-    ///
-    /// Orthogonal to `require_shell_integration_nonce`: both gates
-    /// must pass for a sequence to record. The nonce gate rejects
-    /// spoofed shell-integration markers at the parser-path entry; the
-    /// capability gate rejects the recording even when the nonce gate
-    /// is off (the pre-nonce default posture).
+    /// The recording sink it gated and the host API that set it are gone, so
+    /// nothing reads this bit and it is always `false` (fail-closed). It stays
+    /// because the session-handoff wire format carries it: handoff metadata
+    /// written by earlier builds names the field.
     pub allow_session_memory: bool,
     /// Allow OSC 4 / OSC 21 indexed palette SET operations (#7937 F01-3).
     ///
@@ -366,32 +343,11 @@ impl TerminalModes {
         }
     }
 
-    /// Whether the cursor is currently visible.
-    #[must_use]
-    #[inline]
-    pub const fn cursor_visible(&self) -> bool {
-        self.cursor_visible
-    }
-
-    /// Current cursor style.
-    #[must_use]
-    #[inline]
-    pub const fn cursor_style(&self) -> CursorStyle {
-        self.cursor_style
-    }
-
     /// Whether DECCKM application cursor mode is enabled.
     #[must_use]
     #[inline]
     pub const fn application_cursor_keys(&self) -> bool {
         self.application_cursor_keys
-    }
-
-    /// Whether alternate screen buffer mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn alternate_screen(&self) -> bool {
-        self.alternate_screen
     }
 
     /// Whether auto-wrap mode is enabled.
@@ -401,53 +357,11 @@ impl TerminalModes {
         self.auto_wrap
     }
 
-    /// Whether origin mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn origin_mode(&self) -> bool {
-        self.origin_mode
-    }
-
-    /// Whether insert mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn insert_mode(&self) -> bool {
-        self.insert_mode
-    }
-
-    /// Whether line-feed/new-line mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn new_line_mode(&self) -> bool {
-        self.new_line_mode
-    }
-
     /// Whether bracketed paste mode is enabled.
     #[must_use]
     #[inline]
     pub const fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
-    }
-
-    /// Current mouse tracking mode.
-    #[must_use]
-    #[inline]
-    pub const fn mouse_mode(&self) -> MouseMode {
-        self.mouse_mode
-    }
-
-    /// Current mouse coordinate encoding mode.
-    #[must_use]
-    #[inline]
-    pub const fn mouse_encoding(&self) -> MouseEncoding {
-        self.mouse_encoding
-    }
-
-    /// Whether focus reporting mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn focus_reporting(&self) -> bool {
-        self.focus_reporting
     }
 
     /// Whether synchronized output mode is enabled.
@@ -464,100 +378,10 @@ impl TerminalModes {
         self.reverse_video
     }
 
-    /// Whether cursor blinking is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn cursor_blink(&self) -> bool {
-        self.cursor_blink
-    }
-
-    /// Whether application keypad mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn application_keypad(&self) -> bool {
-        self.application_keypad
-    }
-
-    /// Whether 132-column mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn column_mode_132(&self) -> bool {
-        self.column_mode_132
-    }
-
-    /// Whether reverse wraparound mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn reverse_wraparound(&self) -> bool {
-        self.reverse_wraparound
-    }
-
-    /// Whether VT52 mode is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn vt52_mode(&self) -> bool {
-        self.vt52_mode
-    }
-
     /// Whether alternate scroll mode (DECSET 1007) is enabled.
     #[must_use]
     #[inline]
     pub const fn alternate_scroll(&self) -> bool {
         self.alternate_scroll
-    }
-
-    /// Whether BiDi arrow-swap mode (DEC ?1243) is enabled.
-    #[must_use]
-    #[inline]
-    pub const fn bidi_arrow_swap(&self) -> bool {
-        self.bidi_arrow_swap
-    }
-
-    /// Set alternate screen mode.
-    #[inline]
-    #[cfg_attr(
-        test,
-        aterm_spec::spec_unmodeled(
-            reason = "bypass setter — TLA+ refinement is on TerminalHandler::enter/exit_alternate_screen"
-        )
-    )]
-    pub fn set_alternate_screen(&mut self, enabled: bool) {
-        self.alternate_screen = enabled;
-    }
-
-    /// Set bracketed paste mode.
-    #[inline]
-    #[cfg_attr(
-        test,
-        aterm_spec::spec_unmodeled(
-            reason = "bypass setter — TLA+ refinement is on TerminalHandler::enable/disable_bracketed_paste"
-        )
-    )]
-    pub fn set_bracketed_paste(&mut self, enabled: bool) {
-        self.bracketed_paste = enabled;
-    }
-
-    /// Set mouse tracking mode.
-    #[inline]
-    #[cfg_attr(
-        test,
-        aterm_spec::spec_unmodeled(
-            reason = "bypass setter — TLA+ refinement is on TerminalHandler mouse tracking helpers"
-        )
-    )]
-    pub fn set_mouse_mode(&mut self, mode: MouseMode) {
-        self.mouse_mode = mode;
-    }
-
-    /// Set mouse coordinate encoding mode.
-    #[inline]
-    #[cfg_attr(
-        test,
-        aterm_spec::spec_unmodeled(
-            reason = "bypass setter — TLA+ refinement is on TerminalHandler mouse encoding helpers"
-        )
-    )]
-    pub fn set_mouse_encoding(&mut self, encoding: MouseEncoding) {
-        self.mouse_encoding = encoding;
     }
 }

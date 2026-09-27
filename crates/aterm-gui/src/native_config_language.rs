@@ -198,6 +198,9 @@ const RIGHT_CLICK_GESTURES: &[&str] = &["copy_paste", "off"];
 const RIGHT_CLICK_ALIASES: &[&str] = &["copy-paste"];
 const TAB_MENU_CHORDS: &[&str] = &["on", "menu_key", "off"];
 const TAB_MENU_CHORD_ALIASES: &[&str] = &["both", "menu-key", "menu"];
+/// `[privacy] warmup` — `app_config::PrivacyWarmup::ALL`'s spellings (pinned
+/// equal by `every_key_the_config_reader_accepts_is_known_to_manual`).
+const PRIVACY_WARMUPS: &[&str] = &["never", "on-request"];
 const TAB_BAND_HEIGHTS: &[&str] = &["compact", "standard"];
 const UNIVERSAL_CONTROL_POLICIES: &[&str] = &["off", "leave"];
 const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
@@ -722,6 +725,45 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ],
         true,
     ),
+    // Its table header, so `[fab` completes to `[fabric]` like every other table.
+    manual(
+        "fabric",
+        "Fabric bridge",
+        ConfigSchemaKind::Table,
+        &["fabric", "bridge", "inbox", "astream", "bus"],
+        false,
+    ),
+    // The EXPERIMENTAL embedded operator's launch switch (`[operator] enabled`,
+    // `operator_host::enabled`): deliberately off the Settings pages (see its
+    // `DEFERRED_CONFIG_KEYS` rationale), and the one spelling since its
+    // environment variables went (2026-09-24), so Manual completes and hovers it.
+    manual(
+        "operator",
+        "Embedded operator",
+        ConfigSchemaKind::Table,
+        &["operator", "fleet", "manage"],
+        false,
+    ),
+    manual(
+        "operator.enabled",
+        "Start the embedded operator",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["operator", "fleet", "manage", "observer", "attention"],
+        true,
+    ),
+    // The coding-agent primer's opt-out (`agents_auto_prime`, default on): a live
+    // key read off the UI thread by the spawn seam and deliberately off the
+    // Settings pages (its `DEFERRED_CONFIG_KEYS` rationale), yet written by hand —
+    // every hermetic launch recipe in `tools/` writes `agents_auto_prime = false`,
+    // and each of those launches used to open on a "unknown to this aterm build"
+    // warning band that every capture then carried.
+    manual(
+        "agents_auto_prime",
+        "Prime coding agents automatically",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["agents", "claude", "codex", "primer", "guidance"],
+        true,
+    ),
     manual(
         "windowing_behavior",
         "Where a new terminal opens",
@@ -891,8 +933,12 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         false,
     ),
     // The `[harness]` table (design DESIGN-aterm-wrapper-2026-09-17 §4.6.2):
-    // its one Bool leaf rides the native registry (`prefs::NESTED_LEAVES`);
-    // this header is what lets Manual complete `[harness]` and what the dotted
+    // its three Settings rows — the master switch `enabled`, the approval
+    // level `approve` (owner, 2026-09-24) and the question answer
+    // `answer_questions` (owner, 2026-09-25) — ride the native registry
+    // (`prefs::NESTED_LEAVES`), so neither is listed here (a row here would be
+    // shadowed and dropped, `the_manual_schema_holds_one_row_per_key`); this
+    // header is what lets Manual complete `[harness]` and what the dotted
     // leaf's prefix rule requires.
     manual(
         "harness",
@@ -902,10 +948,12 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         false,
     ),
     // The supervisor's policy (`aterm_agent::supervise::config::KEYS`, the
-    // in-GUI host's `harness_host`): every key but `enabled`, which is the
-    // Settings row above. Known here so the file's `[harness]` keys are
-    // completed and a misspelled one is reported, not silently dropped;
-    // `every_supervisor_key_is_known_to_the_config_language` pins the two lists.
+    // in-GUI host's `harness_host`): every key but `enabled`, `approve` and
+    // `answer_questions`, the Settings rows above. Every one is ON (full
+    // power) by default and can only take power away. Known here so the
+    // file's `[harness]` keys are completed and a misspelled one is reported,
+    // not silently dropped; `every_supervisor_key_is_known_to_the_config_language`
+    // pins the two lists.
     manual(
         "harness.headless",
         "Supervise in a headless instance",
@@ -914,38 +962,17 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
-        "harness.auto_reads",
-        "Approve read-only commands",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["supervisor", "approve", "bash", "read"],
-        true,
-    ),
-    manual(
-        "harness.rm_breaker",
-        "Answer the rm circuit breaker for scratch paths",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["supervisor", "approve", "rm", "scratch"],
-        true,
-    ),
-    manual(
-        "harness.read_outside_cwd",
-        "Approve reads outside the project",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["supervisor", "approve", "read", "file"],
-        true,
-    ),
-    manual(
-        "harness.trust_dialog",
-        "Answer the folder-trust dialog",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["supervisor", "trust", "folder", "worktree"],
-        true,
-    ),
-    manual(
         "harness.trust_roots",
         "Folders trusted without asking",
         ConfigSchemaKind::StringList,
         &["supervisor", "trust", "folder", "worktree"],
+        true,
+    ),
+    manual(
+        "harness.answer_text",
+        "What a question is answered with",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["supervisor", "question", "decision", "answer"],
         true,
     ),
     manual(
@@ -963,17 +990,17 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
-        "harness.continue_per_hour",
-        "Continuations per session per hour",
-        ConfigSchemaKind::Scalar(EditKind::Integer),
-        &["supervisor", "continue", "budget"],
-        true,
-    ),
-    manual(
         "harness.continue_text",
         "Continuation text",
         ConfigSchemaKind::Scalar(EditKind::Text),
         &["supervisor", "continue", "keep going"],
+        true,
+    ),
+    manual(
+        "harness.continue_per_hour",
+        "Continuations per session per hour (0: no cap)",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["supervisor", "continue", "budget"],
         true,
     ),
     manual(
@@ -999,7 +1026,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.model_fallback",
-        "Model to switch to at a model limit",
+        "Model to relaunch on at a model limit",
         ConfigSchemaKind::Scalar(EditKind::Text),
         &["supervisor", "model", "limit", "opus"],
         true,
@@ -1011,14 +1038,28 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["supervisor", "context", "compact"],
         true,
     ),
-    // Not the supervisor's: the live agent upgrade's switch
-    // (`aterm harness upgrade`, the window's minute sweep), in this table so
+    manual(
+        "harness.relaunch",
+        "Relaunch an agent that exited on its own",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "relaunch", "restart", "exit"],
+        true,
+    ),
+    // The live agent upgrade's switch (`aterm harness upgrade`, and the
+    // window's host at its sessions' idle points), in this table so
     // `[harness]` stays the one policy home.
     manual(
         "harness.upgrade",
         "Restart live Claude Code sessions onto a newer build",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["upgrade", "update", "claude", "restart"],
+        true,
+    ),
+    manual(
+        "harness.human_grace_s",
+        "Seconds the supervisor keeps off a session a person typed into",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["supervisor", "human", "keyboard", "grace"],
         true,
     ),
     manual(
@@ -1095,6 +1136,99 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["atpkg", "mouse", "keyboard", "sharing"],
         true,
     ),
+    // The `[privacy]` table (`app_config::PrivacyConfig`, the macOS consent
+    // lane): kept off the Settings pages on purpose — the Security page's
+    // "macOS file access" block is its surface (`DEFERRED_CONFIG_KEYS`) — but
+    // every key is one an operator writes by hand, and each was called "unknown
+    // to this aterm build" until these rows. `auto_accept` is here too: it is
+    // parsed so its refusal can be SAID (`config_semantic_warnings`), and a key
+    // Manual calls unknown says nothing.
+    manual(
+        "privacy",
+        "macOS consent posture",
+        ConfigSchemaKind::Table,
+        &["tcc", "consent", "full disk access", "macos", "security"],
+        false,
+    ),
+    manual(
+        "privacy.enabled",
+        "Report macOS consent state",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["tcc", "consent", "master"],
+        true,
+    ),
+    manual(
+        "privacy.check",
+        "Probe Full Disk Access",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["tcc", "full disk access", "probe"],
+        true,
+    ),
+    manual(
+        "privacy.notice",
+        "Show the macOS access card",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["tcc", "full disk access", "card", "notice"],
+        true,
+    ),
+    manual(
+        "privacy.report_attribution",
+        "Attribute consent reports to sessions",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["tcc", "responsible", "session"],
+        true,
+    ),
+    manual(
+        "privacy.warmup",
+        "Offer the folder-access warm-up",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: PRIVACY_WARMUPS,
+        }),
+        &["tcc", "folders", "prompt", "warm-up"],
+        true,
+    ),
+    manual(
+        "privacy.warmup_folders",
+        "Folders the warm-up asks for",
+        ConfigSchemaKind::StringList,
+        &["tcc", "documents", "desktop", "downloads"],
+        true,
+    ),
+    manual(
+        "privacy.warmup_hold_ms",
+        "Update hold during a warm-up (ms)",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["tcc", "warm-up", "update", "hold"],
+        true,
+    ),
+    manual(
+        "privacy.probe_interval_ms",
+        "Consent re-probe interval (ms)",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["tcc", "probe", "interval"],
+        true,
+    ),
+    manual(
+        "privacy.observer",
+        "Observe tccd's consent log",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["tcc", "tccd", "log", "observer"],
+        true,
+    ),
+    manual(
+        "privacy.protected_roots",
+        "Protected roots",
+        ConfigSchemaKind::StringList,
+        &["tcc", "containment", "private", "paths"],
+        true,
+    ),
+    manual(
+        "privacy.auto_accept",
+        "Answer consent dialogs (reserved; refused)",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["tcc", "consent", "reserved"],
+        true,
+    ),
     manual(
         "matrix_rain",
         "Matrix rain",
@@ -1108,6 +1242,46 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ConfigSchemaKind::Table,
         &["streak", "effect", "output", "prism", "rainbow"],
         false,
+    ),
+    // The table's five VISUAL keys: config-file surface, deliberately not
+    // Settings rows yet (`prefs::NESTED_LEAVES` says what they are owed first),
+    // but live — each is read by its `Config::output_streak_*_or_default`
+    // resolver — so Manual must not call them unknown. The sixth, `sound`, is
+    // the Sound menu's native row.
+    manual(
+        "output_streak.enabled",
+        "Show the output streak",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["streak", "prism", "wake"],
+        true,
+    ),
+    manual(
+        "output_streak.intensity",
+        "Output streak intensity",
+        ConfigSchemaKind::Scalar(EditKind::Float),
+        &["streak", "prism", "amplitude"],
+        true,
+    ),
+    manual(
+        "output_streak.tail",
+        "Output streak tail (cells)",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["streak", "prism", "comet", "length"],
+        true,
+    ),
+    manual(
+        "output_streak.max_streaks",
+        "Output streaks at once",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["streak", "prism", "comet", "count"],
+        true,
+    ),
+    manual(
+        "output_streak.idle_secs",
+        "Output streak idle drain (seconds)",
+        ConfigSchemaKind::Scalar(EditKind::Float),
+        &["streak", "prism", "idle", "drain"],
+        true,
     ),
     // The `[presence]` table (round 19): its two Bool leaves ride the native
     // registry (`prefs::NESTED_LEAVES`); this header is what lets Manual
@@ -1215,6 +1389,58 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Ignored orca words",
         ConfigSchemaKind::StringList,
         &["whale", "lexicon", "exclude"],
+        true,
+    ),
+    // The typed-word dog cameo and the kitty commands (`SparkleCanineConfig`,
+    // `SparkleTricksConfig`): input-path classes with no Settings rows, whose
+    // keys Manual called unknown until these rows.
+    manual(
+        "sparkle_words.canine",
+        "Keyword dogs",
+        ConfigSchemaKind::Table,
+        &["dog", "puppy", "words"],
+        false,
+    ),
+    manual(
+        "sparkle_words.canine.enabled",
+        "Summon dogs for typed dog words",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["dog", "puppy", "cameo"],
+        true,
+    ),
+    manual(
+        "sparkle_words.canine.extra_words",
+        "Additional dog words",
+        ConfigSchemaKind::StringList,
+        &["dog", "lexicon", "include"],
+        true,
+    ),
+    manual(
+        "sparkle_words.canine.ignore_words",
+        "Ignored dog words",
+        ConfigSchemaKind::StringList,
+        &["dog", "lexicon", "exclude"],
+        true,
+    ),
+    manual(
+        "sparkle_words.tricks",
+        "Kitty commands",
+        ConfigSchemaKind::Table,
+        &["cat", "kitty", "tricks", "commands"],
+        false,
+    ),
+    manual(
+        "sparkle_words.tricks.enabled",
+        "Kitty commands (sit, jump, good kitty)",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["cat", "kitty", "tricks", "sit"],
+        true,
+    ),
+    manual(
+        "sparkle_words.tricks.ignore_words",
+        "Ignored kitty commands",
+        ConfigSchemaKind::StringList,
+        &["cat", "tricks", "lexicon", "exclude"],
         true,
     ),
     manual(
@@ -1360,11 +1586,19 @@ pub(crate) fn config_schema() -> &'static [ConfigSchemaEntry] {
             if schema.iter().any(|known| known.key == entry.key) {
                 continue;
             }
+            // The supervisor's keys show their FULL-POWER default: every one
+            // is on unless the file limits it, so the default is what a
+            // person reading the key is choosing to take away from.
+            let placeholder = entry
+                .key
+                .strip_prefix("harness.")
+                .and_then(aterm_agent::supervise::SupervisorConfig::default_shown)
+                .unwrap_or_default();
             schema.push(ConfigSchemaEntry {
                 key: entry.key,
                 label: entry.label,
                 kind: entry.kind,
-                placeholder: String::new(),
+                placeholder,
                 keywords: entry.keywords,
                 native_scalar: false,
                 manual_reset_safe: entry.manual_reset_safe,
@@ -1727,7 +1961,8 @@ pub(crate) fn ignored_key_warnings(source: &str) -> Vec<String> {
 
 /// [`ignored_key_warnings`] in two halves, from ONE walk: the band's view
 /// (`app_config::collect_key_notices`). `retired` holds the retired and
-/// deprecated spellings ([`ConfigAnalysis::retired_spellings`]); `ignored`
+/// deprecated spellings and the keys a removed feature left behind
+/// ([`ConfigAnalysis::retired_spellings`]); `ignored`
 /// holds every other line, the bounded validator's roll-up included. Each half
 /// keeps source order.
 pub(crate) fn key_warnings(source: &str) -> KeyWarnings {
@@ -1752,8 +1987,9 @@ pub(crate) fn key_warnings(source: &str) -> KeyWarnings {
 pub(crate) struct KeyWarnings {
     /// Keys this build does nothing with, and the machine table's type errors.
     pub(crate) ignored: Vec<String>,
-    /// Retired and deprecated spellings, each sentence saying whether the key
-    /// is still read and what to rename or remove.
+    /// Retired and deprecated spellings, and keys a removed feature left
+    /// behind, each sentence saying whether the key is still read and what to
+    /// rename or remove.
     pub(crate) retired: Vec<String>,
 }
 
@@ -1981,13 +2217,15 @@ fn warn_compatibility_only_item(
         aterm_toml::edit::Item::Value(_) | aterm_toml::edit::Item::ArrayOfTables(_) => true,
     };
     if authored && is_compatibility_only_key(path) {
-        push_diagnostic(
+        // A key a REMOVED feature left behind is a record on the band, the
+        // same as a retired spelling: nothing is broken, and nothing the person
+        // presses brings the feature back (audit 2026-09-24, design ruling 213).
+        push_retired_spelling(
             analysis,
             source,
             source_value_range(source, path)
                 .or_else(|| item.span())
                 .unwrap_or(0..source.len().min(1)),
-            ConfigDiagnosticSeverity::Warning,
             compatibility_only_message(path),
         );
     }
@@ -2775,6 +3013,22 @@ fn warn_unknown_item(
                 format!("{path} must be true or false"),
             );
         }
+        return;
+    }
+    if let Some(message) = path
+        .strip_prefix("harness.")
+        .and_then(|key| aterm_agent::supervise::config::retired_key_note(key, item.as_bool()))
+    {
+        // RETIRED, not unknown (D9, 2026-09-25): 0.93.0's approval switches
+        // still LIMIT when written `false` — the supervisor's one reader
+        // takes each as the limit it named — so "unknown to this build" would
+        // hide a limit that holds. The reader's own words, so the file's line
+        // and the harness notice tell one story (`harness_notices` leaves the
+        // reader's copy out).
+        let range = source_value_range(source, path)
+            .or_else(|| item.span())
+            .unwrap_or(0..source.len().min(1));
+        push_retired_spelling(analysis, source, range, message);
         return;
     }
     if path == crate::prefs::LEGACY_EDIT_DISPLAY_FONT {
@@ -4136,6 +4390,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         .map(|note| format!(" · {note}"))
         .unwrap_or_default();
     let constraint = match setting.key {
+        crate::prefs::EDIT_CHOICE_SOUND => {
+            " · one quiet chime when the in-window supervisor answers Claude Code's question dialog ([harness] answer_questions, or the session's meta set questions); plays for a background tab too, at most once per 2 s · quiets only the chime; the band's ◆ chose flash and the rim pulse stay · subordinate to trail_sounds and trail_sound_volume, silent in serious mode · audio playback is macOS-only"
+        }
         crate::prefs::EDIT_MINIMUM_CONTRAST => {
             " · translucent backgrounds enforce at least 4.5:1 text contrast"
         }
@@ -4162,6 +4419,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         crate::prefs::EDIT_FONT_THICKEN => {
             " · macOS CoreText only; parsed and preserved but inert on other platforms"
+        }
+        "privacy.auto_accept" => {
+            " · RESERVED and refused: aterm never answers a macOS consent dialog, so no value of this key does anything; grant Full Disk Access instead (Settings \u{25b8} Security)"
         }
         crate::prefs::EDIT_MOTION => crate::prefs::motion_auto_help(),
         crate::prefs::EDIT_ROBI => {
@@ -4229,7 +4489,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · 0 searches only the live screen; a bounded index can report partial results for older retained history"
         }
         crate::prefs::EDIT_PACKAGES_ENABLED => {
-            " · Automatic updates — the one switch for the background package service (the retired auto_update is read as it), read live by the window (off stands it down within seconds, on resumes it); a published public index is picked up within minutes, and a full signed check runs every six hours across every aterm on the machine; explicit package commands and Update Now remain available when the trust-root gate is open"
+            " · Automatic updates — the one switch for the background package service (the retired auto_update is read as it), read live by the window (off stands it down within seconds, on resumes it); a published public index is picked up within minutes, and a full signed check runs every six hours across every aterm on the machine; explicit package commands and Check & Update Now remain available when the trust-root gate is open"
         }
         crate::prefs::EDIT_PACKAGES_AUTO_INSTALL => {
             " · the one install consent (the retired seed_install is read as it while this is unset): the first-run fill and new members of the signed set; uninstall, exclude and packages.enabled = false always win, and it cannot bypass the package trust-root gate"
@@ -5570,6 +5830,256 @@ intensity = 0.25
         );
     }
 
+    /// The field list the config READER declares for the table at `path`: `T`'s
+    /// own `Deserialize` is driven down `path` one key at a time, and the list
+    /// serde's derive hands `deserialize_struct` at the end of it is recorded.
+    /// Nothing is ever built — every probe ends in an error on purpose — and
+    /// nothing is restated, so a field added to any table reaches
+    /// [`reader_paths`] the moment it compiles. `None`: not a derived table (a
+    /// scalar, a list, a map, or a table with its own `Deserialize`).
+    fn reader_fields<T: serde::de::DeserializeOwned>(
+        path: &[&'static str],
+    ) -> Option<&'static [&'static str]> {
+        struct Reader<'p> {
+            path: &'p [&'static str],
+            fields: &'p mut Option<&'static [&'static str]>,
+        }
+        struct OneKey<'p> {
+            key: Option<&'static str>,
+            rest: &'p [&'static str],
+            fields: &'p mut Option<&'static [&'static str]>,
+        }
+        fn done<E: serde::de::Error>() -> E {
+            E::custom("reader probe")
+        }
+        impl<'de> serde::Deserializer<'de> for Reader<'_> {
+            type Error = serde::de::value::Error;
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(done())
+            }
+            fn deserialize_option<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                visitor.visit_some(self)
+            }
+            fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                visitor.visit_newtype_struct(self)
+            }
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                match self.path.split_first() {
+                    None => {
+                        *self.fields = Some(fields);
+                        Err(done())
+                    }
+                    Some((key, rest)) => visitor.visit_map(OneKey {
+                        key: Some(key),
+                        rest,
+                        fields: self.fields,
+                    }),
+                }
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf unit unit_struct seq tuple tuple_struct map enum
+                identifier ignored_any
+            }
+        }
+        impl<'de> serde::de::MapAccess<'de> for OneKey<'_> {
+            type Error = serde::de::value::Error;
+            fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: K,
+            ) -> Result<Option<K::Value>, Self::Error> {
+                use serde::de::IntoDeserializer as _;
+                self.key
+                    .take()
+                    .map(|key| seed.deserialize(key.into_deserializer()))
+                    .transpose()
+            }
+            fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: V,
+            ) -> Result<V::Value, Self::Error> {
+                seed.deserialize(Reader {
+                    path: self.rest,
+                    fields: &mut *self.fields,
+                })
+            }
+        }
+        let mut fields = None;
+        let _ = T::deserialize(Reader {
+            path,
+            fields: &mut fields,
+        });
+        fields
+    }
+
+    /// Every dotted key path `T`'s reader accepts, each with whether it is a
+    /// table. A table is walked into exactly where Manual's unknown-key walk
+    /// walks: not below a map, a record list or a free-form entry, whose
+    /// members are the author's own names.
+    fn reader_paths<T: serde::de::DeserializeOwned>() -> Vec<(String, bool)> {
+        fn walk<T: serde::de::DeserializeOwned>(
+            path: &mut Vec<&'static str>,
+            out: &mut Vec<(String, bool)>,
+        ) {
+            let Some(fields) = reader_fields::<T>(path) else {
+                return;
+            };
+            for &field in fields {
+                path.push(field);
+                let dotted = path.join(".");
+                let table = reader_fields::<T>(path).is_some();
+                let descend = table
+                    && config_schema_entry(&dotted)
+                        .is_none_or(|entry| entry.kind == ConfigSchemaKind::Table);
+                out.push((dotted, table));
+                if descend {
+                    walk::<T>(path, out);
+                }
+                path.pop();
+            }
+        }
+        let mut out = Vec::new();
+        walk::<T>(&mut Vec::new(), &mut out);
+        out
+    }
+
+    /// Whether Manual tells `path` any story but "unknown to this aterm build":
+    /// a schema entry, a compatibility-only or retired key, or one of the old
+    /// spellings `warn_unknown_item` renames by name.
+    fn manual_knows(path: &str) -> bool {
+        config_schema_entry(path).is_some()
+            || is_compatibility_only_key(path)
+            || path == crate::prefs::LEGACY_EDIT_DISPLAY_FONT
+            || crate::prefs::RETIRED_PACKAGES_SPELLINGS
+                .iter()
+                .any(|(retired, _)| *retired == path)
+    }
+
+    /// A LIVE KEY IS NEVER "UNKNOWN". `agents_auto_prime = false` — in every
+    /// hermetic launch recipe under `tools/` — was told it "is unknown to this
+    /// aterm build", and a headless capture carried that warning band across its
+    /// top row. It was a class: the same walk called every `[privacy]` key
+    /// unknown, and five `[output_streak]` keys, and the `[sparkle_words.canine]`
+    /// and `[sparkle_words.tricks]` tables, all of them keys the reader parses and
+    /// a resolver reads. So the list checked is the READER's own — every table and
+    /// every key `Config`'s `Deserialize` accepts, walked from the derive
+    /// ([`reader_paths`]) — with no table excluded.
+    #[test]
+    fn every_key_the_config_reader_accepts_is_known_to_manual() {
+        // Every key the Settings pages defer — the two tables included — is one
+        // an operator writes by hand, so each has a schema entry of its own.
+        let deferred: Vec<&str> = crate::prefs::DEFERRED_CONFIG_KEYS
+            .iter()
+            .map(|&(key, _)| key)
+            .filter(|key| config_schema_entry(key).is_none())
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "deferred keys Manual would call unknown: {deferred:?}"
+        );
+
+        let paths = reader_paths::<crate::app_config::Config>();
+        let unknown: Vec<&str> = paths
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|path| !manual_knows(path))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "keys the config reader accepts that Manual would call unknown: {unknown:?}"
+        );
+        // Not vacuous: the walk reached the tables, and the leaves, this was
+        // written for.
+        for (witness, is_table) in [
+            ("privacy", true),
+            ("privacy.auto_accept", false),
+            ("fabric", true),
+            ("output_streak.idle_secs", false),
+            ("sparkle_words.tricks", true),
+            ("sparkle_words.canine.extra_words", false),
+        ] {
+            assert!(
+                paths.contains(&(witness.to_string(), is_table)),
+                "the reader walk never reached {witness}"
+            );
+        }
+        // NEGATIVE CONTROL: a reader with one key Manual has never heard of is
+        // caught, and nothing else in the same table is.
+        #[derive(serde::Deserialize)]
+        #[expect(dead_code, reason = "only the reader's field list is read")]
+        struct Stray {
+            privacy: Option<StrayPrivacy>,
+        }
+        #[derive(serde::Deserialize)]
+        #[expect(dead_code, reason = "only the reader's field list is read")]
+        struct StrayPrivacy {
+            observer: Option<bool>,
+            no_such_key: Option<bool>,
+        }
+        let stray: Vec<String> = reader_paths::<Stray>()
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| !manual_knows(path))
+            .collect();
+        assert_eq!(stray, ["privacy.no_such_key"]);
+
+        // The warm-up's vocabulary is the resolver's.
+        assert_eq!(
+            PRIVACY_WARMUPS,
+            crate::app_config::PrivacyWarmup::ALL
+                .iter()
+                .map(|mode| mode.as_str())
+                .collect::<Vec<_>>()
+        );
+        // And the band agrees: those keys, written out, draw no diagnostic...
+        let analysis = analyze(
+            "agents_auto_prime = false\n\
+             [privacy]\nenabled = true\ncheck = true\nnotice = true\n\
+             report_attribution = true\nwarmup = \"on-request\"\n\
+             warmup_folders = [\"documents\"]\nwarmup_hold_ms = 120000\n\
+             probe_interval_ms = 5000\nobserver = false\nprotected_roots = []\n\
+             auto_accept = false\n\
+             [fabric]\ncommand = \"aterm-link serve\"\n\
+             [output_streak]\nenabled = true\nintensity = 1.0\ntail = 8\n\
+             max_streaks = 2\nidle_secs = 10.0\n\
+             [sparkle_words.canine]\nenabled = true\nextra_words = [\"pupper\"]\n\
+             ignore_words = []\n\
+             [sparkle_words.tricks]\nenabled = true\nignore_words = []\n",
+        );
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "live keys draw no diagnostic: {:?}",
+            analysis.diagnostics
+        );
+        // ...and the reserved key, set, is refused by its own sentence — never
+        // by "unknown".
+        let refused = analyze("[privacy]\nauto_accept = true\n");
+        let messages: Vec<&str> = refused
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(
+            matches!(messages.as_slice(), [only] if only.contains("reserved and not implemented")),
+            "{messages:?}"
+        );
+    }
+
     /// A KEY FROM A DELETED FEATURE IS NOT A KEY FROM THE FUTURE. `show_scene_hud`
     /// and its three siblings left with the Scenes / "Living Panels" band in
     /// `6995b25ac`, but they were never registered as retired, so the unknown-key
@@ -6065,6 +6575,13 @@ home = "~/aterm"
             "tab_menu_chord",
             "tab_band_height",
             "machine.universal_control",
+            // `[harness] approve`: "all" | "safe" | "none", the supervisor
+            // policy's (`aterm_agent::supervise::config::Approve`).
+            "harness.approve",
+            // `[privacy] warmup` (`app_config::PrivacyWarmup`): case-insensitive
+            // like every registry enum; the loader reads an unknown spelling as
+            // the default, which is why the value is graded here.
+            "privacy.warmup",
         ]);
         assert_eq!(actual, expected, "new enum needs language-domain coverage");
 
@@ -7669,7 +8186,9 @@ fps = 999
 
         let table_base = "theme = \"Nord\"\n";
         assert!(!analyze(table_base).has_errors());
-        let table_source = format!("{table_base}\n[");
+        // A typed prefix, so the candidate does not depend on how many shorter
+        // table names the registry holds (a bare `[` offers the eight shortest).
+        let table_source = format!("{table_base}\n[pa");
         let table_assist = assist(&table_source, table_source.len());
         let table_candidate = table_assist
             .completions
@@ -7953,15 +8472,7 @@ sty"#;
             crate::prefs::EDIT_GPU,
             crate::prefs::EDIT_FONT_PX,
             crate::prefs::EDIT_FONT_FAMILY,
-            crate::prefs::EDIT_TAB_STRIP_ROWS,
-            crate::prefs::EDIT_STEM_GAMMA,
             crate::prefs::EDIT_SHELL,
-            "net.listen",
-            "net.cert",
-            "net.key",
-            crate::prefs::EDIT_FALLBACK_FONTS,
-            crate::prefs::EDIT_SYMBOL_FONT,
-            crate::prefs::EDIT_EMOJI_FONT,
         ] {
             let note = crate::prefs::environment_precedence(key)
                 .unwrap_or_else(|| panic!("missing environment precedence for {key}"));
@@ -7969,6 +8480,22 @@ sty"#;
                 help_for(key).contains(note),
                 "Manual help must disclose environment precedence for {key}"
             );
+        }
+        // Config-only keys (their `ATERM_*` twins were deleted, 2026-09-24) claim
+        // no ambient override: the table is the one spelling, so their help
+        // discloses none.
+        for key in [
+            crate::prefs::EDIT_TAB_STRIP_ROWS,
+            crate::prefs::EDIT_STEM_GAMMA,
+            crate::prefs::EDIT_WINDOW_THEME,
+            crate::prefs::EDIT_FALLBACK_FONTS,
+            crate::prefs::EDIT_SYMBOL_FONT,
+            crate::prefs::EDIT_EMOJI_FONT,
+            "net.listen",
+            "net.cert",
+            "net.key",
+        ] {
+            assert_eq!(crate::prefs::environment_precedence(key), None, "{key}");
         }
         assert!(help_for(crate::prefs::EDIT_FONT_WEIGHT).contains("provides a wght axis"));
         assert!(
@@ -8584,20 +9111,91 @@ sty"#;
         );
     }
 
+    /// A key a removed feature left behind (`show_hud`, the Scene keys,
+    /// `packages.channel`) is the band's record half, beside the retired
+    /// spellings; a key this build does not know stays in the ignored half,
+    /// which reaches the glass (design ruling 213).
+    #[test]
+    fn a_removed_features_key_is_a_record_and_a_typo_is_not() {
+        let warned =
+            key_warnings("show_hud = true\ncolums = 100\n[packages]\nchannel = \"beta\"\n");
+        assert!(
+            warned
+                .retired
+                .iter()
+                .any(|l| l.contains("show_hud has no effect")),
+            "{warned:?}"
+        );
+        assert!(
+            warned
+                .retired
+                .iter()
+                .any(|l| l.contains("packages.channel")),
+            "{warned:?}"
+        );
+        assert!(
+            warned
+                .ignored
+                .iter()
+                .all(|l| !l.contains("show_hud") && !l.contains("channel")),
+            "{warned:?}"
+        );
+        assert!(
+            warned.ignored.iter().any(|l| l.contains("colums")),
+            "{warned:?}"
+        );
+        // `--validate-config` still lists all of them.
+        let all = ignored_key_warnings("show_hud = true\ncolums = 100\n");
+        assert_eq!(all.len(), 2, "{all:?}");
+    }
+
     /// The supervisor's `[harness]` keys (`aterm_agent::supervise::config::
     /// KEYS`) are the config language's: each is completed, and a misspelled
-    /// one is an ignored-key notice — never dropped in silence. `enabled` is
-    /// the Settings row (`prefs::EDIT_HARNESS_ENABLED`).
+    /// one is an ignored-key notice — never dropped in silence. `enabled`,
+    /// `approve` and `answer_questions` are Settings rows
+    /// (`prefs::EDIT_HARNESS_ENABLED`, `prefs::EDIT_HARNESS_APPROVE`,
+    /// `prefs::EDIT_HARNESS_ANSWER_QUESTIONS`), registered once through
+    /// `prefs::NESTED_LEAVES` and never ALSO in `MANUAL_SCHEMA`, where the
+    /// merge would drop the second row in silence.
     #[test]
     fn every_supervisor_key_is_known_to_the_config_language() {
+        let rows = [
+            crate::prefs::EDIT_HARNESS_ENABLED,
+            crate::prefs::EDIT_HARNESS_APPROVE,
+            crate::prefs::EDIT_HARNESS_ANSWER_QUESTIONS,
+        ];
         for key in aterm_agent::supervise::config::KEYS {
             let dotted = format!("harness.{key}");
-            let known = *key == "enabled" && dotted == crate::prefs::EDIT_HARNESS_ENABLED
-                || MANUAL_SCHEMA.iter().any(|e| e.key == dotted);
-            assert!(known, "{dotted} is not in the config language");
+            let row = rows.contains(&dotted.as_str());
+            let manual = MANUAL_SCHEMA.iter().any(|e| e.key == dotted);
+            if row {
+                assert!(
+                    crate::prefs::nested_leaf(&dotted).is_some() && !manual,
+                    "{dotted} is a Settings row: one registration, in NESTED_LEAVES"
+                );
+            }
+            assert!(row || manual, "{dotted} is not in the config language");
+            // …and whichever list holds it, the resolved schema serves it.
+            let schema = config_schema().iter().find(|e| e.key == dotted);
+            assert!(
+                schema.is_some(),
+                "{dotted} is not served by config_schema()"
+            );
         }
-        let good = "[harness]\nenabled = true\ncontinue = false\ncontinue_per_hour = 3\n\
-                    trust_roots = [\"~/aterm*\", \"/private/tmp/claude-*\"]\n\
+        let approve = config_schema()
+            .iter()
+            .find(|e| e.key == crate::prefs::EDIT_HARNESS_APPROVE)
+            .expect("the approval level is a schema key");
+        assert_eq!(
+            approve.kind,
+            ConfigSchemaKind::Scalar(EditKind::Enum {
+                options: &["all", "safe", "none"]
+            }),
+            "an Enum, so Manual completes all/safe/none"
+        );
+        assert!(approve.native_scalar, "a Settings row, not Manual-only");
+        let good = "[harness]\nenabled = true\napprove = \"safe\"\ncontinue = false\n\
+                    continue_per_hour = 3\ntrust_roots = [\"~/aterm*\", \"/private/tmp/claude-*\"]\n\
                     model_fallback = \"opus\"\n";
         let warned = key_warnings(good);
         assert!(warned.ignored.is_empty(), "{:?}", warned.ignored);
@@ -8613,10 +9211,60 @@ sty"#;
                 e.label
             );
         }
+        // Each key says the full-power default it limits (`rules_file` has
+        // none to show): a switch reads `default true`, `approve` `all`.
+        for key in aterm_agent::supervise::config::KEYS
+            .iter()
+            .filter(|k| **k != "enabled" && **k != "rules_file")
+        {
+            let dotted = format!("harness.{key}");
+            let entry = config_schema()
+                .iter()
+                .find(|e| e.key == dotted)
+                .unwrap_or_else(|| panic!("{dotted}"));
+            assert!(
+                setting_help(entry).contains(" \u{b7} default "),
+                "{dotted}: {}",
+                setting_help(entry)
+            );
+        }
+        let help = |key: &str| setting_help(config_schema().iter().find(|e| e.key == key).unwrap());
+        assert!(help("harness.continue").contains("default true"));
+        assert!(help("harness.approve").contains("default all"));
+        assert!(help("harness.continue_per_hour").contains("default 0 (no cap)"));
+        assert!(!help("harness.rules_file").contains("default"));
         // NEGATIVE CONTROL: a typo inside the table is reported by name.
         let typo = key_warnings("[harness]\ncontine = true\n");
         assert!(
             typo.ignored.iter().any(|l| l.contains("contine")),
+            "{:?}",
+            typo.ignored
+        );
+    }
+
+    /// D9: 0.93.0's retired `[harness]` approval switches are RETIRED here,
+    /// not unknown — one written `false` still limits — and the line says
+    /// what the supervisor's reader says of it, word for word. NEGATIVE
+    /// CONTROL: a misspelling of one is an ignored key.
+    #[test]
+    fn a_retired_harness_key_is_told_the_limit_it_still_is() {
+        for key in aterm_agent::supervise::config::RETIRED_KEYS {
+            for value in [false, true] {
+                let warned = key_warnings(&format!("[harness]\n{key} = {value}\n"));
+                assert!(warned.ignored.is_empty(), "{key}: {:?}", warned.ignored);
+                let said = aterm_agent::supervise::config::retired_key_note(key, Some(value))
+                    .expect("a retired key");
+                assert!(
+                    warned.retired.iter().any(|l| l.contains(&said)),
+                    "{key} = {value}: {:?}",
+                    warned.retired
+                );
+            }
+        }
+        let typo = key_warnings("[harness]\napprove_al = false\n");
+        assert!(typo.retired.is_empty(), "{:?}", typo.retired);
+        assert!(
+            typo.ignored.iter().any(|l| l.contains("approve_al")),
             "{:?}",
             typo.ignored
         );

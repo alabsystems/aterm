@@ -1024,6 +1024,7 @@ impl MusicNotes {
 
     /// Resolve this frame's sprites into `out` (bounded by [`MAX_NOTES`]) —
     /// the growable-buffer twin of [`Self::frame_array`] for tests/tools.
+    #[cfg(test)]
     pub fn frames(&self, now: Instant, reduced_motion: bool, out: &mut Vec<NoteSprite>) {
         for note in self.ring.iter().flatten() {
             if let Some(sprite) = Self::resolve(note, now, reduced_motion) {

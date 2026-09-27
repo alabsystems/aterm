@@ -142,12 +142,6 @@ impl Terminal {
             changes.push(ConfigChange::CursorVisible);
         }
 
-        // Font descriptor
-        if self.font != config.font {
-            self.font = config.font.clone();
-            changes.push(ConfigChange::Font);
-        }
-
         // Default foreground
         let fg_changed = self.color.default_foreground != config.default_foreground;
         if fg_changed {

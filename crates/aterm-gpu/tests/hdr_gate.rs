@@ -182,9 +182,7 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         assert_eq!(modeled["is_f16"], is_f16);
         assert_eq!(modeled["capture_linear"], capture_linear);
         for invariant in [
-            "FailedRetagFallsBackAtomically",
             "ResolvedF16RequiresSuccessfulRetag",
-            "AwaitingUpgradeIsSdr",
             "CaptureMatchesSurfaceEncoding",
             "ValuesBounded",
         ] {
@@ -239,9 +237,7 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         assert_eq!(modeled["is_f16"], is_f16);
         assert_eq!(modeled["capture_linear"], capture_linear);
         for invariant in [
-            "FailedRetagFallsBackAtomically",
             "ResolvedF16RequiresSuccessfulRetag",
-            "AwaitingUpgradeIsSdr",
             "CaptureMatchesSurfaceEncoding",
             "ValuesBounded",
         ] {
@@ -280,10 +276,6 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         "old ignore-failure transition must not conform"
     );
     assert!(
-        !model.check_invariant("FailedRetagFallsBackAtomically", &ignored_failure),
-        "negative control must violate the atomic fallback law"
-    );
-    assert!(
         !model.check_invariant("ResolvedF16RequiresSuccessfulRetag", &ignored_failure),
         "negative control must expose untagged f16"
     );
@@ -303,8 +295,8 @@ fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
         "failed upgrade must not leave an untagged f16 surface"
     );
     assert!(
-        !model.check_invariant("FailedRetagFallsBackAtomically", &failed_upgrade),
-        "failed-upgrade negative control must violate atomic SDR fallback"
+        !model.check_invariant("ResolvedF16RequiresSuccessfulRetag", &failed_upgrade),
+        "failed-upgrade negative control must expose untagged f16"
     );
     assert!(
         !model.check_invariant("CaptureMatchesSurfaceEncoding", &failed_upgrade),
@@ -503,8 +495,8 @@ fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
     // re-reading the surface after configure+tag — not by the planner and not by
     // the conformance test, which selects the apply itself. Leave this guard off
     // and a failed scRGB tag still publishes linear capture over an SDR
-    // swapchain: exactly the model's `Buggy = 1` defect, violating
-    // `CaptureMatchesSurfaceEncoding` and `AwaitingUpgradeIsSdr`.
+    // swapchain: capture and encoding disagree, which is
+    // `CaptureMatchesSurfaceEncoding`.
     assert_eq!(
         reconcile.matches("if surf.is_hdr() {").count(),
         2,

@@ -292,14 +292,13 @@ struct Staged {
 }
 
 impl Staged {
-    /// Close every descriptor still ours — the masters too, which the
-    /// adoption holds as plain numbers — and remove the scratch dir.
+    /// Close every descriptor still ours and remove the scratch dir. The
+    /// masters are not: once the wire names them they are the successor's —
+    /// the adoption closes each as it drops, and a refusal closes them at once.
     fn teardown(self) {
         for fd in self
-            .live
-            .iter()
-            .map(|(_, master, _)| *master)
-            .chain(self.slaves)
+            .slaves
+            .into_iter()
             .chain(self.pipes)
             .chain(self.ready_write)
         {
@@ -599,7 +598,7 @@ fn a_repainted_session_is_counted_for_the_landing_row() {
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.adopted.len(), 2, "both shells adopt");
     assert_eq!(incoming.repainted_tabs(), 1, "one of them was repainted");
-    let words = crate::update_words::landed("0.92.0", 7, incoming.repainted_tabs());
+    let words = crate::update_words::landed("0.92.0", 7, incoming.repainted_tabs(), None);
     assert_eq!(
         words.detail.first().map(String::as_str),
         Some("1 tab repainted"),

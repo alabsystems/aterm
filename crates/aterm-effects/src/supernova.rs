@@ -79,6 +79,7 @@ pub const TIER_NOVA_END: u64 = 950;
 
 /// Decode the tier from the HIGH half of the birth draw.
 #[must_use]
+#[cfg(test)]
 pub fn tier_of(draw: u64) -> SuperTier {
     tier_for(draw, 1)
 }

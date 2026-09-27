@@ -1,0 +1,25 @@
+# claude-code 2.1.283 · MEASURED 2026-09-25, `aterm ctl text` of a private headless aterm (80x24, the owner's settings: auto mode by default, the top effort level on) · mid-turn in auto mode: esc to interrupt on the mode row · the effort tag's word is replaced by the stand-in `workspace`, same width
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Opus 5.5 with xhigh effort · Claude Max
+ ▝▝   ▝▝   ~/aterm · /rc
+
+
+⏺ agents-md: no CLAUDE.md found; AGENTS.md loaded:
+  /Users//user00/aterm/AGENTS.md
+
+❯ Count from 1 to 30, one number per line, nothing else.
+
+
+
+
+
+
+
+
+✳ Caramelizing…
+
+──────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents

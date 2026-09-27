@@ -67,7 +67,7 @@ use std::path::Path;
 /// one threshold.)
 ///
 /// The threshold means "three checks in a row". At the one 30-minute cadence
-/// (`cadence::INTERVAL_SECS`, `spawn_background_check`) — doubling while checks fail —
+/// (`cadence::INTERVAL_SECS`, `spawn_background_check_with_settings`) — doubling while checks fail —
 /// that is two to three hours of one failure class, long enough that a flaky network
 /// blip never escalates and short enough that a broken pipeline is named the same day.
 pub use crate::PERSISTENT_AFTER;
@@ -249,6 +249,63 @@ pub struct Health {
     /// (empty when nothing is).
     #[serde(default)]
     pub pending_since: String,
+    /// What the seamless handoff's capture cost the last time it was TIMED — a
+    /// dry run of the park's own capture, taken while the successor booted with
+    /// every reader live — in microseconds (0 when none has been measured).
+    /// Written by [`Self::record_handoff_capture`].
+    ///
+    /// THE MEMORY THE FIRST FREEZE RUNG NEVER HAD (gap #25, 2026-09-26). The
+    /// first automatic park's budget was a constant 20 ms, and on the owner's
+    /// desk the park had grown past it: 0.91 and 0.92 both missed that rung,
+    /// re-parked 500 ms later on the 80 ms rung and landed there in 22 and 20
+    /// ms — a stall, a second park and about half a second of extra wall time
+    /// on every update. The GUI now seeds that rung from measurements —
+    /// `clamp(1.5 × the larger of this and [`Self::handoff_park_us`], 20 ms,
+    /// 80 ms)` — and this is where they outlive the process that took them:
+    /// the next update reads them back ([`crate::handoff_capture_prior`]).
+    /// Observability and a PRIOR, never a gate: an absent or corrupt value is
+    /// the 20 ms default the rung always had.
+    #[serde(default)]
+    pub handoff_capture_us: u64,
+    /// How many sessions the timed capture of [`Self::handoff_capture_us`]
+    /// carried — the desk it describes, so a reader can tell a number taken
+    /// over two tabs from one taken over twenty.
+    #[serde(default)]
+    pub handoff_capture_sessions: u32,
+    /// The first automatic freeze rung [`Self::handoff_capture_us`] seeded, in
+    /// milliseconds (0 when none has been measured) — what `update status`
+    /// prints as `freeze_seed_ms=`.
+    #[serde(default)]
+    pub handoff_freeze_seed_ms: u64,
+    /// The build that was RUNNING when [`Self::handoff_capture_us`] was
+    /// measured (0 when unknown): the capture is that build's code over that
+    /// moment's desk.
+    #[serde(default)]
+    pub handoff_capture_build: u64,
+    /// RFC3339 UTC of [`Self::handoff_capture_us`] (empty when there is none).
+    #[serde(default)]
+    pub handoff_capture_at: String,
+    /// What the seamless handoff's REAL park cost the last time one landed —
+    /// from the instant the readers were told to stop until the capture, the
+    /// layout and both digests were done: everything the freeze budget is spent
+    /// on — in microseconds (0 when none has been recorded). Written by
+    /// [`Self::record_handoff_park`].
+    ///
+    /// The dry run of [`Self::handoff_capture_us`] cannot time the part of the
+    /// park that IS the freeze — stopping the readers — and on the owner's desk
+    /// that part is most of it: measured 2026-09-26 at opt-level 3, the capture
+    /// of two 50x200 sessions with 10 000 scrollback lines each takes 1.1 ms,
+    /// where 0.91's and 0.92's parks of a two-session desk took 22 and 20 ms.
+    /// So the next update seeds its first rung from the larger of the two.
+    #[serde(default)]
+    pub handoff_park_us: u64,
+    /// The build that was RUNNING when [`Self::handoff_park_us`] was recorded
+    /// (0 when unknown).
+    #[serde(default)]
+    pub handoff_park_build: u64,
+    /// RFC3339 UTC of [`Self::handoff_park_us`] (empty when there is none).
+    #[serde(default)]
+    pub handoff_park_at: String,
 }
 
 impl Health {
@@ -802,6 +859,52 @@ impl Health {
         h
     }
 
+    /// Record one TIMED handoff capture (gap #25): `capture_us` microseconds to
+    /// capture `sessions` session(s), measured by `current_build`, which seeded
+    /// a first freeze rung of `freeze_seed_ms`. The newest measurement replaces
+    /// the last one outright — it is a prior about THIS desk and THIS build,
+    /// and an older, cheaper desk is exactly the number that made the rung
+    /// miss. A zero measurement records nothing (it cannot be told from "never
+    /// measured"); every streak and every other slot is untouched.
+    pub fn record_handoff_capture(
+        path: &Path,
+        current_build: u64,
+        capture_us: u64,
+        sessions: u32,
+        freeze_seed_ms: u64,
+    ) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if capture_us == 0 {
+            return h;
+        }
+        h.handoff_capture_us = capture_us;
+        h.handoff_capture_sessions = sessions;
+        h.handoff_freeze_seed_ms = freeze_seed_ms;
+        h.handoff_capture_build = current_build;
+        h.handoff_capture_at = crate::install::now_rfc3339();
+        h.write(path);
+        h
+    }
+
+    /// Record what one LANDED seamless park cost `current_build`: `park_us`
+    /// microseconds from the readers' stop to a capture ready to hand over
+    /// (see [`Self::handoff_park_us`]). Same rules as
+    /// [`Self::record_handoff_capture`]: the newest replaces the last, a zero
+    /// records nothing, and no streak or standing slot moves.
+    pub fn record_handoff_park(path: &Path, current_build: u64, park_us: u64) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if park_us == 0 {
+            return h;
+        }
+        h.handoff_park_us = park_us;
+        h.handoff_park_build = current_build;
+        h.handoff_park_at = crate::install::now_rfc3339();
+        h.write(path);
+        h
+    }
+
     /// Best-effort sibling lock (`…/health.toml.lock`) guarding a whole read→mutate→
     /// write of the ledger. `None` on failure: the caller then proceeds unlocked —
     /// health is observability, never a gate, so a missed lock must never drop the
@@ -845,6 +948,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("health.toml")
+    }
+
+    /// A TIMED HANDOFF CAPTURE IS A PRIOR (gap #25): it survives a re-read, the
+    /// newest measurement replaces the last outright (an older, cheaper desk is
+    /// exactly the number that made the first freeze rung miss), a zero reading
+    /// records nothing, and no streak or standing slot moves for it.
+    #[test]
+    fn a_timed_handoff_capture_is_kept_as_a_prior_and_moves_no_streak() {
+        let p = tmp("handoff-capture");
+        Health::record_apply_failure(&p, 9, 909, "ActivityRevoked");
+        Health::record_apply_refusal(&p, 9, "the terminal was busy");
+        let recorded = Health::record_handoff_capture(&p, 9, 22_000, 2, 33);
+        let read = Health::read(&p);
+        for h in [&recorded, &read] {
+            assert_eq!(
+                (
+                    h.handoff_capture_us,
+                    h.handoff_capture_sessions,
+                    h.handoff_freeze_seed_ms,
+                    h.handoff_capture_build
+                ),
+                (22_000, 2, 33, 9)
+            );
+            assert!(
+                !h.handoff_capture_at.is_empty(),
+                "a measurement carries its time"
+            );
+            assert_eq!(h.apply_failures, 1, "no streak moves");
+            assert_eq!(h.apply_failures_for_target, 1);
+            assert_eq!(h.last_apply_refusal, "the terminal was busy");
+            assert!(!h.is_persistent());
+        }
+        let newer = Health::record_handoff_capture(&p, 10, 9_000, 1, 20);
+        assert_eq!(
+            (
+                newer.handoff_capture_us,
+                newer.handoff_capture_sessions,
+                newer.handoff_capture_build
+            ),
+            (9_000, 1, 10),
+            "the newest measurement replaces the last, cheaper or not"
+        );
+        let zero = Health::record_handoff_capture(&p, 11, 0, 3, 20);
+        assert_eq!(
+            (zero.handoff_capture_us, zero.handoff_capture_build),
+            (9_000, 10),
+            "a zero reading cannot be told from none, so it records nothing"
+        );
+
+        // The LANDED park is its own slot, on the same rules, and neither slot
+        // moves the other.
+        let parked = Health::record_handoff_park(&p, 12, 22_000);
+        assert_eq!(
+            (parked.handoff_park_us, parked.handoff_park_build),
+            (22_000, 12)
+        );
+        assert!(!parked.handoff_park_at.is_empty());
+        assert_eq!(
+            parked.handoff_capture_us, 9_000,
+            "the dry run's slot is untouched"
+        );
+        let zero = Health::record_handoff_park(&p, 13, 0);
+        assert_eq!(
+            (zero.handoff_park_us, zero.handoff_park_build),
+            (22_000, 12)
+        );
+        let read = Health::read(&p);
+        assert_eq!(
+            (
+                read.handoff_park_us,
+                read.handoff_capture_us,
+                read.apply_failures
+            ),
+            (22_000, 9_000, 1)
+        );
     }
 
     /// The stage-backoff check proves ACQUISITION works while deliberately declining to

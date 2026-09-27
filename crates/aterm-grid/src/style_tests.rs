@@ -198,36 +198,6 @@ fn table_stats() {
 }
 
 #[test]
-fn table_compact() {
-    let mut table = StyleTable::new();
-
-    let style1 = Style::with_fg(Color::new(255, 0, 0));
-    let style2 = Style::with_bg(Color::new(0, 0, 255));
-    let style3 = Style::with_attrs(StyleAttrs::BOLD);
-
-    let id1 = table.intern(style1);
-    let id2 = table.intern(style2);
-    let id3 = table.intern(style3);
-
-    // Release style2
-    table.release(id2);
-
-    assert_eq!(table.len(), 4);
-
-    let id_map = table.compact();
-
-    // Should have removed style2
-    assert_eq!(table.len(), 3);
-
-    // Default should stay at 0
-    assert_eq!(id_map[0], StyleId::DEFAULT);
-
-    // style1 and style3 should be remapped
-    assert_ne!(id_map[id1.raw() as usize], StyleId::DEFAULT);
-    assert_ne!(id_map[id3.raw() as usize], StyleId::DEFAULT);
-}
-
-#[test]
 fn table_clear() {
     let mut table = StyleTable::new();
 
@@ -617,111 +587,11 @@ fn style_table_saturation_preserves_existing_styles() {
     }
 }
 
-/// Verify compact() id_map correctness: surviving styles resolve to same content.
-///
-/// The id_map returned by compact() must satisfy:
-/// `table.get(id_map[old_idx]) == old_style` for all surviving (ref_count > 0) entries.
-/// Dead entries (ref_count == 0) must map to StyleId::DEFAULT.
-///
-/// Part of #4548
+/// `build_compaction_map` computes the dense remap without mutating the
+/// table. Dead styles (refcount 0) map to DEFAULT; live styles receive dense
+/// indices starting at 1.
 #[test]
-fn style_table_compact_remap_preserves_content() {
-    let mut table = StyleTable::new();
-
-    // Create 10 distinct styles and record their IDs and values.
-    let mut entries: Vec<(StyleId, Style)> = Vec::new();
-    for i in 1..=10u8 {
-        let style = Style::with_fg(Color::new(i, i.wrapping_mul(2), i.wrapping_mul(3)));
-        let id = table.intern(style);
-        entries.push((id, style));
-    }
-    assert_eq!(table.len(), 11); // 10 + default
-
-    // Release styles at indices 2, 5, 7 (0-based in entries vec).
-    let dead_indices = [2usize, 5, 7];
-    for &di in &dead_indices {
-        table.release(entries[di].0);
-    }
-
-    // Compact and get the remap.
-    let id_map = table.compact();
-    assert_eq!(table.len(), 8); // 11 - 3 dead = 8
-
-    // Verify surviving styles resolve to same content via id_map.
-    for (i, (old_id, original_style)) in entries.iter().enumerate() {
-        let new_id = id_map[old_id.raw() as usize];
-
-        if dead_indices.contains(&i) {
-            // Dead entries must map to default.
-            assert_eq!(
-                new_id,
-                StyleId::DEFAULT,
-                "dead style at entry index {i} must map to default"
-            );
-        } else {
-            // Surviving entries must resolve to the same style.
-            let resolved = table.get(new_id);
-            assert_eq!(
-                resolved,
-                Some(original_style),
-                "surviving style at entry index {i} must resolve to same content after compact"
-            );
-        }
-    }
-
-    // Verify lookup consistency: interning a surviving style returns the new ID.
-    let (_, style_0) = entries[0]; // survived
-    let re_interned = table.intern(style_0);
-    assert_eq!(
-        re_interned,
-        id_map[entries[0].0.raw() as usize],
-        "re-interning a surviving style must return its compacted ID"
-    );
-}
-
-/// `compact` on a table with mixed live and released styles preserves all
-/// live style content and removes dead entries. After compaction, re-interning
-/// a surviving style must return its new compacted ID.
-#[test]
-fn compact_preserves_content_with_released_styles() {
-    let mut table = StyleTable::new();
-
-    let s1 = Style::with_fg(Color::new(10, 20, 30));
-    let s2 = Style::with_fg(Color::new(40, 50, 60));
-    let s3 = Style::with_fg(Color::new(70, 80, 90));
-
-    let id1 = table.intern(s1);
-    let id2 = table.intern(s2);
-    let id3 = table.intern(s3);
-
-    // Release the middle style to create a dead gap.
-    table.release(id2);
-    assert_eq!(table.stats().total_styles, 4); // default + 3
-
-    let id_map = table.compact();
-
-    // After compaction: default + 2 live = 3 entries.
-    assert_eq!(table.stats().total_styles, 3);
-
-    // Dead style maps to DEFAULT.
-    assert_eq!(id_map[id2.raw() as usize], StyleId::DEFAULT);
-
-    // Live styles get dense IDs and content is preserved.
-    let new_id1 = id_map[id1.raw() as usize];
-    let new_id3 = id_map[id3.raw() as usize];
-    assert_eq!(table.get(new_id1), Some(&s1), "style 1 content");
-    assert_eq!(table.get(new_id3), Some(&s3), "style 3 content");
-
-    // Re-interning a surviving style returns its compacted ID.
-    let re_interned = table.intern(s1);
-    assert_eq!(re_interned, new_id1, "re-intern returns compacted ID");
-}
-
-/// `build_compaction_map` must produce the same mapping as `compact` without
-/// mutating the table. Dead styles (refcount 0) map to DEFAULT; live styles
-/// receive dense indices starting at 1.
-#[test]
-fn build_compaction_map_matches_compact() {
+fn build_compaction_map_is_dense_and_read_only() {
     let mut table = StyleTable::new();
 
     let mut entries: Vec<(StyleId, Style)> = Vec::new();

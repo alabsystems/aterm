@@ -149,7 +149,7 @@ impl Contained {
     /// between would make the count name a different report.
     #[inline]
     #[must_use]
-    pub fn ordinal(self) -> u64 {
+    pub(crate) fn ordinal(self) -> u64 {
         self.ordinal
     }
 }
@@ -313,10 +313,10 @@ pub struct ContainedException<'a> {
 }
 
 /// The most call-stack frames [`report`] copies out.
-pub const STACK_FRAMES_MAX: usize = 48;
+pub(crate) const STACK_FRAMES_MAX: usize = 48;
 
 /// How many exceptions this process has contained.
-pub static CONTAINED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CONTAINED: AtomicU64 = AtomicU64::new(0);
 
 /// How many exceptions this process has contained so far.
 ///
@@ -394,7 +394,7 @@ pub fn default_sink(e: &ContainedException<'_>) {
 /// containment still counts.
 #[cold]
 #[inline(never)]
-pub fn report(method: &str, exception: Id) -> u64 {
+pub(crate) fn report(method: &str, exception: Id) -> u64 {
     let ordinal = CONTAINED.fetch_add(1, Ordering::Relaxed) + 1;
     // Under a pool of its own: `-name`, `-reason` and `-callStackSymbols`
     // answer autoreleased objects, and a containment may happen on a thread

@@ -9,7 +9,7 @@
 //!                                      and emit one NDJSON record per event on stdout —
 //!                                      each addressed by an astream Subject
 //!                                      `/fleet/<pid>/events/<sid>`. An instance bound to
-//!                                      an explicit $ATERM_CONTROL_SOCK is listed but not
+//!                                      an explicit --control-sock is listed but not
 //!                                      federated: the streamer addresses it by `--pid`,
 //!                                      which resolves only default-dir sockets.
 //!
@@ -60,21 +60,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
             command @ ("status" | "inspect" | "manage" | "unmanage" | "next" | "extend" | "ack"
             | "reconcile" | "clear-fault" | "propose"),
         ) => operator_command(command, &argv[1..]),
-        Some("-h") | Some("--help") | None => usage(0),
-        Some(other) => {
-            eprintln!("aterm-fleet: unknown mode {other:?}");
-            usage(2)
+        Some("-h") | Some("--help") | None => usage(),
+        Some(_) => {
+            eprintln!("aterm-fleet: no such mode; run `aterm fleet --help`");
+            ExitCode::from(2)
         }
     }
 }
 
-fn usage(code: u8) -> ExitCode {
+fn usage() -> ExitCode {
     let help = "aterm-fleet — federate a fleet of aterm sessions into one fabric.\n\n\
          USAGE:\n\
          \x20 aterm-fleet events     merge the `subscribe events` of every live instance in the\n\
          \x20                        default socket dir to stdout as NDJSON, addressed by astream\n\
          \x20                        Subject /fleet/<pid>/events/<sid> (an instance on an explicit\n\
-         \x20                        $ATERM_CONTROL_SOCK is listed by `ls` but not federated)\n\
+         \x20                        --control-sock is listed by `ls` but not federated)\n\
          \x20 aterm-fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
          \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\
          \x20                        retain stdout/stderr and exit_code; exit 1 if any command fails\n\
@@ -88,22 +88,11 @@ fn usage(code: u8) -> ExitCode {
          \x20 aterm-fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human\n\
          \x20 aterm-fleet clear-fault confirm=human\n\
          \x20 aterm-fleet propose    read one guarded-turn JSON proposal from stdin\n\n\
-         Operator commands and fleet DISCOVERY use the in-process control client.\n\
-         The events streamers and exec find the aterm-ctl BINARY via $ATERM_CTL,\n\
-         then a sibling of this binary, then PATH.\n\n\
-         The embedded operator is EXPERIMENTAL (status reports it) and OFF by default.\n\
-         Launch an aterm instance with ATERM_OPERATOR=1 to opt in. A NEW profile starts\n\
-         with an empty allowlist, so `manage <sid>` is required before anything is\n\
-         observed; a relaunched profile replays the sids it already manages from its\n\
-         durable WAL/checkpoint. Without the opt-in (or with $ATERM_NO_OPERATOR set to\n\
-         anything but empty or `0`) its verbs answer `ERR operator unavailable`.\n\
-         See docs/OPERATOR-EMBEDDED.md.\n";
-    if code == 0 {
-        print!("{help}");
-    } else {
-        eprint!("{help}");
-    }
-    ExitCode::from(code)
+         The operator verbs need `[operator] enabled = true` in aterm.toml (else they\n\
+         answer `ERR operator unavailable`) and a `manage <sid>` per session, kept\n\
+         across relaunches. See docs/OPERATOR-EMBEDDED.md.\n";
+    print!("{help}");
+    ExitCode::SUCCESS
 }
 
 /// Forward a fleet-facing operator command to the normal aterm instance that
@@ -141,15 +130,12 @@ fn operator_ctl_args(
 }
 
 /// Resolve the `aterm-ctl` BINARY for the child-process paths that still need
-/// one — the per-instance `subscribe` streamers and `exec` dispatch: `$ATERM_CTL`,
-/// else a sibling of this binary (the co-distributed toolchain layout), else the
-/// bare name on `PATH`. Discovery no longer goes through it (see
+/// one — the per-instance `subscribe` streamers and `exec` dispatch: the alias
+/// beside this binary (the co-distributed toolchain layout), else the bare name
+/// on `PATH`. Discovery no longer goes through it (see
 /// [`list_sessions`]), so a missing binary is now a streaming/dispatch failure
 /// only, never a silently empty fleet.
 fn ctl_bin() -> String {
-    if let Ok(p) = std::env::var("ATERM_CTL") {
-        return p;
-    }
     std::env::current_exe()
         .ok()
         .and_then(|exe| crate::drive_cli::sibling_ctl(&exe))
@@ -274,9 +260,8 @@ impl ListDiagnostics {
             )
         } else {
             format!(
-                "aterm-fleet: CANNOT LIST THE FLEET{repeat} — the fleet is unknown, not empty \
-                 (aterm-ctl ls would exit {}): {}",
-                error.code, error.reason
+                "aterm-fleet: cannot list the fleet{repeat}: {}",
+                error.reason
             )
         })
     }
@@ -368,9 +353,7 @@ fn resolve_federated_sid(
 /// makes a busy pool a one-second delay instead of permanent blindness.
 fn federate() {
     let ctl = ctl_bin();
-    eprintln!(
-        "aterm-fleet: federating fleet — rescanning every {RESCAN_SECS}s, events -> NDJSON on stdout (Ctrl-C to stop)"
-    );
+    eprintln!("aterm-fleet: streaming the fleet's events to stdout (Ctrl-C stops)");
 
     // Each instance streams on its own thread; a single writer thread (this one, below)
     // serializes the merged NDJSON so records never interleave mid-line. The scanner and
@@ -410,7 +393,7 @@ fn federate() {
                     }
                 }
                 eprintln!(
-                    "aterm-fleet: federating instance {pid} — live target set (@*), {} session(s) now",
+                    "aterm-fleet: streaming instance {pid}: {} session(s)",
                     sids.len()
                 );
                 let ctl = scan_ctl.clone();
@@ -568,7 +551,7 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<Str
 /// EXEC: dispatch command lines from stdin (`@<sid> <verb> [args…]`) to the fleet.
 fn dispatch() -> ExitCode {
     let ctl = ctl_bin();
-    eprintln!("aterm-fleet: dispatching commands from stdin (`@<sid> <verb> [args...]` per line)");
+    eprintln!("aterm-fleet: reading `@<sid> <verb> [args...]` lines from stdin");
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     match dispatch_lines(stdin.lock(), &mut stdout.lock(), |argv| {
@@ -876,19 +859,25 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
-        // THIRTY SECONDS, not three, and the budget below is five, not one.
-        // What this pins is that EOF on a LIVE child's stdout ends the stream
-        // instead of waiting the child out — so the only thing the numbers have
-        // to do is separate "returned on EOF" from "waited for the child", and
-        // the WIDER the gap the more reliably they do it. At 3 s against 1 s the
-        // margin was 3x, which a loaded machine eats: this test spawns a real
-        // process, and it failed in a full `cargo test --workspace` on a box
-        // running several builds while passing every time in isolation. A 6x
-        // gap keeps the discrimination (a regression waits 30 s and blows a 5 s
-        // budget by six times over) and stops charging the property for the
-        // scheduler's mood. The 30 s is only ever paid when the test FAILS.
-        std::fs::write(&script, b"#!/bin/sh\nexec 1>&-\nexec sleep 30\n")
-            .expect("write fake subscriber");
+        // THE BOUND IS THE CHILD'S OWN LIFETIME, not a guess at "prompt". What
+        // this pins is that EOF on a LIVE child's stdout ends the stream instead
+        // of waiting the child out — so the one thing the number has to do is
+        // separate "returned on EOF" from "waited for the child". The child
+        // sleeps 60 s; a regression therefore returns at 60 s or later, and any
+        // return before HALF the child's life (30 s) can only have come from the
+        // EOF. The history of this bound is why it is written this way: 3 s
+        // against 1 s failed in a full `cargo test --workspace` on a box running
+        // several builds, and 30 s against 5 s still failed at load 51 (a return
+        // after 7.64 s, measured 2026-09-24) — each time a budget for the
+        // scheduler's mood was charged to the property. Half the child's lifetime
+        // is the widest bound that still discriminates, and the 60 s is only
+        // ever paid when the test FAILS.
+        const CHILD_LIFETIME_S: u64 = 60;
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec 1>&-\nexec sleep {CHILD_LIFETIME_S}\n"),
+        )
+        .expect("write fake subscriber");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("make fake subscriber executable");
         let (tx, _rx) = federation_channel();
@@ -902,9 +891,10 @@ mod tests {
         ));
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < std::time::Duration::from_secs(CHILD_LIFETIME_S / 2),
             "EOF from a live child escaped prompt cleanup: returned after {elapsed:?}, \
-             which is the child's own 30 s sleep showing through rather than EOF"
+             which is the child's own {CHILD_LIFETIME_S} s sleep showing through rather \
+             than EOF"
         );
         let _ = std::fs::remove_file(script);
     }
@@ -1209,14 +1199,12 @@ mod tests {
         let line = diag
             .observe(&broken)
             .expect("a failure must never pass silently");
-        assert!(line.contains("CANNOT LIST THE FLEET"), "{line}");
-        assert!(line.contains("not empty"), "{line}");
+        assert!(line.contains("cannot list the fleet"), "{line}");
         // The cause `Command::output()` used to swallow with the child's stderr.
         assert!(
             line.contains("a sandbox is refusing AF_UNIX connect()"),
             "{line}"
         );
-        assert!(line.contains("exit 2"), "{line}");
 
         // An EMPTY fleet is a different sentence: the bridge is working, there is
         // simply nothing to federate. An operator must be able to tell them apart
@@ -1228,7 +1216,7 @@ mod tests {
         ));
         let line = diag.observe(&empty).expect("said once");
         assert!(line.contains("nothing to federate"), "{line}");
-        assert!(!line.contains("CANNOT LIST"), "{line}");
+        assert!(!line.contains("cannot list"), "{line}");
     }
 
     /// The 1 Hz rescan must not become a 1 Hz log. A distinct reason speaks at

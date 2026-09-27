@@ -70,6 +70,34 @@ pub(crate) struct ShellIntegrationAuth {
     /// authorized, (b) `id=` was missing, or (c) `id=` was malformed
     /// or mismatched. Exposed for host-side metrics / hardening audits.
     dropped_count: u64,
+    /// The authorized nonce was handed to a shell that has NOT YET TAKEN IT
+    /// ([`Self::authorize_on_first_mark`]): the re-key of an adopted shell,
+    /// delivered through a file the shell reads at its next prompt — which may
+    /// be hours away while a long program runs in the foreground. Marks signed
+    /// with the nonce verify as usual; until the first one does, the nonce is
+    /// not IN USE ([`Self::nonce_in_use`] is `None`), so the host neither
+    /// reports the shell's marks as reaching the engine nor carries, across the
+    /// next update, a key the shell may never have seen. Cleared by the first
+    /// valid mark, by [`Self::authorize`] and by [`Self::revoke`].
+    awaiting_first_mark: bool,
+    /// A TYPED re-key's way back ([`Self::authorize_rekey`]): the authorization
+    /// it replaced, kept while its key waits in a one-use file that a line
+    /// typed at the shell's prompt is to read. `Some` exactly while such a key
+    /// is authorized and not yet settled either way: the host puts the prior
+    /// back ([`Self::withdraw_rekey`]) when the line never ran — its file still
+    /// there — so an untaken key never outlives the file that held it, and
+    /// forgets it ([`Self::settle_rekey`]) once the file is gone, the shell
+    /// holding the key. Cleared too by the first mark signed with the key (the
+    /// shell took it and used it), by [`Self::authorize`] and by
+    /// [`Self::authorize_on_first_mark`].
+    typed_prior: Option<Prior>,
+}
+
+/// The authorization a typed re-key replaced ([`ShellIntegrationAuth::typed_prior`]).
+#[derive(Clone, Copy, Debug)]
+struct Prior {
+    nonce: Option<[u8; 32]>,
+    awaiting_first_mark: bool,
 }
 
 impl ShellIntegrationAuth {
@@ -78,6 +106,8 @@ impl ShellIntegrationAuth {
         Self {
             nonce: None,
             dropped_count: 0,
+            awaiting_first_mark: false,
+            typed_prior: None,
         }
     }
 
@@ -87,23 +117,94 @@ impl ShellIntegrationAuth {
     /// passes the structural gate in [`verify_nonce`].
     pub(crate) fn authorize(&mut self, nonce: [u8; 32]) {
         self.nonce = Some(nonce);
+        self.awaiting_first_mark = false;
+        self.typed_prior = None;
+    }
+
+    /// [`Self::authorize`] for a nonce the shell has not taken yet (see
+    /// `awaiting_first_mark`): it verifies marks from now on, and it is IN USE
+    /// from the first mark that carries it.
+    pub(crate) fn authorize_on_first_mark(&mut self, nonce: [u8; 32]) {
+        self.nonce = Some(nonce);
+        self.awaiting_first_mark = true;
+        self.typed_prior = None;
+    }
+
+    /// [`Self::authorize_on_first_mark`] for a TYPED re-key, which can be taken
+    /// back: the authorization it replaces is kept (`typed_prior`) until the
+    /// host settles the key either way. A second typed re-key before the first
+    /// is settled keeps the FIRST one's prior — the authorization the shell
+    /// had before any of them.
+    pub(crate) fn authorize_rekey(&mut self, nonce: [u8; 32]) {
+        let prior = self.typed_prior.take().unwrap_or(Prior {
+            nonce: self.nonce,
+            awaiting_first_mark: self.awaiting_first_mark,
+        });
+        self.nonce = Some(nonce);
+        self.awaiting_first_mark = true;
+        self.typed_prior = Some(prior);
+    }
+
+    /// Whether `nonce` is the typed re-key authorized now, not yet settled and
+    /// not yet taken by a mark.
+    fn rekey_pending(&self, nonce: &[u8; 32]) -> bool {
+        self.typed_prior.is_some()
+            && self.awaiting_first_mark
+            && self.nonce.as_ref().is_some_and(|n| n == nonce)
+    }
+
+    /// TAKE BACK the typed re-key `nonce`: the authorization it replaced is
+    /// restored, so a key whose line never ran authorizes nothing. `false`,
+    /// changing nothing, when `nonce` is not the pending typed re-key — a
+    /// mark already carried it (the shell has it and uses it: a working key is
+    /// never moved), another authorization replaced it, or it was settled.
+    pub(crate) fn withdraw_rekey(&mut self, nonce: &[u8; 32]) -> bool {
+        if !self.rekey_pending(nonce) {
+            return false;
+        }
+        if let Some(prior) = self.typed_prior.take() {
+            self.nonce = prior.nonce;
+            self.awaiting_first_mark = prior.awaiting_first_mark;
+        }
+        true
+    }
+
+    /// KEEP the typed re-key `nonce`: its file was consumed, so the shell holds
+    /// the key, and the authorization it replaced is forgotten. The key stays
+    /// not-in-use until its first mark, exactly as after
+    /// [`Self::authorize_on_first_mark`]. `false`, changing nothing, when
+    /// `nonce` is not the pending typed re-key.
+    pub(crate) fn settle_rekey(&mut self, nonce: &[u8; 32]) -> bool {
+        if !self.rekey_pending(nonce) {
+            return false;
+        }
+        self.typed_prior = None;
+        true
     }
 
     /// Revoke any previously authorized nonce. Subsequent OSC 133/633
     /// sequences cannot satisfy [`verify_nonce`] until `authorize` is
     /// called again.
+    #[cfg(test)]
     pub(crate) fn revoke(&mut self) {
         self.nonce = None;
+        self.awaiting_first_mark = false;
+        self.typed_prior = None;
     }
 
-    /// The authorized nonce, for the seamless-handoff carry only
-    /// ([`super::Terminal::checkpoint_carry`]): an adopted shell keeps
-    /// emitting the nonce it was spawned with, so the successor engine
-    /// must authorize that same value or drop every mark for the
-    /// session's life.
+    /// The authorized nonce once the shell is USING it: always for one
+    /// [`Self::authorize`]d at spawn or from a handoff's carry, and for one
+    /// [`Self::authorize_on_first_mark`]ed only after a mark signed with it
+    /// arrived. What `status integration=` reports, and what the seamless-handoff
+    /// carry takes ([`super::Terminal::checkpoint_carry`]): an adopted shell
+    /// keeps emitting the nonce it signs with, so the successor engine must
+    /// authorize that same value or drop every mark for the session's life. A
+    /// re-key the shell never took is NOT carried — the successor re-keys it
+    /// afresh through the same channel, so a key the shell never saw cannot
+    /// read as `integration=on` on the far side of an update.
     #[must_use]
-    pub(crate) fn nonce(&self) -> Option<[u8; 32]> {
-        self.nonce
+    pub(crate) fn nonce_in_use(&self) -> Option<[u8; 32]> {
+        self.nonce.filter(|_| !self.awaiting_first_mark)
     }
 
     /// Number of OSC 133/633 sequences silently dropped since this
@@ -149,6 +250,10 @@ impl ShellIntegrationAuth {
         };
 
         if constant_time_eq_32(&claimed, expected) {
+            // The shell has the key: a re-key it had not taken is in use now,
+            // and a typed one is past taking back.
+            self.awaiting_first_mark = false;
+            self.typed_prior = None;
             true
         } else {
             self.dropped_count = self.dropped_count.saturating_add(1);
@@ -198,31 +303,6 @@ impl ShellIntegrationAuth {
             super::policy_bridge::BridgeDecision::Allow
             | super::policy_bridge::BridgeDecision::Fallback => self.verify_nonce(params),
         }
-    }
-
-    /// Provenance ceremony: lift this shell-integration authorization
-    /// state into a [`aterm_provenance::HostAuthorizationToken`] borrowed
-    /// for the auth state's lifetime.
-    ///
-    /// Part of the #8001 `authorize_*` wiring (design §6 migration table).
-    /// Callers must first pass [`verify_nonce`] for the current OSC
-    /// 133/633 dispatch — this method is a pure borrow, so the caller is
-    /// responsible for the ordering. (The design trade-off is documented
-    /// in the #8001 design caveat list: a nonce-bound
-    /// `AuthorizedShellIntegration<'_>` wrapper was considered but would
-    /// require plumbing a new borrow through `handler_osc`. The existing
-    /// verify-then-mint pattern matches `ClipboardAuth`.)
-    ///
-    /// The returned token is borrowed against `&self`, so it cannot
-    /// outlive the OSC 133/633 dispatch frame.
-    #[allow(
-        dead_code,
-        reason = "audit-only provenance ceremony retained until production callers consume the host-authorization token directly"
-    )]
-    #[must_use]
-    pub(crate) fn as_host_auth_token(&self) -> aterm_provenance::HostAuthorizationToken<'_> {
-        let _ = &self.nonce;
-        aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
     }
 }
 
@@ -480,24 +560,5 @@ mod tests {
         // Upper case accepted.
         let hex_upper = b"000123456789ABCDEFFEDCBA987654321000FF112233445566778899AABBCCDD";
         assert_eq!(decode_hex_32(hex_upper), Some(expected));
-    }
-
-    /// #8001 ceremony: the `ShellIntegrationAuth` auth state exposes an
-    /// `as_host_auth_token` that lifts `Provenance<_, Pty>` to
-    /// `Provenance<_, Host>`. The caller must have verified the nonce
-    /// before calling this — the token is purely an audit marker; the
-    /// structural check is the presence of `&ShellIntegrationAuth`.
-    #[test]
-    fn as_host_auth_token_lifts_pty_to_host() {
-        use aterm_provenance::{OriginTag, Provenance, authorize_pty_to_host};
-
-        let mut auth = ShellIntegrationAuth::new();
-        auth.authorize(nonce_with_byte(0x42));
-        let tok = auth.as_host_auth_token();
-        let pty: Provenance<String, aterm_provenance::Pty> =
-            Provenance::from_pty("prompt".to_string());
-        let host = authorize_pty_to_host(pty, tok);
-        assert_eq!(host.tag(), OriginTag::Host);
-        assert_eq!(host.as_ref(), "prompt");
     }
 }

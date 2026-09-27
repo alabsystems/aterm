@@ -9,62 +9,181 @@
 //! own), and nothing bounded what they held. Measured across incremental
 //! `--fast` runs: `target/` grew 36 GB -> 55 GB, `target-tippy/` sat at 16-18 GB
 //! and `target-drivers/` at 16-20 GB, on a 926 GB volume that also carries
-//! `$HOME/trust` (428 GB) and `~/ay` (195 GB). Two contract runs died mid-ladder
-//! with `No space left on device` — one on a stage log that could not be
-//! created (`aterm-verify: cannot run …/targo: No space left on device (os
-//! error 28)`), one inside a build child (`error: failed to write
-//! …/target/debug/deps/…/lib.rmeta: No space left on device`) — then `verify:
-//! cannot write the ladder`, and the rows they had managed to print were `FAIL`
-//! rows of a FINDING's severity. WHICH stage each died on was not recorded, and
-//! neither was the free space they started with: no ladder from that day
-//! survives, and no run before this change read the disk at all. After deleting
-//! those dirs, a cold run with `CARGO_INCREMENTAL=0` in the environment passed
-//! the contract; the snapshot it left measured 23 GB on 2026-09-21, and the
-//! passing receipt of that day (`0a45a7446`) was written 32 min after its
-//! commit. Incremental artifacts were most of the bloat, and the gate never
-//! needed them — it builds each commit once ([`crate::CHILD_ENV`]).
+//! `$HOME/trust` (428 GB) and `~/ay` (195 GB). On 2026-09-20 two contract runs
+//! died mid-ladder with `No space left on device`, and their logs, in the
+//! snapshot's `.aterm-verify/logs`, name the stage: `13a8494eb`'s
+//! (`verify-90487.log`) passed its build and could not start its test stage
+//! (`aterm-verify: cannot run …/targo: No space left on device (os error
+//! 28)`); `cb770c598`'s first run (`verify-45265.log`) died inside its build
+//! (`error: failed to write …/target/debug/deps/…/lib.rmeta: No space left on
+//! device`) and then the same way. The rows they printed were `FAIL` rows of a
+//! FINDING's severity, and neither recorded the free space it started with: no
+//! run before this change read the disk. With `target/`, `target-tippy/` and
+//! `target-drivers/` deleted and `CARGO_INCREMENTAL=0` in the environment, the
+//! next run of `cb770c598` (`verify-53539.log`) built them cold, and the
+//! snapshot measured 23 GiB after it (`du -sh`). Incremental artifacts were
+//! most of the bloat, and the gate never needed them — it builds each commit
+//! once ([`crate::CHILD_ENV`]).
 //!
-//! WHAT THIS DOES. Before the ladder is planned, [`crate::run`] reads the free
-//! space on the volume holding the run's root and REFUSES — COULD NOT RUN, exit
-//! 3, never a skip and never a finding — when it is under [`FLOOR_BYTES`],
-//! printing the free amount, the floor, what the run's own target dirs hold and
-//! the remedy: those dirs are regenerable. A run that starts under the floor
-//! does not die at minute forty with a half-written ladder; it says so at
-//! second one, and leaves no receipt, so the last real judgement of the commit
-//! still stands.
+//! WHERE THE NUMBERS BELOW COME FROM. Verdicts, stage times and `Compiling`
+//! counts are read off each run's log in the snapshot's `.aterm-verify/logs`
+//! and its receipt in the caller's `.aterm-verify/receipts`. A run is COLD
+//! when its main lanes were emptied before it — `cb770c598`'s second run and
+//! `b994cadd0`'s, with 769 and 809 `Compiling` lines — and WARM otherwise:
+//! `0a45a7446`, `fd0be116b` and `216e2e5cb`, with 43-308. Sizes marked `du
+//! -sh`, `du -sk` or `df -h` were read by hand in the sessions that ran those
+//! runs; no file in the repo or the snapshot records them.
 //!
-//! WHY 40 GiB. A cold, non-incremental contract run leaves ~23 GB of caches, so
-//! that is what a run from empty lanes writes, and a warm run rewrites a large
-//! part of it (cargo does not unlink an old artifact before writing the new
-//! one). The floor is that footprint again in reserve, because a volume at zero
-//! loses the ladder and the receipt — the two files the gate exists to write —
-//! on top of losing the build. Below 40 GiB the gate refuses before building
-//! anything; above it a cold rebuild fits with ~17 GB to spare. The floor is
-//! arithmetic over a measured footprint, NOT a level either 2026-09-20 death
-//! was observed at: what those runs started with is not recorded, and the
-//! preflight would not necessarily have caught them. What bounds the growth
-//! that caused them is `CARGO_INCREMENTAL=0`; the floor bounds the damage when
-//! something else fills the volume.
+//! WHY NOT A FLAT FLOOR (2026-09-23). Until then the preflight refused any run
+//! with less than 40 GiB free, whatever the lanes already held. That is about
+//! a run from EMPTY lanes plus a cold footprint in reserve, and it was charged
+//! to warm runs too: the cold run of `b994cadd0` left its lanes at 20.2 GiB
+//! (`du -sk`), the volume read 22.2 GiB free five minutes before that run
+//! ended, and the flat floor refuses a run at that reading which the estimate
+//! — a warm run's growth plus the reserve — puts at 22.0 GiB.
 //!
-//! The free-space read is `df -Pk`, the POSIX spelling, because this crate has
-//! no dependencies on purpose (see its `Cargo.toml`) and std has no `statvfs`.
-//! Everything that decides is a pure function of numbers, tested below on
-//! synthetic ones.
+//! WHAT THIS DOES. Before the ladder is planned, [`crate::run`] budgets what
+//! THIS run will write and REFUSES — COULD NOT RUN, exit 3, never a skip and
+//! never a finding — when the volume holding the run's root has less free. It
+//! reads two numbers: the free space (`df -Pk`, [`read_free`]) and what the
+//! run's lanes already hold (`du -sk` over [`lane_dirs`], [`measure_lanes`]).
+//! The requirement is [`Budget::need`]:
+//!
+//! ```text
+//! need = max(cold - lanes credited, warm growth) + reserve
+//! ```
+//!
+//! A build writes its cold footprint less what warm lanes already hold, a warm
+//! build still grows its lanes ([`WARM_GROWTH_BYTES`]), and the reserve is for
+//! everything the estimate does not count ([`RESERVE_BYTES`]). Only a
+//! snapshot's lanes are credited ([`Owner`]): they are the gate's alone —
+//! synced, stamped and locked by it. A snapshot whose lanes hold more than
+//! [`LANE_CAP_BYTES`] has them REMOVED before the free space is read
+//! ([`crate::snapshot::remove_lanes`]) and is budgeted cold. The `verify: disk
+//! …` line prints the free space, the lanes and the requirement with its terms,
+//! so every ladder carries arithmetic a reader can check; a refusal adds the
+//! regenerable dirs, each sized, and what removing them would buy. A run
+//! refused here leaves no receipt, so the last real judgement of the commit
+//! stands. `--disk-floor <GiB>` ([`Plan::floor`]) replaces the estimate with
+//! exactly that requirement.
+//!
+//! WHAT NO PREFLIGHT CAN BUDGET is another writer. The estimate is of THIS
+//! run's own writes, and the volume is shared: other sessions' builds, their
+//! scratch under `/tmp`, anything. During the warm run of `216e2e5cb` on
+//! 2026-09-23 the volume went from 43.5 GiB free (its `verify: disk` line) to
+//! 11 GiB 22 minutes in (`df -h`). Its lanes had grown by about 14 GiB by then
+//! — the whole snapshot read 37 GiB the day before, with no run between, and
+//! its lanes summed 50 GiB at that moment (`du -sh`) — so about 18 GiB of the
+//! drop was not its lanes, and WHO wrote it is not recorded. Two candidates are
+//! on the record without either being sized against it: four other build dirs
+//! on the volume (`~/aterm-h-target-{a..d}.noindex`) held 9.3 GiB then and
+//! 31 GiB 77 minutes later (`du -sh`), and this run's own test fixtures, of
+//! which only this crate's were measured ([`RESERVE_BYTES`]) — the test stage
+//! runs `targo test --workspace`, and the other crates' fixtures were not.
+//! Free space even ROSE from 11 to 20 GiB between 14:26:54 and 14:29:31,
+//! inside that run's test stage, and nothing records what released it. No
+//! reserve that still admits a warm run could cover an unbounded other
+//! writer, and the preflight reads once, at the start. What
+//! keeps that case honest is downstream: a child that dies of ENOSPC is a
+//! COULD NOT RUN row ([`crate::ladder::Report::fail_child`]), so such a run
+//! ends COULD NOT RUN, never with a finding about the tree.
+//!
+//! The free-space read is `df -Pk` and the lanes' is `du -sk`, both POSIX,
+//! because this crate has no dependencies on purpose (see its `Cargo.toml`) and
+//! std has no `statvfs`. `du` counts allocated blocks and a hard-linked file
+//! once, which is nearer than a sum of file lengths to what removing the dirs
+//! gives back to `df`. Everything that decides is a pure function of numbers,
+//! tested below on synthetic ones.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// One gibibyte.
 pub const GIB: u64 = 1 << 30;
 
-/// The free-space floor under which the gate refuses to start: 40 GiB (see
-/// the module doc for the measurement it comes from).
-pub const FLOOR_BYTES: u64 = 40 * GIB;
-
-/// The lane target dirs that do not sit at the root under a `target*` name.
+/// What a run from EMPTY lanes writes into them: 24 GiB.
 ///
-/// THE ONE LIST. [`crate::snapshot`]'s `lane_dirs` reads this rather than
-/// keeping its own copy: the two were separate until 2026-09-21, and
+/// MEASURED after the two cold runs since `CARGO_INCREMENTAL=0` landed on
+/// 2026-09-20 — the only runs with size readings (older logs exist; they have
+/// none). `cb770c598`'s on 2026-09-20, with
+/// `target/`, `target-tippy/` and `target-drivers/` emptied before it and the
+/// other lanes kept, left the whole snapshot at 23 GiB (`du -sh`, 7 s after
+/// its log's last line). `b994cadd0`'s on 2026-09-23, with every lane emptied
+/// before it, left the lanes at 21,220,340 KiB — 20.2 GiB (`du -sk`) — and
+/// the whole snapshot at 21 GiB (`du -sh`). 24 GiB is above both, for a
+/// workspace that only grows.
+pub const COLD_BYTES: u64 = 24 * GIB;
+
+/// What a run on WARM lanes still adds to them: 16 GiB.
+///
+/// Warm lanes grow, because cargo deletes no artifact a later build stops
+/// using. MEASURED over the three warm runs since `CARGO_INCREMENTAL=0` landed
+/// on 2026-09-20 (the only runs with size readings), as the snapshot's size
+/// before and after each (`du -sh`, no other run between the two readings):
+/// `0a45a7446` (2026-09-20, one commit past the lanes' last build) left it at
+/// 23 GiB, as it found it; `fd0be116b` (2026-09-21, 55 commits past) took it
+/// from 23 to 37 GiB; `216e2e5cb` (2026-09-23, 292 commits past) from 37 GiB
+/// to lanes summing 49.4 GiB 11 minutes after it ended. 16 GiB is above the
+/// largest, 14 GiB, read to the whole GiB. It is the floor of the estimate, so
+/// lanes that already hold a whole cold footprint still budget a run's growth.
+///
+/// Both large ones crossed a workspace version bump (0.89.0 -> 0.90.0,
+/// 0.90.0 -> 0.91.0), which rebuilds every first-party crate, so they are what
+/// a warm run adds when all of the workspace's own code rebuilds. A warm run
+/// that rebuilds the third-party crates as well can add up to a cold
+/// footprint, and this budget does not cover it: such a run that fills the
+/// volume ends COULD NOT RUN.
+pub const WARM_GROWTH_BYTES: u64 = 16 * GIB;
+
+/// Room kept free beyond what the run writes into its lanes: 6 GiB.
+///
+/// A MARGIN, NOT A MEASUREMENT, for this run's own writes outside its lanes
+/// and for the error in the two estimates above, which are read to the whole
+/// GiB. Of those writes, measured: its ladder log (2.4-3.1 MB for each
+/// complete run in the snapshot's `.aterm-verify/logs`), its receipt (under 1
+/// KiB), and this crate's own test fixtures under `/tmp` and `$TMPDIR`, which
+/// peaked at 3.8 MiB and left 3.3 MiB behind (`du -sk`, sampled 420 times
+/// through one `targo --unverified test -p aterm-verify` here, 2026-09-23). Not
+/// measured: the other crates' test fixtures, which write there too. It is
+/// NOT room for other writers on the volume, which no preflight can budget
+/// (the module doc says what happens instead).
+pub const RESERVE_BYTES: u64 = 6 * GIB;
+
+/// The most a snapshot's lanes may hold when a run starts: 40 GiB,
+/// [`COLD_BYTES`] plus [`WARM_GROWTH_BYTES`] — a cold footprint and one warm
+/// run's growth.
+///
+/// Nothing else bounds them: a warm run grows the lanes, and only a new
+/// compiler empties them ([`crate::snapshot`]'s prune). Over the cap they are
+/// removed before the run, which is budgeted cold. At the growth measured
+/// above that makes every third run cold: a cold run leaves about 21 GiB, the
+/// next adds about 14 to 35, the next about 13 to 48, which is over the cap.
+///
+/// The cost is that run being cold. Each run's wall time, from its log's
+/// creation to its receipt: cold, 38 min 12 s (`cb770c598`, FAIL) and 35 min
+/// 19 s (`b994cadd0`, PASS); warm, 32 min 3 s (`0a45a7446`, PASS), 37 min
+/// 31 s (`fd0be116b`, PASS) and 38 min 16 s (`216e2e5cb`, FAIL). Five runs on
+/// a machine other sessions share do not separate the two. The build stage
+/// alone took 137.0 s and 215.5 s cold, and 39.0 s, 108.7 s and 246.6 s warm.
+pub const LANE_CAP_BYTES: u64 = COLD_BYTES + WARM_GROWTH_BYTES;
+
+/// How long `du -sk` may run before the lanes count as unmeasured: 60 s.
+///
+/// MEASURED 2026-09-23 on this machine: 0.55 s over the snapshot's lanes
+/// (20.2 GiB in 38,427 entries); 1.95 s over a 21.9 GiB target dir of 109,419
+/// entries read for the first time; 2.60 s over five target dirs holding 59.6
+/// GiB in 302,032 entries, re-read. `du` walks entries, not bytes. A
+/// measurement that misses this deadline — or fails — credits nothing, and the
+/// run is budgeted cold: the direction that refuses more, never less.
+pub const DU_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The lane target dirs that do not sit at the root as `target` or `target-*`.
+///
+/// THE ONE LIST. [`lane_dirs`] reads it, and [`crate::snapshot`] stamps and
+/// removes what that returns rather than keeping its own copy: the two were
+/// separate until 2026-09-21, and
 /// `libc-oracle/target-symgate` was in one and not the other, so a refused
 /// operator was told to delete "every one of them" and left a stamped,
 /// regenerable lane behind.
@@ -73,6 +192,41 @@ pub const NESTED_LANE_DIRS: [&str; 3] = [
     "libc-oracle/target",
     "libc-oracle/target-symgate",
 ];
+
+/// The preflight's numbers: the constants above in a real run, scaled down to
+/// bytes by the gate's own tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// What a run from empty lanes writes ([`COLD_BYTES`]).
+    pub cold: u64,
+    /// What a run on warm lanes still adds ([`WARM_GROWTH_BYTES`]).
+    pub warm_growth: u64,
+    /// Room kept free beyond both ([`RESERVE_BYTES`]).
+    pub reserve: u64,
+    /// Lanes over this are removed before the run ([`LANE_CAP_BYTES`]).
+    pub lane_cap: u64,
+}
+
+impl Budget {
+    /// The measured budget every real run takes.
+    pub const MEASURED: Self = Self {
+        cold: COLD_BYTES,
+        warm_growth: WARM_GROWTH_BYTES,
+        reserve: RESERVE_BYTES,
+        lane_cap: LANE_CAP_BYTES,
+    };
+
+    /// `max(cold - credited, warm_growth) + reserve`: the free space a run
+    /// whose lanes already hold `credited` bytes needs. Saturating, so no
+    /// synthetic number can wrap it into a small one.
+    #[must_use]
+    pub fn need(&self, credited: u64) -> u64 {
+        self.cold
+            .saturating_sub(credited)
+            .max(self.warm_growth)
+            .saturating_add(self.reserve)
+    }
+}
 
 /// What the preflight read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,50 +305,293 @@ fn is_percentage(field: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The preflight's decision, pure over the reading and the floor: `Ok` to
-/// proceed, or the sentence of the COULD-NOT-RUN row. A volume that cannot be
-/// measured refuses too — a gate that cannot tell whether it can finish does
-/// not start, for the same reason a hook that cannot judge does not admit.
-///
-/// # Errors
-/// The ladder row's label, naming the free amount and the floor (or why the
-/// volume could not be read).
-pub fn decide(reading: &Reading, floor: u64, root: &Path) -> Result<(), String> {
-    match reading {
-        Reading::Free(free) if *free >= floor => Ok(()),
-        Reading::Free(free) => Err(format!(
-            "disk: {} free on the volume holding {}, under the {} floor — nothing was built \
-             (the volume filled mid-ladder twice on 2026-09-20)",
-            gib(*free),
-            root.display(),
-            gib(floor)
-        )),
-        Reading::Unknown(why) => Err(format!(
-            "disk: the free space on the volume holding {} could not be read ({why}), so the {} \
-             floor could not be checked — nothing was built",
-            root.display(),
-            gib(floor)
+/// What the run's lanes held when the preflight measured them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lanes {
+    /// Each of [`lane_dirs`], root-relative, with the bytes `du -sk` gave it.
+    Measured(Vec<(PathBuf, u64)>),
+    /// Why they were not measured.
+    Unknown(String),
+}
+
+impl Lanes {
+    /// Their total, when they were measured.
+    #[must_use]
+    pub fn total(&self) -> Option<u64> {
+        match self {
+            Lanes::Measured(dirs) => Some(dirs.iter().fold(0, |t, (_, b)| t.saturating_add(*b))),
+            Lanes::Unknown(_) => None,
+        }
+    }
+}
+
+/// `du -sk` over the run's lanes ([`lane_dirs`]), within [`DU_DEADLINE`].
+#[must_use]
+pub fn measure_lanes(root: &Path) -> Lanes {
+    let dirs = lane_dirs(root);
+    if dirs.is_empty() {
+        return Lanes::Measured(Vec::new());
+    }
+    let mut du = Command::new("du");
+    du.arg("-sk").arg("--").args(&dirs).current_dir(root);
+    let out = match output_within(du, DU_DEADLINE) {
+        Ok(out) => out,
+        Err(why) => return Lanes::Unknown(format!("du -sk {why}")),
+    };
+    if !out.status.success() {
+        return Lanes::Unknown(format!(
+            "du -sk failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    match parse_du(&text, dirs.len()) {
+        Some(kib) => Lanes::Measured(
+            dirs.into_iter()
+                .zip(kib.into_iter().map(|k| k.saturating_mul(1024)))
+                .collect(),
+        ),
+        None => Lanes::Unknown(format!(
+            "du -sk printed no size for each of {} lanes: {:?}",
+            dirs.len(),
+            text.trim()
         )),
     }
 }
 
-/// The `verify: disk …` header line: the reading and the floor, so the record
-/// of every run says how much room it started with.
+/// The sizes `du -sk` printed, in KiB, one line per operand in operand order:
+/// the size, blanks, the path. `None` unless there is exactly one line per
+/// lane and each starts with a number — a path with a newline in it, or a line
+/// this cannot read, is a measurement it does not have, never a guess.
 #[must_use]
-pub fn header_line(reading: &Reading, floor: u64, root: &Path) -> String {
+pub fn parse_du(text: &str, lanes: usize) -> Option<Vec<u64>> {
+    let sizes: Vec<u64> = text
+        .lines()
+        .map(|l| l.split_whitespace().next()?.parse().ok())
+        .collect::<Option<_>>()?;
+    (sizes.len() == lanes).then_some(sizes)
+}
+
+/// `cmd`'s output, or why there is none: it could not be run, or it was still
+/// running at `deadline` and was killed and reaped. Both pipes are drained on
+/// threads, so a child with a lot to say cannot block on a full pipe and run
+/// out the clock; a killed child's drains are left to end when its pipes
+/// close, never waited for. The wait polls like [`crate::exec`]'s stage
+/// children do: std has no wait with a deadline, and this crate has no `libc`.
+fn output_within(mut cmd: Command, deadline: Duration) -> Result<Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not be run: {e}"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = Instant::now();
+    let mut nap = Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(format!("could not be waited for: {e}")),
+        }
+        let Some(left) = deadline.checked_sub(started.elapsed()) else {
+            break Err(format!(
+                "did not finish within {:.1} s",
+                deadline.as_secs_f64()
+            ));
+        };
+        std::thread::sleep(nap.min(left));
+        nap = (nap * 2).min(Duration::from_millis(25));
+    };
+    match status {
+        Ok(status) => Ok(Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        }),
+        Err(why) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(why)
+        }
+    }
+}
+
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// Whose lanes the run's are, which decides whether they are credited and
+/// whether the cap may remove them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// A snapshot's: the gate's alone — synced, stamped and locked by it, so
+    /// what they hold is what earlier gate runs built there for this one to
+    /// reuse.
+    Snapshot,
+    /// The caller's checkout (`--in-place`, `--selftest`, a root that is not a
+    /// git checkout). Its `target` and `target-*` dirs may be the caller's own
+    /// caches, which this run need not write to at all, so they are neither
+    /// credited nor removed.
+    InPlace,
+}
+
+/// The preflight's decision before any byte moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// The numbers the estimate was made with.
+    pub budget: Budget,
+    /// `--disk-floor`: the requirement, with the estimate skipped.
+    pub floor: Option<u64>,
+    /// What the lanes held, or why that is unknown.
+    pub held: Result<u64, String>,
+    /// Whose lanes they are.
+    pub owner: Owner,
+    /// Remove the lanes before the free space is read: a snapshot's, measured
+    /// over the cap. Decided with or without `--disk-floor`, which moves the
+    /// requirement and not the bound on the lanes.
+    pub remove: bool,
+    /// One sentence per lane the removal could not remove, filled in by the
+    /// caller that acted on [`Plan::remove`].
+    pub unremoved: Vec<String>,
+    /// The bytes credited against [`Budget::cold`].
+    pub credited: u64,
+    /// The free space this run requires.
+    pub need: u64,
+}
+
+/// The plan, pure over what was measured: the lanes are credited only when a
+/// snapshot's were measured and stay, and the requirement is the floor when
+/// one was given and [`Budget::need`] of the credit otherwise.
+#[must_use]
+pub fn plan(budget: Budget, floor: Option<u64>, lanes: &Lanes, owner: Owner) -> Plan {
+    let held = lanes.total().ok_or_else(|| match lanes {
+        Lanes::Unknown(why) => why.clone(),
+        Lanes::Measured(_) => String::new(),
+    });
+    let remove = owner == Owner::Snapshot && held.as_ref().is_ok_and(|h| *h > budget.lane_cap);
+    let credited = match (&held, owner) {
+        (Ok(h), Owner::Snapshot) if !remove => *h,
+        _ => 0,
+    };
+    Plan {
+        budget,
+        floor,
+        held,
+        owner,
+        remove,
+        unremoved: Vec::new(),
+        credited,
+        need: floor.unwrap_or_else(|| budget.need(credited)),
+    }
+}
+
+impl Plan {
+    /// What the lanes held, and what became of them.
+    fn lanes_clause(&self) -> String {
+        match (&self.held, self.owner) {
+            (Err(why), _) => format!("lanes unmeasured ({why}), so none credited"),
+            (Ok(h), Owner::InPlace) => {
+                format!("target dirs {}, not credited in place", gib(*h))
+            }
+            (Ok(h), Owner::Snapshot) if self.remove && self.unremoved.is_empty() => format!(
+                "lanes {}, over the {} cap, so removed before the free space was read",
+                gib(*h),
+                gib(self.budget.lane_cap)
+            ),
+            (Ok(h), Owner::Snapshot) if self.remove => format!(
+                "lanes {}, over the {} cap; removing them failed as the `verify: lanes` \
+                 line(s) above say, and none are credited",
+                gib(*h),
+                gib(self.budget.lane_cap)
+            ),
+            (Ok(h), Owner::Snapshot) => format!("lanes {}", gib(*h)),
+        }
+    }
+
+    /// The requirement, with the terms that produced it.
+    fn need_clause(&self) -> String {
+        match self.floor {
+            Some(f) => format!("need {} (--disk-floor: exactly this, no estimate)", gib(f)),
+            None => format!(
+                "need {} = max({} cold - {} credited, {} warm growth) + {} reserve",
+                gib(self.need),
+                gib(self.budget.cold),
+                gib(self.credited),
+                gib(self.budget.warm_growth),
+                gib(self.budget.reserve)
+            ),
+        }
+    }
+
+    /// The requirement as the refusal names it.
+    fn need_noun(&self) -> String {
+        match self.floor {
+            Some(f) => format!("{} --disk-floor", gib(f)),
+            None => format!("{} this run needs", gib(self.need)),
+        }
+    }
+}
+
+/// The preflight's decision, pure over the reading and the plan: `Ok` to
+/// proceed, or the sentence of the COULD-NOT-RUN row. A volume that cannot be
+/// measured refuses too — a gate that cannot tell whether it can finish does
+/// not start, for the same reason a reader that cannot judge does not admit.
+///
+/// # Errors
+/// The ladder row's label, naming the free amount and the requirement (or why
+/// the volume could not be read). The terms of the requirement are on the
+/// `verify: disk …` line above it ([`header_line`]).
+pub fn decide(reading: &Reading, plan: &Plan, root: &Path) -> Result<(), String> {
     match reading {
-        Reading::Free(free) => format!(
-            "verify: disk {} free on the volume holding {} (floor {})\n",
+        Reading::Free(free) if *free >= plan.need => Ok(()),
+        Reading::Free(free) => Err(format!(
+            "disk: {} free on the volume holding {}, under the {} — nothing was built",
             gib(*free),
             root.display(),
-            gib(floor)
+            plan.need_noun()
+        )),
+        Reading::Unknown(why) => Err(format!(
+            "disk: the free space on the volume holding {} could not be read ({why}), so the {} \
+             could not be checked — nothing was built",
+            root.display(),
+            plan.need_noun()
+        )),
+    }
+}
+
+/// The `verify: disk …` header line: the free space, the lanes and the
+/// requirement with its terms, so the record of every run says how much room
+/// it started with and a reader can check the sum.
+#[must_use]
+pub fn header_line(reading: &Reading, plan: &Plan, root: &Path) -> String {
+    let free = match reading {
+        Reading::Free(free) => format!(
+            "{} free on the volume holding {}",
+            gib(*free),
+            root.display()
         ),
         Reading::Unknown(why) => format!(
-            "verify: disk free space on the volume holding {} could not be read ({why}; floor {})\n",
-            root.display(),
-            gib(floor)
+            "free space on the volume holding {} could not be read ({why})",
+            root.display()
         ),
-    }
+    };
+    format!(
+        "verify: disk {free}; {}; {}\n",
+        plan.lanes_clause(),
+        plan.need_clause()
+    )
 }
 
 /// The caller tree's incremental caches, newest-first by size: `target*/…/incremental`
@@ -207,8 +604,8 @@ pub fn header_line(reading: &Reading, floor: u64, root: &Path) -> String {
 /// on demand. MEASURED 2026-09-21 on this machine: the caller tree held 47 GB
 /// of which 26 GB was `target.noindex/debug/incremental`; removing it returned
 /// 19 GB and cost one warm dev rebuild, while removing the run's own lanes
-/// would have returned 7.7 GB and cost the next contract run ~52 minutes.
-/// That asymmetry is why [`remedy`] names these first.
+/// would have returned 7.7 GB and made the next contract run cold. That
+/// asymmetry is why [`remedy`] names these first.
 #[must_use]
 pub fn caller_incremental_dirs(caller: &Path) -> Vec<(PathBuf, u64)> {
     let mut out: Vec<(PathBuf, u64)> = Vec::new();
@@ -241,15 +638,21 @@ pub fn caller_incremental_dirs(caller: &Path) -> Vec<(PathBuf, u64)> {
     out
 }
 
-/// The remedy block under the refusal: what the run's own target dirs hold,
-/// each named, and the fact that every one of them is regenerable.
+/// The remedy block under the refusal: the caller's free bytes first, then
+/// what the run's own lanes hold, each named, with what removing them would
+/// buy against the requirement — every one of them is regenerable.
 #[must_use]
-pub fn remedy(root: &Path, floor: u64, caller: Option<&Path>) -> String {
+pub fn remedy(
+    root: &Path,
+    plan: &Plan,
+    lanes: &Lanes,
+    reading: &Reading,
+    caller: Option<&Path>,
+) -> String {
     let mut s = String::new();
-    // The free bytes first. A human under the floor reaches for whatever the
-    // message names, and until 2026-09-21 the only thing it named was this
-    // run's own warm lanes: the most expensive bytes on the volume, priced at
-    // one cold contract run. The caller's incremental caches cost nothing to
+    // The free bytes first. A human under the requirement reaches for whatever
+    // the message names, and until 2026-09-21 the only thing it named was this
+    // run's own warm lanes. The caller's incremental caches cost nothing to
     // lose and are usually larger.
     let free_first: Vec<(PathBuf, u64)> = caller
         .filter(|c| *c != root)
@@ -268,50 +671,127 @@ pub fn remedy(root: &Path, floor: u64, caller: Option<&Path>) -> String {
         }
         s.push_str("  Only if that is not enough:\n");
     }
-    let dirs = target_dirs(root);
-    let sized: Vec<(PathBuf, u64)> = dirs
-        .iter()
-        .map(|d| (d.clone(), dir_bytes(&root.join(d))))
-        .collect();
-    let total: u64 = sized.iter().map(|(_, b)| *b).sum();
-    if sized.is_empty() {
-        s.push_str(&format!(
-            "  this run's root {} holds no target dirs yet: a cold run writes ~23 GB of caches, \
-             and the volume does not have room for that plus its own headroom.\n",
-            root.display()
-        ));
-    } else {
-        s.push_str(&format!(
-            "  this run's target dirs hold {} in total, all of it regenerable — remove them and \
-             the next run rebuilds cold (~52 min and 23 GB, measured 2026-09-20 on the run whose \
-             receipt is 0a45a7446: verdict PASS, merge-contract yes):\n",
-            gib(total)
-        ));
-        for (d, b) in &sized {
-            s.push_str(&format!("      {:>10}  {}/\n", gib(*b), d.display()));
-        }
-    }
-    s.push_str(&format!(
-        "  or free space elsewhere on the volume. The floor is {} because a cold, \
-         non-incremental contract run leaves ~23 GB of caches, and a warm one rewrites much of \
-         that before it unlinks anything, and a volume at zero loses the ladder and the receipt \
-         as well as the build. Every child of this gate compiles with CARGO_INCREMENTAL=0, so \
-         the dirs no longer grow run over run (target/ had reached 55 GB with it on).",
-        gib(floor)
-    ));
+    s.push_str(&lanes_remedy(root, plan, lanes, reading));
+    s.push_str(&match plan.floor {
+        Some(_) => "  or free space elsewhere on the volume, or lower --disk-floor: a run that \
+                    does run out of space mid-ladder is COULD NOT RUN, never a verdict about the \
+                    tree."
+            .to_string(),
+        None => format!(
+            "  or free space elsewhere on the volume. The requirement is what this run writes \
+             plus a reserve: a cold footprint less what its lanes already hold, but never less \
+             than a warm run still adds to them (cargo deletes no artifact a later build stops \
+             using), and a {} reserve for its own writes outside them. What other writers put \
+             on the volume while it runs is not in it: no preflight can budget that, and a run \
+             that runs out of space ends COULD NOT RUN. --disk-floor <GiB> replaces the \
+             estimate for one run.",
+            gib(plan.budget.reserve)
+        ),
+    });
     s
 }
 
-/// The run's own target dirs, root-relative: every directory at the root named
-/// `target*` (a symlink is not counted — it may point at another volume) plus
-/// [`NESTED_LANE_DIRS`] where they exist. Sorted, so the remedy is stable.
+/// The lanes' part of [`remedy`].
+fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> String {
+    let mut s = String::new();
+    let sized = match lanes {
+        Lanes::Measured(sized) => sized,
+        Lanes::Unknown(why) => {
+            s.push_str(&format!(
+                "  this run's lanes could not be sized ({why}); every one of them is \
+                 regenerable:\n"
+            ));
+            for d in lane_dirs(root) {
+                s.push_str(&format!("      {}/\n", d.display()));
+            }
+            return s;
+        }
+    };
+    if sized.is_empty() {
+        s.push_str(&match plan.floor {
+            Some(_) => format!(
+                "  this run's root {} holds no target dirs yet, so it has none of its own to \
+                 remove.\n",
+                root.display()
+            ),
+            None => format!(
+                "  this run's root {} holds no target dirs yet, so the run is budgeted cold: it \
+                 writes its whole footprint, and the volume does not have room for that plus \
+                 the reserve.\n",
+                root.display()
+            ),
+        });
+        return s;
+    }
+    let held = lanes.total().unwrap_or(0);
+    let cold = plan.budget.need(0);
+    s.push_str(&format!(
+        "  this run's target dirs hold {}, all of it regenerable",
+        gib(held)
+    ));
+    match (plan.owner, plan.floor) {
+        _ if plan.remove => s.push_str(&format!(
+            " — what is left after the removal of lanes over the {} cap",
+            gib(plan.budget.lane_cap)
+        )),
+        (Owner::Snapshot, None) => {
+            s.push_str(&format!(
+                ". Removing them gives that back, and the next run is then cold and needs {} \
+                 ({} cold + {} reserve)",
+                gib(cold),
+                gib(plan.budget.cold),
+                gib(plan.budget.reserve)
+            ));
+            if let Reading::Free(free) = reading {
+                let after = free.saturating_add(held);
+                if after >= cold {
+                    s.push_str(&format!(": {} would be free — enough", gib(after)));
+                } else {
+                    s.push_str(&format!(
+                        ": {} would be free — still {} short",
+                        gib(after),
+                        gib(cold - after)
+                    ));
+                }
+            }
+        }
+        (Owner::InPlace, None) => s.push_str(&format!(
+            "; in place they are not credited, so removing them gives that back and leaves \
+             the requirement at {}",
+            gib(plan.need)
+        )),
+        (_, Some(_)) => s.push_str("; removing them gives that back"),
+    }
+    s.push_str(":\n");
+    for (d, b) in sized {
+        s.push_str(&format!("      {:>10}  {}/\n", gib(*b), d.display()));
+    }
+    s
+}
+
+/// The run's lanes, root-relative: the directory `target` and every `target-*`
+/// directory at the root (a symlink is not counted — it may point at another
+/// volume), plus [`NESTED_LANE_DIRS`] where they exist beneath no symlink.
+/// Sorted, so the remedy is stable.
+///
+/// THE ONE DEFINITION of a lane. [`crate::snapshot`] stamps exactly these, the
+/// preflight measures exactly these and the cap removes exactly these
+/// ([`crate::snapshot::remove_lanes`]), so what the preflight counts is what
+/// the cap deletes. A root directory whose name merely STARTS with `target` —
+/// `targets/`, `target_x/`, a dev `target.noindex/` — is not a lane: no run
+/// stamps it, and the cap as first written (2026-09-23, before it was
+/// committed) would have deleted it.
 #[must_use]
-pub fn target_dirs(root: &Path) -> Vec<PathBuf> {
+pub fn lane_dirs(root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("target"))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name == "target" || name.starts_with("target-")
+        })
         .filter(|e| e.path().symlink_metadata().is_ok_and(|m| m.is_dir()))
         .map(|e| PathBuf::from(e.file_name()))
         .collect();
@@ -319,10 +799,20 @@ pub fn target_dirs(root: &Path) -> Vec<PathBuf> {
         NESTED_LANE_DIRS
             .iter()
             .map(PathBuf::from)
-            .filter(|d| root.join(d).symlink_metadata().is_ok_and(|m| m.is_dir())),
+            .filter(|d| real_dirs_all_the_way(root, d)),
     );
     out.sort();
     out
+}
+
+/// Every component of `rel` under `root` is a real directory, none a symlink:
+/// a lane beneath a link is a directory somewhere else, never this run's.
+fn real_dirs_all_the_way(root: &Path, rel: &Path) -> bool {
+    let mut at = root.to_path_buf();
+    rel.components().all(|c| {
+        at.push(c);
+        at.symlink_metadata().is_ok_and(|m| m.is_dir())
+    })
 }
 
 /// The bytes of every regular file under `dir`, symlinks not followed. Best
@@ -371,6 +861,11 @@ mod tests {
     const LINUX: &str = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
                          /dev/nvme0n1p2   981876212 812345678 119548922      88% /\n";
 
+    /// Lanes measured at `bytes` in one `target/` dir.
+    fn held(bytes: u64) -> Lanes {
+        Lanes::Measured(vec![(PathBuf::from("target"), bytes)])
+    }
+
     #[test]
     fn the_available_column_is_read_in_bytes_whatever_the_mount_point_is_called() {
         assert_eq!(parse_df(MACOS), Some(83_991_144 * 1024));
@@ -405,14 +900,15 @@ mod tests {
             Some(12_582_912 * 1024),
             "counting fields from the left reads Used (888 GiB) and starts the gate"
         );
+        let cold = plan(Budget::MEASURED, None, &held(0), Owner::Snapshot);
         assert!(
             decide(
                 &Reading::Free(parse_df(real).expect("parsed")),
-                40 * GIB,
+                &cold,
                 Path::new("/Users//x")
             )
             .is_err(),
-            "12 GiB free must refuse at the 40 GiB floor"
+            "12 GiB free must refuse a cold run's 30 GiB"
         );
         // Spaces at BOTH ends at once.
         let both = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
@@ -451,27 +947,150 @@ mod tests {
         }
     }
 
-    /// THE DECISION, on synthetic numbers: under the floor refuses, at or over
-    /// it proceeds, and a volume that cannot be read refuses rather than being
-    /// read as roomy.
+    /// THE ESTIMATE, on synthetic numbers: `max(cold - credited, warm) +
+    /// reserve`, and never a wrapped one.
     #[test]
-    fn the_floor_is_a_refusal_below_it_and_nothing_at_or_above_it() {
+    fn the_requirement_is_the_cold_footprint_less_the_lanes_but_never_less_than_a_warm_run() {
+        let b = Budget {
+            cold: 100,
+            warm_growth: 30,
+            reserve: 7,
+            lane_cap: 1000,
+        };
+        assert_eq!(b.need(0), 107, "cold: the whole footprint");
+        assert_eq!(b.need(40), 67, "partly warm: the rest of it");
+        assert_eq!(b.need(70), 37, "at cold - warm the two terms meet");
+        assert_eq!(
+            b.need(95),
+            37,
+            "warm: a run's growth, however full the lanes"
+        );
+        assert_eq!(b.need(u64::MAX), 37);
+        let huge = Budget {
+            cold: u64::MAX,
+            warm_growth: 0,
+            reserve: u64::MAX,
+            lane_cap: u64::MAX,
+        };
+        assert_eq!(huge.need(0), u64::MAX, "saturates, never wraps small");
+    }
+
+    /// THE MEASURED BUDGET against the case that motivated it: the snapshot's
+    /// lanes holding the 20.2 GiB `b994cadd0`'s cold run left (21,220,340 KiB
+    /// by `du -sk`, 2026-09-23) and the 22.2 GiB the volume read five minutes
+    /// before that run ended. The flat 40 GiB floor refuses that run; the
+    /// estimate asks for a warm run's growth plus the reserve, 22.0 GiB.
+    #[test]
+    fn a_warm_snapshot_at_22_gib_free_runs_where_the_flat_floor_refused_it() {
         let root = Path::new("/Users//x/aterm-verify.noindex");
-        let floor = 40 * GIB;
-        assert_eq!(decide(&Reading::Free(40 * GIB), floor, root), Ok(()));
-        assert_eq!(decide(&Reading::Free(400 * GIB), floor, root), Ok(()));
-        let why = decide(&Reading::Free(40 * GIB - 1), floor, root).expect_err("one byte under");
+        let warm = plan(
+            Budget::MEASURED,
+            None,
+            &held(21_220_340 * 1024),
+            Owner::Snapshot,
+        );
+        assert!(!warm.remove);
+        assert_eq!(warm.credited, 21_220_340 * 1024);
+        assert_eq!(warm.need, WARM_GROWTH_BYTES + RESERVE_BYTES);
+        assert_eq!(gib(warm.need), "22.0 GiB");
+        // One byte over the 22.2 GiB boundary: `GIB / 5` alone is just under a
+        // real fifth.
+        let read = 22 * GIB + GIB / 5 + 1;
+        assert_eq!(gib(read), "22.2 GiB");
+        assert_eq!(decide(&Reading::Free(read), &warm, root), Ok(()));
+        assert_eq!(decide(&Reading::Free(22 * GIB), &warm, root), Ok(()));
+        let why = decide(&Reading::Free(22 * GIB - 1), &warm, root).expect_err("under 22");
+        assert!(
+            why.starts_with("disk: 21.9 GiB free on the volume holding /Users//x/"),
+            "{why}"
+        );
+        assert!(why.contains("under the 22.0 GiB this run needs"), "{why}");
+        assert!(why.ends_with("nothing was built"), "{why}");
+
+        // From empty lanes the same budget asks for the whole footprint.
+        let cold = plan(Budget::MEASURED, None, &held(0), Owner::Snapshot);
+        assert_eq!(cold.need, COLD_BYTES + RESERVE_BYTES);
+        assert_eq!(gib(cold.need), "30.0 GiB");
+        assert!(decide(&Reading::Free(22 * GIB), &cold, root).is_err());
+        assert_eq!(decide(&Reading::Free(30 * GIB), &cold, root), Ok(()));
+        assert!(decide(&Reading::Free(30 * GIB - 1), &cold, root).is_err());
+    }
+
+    /// OVER THE CAP a snapshot's lanes are removed and the run is budgeted
+    /// cold; at the cap they stay and are credited. In place nothing is ever
+    /// removed or credited, and lanes that could not be measured credit
+    /// nothing — both are budgeted cold, the direction that refuses more.
+    #[test]
+    fn lanes_over_the_cap_are_removed_and_budgeted_cold_and_only_a_snapshots() {
+        let b = Budget::MEASURED;
+        let at_cap = plan(b, None, &held(LANE_CAP_BYTES), Owner::Snapshot);
+        assert!(!at_cap.remove, "at the cap is not over it");
+        assert_eq!(at_cap.credited, LANE_CAP_BYTES);
+        assert_eq!(at_cap.need, WARM_GROWTH_BYTES + RESERVE_BYTES);
+
+        let over = plan(b, None, &held(LANE_CAP_BYTES + 1), Owner::Snapshot);
+        assert!(over.remove);
+        assert_eq!(over.credited, 0, "removed lanes are not credited");
+        assert_eq!(over.need, COLD_BYTES + RESERVE_BYTES);
+
+        let in_place = plan(b, None, &held(LANE_CAP_BYTES * 2), Owner::InPlace);
+        assert!(!in_place.remove, "the caller's dirs are never removed");
+        assert_eq!(in_place.credited, 0);
+        assert_eq!(in_place.need, COLD_BYTES + RESERVE_BYTES);
+
+        let unknown = plan(
+            b,
+            None,
+            &Lanes::Unknown("du -sk did not finish within 60.0 s".into()),
+            Owner::Snapshot,
+        );
+        assert!(
+            !unknown.remove,
+            "an unmeasured tree is not known to be over"
+        );
+        assert_eq!(unknown.credited, 0);
+        assert_eq!(unknown.need, COLD_BYTES + RESERVE_BYTES);
+
+        // The cap is the sum it is documented as.
+        assert_eq!(LANE_CAP_BYTES, COLD_BYTES + WARM_GROWTH_BYTES);
+        assert_eq!(gib(LANE_CAP_BYTES), "40.0 GiB");
+    }
+
+    /// `--disk-floor` is exactly its number — no estimate, whatever the lanes
+    /// hold — and it moves the requirement only: over-cap lanes are still
+    /// removed. A floor of zero refuses nothing a volume can be read for.
+    #[test]
+    fn the_disk_floor_replaces_the_estimate_and_nothing_else() {
+        let root = Path::new("/r");
+        let floor = plan(
+            Budget::MEASURED,
+            Some(40 * GIB),
+            &held(20 * GIB),
+            Owner::Snapshot,
+        );
+        assert_eq!(floor.need, 40 * GIB, "no credit for warm lanes");
+        assert_eq!(decide(&Reading::Free(40 * GIB), &floor, root), Ok(()));
+        let why = decide(&Reading::Free(40 * GIB - 1), &floor, root).expect_err("one byte under");
         assert!(why.starts_with("disk: 39.9 GiB free"), "{why}");
-        assert!(why.contains("under the 40.0 GiB floor"), "{why}");
-        assert!(why.contains("nothing was built"), "{why}");
-        let why = decide(&Reading::Free(12 * GIB + GIB / 2), floor, root).expect_err("well under");
-        assert!(why.contains("12.5 GiB free"), "{why}");
-        assert!(why.contains(root.to_str().unwrap()), "{why}");
-        // A floor of zero is the knob that never refuses (a test's, never the gate's).
-        assert_eq!(decide(&Reading::Free(0), 0, root), Ok(()));
+        assert!(why.contains("under the 40.0 GiB --disk-floor"), "{why}");
+
+        let zero = plan(
+            Budget::MEASURED,
+            Some(0),
+            &held(LANE_CAP_BYTES + 1),
+            Owner::Snapshot,
+        );
+        assert_eq!(zero.need, 0);
+        assert!(
+            zero.remove,
+            "the floor does not lift the bound on the lanes"
+        );
+        assert_eq!(decide(&Reading::Free(0), &zero, root), Ok(()));
+
+        // A volume that cannot be read refuses under any requirement.
         let why = decide(
             &Reading::Unknown("cannot run df -Pk: gone".into()),
-            floor,
+            &zero,
             root,
         )
         .expect_err("unmeasurable refuses");
@@ -479,21 +1098,76 @@ mod tests {
             why.contains("could not be read (cannot run df -Pk: gone)"),
             "{why}"
         );
-        assert!(why.contains("floor could not be checked"), "{why}");
+        assert!(
+            why.contains("0.0 GiB --disk-floor could not be checked"),
+            "{why}"
+        );
     }
 
+    /// The header line carries every term, so a reader can redo the sum from
+    /// the record alone — for each way the lanes can stand.
     #[test]
-    fn the_header_line_names_the_reading_and_the_floor_on_one_line() {
+    fn the_header_line_carries_the_free_space_the_lanes_and_the_arithmetic() {
         let root = Path::new("/r");
-        // A tenth of a GiB is not a whole number of bytes, so the input sits one
-        // byte above the boundary: `GIB / 10` alone is just under a real tenth.
-        let line = header_line(&Reading::Free(80 * GIB + GIB / 10 + 1), 40 * GIB, root);
-        assert_eq!(
-            line,
-            "verify: disk 80.1 GiB free on the volume holding /r (floor 40.0 GiB)\n"
+        let free = Reading::Free(22 * GIB + GIB / 5 + 1);
+        let warm = plan(
+            Budget::MEASURED,
+            None,
+            &held(20 * GIB + GIB / 5 + 1),
+            Owner::Snapshot,
         );
-        let line = header_line(&Reading::Unknown("no df".into()), 40 * GIB, root);
-        assert!(line.starts_with("verify: disk free space on the volume holding /r could not be read (no df; floor 40.0 GiB)"), "{line}");
+        assert_eq!(
+            header_line(&free, &warm, root),
+            "verify: disk 22.2 GiB free on the volume holding /r; lanes 20.2 GiB; need 22.0 \
+             GiB = max(24.0 GiB cold - 20.2 GiB credited, 16.0 GiB warm growth) + 6.0 GiB \
+             reserve\n"
+        );
+
+        let mut over = plan(Budget::MEASURED, None, &held(45 * GIB), Owner::Snapshot);
+        let line = header_line(&free, &over, root);
+        assert!(
+            line.contains(
+                "; lanes 45.0 GiB, over the 40.0 GiB cap, so removed before the free \
+                           space was read; need 30.0 GiB = max(24.0 GiB cold - 0.0 GiB credited"
+            ),
+            "{line}"
+        );
+        over.unremoved = vec!["target not removed: busy".into()];
+        let line = header_line(&free, &over, root);
+        assert!(
+            line.contains("; removing them failed as the `verify: lanes` line(s) above say"),
+            "{line}"
+        );
+        assert!(!line.contains("so removed"), "{line}");
+
+        let in_place = plan(Budget::MEASURED, None, &held(GIB), Owner::InPlace);
+        assert!(
+            header_line(&free, &in_place, root)
+                .contains("; target dirs 1.0 GiB, not credited in place; need 30.0 GiB"),
+        );
+        let unknown = plan(
+            Budget::MEASURED,
+            None,
+            &Lanes::Unknown("du -sk failed".into()),
+            Owner::Snapshot,
+        );
+        assert!(
+            header_line(&free, &unknown, root)
+                .contains("; lanes unmeasured (du -sk failed), so none credited; need 30.0 GiB")
+        );
+        let floor = plan(Budget::MEASURED, Some(0), &held(GIB), Owner::InPlace);
+        let line = header_line(&free, &floor, root);
+        assert!(
+            line.ends_with("; need 0.0 GiB (--disk-floor: exactly this, no estimate)\n"),
+            "{line}"
+        );
+        let line = header_line(&Reading::Unknown("no df".into()), &floor, root);
+        assert!(
+            line.starts_with(
+                "verify: disk free space on the volume holding /r could not be read (no df); "
+            ),
+            "{line}"
+        );
         assert_eq!(line.matches('\n').count(), 1);
     }
 
@@ -511,12 +1185,86 @@ mod tests {
         assert_eq!(gib(23 * GIB + GIB - 1), "23.9 GiB");
     }
 
-    /// The remedy names the run's OWN dirs: root-level `target*` directories
-    /// and the two nested lane dirs, never a file or a symlink that happens to
-    /// carry the name, sized by the bytes their files hold.
+    /// `du -sk` prints one size per operand, and anything else is a
+    /// measurement this does not have.
+    #[test]
+    fn du_output_is_one_size_per_lane_or_nothing() {
+        assert_eq!(
+            parse_du("14875876\ttarget\n910232\ttarget-tippy\n", 2),
+            Some(vec![14_875_876, 910_232])
+        );
+        // POSIX specifies blanks between the columns, not a tab.
+        assert_eq!(parse_du("12 target\n", 1), Some(vec![12]));
+        assert_eq!(parse_du("12\ttarget\n", 2), None, "a lane with no line");
+        assert_eq!(
+            parse_du("12\ttarget\nweird\n", 1),
+            None,
+            "a path with a newline"
+        );
+        assert_eq!(parse_du("", 1), None);
+        assert_eq!(parse_du("", 0), Some(Vec::new()));
+    }
+
+    /// The live measurement: what `du -sk` gives each lane dir, at least the
+    /// bytes its files hold, and nothing for a tree with no lanes.
     #[cfg(unix)]
     #[test]
-    fn the_target_dirs_are_the_lane_dirs_that_exist_and_nothing_that_merely_sounds_like_one() {
+    fn the_lanes_are_measured_by_du_one_size_per_dir() {
+        let tmp = crate::mktemp_dir("atv-disk-du").expect("mktemp");
+        assert_eq!(measure_lanes(&tmp), Lanes::Measured(Vec::new()));
+        std::fs::create_dir_all(tmp.join("target/debug")).expect("mkdir");
+        std::fs::create_dir_all(tmp.join("libc-oracle/target")).expect("mkdir");
+        std::fs::write(tmp.join("target/debug/big"), vec![1u8; 256 * 1024]).expect("write");
+        let Lanes::Measured(sized) = measure_lanes(&tmp) else {
+            panic!("du -sk did not measure {}", tmp.display());
+        };
+        let names: Vec<String> = sized.iter().map(|(d, _)| d.display().to_string()).collect();
+        assert_eq!(names, ["libc-oracle/target", "target"]);
+        assert!(sized[1].1 >= 256 * 1024, "{sized:?}");
+        assert!(sized[1].1 < 1024 * 1024, "{sized:?}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// THE BOUND: a child still running at the deadline is killed and reaped,
+    /// and the deadline is what is reported — the measurement never holds a
+    /// run for longer than it was given.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_past_its_deadline_is_killed_and_named() {
+        let mut slow = Command::new("sleep");
+        slow.arg("30");
+        let started = Instant::now();
+        let got = output_within(slow, Duration::from_millis(200));
+        assert_eq!(
+            got.map(|o| o.status.success()),
+            Err("did not finish within 0.2 s".into())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the child was not killed at its deadline: {:?}",
+            started.elapsed()
+        );
+        let mut quick = Command::new("/bin/sh");
+        quick.args(["-c", "echo out; echo err >&2"]);
+        let out = output_within(quick, Duration::from_secs(30)).expect("ran");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"out\n");
+        assert_eq!(out.stderr, b"err\n");
+        let gone = output_within(Command::new("/no/such/program"), Duration::from_secs(1));
+        assert!(
+            gone.as_ref()
+                .is_err_and(|e| e.starts_with("could not be run")),
+            "{gone:?}"
+        );
+    }
+
+    /// The remedy names the run's OWN dirs: `target` and the root-level
+    /// `target-*` directories and the nested lane dirs, never a file or a
+    /// symlink that happens to carry the name, a root directory whose name
+    /// only starts with `target`, nor a nested lane beneath a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn the_lane_dirs_are_the_ones_that_exist_and_nothing_that_merely_sounds_like_one() {
         let tmp = crate::mktemp_dir("atv-disk").expect("mktemp");
         for d in [
             "target/debug/deps",
@@ -525,6 +1273,10 @@ mod tests {
             "libc-oracle/target",
             "tools/freeze-safety-gate/target/x",
             "crates/target-not-a-lane",
+            "elsewhere/freeze-safety-gate/target",
+            "targets",
+            "target_x",
+            "target.noindex/debug",
         ] {
             std::fs::create_dir_all(tmp.join(d)).expect("mkdir");
         }
@@ -535,7 +1287,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.join("target"), tmp.join("target-elsewhere"))
             .expect("symlink");
 
-        let dirs = target_dirs(&tmp);
+        let dirs = lane_dirs(&tmp);
         let names: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
         assert_eq!(
             names,
@@ -556,32 +1308,92 @@ mod tests {
             "an unreadable dir counts nothing"
         );
 
-        let text = remedy(&tmp, 40 * GIB, None);
+        let lanes = measure_lanes(&tmp);
+        let p = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
+        let text = remedy(&tmp, &p, &lanes, &Reading::Free(GIB), None);
         assert!(text.contains("regenerable"), "{text}");
         assert!(
             text.contains("  target/\n") && text.contains("  target-tippy/\n"),
             "{text}"
         );
+        for not_a_lane in [
+            "target-notes.txt",
+            "target-elsewhere",
+            "targets/",
+            "target_x/",
+        ] {
+            assert!(!text.contains(not_a_lane), "{not_a_lane}: {text}");
+        }
+        assert!(!text.contains("target.noindex"), "{text}");
         assert!(
-            !text.contains("target-notes.txt") && !text.contains("target-elsewhere"),
+            text.contains("the next run is then cold and needs 30.0 GiB"),
             "{text}"
         );
-        assert!(text.contains("CARGO_INCREMENTAL=0"), "{text}");
+        assert!(text.contains("still "), "1 GiB free is short of 30: {text}");
+        assert!(text.contains("--disk-floor <GiB>"), "{text}");
+
+        // A nested lane beneath a symlink is somewhere else, never this run's.
+        std::fs::remove_dir_all(tmp.join("tools")).expect("rm");
+        std::os::unix::fs::symlink(tmp.join("elsewhere"), tmp.join("tools")).expect("symlink");
+        assert!(
+            !lane_dirs(&tmp).contains(&PathBuf::from("tools/freeze-safety-gate/target")),
+            "{:?}",
+            lane_dirs(&tmp)
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
-    fn a_root_with_no_target_dirs_still_gets_a_remedy() {
+    fn a_root_with_no_lane_dirs_still_gets_a_remedy() {
         let tmp = crate::mktemp_dir("atv-disk-empty").expect("mktemp");
-        let text = remedy(&tmp, 40 * GIB, None);
+        let lanes = measure_lanes(&tmp);
+        let p = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
+        let text = remedy(&tmp, &p, &lanes, &Reading::Free(GIB), None);
         assert!(text.contains("holds no target dirs yet"), "{text}");
-        assert!(text.contains("40.0 GiB"), "{text}");
+        assert!(text.contains("budgeted cold"), "{text}");
+        let floor = plan(Budget::MEASURED, Some(40 * GIB), &lanes, Owner::Snapshot);
+        let text = remedy(&tmp, &floor, &lanes, &Reading::Free(GIB), None);
+        assert!(text.contains("lower --disk-floor"), "{text}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// What removing the lanes would buy is arithmetic over the same numbers
+    /// the header printed: enough when the freed bytes cover a cold run, the
+    /// shortfall when they do not, and in place the requirement unmoved.
+    #[test]
+    fn the_remedy_prices_removing_the_lanes_against_a_cold_run() {
+        let root = Path::new("/nonexistent/root");
+        let lanes = held(20 * GIB);
+        let warm = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
+        let text = remedy(root, &warm, &lanes, &Reading::Free(12 * GIB), None);
+        assert!(
+            text.contains(
+                "this run's target dirs hold 20.0 GiB, all of it regenerable. Removing \
+                           them gives that back, and the next run is then cold and needs 30.0 GiB \
+                           (24.0 GiB cold + 6.0 GiB reserve): 32.0 GiB would be free — enough:\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("      20.0 GiB  target/\n"), "{text}");
+        let text = remedy(root, &warm, &lanes, &Reading::Free(5 * GIB), None);
+        assert!(
+            text.contains("25.0 GiB would be free — still 5.0 GiB short"),
+            "{text}"
+        );
+        let in_place = plan(Budget::MEASURED, None, &lanes, Owner::InPlace);
+        let text = remedy(root, &in_place, &lanes, &Reading::Free(5 * GIB), None);
+        assert!(
+            text.contains(
+                "in place they are not credited, so removing them gives that back and \
+                           leaves the requirement at 30.0 GiB"
+            ),
+            "{text}"
+        );
+    }
+
     /// The free bytes come first, and they are named as free. A human under the
-    /// floor deletes what the message names, so what it names first decides
-    /// whether the next contract run is warm or costs ~52 minutes.
+    /// requirement deletes what the message names, so what it names first
+    /// decides whether the next contract run is warm or cold.
     #[test]
     fn the_remedy_names_the_callers_incremental_caches_before_its_own_warm_lanes() {
         let caller = crate::mktemp_dir("atv-disk-caller").expect("mktemp");
@@ -594,8 +1406,11 @@ mod tests {
         .expect("write");
         std::fs::create_dir_all(root.join("target-tippy")).expect("mk");
         std::fs::write(root.join("target-tippy/x.rmeta"), vec![0u8; 512]).expect("write");
+        let lanes = measure_lanes(&root);
+        let p = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
+        let free = Reading::Free(GIB);
 
-        let text = remedy(&root, 40 * GIB, Some(&caller));
+        let text = remedy(&root, &p, &lanes, &free, Some(&caller));
         let free_at = text.find("costs nothing").expect(&text);
         let lanes_at = text.find("target-tippy/").expect(&text);
         assert!(free_at < lanes_at, "free bytes must be named first: {text}");
@@ -604,13 +1419,13 @@ mod tests {
         assert!(text.contains("Only if that is not enough"), "{text}");
 
         // In place (no snapshot) there is no second tree, so nothing is claimed.
-        let in_place = remedy(&root, 40 * GIB, None);
+        let in_place = remedy(&root, &p, &lanes, &free, None);
         assert!(!in_place.contains("costs nothing"), "{in_place}");
         assert!(in_place.contains("regenerable"), "{in_place}");
 
         // A caller with no incremental caches says nothing about them either.
         let bare = crate::mktemp_dir("atv-disk-bare").expect("mktemp");
-        let quiet = remedy(&root, 40 * GIB, Some(&bare));
+        let quiet = remedy(&root, &p, &lanes, &free, Some(&bare));
         assert!(!quiet.contains("costs nothing"), "{quiet}");
 
         for d in [caller, root, bare] {

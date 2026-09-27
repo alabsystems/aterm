@@ -21,9 +21,9 @@
 //!   event; we move it to the warm `spilled` tier rather than drop it (the
 //!   B.8.2 `tier_residency_model` obligation). The warm tier is itself bounded by
 //!   a byte budget; anything dropped past the budget is **counted**
-//!   ([`dropped_events`](Self::dropped_events)), never silently lost — the cold
-//!   (disk) drain that would make the budget unnecessary is the off-lock
-//!   persistence task (a documented follow-up, not this headless unit).
+//!   ([`dropped_events`](Self::dropped_events)), never silently lost. No cold
+//!   (disk) tier exists — parked 2026-09-25: recording is opt-in, and R19's
+//!   re-keyframing keeps a bounded replay window reachable.
 //! - **No fs / no lock / no wall-clock-as-state.** Ticks come from one epoch
 //!   captured at construction; the GUI feeds bursts off the reader hot path on a
 //!   dedicated writer thread, exactly as the asciicast tap does.
@@ -37,14 +37,21 @@ use aterm_core::terminal::{HostBindings, Terminal, TerminalCheckpoint};
 
 /// Default byte budget for retained blob payloads + warm-tier events. A flood
 /// cannot balloon RAM past this; an idle session costs nothing.
-pub const DEFAULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const DEFAULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// A burst handed from the reader hot path to the temporal writer thread
 /// (lock-free, FIFO — mirrors the asciicast `Vec<u8>` channel). Recording the
 /// tick + spine append happens on the writer thread, never under `term_lock`.
-pub enum TemporalMsg {
+pub(crate) enum TemporalMsg {
     /// Raw PTY input fed to `process()` (the engine-driving bytes). `Arc<[u8]>` so
     /// the reader's single per-burst heap copy is shared with the asciicast tap.
+    ///
+    /// Not only PTY bytes: a FOREGROUND HANDBACK (2026-09-25,
+    /// `Terminal::foreground_handback`) feeds host-synthesized bytes through the
+    /// same `process_at` at the offset where the foreground process group
+    /// changed, and the reader records them here as one `RawIn` at that position
+    /// (and splices them into the cast and `bytes` taps at the same offset), so a
+    /// replay of the spine reaches the live state.
     RawIn(Arc<[u8]>),
     /// Engine reply bytes emitted to the PTY peer (`take_response()`). `Arc<[u8]>`
     /// so the reader's single allocation is shared with the sink write.
@@ -67,7 +74,7 @@ struct Blob {
 }
 
 /// Per-session capture into the `aterm-buffer` temporal spine.
-pub struct TemporalRecorder {
+pub(crate) struct TemporalRecorder {
     /// The event-log spine (the one timeline). Bounded ring; eviction spills.
     log: EventLog,
     /// Bulk payloads for `RawIn`/`Reply`, keyed by `BlobId`, oldest first.
@@ -83,8 +90,8 @@ pub struct TemporalRecorder {
     /// because they are the exact values `append` returned when that very event
     /// was recorded.
     keyframes: VecDeque<RetainedKeyframe>,
-    /// Warm tier: events evicted from the live ring (spill-not-forget). In a full
-    /// deployment an off-lock task drains these to the cold/disk tier.
+    /// Warm tier: events evicted from the live ring (spill-not-forget), bounded by
+    /// `budget`. Nothing drains it to disk: there is no cold tier (parked 2026-09-25).
     spilled: VecDeque<Event>,
     /// Monotone blob-id source.
     next_blob: u64,
@@ -95,7 +102,7 @@ pub struct TemporalRecorder {
     /// The retained byte budget; drop-oldest (counted) when exceeded.
     budget: usize,
     /// Count of warm-tier events dropped past the budget (NEVER silent — the
-    /// design's "no silent caps" rule). Zero once the cold drain is wired.
+    /// design's "no silent caps" rule).
     dropped_events: u64,
     /// Bytes of `RawIn` recorded since the last keyframe. When it crosses the
     /// re-keyframe interval the recorder mints a FRESH keyframe (by replaying to the
@@ -110,13 +117,13 @@ pub struct TemporalRecorder {
 impl TemporalRecorder {
     /// A recorder with the default budget.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_budget(DEFAULT_BUDGET_BYTES)
     }
 
     /// A recorder with an explicit retained-byte budget (>= 1).
     #[must_use]
-    pub fn with_budget(budget: usize) -> Self {
+    pub(crate) fn with_budget(budget: usize) -> Self {
         Self {
             log: EventLog::default(),
             blobs: VecDeque::new(),
@@ -136,7 +143,7 @@ impl TemporalRecorder {
     /// Both the reader-thread (RawIn/Reply) and main-thread (Resize/Keyframe)
     /// taps call this so one session shares a single monotone tick timeline.
     #[must_use]
-    pub fn now(&self) -> Ticks {
+    pub(crate) fn now(&self) -> Ticks {
         // CLOCK-EXEMPT: derives the recorded tick from the recorder epoch; this
         // is the value we RECORD, not engine state read during process().
         Ticks(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))
@@ -162,13 +169,14 @@ impl TemporalRecorder {
     /// bytes are the genuine engine-driving input — replay re-feeds exactly these.
     /// Borrowing convenience over [`record_raw_in_shared`](Self::record_raw_in_shared)
     /// for callers without a shared allocation in hand (one copy).
-    pub fn record_raw_in(&mut self, bytes: &[u8]) {
+    #[cfg(test)]
+    pub(crate) fn record_raw_in(&mut self, bytes: &[u8]) {
         self.record_raw_in_shared(Arc::from(bytes));
     }
 
-    /// [`record_raw_in`](Self::record_raw_in), retaining the caller's SHARED burst
+    /// Record a raw PTY-input burst, retaining the caller's SHARED burst
     /// allocation directly (a refcount bump — no re-copy of the reader's bytes).
-    pub fn record_raw_in_shared(&mut self, bytes: Arc<[u8]>) {
+    pub(crate) fn record_raw_in_shared(&mut self, bytes: Arc<[u8]>) {
         let ts = self.now();
         self.bytes_since_keyframe += bytes.len();
         let id = self.store_blob(bytes);
@@ -181,13 +189,14 @@ impl TemporalRecorder {
     /// Record an engine reply burst (`take_response()` -> PTY peer). Recorded for
     /// forked-timeline fidelity; NOT re-emitted on replay (the design's contract).
     /// Borrowing convenience over [`record_reply_shared`](Self::record_reply_shared).
-    pub fn record_reply(&mut self, bytes: &[u8]) {
+    #[cfg(test)]
+    pub(crate) fn record_reply(&mut self, bytes: &[u8]) {
         self.record_reply_shared(Arc::from(bytes));
     }
 
-    /// [`record_reply`](Self::record_reply), retaining the caller's shared
-    /// allocation directly. Empty replies are a no-op (no spurious event).
-    pub fn record_reply_shared(&mut self, bytes: Arc<[u8]>) {
+    /// Record an engine reply burst, retaining the caller's shared allocation
+    /// directly. Empty replies are a no-op (no spurious event).
+    pub(crate) fn record_reply_shared(&mut self, bytes: Arc<[u8]>) {
         if bytes.is_empty() {
             return;
         }
@@ -198,7 +207,7 @@ impl TemporalRecorder {
 
     /// Record a geometry change (reflow is path-dependent, so resize is a
     /// first-class recorded event, never re-ordered — B.2.3).
-    pub fn record_resize(&mut self, rows: u16, cols: u16) {
+    pub(crate) fn record_resize(&mut self, rows: u16, cols: u16) {
         let ts = self.now();
         self.append(Op::Resize { rows, cols }, ts);
     }
@@ -206,7 +215,7 @@ impl TemporalRecorder {
     /// Record a keyframe (a serialized [`TerminalCheckpoint`] taken at a
     /// parser-ground boundary, B.3.3). Replay seeds from the nearest keyframe
     /// `<= seq(t)` and folds `RawIn` forward.
-    pub fn record_keyframe(&mut self, checkpoint: TerminalCheckpoint) {
+    pub(crate) fn record_keyframe(&mut self, checkpoint: TerminalCheckpoint) {
         let ts = self.now();
         let id = KeyframeId(self.next_keyframe);
         self.next_keyframe += 1;
@@ -217,6 +226,7 @@ impl TemporalRecorder {
         // the append's own return value and cannot disagree with the spine.
         let seq = self.append(Op::Keyframe(id), ts);
         self.keyframes.push_back(RetainedKeyframe {
+            #[cfg(test)]
             id,
             seq,
             ts,
@@ -308,8 +318,8 @@ impl TemporalRecorder {
     // where evicting the sole keyframe's forward chain made `replay_at` return None
     // after one build log — no longer holds; the self-replayed keyframe seeds the
     // `nearest keyframe <= at` fold correctly because it is stamped at its replay
-    // instant, not `now()`.) The remaining follow-up is the COLD/on-disk tier for
-    // deep history beyond the RAM budget, not the re-keyframing itself.
+    // instant, not `now()`.) Deep history beyond the RAM budget (a COLD/on-disk
+    // tier) is not built and not scheduled — parked 2026-09-25.
     fn enforce_budget(&mut self) {
         while self.used > self.budget {
             // Prefer dropping the oldest blob (largest, most reclaimable) first.
@@ -332,31 +342,32 @@ impl TemporalRecorder {
 
     /// Total events ever appended to the spine (live + spilled + dropped).
     #[must_use]
-    pub fn total_events(&self) -> u64 {
+    pub(crate) fn total_events(&self) -> u64 {
         self.log.total()
     }
 
     /// Live (un-evicted) event count on the spine.
     #[must_use]
-    pub fn live_events(&self) -> usize {
+    pub(crate) fn live_events(&self) -> usize {
         self.log.live().count()
     }
 
     /// Warm-tier (spilled-but-retained) event count.
     #[must_use]
-    pub fn spilled_events(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn spilled_events(&self) -> usize {
         self.spilled.len()
     }
 
     /// Keyframes currently retained.
     #[must_use]
-    pub fn keyframe_count(&self) -> usize {
+    pub(crate) fn keyframe_count(&self) -> usize {
         self.keyframes.len()
     }
 
-    /// Warm-tier events dropped past the budget (cold drain not yet wired).
+    /// Warm-tier events dropped past the budget (there is no cold tier).
     #[must_use]
-    pub fn dropped_events(&self) -> u64 {
+    pub(crate) fn dropped_events(&self) -> u64 {
         self.dropped_events
     }
 
@@ -375,7 +386,7 @@ impl TemporalRecorder {
     /// `MAX_LOG_EVENTS` = 65,536 events, on the default replay target, from
     /// inside the re-keyframe path that runs every 2 MiB of recorded input.
     #[must_use]
-    pub fn latest_tick(&self) -> Ticks {
+    pub(crate) fn latest_tick(&self) -> Ticks {
         self.log.newest_live().map(|e| e.ts).unwrap_or_default()
     }
 
@@ -442,7 +453,7 @@ impl TemporalRecorder {
     /// [`HostBindings`] is empty, so a null set reconstructs a fully-inspectable
     /// buffer whose grid matches the source.
     #[must_use]
-    pub fn replay_at(&self, host: HostBindings, at: Option<Ticks>) -> Option<Terminal> {
+    pub(crate) fn replay_at(&self, host: HostBindings, at: Option<Ticks>) -> Option<Terminal> {
         let at = at.unwrap_or_else(|| self.latest_tick());
         // Base keyframe: O(MAX_KEYFRAMES) over the retained deque (which carries
         // each keyframe's own spine coordinates) instead of a full walk of the
@@ -480,8 +491,9 @@ impl TemporalRecorder {
 /// of the whole 65k-event spine into a four-entry scan, and it costs 16 bytes
 /// against a checkpoint that carries a whole serialized grid.
 struct RetainedKeyframe {
-    /// The spine handle this checkpoint is referenced by.
-    #[allow(dead_code)] // the spine's own `Op::Keyframe(id)` is the wire form
+    /// The spine handle this checkpoint is referenced by. Only the tests read
+    /// it, to hold the `(seq, ts)` index to the spine's own `Op::Keyframe(id)`.
+    #[cfg(test)]
     id: KeyframeId,
     /// The `Seq` its `Op::Keyframe` event was appended at — the fold's start
     /// cursor AND the liveness coordinate (`seq >= oldest_live().seq`).

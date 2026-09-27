@@ -1037,6 +1037,241 @@ impl LineSizeSpan {
     }
 }
 
+/// A HOST CHROME ROW DRAWN AT PIXEL RESOLUTION — the message band's meter
+/// (docs/DESIGN-unified-messages-2026-09-21.md, ruling 242). A cell
+/// background paints whole cells, so a fill whose edge falls inside a cell,
+/// a gradient along the row, or a rail in the row's lowest pixels cannot be
+/// said in cells; this is the one place the host says them, and both
+/// renderers paint it the same way from the same data.
+///
+/// Painted after the row's cell backgrounds and its gutters, before its
+/// glyphs: [`Self::ground`] over the row's full band height (gutters
+/// included) except under [`Self::own`] columns (chips, which keep their own
+/// fill), then [`Self::rail`] in the band's lowest [`Self::rail_h`] pixels.
+/// The glyphs then draw as ever — lifted clear of the rail on a row that asks
+/// ([`Self::clear_rail`]) — except the one cell [`Self::split`] names, whose
+/// glyph is drawn twice under complementary clips: its pixels left of the
+/// split in the split's ink, the rest in the cell's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChromeRaster {
+    /// The frame row (counted from the top of the composed input, like
+    /// [`RenderInput::cells`]).
+    pub row: u16,
+    /// One `0x00RRGGBB` per FRAME pixel column, `[0, frame_w)`; empty for no
+    /// ground (the cells' own backgrounds stand).
+    pub ground: std::sync::Arc<[u32]>,
+    /// One `0x00RRGGBB` per frame pixel column for the rail band, with
+    /// [`ChromeRaster::KEEP`] where the band keeps the ground; empty for no
+    /// rail.
+    pub rail: std::sync::Arc<[u32]>,
+    /// The rail band's height in device pixels, at the bottom of the row.
+    pub rail_h: u16,
+    /// This row's words keep CLEAR of its rail (a level's rail, design ruling
+    /// 248): the renderer fits the rail and one clear pixel row under the
+    /// lowest ink the face can draw, lifting the glyphs by what that needs and
+    /// never by more than the face leaves free above its tallest letter, and
+    /// narrowing the rail to what is left (`aterm_render::chrome_fit`, one
+    /// rule for both renderers). [`Self::rail_h`] is then the rail's most.
+    /// `false` on every other row — the historical placement, byte for byte.
+    pub clear_rail: bool,
+    /// Cell columns `[start, end)` that keep their OWN cell background: the
+    /// ground is not painted there.
+    pub own: Vec<(u16, u16)>,
+    /// The ink split, when the row's fill ends inside a cell.
+    pub split: Option<InkSplit>,
+    /// OUTLINED capsules (design ruling 249): each a ring drawn over the
+    /// ground (the meter runs on round it) with the band's own ground inside,
+    /// placed and antialiased by one builder both renderers paint from
+    /// (`aterm_render::chrome_ring_runs`), after the ground and the rail and
+    /// before the glyphs. Empty on every row without one.
+    pub rings: Vec<ChromeRing>,
+    /// The cells whose glyph is DRAWN as a band icon (design ruling 251)
+    /// instead of rasterized from a font: the cell keeps its character (the
+    /// text grid, a screen reader, copy and the `messages` verb all read it),
+    /// its ink and its ground; only the pixels of its glyph change. Between
+    /// two blank cells the icon is drawn at the words' capital height and
+    /// spills into them (ruling 258). Empty on every row without one.
+    pub icons: Vec<ChromeIcon>,
+}
+
+impl ChromeRaster {
+    /// The rail value that keeps the ground under it.
+    pub const KEEP: u32 = u32::MAX;
+
+    /// Whether cell column `col` keeps its own background.
+    #[must_use]
+    pub fn owns(&self, col: usize) -> bool {
+        self.own
+            .iter()
+            .any(|&(a, b)| (usize::from(a)..usize::from(b)).contains(&col))
+    }
+
+    /// The icon cell column `col` draws in place of its glyph, if any.
+    #[must_use]
+    pub fn icon_at(&self, col: usize) -> Option<BandIcon> {
+        self.icons
+            .iter()
+            .find(|i| usize::from(i.col) == col)
+            .map(|i| i.icon)
+    }
+}
+
+/// One OUTLINED capsule on a [`ChromeRaster`] row (design ruling 249): the
+/// cells `[start, end)` carry a ring in `ring` with `inner` inside it; the
+/// renderer sizes the ring from the cell and the face
+/// (`aterm_render::chrome_ring_runs`: standing on the face's underline at
+/// its thickness, inset from the cells' edges, rounded, its corners
+/// antialiased against the ground under them). Its straight floor between
+/// the two end cells is those cells' single underline in `ring`, which the
+/// host sets (`aterm_render::chrome_ring_floor_cols`, ruling 254), so the
+/// renderer's descender ink-skip carves it like any rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeRing {
+    /// First cell column of the capsule (inclusive).
+    pub start: u16,
+    /// One past its last cell column.
+    pub end: u16,
+    /// The ring's colour, `0x00RRGGBB`.
+    pub ring: u32,
+    /// The ground inside the ring, `0x00RRGGBB` — the colour the capsule's
+    /// cells carry as their background, so its label's glyphs blend on it.
+    pub inner: u32,
+    /// The band's closing SEAM, `0x00RRGGBB`, where the ring's row carries
+    /// it (the stack's last row): the ring draws it across its two end cells
+    /// on the floor's rows, meeting its rounded foot antialiased, and those
+    /// cells carry no underline of their own (ruling 254). `None` on every
+    /// other row.
+    pub seam: Option<u32>,
+}
+
+/// One cell of a [`ChromeRaster`] row whose glyph is a drawn [`BandIcon`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeIcon {
+    /// The cell column.
+    pub col: u16,
+    /// The icon drawn there.
+    pub icon: BandIcon,
+}
+
+/// THE BAND'S ICON SET (design ruling 251): one drawn, antialiased icon for
+/// every status glyph a message row can carry, so the row's glyph cell reads
+/// as one family instead of whichever font happens to hold `⚠` or `ℹ`. Each
+/// stands in for exactly one character of the band's closed glyph set
+/// ([`Self::for_char`]); the renderer draws it from the cell's geometry and
+/// the face's own stroke weight, in the cell's ink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BandIcon {
+    /// `ℹ` — an `i` cut out of a disc.
+    Info,
+    /// `✓` — a check.
+    Success,
+    /// `⚠` — `!` cut out of a triangle.
+    Warn,
+    /// `✕` — a cross.
+    Error,
+    /// `⇣` — an arrow down onto a tray.
+    Download,
+    /// `↻` — a turning arrow.
+    Update,
+    /// `↑` — an arrow up.
+    Upload,
+    /// `⏸` — two bars.
+    Pause,
+    /// `✦` — a four-point star.
+    Sparkle,
+    /// `!` — the fallback mark.
+    Alert,
+    /// `·` — a dot.
+    Dot,
+    /// `…` — three dots.
+    More,
+}
+
+impl BandIcon {
+    /// Every icon, in its index order ([`Self::index`]).
+    pub const ALL: [BandIcon; 12] = [
+        Self::Info,
+        Self::Success,
+        Self::Warn,
+        Self::Error,
+        Self::Download,
+        Self::Update,
+        Self::Upload,
+        Self::Pause,
+        Self::Sparkle,
+        Self::Alert,
+        Self::Dot,
+        Self::More,
+    ];
+
+    /// The icon that stands in for `ch`, the band's glyph; `None` for any
+    /// character outside the set (it keeps its font glyph).
+    #[must_use]
+    pub const fn for_char(ch: char) -> Option<Self> {
+        Some(match ch {
+            '\u{2139}' => Self::Info,
+            '\u{2713}' | '\u{2714}' => Self::Success,
+            '\u{26a0}' => Self::Warn,
+            '\u{2715}' | '\u{2716}' | '\u{2717}' => Self::Error,
+            '\u{21e3}' | '\u{2193}' => Self::Download,
+            '\u{21bb}' => Self::Update,
+            '\u{2191}' => Self::Upload,
+            '\u{23f8}' => Self::Pause,
+            '\u{2726}' => Self::Sparkle,
+            '!' => Self::Alert,
+            '\u{00b7}' => Self::Dot,
+            '\u{2026}' => Self::More,
+            _ => return None,
+        })
+    }
+
+    /// The character this icon is drawn for (the one a text grid keeps).
+    #[must_use]
+    pub const fn ch(self) -> char {
+        match self {
+            Self::Info => '\u{2139}',
+            Self::Success => '\u{2713}',
+            Self::Warn => '\u{26a0}',
+            Self::Error => '\u{2715}',
+            Self::Download => '\u{21e3}',
+            Self::Update => '\u{21bb}',
+            Self::Upload => '\u{2191}',
+            Self::Pause => '\u{23f8}',
+            Self::Sparkle => '\u{2726}',
+            Self::Alert => '!',
+            Self::Dot => '\u{00b7}',
+            Self::More => '\u{2026}',
+        }
+    }
+
+    /// A small stable index (a glyph cache key carries it).
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self as u32
+    }
+
+    /// The icon at `index` ([`Self::index`]).
+    #[must_use]
+    pub fn from_index(index: u32) -> Option<Self> {
+        Self::ALL.get(usize::try_from(index).ok()?).copied()
+    }
+}
+
+/// Where a chrome row's fill ends inside a cell ([`ChromeRaster::split`]):
+/// that cell's glyph pixels left of frame pixel `x` wear `ink` (with `bg` as
+/// the corrected-alpha operand), the rest the cell's own fg and bg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InkSplit {
+    /// The cell column the split falls in.
+    pub col: u16,
+    /// The frame pixel the split is at: `[.., x)` is the fill side.
+    pub x: u32,
+    /// The fill side's ink, `0x00RRGGBB`.
+    pub ink: u32,
+    /// The fill side's ground under the glyph, `0x00RRGGBB`.
+    pub bg: u32,
+}
+
 /// One pane-local live default-background interval inside a composed
 /// [`RenderInput`] row.
 ///
@@ -1692,6 +1927,12 @@ pub struct RenderInput {
     /// background is a colour, not an enforcement budget — no instance count
     /// can make it wrong, and going per-pane here is the fix, not the hazard.
     pub default_bg_spans: Vec<Vec<DefaultBgSpan>>,
+    /// Host chrome rows drawn at PIXEL resolution ([`ChromeRaster`], the
+    /// message band's meter), at most one per row, in any order. Empty — every
+    /// frame without a metered band row — is the historical path, byte for
+    /// byte. Rendered content: compared in `PartialEq`, and a row whose raster
+    /// changes is a dirty row (`aterm_render::compute_dirty_rows`).
+    pub chrome_rasters: Vec<ChromeRaster>,
     /// Per-row, sparse inline-image placements (`term.images_row(r)`):
     /// `(col, ImageRef)` for every cell covered by an iTerm2 OSC 1337 `File=`
     /// image. The renderer decodes each image once (keyed by the `Arc` inside the
@@ -1741,6 +1982,13 @@ pub struct RenderInput {
     /// it as "unknown" rather than masking the sentinel's high byte into a
     /// colour, which would read as pure black.
     pub default_fg: u32,
+    /// The exact implicit empty cell resolved under the same terminal lock as
+    /// `cells`. Unlike `default_fg` / `default_bg`, this is always concrete:
+    /// those scalar fields retain `COLOR_UNSET` for an unconfigured terminal's
+    /// renderer fallback. Host row overlays use this when they need the live
+    /// terminal ink and ground without a second, potentially contended lock or
+    /// a colour read from a newer frame.
+    pub implicit_blank: RenderCell,
     /// The LIVE cursor colour (`0x00RRGGBB`) for this frame: an explicit OSC 12
     /// value/configured OSC 112 baseline, or the live OSC 10 foreground while OSC 21
     /// `cursor=` selects dynamic behavior. The terminal snapshot resolves that policy
@@ -2216,10 +2464,12 @@ impl Clone for RenderInput {
             line_sizes: self.line_sizes.clone(),
             line_size_spans: self.line_size_spans.clone(),
             default_bg_spans: self.default_bg_spans.clone(),
+            chrome_rasters: self.chrome_rasters.clone(),
             images: self.images.clone(),
             wallpaper: self.wallpaper.clone(),
             default_bg: self.default_bg,
             default_fg: self.default_fg,
+            implicit_blank: self.implicit_blank,
             cursor_color: self.cursor_color,
             snapshot_seq: self.snapshot_seq,
             content_seq: self.content_seq,
@@ -2373,10 +2623,12 @@ impl PartialEq for RenderInput {
             // the derived compare, priced per DISTINCT image pair instead of
             // per covered cell (see `images_eq`).
             && images_eq(&self.images, &other.images)
+            && self.chrome_rasters == other.chrome_rasters
             && self.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
                 == other.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
             && self.default_bg == other.default_bg
             && self.default_fg == other.default_fg
+            && self.implicit_blank == other.implicit_blank
             && self.cursor_color == other.cursor_color
         // `snapshot_seq` intentionally NOT compared — see the impl comment.
         // `scroll_frac_px` / `grid_top_row` / `grid_bot_row` are also NOT compared:
@@ -2501,6 +2753,13 @@ impl Default for RenderInput {
 }
 
 impl RenderInput {
+    /// The pixel-resolution chrome raster of frame row `r`, if the host drew
+    /// one ([`ChromeRaster`]).
+    #[must_use]
+    pub fn chrome_raster(&self, r: usize) -> Option<&ChromeRaster> {
+        self.chrome_rasters.iter().find(|m| usize::from(m.row) == r)
+    }
+
     /// Update a damage-cache snapshot without retaining the four large
     /// cursor-effect payloads when their producer supplied compact metadata.
     ///
@@ -2576,7 +2835,9 @@ impl RenderInput {
         self.wallpaper.clone_from(&source.wallpaper);
         self.default_bg = source.default_bg;
         self.default_fg = source.default_fg;
+        self.implicit_blank = source.implicit_blank;
         self.cursor_color = source.cursor_color;
+        self.chrome_rasters.clone_from(&source.chrome_rasters);
         self.snapshot_seq = source.snapshot_seq;
         self.content_seq = source.content_seq;
         self.process_sequence = source.process_sequence;
@@ -2617,8 +2878,8 @@ impl RenderInput {
     /// scratch buffer that [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into)
     /// refills in place each frame (C-1). Cursor scalars default to off/origin and
     /// `snapshot_seq` to 0. `cell_frame_into` overwrites the engine-owned grid,
-    /// cursor (including its live colour), live implicit background, selection
-    /// (including its live colours), and snapshot metadata; hosts must stamp or
+    /// cursor (including its live colour), live implicit blank/background,
+    /// selection (including its live colours), and snapshot metadata; hosts must stamp or
     /// clear their own overlay and presentation-transform fields on each frame.
     #[must_use]
     pub fn empty() -> Self {
@@ -2678,7 +2939,9 @@ impl RenderInput {
             wallpaper: None,
             default_bg: COLOR_UNSET,
             default_fg: COLOR_UNSET,
+            implicit_blank: RenderCell::default(),
             cursor_color: COLOR_UNSET,
+            chrome_rasters: Vec::new(),
             snapshot_seq: 0,
             content_seq: 0,
             process_sequence: 0,

@@ -107,6 +107,5 @@ pub(crate) struct PageIndexEntry {
     ///
     /// After construction, cumulative_lines is used for lookups instead.
     /// Debug builds assert this matches cumulative line counts.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) line_count: u32,
 }

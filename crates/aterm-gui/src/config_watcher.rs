@@ -5,7 +5,7 @@
 //!
 //! A single background thread observes the user config file
 //! (`config_path()` — `$XDG_CONFIG_HOME/aterm/aterm.toml`, else
-//! `~/.config/aterm/aterm.toml`) on a fixed cadence and, when its
+//! `~/.config/aterm/aterm.toml`) every 500 ms and, when its
 //! bounded content/target generation changes, posts a
 //! [`Wake::ConfigReloadObserved`](crate::Wake) with those exact admitted bytes;
 //! the UI thread never reopens the pathname and only applies the immutable
@@ -16,12 +16,12 @@
 //!
 //! WHY poll, not a filesystem-notification crate: this codebase is
 //! hardened, dependency-conscious, and sandbox-sensitive (the `Containment`
-//! mode denies reads/writes under `~/.config/aterm`). A ~500 ms bounded
+//! mode denies reads/writes under `~/.config/aterm`). A bounded
 //! observation loop adds ZERO new dependencies, no inotify/FSEvents/kqueue file
 //! descriptors, and no surprising behavior under a sandbox profile. Config
 //! failures are posted as typed, de-duplicated status edges while the previous
 //! live generation remains active. Recovery posts a matching clear edge. Theme
-//! polling is metadata-only while idle: bounded path/file identity, mtime, and
+//! polling backs off to 2 s while stable and is metadata-only: bounded path/file identity, mtime, and
 //! ctime (where the platform exposes it) select a candidate edge; theme bytes are
 //! read only while preparing that changed generation. A timestamp-preserving
 //! rewrite or atomic replacement therefore cannot leave the process stale on
@@ -39,7 +39,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use winit::event_loop::EventLoopProxy;
 
@@ -50,6 +50,11 @@ use crate::Wake;
 /// bounded metadata. Candidate-edge reads share Manual's 512-KiB cap, and the
 /// thread is parked in `sleep` between polls.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A stable theme directory needs a bounded rescan, but not four directory
+/// walks per two seconds. Config observation and theme edge follow-ups retain
+/// the 500 ms cadence; only unchanged theme generations use this interval.
+const THEME_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The independently recoverable host inputs watched by this worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -275,7 +280,7 @@ impl FailureLatch {
 /// The worker compares its first observation against that baseline, so an edit in
 /// the load→watch handoff is delivered immediately while an unchanged launch
 /// config is not redundantly re-applied.
-pub fn spawn(
+pub(crate) fn spawn(
     path: Option<std::path::PathBuf>,
     startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
     initial_themes: Arc<crate::app_config::ThemeCatalog>,
@@ -317,6 +322,7 @@ pub fn spawn(
         }
 
         let initial_theme_stamp = theme_dir.as_deref().map(theme_directory_stamp);
+        let mut theme_poll = ThemePollSchedule::new(Instant::now(), initial_theme_stamp.clone());
         // Theme discovery happened before this worker was spawned and has no
         // persisted file baseline. Treat the first successful poll as a
         // reconciliation edge so an edit in that startup gap cannot be lost.
@@ -391,62 +397,84 @@ pub fn spawn(
                 }
             }
 
-            if let Some(directory) = theme_dir.as_deref() {
-                match theme_directory_stamp(directory) {
+            if let Some(directory) = theme_dir.as_deref()
+                && theme_poll.due(Instant::now())
+            {
+                let sample = match theme_directory_stamp(directory) {
                     Err(kind) => {
                         if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(kind))
                         {
                             break;
                         }
+                        Err(kind)
                     }
-                    Ok(stamp) => match prepare_theme_edge_with(
-                        directory,
-                        last_theme_stamp.as_ref(),
-                        stamp,
-                        || {
-                            crate::app_config::ThemeCatalog::try_discover_in(directory)
-                                .map(Arc::new)
-                                .map_err(theme_discovery_failure_kind)
-                        },
-                    ) {
-                        None => {
-                            // A complete metadata scan also proves recovery from
-                            // a transient stamp failure when the generation did
-                            // not otherwise change. No theme bytes are reopened.
-                            if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
-                                break;
-                            }
-                        }
-                        Some(Err(kind)) => {
-                            if !post_status(
-                                &proxy,
-                                &mut theme_failure,
-                                WatchTarget::Themes,
-                                Some(kind),
-                            ) {
-                                break;
-                            }
-                        }
-                        Some(Ok((stable_stamp, discovered))) => {
-                            if *discovered != *themes {
-                                if proxy
-                                    .send_event(Wake::ThemeCatalogChanged(Arc::clone(&discovered)))
-                                    .is_err()
-                                {
+                    Ok(stamp) => {
+                        let sampled_stamp = stamp.clone();
+                        match prepare_theme_edge_with(
+                            directory,
+                            last_theme_stamp.as_ref(),
+                            stamp,
+                            || {
+                                crate::app_config::ThemeCatalog::try_discover_in(directory)
+                                    .map(Arc::new)
+                                    .map_err(theme_discovery_failure_kind)
+                            },
+                        ) {
+                            None => {
+                                // A complete metadata scan also proves recovery from
+                                // a transient stamp failure when the generation did
+                                // not otherwise change. No theme bytes are reopened.
+                                if !post_status(
+                                    &proxy,
+                                    &mut theme_failure,
+                                    WatchTarget::Themes,
+                                    None,
+                                ) {
                                     break;
                                 }
-                                themes = discovered;
+                                Ok(sampled_stamp)
                             }
-                            // The catalogue and acknowledgement were derived
-                            // from one coherent sample. A racing mutation stays
-                            // unacknowledged and is retried next poll.
-                            last_theme_stamp = Some(stable_stamp);
-                            if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
-                                break;
+                            Some(Err(kind)) => {
+                                if !post_status(
+                                    &proxy,
+                                    &mut theme_failure,
+                                    WatchTarget::Themes,
+                                    Some(kind),
+                                ) {
+                                    break;
+                                }
+                                Err(kind)
+                            }
+                            Some(Ok((stable_stamp, discovered))) => {
+                                if *discovered != *themes {
+                                    if proxy
+                                        .send_event(Wake::ThemeCatalogChanged(Arc::clone(
+                                            &discovered,
+                                        )))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    themes = discovered;
+                                }
+                                // The catalogue and acknowledgement were derived
+                                // from one coherent sample. A racing mutation stays
+                                // unacknowledged and is retried next poll.
+                                last_theme_stamp = Some(stable_stamp.clone());
+                                if !post_status(
+                                    &proxy,
+                                    &mut theme_failure,
+                                    WatchTarget::Themes,
+                                    None,
+                                ) {
+                                    break;
+                                }
+                                Ok(stable_stamp)
                             }
                         }
-                    },
-                }
+                    }
+                };
+                theme_poll.observed(Instant::now(), sample);
             }
         }
     });
@@ -582,16 +610,15 @@ fn config_failure_kind(error: &crate::native_document_host::DocumentHostError) -
         DocumentHostError::ChangedWhileReading => WatchFailureKind::ConfigChangedWhileReading,
         // An evicted (dataless) config file cannot be read on a thread whose
         // materialization policy is OFF; to the watcher that is "unreadable".
-        DocumentHostError::Io { .. } | DocumentHostError::NotDownloaded { .. } => {
-            WatchFailureKind::ConfigUnreadable
-        }
+        DocumentHostError::Io { .. } => WatchFailureKind::ConfigUnreadable,
+        #[cfg(unix)]
+        DocumentHostError::NotDownloaded { .. } => WatchFailureKind::ConfigUnreadable,
         DocumentHostError::UnsupportedScheme
         | DocumentHostError::RemoteAuthority
         | DocumentHostError::MalformedUri
         | DocumentHostError::InvalidEncoding
         | DocumentHostError::NotAbsolute
         | DocumentHostError::UnknownGrant
-        | DocumentHostError::ReadOnlyGrant
         | DocumentHostError::SymlinkComponent { .. }
         | DocumentHostError::TargetRetargeted => WatchFailureKind::ConfigUnsafeBinding,
     }
@@ -635,6 +662,39 @@ struct ThemeDirectoryStamp {
     inspected_entries: usize,
     candidate_metadata: usize,
     truncated: bool,
+}
+
+/// Keep the 500 ms startup reconciliation and one fast follow-up after an
+/// observed theme change or failure transition. A stable directory then costs
+/// one bounded scan every 2 s. An independent theme edit can therefore wait
+/// roughly 2 s plus scheduling/work delay; config file latency is unchanged.
+struct ThemePollSchedule {
+    next_poll: Instant,
+    last_sample: Option<Result<ThemeDirectoryStamp, WatchFailureKind>>,
+}
+
+impl ThemePollSchedule {
+    fn new(now: Instant, initial: Option<Result<ThemeDirectoryStamp, WatchFailureKind>>) -> Self {
+        Self {
+            next_poll: now + POLL_INTERVAL,
+            last_sample: initial,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next_poll
+    }
+
+    fn observed(&mut self, now: Instant, sample: Result<ThemeDirectoryStamp, WatchFailureKind>) {
+        let changed = self.last_sample.as_ref() != Some(&sample);
+        self.last_sample = Some(sample);
+        self.next_poll = now
+            + if changed {
+                POLL_INTERVAL
+            } else {
+                THEME_IDLE_POLL_INTERVAL
+            };
+    }
 }
 
 /// Cheap bounded identity/metadata stamp for the theme directory. No theme file
@@ -819,8 +879,9 @@ impl crate::App {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureLatch, WatchFailure, WatchFailureKind, WatchStatusEvent, WatchStatusState,
-        WatchTarget, coherent_theme_sample_with, config_failure_kind, config_file_observation,
+        FailureLatch, POLL_INTERVAL, THEME_IDLE_POLL_INTERVAL, ThemePollSchedule, WatchFailure,
+        WatchFailureKind, WatchStatusEvent, WatchStatusState, WatchTarget,
+        coherent_theme_sample_with, config_failure_kind, config_file_observation,
         config_file_stamp, config_path_stamp, initial_config_observation_changed,
         prepare_config_edge_with, prepare_theme_edge_with, theme_directory_stamp,
     };
@@ -1145,6 +1206,67 @@ mod tests {
         assert!(result.is_none());
         assert_eq!(content_loads, 0, "an idle poll must not open theme files");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_scans_back_off_only_after_a_stable_sample_and_follow_edges_quickly() {
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-theme-watch-idle-cadence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = Instant::now();
+        let empty = theme_directory_stamp(&dir).unwrap();
+        let mut schedule = ThemePollSchedule::new(start, Some(Ok(empty.clone())));
+
+        // The first reconciliation remains at the old 500 ms deadline.
+        assert!(!schedule.due(start + POLL_INTERVAL - std::time::Duration::from_nanos(1)));
+        let first = start + POLL_INTERVAL;
+        assert!(schedule.due(first));
+        schedule.observed(first, Ok(empty));
+        assert!(!schedule.due(first + POLL_INTERVAL));
+        let idle_due = first + THEME_IDLE_POLL_INTERVAL;
+        assert!(schedule.due(idle_due));
+
+        // An independent theme edit is observed at the bounded idle deadline;
+        // its next sample gets the original 500 ms cadence.
+        std::fs::write(dir.join("Work.conf"), "foreground = #112233\n").unwrap();
+        let created = theme_directory_stamp(&dir).unwrap();
+        schedule.observed(idle_due, Ok(created.clone()));
+        assert!(!schedule.due(idle_due + POLL_INTERVAL - std::time::Duration::from_nanos(1)));
+        let follow_up = idle_due + POLL_INTERVAL;
+        assert!(schedule.due(follow_up));
+        schedule.observed(follow_up, Ok(created));
+        assert!(!schedule.due(follow_up + POLL_INTERVAL));
+        assert!(schedule.due(follow_up + THEME_IDLE_POLL_INTERVAL));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_failure_and_recovery_get_one_fast_follow_up_each() {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut schedule = ThemePollSchedule::new(start, None);
+        let failed_at = start + POLL_INTERVAL;
+        schedule.observed(failed_at, Err(WatchFailureKind::ThemeDirectoryUnreadable));
+        let repeated_at = failed_at + POLL_INTERVAL;
+        assert!(schedule.due(repeated_at));
+        schedule.observed(repeated_at, Err(WatchFailureKind::ThemeDirectoryUnreadable));
+        assert!(!schedule.due(repeated_at + POLL_INTERVAL));
+        let recovered_at = repeated_at + THEME_IDLE_POLL_INTERVAL;
+        assert!(schedule.due(recovered_at));
+        let recovered = super::ThemeDirectoryStamp {
+            fingerprint: 1,
+            inspected_entries: 0,
+            candidate_metadata: 0,
+            truncated: false,
+        };
+        schedule.observed(recovered_at, Ok(recovered));
+        assert!(schedule.due(recovered_at + POLL_INTERVAL));
     }
 
     #[test]

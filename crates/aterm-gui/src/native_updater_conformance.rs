@@ -25,8 +25,10 @@ use crate::native_update_auto_intent::{
     ApplyPhase, ArmDecision, ArmFacts, AttemptDisposition, AttemptResult, PollDecision, PollFacts,
     WaitReason, arm, finish, poll,
 };
+#[cfg(unix)]
+use crate::native_updater_service::ApplyMode;
 use crate::native_updater_service::{
-    ApplyDecision, ApplyMode, ApplyPreflightStart, CheckCompletion, CheckStart, ClosePreflight,
+    ApplyDecision, ApplyPreflightStart, CheckCompletion, CheckStart, ClosePreflight,
     DurableUpdateStatus, NativeUpdaterService, UpdaterModelState, UpdaterTransition,
 };
 
@@ -83,10 +85,6 @@ fn project(model: &Model, state: UpdaterModelState) -> State {
     );
     projected.insert("verified", i64::from(state.verified));
     projected.insert("close_preflight", i64::from(state.close_preflight));
-    projected.insert(
-        "install_on_clean_quit",
-        i64::from(state.install_on_clean_quit),
-    );
     projected.insert(
         "reexec_count",
         i64::try_from(state.reexec_count).expect("bounded reexec count"),
@@ -153,10 +151,7 @@ fn real_updater_service_conforms_for_single_flight_stage_defer_and_safe_apply() 
     assert_eq!(service.last_transitions().len(), 3);
     assert_last_batch(&model, &service);
 
-    assert!(service.install_when_safe());
-    assert_last_batch(&model, &service);
-
-    let preflight = match service.begin_apply_preflight(ApplyMode::CleanQuit) {
+    let preflight = match service.begin_apply_preflight() {
         ApplyPreflightStart::Inspect(ticket) => ticket,
         other => panic!("expected close preflight, got {other:?}"),
     };
@@ -242,7 +237,7 @@ fn blocked_close_preflight_never_advances_to_apply() {
         CheckCompletion::Reduced
     );
     let before = service.model_state();
-    let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+    let preflight = match service.begin_apply_preflight() {
         ApplyPreflightStart::Inspect(ticket) => ticket,
         other => panic!("expected preflight, got {other:?}"),
     };
@@ -274,7 +269,7 @@ fn failed_apply_rearms_exact_stage_and_stale_attempt_cannot_abort_retry() {
     );
     assert_last_batch(&model, &service);
 
-    let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+    let preflight = match service.begin_apply_preflight() {
         ApplyPreflightStart::Inspect(ticket) => ticket,
         other => panic!("expected preflight, got {other:?}"),
     };
@@ -301,7 +296,7 @@ fn failed_apply_rearms_exact_stage_and_stale_attempt_cannot_abort_retry() {
     assert!(service.model_state().verified);
     assert_eq!(service.model_state().reexec_count, 0);
 
-    let retry = match service.begin_apply_preflight(ApplyMode::Immediate) {
+    let retry = match service.begin_apply_preflight() {
         ApplyPreflightStart::Inspect(ticket) => ticket,
         other => panic!("aborted stage must remain retryable, got {other:?}"),
     };
@@ -310,6 +305,17 @@ fn failed_apply_rearms_exact_stage_and_stale_attempt_cannot_abort_retry() {
         other => panic!("expected retry command, got {other:?}"),
     };
     assert_last_batch(&model, &service);
+    // Negative control for the fresh-nonce law: the real retry below mints a new
+    // attempt. Re-arming under the failed attempt's own nonce is the one identity
+    // a late replay of that failure would still match.
+    let buggy_identity = aterm_spec::interp::with_buggy(&identity_model, 1);
+    assert!(
+        identity_model
+            .successors("RetryReusingFailedNonce", &identity)
+            .is_empty()
+    );
+    let reused = buggy_identity.successors("RetryReusingFailedNonce", &identity)[0].clone();
+    assert!(!buggy_identity.check_invariant("RetryUsesFreshIdentity", &reused));
     let retry_identity = identity_model.successors("StartAttempt", &identity)[0].clone();
     assert_exact_model_action(&identity_model, "StartAttempt", &identity, &retry_identity);
     identity = retry_identity;
@@ -333,6 +339,9 @@ fn failed_apply_rearms_exact_stage_and_stale_attempt_cannot_abort_retry() {
         &replay_rejected,
     );
     assert_eq!(replay_rejected, identity);
+    let canceled = buggy_identity.successors("AcceptStaleAbort", &identity)[0].clone();
+    assert_eq!(admits(&identity_model, &identity, &canceled), None);
+    assert!(!buggy_identity.check_invariant("StaleAbortCannotCancelRetry", &canceled));
 
     assert!(service.abort_apply(&retry_attempt, "second child readiness failed"));
     assert_last_batch(&model, &service);
@@ -578,6 +587,33 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     regressed.insert("retry_eligible", 1);
     assert!(!model.check_invariant("ForegroundJobsDoNotBlockSeamless", &regressed));
     assert_eq!(admits(&model, &before, &regressed), None);
+    // The same block is exactly the model's named v0.53 mutant, which the
+    // healthy model never admits and the progress law refuses.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let v053 = buggy.successors("BlockForegroundDespiteSeamless", &before)[0].clone();
+    assert_eq!(
+        (v053["phase"], v053["decision"], v053["retry_eligible"]),
+        (3, 3, 1)
+    );
+    assert_eq!(admits(&model, &before, &v053), None);
+    assert!(!buggy.check_invariant("ForegroundJobsDoNotBlockSeamless", &v053));
+
+    // Negative control for the cold lane: with the seamless lane gone and a live
+    // job on a PTY, the real classifier blocks. Its live-session check dropped in
+    // a release macOS build — whose cold arm re-checks only by `debug_assert!` —
+    // the destructive re-exec runs over the job.
+    let facts = AdmissionFacts {
+        seamless_capable: false,
+        ..facts
+    };
+    assert_eq!(
+        classify(facts),
+        AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless)
+    );
+    let before = admission_before(&model, facts);
+    let hung_up = buggy.successors("ReexecColdOverLiveSessions", &before)[0].clone();
+    assert_eq!(admits(&model, &before, &hung_up), None);
+    assert!(!buggy.check_invariant("ColdFallbackNeverDropsForeground", &hung_up));
 }
 
 /// The admitted seamless lane carries a live foreground job into the replacement,
@@ -1030,7 +1066,7 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
         model.successors("ParkReaders", &busy).is_empty(),
         "the healthy model never parks a busy terminal"
     );
-    let parked = buggy.successors("ParkReaders", &busy)[0].clone();
+    let parked = buggy.successors("ParkWithoutQuietOrGrace", &busy)[0].clone();
     assert!(!buggy.check_invariant("AutomaticAttemptRequiresQuietOrClosedGraceWindow", &parked));
     // And the shipping gate refuses the same state on both automatic lanes.
     for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
@@ -1325,6 +1361,7 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
             version: None,
             receipt_build: Some(build),
             receipt_dmg_sha256: Some("ab".repeat(32)),
+            trial_launches: 0,
         }),
     });
     assert!(
@@ -1631,7 +1668,7 @@ fn real_hold_cap_and_repark_match_the_model_s_unparked_states() {
         "a Commit over a screen nobody froze is unreachable"
     );
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let unparked_accept = buggy.successors("AttemptAccepted", &reparked)[0].clone();
+    let unparked_accept = buggy.successors("AcceptWithoutPark", &reparked)[0].clone();
     assert!(!buggy.check_invariant("AcceptedRequiresParkedReaders", &unparked_accept));
 }
 
@@ -1683,6 +1720,21 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     ));
     let recent = model.successors("PollRecentActivity", &state)[0].clone();
     assert_exact_model_action(&model, "PollRecentActivity", &state, &recent);
+    // NEGATIVE CONTROL, on the shipping predicate: output inside the epoch is
+    // activity to the real clock. Fed the hidden tab's PRESENT stamp instead —
+    // zero, for a tab that has never presented — the same predicate calls it
+    // quiet mid-output. That is the mutant's reading, and the ordinary attempt
+    // that follows it is what the clock law refuses.
+    let hidden_present_ns = 0_u64;
+    assert!(crate::automatic_output_activity_quiet(
+        recent_now_ns,
+        hidden_present_ns
+    ));
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let misread = buggy.successors("QuietFromLastPresent", &recent)[0].clone();
+    assert_eq!(admits(&model, &recent, &misread), None);
+    let mid_output = buggy.successors("Attempt", &misread)[0].clone();
+    assert!(!buggy.check_invariant("AttemptOnlyAfterAgedQuiet", &mid_output));
     state = recent;
 
     let retry_now = std::time::Instant::now();
@@ -1727,20 +1779,434 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     assert_exact_model_action(&model, "Attempt", &state, &attempted);
 
     // Retired behavior: an unacknowledged latency sample made quiet false even
-    // after arbitrarily old output. The model's Buggy branch additionally derives
+    // after arbitrarily old output. The model's mutant additionally derives
     // retry_at from that expired output deadline, exposing both failures.
     let presentation_stamp = 1_u64;
     assert_ne!(presentation_stamp, 0);
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut stuck = buggy.init_state();
     for action in [
         "HiddenOutput",
         "WakeHandledNoPresent",
         "PollRecentActivity",
-        "QuietEpochElapses",
+        "QuietGatedOnPresentationSample",
     ] {
         assert!(buggy.fire(action, &mut stuck));
     }
     assert!(!buggy.check_invariant("OldHiddenPresentationCannotGate", &stuck));
     assert!(!buggy.check_invariant("ActivityRetryIsStrictlyFuture", &stuck));
+}
+
+/// The observable state of a STRUCTURAL latch, as the Tier-1 bind of
+/// `NativeUpdateStructuralLatch` reads it (gap 14, 2026-09-26). `day`, `newer`,
+/// `pending` and `room` are the ENVIRONMENT — the clock, the checker's stage,
+/// the lane having looked, the boot sentinel's count — which the test drives
+/// and waives; the rest is read off the shipping state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StructuralLatchObservation {
+    pub(crate) room: bool,
+    pub(crate) latched: bool,
+    pub(crate) pending: bool,
+    pub(crate) day: bool,
+    pub(crate) owed: bool,
+    pub(crate) newer: bool,
+    pub(crate) newer_spent: bool,
+    pub(crate) said: bool,
+    pub(crate) escaped: bool,
+}
+
+/// Project one [`StructuralLatchObservation`] onto the model's variables. The
+/// re-sample is owed or spent, never both and never neither, in shipping state
+/// (`AutoApplyStructuralVerdict::resample_at`): `spent` is its complement.
+pub(crate) fn project_structural_latch(
+    model: &Model,
+    observed: StructuralLatchObservation,
+) -> State {
+    let mut state = model.init_state();
+    state.insert("phase", 1);
+    state.insert("room", i64::from(observed.room));
+    state.insert("latched", i64::from(observed.latched));
+    state.insert("pending", i64::from(observed.pending));
+    state.insert("day", i64::from(observed.day));
+    state.insert("owed", i64::from(observed.owed));
+    state.insert("spent", i64::from(!observed.owed));
+    state.insert("newer", i64::from(observed.newer));
+    state.insert("newer_spent", i64::from(observed.newer_spent));
+    state.insert("said", i64::from(observed.said));
+    state.insert("escaped", i64::from(observed.escaped));
+    state
+}
+
+/// THE DECISION, EXHAUSTIVELY: for every reachable model state in which the lane
+/// looks at the latch (`Decide` enabled), the shipping `structural_latch` is fed
+/// the facts that state names — the day's re-sample due, an unspent newer
+/// download, the trial's room — and what it answers, applied the way the host
+/// applies it (`App::look_at_structural_latch`: a release clears the latch and
+/// spends what earned it; a hold keeps it, spends the re-sample and the release,
+/// and is said), must be EXACTLY the model's `Decide` successor.
+///
+/// NEGATIVE CONTROL: the `Buggy = 1` `Decide` from the same states is today's
+/// strand where the trial has room and a trial-blind release where it has none;
+/// the shipping decision differs from it wherever an attempt was earned, and the
+/// invariants catch it there.
+#[test]
+fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
+    use crate::native_update_auto_intent::{
+        StructuralLatchDecision, StructuralLatchFacts, structural_latch,
+    };
+    let model = aterm_spec::derive::native_update_structural_latch_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut frontier = vec![model.init_state()];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut decided = 0;
+    let mut earned = 0;
+    while let Some(state) = frontier.pop() {
+        if !seen.insert(format!("{state:?}")) {
+            continue;
+        }
+        for action in &model.actions {
+            frontier.extend(model.successors(action.name, &state));
+        }
+        if !model.action_enabled("Decide", &state) {
+            continue;
+        }
+        decided += 1;
+        let facts = StructuralLatchFacts {
+            resample_due: state["day"] == 1 && state["owed"] == 1,
+            resample_owed: state["owed"] == 1,
+            unspent_newer_download: (state["newer"] == 1 && state["newer_spent"] == 0)
+                .then_some(12),
+            trial_room: Some(state["room"] == 1),
+        };
+        let decision = structural_latch(facts);
+        let (latched, resample_spent, newer_spent, said) = match decision {
+            StructuralLatchDecision::Hold => (true, false, false, false),
+            StructuralLatchDecision::Release { resample, newer } => {
+                earned += 1;
+                (false, resample, newer.is_some(), false)
+            }
+            StructuralLatchDecision::HoldForTrial { newer, .. } => {
+                earned += 1;
+                (true, true, newer.is_some(), true)
+            }
+            StructuralLatchDecision::Unmeasured => {
+                panic!("a measured trial never answers Unmeasured: {facts:?}")
+            }
+        };
+        let after = project_structural_latch(
+            &model,
+            StructuralLatchObservation {
+                room: state["room"] == 1,
+                latched,
+                pending: false,
+                day: state["day"] == 1,
+                owed: state["owed"] == 1 && !resample_spent,
+                newer: state["newer"] == 1,
+                newer_spent: state["newer_spent"] == 1 || newer_spent,
+                said: state["said"] == 1 || said,
+                escaped: state["escaped"] == 1,
+            },
+        );
+        assert_exact_model_action(&model, "Decide", &state, &after);
+        let mutant = buggy.successors("Decide", &state);
+        if !matches!(decision, StructuralLatchDecision::Hold) {
+            assert_ne!(
+                mutant.as_slice(),
+                std::slice::from_ref(&after),
+                "the shipping decision must not be the mutant where an attempt was earned"
+            );
+            assert!(
+                mutant.iter().any(|bad| buggy
+                    .invariants
+                    .iter()
+                    .any(|invariant| !buggy.check_invariant(invariant.name, bad))),
+                "the mutant's step is caught: {state:?}"
+            );
+        }
+    }
+    assert!(
+        decided > 0 && earned > 0,
+        "the sweep decided {decided}, earned {earned}"
+    );
+    // An UNMEASURED trial spends nothing, whatever was earned.
+    assert_eq!(
+        structural_latch(StructuralLatchFacts {
+            resample_due: true,
+            resample_owed: true,
+            unspent_newer_download: Some(12),
+            trial_room: None,
+        }),
+        StructuralLatchDecision::Unmeasured
+    );
+    // …and an unmeasured trial withdraws no promise either: only a count that
+    // rules the re-sample out does.
+    assert_eq!(
+        structural_latch(StructuralLatchFacts {
+            resample_due: false,
+            resample_owed: true,
+            unspent_newer_download: None,
+            trial_room: None,
+        }),
+        StructuralLatchDecision::Hold
+    );
+}
+
+/// THE SHIPPING ARC, projected step by step (gap 14, 2026-09-26): the real
+/// `App` converges on the installed activation of build 11 through the
+/// completion lane, and every step after — the first count read after it
+/// (`TrialHasRoom`/`TrialIsSpent`, then `Decide`), a re-publish of 11 offered
+/// (`ArmSameBuild`), a verified download of 12 reconciled (`NewerArrives`,
+/// `Decide`), the attempt failing the same way (`AttemptFails`), the day
+/// passing and its lapse (`DayPasses`, `Decide`), the re-sample failing — is
+/// projected off the real latch, verdict and notice and checked against the
+/// model's own step. Twice: with room in the boot trial, and with the trial one
+/// launch from its revert, where the first count withdraws the promised
+/// re-sample and every earned attempt is held and said.
+///
+/// Each anchored shipping function is ENTERED on the way (the `#[refines]`
+/// probes), so the bind is about the code that runs, not about strings.
+#[test]
+fn real_structural_latch_arc_is_the_model_s_arc() {
+    use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
+    use crate::native_updater_service::{ApplyAttemptTicket, InstalledUpdate};
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let model = aterm_spec::derive::native_update_structural_latch_model();
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    assert!(
+        aterm_spec::xref::reset_entered_anchors(),
+        "the evidence window must open"
+    );
+
+    for room in [true, false] {
+        let installed = InstalledUpdate {
+            build: 11,
+            commit: COMMIT.to_string(),
+            version: None,
+            receipt_build: None,
+            receipt_dmg_sha256: None,
+            trial_launches: if room {
+                0
+            } else {
+                crate::app_native::BOOT_TRIAL_LAUNCH_LIMIT - 1
+            },
+        };
+        let facts =
+            |sequence: u64, newer: Option<u64>| crate::app_native::NativeUpdateReconcileFacts {
+                _ticket: crate::app_native::NativeUpdateReconcileTicket::for_test(sequence),
+                observation_sequence: sequence,
+                observed_at: std::time::Instant::now(),
+                durable: Some(DurableUpdateStatus {
+                    staged_dmg_sha256: newer.map(|_| "cd".repeat(32)),
+                    ..status(newer, 0)
+                }),
+                installed: Some(installed.clone()),
+            };
+        let mut app = crate::App::headless_for_test();
+        app.native_updater_service = NativeUpdaterService::new(10, "1.0.10", true);
+        let _ = app.reconcile_native_update_facts(facts(1, None));
+        let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
+        let fail = |app: &mut crate::App| {
+            let ticket = ApplyAttemptTicket::for_test(11, COMMIT, &activation);
+            ticket.make_current_apply_for_test(&mut app.native_updater_service);
+            let _ = app.abort_reaped_native_apply_before_reconcile(
+                &ticket,
+                "overlap handoff failed safely: handoff proof ended AdoptionMismatch".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+            );
+        };
+        fail(&mut app);
+        fail(&mut app);
+        // Everything the environment drove, and the lane's own looks, as the
+        // test's bookkeeping; everything else read off the shipping state.
+        let observe = |app: &crate::App, day: bool, newer: bool, escaped: bool| {
+            let verdict = app
+                .auto_apply_structural_verdict
+                .expect("the converged lane stands on a structural verdict");
+            project_structural_latch(
+                &model,
+                StructuralLatchObservation {
+                    room,
+                    latched: app.auto_apply_manual_only.is_some(),
+                    pending: false,
+                    day,
+                    owed: verdict.resample_at.is_some(),
+                    newer,
+                    newer_spent: verdict.newer_spent >= 12,
+                    // The notice a HOLD says; with room no hold happens on this
+                    // arc, and its final convergence is not projected as one.
+                    said: !room && app.auto_apply_stranded_announced == Some((11, false)),
+                    escaped,
+                },
+            )
+        };
+
+        // Converged, and no count read yet: the attempt that converged just
+        // returned, and its launch may still be given back.
+        assert!(
+            app.native_installed_trial.is_none(),
+            "room={room}: a returned attempt leaves the count unmeasured"
+        );
+        // The first count read after it — the model's `TrialHasRoom` /
+        // `TrialIsSpent`, a look like any other observation — then its Decide.
+        let mut counted = model.init_state();
+        assert!(model.fire(
+            if room { "TrialHasRoom" } else { "TrialIsSpent" },
+            &mut counted
+        ));
+        let _ = app.reconcile_native_update_facts(facts(2, None));
+        let converged = observe(&app, false, false, false);
+        assert_exact_model_action(&model, "Decide", &counted, &converged);
+        if !room {
+            // NEGATIVE CONTROL: the promise left standing — what shipped
+            // before this review, a retry on the notice for a day — is caught.
+            let buggy = aterm_spec::interp::with_buggy(&model, 1);
+            let promise = buggy.successors("Decide", &counted)[0].clone();
+            assert_ne!(promise, converged);
+            assert!(!buggy.check_invariant("NoRetryPromisedPastTheTrial", &promise));
+        }
+
+        // ArmSameBuild: build 11 under another digest is offered, and stays out.
+        let escaped = app.arm_native_auto_apply(11, &"ef".repeat(32));
+        let after = observe(&app, false, false, escaped);
+        assert_exact_model_action(&model, "ArmSameBuild", &converged, &after);
+
+        // NewerArrives, then the reconcile's look: Decide.
+        let arrived = model.successors("NewerArrives", &after)[0].clone();
+        let _ = app.reconcile_native_update_facts(facts(3, Some(12)));
+        let decided = observe(&app, false, true, false);
+        assert_exact_model_action(&model, "Decide", &arrived, &decided);
+        // NEGATIVE CONTROL: today's strand (room) or the trial-blind release
+        // (none) — not what shipped, and caught.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mutant = buggy.successors("Decide", &arrived)[0].clone();
+        assert_ne!(
+            mutant, decided,
+            "room={room}: the shipping look is not the mutant"
+        );
+        assert!(
+            buggy
+                .invariants
+                .iter()
+                .any(|invariant| !buggy.check_invariant(invariant.name, &mutant)),
+            "room={room}: the mutant's look is caught"
+        );
+
+        if room {
+            // The attempt it earned is armed, and fails the same way.
+            assert!(app.arm_native_auto_apply(11, &activation));
+            fail(&mut app);
+            let refailed = observe(&app, false, true, false);
+            assert_exact_model_action(&model, "AttemptFails", &decided, &refailed);
+            // The returned attempt left the trial UNMEASURED (its launch may
+            // still be counted); the observation after it measures the count
+            // again and, with nothing new to decide, changes nothing — a
+            // stutter the model does not name.
+            assert!(
+                app.native_installed_trial.is_none(),
+                "a count read before the attempt's launch vouches for nothing after it"
+            );
+            let _ = app.reconcile_native_update_facts(facts(4, Some(12)));
+            assert_eq!(app.native_installed_trial, Some((11, 0)));
+            assert_eq!(observe(&app, false, true, false), refailed);
+
+            // The day passes; the lapse is the lane's look.
+            let latch = app.auto_apply_manual_only.expect("re-latched");
+            let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+            let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                retry_at: Some(past),
+                ..latch
+            });
+            app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
+                resample_at: Some(past),
+                ..verdict
+            });
+            let dawn = model.successors("DayPasses", &refailed)[0].clone();
+            assert!(app.lapse_expired_auto_apply_manual_only());
+            let resampled = observe(&app, true, true, false);
+            assert_exact_model_action(&model, "Decide", &dawn, &resampled);
+
+            // The one re-sample fails the same way: re-latched, nothing owed.
+            assert!(app.arm_native_auto_apply(11, &activation));
+            fail(&mut app);
+            let done = observe(&app, true, true, false);
+            assert_exact_model_action(&model, "AttemptFails", &resampled, &done);
+            assert_eq!(
+                app.auto_apply_manual_only.map(|manual| manual.retry_at),
+                Some(None),
+                "after its one re-sample the verdict owes nothing"
+            );
+        } else {
+            // No room: the day passes and the lane looks — nothing left to spend.
+            let dawn = model.successors("DayPasses", &decided)[0].clone();
+            assert!(!app.lapse_expired_auto_apply_manual_only());
+            let _ = app.reconcile_native_update_facts(facts(4, Some(12)));
+            let quiet = observe(&app, true, true, false);
+            assert_exact_model_action(&model, "Decide", &dawn, &quiet);
+        }
+    }
+
+    // Every anchored shipping function of the machine RAN.
+    let entered = aterm_spec::xref::entered_anchor_ids();
+    aterm_spec::xref::disarm_entered_anchors();
+    let anchors: Vec<_> = aterm_spec::xref::refinements()
+        .filter(|anchor| anchor.machine == "NativeUpdateStructuralLatch")
+        .collect();
+    assert_eq!(
+        anchors.len(),
+        3,
+        "Decide, AttemptFails and ArmSameBuild are anchored"
+    );
+    for anchor in anchors {
+        assert!(
+            !anchor.entry_id.is_empty() && entered.contains(anchor.entry_id),
+            "{} was not entered by the arc: {entered:?}",
+            anchor.entry_id
+        );
+    }
+}
+
+/// The machine is LINKED, not just stated: the decision, the budget's verdict
+/// arm and the latch's build-wide fold carry `#[refines]` anchors naming the one
+/// projection, and the four environment steps are waived on the decision they
+/// feed.
+#[test]
+fn structural_latch_shipping_anchors_are_linked() {
+    const PROJECT: &str = "aterm_gui::native_updater_conformance::project_structural_latch";
+    let mut refinements: Vec<_> = aterm_spec::xref::refinements()
+        .filter(|anchor| anchor.machine == "NativeUpdateStructuralLatch")
+        .map(|anchor| (anchor.action, anchor.rust_method, anchor.project))
+        .collect();
+    refinements.sort_unstable();
+    assert_eq!(
+        refinements,
+        [
+            ("ArmSameBuild", "covers", PROJECT),
+            ("AttemptFails", "spend_physical_failure_budget", PROJECT),
+            ("Decide", "structural_latch", PROJECT),
+        ]
+    );
+    let mut waivers: Vec<_> = aterm_spec::xref::waivers()
+        .filter(|waiver| waiver.machine == "NativeUpdateStructuralLatch")
+        .map(|waiver| (waiver.action, waiver.rust_method))
+        .collect();
+    waivers.sort_unstable();
+    assert_eq!(
+        waivers,
+        [
+            ("DayPasses", "structural_latch"),
+            ("NewerArrives", "structural_latch"),
+            ("TrialHasRoom", "structural_latch"),
+            ("TrialIsSpent", "structural_latch"),
+        ]
+    );
+    let model = aterm_spec::derive::native_update_structural_latch_model();
+    let mut covered: Vec<_> = refinements
+        .iter()
+        .map(|(action, _, _)| *action)
+        .chain(waivers.iter().map(|(action, _)| *action))
+        .collect();
+    covered.sort_unstable();
+    let mut actions: Vec<_> = model.actions.iter().map(|action| action.name).collect();
+    actions.sort_unstable();
+    assert_eq!(covered, actions, "every action is anchored or waived");
 }

@@ -33,6 +33,7 @@ const ENV_NONCE: &str = "ATERM_SEAMLESS_NONCE";
 const ENV_LAYOUT: &str = "ATERM_SEAMLESS_LAYOUT";
 const ENV_TARGET: &str = "ATERM_SEAMLESS_TARGET";
 
+#[cfg(any(unix, test))]
 const ADOPTION_PROOF_DOMAIN: &[u8] = b"aterm-seamless-adoption-v1\0";
 const LAYOUT_PROOF_DOMAIN: &[u8] = b"aterm-seamless-layout-v1\0";
 const SCREEN_PROOF_DOMAIN: &[u8] = b"aterm-seamless-screen-v1\0";
@@ -67,6 +68,7 @@ const MAX_HANDOFF_GRID_CELLS: u64 = MAX_HANDOFF_AGGREGATE_GRID_CELLS / 2;
 /// enforced, frozen: what a producer must honour when the successor it hands
 /// to is OLDER than itself (a rollback), because that consumer's cap cannot be
 /// raised from here. See [`WireCaps::for_target`].
+#[cfg(any(unix, test))]
 const LEGACY_HANDOFF_GRID_CELLS: u64 = 32 * 1024;
 /// Maximum scrollback lines a handoff checkpoint may carry, per session.
 ///
@@ -85,6 +87,12 @@ const LEGACY_HANDOFF_GRID_CELLS: u64 = 32 * 1024;
 /// the same order of magnitude it already had. The producer additionally
 /// degrades to fewer lines, or none, under deadline pressure, so this is an upper
 /// bound and never a requirement.
+///
+/// It is no longer the bound on what an update carries (2026-09-26): the history
+/// OLDER than these lines rides the history sidecar (`crate::handoff_history`),
+/// exported with the readers live and imported after Commit, so what this bound
+/// decides is only how much the FREEZE pays for. A session whose sidecar cannot
+/// be used crosses with these lines alone, and the rest is counted.
 const MAX_HANDOFF_HISTORY_LINES: u32 = 256;
 
 /// The producer's per-session history target. Same value as the wire ceiling —
@@ -92,6 +100,7 @@ const MAX_HANDOFF_HISTORY_LINES: u32 = 256;
 /// aims for, and keeping them equal means a healthy capture carries the maximum
 /// the protocol allows.
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn max_handoff_history_lines() -> u32 {
     MAX_HANDOFF_HISTORY_LINES
 }
@@ -118,8 +127,11 @@ pub(crate) fn max_handoff_history_lines() -> u32 {
 /// visible+alt cells before any session may spend the aggregate on optional
 /// scrollback, so a later session can never find the budget already gone.
 const MAX_HANDOFF_AGGREGATE_GRID_CELLS: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
 const READY_WIRE_MAGIC: &[u8; 4] = b"ASR1";
+#[cfg(unix)]
 const COMMIT_WIRE_MAGIC: &[u8; 4] = b"ASC1";
+#[cfg(unix)]
 pub(crate) const READY_WIRE_LEN: usize = 4 + 4 + 32;
 
 /// Whether an env set is one of the TWO legal handoff shapes.
@@ -149,6 +161,7 @@ pub(crate) const READY_WIRE_LEN: usize = 4 + 4 + 32;
 /// same-typed parameters a transposed pair is both easy to write and invisible
 /// at the call site — while the thing being described really is one value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct HandoffEnvPresence {
     manifest: bool,
     fds: bool,
@@ -160,6 +173,7 @@ struct HandoffEnvPresence {
     claim: bool,
 }
 
+#[cfg(any(unix, test))]
 fn handoff_is_modern_overlap(present: HandoffEnvPresence) -> bool {
     let HandoffEnvPresence {
         manifest,
@@ -201,12 +215,15 @@ pub(crate) type SessionIdentity = (u64, i32, i32);
 /// both cardinality and membership, so zero/subset/duplicate adoption cannot be
 /// mistaken for complete readiness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 pub(crate) struct AdoptionProof {
     count: u32,
     digest: [u8; 32],
 }
 
+#[cfg(any(unix, test))]
 impl AdoptionProof {
+    #[cfg(unix)]
     fn to_wire_with_magic(self, magic: &[u8; 4]) -> [u8; READY_WIRE_LEN] {
         let mut wire = [0u8; READY_WIRE_LEN];
         wire[..4].copy_from_slice(magic);
@@ -216,20 +233,24 @@ impl AdoptionProof {
     }
 
     #[must_use]
+    #[cfg(unix)]
     pub(crate) fn to_wire(self) -> [u8; READY_WIRE_LEN] {
         self.to_wire_with_magic(READY_WIRE_MAGIC)
     }
 
     #[must_use]
+    #[cfg(unix)]
     pub(crate) fn to_commit_wire(self) -> [u8; READY_WIRE_LEN] {
         self.to_wire_with_magic(COMMIT_WIRE_MAGIC)
     }
 
     #[must_use]
+    #[cfg(unix)]
     pub(crate) fn from_wire(wire: &[u8; READY_WIRE_LEN]) -> Option<Self> {
         Self::from_wire_with_magic(wire, READY_WIRE_MAGIC)
     }
 
+    #[cfg(unix)]
     fn from_wire_with_magic(wire: &[u8; READY_WIRE_LEN], magic: &[u8; 4]) -> Option<Self> {
         if &wire[..4] != magic {
             return None;
@@ -240,6 +261,7 @@ impl AdoptionProof {
     }
 
     #[must_use]
+    #[cfg(unix)]
     pub(crate) fn commit_wire_matches(self, wire: &[u8; READY_WIRE_LEN]) -> bool {
         Self::from_wire_with_magic(wire, COMMIT_WIRE_MAGIC) == Some(self)
     }
@@ -337,6 +359,7 @@ impl AdoptionProof {
 /// already in scope in `run_handoff_worker`), and forks otherwise, so an older
 /// successor is never handed descriptors it has no code to receive.
 #[must_use]
+#[cfg(any(unix, test))]
 pub(crate) fn adoption_proof(
     nonce: &str,
     target_build: u64,
@@ -404,7 +427,7 @@ pub(crate) fn normalize_commit(commit: &str) -> Option<String> {
     // simply off. Worse, that is the environment the handoff is most often
     // exercised in, so the one configuration that could have surfaced an
     // `AdoptionMismatch` regression was the configuration where the check did
-    // not run (docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md §13).
+    // not run (removed in c493e44ca).
     //
     // The QA seam keeps everything else it does — `ATERM_DEBUG_SEAMLESS_REEXEC`
     // still re-execs the same binary through the real handoff — it just no
@@ -426,6 +449,7 @@ pub(crate) fn normalize_commit(commit: &str) -> Option<String> {
 /// schema bump, added `serde` field, or field reorder preserves — and an update
 /// crosses a version boundary by definition.
 #[must_use]
+#[cfg(any(unix, test))]
 pub(crate) fn layout_digest(layout: &crate::restore::RestoreManifest) -> Option<[u8; 32]> {
     layout_wire_digest(&layout.to_toml().ok()?)
 }
@@ -473,6 +497,7 @@ impl std::fmt::Display for GridSlot {
 /// capture-budget refusal, the orphaned dirty document, and the inactive-grid
 /// blob). Every arm below now names itself and the session it blames.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 pub(crate) enum ScreenDigestRefusal {
     TooManySessions {
         count: usize,
@@ -543,12 +568,14 @@ pub(crate) enum ScreenDigestRefusal {
     WireFraming,
 }
 
+#[cfg(any(unix, test))]
 impl ScreenDigestRefusal {
     /// The session this refusal blames, when it blames one — what the
     /// producer's post-loop self-check ([`settle_wire_carries`]) lowers.
     /// `None` for the pool-wide arms (too many sessions, a duplicate id is
     /// reported by id but is an identity fact, allocation, wire framing).
     #[must_use]
+    #[cfg(any(unix, test))]
     pub(crate) fn local_id(&self) -> Option<u64> {
         match *self {
             Self::TooManySessions { .. }
@@ -568,6 +595,7 @@ impl ScreenDigestRefusal {
     }
 }
 
+#[cfg(any(unix, test))]
 impl std::fmt::Display for ScreenDigestRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
@@ -691,6 +719,7 @@ impl std::fmt::Display for ScreenDigestRefusal {
 /// the geometry, both of which it chose and can choose again. The `cap` checks
 /// stay in the digest, where the meta that sets the cap lives.
 #[must_use]
+#[cfg(any(unix, test))]
 pub(crate) fn checkpoint_shape_refusal(
     local_id: u64,
     checkpoint: &TerminalCheckpoint,
@@ -762,6 +791,7 @@ pub(crate) fn screen_digest(
 /// Every refusal below is the SAME predicate the `Option`-returning version
 /// enforced, in the SAME short-circuit order — only the reason now survives the
 /// return. The hashing surface (`screen_wire_digest`) is untouched.
+#[cfg(any(unix, test))]
 fn screen_digest_refs(
     mut screens: Vec<(u64, &TerminalCheckpoint)>,
 ) -> Result<[u8; 32], ScreenDigestRefusal> {
@@ -945,6 +975,7 @@ fn screen_wire_digest(entries: &mut [ScreenWireEntry<'_>]) -> Option<[u8; 32]> {
 /// but a guessed nonce only ever COSTS the adoption — everything downstream fails closed —
 /// it can never fabricate a session or adopt a stranger's fd, so fail-open is the right
 /// posture here.
+#[cfg(any(unix, test))]
 fn random_nonce() -> String {
     aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32))
 }
@@ -954,18 +985,21 @@ fn random_nonce() -> String {
 /// launched with the manifest's PATH in its environment before the manifest
 /// exists, so the writer ([`write_outgoing`]) and the launch environment must
 /// derive the same name from the same nonce ([`outgoing_manifest_path`]).
+#[cfg(unix)]
 pub(crate) fn mint_outgoing_nonce() -> String {
     random_nonce()
 }
 
 /// The manifest's file name under the private control dir for `nonce`: the one
 /// spelling both the writer and the launch environment use.
+#[cfg(unix)]
 fn outgoing_manifest_name(nonce: &str) -> String {
     format!("seamless-{}-{nonce}.toml", std::process::id())
 }
 
 /// Where [`write_outgoing`] will put the manifest for `nonce` — `None` when there
 /// is no private control dir (then no seamless handoff is possible at all).
+#[cfg(unix)]
 pub(crate) fn outgoing_manifest_path(nonce: &str) -> Option<std::path::PathBuf> {
     Some(crate::control_auth::socket_dir()?.join(outgoing_manifest_name(nonce)))
 }
@@ -974,23 +1008,17 @@ pub(crate) fn outgoing_manifest_path(nonce: &str) -> Option<std::path::PathBuf> 
 /// posture). The error is KEPT (the 2026-09-22/23 update audit, plan P1-2): a
 /// full boot volume and a refused permission are different facts, and the
 /// failure the caller files must be able to say which.
+#[cfg(unix)]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .and_then(|mut f| f.write_all(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
 }
 
 /// Why [`write_outgoing`] wrote nothing — TYPED (the 2026-09-22/23 update
@@ -1000,6 +1028,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// boot volume latched the artifact manual-only after two attempts. The
 /// `std::io::ErrorKind` travels out so the ledger can say `storage full`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
 pub(crate) enum WriteOutgoingFailure {
     /// No private control directory to write into.
     NoPrivateDir,
@@ -1011,6 +1040,7 @@ pub(crate) enum WriteOutgoingFailure {
     Io(std::io::ErrorKind),
 }
 
+#[cfg(unix)]
 impl std::fmt::Display for WriteOutgoingFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1025,6 +1055,7 @@ impl std::fmt::Display for WriteOutgoingFailure {
 /// `O_CREAT|O_EXCL|O_NOFOLLOW`, so nothing already there — a file, or a
 /// symlink someone planted to steer the write — is ever written through. A
 /// partial write is unlinked. `None` on any failure.
+#[cfg(unix)]
 fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
@@ -1415,6 +1446,7 @@ fn checkpoint_meta_bound_violation(meta: &CheckpointMeta) -> Option<MetaBoundVio
 
 /// `true` when every named bound holds — [`checkpoint_meta_bound_violation`]
 /// is `None`. The predicate's own spelling, kept for the cap and the tests.
+#[cfg(any(unix, test))]
 fn checkpoint_meta_is_bounded(meta: &CheckpointMeta) -> bool {
     checkpoint_meta_bound_violation(meta).is_none()
 }
@@ -1494,6 +1526,7 @@ fn dimension_grid_cap(rows: u16, cols: u16, history: u32) -> Option<u64> {
     )
 }
 
+#[cfg(any(unix, test))]
 fn checkpoint_grid_cap(meta: &CheckpointMeta) -> Option<u64> {
     checkpoint_meta_is_bounded(meta).then_some(())?;
     dimension_grid_cap(meta.rows, meta.cols, meta.history_lines)
@@ -1591,6 +1624,7 @@ impl WireCaps {
 
     /// The frozen ceilings of every consumer up to and including v0.91.0.
     #[must_use]
+    #[cfg(any(unix, test))]
     pub(crate) const fn legacy() -> Self {
         Self {
             per_grid_cells: LEGACY_HANDOFF_GRID_CELLS,
@@ -1601,6 +1635,7 @@ impl WireCaps {
     /// The ceilings of the successor at `target_build`, handed to by the
     /// running build.
     #[must_use]
+    #[cfg(any(unix, test))]
     pub(crate) fn for_target(target_build: u64) -> Self {
         Self::for_hop(crate::running_build_number(), target_build)
     }
@@ -1608,6 +1643,7 @@ impl WireCaps {
     /// [`Self::for_target`] with the running build named, so a test can pin
     /// both directions of a hop.
     #[must_use]
+    #[cfg(any(unix, test))]
     pub(crate) fn for_hop(running_build: u64, target_build: u64) -> Self {
         if target_build < running_build {
             Self::legacy()
@@ -1688,6 +1724,7 @@ impl WireCaps {
     /// such a carry must go down the ladder instead (the 2026-09-24 review).
     /// The same arithmetic as v0.91.0's `decode_line_strict`: the attrs run
     /// lengths summed, against the column count.
+    #[cfg(any(unix, test))]
     fn line_decoder_refusal(self, checkpoint: &TerminalCheckpoint) -> Option<String> {
         if !self.attrs_bounded_by_columns {
             return None;
@@ -1749,6 +1786,7 @@ pub(crate) fn admit_checkpoint_dimensions(
 /// it is transactional per session and knows nothing about the sessions still
 /// queued behind the one it is admitting.
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn mandatory_checkpoint_cells(rows: u16, cols: u16) -> u64 {
     u64::from(rows)
         .saturating_mul(u64::from(cols))
@@ -1761,6 +1799,7 @@ pub(crate) fn mandatory_checkpoint_cells(rows: u16, cols: u16) -> u64 {
 /// the same reason `has_alt` is `true` at the pre-capture admission). `None` for
 /// a geometry `dimension_grid_cap` refuses outright.
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn checkpoint_capture_budget_bytes(rows: u16, cols: u16, history: u32) -> Option<u64> {
     dimension_grid_cap(rows, cols, history)?.checked_mul(2)
 }
@@ -1770,6 +1809,7 @@ pub(crate) fn checkpoint_capture_budget_bytes(rows: u16, cols: u16, history: u32
 /// `MAX_HANDOFF_AGGREGATE_GRID_CELLS` for why one shared constant, never a
 /// per-seam copy.
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn max_handoff_aggregate_grid_cells() -> u64 {
     MAX_HANDOFF_AGGREGATE_GRID_CELLS
 }
@@ -2122,6 +2162,7 @@ fn repaint_checkpoint_within(
 /// consumer would reject, and the worst case is one blank tab that redraws.
 /// Ordered from most to least faithful.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg(any(unix, test))]
 pub(crate) enum CarryRung {
     /// The screen as the capture asked for it: the visible grid, the saved
     /// primary, and the scrollback depth the time and budget ladder chose.
@@ -2137,10 +2178,12 @@ pub(crate) enum CarryRung {
     Repaint,
 }
 
+#[cfg(any(unix, test))]
 impl CarryRung {
     /// The successor must make the program redraw (`ScreenCarry::repaint`):
     /// what is on its screen is not exactly what the program last drew.
     #[must_use]
+    #[cfg(unix)]
     pub(crate) const fn needs_repaint(self) -> bool {
         matches!(self, Self::Sanitized | Self::Repaint)
     }
@@ -2149,11 +2192,13 @@ impl CarryRung {
     /// with it only while the screen it describes is the one carried: its
     /// differ state diffs the program's next frame against that screen.
     #[must_use]
+    #[cfg(unix)]
     pub(crate) const fn keeps_control_carry(self) -> bool {
         matches!(self, Self::Full | Self::VisibleOnly)
     }
 }
 
+#[cfg(any(unix, test))]
 impl std::fmt::Display for CarryRung {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -2182,6 +2227,7 @@ impl std::fmt::Display for CarryRung {
 /// column, a scroll region, margin pair or tab-stop vector that no longer fits
 /// resets to the full grid, a DECSC slot past the engine's ceiling goes to
 /// that ceiling, and a directory that is too long or holds a NUL is dropped.
+#[cfg(any(unix, test))]
 pub(crate) fn sanitize_checkpoint_for_wire(
     checkpoint: &mut TerminalCheckpoint,
 ) -> Result<Vec<MetaBoundViolation>, String> {
@@ -2253,6 +2299,7 @@ pub(crate) fn sanitize_checkpoint_for_wire(
 /// Say so, once per degraded carry: a rung below Full is a real loss to the
 /// user (scrollback, a cursor position, or the whole screen until the program
 /// redraws), and the capture used to make its choices in silence.
+#[cfg(any(unix, test))]
 fn log_degraded_carry(local_id: u64, rung: CarryRung, cause: &str) {
     if rung != CarryRung::Full {
         aterm_log::warn!("update apply: session {local_id} carried degraded ({rung}): {cause}");
@@ -2302,6 +2349,7 @@ fn keep_shell_integration_authority(
 /// The Repaint rung for a session whose projection is `source`: its sanitized
 /// scalar state on a blank canonical screen, priced against `aggregate_cells`
 /// at the successor's `caps` ([`repaint_checkpoint_within`]).
+#[cfg(any(unix, test))]
 fn repaint_carry(
     source: &TerminalCheckpoint,
     aggregate_cells: &mut u64,
@@ -2315,6 +2363,7 @@ fn repaint_carry(
 /// The first grid blob of `checkpoint` over the byte cap its own geometry and
 /// carried history price — the `GridOverCap` arms of `screen_digest`, asked
 /// while the carry can still be lowered.
+#[cfg(any(unix, test))]
 fn grid_over_cap(local_id: u64, checkpoint: &TerminalCheckpoint) -> Option<ScreenDigestRefusal> {
     let cap = dimension_grid_cap(checkpoint.rows, checkpoint.cols, checkpoint.history_lines)?;
     [
@@ -2372,6 +2421,7 @@ fn grid_over_cap(local_id: u64, checkpoint: &TerminalCheckpoint) -> Option<Scree
 /// [`Terminal::has_inactive_grid`]: aterm_core::terminal::Terminal::has_inactive_grid
 /// [`Terminal::checkpoint_carry_abandoning_partial`]:
 ///     aterm_core::terminal::Terminal::checkpoint_carry_abandoning_partial
+#[cfg(any(unix, test))]
 pub(crate) fn carry_for_wire(
     terminal: &aterm_core::terminal::Terminal,
     local_id: u64,
@@ -2460,6 +2510,7 @@ pub(crate) fn carry_for_wire(
 /// budget cannot afford at any higher rung (the decode-authority budget,
 /// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`, which only the producer prices). The
 /// same carry [`carry_for_wire`] ends on, with `cause` as its reason.
+#[cfg(any(unix, test))]
 pub(crate) fn repaint_carry_for_wire(
     terminal: &aterm_core::terminal::Terminal,
     local_id: u64,
@@ -2476,6 +2527,7 @@ pub(crate) fn repaint_carry_for_wire(
 /// One session's screen as the producer will commit it, and the rung it was
 /// carried at — the unit [`settle_wire_carries`] lowers.
 #[derive(Debug, Clone)]
+#[cfg(any(unix, test))]
 pub(crate) struct WireCarry {
     pub(crate) local_id: u64,
     pub(crate) checkpoint: TerminalCheckpoint,
@@ -2485,6 +2537,7 @@ pub(crate) struct WireCarry {
 /// What one carry costs `screen_digest`'s aggregate cell admission — the same
 /// sum [`WireCaps::admit`] charges, with the inactive grid counted only when it
 /// is really carried.
+#[cfg(any(unix, test))]
 fn wire_cells(checkpoint: &TerminalCheckpoint) -> u64 {
     let visible = u64::from(checkpoint.rows).saturating_mul(u64::from(checkpoint.cols));
     let history = u64::from(checkpoint.history_lines).saturating_mul(u64::from(checkpoint.cols));
@@ -2499,6 +2552,7 @@ fn wire_cells(checkpoint: &TerminalCheckpoint) -> u64 {
 
 /// The real bytes one carry puts on the wire — what the 256 MiB aggregate
 /// (`MAX_HANDOFF_AGGREGATE_GRID_BYTES`) counts.
+#[cfg(any(unix, test))]
 fn wire_bytes(checkpoint: &TerminalCheckpoint) -> u64 {
     let len = |blob: &[u8]| u64::try_from(blob.len()).unwrap_or(u64::MAX);
     len(&checkpoint.grid).saturating_add(checkpoint.alt_grid.as_deref().map_or(0, len))
@@ -2508,6 +2562,7 @@ fn wire_bytes(checkpoint: &TerminalCheckpoint) -> u64 {
 /// `rows` records of its own strict decode, re-serialized, so the result is
 /// canonical by construction and needs no engine lock. `false` (and nothing
 /// changed) when there is no history to drop or the blob does not decode.
+#[cfg(any(unix, test))]
 fn drop_carried_history(checkpoint: &mut TerminalCheckpoint) -> bool {
     if checkpoint.history_lines == 0 {
         return false;
@@ -2533,12 +2588,14 @@ fn drop_carried_history(checkpoint: &mut TerminalCheckpoint) -> bool {
 /// carry bigger than the smallest blank screen (a pool-wide refusal may still
 /// shrink it — 24x80 at most, then 1x1 — as [`repaint_checkpoint_within`]'s
 /// own fallback does).
+#[cfg(any(unix, test))]
 fn is_lowerable(carry: &WireCarry) -> bool {
     carry.rung != CarryRung::Repaint || (carry.checkpoint.rows, carry.checkpoint.cols) != (1, 1)
 }
 
 /// The index of the carry a POOL-WIDE refusal should lower: the lowerable one
 /// costing the most by `cost`.
+#[cfg(any(unix, test))]
 fn largest_lowerable(carries: &[WireCarry], cost: fn(&TerminalCheckpoint) -> u64) -> Option<usize> {
     carries
         .iter()
@@ -2552,6 +2609,7 @@ fn largest_lowerable(carries: &[WireCarry], cost: fn(&TerminalCheckpoint) -> u64
 /// drop its scrollback when `repaint` is false and it has some; else carry it
 /// at the Repaint rung; and a carry already there becomes a smaller blank
 /// screen (24x80 at most, then 1x1).
+#[cfg(any(unix, test))]
 fn lower_wire_carry(
     carries: &mut [WireCarry],
     index: usize,
@@ -2614,6 +2672,7 @@ fn lower_wire_carry(
 /// Bounded: every lowering moves one carry strictly down (its history, once;
 /// its screen, once; a blank screen to 24x80, then 1x1), so at most four per
 /// session happen.
+#[cfg(any(unix, test))]
 pub(crate) fn settle_wire_carries(
     carries: &mut [WireCarry],
     caps: WireCaps,
@@ -2729,6 +2788,7 @@ fn parse_fd_entry(entry: &str) -> Option<SessionIdentity> {
 /// Extract only the descriptor position from an fd-channel entry. Startup uses
 /// this weaker parser solely to re-arm CLOEXEC on every syntactically named live
 /// fd, even when the surrounding identity/pid makes the authority invalid.
+#[cfg(unix)]
 fn parse_named_fd(entry: &str) -> Option<i32> {
     let (_, rest) = entry.split_once('=')?;
     let (fd, _) = rest.split_once(':')?;
@@ -2781,6 +2841,7 @@ fn manifest_path_matches_nonce(path: &std::path::Path, nonce: &str) -> bool {
 
 /// The physical artifacts one outgoing attempt published, plus the ONE screen
 /// commitment computed over the exact bytes it wrote.
+#[cfg(unix)]
 pub(crate) struct OutgoingHandoff {
     pub manifest_path: String,
     pub nonce: String,
@@ -2820,6 +2881,7 @@ pub(crate) struct OutgoingHandoff {
 /// ([`CarryRung::needs_repaint`]: a clamped or blank screen), whose
 /// `ScreenCarry::repaint` tells the successor to make the program redraw. The
 /// flag is covered by no digest, so it cannot move the proof.
+#[cfg(unix)]
 pub(crate) fn write_outgoing(
     manifest: &SessionHandoff,
     fds: &HandoffFds,
@@ -3091,6 +3153,12 @@ impl IncomingHandoff {
     }
 }
 
+/// Every master the incoming wire names, owned from the moment it is read until
+/// an adoption claims it: whatever is still here when [`take_incoming`] returns —
+/// the whole set on a refusal, anything no authenticated session named on success
+/// — is closed. Together with [`crate::spawn::HandedMaster`], which owns a claimed
+/// master until its session's sink does, a handed-off master always has exactly
+/// one owner, so it is adopted or closed and never both.
 #[cfg(unix)]
 struct IncomingPtyGuard(Vec<i32>);
 
@@ -3107,8 +3175,10 @@ impl IncomingPtyGuard {
         Self(fds)
     }
 
-    fn transfer_all(&mut self) {
-        self.0.clear();
+    /// Move ownership of `fd` from this guard to the adoption being built.
+    fn claim(&mut self, fd: i32) -> crate::spawn::HandedMaster {
+        self.0.retain(|owned| *owned != fd);
+        crate::spawn::HandedMaster::new(fd)
     }
 }
 
@@ -3132,6 +3202,7 @@ impl Drop for IncomingPtyGuard {
 /// write this attempt — the control carry's `.ctl` sidecars included. (A
 /// sender that crashed cannot run this; [`sweep_dead_handoff_leftovers`] is
 /// the stale sweep that retires what it left.)
+#[cfg(any(unix, test))]
 pub(crate) fn discard_outgoing(nonce: &str) {
     let Some(dir) = crate::control_auth::socket_dir() else {
         return;
@@ -3147,16 +3218,20 @@ pub(crate) fn discard_outgoing(nonce: &str) {
     }
 }
 
-/// Unlink this attempt's CONTROL CARRY sidecars (`seamless-<pid>-<nonce>.s<id>.ctl`)
-/// once the successor's proof has checked out. A receiver that reads them
-/// deletes them as it does; one built before the carry never looks at them,
-/// and nothing else would ever remove the turn text and scrolled-off rows they
-/// hold. Prefix- and suffix-bound to our own pid and this exact nonce.
+/// Unlink this attempt's CONTROL CARRY and HISTORY CARRY sidecars
+/// (`seamless-<pid>-<nonce>.s<id>.ctl` / `.hist`) once the successor's proof
+/// has checked out. A receiver that reads them deletes them as it does; one
+/// built before either carry never looks at them, and nothing else would ever
+/// remove the turn text and scrolled-off rows they hold. Prefix- and
+/// suffix-bound to our own pid and this exact nonce.
 ///
-/// THE RECEIVER'S RULE this relies on: a successor reads every sidecar it
-/// wants BEFORE it publishes its proof (`take_incoming` does, while still
-/// single-threaded, ahead of `take_ready_fd`). A receiver that deferred the
-/// read past its proof would find the files gone.
+/// THE RECEIVER'S RULE this relies on: a successor reads every control
+/// sidecar, and OPENS every history sidecar, BEFORE it publishes its proof
+/// (`take_incoming` does, while still single-threaded, ahead of
+/// `take_ready_fd`); an open descriptor outlives the unlink, which is what
+/// lets the history be read after Commit. A receiver that deferred either
+/// past its proof would find the files gone.
+#[cfg(unix)]
 pub(crate) fn retire_outgoing_controls(nonce: &str) {
     let Some(dir) = crate::control_auth::socket_dir() else {
         return;
@@ -3168,7 +3243,7 @@ pub(crate) fn retire_outgoing_controls(nonce: &str) {
     for e in entries.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(&prefix) && name.ends_with(".ctl") {
+        if name.starts_with(&prefix) && (name.ends_with(".ctl") || name.ends_with(".hist")) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -3232,14 +3307,18 @@ pub(crate) const ENV_COMMIT_FD: &str = "ATERM_HANDOFF_COMMIT_FD";
 /// version byte anywhere, because a parent can only publish this name if it has
 /// out-of-band transport code, which is what makes "no parent already in the
 /// field can ever be shown the new shape" structural rather than argued.
+#[cfg(unix)]
 pub(crate) const ENV_RENDEZVOUS: &str = "ATERM_HANDOFF_RENDEZVOUS";
 /// The secret that admits exactly one dialer to that rendezvous.
+#[cfg(unix)]
 pub(crate) const ENV_CLAIM: &str = "ATERM_HANDOFF_CLAIM";
+#[cfg(unix)]
 const ENV_PARENT_PID: &str = "ATERM_HANDOFF_PARENT_PID";
 /// The outgoing process's KERNEL BIRTH RECORD, published beside its pid. A pid
 /// alone is a recyclable number; this is what makes it an identity the
 /// successor can verify without being the outgoing process's fork child. See
 /// [`AttestedParent`] for why that distinction is the whole point.
+#[cfg(unix)]
 const ENV_PARENT_BIRTH: &str = "ATERM_HANDOFF_PARENT_BIRTH";
 
 /// The kernel's own birth record for a process: the microsecond-resolution
@@ -3255,8 +3334,9 @@ const ENV_PARENT_BIRTH: &str = "ATERM_HANDOFF_PARENT_BIRTH";
 /// not gain a dependency on the summary subsystem.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ProcessBirth {
-    seconds: u64,
+pub(crate) struct ProcessBirth {
+    /// Start time, unix seconds.
+    pub(crate) seconds: u64,
     microseconds: u64,
 }
 
@@ -3294,8 +3374,11 @@ impl ProcessBirth {
 ///   protocol is uid-bounded (the 0700 control dir, `control_auth::peer_check`),
 ///   and a cross-uid "parent" is not a shape this lane has;
 /// * the kernel disagreeing about the pid it just reported on.
+///
+/// Also the Claude Code footer's pid-reuse guard (`crate::claude_footer`),
+/// which wants exactly these refusals.
 #[cfg(target_os = "macos")]
-fn read_process_birth(pid: libc::pid_t) -> Option<ProcessBirth> {
+pub(crate) fn read_process_birth(pid: libc::pid_t) -> Option<ProcessBirth> {
     if pid <= 1 {
         return None;
     }
@@ -3341,7 +3424,7 @@ fn read_process_birth(pid: libc::pid_t) -> Option<ProcessBirth> {
 /// field 22 is Linux's equivalent — because [`attest_handoff_parent`] then has
 /// no witness left to offer.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn read_process_birth(_pid: libc::pid_t) -> Option<ProcessBirth> {
+pub(crate) fn read_process_birth(_pid: libc::pid_t) -> Option<ProcessBirth> {
     None
 }
 
@@ -3959,6 +4042,7 @@ impl HandoffTarget {
 /// ever LOSE a handoff: the parent compares the child's proof against its OWN
 /// expectation, so a forged target simply produces a digest the parent rejects.
 #[must_use]
+#[cfg(unix)]
 pub(crate) fn encode_target_identity(build: u64, commit: &str) -> String {
     format!("{build} {}", commit.trim())
 }
@@ -4209,12 +4293,12 @@ impl CommitReceiver {
                     // Parent EOF before exact Commit means this candidate can
                     // never become authoritative. Exit without App/Session
                     // destructors so adopted PTYs remain owned by the parent.
-                    unsafe { libc::_exit(74) }
+                    crate::crash_signal::clean_exit_now(74)
                 }
                 if send.send(received).is_err() && fail_stop {
                     // The event-loop authority disappeared while the parent was
                     // deciding. Remaining alive readerless is never terminal.
-                    unsafe { libc::_exit(74) }
+                    crate::crash_signal::clean_exit_now(74)
                 }
             })
             .ok()?;
@@ -4255,7 +4339,7 @@ impl CommitReceiver {
     /// fail-stop destructor-free; unit fixtures can observe the false result.
     pub(crate) fn fail_stop_if_required(&self) {
         if self.fail_stop {
-            unsafe { libc::_exit(74) }
+            crate::crash_signal::clean_exit_now(74)
         }
     }
 }
@@ -4305,6 +4389,7 @@ fn write_wire(fd: &std::os::fd::OwnedFd, wire: &[u8; READY_WIRE_LEN]) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
 pub(crate) struct CommitError;
 
 /// Irreversible parent Commit. Success is uninhabited: the fixed 40-byte wire is
@@ -4331,9 +4416,11 @@ pub(crate) fn commit_and_exit(
             // it survives as a pid-1 orphan holding this dead job's bootstrap
             // context. Guarded by `tests/handoff_launchd_job.rs`.
             //
-            // SAFETY: this is the protocol's point of no return. `_exit` skips
-            // every App/Session destructor that could SIGHUP the handed-off PTYs.
-            unsafe { libc::_exit(0) }
+            // This is the protocol's point of no return. `_exit` skips every
+            // App/Session destructor that could SIGHUP the handed-off PTYs; the
+            // crash marker goes with it, because handing off IS a clean end
+            // (`crash_signal::clean_exit_now`).
+            crate::crash_signal::clean_exit_now(0)
         }
         if wrote < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             continue;
@@ -4648,6 +4735,7 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     let mut remaining_grid_bytes = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
     let mut used_grid_cells = 0_u64;
     let mut remaining_control_bytes = crate::handoff_carry::MAX_AGGREGATE_BYTES;
+    let mut remaining_history_bytes = crate::handoff_history::MAX_AGGREGATE_BYTES;
     let incoming = manifest
         .sessions
         .iter()
@@ -4716,6 +4804,26 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
                 #[cfg(all(test, unix))]
                 ReceiverShape::PreCarry => None,
             };
+            // THE HISTORY CARRY (`crate::handoff_history`), best-effort like
+            // the control carry: its sidecar is OPENED (and unlinked) here —
+            // before the proof, because the outgoing process retires what is
+            // left once the proof checks out — and read only after Commit. A
+            // sidecar that cannot be opened, or whose screen this build
+            // refused (the carried lines it meets were dropped with it), costs
+            // exactly its lines, counted onto the session's `history_lost`.
+            let history_path =
+                manifest_path.with_file_name(format!("{manifest_stem}.s{}.hist", rec.local_id));
+            let history = match shape {
+                ReceiverShape::Current => crate::handoff_history::incoming(
+                    rec,
+                    matches!(screen, IncomingScreen::Degraded { .. }),
+                    &history_path,
+                    &dir,
+                    &mut remaining_history_bytes,
+                ),
+                #[cfg(all(test, unix))]
+                ReceiverShape::PreCarry => crate::handoff_history::AdoptedHistory::default(),
+            };
             let (checkpoint, degraded) = match screen {
                 IncomingScreen::Exact(checkpoint) => (Some(checkpoint), None),
                 IncomingScreen::Degraded {
@@ -4724,13 +4832,19 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
                     wire,
                 } => (checkpoint, Some((cause, wire))),
             };
+            // Ownership of the master moves from the guard to this adoption: from
+            // here its `Adopted` closes it if the handoff is refused after all.
+            #[cfg(unix)]
+            let master = incoming_pty_guard.claim(fd);
+            #[cfg(not(unix))]
+            let master = crate::spawn::HandedMaster::new(fd);
             Some(IncomingSession {
                 degraded,
                 adopted: Adopted {
                     // Carry the outgoing pool id so the boot re-adopts this shell into its
                     // original pane (the restore manifest's leaf carries the same id).
                     local_id: rec.local_id,
-                    master: fd,
+                    master,
                     pid,
                     // Preserve the fabric SID so `aterm-ctl @<sid>` still resolves the session
                     // after the update; a fresh nonce (edge rows bound to the OLD nonce die
@@ -4773,6 +4887,16 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
                     // BROADCAST OPT-INS (round 23): the topic set rides the record,
                     // validated on the way onto the fabric (`fabric::parse_topics`).
                     topics: rec.topics.clone(),
+                    // THE FOREGROUND HOLDER (2026-09-25): off the record, so it
+                    // arrives whatever rung the screen crossed at and whether or
+                    // not the control carry did. A value that is no pgid is none.
+                    fg_holder: rec.fg_holder.filter(|pgid| *pgid > 0).unwrap_or(0),
+                    // RE-KEY CHANNEL: whether this shell reads a re-key file.
+                    rekey: rec.rekey,
+                    // THE LOADER: whether this shell reads a body pointer.
+                    loader: rec.loader,
+                    // THE HISTORY CARRY, imported after Commit.
+                    history,
                 },
             })
         })
@@ -4867,8 +4991,6 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     {
         crate::control::raise_turn_ids(high);
     }
-    #[cfg(unix)]
-    incoming_pty_guard.transfer_all();
     IncomingHandoff {
         adopted,
         window: manifest.window,
@@ -4883,10 +5005,12 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::restore::{
         RestoreManifest, RestoredSplitTree, RestoredTab, RestoredView, TerminalLeafRestore,
         WindowLayout,
     };
+    #[cfg(unix)]
     use crate::session_store::SessionRecord;
     use std::sync::{Mutex, PoisonError};
 
@@ -5104,6 +5228,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
         RestoreManifest::new(vec![WindowLayout {
             rows: 24,
@@ -5112,6 +5237,7 @@ mod tests {
             outer_x: None,
             outer_y: None,
             maximized: None,
+            show: crate::restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
@@ -5129,6 +5255,7 @@ mod tests {
                         icon: None,
                         role: None,
                         attention: None,
+                        questions: None,
                         identity: None,
                     })),
                     focused_path: Vec::new(),
@@ -5978,6 +6105,13 @@ mod tests {
                 frozen_path: false,
                 identity: None,
                 topics: Vec::new(),
+                fg_holder: None,
+                rekey: false,
+                loader: false,
+                history: None,
+                history_dropped: 0,
+                history_lost: 0,
+                questions: None,
             }],
             next_turn_id: None,
             outgoing_build: None,
@@ -6721,11 +6855,17 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     const PARENT_DEATH_MODE: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_MODE";
+    #[cfg(unix)]
     const PARENT_DEATH_MARKER: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_MARKER";
+    #[cfg(unix)]
     const PARENT_DEATH_READY: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_READY";
+    #[cfg(unix)]
     const PARENT_DEATH_READ_FD: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_READ_FD";
+    #[cfg(unix)]
     const PARENT_DEATH_WRITE_FD: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_WRITE_FD";
+    #[cfg(unix)]
     const PARENT_DEATH_EXPECTED_PID: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_EXPECTED_PID";
 
     /// Subprocess fixture for `leaked_commit_writer_cannot_hide_parent_death`.
@@ -6911,7 +7051,6 @@ mod tests {
         pub(super) expected: AdoptionProof,
         /// The screen commitment the parent took over the bytes it wrote.
         pub(super) screen_digest: [u8; 32],
-        masters: Vec<i32>,
         slaves: Vec<i32>,
         scratch: std::path::PathBuf,
     }
@@ -6924,6 +7063,9 @@ mod tests {
         pub(super) screens: Vec<aterm_core::terminal::TerminalCheckpoint>,
         pub(super) controls: Vec<(u64, Vec<u8>)>,
         pub(super) next_turn_id: Option<u64>,
+        /// Each session's foreground holder, as the park capture stamps it on
+        /// the manifest record (`SessionRecord::fg_holder`).
+        pub(super) fg_holders: Vec<(u64, i32)>,
     }
 
     #[cfg(unix)]
@@ -6939,7 +7081,39 @@ mod tests {
     /// given screens and CONTROL CARRY (one session per checkpoint).
     #[cfg(unix)]
     pub(super) fn stage_carry_handoff(label: &str, carry: &StageCarry) -> StagedHandoff {
-        stage_outgoing_handoff_full(label, carry.screens.len(), None, None, Some(carry), &[])
+        stage_outgoing_handoff_full(
+            label,
+            carry.screens.len(),
+            None,
+            None,
+            Some(carry),
+            &[],
+            None,
+        )
+    }
+
+    /// The HISTORY CARRY's stamp, as the handoff worker runs it just before
+    /// the manifest is written: the manifest, the control dir, the nonce.
+    pub(super) type HistoryStamp<'a> = &'a dyn Fn(&mut SessionHandoff, &std::path::Path, &str);
+
+    /// As [`stage_carry_handoff`], with the HISTORY CARRY stamped onto the
+    /// manifest by `history` (`handoff_history::stamp_manifest`, run in the
+    /// worker's place with the control dir and the attempt nonce).
+    #[cfg(unix)]
+    pub(super) fn stage_history_handoff(
+        label: &str,
+        carry: &StageCarry,
+        history: HistoryStamp<'_>,
+    ) -> StagedHandoff {
+        stage_outgoing_handoff_full(
+            label,
+            carry.screens.len(),
+            None,
+            None,
+            Some(carry),
+            &[],
+            Some(history),
+        )
     }
 
     /// As [`stage_carry_handoff`], with the producer's REPAINT set: the local
@@ -6951,7 +7125,15 @@ mod tests {
         carry: &StageCarry,
         repaint: &[u64],
     ) -> StagedHandoff {
-        stage_outgoing_handoff_full(label, carry.screens.len(), None, None, Some(carry), repaint)
+        stage_outgoing_handoff_full(
+            label,
+            carry.screens.len(),
+            None,
+            None,
+            Some(carry),
+            repaint,
+            None,
+        )
     }
 
     /// As [`stage_outgoing_handoff`], but `meta_wire_override` also rewrites the
@@ -6973,6 +7155,7 @@ mod tests {
             meta_wire_override,
             None,
             &[],
+            None,
         )
     }
 
@@ -6984,6 +7167,7 @@ mod tests {
         meta_wire_override: Option<&dyn Fn(&str) -> String>,
         carry: Option<&StageCarry>,
         repaint: &[u64],
+        history: Option<HistoryStamp<'_>>,
     ) -> StagedHandoff {
         let scratch =
             std::env::temp_dir().join(format!("aterm-handoff-e2e-{label}-{}", std::process::id()));
@@ -6995,7 +7179,6 @@ mod tests {
         let dir = crate::control_auth::socket_dir().expect("scratch control dir");
         std::fs::create_dir_all(&dir).expect("control dir");
 
-        let mut masters = Vec::new();
         let mut slaves = Vec::new();
         let mut records = Vec::new();
         let mut live = Vec::new();
@@ -7013,7 +7196,22 @@ mod tests {
                 )
             };
             assert_eq!(rc, 0, "openpty {index}");
-            masters.push(master);
+            // Both ends CLOEXEC at once. The test binary runs hundreds of tests
+            // on parallel threads, and any of them that spawns a process while
+            // this fixture's PTYs are inheritable hands the child a copy: the
+            // master then never closes, and
+            // `a_refused_handoff_closes_every_master_it_was_handed` read its
+            // slave as `leaked` (the full-suite gate, 2026-09-26; 3/3 green
+            // alone). The handoff claims a descriptor by liveness (`F_GETFD`),
+            // never by its CLOEXEC bit, so nothing here needs them
+            // inheritable. The few instructions between `openpty` and these
+            // `F_SETFD`s remain a window.
+            for fd in [master, slave] {
+                // SAFETY: F_SETFD on a descriptor openpty just returned to this
+                // fixture; it sets only the close-on-exec flag.
+                let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                assert_eq!(rc, 0, "cloexec {index}");
+            }
             slaves.push(slave);
             let local_id = index as u64;
             records.push(SessionRecord {
@@ -7028,10 +7226,23 @@ mod tests {
                 icon: None,
                 role: None,
                 attention: None,
+                questions: None,
                 control: None,
                 frozen_path: false,
                 identity: None,
                 topics: Vec::new(),
+                // What the park capture stamps (`stamp_fg_holders`).
+                fg_holder: carry.and_then(|c| {
+                    c.fg_holders
+                        .iter()
+                        .find(|(id, _)| *id == local_id)
+                        .map(|(_, holder)| *holder)
+                }),
+                rekey: false,
+                loader: false,
+                history: None,
+                history_dropped: 0,
+                history_lost: 0,
             });
             live.push((local_id, master, 4000 + index as i32));
             if let Some(carry) = carry {
@@ -7047,7 +7258,7 @@ mod tests {
                 terminal.checkpoint_visible().expect("parser is Ground"),
             ));
         }
-        let manifest = SessionHandoff {
+        let mut manifest = SessionHandoff {
             schema: SessionHandoff::SCHEMA,
             window: Some(WindowCarry {
                 rows: 24,
@@ -7085,6 +7296,9 @@ mod tests {
         // from it and writes it as the manifest's first line, so a successor
         // launched with the path before the write can authenticate the file.
         let attempt_nonce = mint_outgoing_nonce();
+        if let Some(history) = history {
+            history(&mut manifest, &dir, &attempt_nonce);
+        }
         let outgoing = write_outgoing(
             &manifest,
             &fds,
@@ -7192,7 +7406,6 @@ mod tests {
             fds_wire: outgoing.fds_wire,
             expected,
             screen_digest: parent_screen_digest,
-            masters,
             slaves,
             scratch,
         }
@@ -7231,8 +7444,12 @@ mod tests {
             }
         }
 
+        /// Close the slaves and remove the scratch dir. The masters are not the
+        /// test's to close: once the wire names them they are the successor's,
+        /// exactly as on the exec lane — the adoption closes each as it drops,
+        /// and a refusal closes them at once.
         pub(super) fn teardown(self) {
-            for fd in self.masters.into_iter().chain(self.slaves) {
+            for fd in self.slaves {
                 aterm_pty::close_fd(fd);
             }
             let _ = std::fs::remove_dir_all(&self.scratch);
@@ -7277,7 +7494,7 @@ mod tests {
         let adopted_fds = incoming
             .adopted
             .iter()
-            .map(|adopted| adopted.master)
+            .map(|adopted| adopted.master.raw())
             .collect::<Vec<_>>();
         let ready = take_ready_fd(
             incoming.nonce.clone(),
@@ -7289,7 +7506,7 @@ mod tests {
         let adopted = incoming
             .adopted
             .iter()
-            .map(|item| (item.local_id, item.master, item.pid))
+            .map(|item| (item.local_id, item.master.raw(), item.pid))
             .collect::<Vec<_>>();
         let proof = ready.proof(&adopted)?;
         Some((
@@ -7876,6 +8093,137 @@ mod tests {
         staged.teardown();
     }
 
+    /// CONFORMANCE (Tier-1) of the incoming side's REFUSAL to
+    /// `aterm_spec::derive::fd_handoff_no_leak_model` (`FdHandoffNoLeak`): a
+    /// handoff [`take_incoming`] refuses after it began claiming masters closes
+    /// every master the wire named — session 0's, which its `Adopted` had
+    /// already claimed from the guard (the `HandedMaster` drops with the
+    /// half-built set), and session 1's, still owned by the `IncomingPtyGuard`
+    /// when session 1 is refused — so a refused handoff leaves no master open and
+    /// readerless in this process.
+    ///
+    /// The staged PTYs' SLAVES are the witnesses: a slave reads EOF (macOS) or
+    /// EIO (Linux) once every copy of its master is closed, and would block
+    /// while one is still open. Per master that is the model's `CloseFallback`
+    /// after the `Prepare`s that handed them across, or — still open — its
+    /// `BuggyDrop`, the step only `Buggy = 1` admits.
+    ///
+    /// NEGATIVE CONTROL: make `HandedMaster`'s `Drop` a no-op and session 0's
+    /// claimed master stays open; make `IncomingPtyGuard`'s `Drop` a no-op and
+    /// session 1's does. Either is the `BuggyDrop` step, and this test fails.
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_handoff_closes_every_master_it_was_handed() {
+        use aterm_spec::verify::validate_transition_tiered;
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
+        ];
+        let staged = stage_outgoing_handoff("refusedmasters", 2, None);
+        // Session 1 names a sidecar that is not its own, so it is refused only
+        // after session 0 passed every check and claimed its master.
+        let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+        let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+        let mut published = SessionHandoff::from_toml(toml).expect("parse the published manifest");
+        let carry = published.sessions[1]
+            .screen
+            .as_mut()
+            .expect("every session carries a screen");
+        let own = std::path::PathBuf::from(&carry.grid_file);
+        let foreign = own.with_file_name("seamless-1-someone-else.s1.grid");
+        std::fs::copy(&own, &foreign).expect("a readable foreign sidecar");
+        carry.grid_file = foreign.to_string_lossy().into_owned();
+        std::fs::write(
+            &staged.manifest_path,
+            format!(
+                "{file_nonce}\n{}",
+                published.to_toml().expect("reserialize")
+            ),
+        )
+        .expect("republish");
+        let witnesses = staged.slaves.clone();
+        for &slave in &witnesses {
+            // SAFETY: fcntl on a slave descriptor this fixture opened and owns.
+            let flags = unsafe { libc::fcntl(slave, libc::F_GETFL) };
+            assert!(flags >= 0, "slave flags");
+            // SAFETY: as above; only O_NONBLOCK is added.
+            let rc = unsafe { libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(rc, 0, "non-blocking witness");
+        }
+        let master_closed = |slave: i32| {
+            let mut byte = 0u8;
+            // SAFETY: a one-byte read into a live local from an owned descriptor.
+            let n = unsafe { libc::read(slave, std::ptr::from_mut(&mut byte).cast(), 1) };
+            match n {
+                0 => true,
+                -1 => match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EIO) => true,
+                    Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => false,
+                    other => panic!("unexpected slave read error {other:?}"),
+                },
+                _ => panic!("nothing writes to these PTYs, yet the slave read {n} byte(s)"),
+            }
+        };
+        assert!(
+            witnesses.iter().all(|&slave| !master_closed(slave)),
+            "PRECONDITION: every handed master is open before the handoff is taken"
+        );
+
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(ready_write, commit_read, None);
+        let incoming = take_incoming_as(ReceiverShape::Current);
+        assert!(
+            incoming.adopted.is_empty() && incoming.screen_digest.is_none(),
+            "a sidecar that is not this record's own is refused outright"
+        );
+
+        let model = aterm_spec::derive::fd_handoff_no_leak_model();
+        let label = "FdHandoffNoLeak(take_incoming refusal)";
+        let mut state = model.init_state();
+        let mut advance = |what: &str, action: &str, var: &'static str, value: i64| {
+            let mut next = state.clone();
+            next.insert(var, value);
+            let (ok, why) =
+                validate_transition_tiered(&model, &[], &state, &next, Some(action), label);
+            assert!(
+                ok,
+                "{what}: the refused handoff took `{action}` to {next:?}, which the \
+                 committed model does not admit — {why}"
+            );
+            state = next;
+        };
+        for handed in 1..=2 {
+            advance("the outgoing side", "Prepare", "prepared", handed);
+        }
+        let mut closed = 0;
+        for (local_id, &slave) in witnesses.iter().enumerate() {
+            let what = format!("session {local_id}'s master");
+            if master_closed(slave) {
+                closed += 1;
+                advance(&what, "CloseFallback", "closed", closed);
+            } else {
+                advance(&what, "BuggyDrop", "leaked", 1);
+            }
+        }
+        assert!(model.check_invariant("NoLeak", &state), "{state:?}");
+        assert_eq!(closed, 2, "both masters closed");
+        for fd in [ready_read, ready_write, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
     /// The degrade target is CANONICAL BY CONSTRUCTION: whatever a hostile or
     /// older producer's meta says, [`repaint_checkpoint`] yields a screen this
     /// build's own full predicate (`screen_digest`) admits — the property that
@@ -8280,6 +8628,7 @@ mod f4_adoption_proof_asymmetry {
             outer_x: Some(120),
             outer_y: Some(64),
             maximized: None,
+            show: crate::restore::WindowShow::UNKNOWN,
             tabs: Vec::new(),
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
@@ -8299,6 +8648,7 @@ mod f4_adoption_proof_asymmetry {
                             icon: None,
                             role: None,
                             attention: None,
+                            questions: None,
                             identity: None,
                         },
                     ))),
@@ -8313,6 +8663,7 @@ mod f4_adoption_proof_asymmetry {
                             icon: None,
                             role: None,
                             attention: None,
+                            questions: None,
                             identity: None,
                         },
                     ))),

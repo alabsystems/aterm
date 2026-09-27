@@ -1213,13 +1213,22 @@ fn release_proof_python_with(
     Ok(command)
 }
 
+/// Rustup's home for the compat lane: a non-empty `$RUSTUP_HOME`, else
+/// `<home>/.rustup` — atpkg's one rule ([`atpkg::seam::rustup_home_with`]), which
+/// [`crate::gates`] resolves the rustup `trust` entry through as well, and which
+/// `aterm_verify::toolchain::rustup_home` mirrors for the gate (aterm-cli's tests
+/// hold the two to one table). A set-but-empty variable is the default, not a
+/// relative path to refuse.
 fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
-    let value = std::env::var_os("RUSTUP_HOME")
-        .unwrap_or_else(|| Path::new(home).join(".rustup").into_os_string());
-    if !Path::new(&value).is_absolute() {
+    let value = atpkg::seam::rustup_home_with(
+        std::env::var_os("RUSTUP_HOME").as_deref(),
+        Some(Path::new(home)),
+    )
+    .ok_or("release RUSTUP_HOME has no home to default under")?;
+    if !value.is_absolute() {
         return Err("release RUSTUP_HOME must be absolute".into());
     }
-    Ok(value)
+    Ok(value.into_os_string())
 }
 
 impl Drop for SealedCargoTake {
@@ -2760,7 +2769,7 @@ mod tests {
         .expect("read aterm-gui's build_info.rs");
         let reads = |name: &str| {
             build_info.contains(&format!(
-                "pub const IS_RELEASE_BUILD: bool = option_env!(\"{name}\").is_some();"
+                "const IS_RELEASE_BUILD: bool = option_env!(\"{name}\").is_some();"
             ))
         };
         assert!(reads(super::RELEASE_BUILD_MARKER));
@@ -3852,8 +3861,8 @@ mod tests {
             validate_cli_app_version(
                 "0.2.0",
                 b"aterm 0.2.0\nrunning: /Applications/aterm.app\nanother copy: \
-                  /Users//ana/Applications/aterm.app (0.1.0) \xe2\x80\x94 not the one running; \
-                  the updater updates only this one\n"
+                  /Users//ana/Applications/aterm.app (0.1.0) \xe2\x80\x94 the updater leaves \
+                  it alone\n"
             )
             .is_ok()
         );

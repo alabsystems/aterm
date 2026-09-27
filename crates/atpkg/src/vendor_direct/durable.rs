@@ -269,15 +269,24 @@ mod tests {
         let dest = d.join("x.toml");
         let held = lock_for_update(&dest).unwrap();
         assert!(d.join("x.toml.lock").exists());
+        // Exclusivity read without a clock: the holder raises `released` just
+        // before it lets go, so a waiter that got the lock while it was still
+        // held sees it down. It was the waiter's own elapsed >= 250 ms, which a
+        // thread first scheduled 50 ms late read short on a correct lock (the
+        // load-sensitive test audit of 2026-09-27).
+        let released = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
             let waiter = s.spawn(|| {
-                let start = std::time::Instant::now();
                 let _second = lock_for_update(&dest).unwrap();
-                start.elapsed()
+                released.load(std::sync::atomic::Ordering::Acquire)
             });
             std::thread::sleep(Duration::from_millis(300));
+            released.store(true, std::sync::atomic::Ordering::Release);
             drop(held);
-            assert!(waiter.join().unwrap() >= Duration::from_millis(250));
+            assert!(
+                waiter.join().unwrap(),
+                "the second writer got the update lock while the first still held it"
+            );
         });
     }
 

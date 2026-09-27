@@ -8,6 +8,7 @@
 use crate::center::MessageCenter;
 use crate::glass::{
     CapsuleSpec, Hit, Links, Presentation, RowKind, RowSpec, layout_row, overflow_spec,
+    overflow_words,
 };
 use crate::log::{LogLine, MessageLog, Retired};
 use crate::model::{
@@ -193,7 +194,7 @@ fn the_meter_spans_the_row_at_every_width() {
         busy: false,
         eta: false,
         load: None,
-        load_slot: false,
+        load_slot: crate::model::Loads::NONE,
         capsules: caps(&[Intent::OpenSettings {
             route: "/updates".into(),
         }]),
@@ -224,7 +225,7 @@ fn the_excerpt_never_comes_back_while_narrowing() {
         busy: false,
         eta: false,
         load: None,
-        load_slot: false,
+        load_slot: crate::model::Loads::NONE,
         capsules: caps(&[
             Intent::OpenConfigEditor { line: None },
             Intent::OpenSystemPane {
@@ -328,8 +329,12 @@ fn layout_never_panics_below_eight_cols() {
             }
             assert_eq!(p.hit(0, cols), Hit::Nothing);
         }
-        let _ = layout_row(&overflow_spec(99, Links::Painted), 0, &chars);
-        let _ = layout_row(&overflow_spec(99, Links::Withheld), 0, &chars);
+        for links in [Links::Painted, Links::Withheld] {
+            for progress in [None, Some("Downloading aterm v0.91.0 45%")] {
+                let words = overflow_words(99, links, progress);
+                let _ = layout_row(&overflow_spec(99, &words), 0, &chars);
+            }
+        }
     }
 }
 
@@ -407,19 +412,23 @@ fn the_width_law_holds_under_a_two_cell_measure() {
             }
             if let Some(c) = row.elapsed {
                 assert!(c >= end + 1, "{name}@{cols}: elapsed overlaps");
-                end = c + crate::ELAPSED_W;
+                end = c + row.elapsed_width();
             }
             if let Some(c) = row.eta {
                 assert!(c >= end + 1, "{name}@{cols}: eta overlaps");
                 end = c + row.eta_width();
             }
-            if let Some((c, w)) = row.load {
-                assert!(c >= end + 3, "{name}@{cols}: load overlaps");
-                end = c + wide(w);
-            }
             if let Some((c, s)) = &row.stats {
                 assert!(*c >= end + 2, "{name}@{cols}: stats overlap");
                 end = c + wide(s);
+            }
+            // The load slot is the tail of the words (ruling 246).
+            if let Some((c, w)) = row.load_slot {
+                assert!(c >= end + 2, "{name}@{cols}: load slot overlaps");
+                end = c + w;
+            }
+            if let (Some((c, w)), Some((slot, sw))) = (row.load, row.load_slot) {
+                assert_eq!(c + wide(w), slot + sw, "{name}@{cols}: right-aligned words");
             }
             assert!(
                 first.col >= end + 2,

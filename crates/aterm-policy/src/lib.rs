@@ -62,11 +62,8 @@ use serde::{Deserialize, Serialize};
 pub mod aliases;
 pub mod engine;
 pub mod limits;
-pub mod mirror;
 pub mod profiles;
 pub mod selector;
-
-pub use mirror::{MirrorField, MirrorSnapshot};
 
 #[cfg(test)]
 mod tests;
@@ -328,24 +325,6 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Parse a policy document from a TOML string, falling back to
-    /// [`profiles::hardened`] on any parse error or schema-version mismatch
-    /// (§4.4, fail-closed).
-    ///
-    /// Returns `(policy, fell_back)` — callers log the second bool if they
-    /// need visibility into fall-through behavior.
-    ///
-    /// The full FFI load path with structured error reporting lands in
-    /// #7996; this helper exists so the Phase 0 tests can exercise the
-    /// fail-closed branch without pulling in the engine crate.
-    #[must_use]
-    pub fn from_toml_or_hardened(toml_src: &str) -> (Self, bool) {
-        match aterm_toml::from_str::<Policy>(toml_src) {
-            Ok(policy) if policy.schema_version == SCHEMA_VERSION => (policy, false),
-            _ => (profiles::hardened(), true),
-        }
-    }
-
     /// Serialize this policy as a TOML string. Used for at-rest config files
     /// and for round-trip testing (§5.1).
     ///

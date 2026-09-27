@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `ATERM_NO_PROCEDURAL_GLYPHS=1` escape hatch: with the var set, box
+//! The `ATERM_NO_PROCEDURAL_GLYPHS` development seam: with the var set, box
 //! drawing dispatches to the FONT (primary face), not the procedural source.
+//! A seam compiles only into a debug/`dev-seams` build — a test build is one —
+//! so a shipped binary always draws the procedural glyphs.
 //!
 //! Runs in its own test binary so `std::env::set_var` is safe: no other
 //! thread reads the environment concurrently (the same convention as the

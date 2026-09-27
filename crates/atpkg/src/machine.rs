@@ -8,11 +8,12 @@
 //! `com.apple.universalcontrol` domain. The Spotlight half is [`crate::noindex::apply`].
 //!
 //! Universal Control is macOS's cursor/keyboard roaming between Macs and iPads signed
-//! into the same Apple account. The owner runs with it disabled
-//! (`docs/SESSION-watchdog-noindex-2026-09-02.md`: `Disable = 1`), and a fresh machine
-//! sits at the OS default with neither key set. The switch is per-host and per-user
-//! (`defaults -currentHost`), no sudo — so a first-open pass can apply it, and one
-//! pasted line reverts it: [`UNIVERSAL_CONTROL_REVERT`].
+//! into the same Apple account. The owner runs with it disabled (`Disable = 1`), and a
+//! fresh machine sits at the OS default with neither key set; the keys, their polarity
+//! and what the switch costs are measured in
+//! `docs/measured/macos-doctor-universal-control-2026-09-06.md`. The switch is per-host
+//! and per-user (`defaults -currentHost`), no sudo — so a first-open pass can apply it,
+//! and one pasted line reverts it: [`UNIVERSAL_CONTROL_REVERT`].
 
 use crate::config::UniversalControlPolicy;
 
@@ -96,13 +97,11 @@ impl UniversalControlState {
     pub fn doctor_line(&self, policy: UniversalControlPolicy) -> String {
         if !self.measured {
             // Never "the OS default": nothing was measured, and the remedy is the same
-            // either way, so say what is true and name the command that would tell us.
+            // either way, so say what is true and what happens next.
             return match policy {
                 UniversalControlPolicy::Off => "warn — Universal Control could not be read \
-                     on this host (`defaults -currentHost read com.apple.universalcontrol` did \
-                     not answer), so whether it is on here is unknown; the next aterm window (or \
-                     the day's first terminal session) writes both keys anyway ([machine] universal_control = \"off\") — now: `aterm pkg \
-                     machine apply`"
+                     on this host; the next aterm window (or the day's first terminal session) \
+                     disables it anyway — now: `aterm pkg machine apply`"
                     .to_string(),
                 UniversalControlPolicy::Leave => {
                     "ok — Universal Control could not be read on this host, and [machine] \
@@ -116,17 +115,14 @@ impl UniversalControlState {
             // (or the day's first terminal session) disables it again, so a line that offers
             // only the two `defaults delete`s sends the reader to a change that lasts until
             // then. The command stays byte-identical ([`UNIVERSAL_CONTROL_REVERT`] is
-            // a contract string); what follows it is the half that makes it stick.
+            // a contract string); the setting named before it is the half that makes it stick.
             let keep = match policy {
-                UniversalControlPolicy::Off => {
-                    " — and set [machine] universal_control = \"leave\", or the next aterm \
-                     window (or the day's first terminal session) disables it again"
-                }
+                UniversalControlPolicy::Off => "set [machine] universal_control = \"leave\" and ",
                 UniversalControlPolicy::Leave => "",
             };
             return format!(
-                "ok — Universal Control is disabled on this host (cursor and keyboard stay \
-                 on this Mac); revert: {UNIVERSAL_CONTROL_REVERT}{keep}"
+                "ok — Universal Control is disabled on this host; to turn it back on, {keep}\
+                 run: {UNIVERSAL_CONTROL_REVERT}"
             );
         }
         // A HALF-DISABLED HOST IS NOT AT THE OS DEFAULT. One key set is a state someone
@@ -142,8 +138,8 @@ impl UniversalControlState {
         match policy {
             UniversalControlPolicy::Off => format!(
                 "warn — Universal Control is {posture}; the next aterm window (or the day's \
-                 first terminal session) disables it ([machine] universal_control = \"off\") — now: \
-                 `aterm pkg machine apply`; keep it: universal_control = \"leave\""
+                 first terminal session) disables it — now: `aterm pkg machine apply`; keep \
+                 it: [machine] universal_control = \"leave\""
             ),
             UniversalControlPolicy::Leave => format!(
                 "ok — Universal Control left {posture} ([machine] universal_control = \"leave\")"
@@ -174,6 +170,7 @@ impl UniversalControlState {
 /// [`crate::platform::unix`] (compiled under the strict gate, no `fmt::Arguments`) can
 /// call it.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
     let trimmed: Vec<u8> = stdout
         .iter()

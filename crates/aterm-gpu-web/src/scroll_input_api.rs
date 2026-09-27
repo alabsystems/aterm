@@ -109,7 +109,6 @@ impl ScrollInputState {
     /// would otherwise carry a stale shift after the residual resets.
     // The present paths (`render`/`render_offscreen`) are wasm-only; on the
     // native verification target only the tests drive this.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) fn stamp(&self, input: &mut RenderInput, grid_rows: usize, cell_h: usize) {
         input.scroll_frac_px = self.frac_px(cell_h);
         input.grid_top_row = 0;

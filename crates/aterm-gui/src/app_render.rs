@@ -25,7 +25,7 @@ use crate::present::{CpuFrameBuffer as _, CpuPresenter as _};
 use crate::{
     App, BLINK_INTERVAL, Backend, PresentDropAccounting, PresentTarget, RepaintKey,
     SelectionFingerprint, SyncObservation, WindowId, WindowState, chrome_band, metrics, pane,
-    platform::AppRt, rearm_failed_gpu_recovery, request_recovery_redraw, tab_bar, term_lock,
+    platform::AppRt, rearm_failed_gpu_recovery, request_gpu_recovery_redraw, tab_bar, term_lock,
     term_try_lock,
 };
 
@@ -147,21 +147,18 @@ enum CursorEffectScrollDecision {
 /// env var and went with their subjects; the standing answer to "why is the
 /// ribbon dark" is now `aterm ctl trail` (the admission ring and its
 /// `trail status` line), which needs no rebuild.
-/// A static once-sampled bool — a mid-run env mutation is not a supported use
-/// — so every trace site pays one cached load when the trace is off.
+/// A DEVELOPMENT seam ([`aterm_types::dev_seam!`]): a shipped binary never arms
+/// it. A static once-sampled bool — a mid-run env mutation is not a supported
+/// use — so every trace site pays one cached load when the trace is off.
 ///
-/// EMPTY DOES NOT ARM IT, the same rule `$ATERM_HEADLESS` states in `--help`
-/// ("0/off/empty do NOT arm it"). This was `var_os(..).is_some()`, which is
-/// TRUE for an empty string — and `tools/paint-conformance/paint_probe.sh`
-/// forwards `ATERM_TRACE_SPAWN="${ATERM_TRACE_SPAWN:-}"` through an `env -i`,
-/// so the variable arrived SET AND EMPTY and every paint-conformance run had
-/// the per-present SPAWNSRC trace armed, writing a line per cursor move into
-/// the probe's gui.log. A pass-through that means "forward it if the operator
-/// set it" must not be what turns the diagnostic on.
+/// EMPTY DOES NOT ARM IT (nor does `0`): `tools/paint-conformance/paint_probe.sh`
+/// forwards `ATERM_TRACE_SPAWN="${ATERM_TRACE_SPAWN:-}"` through an `env -i`, so
+/// the variable arrives SET AND EMPTY on every run; a pass-through that means
+/// "forward it if the operator set it" must not be what turns the diagnostic on.
 pub(crate) fn trace_spawn_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("ATERM_TRACE_SPAWN").is_some_and(|v| !v.is_empty() && v != "0")
+        aterm_types::dev_seam!("ATERM_TRACE_SPAWN").is_some_and(|v| !v.is_empty() && v != "0")
     })
 }
 
@@ -811,103 +808,115 @@ mod cursor_fx_generation_fence_tests {
         );
     }
 
-    /// **D-3: a terminal / tab switch takes the same curtain.** The other half
-    /// of the same seam — the `terminal_id` that changes when the front tab or
-    /// pane does — with the screen flag unchanged.
+    /// **Every other coordinate-space seam takes the same curtain** — one row per
+    /// seam, each asserting its own trigger held before the band's fate is read
+    /// (the alternate screen, which also has an EXIT phase, is its own test).
+    ///
+    /// Each seam reads the wall clock itself, so the band is laid 300 ms IN THE
+    /// PAST — inside its grace, whole and settled — and the seam then falls at
+    /// the real present with the frames after it in the real future. A band
+    /// seeded at `now` would be curtained before it was laid. Every row must
+    /// curtain (never cut), still draw half-way through, and be exactly gone at
+    /// the curtain's end.
     #[test]
-    fn a_terminal_switch_curtains_the_band() {
-        // The seam under test reads the wall clock itself, so the band is laid
-        // 300 ms IN THE PAST — inside its grace, whole and settled — and the
-        // seam then falls at the real present with the frames after it in the
-        // real future. A band seeded at `now` would be curtained before it was
-        // laid.
-        let t0 = Instant::now() - Duration::from_millis(300);
-        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
-        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            super::sync_cursor_effect_coordinate_space(ws, 7, false);
+    fn every_coordinate_space_seam_curtains_the_band() {
+        type Seam = fn(&mut App, WindowId);
+        let rows: [(&str, Seam); 3] = [
+            (
+                // D-3: a terminal / tab switch. The other half of the alt-screen
+                // seam — the `terminal_id` that changes when the front tab or pane
+                // does — with the screen flag unchanged.
+                "a terminal switch",
+                |app, wid| {
+                    let ws = app.windows.get_mut(&wid).expect("window");
+                    super::sync_cursor_effect_coordinate_space(ws, 7, false);
+                    assert!(
+                        super::sync_cursor_effect_coordinate_space(ws, 8, false),
+                        "a different terminal is a different coordinate space"
+                    );
+                },
+            ),
+            (
+                // A content INVALIDATION. `sync_cursor_effect_scroll`'s `Invalidate`
+                // arm is the seam where the retained coordinates stop sharing one
+                // transform (RIS, `ESC[3J`, a splice) — the same class of fact as
+                // the alternate screen, and it took the same one-frame `reset()`.
+                "a content invalidation",
+                |app, wid| {
+                    let ws = app.windows.get_mut(&wid).expect("window");
+                    super::sync_cursor_effect_scroll(ws, ContentScrollState::default());
+                    let change = super::sync_cursor_effect_scroll(
+                        ws,
+                        ContentScrollState {
+                            invalidation_epoch: 9,
+                            ..ContentScrollState::default()
+                        },
+                    );
+                    assert!(change.invalidated, "precondition: the arm under test");
+                },
+            ),
+            (
+                // THE RESIZE SEAM, and it is the reflow map's absence that makes the
+                // curtain the law (Rainbow Path v3 §2.8 + §9's open question).
+                // `apply_term_resize` is where the grid's meaning changes under every
+                // retained cell; the audit measured it taking the band from 21 lit
+                // cells to 0 inside one capture. §2.8 says the cells should be
+                // translated through `aterm-grid`'s reflow map where it reaches and
+                // curtained where it does not — and it does not reach here
+                // (`mod reflow_map;` is private inside `grid/reflow.rs`, its
+                // functions are `pub(super)`, and `resize` returns no map), so the
+                // curtain is the whole law at this seam and this row is its proof.
+                "a grid resize",
+                |app, wid| {
+                    let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+                    app.apply_term_resize(
+                        wid,
+                        rows.saturating_sub(2).max(2),
+                        cols.saturating_sub(7).max(8),
+                    );
+                },
+            ),
+        ];
+        for (label, seam) in rows {
+            let t0 = Instant::now() - Duration::from_millis(300);
+            let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
             assert!(
-                super::sync_cursor_effect_coordinate_space(ws, 8, false),
-                "a different terminal is a different coordinate space"
+                band_peak(&app, wid) > 0,
+                "{label}: precondition: a lit band"
+            );
+            seam(&mut app, wid);
+            let fell = Instant::now();
+            assert!(
+                app.windows[&wid]
+                    .cursor_glow
+                    .v2_ribbon()
+                    .is_some_and(|r| r.curtained() && !r.at_rest()),
+                "{label} curtains the band, it does not cut it"
+            );
+            tick_at(
+                &mut app,
+                wid,
+                fell + Duration::from_millis(100),
+                (2, 3),
+                true,
+            );
+            assert!(
+                band_peak(&app, wid) > 0,
+                "{label}: still drawing half-way through"
+            );
+            tick_at(
+                &mut app,
+                wid,
+                fell + Duration::from_millis(260),
+                (2, 3),
+                true,
+            );
+            assert_eq!(
+                band_peak(&app, wid),
+                0,
+                "{label}: gone at the curtain's end"
             );
         }
-        let fell = Instant::now();
-        assert!(
-            app.windows[&wid]
-                .cursor_glow
-                .v2_ribbon()
-                .is_some_and(|r| r.curtained() && !r.at_rest()),
-            "a tab / terminal switch curtains (D-3)"
-        );
-        tick_at(
-            &mut app,
-            wid,
-            fell + Duration::from_millis(100),
-            (2, 3),
-            true,
-        );
-        assert!(band_peak(&app, wid) > 0, "still drawing half-way through");
-        tick_at(
-            &mut app,
-            wid,
-            fell + Duration::from_millis(260),
-            (2, 3),
-            true,
-        );
-        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
-    }
-
-    /// **A content INVALIDATION curtains too.** `sync_cursor_effect_scroll`'s
-    /// `Invalidate` arm is the seam where the retained coordinates stop sharing
-    /// one transform (RIS, `ESC[3J`, a splice) — the same class of fact as the
-    /// alternate screen, and it took the same one-frame `reset()`.
-    #[test]
-    fn a_content_invalidation_curtains_the_band_instead_of_cutting_it() {
-        // The seam under test reads the wall clock itself, so the band is laid
-        // 300 ms IN THE PAST — inside its grace, whole and settled — and the
-        // seam then falls at the real present with the frames after it in the
-        // real future. A band seeded at `now` would be curtained before it was
-        // laid.
-        let t0 = Instant::now() - Duration::from_millis(300);
-        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
-        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
-        let change = {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            super::sync_cursor_effect_scroll(ws, ContentScrollState::default());
-            super::sync_cursor_effect_scroll(
-                ws,
-                ContentScrollState {
-                    invalidation_epoch: 9,
-                    ..ContentScrollState::default()
-                },
-            )
-        };
-        let fell = Instant::now();
-        assert!(change.invalidated, "precondition: the arm under test");
-        assert!(
-            app.windows[&wid]
-                .cursor_glow
-                .v2_ribbon()
-                .is_some_and(|r| r.curtained() && !r.at_rest()),
-            "an invalidation curtains the band"
-        );
-        tick_at(
-            &mut app,
-            wid,
-            fell + Duration::from_millis(100),
-            (2, 3),
-            true,
-        );
-        assert!(band_peak(&app, wid) > 0, "still drawing half-way through");
-        tick_at(
-            &mut app,
-            wid,
-            fell + Duration::from_millis(260),
-            (2, 3),
-            true,
-        );
-        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
     }
 
     /// **D-4 / law A4: scrollback HIDES the band and the live viewport brings
@@ -982,56 +991,6 @@ mod cursor_fx_generation_fence_tests {
                 .is_some_and(|r| !r.curtained()),
             "a history viewport is not a coordinate-space seam: no curtain (D-4)"
         );
-    }
-
-    /// **THE RESIZE SEAM CURTAINS TOO, and it is the reflow map's absence that
-    /// makes that the law** (Rainbow Path v3 §2.8 + §9's open question).
-    /// `apply_term_resize` is where the grid's meaning changes under every
-    /// retained cell; the audit measured it taking the band from 21 lit cells
-    /// to 0 inside one capture. §2.8 says the cells should be translated
-    /// through `aterm-grid`'s reflow map where it reaches and curtained where
-    /// it does not — and it does not reach here (`mod reflow_map;` is private
-    /// inside `grid/reflow.rs`, its functions are `pub(super)`, and `resize`
-    /// returns no map), so the curtain is the whole law at this seam and this
-    /// twin is its proof.
-    #[test]
-    fn a_grid_resize_curtains_the_band_because_no_reflow_map_reaches_this_seam() {
-        let t0 = Instant::now() - Duration::from_millis(300);
-        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
-        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
-        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
-        app.apply_term_resize(
-            wid,
-            rows.saturating_sub(2).max(2),
-            cols.saturating_sub(7).max(8),
-        );
-        let fell = Instant::now();
-        assert!(
-            app.windows[&wid]
-                .cursor_glow
-                .v2_ribbon()
-                .is_some_and(|r| r.curtained() && !r.at_rest()),
-            "a reflow curtains the band (§2.8's fallback, and the only law here)"
-        );
-        tick_at(
-            &mut app,
-            wid,
-            fell + Duration::from_millis(100),
-            (2, 3),
-            true,
-        );
-        assert!(
-            band_peak(&app, wid) > 0,
-            "half-way through the resize's curtain the band is still on glass"
-        );
-        tick_at(
-            &mut app,
-            wid,
-            fell + Duration::from_millis(260),
-            (2, 3),
-            true,
-        );
-        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
     }
 
     #[test]
@@ -2440,35 +2399,6 @@ mod cursor_scroll_signal_tests {
         validate_model_action("RestoreInvalidation", 5, decision);
     }
 
-    #[test]
-    fn epoch_change_wins_over_later_uniform_rows_and_overflow_retires() {
-        let previous = ContentScrollState {
-            uniform_up_rows: 10,
-            invalidation_epoch: 4,
-            ..Default::default()
-        };
-        let mixed_later = ContentScrollState {
-            uniform_up_rows: 13,
-            invalidation_epoch: 5,
-            ..Default::default()
-        };
-        assert_eq!(
-            cursor_effect_scroll_decision(Some(previous), mixed_later),
-            CursorEffectScrollDecision::Invalidate,
-            "later uniform output cannot hide an intervening non-uniform batch"
-        );
-        let too_large = ContentScrollState {
-            uniform_up_rows: previous.uniform_up_rows + u64::from(u16::MAX) + 1,
-            invalidation_epoch: previous.invalidation_epoch,
-            ..Default::default()
-        };
-        assert_eq!(
-            cursor_effect_scroll_decision(Some(previous), too_large),
-            CursorEffectScrollDecision::Invalidate,
-            "an unrepresentable exact delta retires instead of under-translating"
-        );
-    }
-
     /// **D2 — the owner, 2026-09-10: "when the screen is refreshed the rainbow
     /// disapears".** The consumer end of the erase fix, on a REAL terminal and a
     /// REAL window: an erase must not reach `cursor_glow.reset()`.
@@ -3348,61 +3278,39 @@ fn momentum_glow_allowed(user_on: bool, host_allows: bool, rainbow_owns_caret: b
 mod caret_blink_law_tests {
     use super::{CursorStyle, compose_caret_style_override, momentum_glow_allowed};
 
-    /// LAW 1, the rainbow half: under the rainbow, Blink is never the
-    /// caret's — regardless of momentum temperature. Cold (`None`) and hot
-    /// (`Some(SteadyBlock)`, and even a hot BAR twin) all compose to the
-    /// pinned steady block.
+    /// The caret-style law, as one truth table of
+    /// `compose_caret_style_override(bolt, rainbow, momentum)`.
     #[test]
-    fn under_the_rainbow_the_caret_never_blinks_at_any_momentum() {
-        for momentum in [
-            None,
-            Some(CursorStyle::SteadyBlock),
-            Some(CursorStyle::SteadyBar),
-            Some(CursorStyle::SteadyUnderline),
-        ] {
+    fn the_caret_style_law_is_one_truth_table() {
+        use CursorStyle::{Bolt, SteadyBar, SteadyBlock, SteadyUnderline};
+        let rows = [
+            // LAW 1, the rainbow half: under the rainbow, Blink is never the
+            // caret's — regardless of momentum temperature. Cold (`None`) and hot
+            // (`Some(SteadyBlock)`, and even a hot BAR twin) all compose to the
+            // pinned steady block.
+            (false, true, None, Some(SteadyBlock)),
+            (false, true, Some(SteadyBlock), Some(SteadyBlock)),
+            (false, true, Some(SteadyBar), Some(SteadyBlock)),
+            (false, true, Some(SteadyUnderline), Some(SteadyBlock)),
+            // LAW 1, the other half: under a classic style the peer's law stands
+            // unchanged — cool (`None`): no override, the configured Blinking*
+            // style is rendered as configured…
+            (false, false, None, None),
+            // …and warm: the Blinking* style is pinned to its Steady* twin.
+            (false, false, Some(SteadyBlock), Some(SteadyBlock)),
+            (false, false, Some(SteadyBar), Some(SteadyBar)),
+            (false, false, Some(SteadyUnderline), Some(SteadyUnderline)),
+            // The bolt outranks both — the `laser` body's own shape, as before.
+            (true, true, Some(SteadyBlock), Some(Bolt)),
+            (true, false, None, Some(Bolt)),
+        ];
+        for (bolt, rainbow, momentum, want) in rows {
             assert_eq!(
-                compose_caret_style_override(false, true, momentum),
-                Some(CursorStyle::SteadyBlock),
-                "rainbow owns the caret, momentum {momentum:?}: the block is pinned steady"
+                compose_caret_style_override(bolt, rainbow, momentum),
+                want,
+                "bolt={bolt} rainbow={rainbow} momentum={momentum:?}"
             );
         }
-    }
-
-    /// LAW 1, the other half: under a classic style the peer's law stands
-    /// unchanged — Blink is the caret's when cool (`None`: the terminal's
-    /// Blinking* style is rendered as configured) and pinned to the Steady*
-    /// twin while warm.
-    #[test]
-    fn under_a_classic_style_blink_returns_when_cool_and_is_pinned_while_warm() {
-        assert_eq!(
-            compose_caret_style_override(false, false, None),
-            None,
-            "cool: no override, the configured blink stands"
-        );
-        for steady in [
-            CursorStyle::SteadyBlock,
-            CursorStyle::SteadyBar,
-            CursorStyle::SteadyUnderline,
-        ] {
-            assert_eq!(
-                compose_caret_style_override(false, false, Some(steady)),
-                Some(steady),
-                "warm: the Blinking* style is pinned to its Steady* twin"
-            );
-        }
-    }
-
-    /// The bolt outranks both — the `laser` body's own shape, as before.
-    #[test]
-    fn the_bolt_outranks_the_rainbow_and_the_momentum_glow() {
-        assert_eq!(
-            compose_caret_style_override(true, true, Some(CursorStyle::SteadyBlock)),
-            Some(CursorStyle::Bolt)
-        );
-        assert_eq!(
-            compose_caret_style_override(true, false, None),
-            Some(CursorStyle::Bolt)
-        );
     }
 
     /// The momentum ENGINE yields the caret cell to the rainbow: with the
@@ -3823,12 +3731,39 @@ mod canonical_layout_scheduler_tests {
         );
     }
 
+    /// Every frame route — terminal, native, heterogeneous — threads ONE visible
+    /// plan through its frame (the helper asserts the fixture's route first).
     #[test]
-    fn terminal_frame_threads_one_visible_plan() {
-        assert_planned_frame_builds_once(
-            App::headless_for_test(),
-            crate::VisibleContentRoute::Terminal { composed: false },
-        );
+    fn every_frame_route_threads_one_visible_plan() {
+        type Fixture = fn() -> (App, crate::VisibleContentRoute);
+        let fixtures: [Fixture; 3] = [
+            // Terminal.
+            || {
+                (
+                    App::headless_for_test(),
+                    crate::VisibleContentRoute::Terminal { composed: false },
+                )
+            },
+            // Native.
+            || {
+                let mut app = App::headless_for_test();
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                let (instance, view) = app.active_native_view(WindowId(0)).expect("native front");
+                (app, crate::VisibleContentRoute::Native { instance, view })
+            },
+            // Heterogeneous.
+            || {
+                let mut app = App::headless_for_test();
+                let wid = WindowId(0);
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+                app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+                (app, crate::VisibleContentRoute::Heterogeneous)
+            },
+        ];
+        for fixture in fixtures {
+            let (app, route) = fixture();
+            assert_planned_frame_builds_once(app, route);
+        }
     }
 
     #[test]
@@ -3911,26 +3846,6 @@ mod canonical_layout_scheduler_tests {
         assert!(app.prepare_layout_coordinate_space(wid, route));
         assert!(app.active_visible_leaf_plan(wid).is_some());
         assert_eq!(visible_leaf_plan_builds(), 3);
-    }
-
-    #[test]
-    fn native_frame_threads_one_visible_plan() {
-        let mut app = App::headless_for_test();
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        let (instance, view) = app.active_native_view(WindowId(0)).expect("native front");
-        assert_planned_frame_builds_once(
-            app,
-            crate::VisibleContentRoute::Native { instance, view },
-        );
-    }
-
-    #[test]
-    fn heterogeneous_frame_threads_one_visible_plan() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
-        assert_planned_frame_builds_once(app, crate::VisibleContentRoute::Heterogeneous);
     }
 
     fn charge_cursor_body(state: &mut WindowState, now: Instant) {
@@ -5009,8 +4924,8 @@ pub(crate) struct TrailSoundPolicy {
     /// resolves it (knob off ⇒ the neutral `Technical` identity) exactly
     /// like it resolves gain.
     pub(crate) tone: aterm_effects::tone::Tone,
-    /// The `trail_sound_bed` knob (default OFF — the owner dislikes the
-    /// drone): with it off no event ever feeds the synth's bed layer, so
+    /// The `trail_sound_bed` knob (default ON since the owner's 2026-09-09
+    /// ruling): with it off no event ever feeds the synth's bed layer, so
     /// the ambient texture contributes exactly zero samples while the notes
     /// keep playing.
     pub(crate) bed: bool,
@@ -5234,6 +5149,16 @@ mod curse_bonk_drain_tests {
             None,
             "raw focus"
         );
+        // THE MENU'S OWN PROMISE, as a law rather than as prose: *"Music effects in
+        // Top Settings is the master switch for the synth voices"*
+        // (`prefs::group_footnote`, "Sound"). `bonk_sound_gain` once had no master
+        // input at all, so the bonk was audible with Music effects off; the knob
+        // stays ON here so nothing ELSE can be what muted it.
+        assert_eq!(
+            bonk_sound_gain(true, false, true, false, 0.4),
+            None,
+            "Music effects master off silences the bonk with the knob still on"
+        );
         assert_eq!(
             bonk_sound_gain(true, true, false, false, 0.4),
             None,
@@ -5248,25 +5173,6 @@ mod curse_bonk_drain_tests {
             bonk_sound_gain(true, true, true, false, 0.0),
             None,
             "zero volume"
-        );
-    }
-
-    /// THE MENU'S OWN PROMISE, as a law rather than as prose: *"Music effects
-    /// in Top Settings is the master switch for the synth voices"*
-    /// (`prefs::group_footnote`, "Sound"). Turning Music effects OFF while the
-    /// Curse bonk knob stays ON — the exact posture a user who wants silence
-    /// leaves the app in — must resolve to silence.
-    ///
-    /// This is the case the shipped code got wrong: `bonk_sound_gain` had no
-    /// master input at all, so the bonk was audible with Music effects off.
-    /// Asserted with the knob deliberately left ON so it cannot pass because
-    /// something ELSE muted the voice.
-    #[test]
-    fn music_effects_off_silences_the_bonk_even_with_the_knob_on() {
-        assert_eq!(
-            bonk_sound_gain(true, false, true, false, 0.4),
-            None,
-            "Music effects off must silence the bonk with the knob still on",
         );
     }
 
@@ -5562,6 +5468,9 @@ fn acknowledge_successful_present(
     );
     let frame_interval = state.frame_interval.unwrap_or(app_frame_interval);
     state.on_present_succeeded();
+    // Every present — content, effect, native — occupies a FIFO slot, so the
+    // queue model hears all of them (`WindowState::fifo_backlog`).
+    state.note_present_backlog(presented_at, frame_interval);
     let content_presented = std::mem::take(&mut state.content_pending);
     if content_presented {
         state.on_content_presented(presented_at);
@@ -5792,16 +5701,6 @@ mod trail_present_pacing_tests {
             win_h: 384,
             head: 0,
         }
-    }
-
-    #[test]
-    fn useful_present_consumes_near_pending_animation_tick() {
-        let frame = Instant::now();
-        let mut next = Some(frame + Duration::from_millis(1));
-        let mut anchor = None;
-        rebase_pending_trail_tick_after_present(&mut next, &mut anchor, frame);
-        assert_eq!(next, None, "no immediate effect-only frame doublet");
-        assert_eq!(anchor, Some(frame), "next sample phases from this frame");
     }
 
     /// THE CHROME-DECORATION LANE (Robi, the typed dog, the reduced-motion sing
@@ -6211,15 +6110,6 @@ mod trail_present_pacing_tests {
         ));
         assert_eq!((next, anchor), (None, Some(fired)));
     }
-    #[test]
-    fn timer_driven_present_preserves_its_fired_deadline_anchor() {
-        let fired = Instant::now();
-        let frame = fired + Duration::from_millis(2);
-        let mut next = None;
-        let mut anchor = Some(fired);
-        rebase_pending_trail_tick_after_present(&mut next, &mut anchor, frame);
-        assert_eq!(anchor, Some(fired), "timer phase lock remains intact");
-    }
 
     #[test]
     fn shared_success_ack_rebases_timers_but_content_gates_the_pacing_stamp() {
@@ -6413,30 +6303,6 @@ mod trail_present_pacing_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn brisk_tail_does_not_add_render_cost_to_each_period() {
-        let interval = Duration::from_millis(16);
-        let fired = Instant::now();
-        let after_render = fired + Duration::from_millis(2);
-        assert_eq!(
-            phase_locked_effect_deadline(after_render, interval, Some(fired), None, true),
-            fired + interval,
-            "the next slot is anchored to the timer fire, not redraw completion"
-        );
-    }
-
-    #[test]
-    fn overloaded_tail_never_catches_up_in_a_burst() {
-        let interval = Duration::from_millis(16);
-        let fired = Instant::now();
-        let overloaded = fired + Duration::from_millis(20);
-        assert_eq!(
-            phase_locked_effect_deadline(overloaded, interval, Some(fired), None, true),
-            overloaded + interval,
-            "a missed slot starts one full period from now"
-        );
     }
 
     #[test]
@@ -6900,6 +6766,14 @@ fn pending_native_leaf_damage(
 /// Lower one semantic leaf into its retained device-pixel allocation. This is
 /// the single patch/full policy for both ordinary native tabs and native leaves
 /// inside heterogeneous split trees.
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "NativePreviewFontConvergence",
+        action = "Paint",
+        project = "aterm_gui::app_render::native_damage_tests::project_native_preview_font_convergence"
+    )
+)]
 fn retain_native_leaf_raster(
     cache: &mut crate::LeafRenderCache,
     scene: crate::app_native::NativeLeafScene,
@@ -6919,6 +6793,7 @@ fn retain_native_leaf_raster(
     let tray = scene
         .compiled
         .tray_with_chrome(chrome_theme, terminal_theme, 13.0);
+    let ime_caret = scene.compiled.ime_caret_rect();
     let patched = match (cache.native.as_mut(), effective_damage) {
         (
             Some(raster),
@@ -6960,6 +6835,7 @@ fn retain_native_leaf_raster(
                 }
                 raster.stamp = scene.stamp;
                 raster.compiled = scene.compiled.clone();
+                raster.ime_caret = ime_caret;
                 raster.presented = false;
                 raster.last_work = crate::NativeRasterWork::Region {
                     rect: region,
@@ -6989,6 +6865,7 @@ fn retain_native_leaf_raster(
         cache.native = Some(crate::NativeLeafRaster {
             stamp: scene.stamp,
             compiled: scene.compiled,
+            ime_caret,
             rgba,
             width,
             height,
@@ -7361,6 +7238,101 @@ mod native_damage_tests {
     }
 
     #[test]
+    fn native_chrome_redraw_reuses_compiled_tree_but_real_damage_rebuilds() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_, view) = app.active_native_view(wid).expect("native Settings view");
+        assert!(app.prepare_native_input_scratch(wid));
+        let compiled_count = crate::app_native::native_ui_compile_count();
+        let window = &app.windows[&wid];
+        let raster = window.leaf_render_cache[&view].native.as_ref().unwrap();
+        let leaf_allocation = raster.rgba.as_ptr();
+        let compiled_allocation = raster.compiled.paint.as_ptr();
+        let pixels = raster.rgba.clone();
+        let fingerprint = raster.compiled.fingerprint();
+        let full_rasters = raster.full_rasters;
+        let observer_allocation = window
+            .native_ui_compiled
+            .as_ref()
+            .unwrap()
+            .compiled
+            .paint
+            .as_ptr();
+        assert!(!raster.compiled.paint.is_empty());
+        assert!(!raster.compiled.semantics.is_empty());
+
+        for _ in 0..3 {
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .native_ui_compiled
+                .as_mut()
+                .unwrap()
+                .phase = crate::app_native::NativeCompiledPhase::Presented;
+            assert!(app.prepare_native_input_scratch(wid));
+            let window = &app.windows[&wid];
+            let raster = window.leaf_render_cache[&view].native.as_ref().unwrap();
+            let observer = window.native_ui_compiled.as_ref().unwrap();
+            assert_eq!(crate::app_native::native_ui_compile_count(), compiled_count);
+            assert_eq!(raster.rgba.as_ptr(), leaf_allocation);
+            assert_eq!(raster.compiled.paint.as_ptr(), compiled_allocation);
+            assert_eq!(observer.compiled.paint.as_ptr(), observer_allocation);
+            assert_eq!(
+                observer.phase,
+                crate::app_native::NativeCompiledPhase::Staged
+            );
+            assert_eq!(observer.compiled.fingerprint(), fingerprint);
+            assert_eq!(raster.full_rasters, full_rasters);
+            assert_eq!(window.settings_card.as_ref().unwrap().rgba, pixels);
+            assert!(
+                app.retained_native_leaf_artifact(wid, view, false)
+                    .is_some()
+            );
+        }
+
+        // A modal changes the presented composite, while the page underneath
+        // remains the same retained paint/hit-test/accessibility authority.
+        app.palette_enter();
+        assert!(app.prepare_native_input_scratch(wid));
+        assert_eq!(crate::app_native::native_ui_compile_count(), compiled_count);
+        assert_ne!(
+            app.windows[&wid].settings_card.as_ref().unwrap().rgba,
+            pixels
+        );
+        app.windows.get_mut(&wid).unwrap().overlay = None;
+        assert!(app.prepare_native_input_scratch(wid));
+        assert_eq!(
+            app.windows[&wid].settings_card.as_ref().unwrap().rgba,
+            pixels
+        );
+
+        // Negative controls: explicit preview damage and semantic route edits
+        // must still enter the genuine compiler and replace retained semantics.
+        app.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+        assert!(app.prepare_native_input_scratch(wid));
+        assert_eq!(
+            crate::app_native::native_ui_compile_count(),
+            compiled_count + 1
+        );
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Packages));
+        assert!(app.prepare_native_input_scratch(wid));
+        assert_eq!(
+            crate::app_native::native_ui_compile_count(),
+            compiled_count + 2
+        );
+        assert_ne!(
+            app.windows[&wid]
+                .native_ui_compiled
+                .as_ref()
+                .unwrap()
+                .compiled
+                .fingerprint(),
+            fingerprint
+        );
+    }
+
+    #[test]
     fn settings_preview_tick_patches_only_the_retained_preview_band() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7398,6 +7370,262 @@ mod native_damage_tests {
             ticked.height,
             rect,
         );
+    }
+
+    fn project_native_preview_font_convergence(
+        app: &App,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        initial_epoch: u64,
+        mut observed: aterm_spec::interp::State,
+        decision: Option<bool>,
+    ) -> aterm_spec::interp::State {
+        let cache = &app.windows[&wid].leaf_render_cache[&view];
+        let retained = cache
+            .native
+            .as_ref()
+            .unwrap()
+            .compiled
+            .paint
+            .iter()
+            .find_map(|paint| match &paint.content {
+                crate::native_ui::UiContent::SettingsPreview(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("retained Typography preview");
+        // Observe ONE candidate's completion cycle without polling its worker.
+        // Superseded results belong to the separate prewarm handshake model.
+        let current = crate::tray_raster::semantic_font_snapshot_for_test(&retained.font_candidate);
+        observed.insert("pending", i64::from(current.pending));
+        observed.insert("ready", i64::from(current.ready_epoch != initial_epoch));
+        observed.insert(
+            "retained",
+            i64::from(retained.font_ready_epoch != initial_epoch),
+        );
+        observed.insert("dirty", i64::from(cache.native_damage.is_some()));
+        if let Some(decision) = decision {
+            observed.insert("decision", i64::from(decision));
+        }
+        observed
+    }
+
+    /// Witness entry at the shipping site as well as validating its actual
+    /// state change below. Calls may also poll or decide internally; this does
+    /// not claim those entry probes distinguish a transition from a no-op.
+    fn drive_native_preview_action<T>(action: &str, drive: impl FnOnce() -> T) -> T {
+        use aterm_spec::xref;
+
+        assert!(xref::reset_entered_anchors());
+        let out = drive();
+        let entered = xref::entered_anchor_ids();
+        xref::disarm_entered_anchors();
+        let anchor = xref::refinements()
+            .find(|anchor| {
+                anchor.machine == "NativePreviewFontConvergence" && anchor.action == action
+            })
+            .expect("every preview action is anchored to its shipping site");
+        assert!(
+            entered.contains(anchor.entry_id),
+            "{action} did not enter its shipping refinement: {}",
+            anchor.rust_method
+        );
+        out
+    }
+
+    #[test]
+    fn static_native_preview_paints_the_completed_font_before_disarming() {
+        use aterm_spec::interp::State;
+
+        let model = aterm_spec::derive::native_preview_font_convergence_model();
+        let preview = |app: &App, wid, view| {
+            app.windows[&wid].leaf_render_cache[&view]
+                .native
+                .as_ref()
+                .unwrap()
+                .compiled
+                .paint
+                .iter()
+                .find_map(|paint| match &paint.content {
+                    crate::native_ui::UiContent::SettingsPreview(spec) => Some(spec.clone()),
+                    _ => None,
+                })
+                .expect("visible Typography preview")
+        };
+        // Completion may first be observed while arming the next wake, or by
+        // the already-due deadline itself. Both must retain the final repaint.
+        for (poll_before_due, serious) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let mut app = App::headless_for_test();
+            app.set_serious_mode(serious);
+            let wid = WindowId(0);
+            app.windows.get_mut(&wid).unwrap().rows = 50;
+            let mut renderer = aterm_render::Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                14.0,
+                aterm_render::Theme::default(),
+            )
+            .unwrap();
+            renderer.set_runtime_font_discovery(false);
+            let font_job = crate::tray_raster::install_pending_chrome_fonts_for_test(renderer);
+            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+            let (_, view) = app.active_native_view(wid).unwrap();
+            assert!(app.prepare_native_input_scratch(wid));
+            let before = preview(&app, wid, view);
+            assert!(before.prepared_font.snapshot.pending);
+            assert_eq!(
+                before.animation(),
+                crate::settings_preview::PreviewAnimation::None
+            );
+            let initial_pixels = app.windows[&wid]
+                .settings_card
+                .as_ref()
+                .unwrap()
+                .rgba
+                .clone();
+            let initial_compiles = crate::app_native::native_ui_compile_count();
+            let initial_decision = drive_native_preview_action("Decide", || {
+                app.active_native_settings_preview(wid, 0).is_some()
+            });
+            assert!(initial_decision);
+
+            let bind = |action: &str, previous: &State, app: &App, decision: Option<bool>| {
+                let observed = project_native_preview_font_convergence(
+                    app,
+                    wid,
+                    view,
+                    before.font_ready_epoch,
+                    model.successors(action, previous)[0].clone(),
+                    decision,
+                );
+                let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    previous,
+                    &observed,
+                    Some(action),
+                    "real Settings font request, completion and retained repaint",
+                );
+                assert!(ok, "font convergence {action}: {why}");
+                // Entry alone is insufficient: omitting each real state
+                // change must fail the same transition validation.
+                let missing_fields: &[&str] = match action {
+                    "Finish" => &["pending", "ready"],
+                    "Invalidate" => &["dirty"],
+                    "Paint" => &["retained", "dirty"],
+                    _ => &[],
+                };
+                if !missing_fields.is_empty() {
+                    let mut missing = observed.clone();
+                    for &field in missing_fields {
+                        missing.insert(field, previous[field]);
+                    }
+                    let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+                        &model,
+                        &[],
+                        previous,
+                        &missing,
+                        Some(action),
+                        "negative control: entered site without its state change",
+                    );
+                    assert!(!ok, "{action} must change the real projected state");
+                }
+                observed
+            };
+            let requested = bind("Decide", &model.init_state(), &app, Some(initial_decision));
+            font_job.complete();
+
+            // A queued worker result is not installed yet. Projection must
+            // remain observational and cannot supply the missing Finish step.
+            assert_eq!(
+                project_native_preview_font_convergence(
+                    &app,
+                    wid,
+                    view,
+                    before.font_ready_epoch,
+                    requested.clone(),
+                    None,
+                ),
+                requested
+            );
+
+            // Isolate the shipping request/poll seam before the arm predicate
+            // so completion and cadence each have their own observed transition.
+            if poll_before_due {
+                drive_native_preview_action("Finish", || {
+                    app.prepare_native_semantic_font(wid, view, 33).unwrap()
+                });
+                let ready = bind("Finish", &requested, &app, None);
+                let decision = drive_native_preview_action("Decide", || {
+                    app.active_native_settings_preview(wid, 33).is_some()
+                });
+                let armed = bind("Decide", &ready, &app, Some(decision));
+                let mut abandoned = armed.clone();
+                abandoned.insert("decision", 0);
+                let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    &ready,
+                    &abandoned,
+                    Some("Decide"),
+                    "negative control: pending-only cadence loses the ready frame",
+                );
+                assert!(
+                    !ok,
+                    "the historical pending-only predicate must be rejected"
+                );
+                assert!(drive_native_preview_action("Invalidate", || {
+                    app.invalidate_active_native_settings_preview(wid, 33)
+                }));
+                let dirty = bind("Invalidate", &armed, &app, None);
+                assert!(drive_native_preview_action("Paint", || {
+                    app.prepare_native_input_scratch(wid)
+                }));
+                let painted = bind("Paint", &dirty, &app, None);
+                let decision = drive_native_preview_action("Decide", || {
+                    app.active_native_settings_preview(wid, 66).is_some()
+                });
+                bind("Decide", &painted, &app, Some(decision));
+            } else {
+                assert!(
+                    app.invalidate_active_native_settings_preview(wid, 33),
+                    "the due deadline must also install and repaint its completed result"
+                );
+                assert!(app.prepare_native_input_scratch(wid));
+            }
+
+            let after = preview(&app, wid, view);
+            assert!(!after.prepared_font.snapshot.pending);
+            assert_ne!(after.font_ready_epoch, before.font_ready_epoch);
+            assert_ne!(after.font_status, before.font_status);
+            assert_ne!(
+                app.windows[&wid].settings_card.as_ref().unwrap().rgba,
+                initial_pixels,
+                "the loading-to-ready change must reach the presented pixels"
+            );
+            assert_eq!(
+                crate::app_native::native_ui_compile_count(),
+                initial_compiles + 1
+            );
+            assert!(
+                app.active_native_settings_preview(wid, 66).is_none(),
+                "the ready static page returns to idle after its final repaint"
+            );
+            assert!(!app.invalidate_active_native_settings_preview(wid, 99));
+            assert!(app.prepare_native_input_scratch(wid));
+            assert_eq!(
+                crate::app_native::native_ui_compile_count(),
+                initial_compiles + 1
+            );
+            if serious {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorMotion));
+                assert!(app.prepare_native_input_scratch(wid));
+                assert!(
+                    app.active_native_settings_preview(wid, 132).is_none(),
+                    "font convergence must not enable cursor animation in Serious Mode"
+                );
+            }
+        }
     }
 
     #[test]
@@ -10088,53 +10316,6 @@ mod sync_hold_tests {
         assert!(!hold && seq == 2);
     }
 
-    /// A completed bracket can be presented through a sampled close+reopen only
-    /// while the replacement episode is still clean. Once any parser action has
-    /// changed that open episode, the grid no longer contains the close boundary.
-    #[test]
-    fn dirty_reopened_episode_keeps_partial_cells_off_glass() {
-        let t0 = Instant::now();
-        let timeout = Duration::from_millis(150);
-        let d = |ms| t0 + Duration::from_millis(ms);
-
-        let (armed, hold, seq) =
-            sync_frame_hold(observation(true, 0, false), false, None, 0, d(0), timeout);
-        assert!(hold);
-
-        let (clean_armed, clean_hold, clean_seq) = sync_frame_hold(
-            observation(true, 1, false),
-            true,
-            armed,
-            seq,
-            d(16),
-            timeout,
-        );
-        assert!(!clean_hold, "a clean reopen retains the completed boundary");
-        assert_eq!(clean_armed, Some(d(166)));
-
-        let (dirty_armed, dirty_hold, dirty_seq) =
-            sync_frame_hold(observation(true, 1, true), true, armed, seq, d(16), timeout);
-        assert!(
-            dirty_hold,
-            "partial cells written after the reopen must remain off glass"
-        );
-        assert_eq!(dirty_armed, Some(d(166)));
-        assert_eq!(dirty_seq, clean_seq);
-
-        assert_eq!(
-            sync_frame_hold(
-                observation(false, 2, false),
-                true,
-                dirty_armed,
-                dirty_seq,
-                d(32),
-                timeout,
-            ),
-            (None, false, 2),
-            "closing the dirty episode releases its now-complete frame"
-        );
-    }
-
     /// Tier-1 conformance for `sync_reopen_visibility_model`: drive the real
     /// parser-owned episode bit and the shipping GUI hold decision through the
     /// close/reopen race, then project each sampled state onto the derived
@@ -10212,6 +10393,40 @@ mod sync_hold_tests {
             u64::from(!clean_hold && term.sync_open_dirty()),
             clean_reopen["partial_visible"] as u64
         );
+        // Negative control (`bc73adcdd`): the retired LEVEL-sampled hold, whose
+        // decision was the mode bit itself, evaluated on this same real
+        // terminal. It reads the close+reopen as one endless episode and holds,
+        // so nothing presents. Projected field by field like the healthy
+        // decision above, it is exactly the model's `Buggy=1` ReopenClean — the
+        // transition the healthy model refuses.
+        let level_hold = term.modes().synchronized_output();
+        assert!(level_hold && !clean_hold);
+        let mut level_held = clean_reopen.clone();
+        level_held.insert("hold", i64::from(level_hold));
+        // A held frame leaves glass at the generation presented before it.
+        level_held.insert("presented_generation", first_closed["presented_generation"]);
+        level_held.insert(
+            "partial_visible",
+            i64::from(!level_hold && term.sync_open_dirty()),
+        );
+        // The level hold is the `Buggy=1` trace that picked it (`level_fault`).
+        let (mut level_closed, mut level_picked) = (first_closed.clone(), level_held.clone());
+        level_closed.insert("level_fault", 1);
+        level_picked.insert("level_fault", 1);
+        assert_eq!(
+            aterm_spec::interp::with_buggy(&model, 1).successors("ReopenClean", &level_closed),
+            vec![level_picked]
+        );
+        assert!(!model.check_invariant("CleanReopenMayPresentCompletedBoundary", &level_held));
+        let (level_ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &first_closed,
+            &level_held,
+            Some("ReopenClean"),
+            "level-sampled sync hold negative control",
+        );
+        assert!(!level_ok, "the level-sampled hold must not conform");
 
         // A real printable action dirties the reopened episode. With no new
         // close, the GUI keeps the last completed generation on glass.
@@ -10288,13 +10503,21 @@ mod sync_hold_tests {
             sync_frame_hold(terminal_observation(&raced), false, None, 0, d(64), timeout);
         assert!(raced_initial_hold);
         raced.process(b"\x1b[?2026l\x1b[?2026hpartial-next-frame");
-        let (_, correct_hold, _) = sync_frame_hold(
+        let (raced_deadline, correct_hold, raced_seq) = sync_frame_hold(
             terminal_observation(&raced),
             true,
             raced_armed,
             raced_armed_end_seq,
             d(80),
             timeout,
+        );
+        // The dirty hold arms a FRESH deadline — the freeze valve: a held pane
+        // with no deadline never gets its about_to_wait wake — and carries the
+        // episode's completed generation forward.
+        assert_eq!(
+            (raced_deadline, raced_seq),
+            (Some(d(80) + timeout), raced.sync_end_seq()),
+            "a dirty reopen holds against a fresh deadline"
         );
         let close_sequence_only_mutant_holds =
             !(raced.modes().synchronized_output() && raced.sync_end_seq() != raced_armed_end_seq);
@@ -10523,47 +10746,52 @@ mod sync_hold_tests {
 mod fallback_convergence_tests {
     use super::fallback_convergence_action;
 
-    // The rising edge + steady-pending frames: keep re-arming (which clears
-    // `last_present`, forcing the frame past the content early-out) but do NOT
-    // invalidate the GPU present cache yet — the real glyphs have not landed.
+    /// `fallback_convergence_action(pending, was_pending) -> (re-arm, invalidate)`,
+    /// its whole four-row truth table.
     #[test]
-    fn rearms_without_invalidate_while_pending() {
-        assert_eq!(
-            fallback_convergence_action(true, false),
-            (true, false),
-            "first pending frame: re-arm, no invalidate"
-        );
-        assert_eq!(
-            fallback_convergence_action(true, true),
-            (true, false),
-            "steady pending frame: re-arm, no invalidate"
-        );
-    }
-
-    // The pending→landed FALLING EDGE: re-arm AND invalidate the GPU present
-    // cache so the re-resolved glyphs reach glass (the damage diff cannot see
-    // `font_epoch`). This is the frame that actually replaces the tofu boxes.
-    #[test]
-    fn invalidates_on_landing_edge() {
-        assert_eq!(
-            fallback_convergence_action(false, true),
-            (true, true),
-            "landing edge: re-arm AND invalidate"
-        );
-    }
-
-    // Steady state — no parse in flight, none just landed — is a pure no-op, so
-    // an idle screen never churns presents. This is the regression guard for the
-    // "font zoom turns bullets into boxes" bug: the SECOND value staying paired
-    // with re-arm proves a converging frame always clears `last_present`, so the
-    // poll loop cannot die on an idle screen after one iteration.
-    #[test]
-    fn steady_state_is_a_noop() {
-        assert_eq!(
-            fallback_convergence_action(false, false),
-            (false, false),
-            "not converging: no re-arm, no invalidate"
-        );
+    fn fallback_convergence_truth_table() {
+        let rows = [
+            // The rising edge + steady-pending frames: keep re-arming (which clears
+            // `last_present`, forcing the frame past the content early-out) but do
+            // NOT invalidate the GPU present cache yet — the real glyphs have not
+            // landed.
+            (
+                true,
+                false,
+                (true, false),
+                "first pending frame: re-arm, no invalidate",
+            ),
+            (
+                true,
+                true,
+                (true, false),
+                "steady pending frame: re-arm, no invalidate",
+            ),
+            // The pending→landed FALLING EDGE: re-arm AND invalidate the GPU present
+            // cache so the re-resolved glyphs reach glass (the damage diff cannot
+            // see `font_epoch`). This is the frame that replaces the tofu boxes.
+            (
+                false,
+                true,
+                (true, true),
+                "landing edge: re-arm AND invalidate",
+            ),
+            // Steady state — no parse in flight, none just landed — is a pure no-op,
+            // so an idle screen never churns presents. This is the regression guard
+            // for the "font zoom turns bullets into boxes" bug: the SECOND value
+            // staying paired with re-arm proves a converging frame always clears
+            // `last_present`, so the poll loop cannot die on an idle screen after
+            // one iteration.
+            (
+                false,
+                false,
+                (false, false),
+                "not converging: no re-arm, no invalidate",
+            ),
+        ];
+        for (pending, was, want, why) in rows {
+            assert_eq!(fallback_convergence_action(pending, was), want, "{why}");
+        }
     }
 }
 
@@ -11157,8 +11385,8 @@ pub(crate) fn apply_drop_overlay_at(
 /// The alpha-parametrized CORE of the inset-accent-border overlay (the drop target's
 /// fixed alphas OR the upgrade rim's pulsing alpha), band-aware exactly like
 /// the fixed-alpha test helper and pure + allocation-free. With the drop-overlay constants
-/// this is byte-identical to the historical fixed-alpha pass — that equivalence is
-/// pinned by `band_aware_overlay_twins_shift_without_touching_bands`.
+/// this is exactly the fixed-alpha test helper (`apply_drop_overlay_at` calls it), whose
+/// band shift `band_aware_overlay_twins_shift_without_touching_bands` pins.
 #[allow(
     clippy::too_many_arguments,
     reason = "a raw surface + a placed frame rect is irreducibly 7 geometry scalars plus the glow; bundling them into a struct only relocates the list"
@@ -11448,22 +11676,16 @@ mod drop_overlay_tests {
         );
     }
 
-    /// W1 regression: the band-aware overlay twins are byte-identical to the
-    /// historical whole-frame compositors at offset 0, and at a band offset they
-    /// paint the SAME frame-relative pixels shifted — never touching the bands.
+    /// W1 regression: at a band offset the band-aware overlay twins paint the
+    /// SAME frame-relative pixels as at offset 0, shifted — never touching the
+    /// bands — and a negative (crop) offset clips instead of panicking.
     #[test]
     fn band_aware_overlay_twins_shift_without_touching_bands() {
         let accent = 0x0050_FA7B;
         let (fw, fh) = (40usize, 24usize);
-        // Offset 0 == the historical compositor, byte-for-byte.
+        // The offset-0 overlay the shifted frame is compared against.
         let mut a = vec![0x0010_2030u32; fw * fh];
-        let mut b = a.clone();
-        apply_drop_overlay(&mut a, fw, fh, accent);
-        apply_drop_overlay_at(&mut b, fw, fh, 0, 0, fw, fh, accent);
-        assert_eq!(
-            a, b,
-            "offset 0 must be byte-identical to the legacy overlay"
-        );
+        apply_drop_overlay_at(&mut a, fw, fh, 0, 0, fw, fh, accent);
 
         // Frame at (3, 3) inside a +7px surface: the overlaid content equals the
         // offset-0 overlay shifted by the band, and every band pixel is untouched.
@@ -11489,7 +11711,7 @@ mod drop_overlay_tests {
             }
         }
 
-        // composite_tray_at: offset 0 == legacy; a band offset shifts the card.
+        // composite_tray_at: a band offset shifts the card.
         let card = crate::SettingsCard {
             rgba: vec![0xAA, 0xBB, 0xCC, 0xFF],
             pw: 1,
@@ -11499,11 +11721,6 @@ mod drop_overlay_tests {
             fp: 0,
             geom: 0,
         };
-        let mut t0 = vec![0u32; 3 * 2];
-        composite_tray(&mut t0, 3, 2, &card);
-        let mut t1 = vec![0u32; 3 * 2];
-        composite_tray_at(&mut t1, 3, 2, 0, 0, &card);
-        assert_eq!(t0, t1, "tray offset 0 must be byte-identical");
         let mut t2 = vec![0u32; 4 * 3];
         composite_tray_at(&mut t2, 4, 3, 1, 2, &card);
         assert_eq!(
@@ -11882,6 +12099,13 @@ pub(crate) fn prepend_strip_row_slices<'a>(
         .splice(0..0, (0..strip).map(|_| Vec::new()));
     dst.default_bg_spans
         .splice(0..0, (0..strip).map(|_| Vec::new()));
+    // The band's pixel-resolution chrome rows are row-tagged: they move down
+    // with the rows they belong to.
+    for m in &mut dst.chrome_rasters {
+        m.row = m
+            .row
+            .saturating_add(u16::try_from(strip).unwrap_or(u16::MAX));
+    }
     // The cursor (terminal-grid row) is now `strip` rows lower in the window;
     // the selection anchors and motion-trail cells move down with it so they
     // stay on terminal content instead of repainting the new strip row.
@@ -12086,6 +12310,11 @@ fn scrub_overlay_row_band(input: &mut RenderInput, rows: std::ops::Range<usize>,
     if rows.start >= rows.end {
         return;
     }
+    // A replacement band also takes custody of pixel-resolution chrome.
+    // Retire only covered rasters; an uncovered meter keeps its ground/rail.
+    input
+        .chrome_rasters
+        .retain(|raster| !rows.contains(&usize::from(raster.row)));
     let start16 = u16::try_from(rows.start).unwrap_or(u16::MAX);
     let end16 = u16::try_from(rows.end).unwrap_or(u16::MAX);
     let tagged = |row: u16| row >= start16 && row < end16;
@@ -12474,96 +12703,113 @@ mod effect_only_reuse_tests {
         );
     }
 
+    /// Every way the snapshot can go stale, one row per gate clause: each row
+    /// starts from a settled engine the gate DOES reuse (the precondition is
+    /// asserted per row), applies ONE perturbation, and requires a refusal. A
+    /// stale-frame refusal is a correctness row: presenting any of these would
+    /// put content on glass the engine no longer holds.
     #[test]
-    fn contention_alone_refuses() {
-        let (mut term, scratch) = settled();
-        let epoch = term.damage_epoch();
-        assert!(
-            !super::effect_only_snapshot_reusable(false, &scratch, &term, epoch, ROWS, COLS),
-            "a try_lock that had to wait is evidence a writer is mid-batch"
-        );
-    }
-
-    #[test]
-    fn a_parser_batch_that_marks_no_damage_still_refuses() {
-        let (mut term, scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "precondition");
-        // OSC 0 retitles the window: no cell changes, no grid damage — and the
-        // damage epoch therefore cannot move. Only `process_sequence` can see
-        // it, and a batch that got this far could equally have been a CUP, a
-        // DECTCEM hide or an OSC 11 recolour, every one of which the snapshot
-        // stamps.
-        term.process(b"\x1b]0;retitled\x07");
-        assert!(
-            !term.has_damage(),
-            "negative-control precondition: this batch marks no grid damage"
-        );
-        assert!(
-            !reusable(&mut term, &scratch),
-            "the process-sequence clause is what catches a damage-free batch"
-        );
-    }
-
-    #[test]
-    fn a_host_selection_change_refuses() {
-        let (mut term, scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "precondition");
-        // `text_selection_mut` is a bare accessor: a mouse drag marks no damage
-        // and runs no batch, yet `cell_frame_fill` stamps the selection into
-        // every snapshot and the renderer paints from it.
-        term.text_selection_mut()
-            .start_selection(0, 2, SelectionSide::Left, SelectionType::Simple);
-        term.text_selection_mut()
-            .update_selection(0, 6, SelectionSide::Right);
-        term.text_selection_mut().complete_selection();
-        assert!(
-            !term.has_damage(),
-            "negative-control precondition: a selection marks no grid damage"
-        );
-        assert!(
-            !reusable(&mut term, &scratch),
-            "a selection the snapshot has not seen must never be presented stale"
-        );
-    }
-
-    #[test]
-    fn a_host_cell_mutation_since_the_fill_refuses() {
-        let (mut term, mut scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "precondition");
-        // The established ghost-paint discipline: stream fade / IME preedit /
-        // prediction ghosts bump `snapshot_seq` after writing cells. Reusing
-        // such a scratch would let the fade pass tint already-tinted cells.
-        scratch.snapshot_seq = scratch.snapshot_seq.wrapping_add(1);
-        assert!(
-            !reusable(&mut term, &scratch),
-            "a host write since the engine fill disowns the snapshot"
-        );
-    }
-
-    #[test]
-    fn real_output_refuses() {
-        let (mut term, scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "precondition");
-        term.process(b"x");
-        assert!(
-            !reusable(&mut term, &scratch),
-            "the freshness invariant is not weakened, only fast-pathed"
-        );
-    }
-
-    #[test]
-    fn a_scrolled_back_viewport_or_a_geometry_change_refuses() {
-        let (mut term, scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "precondition");
-        let epoch = term.damage_epoch();
-        assert!(
-            !super::effect_only_snapshot_reusable(true, &scratch, &term, epoch, ROWS + 1, COLS),
-            "a row count the snapshot was not filled at refuses"
-        );
-        assert!(
-            !super::effect_only_snapshot_reusable(true, &scratch, &term, epoch, ROWS, COLS + 1),
-            "a column count the snapshot was not filled at refuses"
-        );
+    fn every_way_the_snapshot_goes_stale_refuses() {
+        type Perturb = fn(&mut Terminal, &mut RenderInput) -> bool;
+        let rows: [(&str, Perturb); 8] = [
+            (
+                // A try_lock that had to wait is evidence a writer is mid-batch.
+                "contention alone",
+                |term, scratch| {
+                    let epoch = term.damage_epoch();
+                    super::effect_only_snapshot_reusable(false, scratch, term, epoch, ROWS, COLS)
+                },
+            ),
+            (
+                // OSC 0 retitles the window: no cell changes, no grid damage — and
+                // the damage epoch therefore cannot move. Only `process_sequence`
+                // can see it, and a batch that got this far could equally have been
+                // a CUP, a DECTCEM hide or an OSC 11 recolour, every one of which
+                // the snapshot stamps.
+                "a parser batch that marks no damage",
+                |term, scratch| {
+                    term.process(b"\x1b]0;retitled\x07");
+                    assert!(
+                        !term.has_damage(),
+                        "negative-control precondition: this batch marks no grid damage"
+                    );
+                    reusable(term, scratch)
+                },
+            ),
+            (
+                // `text_selection_mut` is a bare accessor: a mouse drag marks no
+                // damage and runs no batch, yet `cell_frame_fill` stamps the
+                // selection into every snapshot and the renderer paints from it.
+                "a host selection change",
+                |term, scratch| {
+                    term.text_selection_mut().start_selection(
+                        0,
+                        2,
+                        SelectionSide::Left,
+                        SelectionType::Simple,
+                    );
+                    term.text_selection_mut()
+                        .update_selection(0, 6, SelectionSide::Right);
+                    term.text_selection_mut().complete_selection();
+                    assert!(
+                        !term.has_damage(),
+                        "negative-control precondition: a selection marks no grid damage"
+                    );
+                    reusable(term, scratch)
+                },
+            ),
+            (
+                // The established ghost-paint discipline: stream fade / IME preedit
+                // / prediction ghosts bump `snapshot_seq` after writing cells.
+                // Reusing such a scratch would let the fade pass tint already-tinted
+                // cells.
+                "a host cell mutation since the fill",
+                |term, scratch| {
+                    scratch.snapshot_seq = scratch.snapshot_seq.wrapping_add(1);
+                    reusable(term, scratch)
+                },
+            ),
+            (
+                // The freshness invariant is not weakened, only fast-pathed.
+                "real output",
+                |term, scratch| {
+                    term.process(b"x");
+                    reusable(term, scratch)
+                },
+            ),
+            (
+                "a row count the snapshot was not filled at",
+                |term, scratch| {
+                    let epoch = term.damage_epoch();
+                    super::effect_only_snapshot_reusable(true, scratch, term, epoch, ROWS + 1, COLS)
+                },
+            ),
+            (
+                "a column count the snapshot was not filled at",
+                |term, scratch| {
+                    let epoch = term.damage_epoch();
+                    super::effect_only_snapshot_reusable(true, scratch, term, epoch, ROWS, COLS + 1)
+                },
+            ),
+            (
+                // Per-terminal `damage_epoch` values collide numerically (both count
+                // from zero); the identity nonce is what cannot. A tab switch hands
+                // the window a different engine with the same scratch.
+                "a snapshot from another terminal",
+                |_term, scratch| {
+                    let (mut other, _) = settled();
+                    reusable(&mut other, scratch)
+                },
+            ),
+        ];
+        for (label, perturb) in rows {
+            let (mut term, mut scratch) = settled();
+            assert!(reusable(&mut term, &scratch), "{label}: precondition");
+            assert!(
+                !perturb(&mut term, &mut scratch),
+                "{label}: a stale snapshot must never be presented"
+            );
+        }
     }
 
     /// SCR-2. The gate exists for the effect tick over an untouched engine, and
@@ -12606,20 +12852,6 @@ mod effect_only_reuse_tests {
         assert!(
             !reusable(&mut term, &scratch),
             "a scratch from one offset over an engine at another is a different viewport"
-        );
-    }
-
-    #[test]
-    fn a_snapshot_from_another_terminal_refuses() {
-        let (mut term, scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "precondition");
-        // Per-terminal `damage_epoch` values collide numerically (both count
-        // from zero); the identity nonce is what cannot. A tab switch hands the
-        // window a different engine with the same scratch.
-        let (mut other, _) = settled();
-        assert!(
-            !reusable(&mut other, &scratch),
-            "a scratch filled by a different terminal is never reusable"
         );
     }
 }
@@ -12932,35 +13164,6 @@ mod pane_free_crop_tests {
                 "flip_x={flip}: a left crop must keep the same texels"
             );
         }
-    }
-
-    /// The asymmetric case is the one that separates a mirror-aware crop from a
-    /// mirror-blind one: trim only the LEFT of a mirrored sprite and the source
-    /// window must shrink from its RIGHT, leaving `ax` alone. Advancing `ax`
-    /// here — the pre-fix behaviour — slides the window off the end of the tile
-    /// and draws the cat sliced from its own middle.
-    #[test]
-    fn a_mirrored_sprite_trims_its_source_from_the_opposite_end() {
-        let mut v = vec![sprite(-1, 8, 100, 8, true)];
-        translate_free_into_pane(&mut v, place(16)); // wide pane: left crop only
-        let s = &v[0];
-        assert_eq!(s.w, 7, "one column was cut");
-        assert_eq!(
-            s.ax, 100,
-            "a mirrored sprite cropped on the left keeps its atlas origin"
-        );
-        assert_eq!(s.aw, 7);
-        // And an unmirrored twin still advances, exactly as it always did.
-        let mut u = vec![sprite(-1, 8, 100, 8, false)];
-        translate_free_into_pane(&mut u, place(16));
-        assert_eq!(u[0].ax, 101, "the unmirrored crop is unchanged");
-    }
-
-    #[test]
-    fn a_sprite_wholly_outside_its_pane_is_dropped() {
-        let mut v = vec![sprite(50, 8, 100, 8, true)];
-        translate_free_into_pane(&mut v, place(6));
-        assert!(v.is_empty());
     }
 }
 
@@ -13606,9 +13809,9 @@ fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) 
 #[cfg(test)]
 mod pet_sing_swap_tests {
     use super::{
-        CursorFxInputs, cursor_companion_presentable, flying_kitty_admitted,
-        forward_kitty_cursor_motion, pet_caret_admitted, pet_companion_admitted,
-        pet_hit_rect_for_frame, pin_pet_mode_exit, retire_kitty_cursor_without_owner,
+        CursorFxInputs, cursor_companion_presentable, forward_kitty_cursor_motion,
+        pet_caret_admitted, pet_companion_admitted, pet_hit_rect_for_frame, pin_pet_mode_exit,
+        retire_kitty_cursor_without_owner,
     };
     use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
     use crate::{App, WindowId};
@@ -13682,230 +13885,6 @@ mod pet_sing_swap_tests {
             wrapped: false,
         });
         assert!(ws.cursor_pet.needs_frames(), "real resumed motion is owed");
-    }
-
-    #[test]
-    fn reduced_song_keeps_the_full_pet_visible_and_late_cutoffs_never_blank() {
-        let t0 = Instant::now();
-        let sense = |now, caret| PetSense {
-            caret_drawn: true,
-            now,
-            caret,
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: true,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut pet = PetBrain::default();
-        let mut now = t0;
-
-        // The ordinary resident is fully present before the song starts.
-        for _ in 0..30 {
-            now += Duration::from_millis(16);
-            let _ = pet.tick(sense(now, Some((4, 12))));
-        }
-        let mut pet_frame = pet.tick(sense(now, Some((4, 12))));
-        assert_eq!(pet_frame.alpha, 255);
-        assert!(pet_caret_admitted(true, 1.0, true));
-
-        let mut singer = crate::kitty_cursor::CursorCat::default();
-        let singer_run = now;
-        for i in 0..160u64 {
-            singer.on_pet_mode_motion_pulse(CursorCatMotionPulse {
-                at: singer_run + Duration::from_millis(i * 40),
-                kind: CursorCatMotionKind::Advance,
-            });
-        }
-        now = singer_run + Duration::from_millis(6_500);
-        singer.set_singing(
-            now,
-            crate::kitty_cursor::SingSync {
-                drive: 1.0,
-                beat: 0.0,
-            },
-        );
-        let held = singer.static_frame(now);
-        assert_eq!(held.alpha, 255);
-        assert!(!flying_kitty_admitted(true, held.sing));
-        assert!(pet_companion_admitted(true, held.sing));
-        // The singer still has an engine frame, but only the full resident
-        // is admitted to the renderer and receives the live caret.
-        pet_frame = pet.tick(sense(now, Some((4, 12))));
-        assert_eq!(pet_frame.alpha, 255);
-
-        // Tier-1: project the real reduced-motion custody verdict onto the
-        // derived state machine. Only the scalar phase bookkeeping comes from
-        // the model successor; all three presentation facts come from runtime.
-        let handoff_model = aterm_spec::derive::reduced_motion_companion_handoff_model();
-        let bind_handoff = |before: &aterm_spec::interp::State,
-                            action: &'static str,
-                            singer_visible: bool,
-                            pet_ready: bool,
-                            pet_visible: bool| {
-            let mut observed = handoff_model.successors(action, before)[0].clone();
-            observed.insert("singer_visible", i64::from(singer_visible));
-            observed.insert("pet_ready", i64::from(pet_ready));
-            observed.insert("pet_visible", i64::from(pet_visible));
-            let label = format!("reduced companion runtime {action}");
-            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-                &handoff_model,
-                &[],
-                before,
-                &observed,
-                Some(action),
-                &label,
-            );
-            assert!(ok, "real reduced custody transition rejected: {why}");
-            observed
-        };
-        let started = bind_handoff(
-            &handoff_model.init_state(),
-            "StartReducedSong",
-            flying_kitty_admitted(true, held.sing) && held.alpha > 0,
-            pet_frame.alpha == 255 && pet_caret_admitted(true, 1.0, true),
-            pet_companion_admitted(true, held.sing) && pet_frame.alpha > 0,
-        );
-
-        // No intermediate wind-down tick: an occluded frame jumps straight
-        // from the held drive to 0.49, below the 0.33 cutoff, or fully drained.
-        // The runtime transition is validated against the corresponding model
-        // action, then a forged transparent result must be rejected.
-        for (drive, action) in [
-            (0.49, "SampleLateBelowHalf"),
-            (0.30, "SampleLateBelowFaceSwap"),
-            (0.0, "SampleLateDrained"),
-        ] {
-            singer.set_singing(
-                now,
-                crate::kitty_cursor::SingSync {
-                    drive: 1.0,
-                    beat: 0.0,
-                },
-            );
-            assert_eq!(singer.static_frame(now).alpha, 255);
-            now += Duration::from_millis(16);
-            singer.set_singing(now, crate::kitty_cursor::SingSync { drive, beat: 0.0 });
-            let cat = singer.static_frame(now);
-            pet_frame = pet.tick(sense(now, Some((4, 12))));
-            let kitty_alpha = if flying_kitty_admitted(true, cat.sing) {
-                cat.alpha
-            } else {
-                0
-            };
-            let pet_alpha = if pet_companion_admitted(true, cat.sing) {
-                pet_frame.alpha
-            } else {
-                0
-            };
-            assert_eq!(
-                kitty_alpha.max(pet_alpha),
-                255,
-                "direct 1.0→{drive} reduced cutoff must reveal an opaque pet"
-            );
-            let observed = bind_handoff(
-                &started,
-                action,
-                kitty_alpha > 0,
-                pet_frame.alpha == 255 && pet_caret_admitted(true, drive, true),
-                pet_alpha > 0,
-            );
-            let mut forged_blackout = observed;
-            forged_blackout.insert("singer_visible", 0);
-            forged_blackout.insert("pet_visible", 0);
-            let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-                &handoff_model,
-                &[],
-                &started,
-                &forged_blackout,
-                Some(action),
-                "forged reduced companion blackout",
-            );
-            assert!(!ok, "{action} must reject an all-transparent projection");
-        }
-
-        // Tier-1 for the ordinary cadence too: half cutoff -> sampled tail ->
-        // below-face handoff -> drain, with every action driven by the same
-        // runtime gates as the direct-late branches above.
-        let mut cadenced = started.clone();
-        for (drive, action) in [
-            (0.50, "SampleAtHalfCutoff"),
-            (0.49, "SampleCadencedBelowHalf"),
-            (0.329, "SampleBelowFaceSwap"),
-            (0.0, "DrainSongTail"),
-        ] {
-            singer.set_singing(now, crate::kitty_cursor::SingSync { drive, beat: 0.0 });
-            let cat = singer.static_frame(now);
-            let kitty_alpha = if flying_kitty_admitted(true, cat.sing) {
-                cat.alpha
-            } else {
-                0
-            };
-            let pet_alpha = if pet_companion_admitted(true, cat.sing) {
-                pet_frame.alpha
-            } else {
-                0
-            };
-            assert_eq!(kitty_alpha.max(pet_alpha), 255, "drive {drive}");
-            cadenced = bind_handoff(
-                &cadenced,
-                action,
-                kitty_alpha > 0,
-                pet_frame.alpha == 255 && pet_caret_admitted(true, drive, true),
-                pet_alpha > 0,
-            );
-        }
-        assert_eq!(cadenced[&"phase"], 5);
-        assert_eq!(cadenced[&"pet_visible"], 1);
-
-        // A cold/new reduced-motion resident becomes an opaque still on its
-        // first live-caret sample. Reduced motion owns no frame-cadence lane,
-        // so leaving the ordinary 0.30 s appearance ramp here could strand a
-        // transparent pet behind the singer until an unrelated redraw.
-        let mut cold_pet = PetBrain::default();
-        let first = cold_pet.tick(sense(now, Some((4, 12))));
-        assert_eq!(first.alpha, 255);
-        for _ in 0..20 {
-            now += Duration::from_millis(16);
-            let frame = cold_pet.tick(sense(now, Some((4, 12))));
-            assert!(pet_caret_admitted(true, 1.0, true));
-            assert!(pet_companion_admitted(true, 1.0));
-            assert_eq!(frame.alpha, 255, "the reduced still stays opaque");
-            pet_frame = frame;
-        }
-        assert_eq!(
-            pet_frame.alpha, 255,
-            "the full pet remains visible through singing"
-        );
-
-        // Full motion keeps the same resident and caret through every phase.
-        assert!(pet_caret_admitted(true, 0.4, false));
-        assert!(pet_caret_admitted(true, 0.329, false));
-        assert!(pet_caret_admitted(true, f32::NAN, true));
-    }
-
-    /// Both motion policies and every phase keep the resident on the caret;
-    /// the classic flying-head mode retains its own presentation policy.
-    #[test]
-    fn a_song_keeps_full_pet_custody_and_never_admits_a_second_head() {
-        for reduced in [false, true] {
-            for drive in [0.0, 0.1, 0.329, 0.33, 0.49, 1.0, f32::NAN, f32::INFINITY] {
-                assert!(pet_caret_admitted(true, drive, reduced));
-                assert!(pet_companion_admitted(true, drive));
-                assert!(!flying_kitty_admitted(true, drive));
-                assert!(!pet_caret_admitted(false, drive, reduced));
-                assert!(!pet_companion_admitted(false, drive));
-                assert!(flying_kitty_admitted(false, drive));
-                assert_eq!(
-                    super::cursor_companion_duty(true, 255, Some((4, 12))),
-                    super::CompanionDuty::Pet,
-                    "a stale singing-head alpha cannot replace or double the resident"
-                );
-            }
-        }
     }
 
     /// Real pet ticks and the shipping sprite emitter, with a moving caret
@@ -14130,20 +14109,6 @@ mod pet_sing_swap_tests {
             !earned.is_active(),
             "switching away from rainbow kitty must ground the old flight"
         );
-    }
-
-    /// Single-pane rendering used to admit both companions during wind-down.
-    #[test]
-    fn pet_and_flying_face_are_never_admitted_together() {
-        for sing in [0.0, 0.1, 0.3299, 0.33, 1.0, f32::NAN] {
-            let flying = flying_kitty_admitted(true, sing);
-            let pet = pet_companion_admitted(true, sing);
-            assert_ne!(
-                pet, flying,
-                "pet mode must choose exactly one companion at sing={sing:?}"
-            );
-        }
-        assert!(!pet_companion_admitted(false, 0.0));
     }
 
     #[test]
@@ -15318,11 +15283,6 @@ mod active_pane_mark_tests {
             ActivePaneMark::key_term(left),
             ActivePaneMark::key_term(right),
             "focus moving to the sibling pane must reach glass"
-        );
-        assert_eq!(
-            ActivePaneMark::key_term(left),
-            ActivePaneMark::key_term(left),
-            "and a settled frame must not churn"
         );
     }
 }
@@ -16695,19 +16655,29 @@ mod tiled_seam_oracle_tests {
         c.app.windows[&wid].composed_retain.retained_rows()
     }
 
-    /// DIFFERENTIAL (K2): the RETAINED composite equals the one that rebuilds
-    /// every row, channel for channel, on every frame of the corpus.
+    /// THE TWO DIFFERENTIALS over three runs of the SAME corpus script through
+    /// independent `App`s: retained, rebuilt-and-tiled, and rebuilt whole-grid.
     ///
-    /// This is the whole correctness bar for the retention lane. A retained
-    /// rectangle that should have been redrawn is stale content on screen —
-    /// strictly worse than the microseconds it saves — so the two arms drive the
-    /// SAME script through two independent `App`s and compare the cells and all
-    /// six per-row channels the fill would otherwise rebuild.
+    /// * (K2) the RETAINED composite equals the one that rebuilds every row,
+    ///   channel for channel, on every frame. This is the whole correctness bar
+    ///   for the retention lane: a retained rectangle that should have been
+    ///   redrawn is stale content on screen — strictly worse than the
+    ///   microseconds it saves — so the cells and all six per-row channels the
+    ///   fill would otherwise rebuild are compared.
+    /// * the TILED composite equals the whole-grid one, cell for cell. Both of
+    ///   those arms rebuild every row: this oracle is about the SEAM pass, and
+    ///   letting the retention lane skip rows would make it compare two frames
+    ///   neither arm actually wrote.
+    ///
+    /// The rebuilt-and-tiled run is the shared middle arm of both comparisons.
     #[test]
-    fn the_retained_composite_matches_the_rebuilt_one_channel_for_channel() {
+    fn the_retained_tiled_and_whole_grid_composites_agree() {
         COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
         let (retained, retained_armed) = drive_corpus(false, true);
         let (rebuilt, rebuilt_armed) = drive_corpus(false, false);
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(true));
+        let (whole, whole_armed) = drive_corpus(false, false);
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
 
         retained_armed.assert_non_vacuous();
         retained_armed.assert_seam_pass(true);
@@ -16715,27 +16685,15 @@ mod tiled_seam_oracle_tests {
         rebuilt_armed.assert_non_vacuous();
         rebuilt_armed.assert_seam_pass(true);
         rebuilt_armed.assert_retention(false);
-        assert_frames_agree(&retained, &rebuilt, "the retained arm", "the rebuilt arm");
-    }
-
-    /// DIFFERENTIAL: the tiled composite equals the whole-grid one, cell for
-    /// cell, on every frame of the corpus.
-    #[test]
-    fn the_tiled_composite_matches_the_whole_grid_fill_cell_for_cell() {
-        // Both arms rebuild every row: this oracle is about the SEAM pass, and
-        // letting the retention lane skip rows would make it compare two
-        // frames neither arm actually wrote.
-        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
-        let (tiled, tiled_armed) = drive_corpus(false, false);
-        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(true));
-        let (whole, whole_armed) = drive_corpus(false, false);
-        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
-
-        tiled_armed.assert_non_vacuous();
-        tiled_armed.assert_seam_pass(true);
         whole_armed.assert_non_vacuous();
         whole_armed.assert_seam_pass(false);
-        assert_frames_agree(&tiled, &whole, "the tiled seam pass", "the whole-grid fill");
+        assert_frames_agree(&retained, &rebuilt, "the retained arm", "the rebuilt arm");
+        assert_frames_agree(
+            &rebuilt,
+            &whole,
+            "the tiled seam pass",
+            "the whole-grid fill",
+        );
     }
 }
 
@@ -20336,140 +20294,172 @@ mod composed_cursor_effect_advance_tests {
             .collect()
     }
 
+    /// The DEC 2026 close/reopen scripts on every present route, one row per
+    /// (route, script). Each route writes each step to EVERY visible terminal
+    /// (a pure split formats the pane index into its bytes) and then presents;
+    /// the row's `(ms, present?)` sequence is the law.
+    ///
+    /// * CLEAN close+reopen: the completed bracket keeps exactly ONE present
+    ///   license, and the newly armed episode holds on the following frame.
+    /// * DIRTY reopen: writes in the reopened episode replaced the close boundary,
+    ///   so the partial next frame stays off glass until that episode closes.
     #[test]
-    fn pure_split_close_reopen_presents_once_then_holds_the_next_episode() {
-        let (mut app, wid, _) = pure_fixture("rainbow kitty");
-        let terms = visible_terminal_handles(&app, wid);
-        assert_eq!(terms.len(), 2);
-        let t0 = Instant::now();
-
-        for term in &terms {
-            term_lock(term).process(b"\x1b[?2026hheld");
+    fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
+        #[derive(Clone, Copy, Debug)]
+        enum Route {
+            PureSplit,
+            Mixed,
+            HeadlessSingleCapture,
         }
-        assert!(
-            !redraw_pure(&mut app, wid, t0),
-            "one held pane holds the complete split"
-        );
-
-        for (index, term) in terms.iter().enumerate() {
-            term_lock(term).process(format!("frame-{index}\x1b[?2026l\x1b[?2026h").as_bytes());
+        // (bytes — `{i}` is the pane index — or "" for none, ms, presents?, why)
+        type Step = (&'static str, u64, bool, &'static str);
+        const HOLD: &str = "\x1b[?2026hheld";
+        let rows: [(Route, [Step; 3]); 5] = [
+            (
+                Route::PureSplit,
+                [
+                    (HOLD, 0, false, "one held pane holds the complete split"),
+                    (
+                        "frame-{i}\x1b[?2026l\x1b[?2026h",
+                        16,
+                        true,
+                        "unchanged extraction-lock samples preserve the close+rearm present license",
+                    ),
+                    (
+                        "",
+                        32,
+                        false,
+                        "the newly armed episodes hold again on the following frame",
+                    ),
+                ],
+            ),
+            (
+                Route::PureSplit,
+                [
+                    (HOLD, 0, false, "held"),
+                    (
+                        "complete-{i}\x1b[?2026l\x1b[?2026hpartial-{i}",
+                        16,
+                        false,
+                        "writes in the reopened episodes replaced the close boundary and must stay off glass",
+                    ),
+                    (
+                        "done\x1b[?2026l",
+                        32,
+                        true,
+                        "closing every dirty reopened episode releases the complete split",
+                    ),
+                ],
+            ),
+            (
+                Route::Mixed,
+                [
+                    (HOLD, 0, false, "held"),
+                    (
+                        "complete\x1b[?2026l\x1b[?2026h",
+                        16,
+                        true,
+                        "the completed bracket keeps its one mixed-frame present license",
+                    ),
+                    (
+                        "",
+                        32,
+                        false,
+                        "the newly armed mixed episode holds on the next frame",
+                    ),
+                ],
+            ),
+            (
+                Route::Mixed,
+                [
+                    (HOLD, 0, false, "held"),
+                    (
+                        "complete\x1b[?2026l\x1b[?2026hpartial",
+                        16,
+                        false,
+                        "a heterogeneous frame cannot expose dirty reopened terminal cells",
+                    ),
+                    (
+                        "done\x1b[?2026l",
+                        32,
+                        true,
+                        "the completed reopened episode releases the mixed frame",
+                    ),
+                ],
+            ),
+            (
+                Route::HeadlessSingleCapture,
+                [
+                    (HOLD, 0, false, "held"),
+                    (
+                        "complete\x1b[?2026l\x1b[?2026hpartial",
+                        16,
+                        false,
+                        "capture must not mistake a dirty reopen for the completed close boundary",
+                    ),
+                    (
+                        "done\x1b[?2026l",
+                        32,
+                        true,
+                        "capture resumes with the fully completed reopened episode",
+                    ),
+                ],
+            ),
+        ];
+        for (route, steps) in rows {
+            let (mut app, wid, terms) = match route {
+                Route::PureSplit => {
+                    let (app, wid, _) = pure_fixture("rainbow kitty");
+                    let terms = visible_terminal_handles(&app, wid);
+                    assert_eq!(terms.len(), 2, "a two-pane split");
+                    (app, wid, terms)
+                }
+                Route::Mixed => {
+                    let (app, wid, session) = mixed_fixture("rainbow kitty");
+                    let term = app.pool.get(session).expect("terminal leaf").term.clone();
+                    (app, wid, vec![term])
+                }
+                Route::HeadlessSingleCapture => {
+                    let mut app = App::headless_for_test();
+                    app.config.cursor_trail = Some(true);
+                    app.config.cursor_trail_style = Some("rainbow kitty".into());
+                    app.config.trail_sounds = Some(false);
+                    let wid = WindowId(0);
+                    let term = app
+                        .front_terminal(wid)
+                        .expect("front terminal")
+                        .term
+                        .clone();
+                    (app, wid, vec![term])
+                }
+            };
+            let t0 = Instant::now();
+            for (bytes, ms, presents, why) in steps {
+                for (index, term) in terms.iter().enumerate() {
+                    if !bytes.is_empty() {
+                        term_lock(term)
+                            .process(bytes.replace("{i}", &index.to_string()).as_bytes());
+                    }
+                }
+                let now = t0 + Duration::from_millis(ms);
+                let presented = match route {
+                    Route::PureSplit => redraw_pure(&mut app, wid, now),
+                    Route::Mixed => app
+                        .prepare_heterogeneous_input_scratch_with_cursor_fx(
+                            wid,
+                            Some(ComposedCursorFxClock::Advance(now)),
+                        )
+                        .is_some(),
+                    Route::HeadlessSingleCapture => app
+                        .prepare_terminal_capture_grid_with_cursor_fx(
+                            wid,
+                            ComposedCursorFxClock::Advance(now),
+                        )
+                        .is_some(),
+                };
+                assert_eq!(presented, presents, "{route:?} +{ms} ms: {why}");
+            }
         }
-        assert!(
-            redraw_pure(&mut app, wid, t0 + Duration::from_millis(16)),
-            "unchanged extraction-lock samples preserve the close+rearm present license"
-        );
-        assert!(
-            !redraw_pure(&mut app, wid, t0 + Duration::from_millis(32)),
-            "the newly armed episodes hold again on the following frame"
-        );
-    }
-
-    #[test]
-    fn pure_split_dirty_reopen_never_presents_partial_next_frame() {
-        let (mut app, wid, _) = pure_fixture("rainbow kitty");
-        let terms = visible_terminal_handles(&app, wid);
-        assert_eq!(terms.len(), 2);
-        let t0 = Instant::now();
-
-        for term in &terms {
-            term_lock(term).process(b"\x1b[?2026hheld");
-        }
-        assert!(!redraw_pure(&mut app, wid, t0));
-
-        for (index, term) in terms.iter().enumerate() {
-            term_lock(term).process(
-                format!("complete-{index}\x1b[?2026l\x1b[?2026hpartial-{index}").as_bytes(),
-            );
-        }
-        assert!(
-            !redraw_pure(&mut app, wid, t0 + Duration::from_millis(16)),
-            "writes in the reopened episodes replaced the close boundary and must stay off glass"
-        );
-
-        for term in &terms {
-            term_lock(term).process(b"done\x1b[?2026l");
-        }
-        assert!(
-            redraw_pure(&mut app, wid, t0 + Duration::from_millis(32)),
-            "closing every dirty reopened episode releases the complete split"
-        );
-    }
-
-    #[test]
-    fn mixed_close_reopen_presents_once_then_holds_the_next_episode() {
-        let (mut app, wid, session) = mixed_fixture("rainbow kitty");
-        let term = app.pool.get(session).expect("terminal leaf").term.clone();
-        let t0 = Instant::now();
-        term_lock(&term).process(b"\x1b[?2026hheld");
-        assert!(
-            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(t0)),
-            )
-            .is_none()
-        );
-
-        term_lock(&term).process(b"complete\x1b[?2026l\x1b[?2026h");
-        assert!(
-            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(
-                    t0 + Duration::from_millis(16),
-                )),
-            )
-            .is_some(),
-            "the completed bracket keeps its one mixed-frame present license"
-        );
-        assert!(
-            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(
-                    t0 + Duration::from_millis(32),
-                )),
-            )
-            .is_none(),
-            "the newly armed mixed episode holds on the next frame"
-        );
-    }
-
-    #[test]
-    fn mixed_dirty_reopen_never_presents_partial_next_frame() {
-        let (mut app, wid, session) = mixed_fixture("rainbow kitty");
-        let term = app.pool.get(session).expect("terminal leaf").term.clone();
-        let t0 = Instant::now();
-
-        term_lock(&term).process(b"\x1b[?2026hheld");
-        assert!(
-            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(t0)),
-            )
-            .is_none()
-        );
-
-        term_lock(&term).process(b"complete\x1b[?2026l\x1b[?2026hpartial");
-        assert!(
-            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(
-                    t0 + Duration::from_millis(16),
-                )),
-            )
-            .is_none(),
-            "a heterogeneous frame cannot expose dirty reopened terminal cells"
-        );
-
-        term_lock(&term).process(b"done\x1b[?2026l");
-        assert!(
-            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
-                wid,
-                Some(ComposedCursorFxClock::Advance(
-                    t0 + Duration::from_millis(32),
-                )),
-            )
-            .is_some(),
-            "the completed reopened episode releases the mixed frame"
-        );
     }
 
     #[test]
@@ -20698,50 +20688,6 @@ mod composed_cursor_effect_advance_tests {
             ),
             CapturePreparation::Unavailable
         ));
-    }
-
-    #[test]
-    fn headless_single_capture_holds_dirty_close_reopen_until_completion() {
-        let mut app = App::headless_for_test();
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".into());
-        app.config.trail_sounds = Some(false);
-        let wid = WindowId(0);
-        let term = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        let t0 = Instant::now();
-
-        term_lock(&term).process(b"\x1b[?2026hheld");
-        assert!(
-            app.prepare_terminal_capture_grid_with_cursor_fx(
-                wid,
-                ComposedCursorFxClock::Advance(t0),
-            )
-            .is_none()
-        );
-
-        term_lock(&term).process(b"complete\x1b[?2026l\x1b[?2026hpartial");
-        assert!(
-            app.prepare_terminal_capture_grid_with_cursor_fx(
-                wid,
-                ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16)),
-            )
-            .is_none(),
-            "capture must not mistake a dirty reopen for the completed close boundary"
-        );
-
-        term_lock(&term).process(b"done\x1b[?2026l");
-        assert!(
-            app.prepare_terminal_capture_grid_with_cursor_fx(
-                wid,
-                ComposedCursorFxClock::Advance(t0 + Duration::from_millis(32)),
-            )
-            .is_some(),
-            "capture resumes with the fully completed reopened episode"
-        );
     }
 
     #[test]
@@ -22127,155 +22073,6 @@ fn blit_rgba_over(
     }
 }
 
-/// Would this rendered row have been permuted by the BiDi reorder?
-///
-/// Delegates the predicate to `aterm-bidi` — the same classifier
-/// `apply_bidi_reorder` consults — so "which rows are visually reordered" cannot
-/// drift between the code that reorders and the code that refuses to paint over
-/// the result. `false` means logical order == visual order for this row, which
-/// is the precondition every logical-coordinate painter silently assumes.
-#[allow(
-    dead_code,
-    reason = "landed with its tests ahead of the host wiring (step 6-11 of docs/RFC-inline-suggest.md); the painter and its BiDi guard are the parts worth reviewing independently of the plumbing"
-)]
-fn row_needs_bidi(rowv: &[RenderCell]) -> bool {
-    rowv.iter().any(|c| aterm_bidi::has_bidi(&[c.ch]))
-}
-
-/// The cells an inline suggestion actually occupied, in the scratch's
-/// coordinates: `start` inclusive, `end` exclusive-ish (the last cell written is
-/// `end`).
-///
-/// Returned rather than a bare `bool` because the ghost is machine-invented text
-/// that must be MASKED from every published surface — copy, selection,
-/// scrollback, recordings and the `aterm-observe` introspection capture. The
-/// caller cannot reconstruct the extent from the suggestion string alone (wrap
-/// position, the bottom-edge stop and the blank-cell stop all shorten it), and
-/// `paint_prediction_ghosts`' caller only gets away with a `bool` because it
-/// still holds the `&[Prediction]` that names every cell it painted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PaintedGhost {
-    /// First cell written, `(row, col)`.
-    start: (usize, usize),
-    /// Last cell written, `(row, col)`.
-    end: (usize, usize),
-}
-
-/// Paint an inline suggestion (ghost text) starting at `(row, col)`, wrapping at
-/// the right margin. Returns the extent painted, or `None` if nothing was.
-///
-/// Sibling of [`paint_prediction_ghosts`] with two deliberate differences.
-///
-/// * **Dimmer.** A prediction is *your own text arriving*; a suggestion is an
-///   OFFER. Predictions blend halfway to the background, suggestions three
-///   quarters, so the two are distinguishable at a glance and the offer never
-///   competes with real output for attention.
-/// * **It is a string, not a cell set.** The suggestion has no per-cell
-///   provenance to reconcile — it is accepted whole (or by word) or it is not.
-///
-/// Stops — rather than overwriting — at three boundaries: the bottom edge (a
-/// suggestion that scrolled the grid would move real output), a row the BiDi
-/// reorder would permute, and the first NON-BLANK cell.
-///
-/// That last one is load-bearing. Under `fish` or `zsh-autosuggestions` the
-/// shell has *already* painted its own suggestion as REAL grid content to the
-/// right of the cursor; without this guard aterm would paint a second, different
-/// completion on top of it. It equally covers the user having moved back into
-/// the middle of a line, where everything right of the cursor is their own text.
-#[allow(
-    dead_code,
-    reason = "landed with its tests ahead of the host wiring — see `row_needs_bidi`"
-)]
-fn paint_suggestion(
-    scratch: &mut RenderInput,
-    text: &str,
-    start: (usize, usize),
-    cols: usize,
-    blank: RenderCell,
-) -> Option<PaintedGhost> {
-    if text.is_empty() || cols == 0 {
-        return None;
-    }
-    // BIDI, half one: the suggestion's own glyphs. Painting an RTL character
-    // would itself make the row bidi — the reorder that runs before the NEXT
-    // frame would then permute cells this ghost is addressing logically. Checked
-    // once, up front, over the whole string.
-    if text.chars().any(|c| aterm_bidi::has_bidi(&[c])) {
-        return None;
-    }
-    let (mut row, mut col) = start;
-    let mut painted: Option<PaintedGhost> = None;
-    // BIDI, half two: the rows painted into. `Terminal::cell_frame_into` ends
-    // with `apply_bidi_reorder`, so a scratch row is in VISUAL order — but the
-    // suggestion's column is a LOGICAL offset from the cursor. On a row holding
-    // an RTL run the two disagree and the ghost lands on top of real text.
-    //
-    // Hoisted out of the per-character loop: the predicate is a property of the
-    // ROW, and re-deriving it for every glyph made the painter quadratic
-    // (`O(chars × row_len)` — a 60-char suggestion on a 200-column row cost
-    // 12 000 classifications per frame, on the render path).
-    let mut checked: Option<usize> = None;
-    for ch in text.chars() {
-        if col >= cols {
-            row += 1;
-            col = 0;
-        }
-        let Some(rowv) = scratch.cells.get_mut(row) else {
-            break; // bottom edge: stop rather than scroll real content
-        };
-        if checked != Some(row) {
-            if row_needs_bidi(rowv) {
-                break;
-            }
-            checked = Some(row);
-        }
-        // NEVER overwrite real content. A cell inside the row's trimmed length
-        // holding anything but a space is the shell's own autosuggestion, or the
-        // user's own text with the cursor moved back into it — either way it is
-        // not ours. Cells past the trimmed length do not exist yet and are ours
-        // to extend into.
-        if rowv.get(col).is_some_and(|c| c.ch != ' ') {
-            break;
-        }
-        let template = rowv.last().copied().unwrap_or(blank);
-        let mut pad = template;
-        pad.ch = ' ';
-        while rowv.len() <= col {
-            rowv.push(pad);
-        }
-        let cell = &mut rowv[col];
-        let (fg, bg) = (cell.fg, cell.bg);
-        cell.ch = ch;
-        // Three quarters of the way to the background — see the doc comment.
-        cell.fg = [
-            ((fg[0] as u16 + 3 * bg[0] as u16) / 4) as u8,
-            ((fg[1] as u16 + 3 * bg[1] as u16) / 4) as u8,
-            ((fg[2] as u16 + 3 * bg[2] as u16) / 4) as u8,
-        ];
-        cell.wide = false;
-        cell.emoji_presentation = false;
-        cell.text_presentation = false;
-        cell.bold = false;
-        cell.italic = false;
-        cell.underline = aterm_core::terminal::UnderlineStyle::None;
-        cell.strikethrough = false;
-        cell.overline = false;
-        cell.underline_color = None;
-        painted = Some(match painted {
-            None => PaintedGhost {
-                start: (row, col),
-                end: (row, col),
-            },
-            Some(p) => PaintedGhost {
-                end: (row, col),
-                ..p
-            },
-        });
-        col += 1;
-    }
-    painted
-}
-
 /// Hand a consumer the predictor's resident overlay slice. Keeping the borrow
 /// inside this closure lets callers mutate a disjoint render scratch without a
 /// transient `Vec<Prediction>` copy.
@@ -22388,43 +22185,60 @@ mod ime_preedit_field_tests {
     //! its own unit tests in aterm-core; this module owns only the field twin.
     use super::field_preedit_display;
 
+    /// `field_preedit_display(text, caret, preedit, preedit_caret)` → (display,
+    /// caret, underline span), one labelled row per case.
     #[test]
-    fn field_display_splices_at_the_caret() {
-        // Caret mid-field, IME caret mid-composition: the composition lands at
-        // the field caret and the visible caret rides INSIDE it.
-        let (text, caret, span) = field_preedit_display("find", 2, "中文", Some("中".len()));
-        assert_eq!(text, "fi中文nd");
-        assert_eq!(span, 2.."fi中文".len());
-        assert_eq!(caret, 2 + "中".len());
-        // No caret offset ⇒ the field caret sits after the whole composition
-        // (winit's "platform gave no range" contract).
-        let (text, caret, _) = field_preedit_display("ab", 2, "に", None);
-        assert_eq!(text, "abに");
-        assert_eq!(caret, text.len());
-    }
-
-    /// Both offsets are floored to char boundaries: a field caret or a platform
-    /// caret landing mid-UTF-8 must not panic the render path.
-    #[test]
-    fn interior_byte_offsets_are_floored_to_char_boundaries() {
-        // Field caret 1 is inside "中"; the composition caret 2 is inside "日".
-        let (text, caret, span) = field_preedit_display("中", 1, "日", Some(2));
-        assert_eq!(text, "日中", "the field caret floored to 0");
-        assert_eq!(span, 0.."日".len());
-        assert_eq!(caret, 0, "the composition caret floored to 0");
-    }
-
-    /// An empty composition is the identity: the display string, the caret and
-    /// an empty span reproduce the settled field exactly.
-    #[test]
-    fn an_empty_composition_is_the_identity() {
-        let (text, caret, span) = field_preedit_display("query", 3, "", None);
-        assert_eq!(text, "query");
-        assert_eq!(caret, 3);
-        assert!(
-            span.is_empty(),
-            "an empty span authors no underline, no anchor"
-        );
+    fn field_preedit_display_rows() {
+        enum Span {
+            Is(std::ops::Range<usize>),
+            Empty,
+            Unchecked,
+        }
+        let rows = [
+            // Caret mid-field, IME caret mid-composition: the composition lands at
+            // the field caret and the visible caret rides INSIDE it.
+            (
+                "splices at the caret",
+                ("find", 2, "中文", Some("中".len())),
+                ("fi中文nd", 2 + "中".len(), Span::Is(2.."fi中文".len())),
+            ),
+            // No caret offset ⇒ the field caret sits after the whole composition
+            // (winit's "platform gave no range" contract).
+            (
+                "no platform caret",
+                ("ab", 2, "に", None),
+                ("abに", "abに".len(), Span::Unchecked),
+            ),
+            // Both offsets are floored to char boundaries: a field caret or a
+            // platform caret landing mid-UTF-8 must not panic the render path.
+            // Field caret 1 is inside "中"; the composition caret 2 is inside "日".
+            (
+                "interior byte offsets floor to char boundaries",
+                ("中", 1, "日", Some(2)),
+                ("日中", 0, Span::Is(0.."日".len())),
+            ),
+            // An empty composition is the identity: the display string and the
+            // caret reproduce the settled field, and the empty span authors no
+            // underline, no anchor.
+            (
+                "an empty composition is the identity",
+                ("query", 3, "", None),
+                ("query", 3, Span::Empty),
+            ),
+        ];
+        for (label, (text, caret, preedit, preedit_caret), (want_text, want_caret, want_span)) in
+            rows
+        {
+            let (got_text, got_caret, got_span) =
+                field_preedit_display(text, caret, preedit, preedit_caret);
+            assert_eq!(got_text, want_text, "{label}");
+            assert_eq!(got_caret, want_caret, "{label}");
+            match want_span {
+                Span::Is(span) => assert_eq!(got_span, span, "{label}"),
+                Span::Empty => assert!(got_span.is_empty(), "{label}"),
+                Span::Unchecked => {}
+            }
+        }
     }
 }
 
@@ -22608,169 +22422,6 @@ mod overlay_card_theme_tests {
 }
 
 #[cfg(test)]
-mod suggestion_paint_tests {
-    use super::paint_suggestion;
-    use aterm_core::terminal::RenderCell;
-    use aterm_render::RenderInput;
-
-    fn blank() -> RenderCell {
-        RenderCell {
-            ch: ' ',
-            fg: [200, 200, 200],
-            bg: [0, 0, 0],
-            wide: false,
-            emoji_presentation: false,
-            text_presentation: false,
-            bold: false,
-            italic: false,
-            underline: aterm_core::terminal::UnderlineStyle::None,
-            strikethrough: false,
-            overline: false,
-            underline_color: None,
-            overline_color: None,
-        }
-    }
-
-    fn scratch(rows: usize) -> RenderInput {
-        let mut s = RenderInput::empty();
-        s.cells = vec![Vec::new(); rows];
-        s
-    }
-
-    #[test]
-    fn suggestion_paints_dimmer_than_a_prediction() {
-        let mut s = scratch(2);
-        assert!(paint_suggestion(&mut s, "ab", (0, 2), 10, blank()).is_some());
-        assert_eq!(s.cells[0][2].ch, 'a');
-        assert_eq!(s.cells[0][3].ch, 'b');
-        assert_eq!(
-            s.cells[0][2].fg,
-            [50, 50, 50],
-            "three quarters to bg — a prediction dims only halfway ([100;3])"
-        );
-    }
-
-    #[test]
-    fn suggestion_wraps_at_the_right_margin() {
-        let mut s = scratch(2);
-        assert!(paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).is_some());
-        assert_eq!(s.cells[0][2].ch, 'x');
-        assert_eq!(s.cells[0][3].ch, 'y');
-        assert_eq!(s.cells[1][0].ch, 'z', "continues on the next row");
-    }
-
-    #[test]
-    fn suggestion_stops_at_the_bottom_edge_instead_of_scrolling() {
-        let mut s = scratch(1);
-        // Only one row exists; the tail would need a second.
-        assert!(paint_suggestion(&mut s, "abcde", (0, 2), 4, blank()).is_some());
-        assert_eq!(
-            s.cells.len(),
-            1,
-            "no row was added — real output must not move"
-        );
-        assert_eq!(s.cells[0][2].ch, 'a');
-        assert_eq!(s.cells[0][3].ch, 'b');
-    }
-
-    #[test]
-    fn empty_text_paints_nothing() {
-        let mut s = scratch(2);
-        assert!(paint_suggestion(&mut s, "", (0, 0), 10, blank()).is_none());
-        assert!(s.cells[0].is_empty());
-    }
-
-    #[test]
-    fn degenerate_geometry_paints_nothing() {
-        let mut s = scratch(2);
-        assert!(paint_suggestion(&mut s, "abc", (0, 0), 0, blank()).is_none());
-    }
-
-    /// The scratch is bidi-REORDERED (visual order) but the suggestion column is
-    /// a LOGICAL offset, so on an RTL row the two disagree. Refusing is the only
-    /// safe option; painting would land the ghost on top of real text.
-    #[test]
-    fn an_rtl_row_is_refused_rather_than_mispainted() {
-        let mut s = scratch(1);
-        let mut hebrew = blank();
-        hebrew.ch = 'ש';
-        s.cells[0] = vec![hebrew, blank()];
-        assert!(
-            paint_suggestion(&mut s, "abc", (0, 2), 10, blank()).is_none(),
-            "a row the BiDi reorder would permute must not take a logical-coord ghost"
-        );
-        assert_eq!(s.cells[0][0].ch, 'ש', "real content untouched");
-    }
-
-    /// An RTL glyph in the SUGGESTION would make the row bidi, so the next
-    /// frame's reorder would permute the very cells this ghost addresses
-    /// logically. Refused up front, before any cell is touched.
-    #[test]
-    fn an_rtl_suggestion_is_refused_on_an_ltr_row() {
-        let mut s = scratch(1);
-        s.cells[0] = vec![blank(), blank()];
-        assert!(paint_suggestion(&mut s, "שלום", (0, 2), 10, blank()).is_none());
-        assert_eq!(s.cells[0].len(), 2, "no cell was touched");
-    }
-
-    /// The row predicate is hoisted out of the character loop; a multi-row
-    /// suggestion must still re-check when it wraps onto a NEW row.
-    #[test]
-    fn wrapping_onto_an_rtl_row_stops_at_that_row() {
-        let mut s = scratch(2);
-        let mut heb = blank();
-        heb.ch = 'ש';
-        s.cells[0] = vec![blank(), blank()];
-        s.cells[1] = vec![heb];
-        assert!(paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).is_some());
-        assert_eq!(s.cells[0][2].ch, 'x');
-        assert_eq!(s.cells[0][3].ch, 'y');
-        assert_eq!(
-            s.cells[1][0].ch, 'ש',
-            "the wrapped tail must not land on an RTL row"
-        );
-    }
-
-    /// Under `fish` / `zsh-autosuggestions` the shell has ALREADY painted its
-    /// own completion as real grid content right of the cursor. Painting a
-    /// second, different one on top of it is the worst outcome available.
-    #[test]
-    fn a_non_blank_cell_stops_the_ghost() {
-        let mut s = scratch(1);
-        let mut shell_sugg = blank();
-        shell_sugg.ch = 'Z';
-        // "$ " then a blank we may use, then the shell's own suggestion.
-        s.cells[0] = vec![blank(), blank(), blank(), shell_sugg];
-        let g = paint_suggestion(&mut s, "abc", (0, 2), 10, blank()).expect("one cell");
-        assert_eq!(s.cells[0][2].ch, 'a', "the blank cell was ours to take");
-        assert_eq!(s.cells[0][3].ch, 'Z', "the shell's suggestion is untouched");
-        assert_eq!(g.start, (0, 2));
-        assert_eq!(g.end, (0, 2), "the extent stops at the collision");
-    }
-
-    /// The extent is what a host masks from copy / a11y / introspection, so it
-    /// must describe the cells actually written — not the string it was asked
-    /// to paint.
-    #[test]
-    fn the_reported_extent_tracks_a_wrap() {
-        let mut s = scratch(2);
-        let g = paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).expect("painted");
-        assert_eq!(g.start, (0, 2));
-        assert_eq!(g.end, (1, 0), "ends on the wrapped row");
-    }
-
-    #[test]
-    fn a_pure_ltr_row_still_paints() {
-        let mut s = scratch(1);
-        let mut a = blank();
-        a.ch = '$';
-        s.cells[0] = vec![a, blank()];
-        assert!(paint_suggestion(&mut s, "ab", (0, 2), 10, blank()).is_some());
-        assert_eq!(s.cells[0][2].ch, 'a');
-    }
-}
-
-#[cfg(test)]
 mod prediction_ghost_tests {
     use super::{paint_prediction_ghosts, terminal_blank_cell, with_borrowed_prediction_overlay};
     use crate::predict::{PredictMode, Prediction, Predictor};
@@ -22949,121 +22600,184 @@ mod comet_trail_tests {
     use crate::App;
     use crate::cursor_glow::GlowStyle;
 
-    /// The "comet" style is the best-of-all: the additive aurora light CROWN
-    /// (bloom + landing ring, per config), the continuous anti-aliased BEAM along
-    /// the swept path (the spatial-continuity fix — without it the grid-quantized
-    /// cell body reads as gappy blocks), AND the faint cadence-comet `TrailCell`
-    /// ember bed under both (its coverage capped low; see READABLE_ALPHA_CAP). So
-    /// `glow_config` reports an enabled `Comet` aurora (its own variant since the
-    /// icy-tail/nucleus upgrade — icy ramp, debris glitter, glacial default hue)
-    /// with crown, ring, and `beam = true`, AND `trail_config` reports an enabled
-    /// comet trail body.
+    /// The trail-style config spellings → `glow_config()` / `trail_config()`, one
+    /// row per spelling. The spellings are a config contract; each row asserts
+    /// only the fields its case is about (`None` = not asserted).
+    ///
+    /// * "comet" is the best-of-all: the additive aurora light CROWN (bloom +
+    ///   landing ring), the continuous anti-aliased BEAM along the swept path (the
+    ///   spatial-continuity fix — without it the grid-quantized cell body reads as
+    ///   gappy blocks), AND the faint cadence-comet `TrailCell` ember bed under
+    ///   both (its coverage capped low; see READABLE_ALPHA_CAP) — its own `Comet`
+    ///   aurora since the icy-tail/nucleus upgrade (icy ramp, debris glitter,
+    ///   glacial default hue).
+    /// * "beam" is the first-class steady TUBE (`GlowStyle::Beam`, its PHOTON
+    ///   ICE-BLUE default hue) and keeps its old preset's discipline: aurora
+    ///   enabled but radius 0 / ring off, and NO trail body — even when crown and
+    ///   ring are explicitly configured on. An explicit trail colour still
+    ///   overrides the ice-blue default.
+    /// * the additive-only styles (lumen/rainbow/…) keep their configured
+    ///   crown+ring AND their own additive beam, and produce NO trail body (the
+    ///   comet trail is comet-exclusive). Water is the exception — it drops the
+    ///   beam (WATER-1); laser, the beam it was being conflated with, keeps it.
+    /// * "off", and the master `cursor_trail = false` switch whatever the style
+    ///   (comet included), disable BOTH layers.
     #[test]
-    fn comet_style_keeps_the_light_crown_and_enables_the_trail() {
-        let mut app = App::headless_for_test();
-        app.config.cursor_trail = Some(true); // master switch; this test covers STYLE mapping
-        app.config.cursor_trail_style = Some("comet".into());
-        let g = app.glow_config();
-        assert!(g.enabled, "comet keeps an ENABLED aurora crown");
-        assert_eq!(
-            g.style,
-            GlowStyle::Comet,
-            "the comet owns its own light now"
-        );
-        assert_eq!(
-            g.color,
-            crate::cursor_glow::COMET_DEFAULT_COLOR,
-            "no pinned trail colour ⇒ the comet defaults GLACIAL BLUE"
-        );
-        assert!(
-            g.radius > 0.0,
-            "comet keeps the bloom crown (not beam-only)"
-        );
-        assert!(g.ring, "comet keeps the landing ring");
-        assert!(
-            g.beam,
-            "comet layers the continuous AA beam under its ember bed — the beam is \
-             what makes the streak spatially seamless instead of gappy cell blocks"
-        );
-        // The comet body (TrailCell trail) is produced only for this style.
-        let t = app.trail_config();
-        assert!(t.enabled, "comet enables the cadence-comet trail body");
-        assert!(app.trail_is_comet());
-    }
-
-    /// The "beam" style is the first-class steady TUBE (`GlowStyle::Beam`, its
-    /// PHOTON ICE-BLUE default hue) and keeps its old preset's discipline: aurora
-    /// enabled but radius 0 / ring off, and NO trail body — even when crown/ring
-    /// are explicitly configured on.
-    #[test]
-    fn beam_style_is_beam_only_no_trail() {
-        let mut app = App::headless_for_test();
-        app.config.cursor_trail = Some(true); // master switch (default OFF, 6272bd7a); this test covers STYLE mapping
-        app.config.cursor_trail_style = Some("beam".into());
-        app.config.cursor_trail_radius = Some(1.5);
-        app.config.cursor_trail_ring = Some(true);
-        let g = app.glow_config();
-        assert!(g.enabled, "beam maps to an ENABLED aurora");
-        assert_eq!(g.style, GlowStyle::Beam, "beam is its own style now");
-        assert_eq!(
-            g.color,
-            crate::cursor_glow::BEAM_DEFAULT_COLOR,
-            "beam defaults to photon ice-blue, not the theme cursor"
-        );
-        assert_eq!(
-            g.radius, 0.0,
-            "beam-only: no bloom crown even when configured"
-        );
-        assert!(!g.ring, "beam-only: no landing ring even when configured");
-        assert!(g.beam, "the beam style IS the pure additive beam (WATER-2)");
-        assert!(!app.trail_config().enabled, "beam has no comet trail body");
-        assert!(!app.trail_is_comet());
-        // An explicit trail colour still overrides the ice-blue default.
-        app.config.cursor_trail_color = Some("#ff00ff".into());
-        assert_eq!(app.glow_config().color, 0x00FF_00FF);
-    }
-
-    /// The additive-only styles (lumen/rainbow/…) keep their configured crown+ring
-    /// AND their own additive beam, and produce NO trail body (the comet trail is
-    /// comet-exclusive). Water is the exception — it drops the beam (WATER-1).
-    #[test]
-    fn additive_styles_keep_crown_and_have_no_trail() {
-        let mut app = App::headless_for_test();
-        app.config.cursor_trail = Some(true); // master switch (default OFF, 6272bd7a); this test covers STYLE mapping
-        app.config.cursor_trail_style = Some("lumen".into());
-        let g = app.glow_config();
-        assert!(
-            g.enabled && g.radius > 0.0 && g.ring,
-            "lumen keeps crown+ring"
-        );
-        assert!(g.beam, "lumen shows its additive beam");
-        assert!(!app.trail_config().enabled, "lumen has no comet trail body");
-        // Water keeps the crown/ring/droplets but drops the laser-like beam (WATER-1).
-        app.config.cursor_trail_style = Some("water".into());
-        let w = app.glow_config();
-        assert!(w.enabled && w.radius > 0.0, "water keeps its crown");
-        assert!(
-            !w.beam,
-            "water drops the beam — droplets only, not a recolored laser"
-        );
-        // Laser (the beam it was being conflated with) KEEPS its beam.
-        app.config.cursor_trail_style = Some("laser".into());
-        assert!(app.glow_config().beam, "laser keeps its monochrome beam");
-        // "off" disables both layers.
-        app.config.cursor_trail_style = Some("off".into());
-        assert!(!app.glow_config().enabled, "off disables the aurora");
-        assert!(!app.trail_config().enabled, "off disables the trail");
-    }
-
-    /// The master `cursor_trail = false` switch disables BOTH layers regardless of
-    /// the style (comet included).
-    #[test]
-    fn master_off_disables_both_layers() {
-        let mut app = App::headless_for_test();
-        app.config.cursor_trail_style = Some("comet".into());
-        app.config.cursor_trail = Some(false);
-        assert!(!app.glow_config().enabled, "master off kills the crown");
-        assert!(!app.trail_config().enabled, "master off kills the trail");
+    fn trail_style_spellings_map_to_their_layers() {
+        #[derive(Default)]
+        struct Row {
+            label: &'static str,
+            master: Option<bool>,
+            style: &'static str,
+            radius: Option<f32>,
+            ring: Option<bool>,
+            color: Option<&'static str>,
+            want_enabled: Option<bool>,
+            want_style: Option<GlowStyle>,
+            want_color: Option<u32>,
+            /// `Some(true)`: a bloom crown (radius > 0); `Some(false)`: beam-only
+            /// (radius exactly 0).
+            want_crown: Option<bool>,
+            want_ring: Option<bool>,
+            want_beam: Option<bool>,
+            want_trail: Option<bool>,
+            want_comet: Option<bool>,
+        }
+        let rows = [
+            Row {
+                label: "comet",
+                master: Some(true),
+                style: "comet",
+                want_enabled: Some(true),
+                want_style: Some(GlowStyle::Comet),
+                // No pinned trail colour ⇒ the comet defaults GLACIAL BLUE.
+                want_color: Some(crate::cursor_glow::COMET_DEFAULT_COLOR),
+                want_crown: Some(true),
+                want_ring: Some(true),
+                want_beam: Some(true),
+                want_trail: Some(true),
+                want_comet: Some(true),
+                ..Row::default()
+            },
+            Row {
+                label: "beam, crown and ring configured on",
+                master: Some(true),
+                style: "beam",
+                radius: Some(1.5),
+                ring: Some(true),
+                want_enabled: Some(true),
+                want_style: Some(GlowStyle::Beam),
+                want_color: Some(crate::cursor_glow::BEAM_DEFAULT_COLOR),
+                want_crown: Some(false),
+                want_ring: Some(false),
+                // The beam style IS the pure additive beam (WATER-2).
+                want_beam: Some(true),
+                want_trail: Some(false),
+                want_comet: Some(false),
+                ..Row::default()
+            },
+            Row {
+                label: "beam with an explicit trail colour",
+                master: Some(true),
+                style: "beam",
+                radius: Some(1.5),
+                ring: Some(true),
+                color: Some("#ff00ff"),
+                want_color: Some(0x00FF_00FF),
+                ..Row::default()
+            },
+            Row {
+                label: "lumen",
+                master: Some(true),
+                style: "lumen",
+                want_enabled: Some(true),
+                want_crown: Some(true),
+                want_ring: Some(true),
+                want_beam: Some(true),
+                want_trail: Some(false),
+                ..Row::default()
+            },
+            Row {
+                label: "water keeps its crown, droplets only",
+                master: Some(true),
+                style: "water",
+                want_enabled: Some(true),
+                want_crown: Some(true),
+                want_beam: Some(false),
+                ..Row::default()
+            },
+            Row {
+                label: "laser keeps its monochrome beam",
+                master: Some(true),
+                style: "laser",
+                want_beam: Some(true),
+                ..Row::default()
+            },
+            Row {
+                label: "off",
+                master: Some(true),
+                style: "off",
+                want_enabled: Some(false),
+                want_trail: Some(false),
+                ..Row::default()
+            },
+            Row {
+                label: "master off, style comet",
+                master: Some(false),
+                style: "comet",
+                want_enabled: Some(false),
+                want_trail: Some(false),
+                ..Row::default()
+            },
+        ];
+        for row in rows {
+            let label = row.label;
+            let mut app = App::headless_for_test();
+            app.config.cursor_trail_style = Some(row.style.into());
+            if let Some(master) = row.master {
+                app.config.cursor_trail = Some(master);
+            }
+            if let Some(radius) = row.radius {
+                app.config.cursor_trail_radius = Some(radius);
+            }
+            if let Some(ring) = row.ring {
+                app.config.cursor_trail_ring = Some(ring);
+            }
+            if let Some(color) = row.color {
+                app.config.cursor_trail_color = Some(color.into());
+            }
+            let g = app.glow_config();
+            if let Some(want) = row.want_enabled {
+                assert_eq!(g.enabled, want, "{label}: aurora enabled");
+            }
+            if let Some(want) = row.want_style {
+                assert_eq!(g.style, want, "{label}: glow style");
+            }
+            if let Some(want) = row.want_color {
+                assert_eq!(g.color, want, "{label}: colour");
+            }
+            match row.want_crown {
+                Some(true) => assert!(g.radius > 0.0, "{label}: keeps the bloom crown"),
+                Some(false) => assert_eq!(g.radius, 0.0, "{label}: beam-only, no bloom crown"),
+                None => {}
+            }
+            if let Some(want) = row.want_ring {
+                assert_eq!(g.ring, want, "{label}: landing ring");
+            }
+            if let Some(want) = row.want_beam {
+                assert_eq!(g.beam, want, "{label}: additive beam");
+            }
+            if let Some(want) = row.want_trail {
+                assert_eq!(
+                    app.trail_config().enabled,
+                    want,
+                    "{label}: comet trail body"
+                );
+            }
+            if let Some(want) = row.want_comet {
+                assert_eq!(app.trail_is_comet(), want, "{label}: trail_is_comet");
+            }
+        }
     }
 
     #[test]
@@ -23420,89 +23134,12 @@ mod motion_policy_tests {
     /// names the bug.
     #[test]
     fn trail_status_reads_the_focus_the_frame_path_used() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
-        use super::CursorFxInputs;
         use crate::WindowId;
         let mut app = App::headless_for_test();
         app.config.motion = Some("full".into());
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("comet".into());
-        app.config.trail_sounds = Some(false);
-        let wid = WindowId(0);
-        let t0 = Instant::now();
-        app.windows.get_mut(&wid).expect("window").focused = false;
-
-        // Seed the engines' position the way a real window does, so the live
-        // tick below is a genuine MOVE rather than a first sighting.
-        let mut seed = CursorFxInputs::sample_for_test(t0);
-        seed.cur = Some((2, 2));
-        app.tick_cursor_fx(wid, seed).expect("seed cursor engines");
-
-        // Charge the engines the way the typed window really does: a keystroke
-        // stamps the wake, the engines see the move, one tick commits it.
-        let typed = t0 + Duration::from_millis(1);
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            ws.last_key_at = Some(typed);
-            ws.typing_cadence.on_keystroke(typed);
-            ws.cursor_glow.note_synthetic_move(typed);
-            ws.cursor_trail.note_synthetic_move(typed);
-        }
-        let mut live = CursorFxInputs::sample_for_test(t0 + Duration::from_millis(2));
-        live.cur = Some((2, 5));
-        app.tick_cursor_fx(wid, live).expect("live cursor tick");
-
-        let at = t0 + Duration::from_millis(3);
-        let ws = app.windows.get(&wid).expect("window");
-        assert!(
-            ws.cursor_fx_active(at, false),
-            "precondition: the lane HAS work to schedule (glow={} trail={})",
-            ws.cursor_glow.is_active(),
-            ws.cursor_trail.is_active(),
-        );
-        assert!(
-            ws.terminal_effect_frame_active(at, false),
-            "the typed wake arms the frame train, not just the paint policy"
-        );
-
-        // W11b, unchanged: the SAME live engines on an unwatched window park.
-        // Asserted against a charged engine set, so the park is the focus fold's
-        // doing and not an empty lane.
-        app.windows.get_mut(&wid).expect("window").last_key_at = None;
-        let ws = app.windows.get(&wid).expect("window");
-        assert!(ws.cursor_fx_active(at, false), "the engines are still live");
-        assert!(
-            !ws.terminal_effect_frame_active(at, false),
-            "unfocused and untyped: W11b parks the 60 fps lane"
-        );
-
-        // And the wake EXPIRES with the policy: past the hold the lane parks
-        // again, again asserted against a live engine set.
-        let late = typed + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1);
-        app.windows.get_mut(&wid).expect("window").last_key_at = Some(typed);
-        let ws = app.windows.get(&wid).expect("window");
-        assert!(
-            ws.cursor_fx_active(late, false),
-            "the engine set is still charged at the expiry instant"
-        );
-        assert!(
-            !ws.terminal_effect_frame_active(late, false),
-            "an expired wake parks the lane again (FL-1's settle)"
-        );
-
-        // The two halves agree on the SAME instant — the invariant the fold's
-        // doc-comment claims. A wake that painted but never scheduled, or
-        // scheduled but never painted, is the drift that blacked the trail out.
-        for probe in [t0, typed, typed + Duration::from_secs(1), late] {
-            let ws = app.windows.get(&wid).expect("window");
-            assert_eq!(
-                ws.cursor_fx_typed_wake(probe),
-                app.cursor_fx_focus(wid, false, probe),
-                "policy and scheduler read one predicate at {probe:?}"
-            );
-        }
-
         app.config.cursor_trail_style = Some("rainbow kitty".into());
         let wid = WindowId(0);
         assert_eq!(
@@ -23993,10 +23630,6 @@ mod motion_policy_tests {
                 "the resident remains static until the fade has fully recovered",
             );
             assert!(super::resident_pet_reduced_motion(true, false, envelope));
-            assert_eq!(
-                super::shed_companion_alpha(200, envelope),
-                (200.0 * envelope).round() as u8
-            );
         }
     }
 
@@ -24921,6 +24554,363 @@ pub(crate) fn capture_cursor_neighbor_rows(
     (above_present, below_present)
 }
 
+/// The exact grid and cursor-row identity behind one single-pane poof/witness
+/// read. A content clock alone is insufficient: a parser batch can move the
+/// caret without changing cells, while a viewport change can show different
+/// cells at the same row. Conversely, an effect-only frame changes none of
+/// these terms and need not walk the terminal's rows again.
+/// The content/grid generation advances on cell changes, parser sequence
+/// catches output batches that leave grid damage silent, and the viewport and
+/// history terms fence row remapping without new glyph output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SinglePaneRowProbeKey {
+    terminal_id: u64,
+    alternate_screen: bool,
+    content_seq: u64,
+    grid_content_gen: u64,
+    process_sequence: u32,
+    display_offset: usize,
+    base_y: usize,
+    absolute_row_revision: u64,
+    history_renumber_epoch: u64,
+    scroll_up_rows: u64,
+    scroll_invalidation_epoch: u64,
+    scroll_band_seq: u64,
+    host_rows: usize,
+    host_cols: usize,
+    term_rows: u16,
+    term_cols: u16,
+    cursor_row: usize,
+    v2_owns_frame: bool,
+}
+
+impl SinglePaneRowProbeKey {
+    fn read(
+        terminal: &Terminal,
+        cursor_row: usize,
+        host_rows: usize,
+        host_cols: usize,
+        v2_owns_frame: bool,
+    ) -> Self {
+        let grid = terminal.grid();
+        let scroll = terminal.content_scroll_state();
+        Self {
+            terminal_id: terminal.render_identity(),
+            alternate_screen: terminal.is_alternate_screen(),
+            content_seq: terminal.content_seq(),
+            grid_content_gen: grid.content_gen(),
+            process_sequence: terminal.pipeline_timestamps().process_sequence,
+            display_offset: grid.display_offset(),
+            base_y: grid.base_y(),
+            absolute_row_revision: terminal.absolute_row_revision(),
+            history_renumber_epoch: grid.history_renumber_epoch(),
+            scroll_up_rows: scroll.uniform_up_rows,
+            scroll_invalidation_epoch: scroll.invalidation_epoch,
+            scroll_band_seq: scroll.band_seq,
+            host_rows,
+            host_cols,
+            term_rows: terminal.rows(),
+            term_cols: terminal.cols(),
+            cursor_row,
+            v2_owns_frame,
+        }
+    }
+}
+
+/// A private copy is deliberate: composed rendering and headless capture may
+/// move or overwrite the window's `poof_*` scratch. Restoring this copy on a
+/// hit costs a bounded memory copy, but avoids all terminal cell resolution
+/// under LOCK A while feeding the engines their row observations every frame.
+#[derive(Debug, Default)]
+pub(crate) struct SinglePaneRowProbeCache {
+    key: Option<SinglePaneRowProbeKey>,
+    caret: Vec<char>,
+    above: Vec<char>,
+    below: Vec<char>,
+    above_present: bool,
+    below_present: bool,
+}
+
+impl SinglePaneRowProbeCache {
+    fn invalidate(&mut self) {
+        self.key = None;
+    }
+
+    /// `(cache_hit, above_present, below_present)` for the exact current grid.
+    /// The returned buffers are always rewritten, including on a hit, so the
+    /// caller's existing poof, neighbor and ribbon-witness feeds stay live.
+    fn sample(
+        &mut self,
+        terminal: &Terminal,
+        cursor_row: usize,
+        host_rows: usize,
+        host_cols: usize,
+        v2_owns_frame: bool,
+        probes: (&mut Vec<char>, &mut Vec<char>, &mut Vec<char>),
+    ) -> (bool, bool, bool) {
+        let (caret, above, below) = probes;
+        let key =
+            SinglePaneRowProbeKey::read(terminal, cursor_row, host_rows, host_cols, v2_owns_frame);
+        if self.key == Some(key) {
+            caret.clone_from(&self.caret);
+            above.clone_from(&self.above);
+            below.clone_from(&self.below);
+            return (true, self.above_present, self.below_present);
+        }
+
+        terminal.row_cols_into(cursor_row, caret);
+        let (above_present, below_present) = capture_cursor_neighbor_rows(
+            terminal,
+            cursor_row,
+            host_rows,
+            v2_owns_frame,
+            above,
+            below,
+        );
+        self.caret.clone_from(caret);
+        self.above.clone_from(above);
+        self.below.clone_from(below);
+        self.above_present = above_present;
+        self.below_present = below_present;
+        self.key = Some(key);
+        (false, above_present, below_present)
+    }
+}
+
+#[cfg(test)]
+mod single_pane_row_probe_cache_tests {
+    use super::SinglePaneRowProbeCache;
+    use aterm_core::terminal::Terminal;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    fn sample(
+        cache: &mut SinglePaneRowProbeCache,
+        term: &Terminal,
+        row: usize,
+        host_rows: usize,
+        host_cols: usize,
+        v2: bool,
+        probes: &mut [Vec<char>; 3],
+    ) -> (bool, bool, bool) {
+        let [caret, above, below] = probes;
+        cache.sample(term, row, host_rows, host_cols, v2, (caret, above, below))
+    }
+
+    #[test]
+    fn unchanged_effect_frames_reuse_exact_rows_and_restore_scratched_buffers() {
+        let mut term = Terminal::new(4, 12);
+        term.process(b"above\r\ncaret\r\nbelow");
+        let mut cache = SinglePaneRowProbeCache::default();
+        let mut probes = [Vec::new(), Vec::new(), Vec::new()];
+
+        assert_eq!(
+            sample(&mut cache, &term, 1, 4, 12, true, &mut probes),
+            (false, true, true)
+        );
+        assert_eq!(probes[0][..5], ['c', 'a', 'r', 'e', 't']);
+        assert_eq!(probes[1][..5], ['a', 'b', 'o', 'v', 'e']);
+        assert_eq!(probes[2][..5], ['b', 'e', 'l', 'o', 'w']);
+
+        // A composed capture can move/rewrite the same window's poof scratch.
+        // The private cache must restore all three rows without asking the
+        // terminal to resolve them again on this unchanged effect frame.
+        for probe in &mut probes {
+            probe.clear();
+            probe.extend(['X'; 12]);
+        }
+        assert_eq!(
+            sample(&mut cache, &term, 1, 4, 12, true, &mut probes),
+            (true, true, true)
+        );
+        assert_eq!(probes[0][..5], ['c', 'a', 'r', 'e', 't']);
+        assert_eq!(probes[1][..5], ['a', 'b', 'o', 'v', 'e']);
+        assert_eq!(probes[2][..5], ['b', 'e', 'l', 'o', 'w']);
+        assert!(
+            sample(&mut cache, &term, 1, 4, 12, true, &mut probes).0,
+            "consecutive animation frames must keep hitting"
+        );
+    }
+
+    #[test]
+    fn parser_content_row_geometry_and_neighbor_ownership_break_reuse() {
+        let mut term = Terminal::new(4, 12);
+        term.process(b"above\r\ncaret\r\nbelow");
+        term.take_damage();
+        let mut cache = SinglePaneRowProbeCache::default();
+        let mut probes = [Vec::new(), Vec::new(), Vec::new()];
+        assert!(!sample(&mut cache, &term, 1, 4, 12, false, &mut probes).0);
+        assert!(sample(&mut cache, &term, 1, 4, 12, false, &mut probes).0);
+        assert!(probes[1].is_empty() && probes[2].is_empty());
+
+        let content_before = term.content_seq();
+        term.process(b"\x1b]0;new title\x07");
+        assert_eq!(term.content_seq(), content_before);
+        assert!(!term.has_damage(), "title batch changes no cells");
+        assert!(
+            !sample(&mut cache, &term, 1, 4, 12, false, &mut probes).0,
+            "a damage-free parser batch must still invalidate"
+        );
+        assert!(
+            !sample(&mut cache, &term, 2, 4, 12, false, &mut probes).0,
+            "a different cursor row names different cells"
+        );
+        assert_eq!(probes[0][..5], ['b', 'e', 'l', 'o', 'w']);
+        assert!(
+            !sample(&mut cache, &term, 2, 4, 13, false, &mut probes).0,
+            "host geometry is part of the probe's coordinate space"
+        );
+        assert_eq!(
+            sample(&mut cache, &term, 2, 4, 13, true, &mut probes),
+            (false, true, true),
+            "Rainbow Kitty engagement needs fresh neighbor rows"
+        );
+        assert_eq!(probes[1][..5], ['c', 'a', 'r', 'e', 't']);
+
+        term.process(b"Z");
+        assert!(
+            !sample(&mut cache, &term, 2, 4, 13, true, &mut probes).0,
+            "new content cannot reuse the prior row"
+        );
+        term.resize(5, 13);
+        assert!(
+            !sample(&mut cache, &term, 2, 5, 13, true, &mut probes).0,
+            "a resize changes row resolution"
+        );
+    }
+
+    #[test]
+    fn viewport_and_terminal_identity_break_reuse() {
+        let mut term = Terminal::new(4, 12);
+        term.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        let mut cache = SinglePaneRowProbeCache::default();
+        let mut probes = [Vec::new(), Vec::new(), Vec::new()];
+        assert!(!sample(&mut cache, &term, 1, 4, 12, true, &mut probes).0);
+        assert!(sample(&mut cache, &term, 1, 4, 12, true, &mut probes).0);
+
+        term.scroll_display(1);
+        assert!(term.grid().display_offset() > 0);
+        assert!(
+            !sample(&mut cache, &term, 1, 4, 12, true, &mut probes).0,
+            "a different viewport shows different rows"
+        );
+        cache.invalidate(); // the single-pane live-bottom guard's skipped arm
+        term.scroll_display(-1);
+        assert!(!sample(&mut cache, &term, 1, 4, 12, true, &mut probes).0);
+
+        let other = Terminal::new(4, 12);
+        assert_ne!(term.render_identity(), other.render_identity());
+        assert!(
+            !sample(&mut cache, &other, 1, 4, 12, true, &mut probes).0,
+            "a tab switch cannot borrow the prior terminal's row"
+        );
+    }
+
+    /// Manual A/B of the real three-row read path. The measurements enclose
+    /// only the uncontended terminal-lock hold; parser writes happen outside
+    /// them so the typed case isolates the first echo's row-probe cost.
+    #[test]
+    #[ignore = "manual row-probe lock-hold timing"]
+    fn diagnostic_row_probe_cache_lock_hold_ab() {
+        use super::capture_cursor_neighbor_rows;
+
+        const ROW: usize = 14;
+        const EFFECT_SAMPLES: usize = 10_000;
+        const TYPED_SAMPLES: usize = 2_000;
+
+        let mut terminal = Terminal::new(30, 120);
+        for row in 14..=16 {
+            let mut output = format!("\x1b[{row};1H").into_bytes();
+            output.extend(vec![b'X'; 110]);
+            terminal.process(&output);
+        }
+        let terminal = Mutex::new(terminal);
+        let mut cache = SinglePaneRowProbeCache::default();
+        let mut baseline_probes = [Vec::new(), Vec::new(), Vec::new()];
+        let mut cached_probes = [Vec::new(), Vec::new(), Vec::new()];
+        let mut baseline_effect = Vec::with_capacity(EFFECT_SAMPLES);
+        let mut cached_effect = Vec::with_capacity(EFFECT_SAMPLES);
+        let mut baseline_typed = Vec::with_capacity(TYPED_SAMPLES);
+        let mut cached_typed = Vec::with_capacity(TYPED_SAMPLES);
+
+        let baseline = |terminal: &Mutex<Terminal>, probes: &mut [Vec<char>; 3]| {
+            let term = terminal.lock().expect("terminal lock");
+            let start = Instant::now();
+            let [caret, above, below] = probes;
+            term.row_cols_into(ROW, caret);
+            let presence = capture_cursor_neighbor_rows(&term, ROW, 30, true, above, below);
+            std::hint::black_box((caret.len(), presence));
+            drop(term);
+            start.elapsed().as_nanos()
+        };
+        let cached = |terminal: &Mutex<Terminal>,
+                      cache: &mut SinglePaneRowProbeCache,
+                      probes: &mut [Vec<char>; 3]| {
+            let term = terminal.lock().expect("terminal lock");
+            let start = Instant::now();
+            let hit = sample(cache, &term, ROW, 30, 120, true, probes).0;
+            std::hint::black_box((&probes[0], hit));
+            drop(term);
+            (start.elapsed().as_nanos(), hit)
+        };
+
+        // Prime the private copy; subsequent effect-only frames must avoid all
+        // three row_cols_into calls while returning the same glyphs.
+        assert!(!cached(&terminal, &mut cache, &mut cached_probes).1);
+        for i in 0..EFFECT_SAMPLES {
+            if i % 2 == 0 {
+                baseline_effect.push(baseline(&terminal, &mut baseline_probes));
+                let (ns, hit) = cached(&terminal, &mut cache, &mut cached_probes);
+                assert!(hit);
+                cached_effect.push(ns);
+            } else {
+                let (ns, hit) = cached(&terminal, &mut cache, &mut cached_probes);
+                assert!(hit);
+                cached_effect.push(ns);
+                baseline_effect.push(baseline(&terminal, &mut baseline_probes));
+            }
+            assert_eq!(cached_probes, baseline_probes);
+        }
+
+        for i in 0..TYPED_SAMPLES {
+            terminal
+                .lock()
+                .expect("terminal lock")
+                .process(if i % 2 == 0 {
+                    b"\x1b[15;1HA"
+                } else {
+                    b"\x1b[15;1HB"
+                });
+            if i % 2 == 0 {
+                baseline_typed.push(baseline(&terminal, &mut baseline_probes));
+                let (ns, hit) = cached(&terminal, &mut cache, &mut cached_probes);
+                assert!(!hit, "new typed glyph must invalidate cached rows");
+                cached_typed.push(ns);
+            } else {
+                let (ns, hit) = cached(&terminal, &mut cache, &mut cached_probes);
+                assert!(!hit, "new typed glyph must invalidate cached rows");
+                cached_typed.push(ns);
+                baseline_typed.push(baseline(&terminal, &mut baseline_probes));
+            }
+            assert_eq!(cached_probes, baseline_probes);
+        }
+
+        let report = |label: &str, mut samples: Vec<u128>, row_reads: usize| {
+            samples.sort_unstable();
+            let p50 = samples[samples.len() / 2];
+            let p95 = samples[samples.len() * 95 / 100];
+            println!(
+                "{label}: n={} row_cols_into/tick={row_reads} lock_p50_ns={p50} lock_p95_ns={p95}",
+                samples.len()
+            );
+        };
+        report("effect baseline", baseline_effect, 3);
+        report("effect cached", cached_effect, 0);
+        report("typed baseline", baseline_typed, 3);
+        report("typed cached", cached_typed, 3);
+    }
+}
+
 fn focused_composed_cursor_fx_sample(
     session: u64,
     terminal: &Terminal,
@@ -25240,6 +25230,29 @@ impl App {
             } else {
                 (sub_rows, sub_cols)
             };
+            // RULING 240: a wheel glide in flight over this engine LANDS at its
+            // target before a width change can detach the history, so the
+            // detach records the place the reader was going to as the one the
+            // re-attach restores. Only a glide over this very engine pays the
+            // extra short lock, and only a width change settles it.
+            if let Some(term) = self.pool.get(id).map(|s| s.term.clone()) {
+                let gliding: Vec<WindowId> = self
+                    .windows
+                    .iter()
+                    .filter(|(_, ws)| {
+                        ws.scroll_glide
+                            .as_ref()
+                            .is_some_and(|st| Arc::ptr_eq(&st.term, &term))
+                    })
+                    .map(|(glide_wid, _)| *glide_wid)
+                    .collect();
+                if !gliding.is_empty() && term_lock(&term).cols() != sub_cols {
+                    let now = Instant::now();
+                    for glide_wid in gliding {
+                        self.settle_scroll_motion_at_target(glide_wid, now);
+                    }
+                }
+            }
             let Some(s) = self.pool.get(id) else { continue };
             let pending = {
                 let mut term = term_lock(&s.term);
@@ -25285,16 +25298,23 @@ impl App {
                 // self-throttle above) beats unbounded, routine data loss, so
                 // cancellation is wired ONLY to session teardown (`Session::drop`
                 // raises `reflow_cancel`), where the history was dying anyway.
+                // THE REWRAP'S GAUGE (ruling 233): booked here, on the loop
+                // thread, before any worker can take the job, so a person who
+                // scrolls back a moment later finds it running. The hold
+                // rides the job (ruling 236): whichever arm takes it ends it,
+                // and an unwind or a job nobody took ends it `Failed`.
+                let rewrap = s.ctx.rewrap_gauge.begin_job(pending.lines_total());
                 let job = std::sync::Arc::new(std::sync::Mutex::new(Some((
                     pending,
                     s.term.clone(),
                     reflow_wake_proxy.clone(),
+                    rewrap,
                 ))));
                 let cancel = s.reflow_cancel.clone();
                 let run = {
                     let job = job.clone();
                     move || {
-                        if let Some((pending, term, proxy)) =
+                        if let Some((pending, term, proxy, rewrap)) =
                             job.lock().unwrap_or_else(|p| p.into_inner()).take()
                         {
                             // CONCURRENCY GAUGE (MPT-1's instrument): this
@@ -25328,14 +25348,26 @@ impl App {
                             // semantics are unchanged — nothing is cancelled, content
                             // re-attaches before every re-detach.
                             let mut next = Some(pending);
+                            let mut ended = aterm_messages::WaitEnd::Done;
                             while let Some(active) = next.take() {
+                                let pass_lines = active.lines_total();
                                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    drive_reflow_job(active, &cancel, REFLOW_WORKER_STEP_LINES)
+                                    drive_reflow_job_gauged(
+                                        active,
+                                        &cancel,
+                                        REFLOW_WORKER_STEP_LINES,
+                                        Some(rewrap.gauge()),
+                                    )
                                 })) {
                                     Ok(Some(reflowed)) => {
                                         next = term_lock(&term).finish_resize_offload(reflowed);
+                                        rewrap.gauge().pass_done(
+                                            pass_lines,
+                                            next.as_ref().map(|n| n.lines_total()),
+                                        );
                                     }
                                     Ok(None) => {
+                                        ended = aterm_messages::WaitEnd::Gone;
                                         aterm_log::info!(
                                             "reflow worker cancelled rewrapping session {id} \
                                              scrollback (session teardown); aborting the \
@@ -25345,6 +25377,7 @@ impl App {
                                         term_lock(&term).abort_resize_offload();
                                     }
                                     Err(_) => {
+                                        ended = aterm_messages::WaitEnd::Failed;
                                         aterm_log::error!(
                                             "reflow worker panicked rewrapping session {id} \
                                              scrollback; aborting the offload (tiered history \
@@ -25354,6 +25387,7 @@ impl App {
                                     }
                                 }
                             }
+                            rewrap.finish(ended);
                             // Repaint either way: rewrapped history on success, or the
                             // ring-only fallback after an abort.
                             if let Some(proxy) = proxy {
@@ -25377,7 +25411,7 @@ impl App {
                 // run it. Exactly one of `run` and `inline` finds the job in
                 // the slot; the other's `take()` returns `None`.
                 let inline = move || {
-                    let Some((pending, term, proxy)) =
+                    let Some((pending, term, proxy, rewrap)) =
                         job.lock().unwrap_or_else(|p| p.into_inner()).take()
                     else {
                         return; // a pooled worker already took this job
@@ -25390,7 +25424,9 @@ impl App {
                     // drop the tiered history (bounded, logged) rather than freeze the UI
                     // and trip the stall watchdog (audit #6).
                     const INLINE_REFLOW_MAX_LINES: usize = 20_000;
+                    let mut ended = aterm_messages::WaitEnd::Done;
                     if pending.line_count() > INLINE_REFLOW_MAX_LINES {
+                        ended = aterm_messages::WaitEnd::Failed;
                         aterm_log::error!(
                             "no reflow worker could be started and session {id} history \
                              ({} lines) is too large to rewrap inline without a main-thread \
@@ -25419,6 +25455,7 @@ impl App {
                                             next = term_lock(&term).finish_resize_offload(again);
                                         }
                                         Err(_) => {
+                                            ended = aterm_messages::WaitEnd::Failed;
                                             aterm_log::error!(
                                                 "inline convergence rewrap of session {id} \
                                                  panicked; aborting the offload (grid \
@@ -25436,6 +25473,7 @@ impl App {
                                 );
                             }
                             Err(_) => {
+                                ended = aterm_messages::WaitEnd::Failed;
                                 aterm_log::error!(
                                     "no reflow worker could be started AND the inline rewrap \
                                      of session {id} panicked; aborting the offload (grid \
@@ -25450,6 +25488,7 @@ impl App {
                     // own completion — else the quiescence witness would wait
                     // forever for a worker that was never created.
                     reflow_gauge::note_inline();
+                    rewrap.finish(ended);
                     if let Some(proxy) = proxy {
                         let _ = proxy.send_event(crate::Wake::Output {
                             session: id,
@@ -28026,7 +28065,7 @@ impl App {
         // rotated by `col`. A witness fed another pane's cells would retire
         // light the owner earned, which is worse than sampling nothing.
         if let Some((caret_row, _, _)) = row_probe {
-            let mut ribbon_rows = [0u16; aterm_effects::rainbow_kitty::witness::WITNESS_ROWS];
+            let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
             let (wanted, needs_read) = {
                 let Some(window) = self.windows.get_mut(&wid) else {
                     return false;
@@ -28230,9 +28269,16 @@ impl App {
         Some(crate::tray_raster::prepare_semantic_font(&candidate))
     }
 
-    /// The active native Settings view only while its semantic workbench has a
-    /// moving subject. This is the shared arm/fire predicate for the existing
-    /// bounded Settings-demo timer, keeping every other native route at 0% idle.
+    /// The active Settings workbench while it animates or awaits a font frame.
+    /// This shared arm/fire predicate returns static, settled previews to idle.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativePreviewFontConvergence",
+            action = "Decide",
+            project = "aterm_gui::app_render::native_damage_tests::project_native_preview_font_convergence"
+        )
+    )]
     pub(crate) fn active_native_settings_preview(
         &self,
         wid: WindowId,
@@ -28241,27 +28287,42 @@ impl App {
         crate::tab_model::ViewId,
         crate::settings_preview::PreviewAnimation,
     )> {
-        if !self
-            .serious_mode_policy()
-            .allows(crate::motion::SeriousEffect::SettingsPreview)
-        {
-            return None;
-        }
         let (_, view) = self.active_native_view(wid)?;
         let viewport = self.native_ui_viewport(wid).ok()?;
         match self.native_runtime.view_state(view) {
             Some(crate::native_app::AppViewState::Settings(state)) => {
                 let motion = self.native_view_motion_cx(wid, view);
                 let font_px = self.win_font_px(wid);
-                let mut animation =
-                    state.preview_animation(phase_ms, motion, font_px, self.theme, viewport);
-                // Explicit host preparation seam: the backend-owned parked
-                // service is requested/polled here, before view compilation or
-                // paint. Its bounded one-shot convergence cadence invalidates
-                // exactly this active Settings view, then returns to pure Wait.
+                // Serious Mode suppresses motion, while font readiness still
+                // converges: a static specimen must not stay on fallback pixels.
+                let mut animation = if self
+                    .serious_mode_policy()
+                    .allows(crate::motion::SeriousEffect::SettingsPreview)
+                {
+                    state.preview_animation(phase_ms, motion, font_px, self.theme, viewport)
+                } else {
+                    crate::settings_preview::PreviewAnimation::None
+                };
+                // The retained preview is the reader of the font worker's
+                // snapshot. Completion must keep one final repaint armed even
+                // when this poll changes pending to false: otherwise a static
+                // page drops its deadline with provisional pixels still on
+                // glass. The same predicate is used at arm and fire, and goes
+                // idle after compilation captures the completed epoch.
                 if self
                     .prepare_native_semantic_font(wid, view, phase_ms)
-                    .is_some_and(|prepared| prepared.snapshot.pending)
+                    .is_some_and(|prepared| {
+                        prepared.snapshot.pending
+                            || self.windows.get(&wid)
+                                .and_then(|window| window.leaf_render_cache.get(&view))
+                                .and_then(|cache| cache.native.as_ref())
+                                .is_some_and(|raster| raster.compiled.paint.iter().any(|paint| {
+                                    matches!(&paint.content,
+                                        crate::native_ui::UiContent::SettingsPreview(spec)
+                                        if spec.font_candidate == prepared.candidate
+                                            && spec.font_ready_epoch != prepared.snapshot.ready_epoch)
+                                }))
+                    })
                 {
                     animation = crate::settings_preview::PreviewAnimation::Continuous;
                 }
@@ -28278,6 +28339,14 @@ impl App {
     /// geometry authority.  If that authority is unavailable we fail closed to
     /// a full repaint; route, service, and appearance transitions continue to
     /// request `All` independently.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativePreviewFontConvergence",
+            action = "Invalidate",
+            project = "aterm_gui::app_render::native_damage_tests::project_native_preview_font_convergence"
+        )
+    )]
     pub(crate) fn invalidate_active_native_settings_preview(
         &mut self,
         wid: WindowId,
@@ -28496,9 +28565,6 @@ impl App {
         let Ok(stamp) = self.native_ui_compile_stamp_for(id, instance, view, viewport) else {
             return false;
         };
-        let Ok(compiled) = self.compiled_native_ui_for(id, instance, view, viewport) else {
-            return false;
-        };
         let width = u32::try_from(
             cols.saturating_mul(cw)
                 .saturating_add(pad.saturating_mul(2)),
@@ -28526,14 +28592,6 @@ impl App {
             .windows
             .get(&id)
             .map_or(0, |window| window.overlay_fp());
-        let fp = {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            compiled.fingerprint().hash(&mut hash);
-            overlay_fp.hash(&mut hash);
-            stamp.hash(&mut hash);
-            hash.finish() | 1
-        };
         let geom = {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -28547,38 +28605,66 @@ impl App {
             scale.to_bits().hash(&mut hash);
             hash.finish()
         };
+        // The retained raster already carries the exact compiled semantics.
+        // A chrome-only redraw must not rebuild that tree (or clone the
+        // document snapshot) when the same stamp/damage guard used by mixed
+        // native panes says its pixels are current. Compile before borrowing
+        // out the cache so a failed rebuild leaves the prior artifact intact.
+        let damage = self
+            .windows
+            .get(&id)
+            .and_then(|window| window.leaf_render_cache.get(&view))
+            .map_or(Some(crate::native_app::DamageRegion::All), |cache| {
+                pending_native_leaf_damage(cache, stamp, width, height)
+            });
+        let compiled = if damage.is_some() {
+            match self.compiled_native_ui_for(id, instance, view, viewport) {
+                Ok(compiled) => Some(compiled),
+                Err(_) => return false,
+            }
+        } else {
+            None
+        };
         let mut cache = self
             .windows
             .get_mut(&id)
             .and_then(|window| window.leaf_render_cache.remove(&view))
             .unwrap_or_default();
-        let leaf_rasterized =
-            if let Some(damage) = pending_native_leaf_damage(&cache, stamp, width, height) {
-                retain_native_leaf_raster(
-                    &mut cache,
-                    crate::app_native::NativeLeafScene {
-                        stamp,
-                        instance,
-                        view,
-                        viewport,
-                        damage,
-                        compiled: compiled.clone(),
-                    },
-                    width,
-                    height,
-                    scale,
-                    theme,
-                    terminal_theme,
-                );
-                true
-            } else {
-                false
-            };
+        let leaf_rasterized = if let (Some(damage), Some(compiled)) = (damage, compiled) {
+            retain_native_leaf_raster(
+                &mut cache,
+                crate::app_native::NativeLeafScene {
+                    stamp,
+                    instance,
+                    view,
+                    viewport,
+                    damage,
+                    compiled,
+                },
+                width,
+                height,
+                scale,
+                theme,
+                terminal_theme,
+            );
+            true
+        } else {
+            false
+        };
         let Some(base_raster) = cache.native.as_ref() else {
             if let Some(window) = self.windows.get_mut(&id) {
                 window.leaf_render_cache.insert(view, cache);
             }
             return false;
+        };
+        let compiled = &base_raster.compiled;
+        let fp = {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            compiled.fingerprint().hash(&mut hash);
+            overlay_fp.hash(&mut hash);
+            stamp.hash(&mut hash);
+            hash.finish() | 1
         };
         let should_raster = leaf_rasterized
             || self.windows.get(&id).is_some_and(|ws| {
@@ -28616,10 +28702,23 @@ impl App {
         let Some(ws) = self.windows.get_mut(&id) else {
             return false;
         };
-        // A native TAB is one leaf filling the window: it has no sibling to be
-        // told apart from and no divider gap to ink, and the loop below wipes
-        // every cell to the chrome blank anyway.
-        fill_divider_grid(&mut ws.input_scratch, rows, cols, theme, None);
+        // The native page overwrites this entire rectangle with chrome blanks
+        // below. Skip the divider-cell fill underneath it while retaining the
+        // same shape, sparse-row, metadata and effect-overlay resets.
+        fill_divider_grid_tiled(
+            &mut ws.input_scratch,
+            rows,
+            cols,
+            theme,
+            None,
+            std::iter::once(pane::PaneRect {
+                session: 0, // unused by the geometry-only seam fill
+                row_off: 0,
+                col_off: 0,
+                rows: ws.rows,
+                cols: ws.cols,
+            }),
+        );
         // No pane fx clip on a native tab (the reused scratch may carry a
         // prior split frame's box — present-time post-fx must not inherit it).
         ws.input_scratch.fx_clip = None;
@@ -28634,11 +28733,18 @@ impl App {
         ws.input_scratch.cursor_visible = false;
         ws.input_scratch.selection = aterm_core::selection::TextSelection::new();
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
-        ws.native_ui_compiled = Some(crate::app_native::NativeCompiledFrame {
-            stamp,
-            phase: crate::app_native::NativeCompiledPhase::Staged,
-            compiled: compiled.clone(),
-        });
+        if !leaf_rasterized
+            && let Some(frame) = ws.native_ui_compiled.as_mut()
+            && frame.stamp == stamp
+        {
+            frame.phase = crate::app_native::NativeCompiledPhase::Staged;
+        } else {
+            ws.native_ui_compiled = Some(crate::app_native::NativeCompiledFrame {
+                stamp,
+                phase: crate::app_native::NativeCompiledPhase::Staged,
+                compiled: compiled.clone(),
+            });
+        }
         if let Some(native) = cache.native.as_mut() {
             if native.presented_x != 0 || native.presented_y != 0 {
                 native.presented = false;
@@ -28661,7 +28767,7 @@ impl App {
         self.splice_tab_strip_with(id, tab_strip);
         #[cfg(a11y_tree)]
         if !overlay_open {
-            self.stage_native_accessibility(id, view, &compiled, plan);
+            self.stage_native_accessibility(id, view, plan);
         }
         true
     }
@@ -28846,6 +28952,8 @@ impl App {
             .windows
             .get(&id)
             .map(|window| (window.overlay.is_some(), window.overlay_fp()))?;
+        let preedit_on_grid =
+            matches!(self.preedit_owner(id), crate::app_input::PreeditOwner::Grid);
         let width = u32::try_from(cols.saturating_mul(cw)).unwrap_or(u32::MAX);
         let height = u32::try_from(rows.saturating_mul(ch)).unwrap_or(u32::MAX);
         let byte_len = usize::try_from(width)
@@ -29090,7 +29198,7 @@ impl App {
                     } else {
                         (Vec::new(), Vec::new(), Vec::new())
                     };
-                    let (terminal_title, blank, cursor_color, cursor_fx_sample) = {
+                    let (terminal_title, blank, cursor_color, cursor_fx_sample, ambiguous_cjk) = {
                         terminal.cell_frame_into(&mut cache.staged_input, sub_rows, sub_cols);
                         let blank = terminal_blank_cell(&terminal);
                         let cursor_color = terminal_cursor_color(&terminal);
@@ -29108,8 +29216,15 @@ impl App {
                         terminal.take_damage();
                         // Lock diet: an Arc clone under the hold; the owned
                         // String materializes after the guard drops (below).
-                        (terminal.title_arc(), blank, cursor_color, cursor_fx_sample)
+                        (
+                            terminal.title_arc(),
+                            blank,
+                            cursor_color,
+                            cursor_fx_sample,
+                            terminal.modes().ambiguous_width_double,
+                        )
                     };
+                    drop(terminal);
                     if cursor_fx_sample.is_some() {
                         focused_cursor_fx_sample = cursor_fx_sample;
                     }
@@ -29118,6 +29233,23 @@ impl App {
                     let row = leaf.rect.origin.y.round().max(0.0) as usize;
                     let col = leaf.rect.origin.x.round().max(0.0) as usize;
                     if let Some(window) = self.windows.get_mut(&id) {
+                        // The focused terminal owns the same transient IME
+                        // overlay in a mixed split as in a terminal-only split.
+                        // Paint before the pane blit so both glyphs and the
+                        // candidate anchor use its own width and caret. Fresh
+                        // extraction on the next compose also erases a cancelled
+                        // or rerouted composition; the engine stays untouched.
+                        if leaf.focused && preedit_on_grid && cache.staged_input.display_offset == 0
+                        {
+                            cache.staged_input.overlay_ime_preedit(
+                                &window.preedit,
+                                window.preedit_caret,
+                                ambiguous_cjk,
+                            );
+                            cache.staged_input.cursor_visible = true;
+                            cache.staged_input.snapshot_seq =
+                                cache.staged_input.snapshot_seq.wrapping_add(1);
+                        }
                         if leaf.focused {
                             // A mixed split still has one authoritative terminal
                             // cursor and search anchor when its focused leaf is a
@@ -29849,6 +29981,36 @@ impl App {
             present
         });
 
+        // A focused native field has its own pixel caret, even in a mixed
+        // native/terminal split. Report only from the retained frame whose
+        // presentation was just acknowledged, never the parked terminal cursor.
+        self.report_native_ime_cursor_area(id, presented_plan);
+
+        // A terminal sibling takes the anchor back when focus leaves a native
+        // field. Mixed frames bypass the terminal-only redraw reporters above;
+        // their presented composite already contains the pane offset, chrome
+        // rows, and any inline IME caret shift, so report it in frame cells.
+        if matches!(route, SuccessfulPresentRoute::Heterogeneous)
+            && matches!(
+                self.view_store.get(presented_plan.focused),
+                Some(crate::tab_model::View::Terminal(_))
+            )
+            && !matches!(
+                self.preedit_owner(id),
+                crate::app_input::PreeditOwner::Find | crate::app_input::PreeditOwner::Rename
+            )
+            && let Some(cell) = self.windows.get(&id).and_then(|state| {
+                let input = &state.input_scratch;
+                (state.overlay.is_none()
+                    && input.cursor_visible
+                    && input.cursor_row < input.rows
+                    && input.cursor_col < input.cols)
+                    .then_some((input.cursor_row, input.cursor_col))
+            })
+        {
+            self.report_ime_cursor_area_frame(id, cell);
+        }
+
         // VIDEO semantic authority is committed at the same success boundary
         // as the tap submission and capture serial. The large RenderInput stays
         // in WindowGpu's resident buffer; this records only its epoch plus the
@@ -30224,6 +30386,10 @@ impl App {
         if !self.compose_native_route_card(id) {
             return;
         }
+        // The Claude Code footer over each Claude pane's permission-mode row
+        // (`crate::claude_footer`): before the paste question and the link
+        // caption, which outrank it and paint over it.
+        self.splice_claude_footer(id, plan, crate::VisibleContentRoute::Heterogeneous);
         // The multi-line-paste confirmation is a SECURITY question: it paints
         // over the top rows after preparation, and the shared present seam
         // crops the later native tray below it so the band stays topmost.
@@ -30504,16 +30670,11 @@ impl App {
             // during a backend rebuild): nothing valid to draw into.
             _ => return,
         }
-        // Per-window DPI (W12): SELECT this window's own resolved metrics on the
-        // shared renderer before composing (guarded no-op when already active), so a
-        // window on a different-DPI monitor renders at its own scale rather than
-        // whichever window last drew. This is now the LIGHT `activate_px` switch —
-        // it keeps every other window's warm glyph atlas resident (sizes coexist by
-        // `px_q`), no teardown — so run it before the borrows below.
-        self.apply_window_scale(id);
-        // The renderer is process-global while cursor blink/style and inactive
+        // The renderer is process-global while DPI, cursor blink/style and inactive
         // selection are window state. Bind THIS target before either native/
-        // heterogeneous early dispatch or the terminal path can encode.
+        // heterogeneous early dispatch or the terminal path can encode. Binding
+        // selects the window's scale too; calling apply_window_scale separately
+        // here would repeat its cell-pixel and font guards on every frame.
         self.bind_window_renderer_state(id);
         // Route by the leaves ACTUALLY visible this frame. A zoomed mixed root
         // has one visible terminal or native leaf; dispatching from the hidden
@@ -30858,6 +31019,13 @@ impl App {
             // happen — hence `undo_host_row_prepend` refuses unless every clause
             // of the inverse holds, and hence the extractor's own `row_shift`
             // clause refuses a shifted scratch by name.
+            // THE CLAUDE CODE FOOTER is a host write too, and one that stays
+            // on screen for as long as Claude Code is in front — so it is
+            // undone FIRST, before the strip's inverse above and before the
+            // reuse arms below read the tokens, and a window showing it keeps
+            // every one of them (`crate::claude_footer::undo`). A no-op when
+            // no footer was painted or anything has touched the scratch since.
+            crate::claude_footer::undo(&mut ws.claude_footer_undo, &mut ws.input_scratch);
             let unspliced = strip_rows_n > 0
                 && ws.input_scratch.undo_host_row_prepend(
                     rows,
@@ -31056,9 +31224,21 @@ impl App {
             // The terminal snapshot remains monotonic even when retained
             // scrollback is capped at zero or full.
             let row_probe = if display_offset == 0 && !scroll_change.changed() {
-                let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
+                let v2_owns_frame = ws.cursor_glow.v2_owns_frame();
+                let (_, neighbor_above, neighbor_below) = ws.single_pane_row_probe_cache.sample(
+                    &term,
+                    usize::from(cpos.row),
+                    rows,
+                    cols,
+                    v2_owns_frame,
+                    (
+                        &mut ws.poof_row_buf,
+                        &mut ws.poof_row_above_buf,
+                        &mut ws.poof_row_below_buf,
+                    ),
+                );
                 // STAR-LANDING NEIGHBORS: capture the rows flanking the
-                // cursor row under the SAME lock, so the displaced rainbow kitty
+                // cursor row from this SAME snapshot, so the displaced rainbow kitty
                 // stars' TEXT-FIRST gate can prove their landing cells blank
                 // (they paint in the ADJACENT rows' pixel bands — the poof
                 // probe's own row says nothing about those). A grid-edge
@@ -31067,15 +31247,7 @@ impl App {
                 // clips into).
                 // Other styles do not consume these rows. v2's first
                 // engagement tick ignores them too; once engaged, this same
-                // lock supplies every landing and witness probe it needs.
-                let (neighbor_above, neighbor_below) = capture_cursor_neighbor_rows(
-                    &term,
-                    usize::from(cpos.row),
-                    rows,
-                    ws.cursor_glow.v2_owns_frame(),
-                    &mut ws.poof_row_above_buf,
-                    &mut ws.poof_row_below_buf,
-                );
+                // cache supplies every landing and witness probe it needs.
                 // THE CONTENT WITNESS's rows (2026-09-12, the abandoned
                 // band): the rows Rainbow Kitty's resident ribbon occupies,
                 // read under this SAME lock — the batch already applied, so
@@ -31089,7 +31261,7 @@ impl App {
                 // refused, so they pay one bool.
                 ws.cursor_glow
                     .observe_ribbon_row(cpos.row, &ws.poof_row_buf);
-                let mut ribbon_rows = [0u16; aterm_effects::rainbow_kitty::witness::WITNESS_ROWS];
+                let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
                 let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
                 for &r in &ribbon_rows[..n] {
                     if usize::from(r) < rows && r != cpos.row {
@@ -31109,6 +31281,7 @@ impl App {
                 }
                 Some((cpos.row, cpos.col, probe_trust))
             } else {
+                ws.single_pane_row_probe_cache.invalidate();
                 None
             };
             // Selection COPY (owned): the sparkle nova view borrows it AND the
@@ -31198,9 +31371,13 @@ impl App {
             // will (the write path honors EA-Ambiguous width), so the overlay
             // below reads the SAME mode bit under the same lock.
             let ambiguous_cjk = term.modes().ambiguous_width_double;
-            let mut pet_world_facts = pet_console_owned.then(|| {
-                aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
-            });
+            // Refresh frames keep this snapshot. Every other frame captures
+            // its facts beside the newer extraction under LOCK B below, so
+            // avoid a block scan here whose result would be discarded.
+            let mut pet_world_facts =
+                (pet_console_owned && (deco_rescan || rain_refresh)).then(|| {
+                    aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
+                });
             // The hover under a still pointer, re-probed against THIS hold when
             // the fill above moved it (G04): a rescan frame is the frame, and
             // its LOCK A is the acquisition the fill rode — so the probe rides
@@ -31490,6 +31667,9 @@ impl App {
             // rest of the frame: the RepaintKey's band term folds it in (a
             // full-width meter moves with a same-column resize, ruling 55).
             let band_geom = self.band_geometry(id);
+            // The Claude Code footer's facts for this plan, read BEFORE the window is
+            // borrowed mutably below (`App::claude_footer_fp` reads the pool).
+            let claude_footer_fp = self.claude_footer_fp(id, plan);
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -31776,6 +31956,7 @@ impl App {
                     aterm_effects::pet_world::PetPane::full(&ws.input_scratch),
                     &exclusions[..count],
                 );
+                metrics::note_pet_world_observation(ws.cursor_pet.observed_cells());
             }
             // Reading owns a certified content surface, never a fabricated
             // caret. The flying head retains its live-viewport-only gate.
@@ -33191,6 +33372,7 @@ impl App {
                 // the frame-time re-probe under LOCK A/B above, painted by the
                 // splice below this gate, dirtying no cell (see `RepaintKey`).
                 link_caption: ws.link_hover,
+                claude_footer_fp,
             };
             if !deco_rescan
                 // A rain refresh refilled the snapshot too — the frame MUST
@@ -33799,6 +33981,16 @@ impl App {
         // priority over the bubble card while a connection drag from
         // THIS window is in flight. A no-op (card = None) otherwise.
         self.splice_conn_wire(id);
+        // The Claude Code footer over each Claude pane's permission-mode row
+        // (`crate::claude_footer`), inside the pane's own columns; the paste
+        // question, the link caption and the tab menu outrank it.
+        self.splice_claude_footer(
+            id,
+            plan,
+            crate::VisibleContentRoute::Terminal {
+                composed: multi_pane,
+            },
+        );
         // The multi-line-paste confirmation is a SECURITY question: it
         // overwrites the top rows in place (the retired config banner's
         // mechanics).
@@ -34184,11 +34376,7 @@ impl App {
             source_drop_counted,
             |app, wid| app.ensure_cpu_present_target(wid),
             |retry, _wid, window| {
-                let Some(window) = window else {
-                    return false;
-                };
-                request_recovery_redraw(retry, || window.request_redraw());
-                true
+                request_gpu_recovery_redraw(retry, window, |window| window.request_redraw())
             },
         )
     }
@@ -35038,10 +35226,10 @@ impl App {
     /// tab) once instead of O(tabs x panes) on every present, and closes the
     /// hole the sweep could not: a stamp armed while hidden and revealed with
     /// no present in between used to be booked in full.
-    // Crate-visible for the honesty test in `lib.rs` (and the workspace
-    // bench seam): the walk's discard/book contract is asserted from
-    // outside this module. No call site or behaviour changes.
-    #[cfg_attr(not(any(test, feature = "bench-support")), allow(dead_code))]
+    // Crate-visible for the honesty test in `lib.rs` and the workspace bench
+    // seam: the walk's discard/book contract is asserted from outside this
+    // module; the present path calls `present_latency_ns_with_plan` directly.
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn present_latency_ns(&mut self, wid: WindowId) -> u64 {
         // Only the leaves of the ACTIVE tab can ever book a measurement, and
         // there are 1-4 of them. MPT-3: this used to walk every leaf of every
@@ -37731,6 +37919,7 @@ impl App {
                     aterm_effects::pet_world::PetPane::full(&ws.composed_focus_scratch),
                     &exclusions[..count],
                 );
+                metrics::note_pet_world_observation(ws.cursor_pet.observed_cells());
             }
             ws.cursor_pet.has_reading_interest()
         } else {
@@ -38346,6 +38535,7 @@ impl App {
             // Same caption term as the single-pane key: the focused pane's
             // hold above re-probed it, the splice after this gate paints it.
             link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
+            claude_footer_fp: self.claude_footer_fp(wid, plan),
         };
         // Displayed (or just-erased) predictions bypass the skip exactly like the
         // single-pane path: a ghost paints/erases without perturbing the RepaintKey.
@@ -38411,6 +38601,11 @@ impl App {
         // them (`plan_composed_retention`, and `COMPOSE_RETAIN_UNSOUND` is the
         // witness that keeps the prediction honest).
         let focus_quiet = ws.preedit.is_empty() && ws.predictor.idle() && !ws.pred_shown;
+        // The Claude Code footer the last frame painted into this composite is
+        // put back first, so the blessing it bumped past reads intact again
+        // and its row is retained or rewritten like any other
+        // (`crate::claude_footer::undo`).
+        crate::claude_footer::undo(&mut ws.claude_footer_undo, &mut ws.input_scratch);
         // WHICH COMPOSED ROWS THIS FRAME MAY LEAVE ALONE. Taken here, before the
         // fill, because the fill is the first thing that would overwrite one.
         plan_composed_retention(
@@ -38958,6 +39153,12 @@ impl App {
     /// The output is byte-identical either way (the cache is keyed on exactly what the
     /// rows are painted from: fingerprint = count+active+titles, plus `cols`).
     pub(crate) fn splice_tab_strip_with(&mut self, wid: WindowId, tab_strip: u64) {
+        // Composed panes reuse scratch without extracting a whole terminal frame.
+        // Retire its previous chrome even when no band remains to splice; any
+        // current band rasters are installed below at their new frame rows.
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.input_scratch.chrome_rasters.clear();
+        }
         let strip = self.tab_strip_rows as usize;
         // THE BAND REACHES THE WINDOW EDGES. A strip cell can only paint its own
         // cell rect (`pad + col·cell_w`), so the band and its seam stop `pad` px short
@@ -39435,6 +39636,24 @@ impl App {
     /// floored against the surface tone under it at that frame (ruling 138),
     /// so there is no time-free paint to reuse under a moving surface — the
     /// width law's layout is what the frames reuse (`band_layout`).
+    /// What the message band paints from (design ruling 250): the chrome
+    /// `theme` and the terminal palette's blue and cyan, which a meter borrows
+    /// when the theme's cursor is near-grey. The palette is the one the
+    /// sessions were configured with (`TerminalConfig::custom_palette`, the
+    /// xterm table when unset); `None` before any config is applied.
+    pub(crate) fn band_palette(
+        &self,
+        theme: aterm_render::Theme,
+    ) -> crate::chrome_band::BandPalette {
+        let ansi = self.session_factory.terminal_config.as_ref().map(|tc| {
+            tc.custom_palette.as_ref().map_or_else(
+                || crate::chrome_band::MeterAnsi::of_palette(&aterm_types::ColorPalette::new()),
+                crate::chrome_band::MeterAnsi::of_palette,
+            )
+        });
+        crate::chrome_band::BandPalette { theme, ansi }
+    }
+
     pub(crate) fn splice_message_band(&mut self, wid: WindowId, theme: aterm_render::Theme) {
         let Some((cols, hover)) = self
             .windows
@@ -39444,12 +39663,14 @@ impl App {
             return;
         };
         let fp = self.messages.fingerprint(cols);
+        let palette = self.band_palette(theme);
         let palette_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             theme.bg.hash(&mut h);
             theme.fg.hash(&mut h);
             theme.cursor.hash(&mut h);
+            palette.ansi.hash(&mut h);
             h.finish()
         };
         // The motion frame this present reads: the one the redraw prepared,
@@ -39472,17 +39693,19 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid)
             && ws.last_band_key != Some(key)
         {
-            let (rows, edges) = match (&ws.band_motion, &ws.band_layout) {
+            let (rows, edges, rasters) = match (&ws.band_motion, &ws.band_layout) {
                 (Some(motion), Some((f, c, p))) if fp != 0 && *f == fp && *c == cols => {
-                    crate::message_band::paint_rows_on(p, theme, hover, geom, motion)
+                    crate::message_band::paint_rows_on(p, palette, hover, geom, motion)
                 }
-                _ => (Vec::new(), Vec::new()),
+                _ => (Vec::new(), Vec::new(), Vec::new()),
             };
             ws.cached_band_rows = rows;
             ws.cached_band_edges = edges;
+            ws.cached_band_rasters = rasters;
             ws.last_band_key = Some(key);
         }
         let cell_h = self.win_cell_size(wid).1;
+        let pad = self.win_pad(wid);
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
         // THE PRESENCE ROW (round 19) sits ABOVE the band — directly under the
         // tab strip — in the row its window committed (`presence.rows`), painted
@@ -39535,6 +39758,9 @@ impl App {
             &ws.cached_band_rows
         };
         let composed = usize::from(presence_row.is_some()) + rows.len();
+        // The band owns the frame's pixel-resolution chrome rows: none carry
+        // over from the scratch's last use.
+        ws.input_scratch.chrome_rasters.clear();
         prepend_strip_row_slices(
             &mut ws.input_scratch,
             composed,
@@ -39545,11 +39771,73 @@ impl App {
             grid_top,
             &mut ws.strip_row_pool,
         );
+        // THE METER AT PIXEL RESOLUTION (ruling 242): each painted band row's
+        // raster, placed on the frame (its column 0 is `lo` window pixels in)
+        // at the row's composed index — the strip, prepended later, shifts it
+        // with every other per-row channel.
+        let presence_n = usize::from(presence_row.is_some());
+        let lo = geom.cells_x.saturating_sub(pad);
+        let frame_w = cols.saturating_mul(geom.cell_w).saturating_add(2 * pad);
+        for (i, raster) in ws.cached_band_rasters.iter().take(rows.len()).enumerate() {
+            if let Some(r) = raster
+                && let Ok(row) = u16::try_from(presence_n + i)
+            {
+                ws.input_scratch
+                    .chrome_rasters
+                    .push(r.on_frame(row, lo, frame_w, cell_h));
+            }
+        }
         // The closing seam goes on whichever row the COMPOSED stack ends with — a
         // painted row, a padded one, or the presence row alone — never on the
         // painter's last row, which the pad and trim above can bury or cut off.
         // Rows `0..composed` are exactly this stack: the strip is prepended later.
         crate::message_band::seal_stack(&mut ws.input_scratch.cells[..composed], theme);
+        // A RAIL (the strain gauge, ruling 243) runs in its row's lowest
+        // pixels, where the stack's closing seam runs too when the row is the
+        // last: where the rail is lit it IS the row's lower edge, so the seam
+        // gives way to it cell by cell (a cell at least half lit).
+        let cw = geom.cell_w.max(1);
+        let railed: Vec<(usize, Vec<usize>)> = ws
+            .input_scratch
+            .chrome_rasters
+            .iter()
+            .filter(|m| !m.rail.is_empty())
+            .map(|m| {
+                let lit = (0..cols)
+                    .filter(|&c| {
+                        let x0 = pad + c * cw;
+                        let on = (x0..x0 + cw)
+                            .filter(|&x| {
+                                m.rail
+                                    .get(x)
+                                    .is_some_and(|&v| v != aterm_render::ChromeRaster::KEEP)
+                            })
+                            .count();
+                        on * 2 >= cw
+                    })
+                    .collect();
+                (usize::from(m.row), lit)
+            })
+            .collect();
+        for (r, lit) in railed {
+            if let Some(row) = ws.input_scratch.cells.get_mut(r) {
+                for c in lit {
+                    if let Some(cell) = row.get_mut(c) {
+                        cell.underline = aterm_core::terminal::UnderlineStyle::None;
+                        cell.underline_color = None;
+                    }
+                }
+            }
+        }
+        // An outlined capsule (ruling 249) stands on the row's underline and
+        // its floor IS its cells' underline, in the ring's colour (ruling
+        // 254): on the last row the seam runs up to the pill's foot (the
+        // ring draws it across its end cells) and the floor carries it on,
+        // instead of cutting through the pill's inside.
+        crate::message_band::floor_rings(
+            &mut ws.input_scratch.cells[..composed],
+            &mut ws.input_scratch.chrome_rasters,
+        );
     }
 
     /// M1b sub-row scroll — record the terminal-content grid/chrome partition and
@@ -39746,6 +40034,9 @@ impl App {
                             // per PTY burst. The bar marks the number rather
                             // than asserting a census it knows has moved.
                             stale: s.results_dirty,
+                            // Ruling 237: the history is away for a rewrap, so
+                            // nothing found is `none yet`, not a miss.
+                            history_away: s.history_away,
                         },
                         preedit_span,
                         cur_term_row,
@@ -42249,66 +42540,37 @@ mod reflow_pool_tests {
 /// The `Acquire` load pairs with `Session::drop`'s `Release` store of
 /// `reflow_cancel` (house style of `reader_stop`; the flag guards no data — the
 /// job is owned right here — so this is belt-and-suspenders for the signal).
+#[cfg(test)]
 pub(crate) fn drive_reflow_job(
+    job: aterm_core::grid::PendingScrollbackReflow,
+    cancel: &std::sync::atomic::AtomicBool,
+    step_budget: usize,
+) -> Option<aterm_core::grid::ReflowedScrollback> {
+    drive_reflow_job_gauged(job, cancel, step_budget, None)
+}
+
+/// [`drive_reflow_job`], storing the job's progress into `gauge` after each
+/// step (design ruling 233): one relaxed store per step, read by the loop
+/// only while a person waits on the rewrap.
+pub(crate) fn drive_reflow_job_gauged(
     mut job: aterm_core::grid::PendingScrollbackReflow,
     cancel: &std::sync::atomic::AtomicBool,
     step_budget: usize,
+    gauge: Option<&crate::session_waits::RewrapGauge>,
 ) -> Option<aterm_core::grid::ReflowedScrollback> {
     loop {
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
             return None; // drops `job`: bounded loss, caller aborts the offload
         }
         match job.reflow_step(step_budget) {
-            aterm_core::grid::ReflowStep::InProgress(next) => job = next,
+            aterm_core::grid::ReflowStep::InProgress(next) => {
+                if let Some(gauge) = gauge {
+                    gauge.step(next.lines_done());
+                }
+                job = next;
+            }
             aterm_core::grid::ReflowStep::Done(reflowed) => return Some(reflowed),
         }
-    }
-}
-
-#[cfg(test)]
-mod native_preview_scheduler_tests {
-    use crate::{App, WindowId};
-
-    /// Font size does not currently change a preview's cadence, so a black-box
-    /// animation assertion alone cannot distinguish a global-font regression. Pair
-    /// the real two-metric scheduler drive with a narrow source-wiring guard on this
-    /// one call site: the scheduler must feed the same window-local font authority as
-    /// semantic compilation and its paint stamp.
-    #[test]
-    fn settings_preview_scheduler_uses_the_target_window_font() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.font_px = 8.0;
-        app.windows.get_mut(&wid).unwrap().metrics.font_px = 24.0;
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorMotion));
-        let (_, view) = app.active_native_view(wid).unwrap();
-        let expected = match app.native_runtime.view_state(view) {
-            Some(crate::native_app::AppViewState::Settings(state)) => state.preview_animation(
-                100,
-                app.native_view_motion_cx(wid, view),
-                app.win_font_px(wid),
-                app.theme,
-                app.native_ui_viewport(wid).unwrap(),
-            ),
-            _ => panic!("Settings view state"),
-        };
-        assert_eq!(app.win_font_px(wid), 24.0);
-        assert_eq!(
-            app.active_native_settings_preview(wid, 100)
-                .map(|(_, animation)| animation),
-            (expected != crate::settings_preview::PreviewAnimation::None).then_some(expected)
-        );
-
-        let source = include_str!("app_render.rs");
-        let body = source
-            .split_once("pub(crate) fn active_native_settings_preview")
-            .expect("preview scheduler definition")
-            .1
-            .split_once("fn append_native_modal_prims")
-            .expect("preview scheduler body")
-            .0;
-        assert!(body.contains("self.win_font_px(wid)"));
-        assert!(!body.contains("self.font_px,"));
     }
 }
 
@@ -43211,14 +43473,69 @@ mod tab_strip_bleed_tests {
         );
     }
 
+    /// Mixed composition reuses the whole-frame scratch instead of extracting
+    /// a terminal frame into it. A removed meter must not outlive its cells.
+    #[test]
+    fn mixed_frame_retires_meter_rasters_when_the_message_band_disappears() {
+        use aterm_messages::{Hold, Message, Meter, Severity, tags};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 0;
+        app.windows.get_mut(&wid).unwrap().rows = 40;
+        app.windows.get_mut(&wid).unwrap().cols = 140;
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        crate::term_lock(&app.pool.get(session).unwrap().term)
+            .process(b"\x1b[2J\x1b[Hterminal stays visible");
+        let id = app.post_message(
+            Message::new(tags::UPDATE, Severity::Info, "a live meter")
+                .meter(Meter {
+                    fill_permille: Some(500),
+                    ..Meter::default()
+                })
+                .hold(Hold::Live {
+                    stale_after: aterm_messages::STALE_UPDATE,
+                }),
+        );
+        assert_eq!(app.message_band_rows, 1);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        assert!(
+            !app.windows[&wid].input_scratch.chrome_rasters.is_empty(),
+            "the fixture paints a real meter before its removal"
+        );
+        assert!(app.withdraw_message(id));
+        app.settle_messages(
+            std::time::Instant::now()
+                + aterm_messages::SHRINK_QUIET
+                + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(app.message_band_rows, 0);
+        assert_eq!(app.windows[&wid].presence.rows, 0);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let input = &app.windows[&wid].input_scratch;
+        assert!(
+            input.chrome_rasters.is_empty(),
+            "the removed meter cannot paint over the next mixed frame"
+        );
+        assert!(input.cells.iter().any(|row| {
+            row.iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .contains("terminal stays visible")
+        }));
+        assert!(app.windows[&wid].settings_card.is_some());
+    }
+
     /// A BAND SPLICED OVER A METERED ROW TAKES ITS GUTTERS WITH IT (audit,
     /// 2026-09-24). The paste-confirmation banner overwrites the top rows in
     /// place after the bleed was handed over; the metered row's per-row tones
     /// then sat beside a row of `bar_bg` and froze on a stale meter tone. The
     /// splice primitive drops the tones of every row it covers; the rows it
-    /// does not cover keep theirs.
+    /// does not cover keep theirs. Pixel-resolution meter rasters obey the same
+    /// ownership: their ground, rail and ink split cannot cover the new banner.
     #[test]
-    fn a_band_spliced_over_a_metered_row_drops_its_gutter_tones() {
+    fn a_band_spliced_over_a_metered_row_drops_its_gutter_tones_and_raster() {
         use aterm_messages::{Hold, Message, Meter, Severity, tags};
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -43244,6 +43561,12 @@ mod tab_strip_bleed_tests {
             "fixture: two metered rows carry tones ({metered:?})"
         );
         let (covered, kept) = (metered[0], metered[1]);
+        let input = &app.windows[&wid].input_scratch;
+        assert!(input.chrome_raster(covered).is_some());
+        let kept_raster = input
+            .chrome_raster(kept)
+            .expect("second meter raster")
+            .clone();
         let cols = usize::from(app.windows[&wid].cols);
         let cell_h = app.win_cell_size(wid).1;
         let blank = crate::message_band::blank_band_row(cols, app.chrome_palette_theme());
@@ -43259,6 +43582,9 @@ mod tab_strip_bleed_tests {
             bleed.gutter_tones(kept),
             "an uncovered row keeps its own tones"
         );
+        let input = &app.windows[&wid].input_scratch;
+        assert!(input.chrome_raster(covered).is_none());
+        assert_eq!(input.chrome_raster(kept), Some(&kept_raster));
     }
 
     /// A STRIP WITH NO SURFACE STILL LETS THE BAND REACH THE EDGES (audit,
@@ -46878,336 +47204,228 @@ mod rain_host_tests {
         assert_eq!(band, vec![7, 3], "full damage leaves the band unchanged");
     }
 
-    /// The tab-strip splice shifts rain quads (row + pixel y, the cat-quad
-    /// shape) and rain halos (the nova shape) down with the grid — a quad
-    /// emitted in viewport coords stays registered with its cell.
+    /// The tab-strip splice moves EVERY grid-relative projection down with the
+    /// grid — one fixture seeding every channel, run at a 1-row and a 2-row strip
+    /// with each strip's expected rows written out:
+    ///
+    /// * rain quads (row + pixel y, the cat-quad shape) and rain halos (the nova
+    ///   shape) — a quad emitted in viewport coords stays registered with its
+    ///   cell, and the halo falloff CENTRE rides the same vertical shift while a
+    ///   vertical splice leaves `cx` alone;
+    /// * the fire CONTRAST-HALO cells, a GRID stream (the `char_fg` rule): row tag
+    ///   only — the stream is cell-anchored and colour-free, so the column and
+    ///   the strength never move;
+    /// * the two easy-to-miss carriers: selection anchors (consumed inside the
+    ///   glyph/background pass) with the pane clip and the per-pane selection
+    ///   list, the atlas-backed cat/rain streams, and rowless free sprites.
     #[test]
-    fn strip_splice_shifts_rain_channels() {
-        let mut input = aterm_render::RenderInput::empty();
-        input.cells = vec![vec![]; 4];
-        input.clusters = vec![vec![]; 4];
-        input.combining = vec![vec![]; 4];
-        input.images = vec![vec![]; 4];
-        input.line_sizes = vec![aterm_core::grid::LineSize::SingleWidth; 4];
-        input.rows = 4;
-        input.rain_quads.push(aterm_render::SpriteQuad {
-            row: 2,
-            x: 8,
-            y: 32,
-            w: 8,
-            h: 16,
-            ax: 0,
-            ay: 0,
-            aw: 8,
-            ah: 16,
-            tint: 0x0028_D75F,
-            alpha: 96,
-            flip_x: false,
-        });
-        input.rain_add.push(aterm_render::RainHalo {
-            row: 2,
-            x: 8,
-            y: 32,
-            w: 8,
-            h: 16,
-            color: 0x0010_3010,
-            cx: 12,
-            cy: 40,
-            rx: 6,
-            ry: 8,
-            // Defaulted `mode: HaloMode::Add` — the historical light.
-            ..Default::default()
-        });
-        let strip = vec![vec![]; 1];
-        let mut pool = Vec::new();
-        prepend_strip_rows(&mut input, &strip, 16, 0, &mut pool);
-        assert_eq!(input.rain_quads[0].row, 3, "row shifted by the strip");
-        assert_eq!(input.rain_quads[0].y, 48, "pixel y shifted by strip*cell_h");
-        assert_eq!(input.rain_add[0].row, 3);
-        assert_eq!(input.rain_add[0].y, 48);
-        assert_eq!(
-            input.rain_add[0].cy, 56,
-            "the halo falloff CENTRE rides the same vertical shift as its quad"
-        );
-        assert_eq!(
-            input.rain_add[0].cx, 12,
-            "a vertical splice leaves cx alone"
-        );
-    }
-
-    /// The tab-strip splice shifts the fire CONTRAST-HALO cells down with the
-    /// grid (a GRID stream, the char_fg rule): row tag only — the stream is
-    /// cell-anchored and colour-free, so nothing else moves.
-    #[test]
-    fn strip_splice_shifts_fire_halo_rows() {
-        let mut input = aterm_render::RenderInput::empty();
-        input.cells = vec![vec![]; 4];
-        input.clusters = vec![vec![]; 4];
-        input.combining = vec![vec![]; 4];
-        input.images = vec![vec![]; 4];
-        input.line_sizes = vec![aterm_core::grid::LineSize::SingleWidth; 4];
-        input.rows = 4;
-        input.fire_halo.push(aterm_render::FireHaloCell {
-            row: 2,
-            col: 5,
-            strength: 200,
-        });
-        input.char_fg.push(aterm_render::CharFg {
-            row: 2,
-            col: 5,
-            fg: 0x0010_0804,
-        });
-        let strip = vec![vec![]; 2];
-        let mut pool = Vec::new();
-        prepend_strip_rows(&mut input, &strip, 16, 0, &mut pool);
-        assert_eq!(
-            input.fire_halo[0].row, 4,
-            "fire_halo row shifted by the strip"
-        );
-        assert_eq!(input.fire_halo[0].col, 5, "the column never moves");
-        assert_eq!(
-            input.fire_halo[0].strength, 200,
-            "the strength rides untouched"
-        );
-        assert_eq!(
-            input.char_fg[0].row, 4,
-            "char_fg shifts identically (the shared GRID-stream rule)"
-        );
-    }
-
-    /// Every grid-relative projection must move with the prepended strip, not
-    /// only cells and cursor. This pins the two easy-to-miss carriers: selection
-    /// anchors (consumed inside the glyph/background pass), the atlas-backed
-    /// cat/rain streams (row tag + pixel y), and rowless free sprites.
-    #[test]
-    fn strip_splice_shifts_selection_and_sprite_channels() {
-        let mut input = aterm_render::RenderInput::empty();
+    fn strip_splice_shifts_every_grid_relative_channel() {
+        struct Want {
+            strip: usize,
+            /// The viewport-row-2 rain quad and halo, and the halo's centre.
+            rain_row: u16,
+            rain_y: u16,
+            halo_cy: u16,
+            /// The viewport-row-2 fire-halo and `char_fg` cells.
+            grid_row: u16,
+            /// The viewport-row-1 cat/rain sprites and the free sprite's y.
+            sprite_row: u16,
+            sprite_y: u16,
+            /// Terminal row zero, where the selection sits, after the splice.
+            selected_row: usize,
+        }
         let blank = crate::chrome_band::blank_cell(aterm_render::Theme::default());
-        input.cells = vec![vec![blank; 4]; 3];
-        input.clusters = vec![vec![]; 3];
-        input.combining = vec![vec![]; 3];
-        input.images = vec![vec![]; 3];
-        input.line_sizes = vec![aterm_core::grid::LineSize::SingleWidth; 3];
-        input.rows = 3;
-        input.cols = 4;
-        input.selection.start_selection(
-            0,
-            0,
-            aterm_core::selection::SelectionSide::Left,
-            aterm_core::selection::SelectionType::Simple,
-        );
-        input
-            .selection
-            .update_selection(0, 1, aterm_core::selection::SelectionSide::Right);
-        input.selection_clip = Some(aterm_render::SelectionClip::new(0, 1, 0, 2));
-        // …and the per-pane list a split frame carries, which must move by the
-        // same translation: leaving an entry behind puts a pane's band `strip`
-        // rows above the cells it belongs to.
-        input.selections = vec![aterm_core::render::PaneSelection {
-            selection: input.selection.clone(),
-            clip: aterm_render::SelectionClip::new(0, 1, 0, 2),
-            bg: aterm_core::render::COLOR_UNSET,
-            fg: aterm_core::render::COLOR_UNSET,
-            inactive: true,
-        }];
-        input.cat_quads.push(aterm_render::SpriteQuad {
-            row: 1,
-            y: 16,
-            ..Default::default()
-        });
-        input.rain_quads.push(aterm_render::SpriteQuad {
-            row: 1,
-            y: 16,
-            ..Default::default()
-        });
-        input.free_sprites.push(aterm_core::render::FreeSprite {
-            y: 16,
-            ..Default::default()
-        });
+        for want in [
+            Want {
+                strip: 1,
+                rain_row: 3,
+                rain_y: 48,
+                halo_cy: 56,
+                grid_row: 3,
+                sprite_row: 2,
+                sprite_y: 32,
+                selected_row: 1,
+            },
+            Want {
+                strip: 2,
+                rain_row: 4,
+                rain_y: 64,
+                halo_cy: 72,
+                grid_row: 4,
+                sprite_row: 3,
+                sprite_y: 48,
+                selected_row: 2,
+            },
+        ] {
+            let strip = want.strip;
+            let mut input = aterm_render::RenderInput::empty();
+            input.cells = vec![vec![blank; 8]; 4];
+            input.clusters = vec![vec![]; 4];
+            input.combining = vec![vec![]; 4];
+            input.images = vec![vec![]; 4];
+            input.line_sizes = vec![aterm_core::grid::LineSize::SingleWidth; 4];
+            input.rows = 4;
+            input.cols = 8;
+            input.selection.start_selection(
+                0,
+                0,
+                aterm_core::selection::SelectionSide::Left,
+                aterm_core::selection::SelectionType::Simple,
+            );
+            input
+                .selection
+                .update_selection(0, 1, aterm_core::selection::SelectionSide::Right);
+            input.selection_clip = Some(aterm_render::SelectionClip::new(0, 1, 0, 2));
+            // …and the per-pane list a split frame carries, which must move by the
+            // same translation: leaving an entry behind puts a pane's band `strip`
+            // rows above the cells it belongs to.
+            input.selections = vec![aterm_core::render::PaneSelection {
+                selection: input.selection.clone(),
+                clip: aterm_render::SelectionClip::new(0, 1, 0, 2),
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: true,
+            }];
+            input.rain_quads.push(aterm_render::SpriteQuad {
+                row: 2,
+                x: 8,
+                y: 32,
+                w: 8,
+                h: 16,
+                ax: 0,
+                ay: 0,
+                aw: 8,
+                ah: 16,
+                tint: 0x0028_D75F,
+                alpha: 96,
+                flip_x: false,
+            });
+            input.rain_add.push(aterm_render::RainHalo {
+                row: 2,
+                x: 8,
+                y: 32,
+                w: 8,
+                h: 16,
+                color: 0x0010_3010,
+                cx: 12,
+                cy: 40,
+                rx: 6,
+                ry: 8,
+                // Defaulted `mode: HaloMode::Add` — the historical light.
+                ..Default::default()
+            });
+            input.fire_halo.push(aterm_render::FireHaloCell {
+                row: 2,
+                col: 5,
+                strength: 200,
+            });
+            input.char_fg.push(aterm_render::CharFg {
+                row: 2,
+                col: 5,
+                fg: 0x0010_0804,
+            });
+            input.cat_quads.push(aterm_render::SpriteQuad {
+                row: 1,
+                y: 16,
+                ..Default::default()
+            });
+            input.rain_quads.push(aterm_render::SpriteQuad {
+                row: 1,
+                y: 16,
+                ..Default::default()
+            });
+            input.free_sprites.push(aterm_core::render::FreeSprite {
+                y: 16,
+                ..Default::default()
+            });
 
-        let strip = vec![vec![blank; 4]; 2];
-        prepend_strip_rows(&mut input, &strip, 16, 0, &mut Vec::new());
+            prepend_strip_rows(
+                &mut input,
+                &vec![vec![blank; 8]; strip],
+                16,
+                0,
+                &mut Vec::new(),
+            );
 
-        assert!(
-            !input.selection.contains(0, 0),
-            "terminal row-zero selection never paints the strip"
-        );
-        assert!(
-            input.selection.contains(2, 0),
-            "selection follows terminal row zero to composed row two"
-        );
-        assert_eq!(
-            input.selection_clip,
-            Some(aterm_render::SelectionClip::new(2, 3, 0, 2)),
-            "the renderer-visible pane clip follows the same strip translation"
-        );
-        assert!(
-            !input.selections[0].selection.contains(0, 0)
-                && input.selections[0].selection.contains(2, 0),
-            "a pane entry's anchors follow terminal row zero too"
-        );
-        assert_eq!(
-            input.selections[0].clip,
-            aterm_render::SelectionClip::new(2, 3, 0, 2),
-            "…and so does its box"
-        );
-        assert!(
-            !input.selection_contains_cell(0, 0, false, false)
-                && input.selection_contains_cell(2, 0, false, false),
-            "the renderer predicate agrees with both halves after the splice"
-        );
-        for quad in input.cat_quads.iter().chain(&input.rain_quads) {
-            assert_eq!(quad.row, 3, "sprite damage tag follows the grid");
-            assert_eq!(quad.y, 48, "sprite destination follows strip*cell_h");
+            let at = format!("{strip}-row strip");
+            assert_eq!(
+                input.rain_quads[0].row, want.rain_row,
+                "{at}: row shifted by the strip"
+            );
+            assert_eq!(
+                input.rain_quads[0].y, want.rain_y,
+                "{at}: pixel y shifted by strip*cell_h"
+            );
+            assert_eq!(input.rain_add[0].row, want.rain_row, "{at}");
+            assert_eq!(input.rain_add[0].y, want.rain_y, "{at}");
+            assert_eq!(
+                input.rain_add[0].cy, want.halo_cy,
+                "{at}: the halo falloff CENTRE rides the same vertical shift as its quad"
+            );
+            assert_eq!(
+                input.rain_add[0].cx, 12,
+                "{at}: a vertical splice leaves cx alone"
+            );
+            assert_eq!(
+                input.fire_halo[0].row, want.grid_row,
+                "{at}: fire_halo row shifted"
+            );
+            assert_eq!(input.fire_halo[0].col, 5, "{at}: the column never moves");
+            assert_eq!(
+                input.fire_halo[0].strength, 200,
+                "{at}: the strength rides untouched"
+            );
+            assert_eq!(
+                input.char_fg[0].row, want.grid_row,
+                "{at}: char_fg shifts identically (the shared GRID-stream rule)"
+            );
+            let (top, bottom) = (want.selected_row, want.selected_row + 1);
+            assert!(
+                !input.selection.contains(0, 0),
+                "{at}: terminal row-zero selection never paints the strip"
+            );
+            assert!(
+                input.selection.contains(want.selected_row as i32, 0),
+                "{at}: selection follows terminal row zero"
+            );
+            assert_eq!(
+                input.selection_clip,
+                Some(aterm_render::SelectionClip::new(top, bottom, 0, 2)),
+                "{at}: the renderer-visible pane clip follows the same strip translation"
+            );
+            assert!(
+                !input.selections[0].selection.contains(0, 0)
+                    && input.selections[0]
+                        .selection
+                        .contains(want.selected_row as i32, 0),
+                "{at}: a pane entry's anchors follow terminal row zero too"
+            );
+            assert_eq!(
+                input.selections[0].clip,
+                aterm_render::SelectionClip::new(top, bottom, 0, 2),
+                "{at}: …and so does its box"
+            );
+            assert!(
+                !input.selection_contains_cell(0, 0, false, false)
+                    && input.selection_contains_cell(want.selected_row, 0, false, false),
+                "{at}: the renderer predicate agrees with both halves after the splice"
+            );
+            for quad in input.cat_quads.iter().chain(&input.rain_quads[1..]) {
+                assert_eq!(
+                    quad.row, want.sprite_row,
+                    "{at}: sprite damage tag follows the grid"
+                );
+                assert_eq!(
+                    quad.y, want.sprite_y,
+                    "{at}: sprite destination follows strip*cell_h"
+                );
+            }
+            assert_eq!(
+                input.free_sprites[0].y,
+                i32::from(want.sprite_y),
+                "{at}: rowless sprite destination follows strip*cell_h"
+            );
         }
-        assert_eq!(
-            input.free_sprites[0].y, 48,
-            "rowless sprite destination follows strip*cell_h"
-        );
-    }
-}
-
-/// VISUAL CAPTURE of the ⌘F find panel: drives the REAL App/splice path, renders the
-/// resulting frame through the REAL CPU rasterizer (`aterm_render::Renderer`), and dumps
-/// PNGs — so the chrome can be reviewed as PIXELS rather than as row-text asserts. Not a
-/// gate: `#[ignore]`d (it needs a system font) and asserted only for "it produced frames".
-///
-/// ```sh
-/// FIND_PANEL_PNG_DIR=/tmp/find cargo test -p aterm-gui --lib \
-///     find_panel_visual_capture -- --ignored --nocapture
-/// ```
-#[cfg(test)]
-mod find_panel_visual_tests {
-    use crate::app_search::SearchEdit;
-    use crate::{App, WindowId, term_lock};
-
-    /// Fill the scratch from the engine and splice the panel, exactly as a real redraw
-    /// does, then render + write `name.png`.
-    fn capture(app: &mut App, wid: WindowId, dir: &std::path::Path, name: &str) -> bool {
-        let (rows, cols) = {
-            let ws = &app.windows[&wid];
-            (ws.rows as usize, ws.cols as usize)
-        };
-        let terminal = app
-            .front_terminal(wid)
-            .expect("front terminal")
-            .term
-            .clone();
-        {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            let mut term = term_lock(&terminal);
-            term.cell_frame_into(&mut ws.input_scratch, rows, cols);
-        }
-        app.splice_find_bar(wid);
-        let Some(mut cpu) =
-            aterm_render::Renderer::from_system(20.0, aterm_render::Theme::default())
-        else {
-            return false; // no system monospace font (headless CI) — skip.
-        };
-        let frame = cpu.render_input(&app.windows[&wid].input_scratch);
-        let mut rgb = Vec::with_capacity(frame.pixels.len() * 3);
-        for &p in &frame.pixels {
-            rgb.push((p >> 16) as u8);
-            rgb.push((p >> 8) as u8);
-            rgb.push(p as u8);
-        }
-        let path = dir.join(format!("{name}.png"));
-        let file = std::fs::File::create(&path).expect("create png");
-        let mut encoder = aterm_png::Encoder::new(
-            std::io::BufWriter::new(file),
-            frame.width as u32,
-            frame.height as u32,
-        );
-        encoder.set_color(aterm_png::ColorType::Rgb);
-        encoder.set_depth(aterm_png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .expect("png header")
-            .write_image_data(&rgb)
-            .expect("png data");
-        crate::logging::stderr_line!(
-            "wrote {} ({}x{})",
-            path.display(),
-            frame.width,
-            frame.height
-        );
-        true
-    }
-
-    fn content(app: &App, lines: &[&str]) {
-        let term = app.pool.get(0).expect("session 0").term.clone();
-        let mut bytes = Vec::new();
-        for line in lines {
-            bytes.extend_from_slice(line.as_bytes());
-            bytes.extend_from_slice(b"\r\n");
-        }
-        term_lock(&term).process(&bytes);
-    }
-
-    #[test]
-    #[ignore = "visual capture: needs a system font; run with --ignored"]
-    fn find_panel_visual_capture() {
-        let dir = std::env::var("FIND_PANEL_PNG_DIR").map_or_else(
-            |_| std::env::temp_dir().join("find-panel"),
-            std::path::PathBuf::from,
-        );
-        std::fs::create_dir_all(&dir).expect("output dir");
-        let lines = [
-            "alpha needle one",
-            "beta line two",
-            "gamma needle three",
-            "delta four",
-            "epsilon needle five",
-            "zeta seven eight",
-        ];
-
-        // 1. Just opened: the empty well shows its placeholder + the full keymap.
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        content(&app, &lines);
-        app.search_enter();
-        if !capture(&mut app, wid, &dir, "1-empty") {
-            crate::logging::stderr_line!("no system font — visual capture skipped");
-            return;
-        }
-
-        // 2. Typed query with live matches: position readout + highlight-all tint.
-        for ch in "needle".chars() {
-            app.search_edit_in(wid, SearchEdit::Insert(ch.to_string()));
-        }
-        capture(&mut app, wid, &dir, "2-typed");
-
-        // 3. Caret parked mid-query (^A then ⌥→): the field's edit position on glass.
-        app.search_edit_in(wid, SearchEdit::MoveStart);
-        app.search_edit_in(wid, SearchEdit::MoveCharRight);
-        app.search_edit_in(wid, SearchEdit::MoveCharRight);
-        capture(&mut app, wid, &dir, "3-caret-mid");
-
-        // 4. A query far wider than the well: it scrolls to keep the caret in view.
-        app.search_edit_in(wid, SearchEdit::KillToEnd);
-        app.search_edit_in(wid, SearchEdit::KillToStart);
-        app.search_edit_in(
-            wid,
-            SearchEdit::Insert(
-                "a-very-long-query-that-runs-past-the-end-of-the-field-and-keeps-going".into(),
-            ),
-        );
-        capture(&mut app, wid, &dir, "4-overlong");
-
-        // 5. No matches: the honest zero-hit readout.
-        app.search_edit_in(wid, SearchEdit::KillToStart);
-        app.search_edit_in(wid, SearchEdit::Insert("zzz".into()));
-        capture(&mut app, wid, &dir, "5-no-match");
-
-        // 6. A narrow window: the right side degrades before the field is squeezed.
-        let narrow = app.insert_logical_window(crate::stub_session(1), 20, 52);
-        app.frontmost_window = Some(narrow);
-        content(&app, &lines);
-        app.search_enter();
-        for ch in "needle".chars() {
-            app.search_edit_in(narrow, SearchEdit::Insert(ch.to_string()));
-        }
-        capture(&mut app, narrow, &dir, "6-narrow");
     }
 }
 
@@ -47221,8 +47439,8 @@ mod find_panel_visual_tests {
 /// columns and in two windows that are not a whole number of cells wide
 /// (`g80`, `g120`: gutters and a remainder band, ruling 55's geometry),
 /// rendered to PNG through the real compose (`splice_message_band`), the
-/// chrome bleed and the presenters' band placement, and the CPU renderer,
-/// exactly like `find_panel_visual_capture`; then the hover states on the
+/// chrome bleed and the presenters' band placement, and the CPU renderer
+/// (`aterm_render::Renderer`); then the hover states on the
 /// staged row; then the first-run sequence — the live row, then its fold at
 /// the child's exit with the grid given back; then the MOTION at every width
 /// — eight frames across one comet period, a determinate download at 0, 5,
@@ -47231,7 +47449,9 @@ mod find_panel_visual_tests {
 /// Contrast and two light themes; then the merged design's own scenes — a
 /// Warn row with a fill, and chips over the fill and over the track
 /// (rulings 136–141), those chips again on three light themes (ruling 155)
-/// and the comet on Tokyo Night and the light themes (rulings 157, 158).
+/// and the comet on Tokyo Night and the light themes (rulings 157, 158);
+/// then the strain row's level gauge for CPU, memory and disk on a dark and
+/// two light grounds, and beside a download (ruling 218).
 ///
 /// A capture is a PURE FUNCTION of the center's state and an injected
 /// instant (design §10.8): every scene is shot in an explicit [`Look`] at an
@@ -47332,6 +47552,25 @@ mod message_band_visual_tests {
                 ws.win_px.map(|s| s.width as usize),
             )
         };
+        // The band's meter borrows the scheme's blue or cyan where its cursor
+        // is near-grey (ruling 250): shoot a builtin ground with that
+        // scheme's own palette, as the app configured with it would.
+        if let Some(s) = aterm_types::scheme::builtin_names()
+            .into_iter()
+            .filter_map(aterm_types::scheme::builtin)
+            .find(|s| {
+                let t = s.to_theme_parts();
+                (t.fg, t.bg, t.cursor) == (theme.fg, theme.bg, theme.cursor)
+            })
+        {
+            let mut tc = app
+                .session_factory
+                .terminal_config
+                .clone()
+                .unwrap_or_default();
+            tc.custom_palette = Some(s.to_color_palette());
+            app.session_factory.terminal_config = Some(tc);
+        }
         let terminal = app
             .front_terminal(wid)
             .expect("front terminal")
@@ -47349,6 +47588,10 @@ mod message_band_visual_tests {
         app.splice_message_band(wid, theme);
         let mut cpu = aterm_render::Renderer::from_system(CAPTURE_PX, theme)?;
         let Some(win_w) = win_w else {
+            // A window with no glass lays its cells out at the App's own
+            // font, not the capture's: the band's PIXEL raster (ruling 242)
+            // is repainted on the frame this renderer draws.
+            reraster_for(app, wid, &cpu, theme);
             let frame = cpu.render_input(&app.windows[&wid].input_scratch);
             return Some(Frame {
                 width: frame.width,
@@ -47395,6 +47638,60 @@ mod message_band_visual_tests {
             band_y: cpu.grid_top(),
             cell_h: cpu.cell_size().1,
         })
+    }
+
+    /// Repaint window `wid`'s band rasters on the frame `cpu` draws (its
+    /// cell width, its pad, no remainder band), keeping each one's row.
+    fn reraster_for(
+        app: &mut App,
+        wid: WindowId,
+        cpu: &aterm_render::Renderer,
+        theme: aterm_render::Theme,
+    ) {
+        let (cw, ch) = cpu.cell_size();
+        let pad = cpu.pad();
+        let Some(ws) = app.windows.get(&wid) else {
+            return;
+        };
+        let (Some(motion), Some((_, cols, p))) = (&ws.band_motion, &ws.band_layout) else {
+            return;
+        };
+        let cols = *cols;
+        let geom = crate::message_band::BandGeometry {
+            win_w: cols * cw + 2 * pad,
+            cells_x: pad,
+            cell_w: cw,
+        };
+        let (_, _, rasters) = crate::message_band::paint_rows_on(
+            p,
+            app.band_palette(theme),
+            ws.band_hover,
+            geom,
+            motion,
+        );
+        let rows: Vec<u16> = ws
+            .input_scratch
+            .chrome_rasters
+            .iter()
+            .map(|m| m.row)
+            .collect();
+        let mut fresh: Vec<aterm_render::ChromeRaster> = rasters
+            .iter()
+            .flatten()
+            .zip(rows)
+            .map(|(r, row)| r.on_frame(row, 0, geom.win_w, ch))
+            .collect();
+        // The seam each ring took over from the composed stack
+        // (`message_band::floor_rings`, ruling 254) rides along: the cells
+        // under it already gave theirs up.
+        for (new, old) in fresh.iter_mut().zip(&ws.input_scratch.chrome_rasters) {
+            for (a, b) in new.rings.iter_mut().zip(&old.rings) {
+                a.seam = b.seam;
+            }
+        }
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.input_scratch.chrome_rasters = fresh;
+        }
     }
 
     /// Write `pixels` (`width` wide) as `path`.
@@ -47470,6 +47767,48 @@ mod message_band_visual_tests {
             look,
             aterm_render::Theme::default(),
         )
+    }
+
+    /// The grounds every row is ALSO shot on beside the default dark one (the
+    /// round-12 critics' set): a dark theme with a cool accent and the two
+    /// light themes.
+    const ROW_GROUNDS: [&str; 3] = ["Tokyo Night", "GitHub Light", "Solarized Light"];
+
+    /// The widths a row is shot at on the other grounds: 60, 80 and 120 whole
+    /// columns, and a window that is not a whole number of cells wide.
+    const GROUND_WIDTHS: [&str; 4] = ["60", "80", "120", "g80"];
+
+    /// [`capture_in`] window `wid` (labelled `cols`) on each of `grounds` as
+    /// `<name>-<ground>-<cols>`, when `cols` is one of [`GROUND_WIDTHS`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a capture is a pure function of exactly these inputs, spelled at the call"
+    )]
+    fn capture_grounds(
+        app: &mut App,
+        wid: WindowId,
+        cols: &str,
+        dir: &std::path::Path,
+        name: &str,
+        at: Instant,
+        look: Look,
+        grounds: &[&str],
+    ) {
+        if !GROUND_WIDTHS.contains(&cols) {
+            return;
+        }
+        for ground in grounds {
+            let slug = ground.to_lowercase().replace(' ', "-");
+            capture_in(
+                app,
+                wid,
+                dir,
+                &format!("{name}-{slug}-{cols}"),
+                at,
+                look,
+                scheme(ground),
+            );
+        }
     }
 
     /// The instant a scene is shot (design §10.12): past the progress grace,
@@ -47653,32 +47992,8 @@ mod message_band_visual_tests {
         );
         std::fs::create_dir_all(&dir).expect("output dir");
         let mut app = App::headless_for_test();
-        let w80 = WindowId(0);
-        let w60 = app.insert_logical_window(crate::stub_session(1), 20, 60);
-        let w120 = app.insert_logical_window(crate::stub_session(2), 20, 120);
-        let w160 = app.insert_logical_window(crate::stub_session(3), 20, 160);
-        // Two windows that are not a whole number of cells wide, with
-        // gutters (ruling 55's geometry): `g80` and `g120`.
-        let g80 = glass_window(&mut app, 4, 80, 10, 7);
-        let g120 = glass_window(&mut app, 5, 120, 8, 11);
-        app.frontmost_window = Some(w80);
-        let windows = [
-            ("60", w60),
-            ("80", w80),
-            ("120", w120),
-            ("160", w160),
-            ("g80", g80),
-            ("g120", g120),
-        ];
-        for (_, wid) in windows {
-            content(&app, wid);
-            // Every capture window stands in for the focused one; each scene
-            // is shot in an explicit look, so the spinner and the comet move
-            // exactly as the engine's grid says (ruling 140). The CPU harness
-            // font draws neither `↻` nor `⚠` (known, pre-existing) while the
-            // spinner frames and `✓` do.
-            app.windows.get_mut(&wid).unwrap().focused = true;
-        }
+        let windows = capture_windows(&mut app);
+        let w80 = windows[1].1;
         // "Staged automatic" is a record (design §10.5 H2; the owner's silent
         // path, 2026-09-24): the scene that showed it commits no row at all.
         app.clear_messages_for_test();
@@ -47691,10 +48006,19 @@ mod message_band_visual_tests {
             app.message_band_rows, 0,
             "a staged automatic build is a record"
         );
+        // …and so is a staged build whose manual latch lapses: it tries again
+        // by itself (`TRIES_AGAIN`), so nothing is the person's to do.
+        app.post_message(update_words::staged(
+            "0.92.0",
+            1234,
+            Some(ApplyPosture::ManualOnlyLatched { lapses: true }),
+        ));
+        app.settle_messages(Instant::now() + PROGRESS_GRACE);
+        assert_eq!(app.message_band_rows, 0, "a self-retry is a record");
         // THE ROWS, one scene each, at the four widths — every row one a
         // reporter really posts, shot 2 s after its motion epoch.
         type Scene = (&'static str, fn(&mut App));
-        let scenes: [Scene; 21] = [
+        let scenes: [Scene; 27] = [
             ("01-first-run-announced", |app| {
                 app.announce_toolchain_pass(FIRST_RUN, true);
             }),
@@ -47708,7 +48032,10 @@ mod message_band_visual_tests {
                     HEALTH_BODY,
                 ));
             }),
+            // A download a PERSON started (Check for Updates): the animated
+            // row with its ETA (design ruling 220).
             ("06-downloading", |app| {
+                app.note_update_check_asked(true);
                 app.note_update_progress(&aterm_update::Progress::Downloading {
                     version: "0.92.0".into(),
                     bytes_done: 45_000_000,
@@ -47716,9 +48043,21 @@ mod message_band_visual_tests {
                 });
             }),
             ("07-checking", |app| {
+                app.note_update_check_asked(true);
                 app.note_update_progress(&aterm_update::Progress::Verifying {
                     version: "0.92.0".into(),
                 });
+            }),
+            // The SAME download run by the background loop: nobody is waiting
+            // on it, so the band stays as it was — no row, no re-grid (design
+            // ruling 220); Settings ▸ Software Update shows it.
+            ("06b-downloading-unattended", |app| {
+                app.note_update_progress(&aterm_update::Progress::Downloading {
+                    version: "0.92.0".into(),
+                    bytes_done: 45_000_000,
+                    bytes_total: 74_000_000,
+                });
+                assert_eq!(app.messages.live_rows().count(), 0, "silent");
             }),
             // The one row the automatic lane raises before the switch: unsaved
             // editor work holding the install, which only the person can clear.
@@ -47740,7 +48079,7 @@ mod message_band_visual_tests {
             // the Version menu's press on the glass (ruling 143).
             ("09-activate", |app| {
                 app.note_update_outcome(update_words::needs_install(
-                    crate::app_update_screen::UPDATE_INSTALLED_TITLE,
+                    &crate::app_update_screen::update_installed_title(Some("0.92.0")),
                     crate::app_update_screen::UPDATE_INSTALLED_DETAIL,
                     aterm_messages::Severity::Info,
                     1234,
@@ -47759,8 +48098,11 @@ mod message_band_visual_tests {
             // A lane that stopped: a row the person acts on, main's words and
             // the `Install now` press (ruling 143; was U17's press-failed row).
             ("11b-update-did-not-apply", |app| {
-                app.note_update_outcome(update_words::needs_install(
+                // A stopped lane whose attempt failed for a reason the person
+                // can act on: its few words beside the title (ruling 246).
+                app.note_update_outcome(update_words::needs_install_because(
                     "Couldn't install aterm v0.92.0",
+                    update_words::short_cause("rename: No space left on device (os error 28)"),
                     update_words::INSTALL_FROM_MENU,
                     aterm_messages::Severity::Warn,
                     1234,
@@ -47878,6 +48220,59 @@ mod message_band_visual_tests {
                 app.announce_toolchain_pass(FIRST_RUN, true);
                 app.apply_toolchain_snapshot(Some(&first_run_read()), true);
             }),
+            // THE AUDIT'S ROWS (2026-09-25): every painted row whose words
+            // the audit changed.
+            // A first run that failed: an install, in the lane's one noun.
+            ("32-alab-install-failed", |app| {
+                app.post_message(toolchain_words::first_run_short(
+                    toolchain_words::FirstRunShort::Failed,
+                    "could not reach the index",
+                ));
+            }),
+            // The lane's one retry promise, on the stopped-lane row.
+            ("11c-install-tries-again", |app| {
+                app.note_update_outcome(update_words::needs_install(
+                    "Couldn't install aterm v0.92.0",
+                    update_words::TRIES_AGAIN,
+                    aterm_messages::Severity::Warn,
+                    1234,
+                ));
+            }),
+            // The config families' short titles: one value, three trail
+            // settings.
+            ("34-config-values", |app| {
+                use crate::message_reporters::{ConfigFamily, ConfigWarnings};
+                let mut warns = ConfigWarnings::default();
+                warns.push(
+                    ConfigFamily::UnacceptedValues,
+                    "config cursor_style: \"blob\" is not one of block, bar, underline; ignored"
+                        .into(),
+                );
+                for key in ["trail_length", "trail_fade", "trail_theme"] {
+                    warns.push(
+                        ConfigFamily::CursorTrail,
+                        format!("config {key}: out of range; the default is used"),
+                    );
+                }
+                app.replace_config_messages(warns.into_messages());
+            }),
+            // The session rows whose repeated detail line went.
+            ("35-shell-lost", |app| {
+                app.post_message(crate::message_reporters::shell_lost_in_update(
+                    "the pty handed over was closed (os error 9)",
+                ));
+                app.post_message(crate::message_reporters::restored_tab_failed(
+                    "fork: Resource temporarily unavailable (os error 35)",
+                ));
+            }),
+            // An a11y bridge that died with a screen reader attached: the
+            // retry line alone behind Details.
+            ("36-a11y-dead", |app| {
+                app.post_message(crate::message_reporters::a11y_publisher_dead(
+                    "the accessibility bridge thread exited",
+                    true,
+                ));
+            }),
         ];
         for (name, scene) in scenes {
             app.clear_messages_for_test();
@@ -47895,6 +48290,16 @@ mod message_band_visual_tests {
                     crate::logging::stderr_line!("no system font \u{2014} visual capture skipped");
                     return;
                 }
+                capture_grounds(
+                    &mut app,
+                    wid,
+                    cols,
+                    &dir,
+                    name,
+                    at,
+                    Look::MOVING,
+                    &ROW_GROUNDS,
+                );
             }
         }
         // HOVER: the staged manual row, pointer on `Install now` (a lit
@@ -47923,6 +48328,16 @@ mod message_band_visual_tests {
                     &format!("14-hover-{tag}-{cols}"),
                     at,
                     Look::MOVING,
+                );
+                capture_grounds(
+                    &mut app,
+                    wid,
+                    cols,
+                    &dir,
+                    &format!("14-hover-{tag}"),
+                    at,
+                    Look::MOVING,
+                    &ROW_GROUNDS,
                 );
                 app.windows.get_mut(&wid).unwrap().band_hover = None;
             }
@@ -47959,6 +48374,920 @@ mod message_band_visual_tests {
         );
         motion_sequences(&mut app, &dir, &windows);
         merged_design_scenes(&mut app, &dir, &windows);
+        strain_scenes(&mut app, &dir, &windows);
+        composition_scenes(&mut app, &dir, &windows);
+        person_pass_scenes(&mut app, &dir, &windows);
+        session_wait_scenes(&mut app, &dir, &windows);
+        wire_and_glint_scenes(&mut app, &dir, &windows);
+    }
+
+    /// A script's `notice` lines through the engine's own `wire::apply`, the
+    /// host's path, on the capture's clock.
+    fn notice(app: &mut App, line: &str, at: Instant) {
+        let req = aterm_messages::wire::NoticeRequest::parse(line).expect("a notice line");
+        let applied = aterm_messages::wire::apply(
+            &mut app.messages,
+            &mut app.wire_gate,
+            req,
+            crate::messages_host::wall_stamp_now(),
+            at,
+        );
+        assert!(applied.reply.starts_with("OK"), "{line}: {}", applied.reply);
+    }
+
+    /// THE ROUND-12 COVERAGE SCENES: a script's `notice progress` rows (busy,
+    /// a percentage fill, an amount with its ETA, its Complete echo) and a
+    /// script's failure row, then the glint mid-travel over a settled bar —
+    /// each at every width, on the default ground and [`ROW_GROUNDS`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one list of scenes, read top to bottom"
+    )]
+    fn wire_and_glint_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
+        let shoot = |app: &mut App, name: &str, at: Instant| {
+            app.settle_messages(at);
+            for &(cols, wid) in windows {
+                capture(app, wid, dir, &format!("{name}-{cols}"), at, Look::MOVING);
+                capture_grounds(app, wid, cols, dir, name, at, Look::MOVING, &ROW_GROUNDS);
+            }
+        };
+        // 70: `notice progress build busy`, 3 s in — the comet.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        notice(
+            app,
+            "progress build busy load=cpu Building aterm -- release profile",
+            start,
+        );
+        let epoch = start + PROGRESS_GRACE;
+        app.settle_messages(epoch);
+        let epoch = app
+            .messages
+            .on_glass()
+            .find_map(|l| l.motion_since)
+            .unwrap_or(epoch);
+        shoot(app, "70-notice-busy", epoch + Duration::from_secs(2));
+        // 71: `pct=`, restated every 200 ms from 10 % to 64 %.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        let mut t = start;
+        for k in 0..=27u64 {
+            t = start + Duration::from_millis(200 * k);
+            let pct = 10 + 2 * k;
+            notice(
+                app,
+                &format!("progress index pct={pct} Indexing the photo library"),
+                t,
+            );
+        }
+        shoot(
+            app,
+            "71-notice-pct",
+            t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME,
+        );
+        // 72: `done=<n>/<total> unit=bytes` at 3 MB/s for 8 s — the ETA.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        let total = 180_000_000u64;
+        let mut t = start;
+        for k in 0..=80u64 {
+            t = start + Duration::from_millis(100 * k);
+            let done = 12_000_000 + 300_000 * k;
+            notice(
+                app,
+                &format!(
+                    "progress backup done={done}/{total} unit=bytes load=network \
+                     Uploading the backup"
+                ),
+                t,
+            );
+        }
+        shoot(
+            app,
+            "72-notice-amount-eta",
+            t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME,
+        );
+        // 73: `notice done backup ok`, a quarter of a second into its echo.
+        let end = t + Duration::from_millis(100);
+        notice(app, "done backup ok", end);
+        shoot(app, "73-notice-done-echo", end + Duration::from_millis(250));
+        // 74: `notice done backup warn` on a fresh row: the Fault echo.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        let mut t = start;
+        for k in 0..=40u64 {
+            t = start + Duration::from_millis(100 * k);
+            let done = 300_000 * k;
+            notice(
+                app,
+                &format!("progress backup done={done}/{total} unit=bytes Uploading the backup"),
+                t,
+            );
+        }
+        // On the glass first: a row resolved before it was ever shown
+        // retires unseen, with no echo.
+        app.settle_messages(t);
+        let end = t + Duration::from_millis(100);
+        notice(app, "done backup warn", end);
+        shoot(app, "74-notice-fault-echo", end + Duration::from_millis(60));
+        // 75: `notice post deploy sev=warn`: a script's failure row.
+        app.clear_messages_for_test();
+        notice(
+            app,
+            "post deploy sev=warn Deploy to staging failed -- exit status 2\\nsee deploy.log",
+            Instant::now(),
+        );
+        let at = shot(app);
+        shoot(app, "75-notice-failed", at);
+        // 76: THE GLINT mid-travel over a settled bar at 57 %: a quarter, half
+        // and three quarters of the way across.
+        app.clear_messages_for_test();
+        let mut download = Download {
+            total: 200_000_000,
+            id: None,
+        };
+        let (t, _) = download.run_to(app, Instant::now(), 0, 4_000_000, 570);
+        app.settle_messages(t);
+        let epoch = app
+            .messages
+            .on_glass()
+            .find_map(|l| l.motion_since)
+            .expect("on glass");
+        let from = aterm_messages::animate::next_glint_start(
+            t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME,
+            epoch,
+        );
+        for k in 1..=3u32 {
+            shoot(
+                app,
+                &format!("76-glint-{k}"),
+                from + aterm_messages::GLINT_TRAVEL * k / 4,
+            );
+        }
+        app.clear_messages_for_test();
+    }
+
+    /// THE WAITS INSIDE A SESSION (design rulings 231–235): a large paste
+    /// on its way to a slow program and a scrollback rewrap the person
+    /// scrolled into, each mid-way with its ETA and at its Complete echo, at
+    /// every width and on GitHub Light.
+    fn session_wait_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
+        use aterm_messages::waits::{paste_row, rewrap_row};
+        let shoot = |app: &mut App, name: &str, at: Instant| {
+            app.settle_messages(at);
+            let at = app
+                .messages
+                .on_glass()
+                .filter_map(|l| l.motion_since)
+                .max()
+                .map_or(at, |epoch| (epoch + Duration::from_secs(2)).max(at));
+            for &(cols, wid) in windows {
+                capture(app, wid, dir, &format!("{name}-{cols}"), at, Look::MOVING);
+                capture_in(
+                    app,
+                    wid,
+                    dir,
+                    &format!("{name}-github-light-{cols}"),
+                    at,
+                    Look::MOVING,
+                    scheme("GitHub Light"),
+                );
+                capture_grounds(
+                    app,
+                    wid,
+                    cols,
+                    dir,
+                    name,
+                    at,
+                    Look::MOVING,
+                    &["Tokyo Night", "Solarized Light"],
+                );
+            }
+        };
+        // 90: a 4.2 MB paste into a line editor taking 110 KB/s, read every
+        // 100 ms for 10 s: `Pasting 4.2 MB`, the fill, `1.1 MB / 4.2 MB`,
+        // the ETA and `Stop paste`.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        let total = 4_200_000;
+        let series = aterm_messages::Amount::series_of("session.paste.0#1");
+        let id = app
+            .messages
+            .post(
+                paste_row(0, series, 0, total, PROGRESS_GRACE),
+                crate::messages_host::wall_stamp_now(),
+                start,
+            )
+            .id;
+        let mut t = start;
+        for k in 1..=100u64 {
+            t = start + Duration::from_millis(100 * k);
+            let msg = paste_row(0, series, 11_000 * k, total, Duration::ZERO);
+            app.messages
+                .restate(id, crate::messages_host::restatement_of(&msg), t);
+        }
+        shoot(app, "90-paste-eta", t);
+        // 91: its Complete echo, a quarter of a second in.
+        let end = t + Duration::from_millis(100);
+        app.messages
+            .withdraw_with(id, aterm_messages::EchoKind::Complete, end);
+        shoot(
+            app,
+            "91-paste-complete-echo",
+            end + Duration::from_millis(250),
+        );
+        // 92: a 3.4M-line history rewrapping at 200K lines/s, sampled every
+        // 250 ms for 6 s after the person scrolled up into it.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        let lines = 3_400_000;
+        let id = app
+            .messages
+            .post(
+                rewrap_row(0, 0, lines, PROGRESS_GRACE),
+                crate::messages_host::wall_stamp_now(),
+                start,
+            )
+            .id;
+        let mut t = start;
+        for k in 1..=24u64 {
+            t = start + Duration::from_millis(250 * k);
+            let msg = rewrap_row(0, 50_000 * k, lines, Duration::ZERO);
+            app.messages
+                .restate(id, crate::messages_host::restatement_of(&msg), t);
+        }
+        shoot(app, "92-rewrap-eta", t);
+        // 93: the re-attach's Complete echo.
+        let end = t + Duration::from_millis(100);
+        app.messages
+            .withdraw_with(id, aterm_messages::EchoKind::Complete, end);
+        shoot(
+            app,
+            "93-rewrap-complete-echo",
+            end + Duration::from_millis(250),
+        );
+        app.clear_messages_for_test();
+    }
+
+    /// A light update pass's read (design ruling 224): `claude` done, `codex`
+    /// downloading `done` of its 60 MB — `1 of 2 programs`, network busy.
+    fn check_update_read(done: u64) -> crate::PkgProgressSnapshot {
+        let mut programs = std::collections::BTreeMap::new();
+        let program = |phase, bytes_done, bytes_total| atpkg::progress::ProgramProgress {
+            phase,
+            bytes_done,
+            bytes_total,
+            build: Some(156),
+            bumped: false,
+            error: None,
+        };
+        programs.insert(
+            "claude".to_string(),
+            program(atpkg::progress::Phase::Done, 58_000_000, 58_000_000),
+        );
+        programs.insert(
+            "codex".to_string(),
+            program(atpkg::progress::Phase::Download, done, 60_000_000),
+        );
+        crate::PkgProgressSnapshot {
+            file: atpkg::progress::ProgressFile {
+                v: atpkg::progress::PROGRESS_VERSION,
+                pid: Some(9),
+                pass: "net".to_string(),
+                started_unix: 1_700_000_500,
+                heartbeat_unix: 1_700_000_500,
+                overall: atpkg::progress::Overall {
+                    programs_done: 1,
+                    programs_total: 2,
+                    bytes_done: 58_000_000 + done,
+                    bytes_total: 118_000_000,
+                },
+                queue: Vec::new(),
+                programs,
+                ended_unix: None,
+            },
+            running: true,
+        }
+    }
+
+    /// Restate the person's live row with `read`'s words at `t` — the host's
+    /// `apply_toolchain_snapshot`, on the capture's synthetic clock, so the
+    /// fill's own rate latches its ETA as it would live.
+    fn restate_person_read(
+        app: &mut App,
+        verb: crate::message_reporters::PackagesVerb,
+        read: &crate::PkgProgressSnapshot,
+        t: Instant,
+    ) {
+        let routine = verb != crate::message_reporters::PackagesVerb::Install;
+        let id = app
+            .messages
+            .live_by_key(toolchain_words::KEY_PASS)
+            .map(|l| l.id)
+            .expect("the person's row");
+        if let toolchain_words::SnapshotWords::Live { message, .. } =
+            toolchain_words::snapshot_words(Some(read), None, routine)
+        {
+            let message = message.finished_as(verb.finished_work());
+            app.messages
+                .restate(id, crate::messages_host::restatement_of(&message), t);
+        }
+    }
+
+    /// A PERSON'S SETTINGS ▸ PACKAGES VERBS (design rulings 224, 225) and the
+    /// sized update download (ruling 226), at every width: the Check busy
+    /// with its elapsed clock, queued at the store lock, filled with its ETA
+    /// once the plan lands, and its Complete echo in its own words; the
+    /// Install sized by its announcement, then filled with its ETA; the
+    /// Remove busy on the disk; a person's download with its total.
+    fn person_pass_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
+        use crate::message_reporters::PackagesVerb;
+        use crate::messages_host::PersonPass;
+        // Settled at `at`, shot on the engine's motion grid 2 s past the
+        // newest row's motion epoch (as `shot`), so the comet is mid-row.
+        let shoot = |app: &mut App, name: &str, at: Instant| {
+            app.settle_messages(at);
+            let at = app
+                .messages
+                .on_glass()
+                .filter_map(|l| l.motion_since)
+                .max()
+                .map_or(at, |epoch| (epoch + Duration::from_secs(2)).max(at));
+            for &(cols, wid) in windows {
+                capture(app, wid, dir, &format!("{name}-{cols}"), at, Look::MOVING);
+                capture_grounds(app, wid, cols, dir, name, at, Look::MOVING, &ROW_GROUNDS);
+            }
+        };
+        // 80: the Check, busy, 12 s in (the elapsed clock shows past 10 s).
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        app.person_pass(PersonPass::Began(PackagesVerb::Check));
+        shoot(app, "80-check-busy", start + Duration::from_secs(12));
+        // 81: queued behind the six-hourly pass, 40 s in.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        app.person_pass(PersonPass::Began(PackagesVerb::Check));
+        app.person_pass(PersonPass::Waiting);
+        shoot(app, "81-check-waiting", start + Duration::from_secs(40));
+        // 82: the plan landed — `codex` downloading at 6 MB/s, read every
+        // 100 ms for 6 s: `Updating ALab tools`, the fill, `1 of 2 programs`,
+        // the ETA, network busy.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        app.person_pass(PersonPass::Began(PackagesVerb::Check));
+        let mut t = start;
+        for k in 0..=60u64 {
+            t = start + PROGRESS_GRACE + Duration::from_millis(100 * k);
+            restate_person_read(
+                app,
+                PackagesVerb::Check,
+                &check_update_read(4_000_000 + 600_000 * k),
+                t,
+            );
+        }
+        shoot(app, "82-check-updating-eta", t);
+        // 83: its Complete echo, a quarter of a second into it — the echo the
+        // child's exit names (`App::person_pass`), on the scene's clock.
+        let id = app
+            .messages
+            .live_by_key(toolchain_words::KEY_PASS)
+            .map(|l| l.id)
+            .expect("the Check's row");
+        let end = t + Duration::from_millis(100);
+        app.messages
+            .withdraw_with(id, aterm_messages::EchoKind::Complete, end);
+        app.person_pass(PersonPass::Ended(aterm_messages::EchoKind::Complete));
+        shoot(
+            app,
+            "83-check-complete-echo",
+            end + Duration::from_millis(250),
+        );
+        // 84: the Install, sized by atpkg's announcement before its plan.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        app.person_pass(PersonPass::Began(PackagesVerb::Install));
+        app.announce_toolchain_pass(FIRST_RUN, false);
+        shoot(app, "84-install-announced", start + Duration::from_secs(4));
+        // 85: the Install's plan, `trust` extracting at 25 MB/s for 8 s.
+        let mut t = start;
+        for k in 0..=80u64 {
+            t = start + PROGRESS_GRACE + Duration::from_millis(100 * k);
+            restate_person_read(
+                app,
+                PackagesVerb::Install,
+                &first_run_read_at(120_000_000 + 2_500_000 * k),
+                t,
+            );
+        }
+        shoot(app, "85-install-eta", t);
+        // 86: the Remove, busy on the disk, 6 s in.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        app.person_pass(PersonPass::Began(PackagesVerb::Remove));
+        shoot(app, "86-remove-busy", start + Duration::from_secs(6));
+        // 87: a person's update download with the size the HEAD gave it, at
+        // 4 MB/s for 10 s: the fill, `45 MB / 74 MB` and its ETA.
+        app.clear_messages_for_test();
+        let start = Instant::now();
+        let report = |done: u64| aterm_update::Progress::Downloading {
+            version: "0.95.0".into(),
+            bytes_done: done,
+            bytes_total: 74_000_000,
+        };
+        let id = app
+            .messages
+            .post(
+                update_words::progress(&report(5_000_000), None, "0.95.0"),
+                crate::messages_host::wall_stamp_now(),
+                start,
+            )
+            .id;
+        let mut t = start;
+        for k in 1..=100u64 {
+            t = start + Duration::from_millis(100 * k);
+            let msg = update_words::progress(&report(5_000_000 + 400_000 * k), None, "0.95.0");
+            app.messages
+                .restate(id, crate::messages_host::restatement_of(&msg), t);
+        }
+        shoot(app, "87-download-sized-eta", t);
+        app.clear_messages_for_test();
+    }
+
+    /// The strain row as the engine builds it (`StrainTracker::row`): the
+    /// engine's own title, a LEVEL meter at `permille` with its stats, the
+    /// load words only when a culprit is named, Warn under critical memory.
+    fn strain_row(
+        kind: aterm_messages::strain::StrainKind,
+        culprit: &aterm_messages::strain::Culprit,
+        permille: u16,
+        stats: &str,
+        severity: aterm_messages::Severity,
+    ) -> aterm_messages::Message {
+        use aterm_messages::strain::{self, Culprit, StrainConfig};
+        use aterm_messages::{Hold, Message, Meter, STRAIN_KEY, tags};
+        let cfg = StrainConfig {
+            services_noun: strain::MACOS_SERVICES,
+            glass: true,
+            self_pid: 1,
+        };
+        let named = !matches!(culprit, Culprit::Resource);
+        let msg = Message::new(tags::SYSTEM, severity, strain::title(kind, culprit, &cfg))
+            .key(STRAIN_KEY)
+            .hold(Hold::Live {
+                stale_after: aterm_messages::STALE_STRAIN,
+            })
+            // The engine's declaration: the one load the kind explains
+            // (design ruling 221).
+            .loads([kind.load()])
+            .meter(Meter {
+                load: named.then(|| kind.load()),
+                ..Meter::level(permille, stats)
+            })
+            .no_excerpt();
+        // The navigation to the tab the title names (ruling 243).
+        match strain::culprit_tab(culprit) {
+            Some(show) => msg.action(show),
+            None => msg,
+        }
+    }
+
+    /// THE STRAIN ROW (design §10.14, ruling 208): the level gauge for each
+    /// kind — CPU with a named tab, memory under critical pressure (Warn),
+    /// disk with no culprit — on the default ground, Tokyo Night and two
+    /// light themes; then the gauge beside a download's progress bar, so the
+    /// two meters read as two things.
+    fn strain_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
+        use aterm_messages::Severity;
+        use aterm_messages::strain::{Culprit, StrainKind};
+        let tab2 = Culprit::Session {
+            program: "yes".into(),
+            tab: 2,
+            elsewhere: false,
+            receiving_keys: false,
+            window: windows.first().map_or(0, |(_, wid)| wid.0),
+        };
+        let rows = [
+            (
+                "cpu",
+                strain_row(StrainKind::Cpu, &tab2, 740, "6 of 8 cores", Severity::Info),
+            ),
+            (
+                "memory",
+                strain_row(
+                    StrainKind::Memory,
+                    &Culprit::Resource,
+                    960,
+                    "memory full \u{b7} swapping",
+                    Severity::Warn,
+                ),
+            ),
+            (
+                "disk",
+                strain_row(
+                    StrainKind::Disk,
+                    &Culprit::Resource,
+                    420,
+                    "waiting on disk",
+                    Severity::Info,
+                ),
+            ),
+        ];
+        for (slug, msg) in rows {
+            app.clear_messages_for_test();
+            app.post_message(msg);
+            let at = shot(app);
+            for &(cols, wid) in windows {
+                capture(
+                    app,
+                    wid,
+                    dir,
+                    &format!("60-strain-{slug}-{cols}"),
+                    at,
+                    Look::MOVING,
+                );
+                for scheme_name in THEMED_SCHEMES.into_iter().take(3) {
+                    let theme = scheme(scheme_name);
+                    let ground = scheme_name.to_lowercase().replace(' ', "-");
+                    capture_in(
+                        app,
+                        wid,
+                        dir,
+                        &format!("61-strain-{slug}-{ground}-{cols}"),
+                        at,
+                        Look::MOVING,
+                        theme,
+                    );
+                }
+            }
+        }
+        // The gauge beside a download at 50 %: a level and a fill, two rows.
+        app.clear_messages_for_test();
+        let mut download = Download {
+            total: 200_000_000,
+            id: None,
+        };
+        let (t, _) = download.run_to(app, Instant::now(), 0, 4_000_000, 500);
+        // Posted at the harness's instant (the download's reads run 25 s of
+        // injected time): at the wall's, the row would be past its staleness.
+        let strain_at = t - Duration::from_secs(4);
+        app.messages.post(
+            strain_row(StrainKind::Cpu, &tab2, 740, "6 of 8 cores", Severity::Info),
+            crate::messages_host::wall_stamp_now(),
+            strain_at,
+        );
+        let at = t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME;
+        app.settle_messages(at);
+        for &(cols, wid) in windows {
+            capture(
+                app,
+                wid,
+                dir,
+                &format!("62-strain-beside-download-{cols}"),
+                at,
+                Look::MOVING,
+            );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "62-strain-beside-download",
+                at,
+                Look::MOVING,
+                &["Tokyo Night", "Solarized Light"],
+            );
+            capture_in(
+                app,
+                wid,
+                dir,
+                &format!("62-strain-beside-download-github-light-{cols}"),
+                at,
+                Look::MOVING,
+                scheme("GitHub Light"),
+            );
+        }
+    }
+
+    /// The capture windows every band scene is shot in: 60, 80, 120 and 160
+    /// whole columns, and two windows that are not a whole number of cells
+    /// wide, with gutters (ruling 55's geometry) — `g80` and `g120` — each
+    /// showing the same shell lines and standing in for the focused window.
+    fn capture_windows(app: &mut App) -> [(&'static str, WindowId); 6] {
+        let w80 = WindowId(0);
+        let w60 = app.insert_logical_window(crate::stub_session(1), 20, 60);
+        let w120 = app.insert_logical_window(crate::stub_session(2), 20, 120);
+        let w160 = app.insert_logical_window(crate::stub_session(3), 20, 160);
+        let g80 = glass_window(app, 4, 80, 10, 7);
+        let g120 = glass_window(app, 5, 120, 8, 11);
+        app.frontmost_window = Some(w80);
+        let windows = [
+            ("60", w60),
+            ("80", w80),
+            ("120", w120),
+            ("160", w160),
+            ("g80", g80),
+            ("g120", g120),
+        ];
+        for (_, wid) in windows {
+            content(app, wid);
+            // Every capture window stands in for the focused one; each scene
+            // is shot in an explicit look, so the comet moves exactly as the
+            // engine's grid says (ruling 140). The glyph cell's `⚠ ✕ ✓ ℹ ↻`
+            // are the drawn icons (ruling 251), so the harness font no longer
+            // decides which of them show.
+            app.windows.get_mut(&wid).unwrap().focused = true;
+        }
+        windows
+    }
+
+    /// Every capsule the band laid out in window `wid`, top row first, as
+    /// `(row, slug, hover target)`: an authored capsule by its action, the
+    /// row's `Details ›` (and the overflow row's `Messages ›`) by the row
+    /// body, which is what lights it (`band_hover_for`). Read after a render.
+    fn laid_capsules(app: &App, wid: WindowId) -> Vec<(u8, String, HoverTarget)> {
+        let Some((_, _, presentation)) = &app.windows[&wid].band_layout else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (r, row) in presentation.rows.iter().enumerate() {
+            for capsule in &row.capsules {
+                let slug: String = capsule
+                    .full_label
+                    .chars()
+                    .filter_map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            Some(c.to_ascii_lowercase())
+                        } else if c == ' ' {
+                            Some('-')
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<String>()
+                    .trim_matches('-')
+                    .to_string();
+                let target = match capsule.role {
+                    aterm_messages::CapsuleRole::Details => HoverTarget::Body,
+                    _ => HoverTarget::Capsule(capsule.action),
+                };
+                out.push((u8::try_from(r).unwrap_or(u8::MAX), slug, target));
+            }
+        }
+        out
+    }
+
+    /// THE ROUND-14 COMPOSITIONS: rows of different kinds on the glass at
+    /// once, which no single-row scene shows — a download a person started,
+    /// with its ETA, under a config warning and beside the strain row; five
+    /// kinds at once (the overflow row); a paste with `Stop paste` while a
+    /// script's failure row is up; the pointer on each capsule of a mixed
+    /// stack; and Catppuccin Latte's outlined Primary over a fill (the
+    /// brownish ring round 13's look flagged), beside GitHub Light's.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one list of compositions, read top to bottom"
+    )]
+    fn composition_scenes(app: &mut App, dir: &std::path::Path, windows: &[(&str, WindowId)]) {
+        use aterm_messages::strain::{Culprit, StrainKind};
+        use aterm_messages::{Hold, Intent, Message, Meter, Severity, tags};
+        let tab2 = Culprit::Session {
+            program: "yes".into(),
+            tab: 2,
+            elsewhere: false,
+            receiving_keys: false,
+            window: windows.first().map_or(0, |(_, wid)| wid.0),
+        };
+        let config_warning = || {
+            use crate::message_reporters::{ConfigFamily, ConfigWarnings};
+            let mut warns = ConfigWarnings::default();
+            warns.push(
+                ConfigFamily::IgnoredKeys,
+                "config line 3: windw_padding \u{2014} did you mean \"window_padding\"? \
+                 (unknown to this aterm build; preserved for forward compatibility)"
+                    .into(),
+            );
+            warns.into_messages()
+        };
+        let shoot = |app: &mut App, name: &str, at: Instant| {
+            crate::logging::stderr_line!("{name}: band rows {}", app.message_band_rows);
+            for &(cols, wid) in windows {
+                capture(app, wid, dir, &format!("{name}-{cols}"), at, Look::MOVING);
+                capture_grounds(app, wid, cols, dir, name, at, Look::MOVING, &ROW_GROUNDS);
+            }
+        };
+        // The pointer on each capsule of the stack, at 80, 120 and g120, on
+        // the default ground and GitHub Light.
+        let hover_each = |app: &mut App, name: &str, at: Instant| {
+            for &(cols, wid) in windows {
+                if !["80", "120", "g120"].contains(&cols) {
+                    continue;
+                }
+                // Lay the band out in this window first.
+                render(app, wid, at, Look::MOVING, aterm_render::Theme::default());
+                for (row, slug, target) in laid_capsules(app, wid) {
+                    app.windows.get_mut(&wid).unwrap().band_hover = Some(BandHover { row, target });
+                    let shot_name = format!("{name}-hover-r{row}-{slug}");
+                    capture(
+                        app,
+                        wid,
+                        dir,
+                        &format!("{shot_name}-{cols}"),
+                        at,
+                        Look::MOVING,
+                    );
+                    capture_in(
+                        app,
+                        wid,
+                        dir,
+                        &format!("{shot_name}-github-light-{cols}"),
+                        at,
+                        Look::MOVING,
+                        scheme("GitHub Light"),
+                    );
+                    app.windows.get_mut(&wid).unwrap().band_hover = None;
+                }
+            }
+        };
+        // Three kinds at once: the download a person started (Check for
+        // Updates) at 45 % with its ETA latched, a config warning, and the
+        // strain row's gauge — each posted on the capture's own clock.
+        let three = |app: &mut App| -> Instant {
+            app.clear_messages_for_test();
+            app.note_update_check_asked(true);
+            let mut download = Download {
+                total: 74_000_000,
+                id: None,
+            };
+            let (t, _) = download.run_to(app, Instant::now(), 0, 2_000_000, 450);
+            let near = t - Duration::from_secs(4);
+            for msg in config_warning() {
+                app.messages
+                    .post(msg, crate::messages_host::wall_stamp_now(), near);
+            }
+            app.messages.post(
+                strain_row(StrainKind::Cpu, &tab2, 740, "6 of 8 cores", Severity::Info),
+                crate::messages_host::wall_stamp_now(),
+                near,
+            );
+            let at = t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME;
+            app.settle_messages(at);
+            at
+        };
+        let at = three(app);
+        shoot(app, "94-three-kinds", at);
+        hover_each(app, "94-three-kinds", at);
+        // Five kinds at once — the three above, a crash and a dead screen
+        // reader bridge: the band keeps three rows and the last is the
+        // overflow link.
+        let at = three(app);
+        let near = at - Duration::from_secs(3);
+        app.messages.post(
+            crate::message_reporters::crash_message(&crate::logging::CrashEvidence {
+                path: std::path::PathBuf::from(
+                    "/Users//ana/Library/Logs/aterm/crash-signal-1-1.log.seen",
+                ),
+                head: vec!["fatal signal 11 (SIGSEGV)".into()],
+            }),
+            crate::messages_host::wall_stamp_now(),
+            near,
+        );
+        app.messages.post(
+            crate::message_reporters::a11y_publisher_dead(
+                "the accessibility bridge thread exited",
+                true,
+            ),
+            crate::messages_host::wall_stamp_now(),
+            near,
+        );
+        app.settle_messages(at);
+        shoot(app, "95-five-kinds-overflow", at);
+        hover_each(app, "95-five-kinds-overflow", at);
+        // A 4.2 MB paste into a slow program, 10 s in, with its `Stop
+        // paste`, while a script's failure row is up.
+        {
+            use aterm_messages::waits::paste_row;
+            app.clear_messages_for_test();
+            let start = Instant::now();
+            notice(
+                app,
+                "post deploy sev=warn Deploy to staging failed -- exit status 2\\nsee deploy.log",
+                start,
+            );
+            let total = 4_200_000;
+            let series = aterm_messages::Amount::series_of("session.paste.0#1");
+            let id = app
+                .messages
+                .post(
+                    paste_row(0, series, 0, total, PROGRESS_GRACE),
+                    crate::messages_host::wall_stamp_now(),
+                    start,
+                )
+                .id;
+            let mut t = start;
+            for k in 1..=100u64 {
+                t = start + Duration::from_millis(100 * k);
+                let msg = paste_row(0, series, 11_000 * k, total, Duration::ZERO);
+                app.messages
+                    .restate(id, crate::messages_host::restatement_of(&msg), t);
+            }
+            let at = t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME;
+            app.settle_messages(at);
+            shoot(app, "96-paste-beside-warning", at);
+            hover_each(app, "96-paste-beside-warning", at);
+        }
+        // CATPPUCCIN LATTE'S OUTLINED PRIMARY OVER A FILL (ruling 249; the
+        // round-13 look: its ring is the rosewater cursor darkened to AA, and
+        // reads brownish): a metered row with a Primary and a Secondary at
+        // 50 %, 80 %, 95 % and 100 %, still and lit, on Latte and, for
+        // comparison, GitHub Light and the default ground.
+        // The count and the fill agree (ruling 259): each fill is its count's.
+        for (permille, count) in [
+            (500u16, "2 of 4 tabs"),
+            (800, "4 of 5 tabs"),
+            (950, "19 of 20 tabs"),
+            (1000, "4 of 4 tabs"),
+        ] {
+            app.clear_messages_for_test();
+            app.messages.post(
+                Message::new(tags::SESSION, Severity::Info, "Saving the session")
+                    .no_excerpt()
+                    .meter(Meter {
+                        fill_permille: Some(permille),
+                        stats: count.into(),
+                        ..Meter::default()
+                    })
+                    .hold(Hold::Live {
+                        stale_after: Duration::from_secs(120),
+                    })
+                    .action(Intent::NewWindow)
+                    .action(Intent::OpenPath {
+                        path: "/Users//ana/Library/Logs/aterm/aterm.log".into(),
+                    }),
+                crate::messages_host::wall_stamp_now(),
+                Instant::now(),
+            );
+            let at = shot(app);
+            let pct = permille / 10;
+            for &(cols, wid) in windows {
+                if !["80", "120", "g120"].contains(&cols) {
+                    continue;
+                }
+                for (ground, theme) in [
+                    ("catppuccin-latte", scheme("Catppuccin Latte")),
+                    ("github-light", scheme("GitHub Light")),
+                    ("default", aterm_render::Theme::default()),
+                ] {
+                    for (lit, hover) in [
+                        ("still", None),
+                        (
+                            "lit",
+                            Some(BandHover {
+                                row: 0,
+                                target: HoverTarget::Capsule(ActionIndex(0)),
+                            }),
+                        ),
+                    ] {
+                        app.windows.get_mut(&wid).unwrap().band_hover = hover;
+                        capture_in(
+                            app,
+                            wid,
+                            dir,
+                            &format!("97-outlined-over-fill-{ground}-{pct:03}-{lit}-{cols}"),
+                            at,
+                            Look::MOVING,
+                            theme,
+                        );
+                    }
+                    app.windows.get_mut(&wid).unwrap().band_hover = None;
+                }
+            }
+        }
+        app.clear_messages_for_test();
+    }
+
+    /// The round-14 compositions alone ([`composition_scenes`]), into
+    /// `STATUS_BARS_PNG_DIR`, without the full scene list's other frames.
+    ///
+    /// ```text
+    /// STATUS_BARS_PNG_DIR=<dir> targo --unverified test -p aterm-gui --lib \
+    ///     message_band_composition_capture -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "visual capture: needs a system font; run with --ignored"]
+    fn message_band_composition_capture() {
+        let dir = std::env::var("STATUS_BARS_PNG_DIR").map_or_else(
+            |_| std::env::temp_dir().join("status-bars"),
+            std::path::PathBuf::from,
+        );
+        std::fs::create_dir_all(&dir).expect("output dir");
+        let mut app = App::headless_for_test();
+        let windows = capture_windows(&mut app);
+        if aterm_render::Renderer::from_system(CAPTURE_PX, aterm_render::Theme::default()).is_none()
+        {
+            crate::logging::stderr_line!("no system font \u{2014} visual capture skipped");
+            return;
+        }
+        composition_scenes(&mut app, &dir, &windows);
     }
 
     /// THE MOTION FRAME SEQUENCES (design §10.12), at 80 and 120 columns.
@@ -48041,6 +49370,16 @@ mod message_band_visual_tests {
                 t,
                 Look::MOVING,
             );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "47-first-run-eta",
+                t,
+                Look::MOVING,
+                &ROW_GROUNDS,
+            );
         }
         // A DETERMINATE DOWNLOAD at a steady 4 MB/s (ruling 55's mapping):
         // 0 % is an empty track, 5 % a sliver from the window's left edge,
@@ -48069,6 +49408,16 @@ mod message_band_visual_tests {
                 t,
                 Look::MOVING,
             );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "41-download-000",
+                t,
+                Look::MOVING,
+                &ROW_GROUNDS,
+            );
         }
         let mut done = 0;
         for permille in [50u64, 500, 950, 1000] {
@@ -48077,7 +49426,7 @@ mod message_band_visual_tests {
             app.settle_messages(t);
             // Past the glide by a frame of the grid the motion is read on,
             // so the frame shows the data, not the last step of the ease.
-            let at = t + aterm_messages::FILL_GLIDE + aterm_messages::ANIM_FRAME;
+            let at = t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME;
             for &(cols, wid) in windows {
                 capture(
                     app,
@@ -48086,6 +49435,16 @@ mod message_band_visual_tests {
                     &format!("41-download-{:03}-{cols}", permille / 10),
                     at,
                     Look::MOVING,
+                );
+                capture_grounds(
+                    app,
+                    wid,
+                    cols,
+                    dir,
+                    &format!("41-download-{:03}", permille / 10),
+                    at,
+                    Look::MOVING,
+                    &ROW_GROUNDS,
                 );
             }
             done += rate / 10;
@@ -48103,6 +49462,18 @@ mod message_band_visual_tests {
                     at,
                     Look::MOVING,
                 );
+                if k < 2 {
+                    capture_grounds(
+                        app,
+                        wid,
+                        cols,
+                        dir,
+                        &format!("42-download-complete-{k}"),
+                        at,
+                        Look::MOVING,
+                        &ROW_GROUNDS,
+                    );
+                }
             }
         }
         // THE FAULT ECHO: a download at 40 % that failed — the flash in the
@@ -48127,6 +49498,18 @@ mod message_band_visual_tests {
                     at,
                     Look::MOVING,
                 );
+                if k < 2 {
+                    capture_grounds(
+                        app,
+                        wid,
+                        cols,
+                        dir,
+                        &format!("42b-download-fault-{k}"),
+                        at,
+                        Look::MOVING,
+                        &ROW_GROUNDS,
+                    );
+                }
             }
         }
         // A STALLED DOWNLOAD: 8 s of bytes, then none for 12 s.
@@ -48148,6 +49531,16 @@ mod message_band_visual_tests {
                 at,
                 Look::MOVING,
             );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "43-download-stalled",
+                at,
+                Look::MOVING,
+                &ROW_GROUNDS,
+            );
         }
         // THE DOWNLOAD'S ETA (scene 27): 6 s of steady samples, latched, and
         // no load words.
@@ -48167,6 +49560,16 @@ mod message_band_visual_tests {
                 t,
                 Look::MOVING,
             );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "27-download-eta",
+                t,
+                Look::MOVING,
+                &ROW_GROUNDS,
+            );
         }
         // A HEAVY-LOAD ROW: a heavy routine pass extracting, its load words
         // up from its first frame on the glass (design §10.6, review round
@@ -48182,6 +49585,16 @@ mod message_band_visual_tests {
                 &format!("44-heavy-load-{cols}"),
                 at,
                 Look::MOVING,
+            );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "44-heavy-load",
+                at,
+                Look::MOVING,
+                &ROW_GROUNDS,
             );
         }
         // THE STILL FORMS (scene 29, reduced motion): work with no fraction
@@ -48205,6 +49618,16 @@ mod message_band_visual_tests {
                 &format!("29-still-forms-{cols}"),
                 t,
                 Look::STILL,
+            );
+            capture_grounds(
+                app,
+                wid,
+                cols,
+                dir,
+                "29-still-forms",
+                t,
+                Look::STILL,
+                &ROW_GROUNDS,
             );
             capture(
                 app,
@@ -48297,7 +49720,7 @@ mod message_band_visual_tests {
         // CHIPS OVER THE METER: a Primary (`New window`), a Secondary (`Open
         // log`) and the row's `Details ›` — over the fill at 95 %, over the
         // track at 50 %, then each lit under the pointer at 95 %.
-        for permille in [950u16, 500] {
+        for (permille, count) in [(950u16, "19 of 20 tabs"), (500, "2 of 4 tabs")] {
             app.clear_messages_for_test();
             post(
                 app,
@@ -48305,7 +49728,7 @@ mod message_band_visual_tests {
                     .no_excerpt()
                     .meter(Meter {
                         fill_permille: Some(permille),
-                        stats: "3 of 4 tabs".into(),
+                        stats: count.into(),
                         ..Meter::default()
                     })
                     .hold(live)
@@ -48396,6 +49819,55 @@ mod message_band_visual_tests {
                         wid,
                         dir,
                         &format!("53-comet-{slug}-{k}-{cols}"),
+                        at,
+                        Look::MOVING,
+                        theme,
+                    );
+                }
+            }
+        }
+        // CHIPS OVER THE COMET (ruling 249): a busy row with a Primary and a
+        // Secondary — the Primary an accent ring, the comet the only solid
+        // accent — at four phases of the sweep (k = 0: the head under the
+        // ring), on the default ground and on
+        // Tokyo Night and the light themes.
+        app.clear_messages_for_test();
+        post(
+            app,
+            Message::new(tags::SESSION, Severity::Info, "Saving the session")
+                .no_excerpt()
+                .meter(Meter::busy("3 of 4 tabs"))
+                .hold(live)
+                .action(Intent::NewWindow)
+                .action(Intent::OpenPath {
+                    path: "/Users//ana/Library/Logs/aterm/aterm.log".into(),
+                }),
+        );
+        shot(app);
+        let epoch = app
+            .messages
+            .on_glass()
+            .find_map(|l| l.motion_since)
+            .expect("the busy row is on the glass");
+        for k in [0u32, 1, 5, 7] {
+            let at = epoch + LOAD_AFTER + COMET_PERIOD * k / 8;
+            for &(cols, wid) in windows {
+                capture(
+                    app,
+                    wid,
+                    dir,
+                    &format!("54-chips-busy-{k}-{cols}"),
+                    at,
+                    Look::MOVING,
+                );
+                for scheme_name in THEMED_SCHEMES {
+                    let theme = scheme(scheme_name);
+                    let slug = scheme_name.to_lowercase().replace(' ', "-");
+                    capture_in(
+                        app,
+                        wid,
+                        dir,
+                        &format!("54-chips-busy-{slug}-{k}-{cols}"),
                         at,
                         Look::MOVING,
                         theme,
@@ -48535,16 +50007,20 @@ mod message_band_visual_tests {
         strip(
             &mut app,
             "glide",
-            &across(jump, aterm_messages::FILL_GLIDE * 2),
+            &across(
+                jump,
+                aterm_messages::animate::glide_span(570, 800) + aterm_messages::ANIM_FRAME,
+            ),
         );
         // The Complete echo, and the Fault echo of the same row.
         let resolved = jump + Duration::from_secs(1);
         let id = download.id.expect("posted");
         assert!(app.messages.resolve(id, Outcome::Ok, resolved));
+        // The wipe (its glide from 80 %), the one sweep, the fade (ruling 244).
         strip(
             &mut app,
             "echo-complete",
-            &across(resolved, Duration::from_millis(900)),
+            &across(resolved, Duration::from_millis(1400)),
         );
         app.clear_messages_for_test();
         let mut failing = Download {
@@ -48589,7 +50065,7 @@ mod message_band_visual_tests {
                 scheme(scheme_name),
             );
             for (outcome, permille, name, span) in [
-                (Outcome::Ok, 800, "echo-complete", 900),
+                (Outcome::Ok, 800, "echo-complete", 1400),
                 (Outcome::Warn, 400, "echo-fault", 700),
             ] {
                 app.clear_messages_for_test();
@@ -48598,7 +50074,7 @@ mod message_band_visual_tests {
                     id: None,
                 };
                 let (t, _) = row.run_to(&mut app, Instant::now(), 0, 4_000_000, permille);
-                let at = t + aterm_messages::FILL_GLIDE + aterm_messages::ANIM_FRAME;
+                let at = t + aterm_messages::FILL_GLIDE_MAX + aterm_messages::ANIM_FRAME;
                 app.settle_messages(at);
                 assert!(app.messages.resolve(row.id.expect("posted"), outcome, at));
                 strip_in(
@@ -48608,6 +50084,61 @@ mod message_band_visual_tests {
                     scheme(scheme_name),
                 );
             }
+        }
+        // THE STRAIN GAUGE (ruling 208): a level that rises from 40 % to 90 %
+        // between two readings — the glide, and nothing moving once it lands
+        // — on the default ground and a light one.
+        use aterm_messages::Severity;
+        use aterm_messages::strain::{Culprit, StrainKind};
+        let tab2 = Culprit::Session {
+            program: "yes".into(),
+            tab: 2,
+            elsewhere: false,
+            receiving_keys: false,
+            window: wid.0,
+        };
+        for (slug, theme) in [
+            ("default", aterm_render::Theme::default()),
+            ("github-light", scheme("GitHub Light")),
+        ] {
+            app.clear_messages_for_test();
+            let t0 = Instant::now();
+            let id = app
+                .messages
+                .post(
+                    strain_row(
+                        StrainKind::Cpu,
+                        &tab2,
+                        400,
+                        "3.2 of 8 cores",
+                        Severity::Info,
+                    ),
+                    crate::messages_host::wall_stamp_now(),
+                    t0,
+                )
+                .id;
+            let rise = t0 + Duration::from_secs(4);
+            app.settle_messages(rise);
+            app.messages.restate(
+                id,
+                crate::messages_host::restatement_of(&strain_row(
+                    StrainKind::Cpu,
+                    &tab2,
+                    900,
+                    "7 of 8 cores",
+                    Severity::Info,
+                )),
+                rise,
+            );
+            strip_in(
+                &mut app,
+                &format!("strain-gauge-rise-{slug}"),
+                &across(
+                    rise - aterm_messages::ANIM_FRAME * 2,
+                    aterm_messages::FILL_GLIDE * 2,
+                ),
+                theme,
+            );
         }
     }
 }
@@ -48752,7 +50283,7 @@ mod message_band_raster_tests {
             x == aterm_messages::GLYPH_COL
                 || layout
                     .elapsed
-                    .is_some_and(|c| (c..c + aterm_messages::ELAPSED_W).contains(&x))
+                    .is_some_and(|c| (c..c + layout.elapsed_width()).contains(&x))
                 || layout
                     .eta
                     .is_some_and(|c| (c..c + layout.eta_width()).contains(&x))
@@ -48807,35 +50338,23 @@ mod message_band_raster_tests {
         let (x_pad, y0) = (cpu.pad(), cpu.grid_top());
         let mut glyphs: Vec<char> = Glyph::ALLOWED.to_vec();
         glyphs.push(Glyph::or_fallback('\u{2699}').ch());
-        // The busy row's spinner frames (main's braille `SPINNER`, driven by
-        // the engine's grid since the merge, ruling 140) are not admitted
-        // glyphs — the engine paints them into the glyph cell of a MOVING
-        // busy row — so each is probed in the same cell the same way.
-        let spinner = aterm_messages::SPINNER;
-        glyphs.extend(spinner);
+        // No spinner frames: a moving comet keeps the row's own glyph (ruling
+        // 251), and every admitted glyph is DRAWN as a band icon through the
+        // row's chrome raster, so this probe now reads the icon's ink.
         for ch_ in glyphs {
             app.clear_messages_for_test();
-            let admitted = Glyph::new(ch_).unwrap_or_else(|| {
-                assert!(
-                    spinner.contains(&ch_),
-                    "{ch_:?} is admitted or a spinner frame"
-                );
-                Glyph::new('\u{2139}').expect("admitted")
-            });
+            let admitted = Glyph::new(ch_).expect("admitted");
             app.post_message(Message::new(tags::SYSTEM, Severity::Info, "glyph").glyph(admitted));
             app.post_message(Message::new(tags::SYSTEM, Severity::Info, "the seam row"));
             assert_eq!(app.message_band_rows, 2);
             compose(&mut app, wid, theme);
-            if spinner.contains(&ch_) {
-                app.windows.get_mut(&wid).unwrap().input_scratch.cells[0][GLYPH_COL].ch = ch_;
-            }
             let cells = &app.windows[&wid].input_scratch.cells;
             let cell = cells[0][GLYPH_COL];
             assert_eq!(cell.ch, ch_);
             assert!(cell.text_presentation, "{ch_:?}");
             assert_ne!(
-                cell.underline, cells[1][GLYPH_COL].underline,
-                "the seam is on row 1, not on the probed row"
+                cell.underline_color, cells[1][GLYPH_COL].underline_color,
+                "the seam is on row 1, not on the probed row (row 0 carries the divider)"
             );
             assert_eq!(
                 cells[0][0].bg, cell.bg,
@@ -48847,19 +50366,31 @@ mod message_band_raster_tests {
                 frame.width >= x_pad + (GLYPH_COL + 1) * cw && frame.height >= y0 + ch,
                 "{ch_:?}"
             );
-            let ink = |col: usize| {
-                let x0 = x_pad + col * cw;
+            // The row's divider (ruling 260) is a rule, not ink.
+            let colors = crate::chrome_band::band_colors(theme);
+            let divider = packed(crate::chrome_band::mix3(
+                colors.bar_bg,
+                colors.label,
+                crate::message_band::DIVIDER_ALPHA,
+            ));
+            let ink = |px: std::ops::Range<usize>| {
                 (y0..y0 + ch)
-                    .flat_map(|y| (x0..x0 + cw).map(move |x| (x, y)))
-                    .filter(|&(x, y)| frame.pixels[y * frame.width + x] != ground)
+                    .flat_map(|y| px.clone().map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        let p = frame.pixels[y * frame.width + x];
+                        p != ground && p != divider
+                    })
                     .count()
             };
+            // The icon may spill into the blank cells beside it (ruling
+            // 258), never as far as the middle of either.
             assert_eq!(
-                ink(0),
+                ink(x_pad..x_pad + cw / 2),
                 0,
-                "{ch_:?}: control — the blank band cell beside the glyph has no ink"
+                "{ch_:?}: control — the blank band cell's far half has no ink"
             );
-            assert!(ink(GLYPH_COL) > 0, "{ch_:?} painted a blank glyph cell");
+            let g0 = x_pad + GLYPH_COL * cw;
+            assert!(ink(g0..g0 + cw) > 0, "{ch_:?} painted a blank glyph cell");
         }
     }
 }
@@ -49185,60 +50716,6 @@ mod key_time_click_tests {
         assert!((narrow.pan - 0.0).abs() < 1e-6);
     }
 
-    /// THE LATENCY PIN: a keypress reaches the audio host WITHOUT a render tick.
-    ///
-    /// Before, the cue was recorded at the key and carried to the synth only by
-    /// the next tick's drain, so the click's arrival was quantized to the frame
-    /// train — 0-16.7 ms on a 60 Hz panel, and further on a loaded frame — after
-    /// the ~20 ms budget in which a click still feels attached to the finger.
-    /// The negative control is the fixture itself: NOTHING here ticks between
-    /// the key and the capture, so under the old wiring this list is empty.
-    #[test]
-    fn a_keypress_reaches_the_audio_host_with_no_render_tick() {
-        use crate::input::{InputEvent, Source};
-        use aterm_effects::trail_sound::{SoundGesture, SoundKind};
-        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-
-        let mut app = crate::App::headless_for_test();
-        // The trail is ASKED FOR, not inherited. Its absent-key default is
-        // platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`), and the tick
-        // below has to actually DRAW to arm the key seam — so on Windows an
-        // inherited default would make this latency pin pass for the wrong reason,
-        // or fail, on the one platform whose input latency it was written for.
-        app.config.cursor_trail = Some(true);
-        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
-        let wid = crate::WindowId(0);
-        // ONE drawing tick, because the engine's silence law arms the key seam
-        // only on a tick that actually drew (`cursor_glow::sound_live`) — the
-        // same reason a session's very first keystroke before any frame is
-        // legitimately silent. Everything after this point is key-path only.
-        app.tick_cursor_fx(
-            wid,
-            super::CursorFxInputs::sample_for_test(std::time::Instant::now()),
-        )
-        .expect("the fixture window ticks");
-        let _ = app.trail_audio.take_captured_for_test();
-
-        let _ = app.input(
-            wid,
-            InputEvent::Key {
-                key: Key::Character('a'),
-                mods: Modifiers::empty(),
-                base_layout: None,
-                event_type: KeyEventType::Press,
-            },
-            Source::Human,
-        );
-
-        let spoken = app.trail_audio.take_captured_for_test();
-        assert!(
-            spoken
-                .iter()
-                .any(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Typed))),
-            "the click must be at the synth already — no frame in the audio path",
-        );
-    }
-
     /// THE SPACEBAR IS THE COMMA at the same seam: the bare Space key's
     /// key-time click carries [`SoundKind::Space`], not the generic typed
     /// click — end to end, physical press to captured synth event.
@@ -49362,6 +50839,15 @@ mod key_time_click_tests {
     /// VISUAL flag is not under test here — `note_typed_glyph` still reads
     /// the modifier — and a Caps-Lock capital gets no pickup, because Caps
     /// Lock mints no Shift cue (`a_bare_shift_reaches_the_audio_host_as_the_lift`).
+    ///
+    /// It is also THE LATENCY PIN: a keypress reaches the audio host WITHOUT a
+    /// render tick. Before, the cue was recorded at the key and carried to the
+    /// synth only by the next tick's drain, so the click's arrival was quantized
+    /// to the frame train — 0-16.7 ms on a 60 Hz panel, and further on a loaded
+    /// frame — after the ~20 ms budget in which a click still feels attached to
+    /// the finger. The negative control is the fixture itself: NOTHING here ticks
+    /// between a key and its capture (the one tick is before the first key), so
+    /// under the old wiring every capture is empty. Keep it that way.
     #[test]
     fn a_caps_lock_capital_is_a_shifted_click() {
         use crate::input::{InputEvent, Source};
@@ -50975,9 +52461,7 @@ mod cell_pixel_size_tests {
     /// EXACTLY ONE call site may pass it: the BOOT session, spawned before the
     /// backend build is joined. Every other spawn must hand over the owning
     /// window's real cell box. Checked by reading the sources, because a headless
-    /// harness cannot fork the real PTY these sites need — the same
-    /// source-wiring-guard idiom `settings_preview_scheduler_uses_the_target_window_font`
-    /// uses for its one call site.
+    /// harness cannot fork the real PTY these sites need.
     #[test]
     fn every_non_boot_spawn_site_hands_over_a_real_cell_box() {
         let sources = [
@@ -54108,53 +55592,6 @@ mod acquire_wait_publication_tests {
     }
 }
 
-#[cfg(test)]
-mod font_coverage_warm_guard {
-    //! NO GUI CODE WARMS THE FONT-COVERAGE INDEX.
-    //!
-    //! The first-present finalizer used to spawn `aterm-font-warm`, a thread
-    //! that read every system font whole (~700 MB on a Mac) to build
-    //! `aterm_render`'s cmap-coverage index — a table only the UNSEALED
-    //! `Tier::RuntimeDecisions` lane reads, and every GUI generation is sealed
-    //! before its first pixel (`aterm-render/tests/sealed_never_consults_
-    //! coverage_index.rs` pins that half). The spawn is gone; this scan keeps
-    //! it gone: a call to the warm anywhere in this crate's shipping source is
-    //! ~0.4-0.8 s of one core and ~700 MB of page-cache reads per launch, for
-    //! nothing.
-
-    #[test]
-    fn no_gui_source_calls_the_font_coverage_warm() {
-        // Built at runtime so this test's own source never contains the
-        // contiguous token it scans for.
-        let needle = format!("warm_font_{}", "coverage_index");
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for entry in std::fs::read_dir(&src_dir).expect("read src/") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let content = std::fs::read_to_string(&path).expect("read source");
-            for (i, line) in content.lines().enumerate() {
-                if !line.contains(&needle) {
-                    continue;
-                }
-                let t = line.trim_start();
-                if t.starts_with("//") {
-                    continue;
-                }
-                panic!(
-                    "{name}:{}: GUI source calls the font-coverage warm — every GUI \
-                     generation is sealed, so the index it builds is unreachable; \
-                     delete the call (see the note in app_render.rs's first-present \
-                     finalizer)",
-                    i + 1
-                );
-            }
-        }
-    }
-}
-
 /// Windowed presents the STARTUP RASTER PROBE has observed; `u32::MAX` once
 /// it has reported the first present that rasterized anything. Process-global
 /// like `first_present`: startup is a fact about the process, not a window.
@@ -54196,5 +55633,355 @@ fn note_startup_present_rasters(before: usize, after: usize) {
              (glyph cache {before} -> {after})"
         );
         STARTUP_RASTER_PROBE.store(u32::MAX, Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod mixed_ime_tests {
+    use super::*;
+    use crate::native_app::{ActionInvocation, AppEvent};
+    use crate::tab_model::{SplitAxis, ViewId, VisibleLeafPlan};
+
+    fn fixture() -> (App, WindowId, ViewId, ViewId, u64) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.cols = 140;
+        window.rows = 40;
+        window.scale = 2.0;
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/search"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let (_, native) = app.active_native_view(wid).unwrap();
+        let (session, terminal) = app.split_active_with_stub_terminal(wid, SplitAxis::Horizontal);
+        crate::term_lock(&app.pool.get(session).unwrap().term).process(b"\x1b[2J\x1b[H$ \x1b[?25l");
+        (app, wid, native, terminal, session)
+    }
+
+    fn focus(app: &mut App, wid: WindowId, view: ViewId) {
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .active_mut()
+                .unwrap()
+                .set_focus(view)
+        );
+        app.sync_window(wid);
+    }
+
+    fn prepare(app: &mut App, wid: WindowId) -> VisibleLeafPlan {
+        let plan = app.prepare_heterogeneous_layout_plan(wid).unwrap();
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(wid, None, &plan)
+                .is_some()
+        );
+        plan
+    }
+
+    fn present(app: &mut App, wid: WindowId, plan: &VisibleLeafPlan) {
+        app.first_present_done = true;
+        app.finalize_successful_present(
+            wid,
+            crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
+            0,
+            None,
+            SuccessfulPresentRoute::Heterogeneous,
+            crate::VisibleContentRoute::Heterogeneous,
+            HostVisualState::default(),
+            plan,
+        );
+    }
+
+    #[test]
+    fn mixed_ime_anchor_follows_presented_native_terminal_native_focus() {
+        let (mut app, wid, native, terminal, session) = fixture();
+        focus(&mut app, wid, native);
+        app.on_ime_preedit(wid, "日本語".to_string(), Some((3, 3)));
+        let plan = prepare(&mut app, wid);
+        present(&mut app, wid, &plan);
+        let native_rect = app.windows[&wid]
+            .last_ime_rect
+            .expect("native field anchor");
+
+        app.on_ime_preedit(wid, String::new(), None);
+        focus(&mut app, wid, terminal);
+        crate::term_lock(&app.pool.get(session).unwrap().term)
+            .modes_mut()
+            .ambiguous_width_double = true;
+        app.on_ime_preedit(wid, "·日".to_string(), Some((2, 2)));
+        let plan = prepare(&mut app, wid);
+        let window = &app.windows[&wid];
+        let pane = &window.leaf_render_cache[&terminal].input;
+        assert_eq!(pane.cells[0][2].ch, '·');
+        assert!(
+            pane.cells[0][3].wide,
+            "ambiguous glyph uses terminal width mode"
+        );
+        assert_eq!(pane.cells[0][4].ch, '日');
+        assert_eq!(
+            pane.cursor_col, 4,
+            "platform middle caret, not marked-text end"
+        );
+        assert!(
+            pane.cursor_visible,
+            "composition overrides hidden engine cursor"
+        );
+        assert_eq!(
+            window.last_ime_rect,
+            Some(native_rect),
+            "staging cannot publish an anchor"
+        );
+        let cell = (
+            window.input_scratch.cursor_row,
+            window.input_scratch.cursor_col,
+        );
+        let leaf = plan.leaf(terminal).unwrap();
+        assert_eq!(
+            cell.0,
+            leaf.rect.origin.y.round() as usize + usize::from(app.chrome_rows(wid))
+        );
+        assert_eq!(cell.1, leaf.rect.origin.x.round() as usize + 4);
+        let (cw, ch) = app.win_cell_size(wid);
+        let (frame_x, frame_y) = app.frame_origin(wid);
+        present(&mut app, wid, &plan);
+        let terminal_rect = app.windows[&wid].last_ime_rect.unwrap();
+        assert_eq!(
+            terminal_rect,
+            (
+                (frame_x + (app.win_pad(wid) + cell.1 * cw) as i64) as i32,
+                (frame_y + (app.win_pad_top(wid) + app.win_head(wid) + cell.0 * ch) as i64) as i32,
+                cw as u32,
+                ch as u32,
+            )
+        );
+        assert_ne!(
+            terminal_rect, native_rect,
+            "old native anchor is a negative control"
+        );
+        assert_eq!(
+            crate::term_lock(&app.pool.get(session).unwrap().term)
+                .cursor()
+                .col,
+            2
+        );
+
+        app.on_ime_preedit(wid, String::new(), None);
+        focus(&mut app, wid, native);
+        app.on_ime_preedit(wid, "日本語".to_string(), Some((3, 3)));
+        let plan = prepare(&mut app, wid);
+        assert_eq!(app.windows[&wid].last_ime_rect, Some(terminal_rect));
+        present(&mut app, wid, &plan);
+        assert_eq!(app.windows[&wid].last_ime_rect, Some(native_rect));
+        let pane = &app.windows[&wid].leaf_render_cache[&terminal].input;
+        assert!(!pane.cursor_visible);
+        assert!(
+            pane.cells[0]
+                .iter()
+                .all(|cell| cell.ch != '·' && cell.ch != '日')
+        );
+    }
+
+    #[test]
+    fn mixed_ime_paint_respects_width_cancel_history_and_find_ownership() {
+        let (mut app, wid, _, terminal, session) = fixture();
+        let term = app.pool.get(session).unwrap().term.clone();
+        for (ambiguous, caret_col) in [(false, 3), (true, 4)] {
+            crate::term_lock(&term).modes_mut().ambiguous_width_double = ambiguous;
+            app.on_ime_preedit(wid, "·日".to_string(), Some((2, 2)));
+            prepare(&mut app, wid);
+            let pane = &app.windows[&wid].leaf_render_cache[&terminal].input;
+            assert_eq!(pane.cursor_col, caret_col);
+            assert_eq!(pane.cells[0][caret_col].ch, '日');
+        }
+        app.on_ime_preedit(wid, String::new(), None);
+        prepare(&mut app, wid);
+        let pane = &app.windows[&wid].leaf_render_cache[&terminal].input;
+        assert_eq!(pane.cursor_col, 2);
+        assert!(!pane.cursor_visible);
+        assert!(
+            pane.cells[0]
+                .iter()
+                .all(|cell| cell.ch != '·' && cell.ch != '日')
+        );
+
+        {
+            let mut term = crate::term_lock(&term);
+            for _ in 0..100 {
+                term.process(b"history\r\n");
+            }
+            term.scroll_display(1);
+            assert!(term.grid().display_offset() > 0);
+        }
+        app.on_ime_preedit(wid, "候補".to_string(), Some((3, 3)));
+        prepare(&mut app, wid);
+        let pane = &app.windows[&wid].leaf_render_cache[&terminal].input;
+        let expected = crate::term_lock(&term).cell_frame(pane.rows, pane.cols);
+        assert_eq!(
+            pane.cells, expected.cells,
+            "composition cannot overwrite history"
+        );
+
+        crate::term_lock(&term).scroll_display(-100);
+        app.search_enter_direction_in(wid, true);
+        app.on_ime_preedit(wid, "候補".to_string(), Some((3, 3)));
+        assert!(matches!(
+            app.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Find
+        ));
+        let plan = prepare(&mut app, wid);
+        let pane = &app.windows[&wid].leaf_render_cache[&terminal].input;
+        let expected = crate::term_lock(&term).cell_frame(pane.rows, pane.cols);
+        assert_eq!(
+            pane.cells, expected.cells,
+            "find field owns its composition"
+        );
+        let field_rect = (7, 11, 13, 17);
+        app.report_ime_cursor_rect(wid, field_rect);
+        present(&mut app, wid, &plan);
+        assert_eq!(
+            app.windows[&wid].last_ime_rect,
+            Some(field_rect),
+            "terminal report cannot replace the find anchor"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_ime_anchor_tests {
+    use super::*;
+    use crate::native_app::{ActionInvocation, AppEvent};
+
+    #[test]
+    fn a_presented_native_field_replaces_the_terminal_ime_anchor_at_its_painted_caret() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/search"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let stale = (3, 5, 7, 11);
+        app.windows.get_mut(&wid).unwrap().last_ime_rect = Some(stale);
+        let mut previous_x = None;
+        for caret in [0, 3, 6] {
+            app.on_ime_preedit(wid, "日本語".to_string(), Some((caret, caret)));
+            let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
+            app.prepare_layout_coordinate_space_from_plan(wid, route, &plan);
+            assert!(app.prepare_native_input_scratch_from_plan(wid, &plan));
+            // Prepared pixels carry no presentation authority yet: a failed
+            // present must not move the candidate window to an unseen caret.
+            let before = app.windows[&wid].last_ime_rect;
+            app.report_native_ime_cursor_area(wid, &plan);
+            assert_eq!(app.windows[&wid].last_ime_rect, before);
+            let stamp = app.windows[&wid]
+                .native_ui_compiled
+                .as_ref()
+                .map(|frame| frame.stamp);
+            app.first_present_done = true;
+            app.finalize_successful_present(
+                wid,
+                crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
+                0,
+                None,
+                SuccessfulPresentRoute::Native {
+                    view,
+                    presented_stamp: stamp,
+                },
+                crate::VisibleContentRoute::Native { instance, view },
+                HostVisualState::default(),
+                &plan,
+            );
+            let (x, y, w, h) = app.windows[&wid].last_ime_rect.expect("native IME anchor");
+            assert_ne!(
+                (x, y, w, h),
+                stale,
+                "the parked terminal cannot own this field"
+            );
+            if let Some(previous_x) = previous_x {
+                assert!(
+                    x > previous_x,
+                    "a middle IME caret moves the candidate anchor"
+                );
+            }
+            previous_x = Some(x);
+
+            // Round-trip through the existing pointer inverse proves the report
+            // uses the retained leaf's scale/origin, not terminal cell metrics.
+            let (artifact, lx, ly) = app
+                .retained_native_leaf_at_pointer(wid, f64::from(x), f64::from(y))
+                .expect("anchor lies on the retained native leaf");
+            assert_eq!(artifact.view, view);
+            let caret = artifact.compiled.ime_caret_rect().unwrap();
+            assert_eq!(
+                artifact.ime_caret,
+                Some(caret),
+                "geometry is derived with the retained raster"
+            );
+            assert!((lx - caret.x).abs() <= 1.0 / artifact.scale as f32);
+            assert!((ly - caret.y).abs() <= 1.0 / artifact.scale as f32);
+            app.report_native_ime_cursor_area(wid, &plan);
+            assert_eq!(
+                app.windows[&wid].last_ime_rect,
+                Some((x, y, w, h)),
+                "unchanged report reuses the memo"
+            );
+        }
+
+        // A retained leaf may remain partly on glass during a centered surface
+        // crop. Candidate geometry must clip to the physical client area too.
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        app.windows.get_mut(&wid).unwrap().win_px = Some(winit::dpi::PhysicalSize::new(100, 100));
+        let (caret, scale) = {
+            let artifact = app
+                .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
+                .unwrap();
+            (artifact.ime_caret.unwrap(), artifact.scale)
+        };
+        let (frame_x, frame_y) = app.frame_origin(wid);
+        for (top, visible) in [
+            (-1, true),
+            (-(f64::from(caret.height) * scale).ceil() as i32 - 2, false),
+        ] {
+            let window = app.windows.get_mut(&wid).unwrap();
+            let card = window.settings_card.as_mut().unwrap();
+            card.dx =
+                u32::try_from(20 - frame_x - (f64::from(caret.x) * scale).floor() as i64).unwrap();
+            card.dy = u32::try_from(
+                i64::from(top) - frame_y - (f64::from(caret.y) * scale).floor() as i64,
+            )
+            .unwrap();
+            window.last_ime_rect = Some(stale);
+            assert!(
+                app.retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
+                    .is_some(),
+                "the retained leaf still intersects the window"
+            );
+            app.report_native_ime_cursor_area(wid, &plan);
+            if visible {
+                let (x, y, w, h) = app.windows[&wid].last_ime_rect.unwrap();
+                assert_eq!(y, 0);
+                assert!(x >= 0 && x as u32 + w <= 100 && h <= 100);
+                assert!((h as f64) < f64::from(caret.height) * scale + 1.0);
+            } else {
+                assert_eq!(
+                    app.windows[&wid].last_ime_rect,
+                    Some(stale),
+                    "fully cropped caret cannot publish an offscreen anchor"
+                );
+            }
+        }
     }
 }

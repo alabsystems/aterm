@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use aterm_messages::MessageId;
 use aterm_messages::strain::{
-    Gate, ProcRow, Reading, SessionRef, StrainConfig, StrainOut, StrainTracker,
+    Gate, JobRef, ProcRow, Reading, SessionRef, StrainConfig, StrainOut, StrainTracker,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -194,7 +194,10 @@ impl Saturate {
 
 /// The strain engine, its probe thread and its one row.
 pub(crate) struct StrainHost {
-    engine: StrainTracker,
+    /// The engine. Crate-visible for the one push only a platform arm can hear
+    /// (macOS memory pressure, `Wake::MemoryPressure`), so that trigger lives
+    /// beside its platform and this file stays `cfg`-free (ruling 210).
+    pub(crate) engine: StrainTracker,
     /// `explain_heavy_load`.
     enabled: bool,
     /// The probe thread's request channel (`true` = with a sweep); `None`
@@ -482,6 +485,14 @@ impl App {
                 self.perform_strain(out);
             }
         }
+        // Whether other work is MEASURABLY slowed (typing felt slow): only
+        // then does a row's own load say its words — a download's `network
+        // busy` explains nothing the title does not (ruling 246).
+        let slowing = self.strain.enabled() && self.strain.engine.felt(now);
+        if slowing != self.messages.slowing() {
+            self.messages.set_slowing(slowing);
+            self.sync_messages();
+        }
         if !self.strain.may_read() {
             return;
         }
@@ -587,11 +598,31 @@ impl App {
                         tab: u16::try_from(index + 1).unwrap_or(u16::MAX),
                         receiving_keys: receiving == Some(id),
                         elsewhere: focused != Some(*wid),
+                        window: wid.0,
                     });
                 }
             }
         }
         out
+    }
+
+    /// aterm's own jobs the engine is told about: each registered child
+    /// ([`crate::own_jobs`]) whose job has a live row, with that row's id and
+    /// current title. Only the job's WORK row on the band counts, as
+    /// `apply_toolchain_snapshot` reads it: a held row on the key (a first
+    /// run's failure row, a carried one) is an outcome, and a row still in
+    /// its reveal grace is one nobody sees — neither explains the load.
+    pub(crate) fn strain_own_jobs(&self) -> Vec<(u32, MessageId, String)> {
+        crate::own_jobs::with_rows(&crate::own_jobs::snapshot(), |key| {
+            self.messages
+                .live_by_key(key)
+                .filter(|l| {
+                    l.revealed
+                        && !l.msg.hold.is_held()
+                        && l.msg.tag != aterm_messages::tags::PACKAGES
+                })
+                .map(|l| (l.id, l.msg.title.clone()))
+        })
     }
 
     /// The probe answered: sweep first (the engine groups it), then the
@@ -603,24 +634,24 @@ impl App {
         }
         if let Some(rows) = rows {
             let sessions = self.strain_sessions();
-            // aterm's own jobs are aterm's children: the sweep's ppid chain
-            // reaches aterm and the engine records them as `aterm itself`,
-            // never names them.
+            // aterm's own jobs that have a live row: their processes are that
+            // row's work — `explained by <title>` on the record, never a
+            // strain row beside it, and never `aterm itself` (ruling 214).
+            let jobs = self.strain_own_jobs();
+            let own: Vec<JobRef<'_>> = jobs
+                .iter()
+                .map(|(pid, id, title)| JobRef {
+                    pid: *pid,
+                    id: *id,
+                    title,
+                })
+                .collect();
             self.strain
                 .engine
-                .scanned(reading.at, &rows, &sessions, &[]);
+                .scanned(reading.at, &rows, &sessions, &own);
         }
         let gate = self.strain_gate();
         let out = self.strain.engine.observe(&reading, gate);
-        self.perform_strain(out);
-    }
-
-    /// The kernel pushed Critical memory pressure.
-    pub(crate) fn strain_memory_critical(&mut self) {
-        if !self.strain.enabled() {
-            return;
-        }
-        let out = self.strain.engine.pushed_critical(Instant::now());
         self.perform_strain(out);
     }
 
@@ -644,7 +675,7 @@ impl App {
     /// a record repeating it). A record with no live row to become (the row
     /// faded, or never showed) is posted as its own; never under a live row's
     /// key, which it would supersede silently.
-    fn perform_strain(&mut self, out: StrainOut) {
+    pub(crate) fn perform_strain(&mut self, out: StrainOut) {
         match out {
             StrainOut::None => {}
             StrainOut::Post(msg) => {
@@ -741,13 +772,7 @@ mod tests {
     #[test]
     fn ctl_send_and_remote_sessions_are_not_samples() {
         let mut app = on_screen_app();
-        let _ = app.input(
-            WID,
-            InputEvent::Text("a".into()),
-            Source::Controller {
-                op: aterm_session::Op::WriteInput,
-            },
-        );
+        let _ = app.input(WID, InputEvent::Text("a".into()), Source::Controller);
         let pending = app.windows[&WID].pending_input;
         assert!(pending.is_pending(), "the control key armed the stamp");
         assert!(
@@ -857,6 +882,139 @@ mod tests {
         }
     }
 
+    /// A sweep of a heavy `atpkg` pass: the pass child (`job`, aterm's own
+    /// child) and eight compilers under it, `n` readings in (cumulative).
+    fn pass_rows(job: u32, n: u64) -> Vec<aterm_messages::strain::ProcRow> {
+        let row = |pid: u32, ppid: u32, name: &str, mc: u64| aterm_messages::strain::ProcRow {
+            pid,
+            ppid,
+            uid_is_ours: true,
+            name: name.into(),
+            bundle: None,
+            cpu_ns: Some(n * 2_000 * mc * 1_000),
+            footprint_kib: Some(20 * 1024),
+        };
+        let mut rows = vec![row(job, std::process::id(), "atpkg", 50)];
+        rows.extend((1..=8).map(|i| row(job + i, job, "cc", 950)));
+        rows
+    }
+
+    /// Drive an episode loaded by a heavy `atpkg` pass for 40 s, then calm
+    /// for 60 s with quick keys, a sweep with every reading; the episode's
+    /// strain records.
+    fn drive_pass(app: &mut App, job: u32) -> Vec<(String, Vec<String>, Option<&'static str>)> {
+        let t0 = Instant::now();
+        let mut n = 0;
+        for step in 0..=1000u64 {
+            let at = t0 + Duration::from_millis(step * 100);
+            let loaded = step <= 400;
+            if step % 3 == 0 {
+                app.strain.note_key(at, if loaded { 120 } else { 5 });
+            }
+            if step > 0 && step % 20 == 0 {
+                n += 1;
+                let mut r = busy(at, n, 950);
+                if !loaded {
+                    r.busy_ticks = Some((20 * 950 * 8 + (n - 20) * 50 * 8, n * 8_000));
+                }
+                app.strain.in_flight = None;
+                app.on_strain_reading(r, Some(pass_rows(job, n.min(20))));
+            }
+        }
+        strain_entries(app)
+    }
+
+    /// OWN JOB (design ruling 214): a heavy pass of aterm's OWN `atpkg`
+    /// child, while its row is live, is that row's work — no strain row
+    /// doubles it, and the episode's record says `explained by <title>`,
+    /// never `aterm itself`. The same load with no row to explain it (a
+    /// silent routine pass) reads as aterm's own.
+    #[test]
+    fn an_own_job_with_a_live_row_explains_the_load() {
+        let job = 3_900_001;
+        let mut app = on_screen_app();
+        let row = app.post_message(crate::toolchain_words::announced(
+            "installing 2 program(s) (about 1 GB)",
+        ));
+        let _own = crate::own_jobs::register(job, crate::toolchain_words::KEY_PASS);
+        let jobs = app.strain_own_jobs();
+        assert!(
+            jobs.contains(&(
+                job,
+                row,
+                crate::toolchain_words::INSTALLING_ALAB.to_string()
+            )),
+            "{jobs:?}"
+        );
+        let records = drive_pass(&mut app, job);
+        assert!(
+            app.messages.live_by_key(STRAIN_KEY).is_none(),
+            "no strain row beside the work row"
+        );
+        assert!(
+            records.iter().any(|(_, detail, _)| detail
+                .iter()
+                .any(|l| l == "not shown: explained by Installing ALab tools")),
+            "{records:?}"
+        );
+
+        // No live row: the pass is not passed on, and reads as aterm's.
+        let mut quiet = on_screen_app();
+        assert!(
+            quiet.strain_own_jobs().iter().all(|(pid, ..)| *pid != job),
+            "a job with no live row explains nothing"
+        );
+        let records = drive_pass(&mut quiet, job);
+        assert!(
+            records
+                .iter()
+                .all(|(_, detail, _)| detail.iter().all(|l| !l.contains("explained by"))),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, detail, _)| detail.iter().any(|l| l == "not shown: aterm itself")),
+            "NEGATIVE CONTROL: the same load reads as aterm's: {records:?}"
+        );
+
+        // A live row on the key that is NOT the job's work (review
+        // 2026-09-24): a first run's failure row, and a heavy routine row
+        // still in its reveal grace. Neither explains the load.
+        let mut failed = on_screen_app();
+        failed.post_message(crate::toolchain_words::first_run_short(
+            crate::toolchain_words::FirstRunShort::Failed,
+            "network unreachable",
+        ));
+        assert!(
+            failed
+                .messages
+                .live_by_key(crate::toolchain_words::KEY_PASS)
+                .is_some(),
+            "the failure row is live on the key"
+        );
+        assert!(
+            failed.strain_own_jobs().iter().all(|(pid, ..)| *pid != job),
+            "a failure row is an outcome, not the job's work"
+        );
+        let records = drive_pass(&mut failed, job);
+        assert!(
+            records
+                .iter()
+                .any(|(_, detail, _)| detail.iter().any(|l| l == "not shown: aterm itself")),
+            "{records:?}"
+        );
+        let mut graced = on_screen_app();
+        graced.post_message(
+            crate::toolchain_words::announced("installing 2 program(s) (about 1 GB)")
+                .reveal_after(aterm_messages::PROGRESS_GRACE),
+        );
+        assert!(
+            graced.strain_own_jobs().iter().all(|(pid, ..)| *pid != job),
+            "a row nobody sees yet explains nothing"
+        );
+    }
+
     /// `explain_heavy_load = false` (a live reload) folds an open row — the
     /// row withdraws — parks the engine, drops the probe, and arms nothing
     /// after: later keys are no samples. On again, the next felt keys start
@@ -943,7 +1101,7 @@ mod tests {
             "{title}"
         );
         assert!(
-            detail.iter().any(|l| l.starts_with("on glass ")),
+            detail.iter().any(|l| l.starts_with("shown for ")),
             "{detail:?}"
         );
         assert_eq!(how.as_deref(), Some("withdrawn"));
@@ -990,8 +1148,8 @@ mod tests {
         assert!(title.ends_with(" s"), "seconds, not the hour away: {title}");
         let glass = detail
             .iter()
-            .find(|l| l.starts_with("on glass "))
-            .expect("the on-glass line");
+            .find(|l| l.starts_with("shown for "))
+            .expect("the shown-for line");
         assert!(glass.ends_with(" s"), "seconds, not the hour away: {glass}");
     }
 

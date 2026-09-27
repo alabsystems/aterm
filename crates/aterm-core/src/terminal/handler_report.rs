@@ -55,7 +55,7 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(
             machine = "terminal_modes",
             action = "SoftReset",
-            project = "aterm_core::terminal::project_modes"
+            project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
     pub(super) fn handle_decstr(&mut self) {
@@ -63,15 +63,8 @@ impl TerminalHandler<'_> {
         self.modes.cursor_visible = true;
 
         // Reset cursor style to the host-preferred default (not the hardcoded
-        // CursorStyle::default()), so a soft reset honors the configured default;
-        // fire callback if it changed.
-        let old_style = self.modes.cursor_style;
+        // CursorStyle::default()), so a soft reset honors the configured default.
         self.modes.cursor_style = *self.default_cursor_style;
-        if old_style != self.modes.cursor_style {
-            if let Some(callback) = self.cursor_style_callback {
-                callback(self.modes.cursor_style);
-            }
-        }
 
         // Reset origin mode
         self.modes.origin_mode = false;

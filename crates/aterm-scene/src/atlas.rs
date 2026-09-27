@@ -8,7 +8,7 @@
 /// Public so other host-side bakers (the sparkle-words v2 `CatBaker` in
 /// `aterm-gui`, design §5.5) reuse THIS rasterizer — the same 4×4-supersampled
 /// coverage, the same straight-alpha src-over — instead of growing a drifting
-/// look-alike. The primitive set (disc / ellipse / rrect / tri / fill) is
+/// look-alike. The primitive set (disc / ellipse / fill) is
 /// exactly what the in-crate sprites bake with.
 pub struct Tile {
     w: u32,
@@ -92,7 +92,7 @@ impl Tile {
     /// fully-covered pixel runs. Byte-identical to calling [`over`](Self::over) `len`
     /// times; when `a` is opaque it pattern-fills the RGBA quad directly (one 4-byte
     /// `copy_from_slice` per pixel, no per-pixel blend). The run is clipped to the tile.
-    pub fn over_run(&mut self, x: i32, y: i32, len: u32, rgb: (f32, f32, f32), a: f32) {
+    pub(crate) fn over_run(&mut self, x: i32, y: i32, len: u32, rgb: (f32, f32, f32), a: f32) {
         if y < 0 || y as u32 >= self.h || a <= 0.0 || len == 0 {
             return;
         }
@@ -147,7 +147,7 @@ impl Tile {
     // verifier times out on the body. Idiom-3 skip (generic-`Fn` / absent callee).
     #[cfg_attr(trust_verify, trust::skip)]
     #[allow(clippy::too_many_arguments)]
-    pub fn fill<F: Fn(f32, f32) -> bool>(
+    pub(crate) fn fill<F: Fn(f32, f32) -> bool>(
         &mut self,
         x0: i32,
         y0: i32,
@@ -221,62 +221,5 @@ impl Tile {
                 nx * nx + ny * ny <= 1.0
             },
         );
-    }
-
-    /// A filled rounded rectangle at `(x, y)` sized `w`×`h` with corner radius `rad`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rrect(
-        &mut self,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        rad: f32,
-        rgb: (f32, f32, f32),
-        a: f32,
-    ) {
-        let r = rad.min(w * 0.5).min(h * 0.5).max(0.0);
-        let (ix0, iy0, ix1, iy1) = (x + r, y + r, x + w - r, y + h - r);
-        // Saturating bbox math, same reasoning as `disc`.
-        self.fill(
-            (x as i32).saturating_sub(1),
-            (y as i32).saturating_sub(1),
-            ((x + w) as i32).saturating_add(2),
-            ((y + h) as i32).saturating_add(2),
-            rgb,
-            a,
-            |px, py| {
-                if px < x || px > x + w || py < y || py > y + h {
-                    return false;
-                }
-                // clamp to the inner rect; distance to that clamp point <= r (rounded corners)
-                let qx = crate::clampf(px, ix0, ix1);
-                let qy = crate::clampf(py, iy0, iy1);
-                let (dx, dy) = (px - qx, py - qy);
-                dx * dx + dy * dy <= r * r
-            },
-        );
-    }
-
-    /// A filled triangle through the three points `p`.
-    pub fn tri(&mut self, p: [(f32, f32); 3], rgb: (f32, f32, f32), a: f32) {
-        let xs = [p[0].0, p[1].0, p[2].0];
-        let ys = [p[0].1, p[1].1, p[2].1];
-        // Saturating bbox math, same reasoning as `disc`.
-        let x0 = (xs.iter().copied().fold(f32::INFINITY, f32::min) as i32).saturating_sub(1);
-        let x1 = (xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) as i32).saturating_add(2);
-        let y0 = (ys.iter().copied().fold(f32::INFINITY, f32::min) as i32).saturating_sub(1);
-        let y1 = (ys.iter().copied().fold(f32::NEG_INFINITY, f32::max) as i32).saturating_add(2);
-        let sign = |ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32| {
-            (ax - cx) * (by - cy) - (bx - cx) * (ay - cy)
-        };
-        self.fill(x0, y0, x1, y1, rgb, a, |x, y| {
-            let d1 = sign(x, y, p[0].0, p[0].1, p[1].0, p[1].1);
-            let d2 = sign(x, y, p[1].0, p[1].1, p[2].0, p[2].1);
-            let d3 = sign(x, y, p[2].0, p[2].1, p[0].0, p[0].1);
-            let neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
-            let pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
-            !(neg && pos)
-        });
     }
 }

@@ -69,6 +69,33 @@ fn vi_marks_set_get_remove() {
     assert!(!marks.contains('a'));
 }
 
+/// Under `cfg(kani)` `ViMarks` stores its marks in
+/// `aterm_types::verification::stubs::VerifyMap`, a build no ordinary compile
+/// reads — so nothing but this test tells a dead-code sweep that `ViMarks` needs
+/// every one of these calls (one such sweep deleted four of them, 2026-09-25, and
+/// the Kani build stopped compiling). The same operations `ViMarks` makes, on
+/// the type it makes them on under Kani, with the answers `HashMap` gives.
+#[test]
+fn kani_marks_map_carries_the_marks_surface() {
+    let mut marks = aterm_types::verification::stubs::VerifyMap::<char, ViPoint>::default();
+    let p = ViPoint::new(5, 10);
+    assert_eq!(marks.insert('a', p), None);
+    assert_eq!(marks.get(&'a').copied(), Some(p));
+    assert!(marks.contains_key(&'a'));
+    let copy = marks.clone();
+    assert_eq!(marks.remove(&'a'), Some(p));
+    assert!(!marks.contains_key(&'a'));
+    assert!(
+        copy.contains_key(&'a'),
+        "a clone is independent of its source"
+    );
+    marks.insert('b', p);
+    marks.clear();
+    assert_eq!(marks.get(&'b'), None);
+    let _ = format!("{marks:?}");
+    let _ = aterm_types::verification::stubs::VerifyMap::<char, ViPoint>::new();
+}
+
 #[test]
 fn vi_marks_rejects_invalid_chars() {
     let mut marks = ViMarks::new();

@@ -1,0 +1,13 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24 (no live capture yet): rows synthesized from the 2.1.282 render code, Gpe() (Ei color warning, title Session paused, marginTop 1 / paddingX 1, a numbered He over _5e()'s `Switch to <fallback>` / `Edit prompt and retry with <model>`, NO footer; the message row paraphrases x5e()'s, which the dump does not show whole), on the measured 2.1.280/2.1.281 box geometry (title at column one under the full-width rule; body and options at the column the dialog's paddingX puts them) · the model-refusal pause, a setup dialog, footerless
+⏺ Working on it.
+  ⎿  (tool output)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Session paused
+
+  Opus 4.1 could not continue this request. Switch to Sonnet 4.5 to keep going, or edit the prompt and retry.
+
+  ❯ 1. Switch to Sonnet 4.5
+    2. Edit prompt and retry with Opus 4.1
+
+

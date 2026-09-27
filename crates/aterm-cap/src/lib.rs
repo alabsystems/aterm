@@ -236,40 +236,12 @@ pub mod effects {
     /// Authorizes spawning a child process (the PTY shell). The single spawn seam
     /// (`aterm-pty`) should require `Cap<Spawn>`.
     pub enum Spawn {}
-    /// Authorizes writing the filesystem (e.g. scrollback persistence).
-    pub enum FsWrite {}
-    /// Authorizes touching the system clipboard (OSC 52).
-    pub enum Clipboard {}
-    /// Authorizes opening a network socket.
-    pub enum Network {}
-
-    // --- hierarchical-session edges (design docs/design/HIERARCHICAL_SESSIONS.md
-    // §7.1, A.6). These are the COARSE compile-time class gate; the fine, per-edge
-    // object identity (which src→dst) is the runtime `aterm-session` EdgeToken. The
-    // intended minimum tier is enforced by `require(cap, min)` at the call site
-    // (as `Spawn` is), not baked into the marker. Cross-session `WriteInput` from
-    // untrusted in-process code stays compile-gated OFF until ROADMAP §5.4 is GREEN
-    // (§7.7); same-uid cross-process driving rides the runtime EdgeToken, sound
-    // independent of §5.4.
-
-    /// Authorizes READING another session's rendered surface (screen/cells/blocks/
-    /// scrollback/search/image/timeline). Intended minimum tier: `Untrusted`.
-    pub enum ReadScreen {}
-    /// Authorizes INJECTING input into another session — the full human vocabulary
-    /// (keys, mouse click/drag/wheel, selection, paste, resize, focus), all of which
-    /// converge on the one `App::input` seam (Addendum A.2). Intended minimum tier:
-    /// `Trusted`.
-    pub enum WriteInput {}
-    /// Authorizes sending a SIGNAL to another session's foreground process group
-    /// (a separate scope from `WriteInput`: a human's Ctrl-C is a byte, not an
-    /// out-of-band signal — §7.2). Intended minimum tier: `Trusted`.
-    pub enum SignalEdge {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use effects::{Clipboard, Spawn};
+    use effects::Spawn;
 
     // Test helper: mint the root authority. SAFETY: in a single-threaded test
     // process with no untrusted input, the trusted-launcher contract of
@@ -291,7 +263,7 @@ mod tests {
     #[test]
     fn require_gates_on_tier() {
         let authority = test_authority();
-        let clip: Cap<Clipboard> = authority.grant(Tier::Untrusted);
+        let clip: Cap<Spawn> = authority.grant(Tier::Untrusted);
         // An effect needing Trusted is denied to an Untrusted cap.
         assert_eq!(
             require(&clip, Tier::Trusted),
@@ -303,7 +275,7 @@ mod tests {
         // An effect needing Untrusted is allowed.
         assert_eq!(require(&clip, Tier::Untrusted), Ok(()));
 
-        let certified: Cap<Clipboard> = authority.grant(Tier::Certified);
+        let certified: Cap<Spawn> = authority.grant(Tier::Certified);
         assert_eq!(require(&certified, Tier::Trusted), Ok(()));
     }
 
@@ -340,33 +312,6 @@ mod tests {
     //   `let _ = Authority::root_authority();`
     // — does NOT compile (it requires `unsafe`), which is the whole point; we
     // assert the unsafe path here and document that the safe path is a type error.
-    // The hierarchical-session edge markers gate exactly like `Spawn`: the marker
-    // is the effect class, `require(cap, min)` is the tier floor. WriteInput/Signal
-    // floor at Trusted; ReadScreen floors at Untrusted (a read is the least power).
-    #[test]
-    fn session_edge_effects_gate_on_their_intended_tier() {
-        use effects::{ReadScreen, SignalEdge, WriteInput};
-        let authority = test_authority();
-
-        let untrusted_write: Cap<WriteInput> = authority.grant(Tier::Untrusted);
-        assert!(
-            require(&untrusted_write, Tier::Trusted).is_err(),
-            "WriteInput floors at Trusted"
-        );
-        let trusted_write: Cap<WriteInput> = authority.grant(Tier::Trusted);
-        assert_eq!(require(&trusted_write, Tier::Trusted), Ok(()));
-
-        let untrusted_signal: Cap<SignalEdge> = authority.grant(Tier::Untrusted);
-        assert!(
-            require(&untrusted_signal, Tier::Trusted).is_err(),
-            "SignalEdge floors at Trusted"
-        );
-
-        // A read is the least-power edge: an Untrusted cap suffices.
-        let read: Cap<ReadScreen> = authority.grant(Tier::Untrusted);
-        assert_eq!(require(&read, Tier::Untrusted), Ok(()));
-    }
-
     #[test]
     fn root_authority_requires_unsafe_and_then_grants() {
         // SAFETY: single-threaded test, no untrusted input — trusted-launcher

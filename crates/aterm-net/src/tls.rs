@@ -1162,7 +1162,13 @@ mod tests {
         // pure sleep — 300 sequential round-trips took >= ~6 s. With condvar
         // signaling and blocking socket reads each round-trip is bounded by real
         // I/O latency only, so the whole batch completes orders of magnitude
-        // faster. The 3 s bound is generous for CI yet impossible under polling.
+        // faster.
+        //
+        // The bound is on the MEDIAN trip, not the batch: polling puts a sleep
+        // in EVERY trip, so its median stays near 20 ms at any load, while
+        // preemption under a saturated gate stretches only a minority of trips.
+        // A 3 s total charged every run-queue wait of ~900 thread wakeups to the
+        // relay (the load-sensitive test audit of 2026-09-27).
         const ROUND_TRIPS: usize = 300;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1209,19 +1215,22 @@ mod tests {
         let exporter = ct.exporter().to_vec();
         present_capability(ct.stream(), &exporter, "driver-1", "drive", &token).unwrap();
 
-        let started = Instant::now();
         let mut got = [0u8; 5];
+        let mut trips = Vec::with_capacity(ROUND_TRIPS);
         for _ in 0..ROUND_TRIPS {
+            let started = Instant::now();
             ct.stream().write_all(b"ping\n").unwrap();
             ct.stream().flush().unwrap();
             ct.stream().read_exact(&mut got).unwrap();
+            trips.push(started.elapsed());
             assert_eq!(&got, b"ping\n");
         }
-        let elapsed = started.elapsed();
+        trips.sort_unstable();
+        let median = trips[ROUND_TRIPS / 2];
         assert!(
-            elapsed < Duration::from_secs(3),
-            "{ROUND_TRIPS} relayed round-trips took {elapsed:?} — the relay is \
-             pacing traffic on a poll interval instead of waking on data"
+            median < Duration::from_millis(10),
+            "the median of {ROUND_TRIPS} relayed round-trips took {median:?} — the \
+             relay is pacing traffic on a poll interval instead of waking on data"
         );
 
         {
@@ -1272,7 +1281,7 @@ mod tests {
     ///
     /// Not a latency budget — a liveness guard. Its only job is that a stall can
     /// never be UNBOUNDED, because an unbounded one hangs `cargo test
-    /// --workspace` (and therefore `tools/verify.sh --fast`, the merge contract)
+    /// --workspace` (and therefore `tools/verify.sh`, the merge contract)
     /// instead of failing it. Sized to survive worst-case scheduler starvation
     /// when the whole workspace suite runs concurrently, not to measure a
     /// loopback round trip, which takes milliseconds.
@@ -1329,7 +1338,7 @@ mod tests {
         // `recv_timeout`, but a socket `read_exact` is not: if the relay has not
         // delivered yet the read blocks FOREVER, and the whole
         // `cargo test --workspace` run stops making progress instead of failing.
-        // That is worse than a failing test, since `tools/verify.sh --fast` (the
+        // That is worse than a failing test, since `tools/verify.sh` (the
         // merge contract, there being no CI) then never returns. Observed
         // hanging a full workspace run for >30 min at 0 % CPU.
         //

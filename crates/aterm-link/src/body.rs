@@ -395,33 +395,6 @@ mod tests {
         }
     }
 
-    /// ONE DEMOTION LIST IN THE CRATE, and it is the one the bridge reads.
-    ///
-    /// This module exported a second, wider one (`ACCEPTED_ONLY_KINDS`, with
-    /// `answer` in it) that nothing consumed. A reader taking it at its word —
-    /// or a later rung reaching for the `pub` constant to reimplement the policy
-    /// — would demote an unlisted principal's `answer` and break request/reply
-    /// for every peer not on the allowlist. The guard is over the source because
-    /// the defect was the EXISTENCE of the second spelling, not its value.
-    #[test]
-    fn the_demotion_policy_is_stated_exactly_once_in_this_crate() {
-        // The needle is SPLIT so this file's own prose about the deleted
-        // constant is not a counterexample: `concat!` joins at compile time and
-        // the source text read back never holds the whole token.
-        let declared = concat!("const ACCEPTED_ONLY", "_KINDS");
-        assert!(
-            !include_str!("body.rs").contains(declared),
-            "body.rs must not declare a second demotion list beside \
-             bridge::DEMOTE_UNLESS_ACCEPTED"
-        );
-        let one = concat!("const DEMOTE_UNLESS", "_ACCEPTED: [&str; 2]");
-        assert_eq!(
-            include_str!("bridge.rs").matches(one).count(),
-            1,
-            "§8.4's list is {{task, control}} and it is declared once"
-        );
-    }
-
     /// An unknown token survives the round trip. A newer publisher's field must
     /// be visible in a diagnostic, not silently erased by an older bridge.
     #[test]

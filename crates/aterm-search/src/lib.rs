@@ -11,14 +11,6 @@
 //! - SparseBitmap (ascending sorted Vec) for line number storage
 //! - Generic interfaces for integrating with grid/scrollback providers
 //!
-//! ## Lifecycle-Driven Document Identity (E2 redesign)
-//!
-//! [`LifecycleSearchIndex`] wraps the trigram engine behind compact per-epoch
-//! document ids and an explicit grid→index lifecycle event alphabet
-//! ([`SearchLifecycleEvent`]): append/replace/evict/reflow/clear/alt-screen.
-//! Gated by a differential equivalence oracle against the legacy
-//! absolute-row-keyed path (`lifecycle_oracle_tests.rs`).
-//!
 //! ## Streaming Search
 //!
 //! The [`streaming`] module provides memory-bounded streaming search:
@@ -36,7 +28,7 @@
 //! | Verified search | O(t + k·L) where k = candidates, L = avg line length |
 //! | Index line | O(n) where n = line length |
 //!
-//! Complexity claims derived from [`SearchIndex::search`] and
+//! Complexity claims derived from `SearchIndex::search` and
 //! [`SearchIndex::search_with_positions`]. Bloom filter O(1)
 //! per-check bound verified by operation counters in `bloom` module tests.
 //!
@@ -64,8 +56,6 @@ mod bytesearch;
 mod grapheme;
 mod index;
 mod iterators;
-mod lifecycle_driver;
-mod lifecycle_index;
 mod literal;
 pub mod streaming;
 mod types;
@@ -77,15 +67,8 @@ pub use index::{
     DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, NarrowedSearch, SearchIndex, SearchOptionsError,
     max_cached_for_retained,
 };
-pub use lifecycle_driver::SearchLifecycleDriver;
-pub use lifecycle_index::{
-    AbsRowMatch, LifecycleSearchIndex, LifecycleSearchResults, SearchLifecycleEvent,
-    U32PayloadResults, UpsertOutcome,
-};
 pub use types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
 
-#[cfg(test)]
-mod lifecycle_oracle_tests;
 #[cfg(test)]
 mod tests;
 
@@ -170,14 +153,6 @@ impl TerminalSearch {
         }
     }
 
-    /// Set the maximum number of cached lines before eviction.
-    ///
-    /// Forwarded to the underlying [`SearchIndex`]. A value of 0 is clamped to
-    /// 1. Does not bump the generation counter (no indexed content changes).
-    pub fn set_max_cached_lines(&mut self, max: usize) {
-        self.index.set_max_cached_lines(max);
-    }
-
     /// The oldest line still retained in the index.
     ///
     /// See [`SearchIndex::lowest_retained_line`]. Matches below this line have
@@ -204,6 +179,7 @@ impl TerminalSearch {
     /// be stale and should be discarded or re-queried.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -228,6 +204,7 @@ impl TerminalSearch {
     }
 
     /// Index multiple scrollback lines.
+    #[cfg(test)]
     pub fn index_scrollback_lines(&mut self, lines: impl IntoIterator<Item = impl AsRef<str>>) {
         for line in lines {
             self.index_scrollback_line(line.as_ref());
@@ -284,15 +261,9 @@ impl TerminalSearch {
         self.bump_generation();
     }
 
-    /// Advance a cached bulk index to a newer retained absolute-row boundary.
-    pub fn retain_history_from(&mut self, first_retained_line: usize) {
-        self.index.retain_history_from(first_retained_line);
-        self.bump_generation();
-    }
-
     /// Advance a cached index past rows the terminal no longer retains,
     /// WITHOUT the eviction-honesty bookkeeping — the complete-retention twin
-    /// of [`retain_history_from`](Self::retain_history_from). See
+    /// of `retain_history_from`. See
     /// [`SearchIndex::drop_history_below`] for the contract (the refreshed
     /// index must stay observationally identical to a from-scratch rebuild
     /// over the surviving rows).
@@ -310,12 +281,14 @@ impl TerminalSearch {
     /// This does NOT remove entries from the underlying trigram index. If the
     /// invalidated lines need to be removed from the index, call [`clear()`]
     /// followed by re-indexing.
+    #[cfg(test)]
     pub fn invalidate(&mut self) {
         self.bump_generation();
     }
 
     /// Check if a query might have matches.
     #[must_use]
+    #[cfg(test)]
     pub fn might_contain(&self, query: &str) -> bool {
         self.index.might_contain(query)
     }
@@ -323,21 +296,6 @@ impl TerminalSearch {
     /// Search for a query string.
     pub fn search(&self, query: &str) -> Vec<SearchMatch> {
         self.index.search_with_positions(query)
-    }
-
-    /// Search with options for case sensitivity and regex mode.
-    ///
-    /// When `case_sensitive` is true and `is_regex` is false, this uses the
-    /// trigram-accelerated search path. Otherwise, all cached lines are scanned
-    /// directly.
-    pub fn search_opts(
-        &self,
-        query: &str,
-        case_sensitive: bool,
-        is_regex: bool,
-    ) -> Result<Vec<SearchMatch>, SearchOptionsError> {
-        self.index
-            .search_with_positions_opts(query, case_sensitive, is_regex)
     }
 
     /// Search with options, returning matches bundled with the eviction signal.
@@ -396,15 +354,11 @@ impl TerminalSearch {
             .search_literal_narrowed(query, case_sensitive, prev_lines)
     }
 
-    /// Search in the specified direction.
-    pub fn search_ordered(&self, query: &str, direction: SearchDirection) -> Vec<SearchMatch> {
-        self.index.search_ordered(query, direction)
-    }
-
     /// Find the next match after the given position.
     ///
     /// This uses O(log n) range queries to skip lines before `after_line`,
     /// then iterates with early termination to find the first match.
+    #[cfg(any(test, kani))]
     pub fn find_next(
         &self,
         query: &str,
@@ -424,6 +378,7 @@ impl TerminalSearch {
     /// range-bounded candidate iteration. Regex mode retains the batch regex
     /// implementation and can return [`SearchOptionsError::RegexNotEnabled`]
     /// when the crate feature is disabled.
+    #[cfg(test)]
     pub fn find_next_opts(
         &self,
         query: &str,
@@ -449,6 +404,7 @@ impl TerminalSearch {
     ///
     /// This uses O(log n) range queries to only search lines before `before_line`,
     /// then iterates with early termination to find the first match.
+    #[cfg(any(test, kani))]
     pub fn find_prev(
         &self,
         query: &str,
@@ -468,6 +424,7 @@ impl TerminalSearch {
     /// Literal searches iterate candidates and lines in reverse order without
     /// materializing a candidate vector. Regex mode retains the batch path; see
     /// [`find_next_opts`](Self::find_next_opts).
+    #[cfg(test)]
     pub fn find_prev_opts(
         &self,
         query: &str,

@@ -4,7 +4,6 @@
 
 //! Configuration types for aterm-core terminals.
 
-use crate::platform::FontDescriptor;
 use aterm_types::{ColorPalette, CursorStyle, ParagraphDirection, Rgb};
 
 // BiDi mode extracted to aterm-types crate (#2440).
@@ -79,76 +78,6 @@ impl BiDiConfig {
     }
 }
 
-// ============================================================================
-// Scrollback Backend Configuration
-// ============================================================================
-
-/// Scrollback storage backend configuration.
-///
-/// Controls whether scrollback is stored entirely in memory (default) or uses
-/// disk-backed cold tier storage for unlimited history.
-#[derive(Debug, Clone, PartialEq, Default)]
-#[non_exhaustive]
-pub enum ScrollbackBackend {
-    /// Memory-only scrollback with tiered compression.
-    ///
-    /// All scrollback data is kept in RAM using hot/warm/cold tiers:
-    /// - Hot: Uncompressed lines (fast access)
-    /// - Warm: LZ4 compressed blocks
-    /// - Cold: Zstd compressed blocks (evicted when memory budget exceeded)
-    #[default]
-    Memory,
-
-    /// Disk-backed scrollback for unlimited history.
-    ///
-    /// Like Memory, but cold tier is persisted to disk:
-    /// - Hot: Uncompressed lines (fast access)
-    /// - Warm: LZ4 compressed blocks
-    /// - Cold: Zstd compressed, stored on disk with LRU cache
-    Disk(DiskBackendConfig),
-}
-
-/// Configuration for disk-backed scrollback storage.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiskBackendConfig {
-    /// Path to the cold tier storage file.
-    pub path: std::path::PathBuf,
-    /// Maximum lines in hot tier before promotion (default: 1000).
-    pub hot_limit: usize,
-    /// Maximum lines in warm tier before eviction (default: 10000).
-    pub warm_limit: usize,
-    /// LRU cache size for cold tier pages (default: 64).
-    pub cold_cache_size: usize,
-}
-
-#[cfg(test)]
-impl DiskBackendConfig {
-    /// Create a new disk backend config with the given path.
-    #[must_use]
-    pub(crate) fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            hot_limit: 1000,
-            warm_limit: 10_000,
-            cold_cache_size: 64,
-        }
-    }
-
-    /// Set hot tier limit.
-    #[must_use]
-    pub(crate) fn with_hot_limit(mut self, limit: usize) -> Self {
-        self.hot_limit = limit;
-        self
-    }
-
-    /// Set warm tier limit.
-    #[must_use]
-    pub(crate) fn with_warm_limit(mut self, limit: usize) -> Self {
-        self.warm_limit = limit;
-        self
-    }
-}
-
 /// Terminal configuration settings.
 ///
 /// This struct bundles all configurable aspects of a terminal that can be
@@ -156,7 +85,7 @@ impl DiskBackendConfig {
 ///
 /// # Configuration Categories
 ///
-/// - **Display**: Cursor style, cursor blink, font descriptor
+/// - **Display**: Cursor style, cursor blink, cursor color and visibility
 /// - **Colors**: Foreground, background, cursor color, palette
 /// - **Behavior**: Scrollback limit, auto-wrap, focus reporting
 /// - **Performance**: Memory budget, sync timeout
@@ -193,9 +122,6 @@ pub struct TerminalConfig {
 
     /// Whether cursor is visible (DECTCEM mode 25).
     pub cursor_visible: bool,
-
-    /// Font descriptor (family, size, weight, italic).
-    pub font: FontDescriptor,
 
     // === Color Settings ===
     /// Default foreground color.
@@ -290,18 +216,6 @@ pub struct TerminalConfig {
     /// How long to wait before forcing sync mode off.
     pub sync_timeout_ms: u64,
 
-    // === Scrollback Settings ===
-    /// Storage backend for scrollback history.
-    ///
-    /// # Important
-    /// This field is **construction-time only** -- it is read during `Terminal::new()`
-    /// and ignored by [`Terminal::apply_config()`]. Switching backends requires
-    /// migrating live scrollback data between storage tiers, which is not
-    /// supported. To change the backend, create a new terminal. Consider using
-    /// [`ConfigBuilder::scrollback_backend()`](super::builder::ConfigBuilder::scrollback_backend)
-    /// instead.
-    pub scrollback_backend: ScrollbackBackend,
-
     // === Text Settings ===
     /// Ambiguous-width characters treated as double-width (CJK mode).
     ///
@@ -336,7 +250,6 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             cursor_color: None,
             cursor_visible: true,
-            font: FontDescriptor::default(),
             // Colors — single source of truth (was 255,255,255 here vs 229,229,229
             // in the runtime terminal state; unified to avoid the divergence the
             // color audit flagged). See aterm_types::DEFAULT_FOREGROUND.
@@ -363,7 +276,6 @@ impl Default for TerminalConfig {
             memory_budget: 100 * 1024 * 1024, // 100 MB
             sync_timeout_ms: 1000,            // 1 second
             // Scrollback
-            scrollback_backend: ScrollbackBackend::default(),
             // Text
             ambiguous_width_double: false,
             bold_is_bright: true,
@@ -371,96 +283,6 @@ impl Default for TerminalConfig {
             // BiDi
             bidi: BiDiConfig::default(),
         }
-    }
-}
-
-impl TerminalConfig {
-    /// Create a configuration builder for fluent API.
-    ///
-    /// Returns a [`ConfigBuilder`](super::builder::ConfigBuilder) initialized
-    /// with default values. This is the recommended way to construct a
-    /// `TerminalConfig` when you only need to override a few fields.
-    #[must_use]
-    pub fn builder() -> super::builder::ConfigBuilder {
-        super::builder::ConfigBuilder::new()
-    }
-
-    /// Compare with another config and return list of changes.
-    ///
-    /// This is useful for determining what UI elements need to be updated
-    /// after a configuration change.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn diff(&self, other: &Self) -> Vec<ConfigChange> {
-        let mut changes = Vec::new();
-
-        if self.cursor_style != other.cursor_style {
-            changes.push(ConfigChange::CursorStyle);
-        }
-        if self.cursor_blink != other.cursor_blink {
-            changes.push(ConfigChange::CursorBlink);
-        }
-        if self.cursor_color != other.cursor_color {
-            changes.push(ConfigChange::CursorColor);
-        }
-        if self.cursor_visible != other.cursor_visible {
-            changes.push(ConfigChange::CursorVisible);
-        }
-        if self.font != other.font {
-            changes.push(ConfigChange::Font);
-        }
-        if self.default_foreground != other.default_foreground
-            || self.default_background != other.default_background
-            || self.selection_background != other.selection_background
-            || self.selection_foreground != other.selection_foreground
-            || self.custom_palette != other.custom_palette
-        {
-            changes.push(ConfigChange::Colors);
-        }
-        if self.scrollback_limit != other.scrollback_limit {
-            changes.push(ConfigChange::ScrollbackLimit);
-        }
-        if self.auto_wrap != other.auto_wrap {
-            changes.push(ConfigChange::AutoWrap);
-        }
-        if self.focus_reporting != other.focus_reporting {
-            changes.push(ConfigChange::FocusReporting);
-        }
-        if self.bracketed_paste != other.bracketed_paste {
-            changes.push(ConfigChange::BracketedPaste);
-        }
-        if self.allow_osc52_query != other.allow_osc52_query {
-            changes.push(ConfigChange::Osc52ClipboardQuery);
-        }
-        if self.allow_window_ops != other.allow_window_ops {
-            changes.push(ConfigChange::WindowOps);
-        }
-        if self.allow_notifications != other.allow_notifications {
-            changes.push(ConfigChange::Notifications);
-        }
-        if self.allow_palette_reconfigure != other.allow_palette_reconfigure {
-            changes.push(ConfigChange::PaletteReconfigure);
-        }
-        if self.memory_budget != other.memory_budget {
-            changes.push(ConfigChange::MemoryBudget);
-        }
-        if self.sync_timeout_ms != other.sync_timeout_ms {
-            changes.push(ConfigChange::SyncTimeout);
-        }
-        if self.bidi != other.bidi {
-            changes.push(ConfigChange::BiDi);
-        }
-        if self.ambiguous_width_double != other.ambiguous_width_double {
-            changes.push(ConfigChange::AmbiguousWidth);
-        }
-        if self.bold_is_bright != other.bold_is_bright
-            || (self.faint_opacity - other.faint_opacity).abs() > f32::EPSILON
-        {
-            changes.push(ConfigChange::StylePolicy);
-        }
-        // Note: scrollback_backend is construction-time only — not diffed here.
-
-        changes
     }
 }
 
@@ -479,8 +301,6 @@ pub enum ConfigChange {
     CursorColor,
     /// Cursor visibility changed.
     CursorVisible,
-    /// Font descriptor changed (family, size, weight, italic).
-    Font,
     /// Color scheme changed (foreground, background, or palette).
     Colors,
     /// Scrollback limit changed.

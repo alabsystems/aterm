@@ -334,23 +334,43 @@ mod tests {
     /// IT RUNS IN A CHILD OF ITSELF, and that is not ceremony: this process's
     /// fd table belongs to `cargo test` (3 and 4 are usually taken, which is the
     /// only reason the happy-path test above never caught this), while a fresh
-    /// `exec` of the same binary has 3 and 4 free and can place descriptors
-    /// exactly without clobbering anything a harness owns. No sleeps, no
-    /// probing: the layout is staged, asserted, then exercised.
+    /// `exec` of the same binary can place descriptors exactly without
+    /// clobbering anything a harness owns. No sleeps, no probing: the layout is
+    /// staged, asserted, then exercised.
+    ///
+    /// A fresh exec has 3 and 4 free only if nothing hands them down: a
+    /// descriptor its parent holds WITHOUT close-on-exec survives the exec, and
+    /// a make-style jobserver passes its pipe exactly that way. The merge gate
+    /// runs the suite under one, and there the staged child found fd 3 open and
+    /// refused (measured 2026-09-25; reproduced by starting the test binary with
+    /// `3</dev/null`). So the launcher CLOSES 3 and 4 in the child before its
+    /// exec — the layout the staging asserts is then true by construction, not
+    /// by the caller's environment.
     #[test]
     fn a_source_already_on_its_target_number_still_reaches_the_child() {
+        use std::os::unix::process::CommandExt;
         if let Ok(stage) = std::env::var(STAGE_ENV) {
             staged(&stage);
             return;
         }
         for stage in ["verb", "push"] {
-            let out = Command::new(std::env::current_exe().expect("the test binary"))
+            let mut launch = Command::new(std::env::current_exe().expect("the test binary"));
+            launch
                 .arg("a_source_already_on_its_target_number_still_reaches_the_child")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
-                .env(STAGE_ENV, stage)
-                .output()
-                .expect("re-exec this test binary");
+                .env(STAGE_ENV, stage);
+            // SAFETY: runs in the forked child between fork and exec, where only
+            // async-signal-safe calls are allowed; `close(2)` is one, touches no
+            // memory, and an already-closed number is an `EBADF` return, ignored.
+            unsafe {
+                launch.pre_exec(|| {
+                    close(BRIDGE_VERB_FD);
+                    close(BRIDGE_PUSH_FD);
+                    Ok(())
+                });
+            }
+            let out = launch.output().expect("re-exec this test binary");
             assert!(
                 out.status.success(),
                 "stage {stage}: {:?}\nstdout: {}\nstderr: {}",

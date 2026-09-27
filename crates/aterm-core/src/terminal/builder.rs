@@ -6,14 +6,10 @@
 //!
 //! Extracted from `terminal/mod.rs` as part of #485 (code health - large files refactor).
 
-use std::sync::Arc;
-
 use crate::grid::Grid;
-use crate::platform::FontDescriptor;
 use crate::scrollback::Scrollback;
 
 use super::Terminal;
-use aterm_types::Rgb;
 
 /// Engine-default hot-ring cap for a TIERED terminal (audit E1). The ring is
 /// the fixed fast tier in front of the compressed store — deep enough that
@@ -31,11 +27,8 @@ pub const TIERED_RING_CAP_DEFAULT: usize = 1_000;
 /// use aterm_core::terminal::TerminalBuilder;
 ///
 /// let terminal = TerminalBuilder::new()
-///     .rows(24)
-///     .cols(80)
+///     .size(24, 80)
 ///     .ring_buffer_size(10_000)
-///     .foreground(aterm_core::terminal::Rgb { r: 255, g: 255, b: 255 })
-///     .background(aterm_core::terminal::Rgb { r: 0, g: 0, b: 0 })
 ///     .build();
 /// ```
 #[derive(Debug)]
@@ -44,10 +37,6 @@ pub struct TerminalBuilder {
     cols: u16,
     ring_buffer_size: Option<usize>,
     scrollback: Option<Scrollback>,
-    foreground: Option<Rgb>,
-    background: Option<Rgb>,
-    font: Option<FontDescriptor>,
-    title: Option<Arc<str>>,
 }
 
 impl Default for TerminalBuilder {
@@ -67,25 +56,7 @@ impl TerminalBuilder {
             cols: 80,
             ring_buffer_size: None,
             scrollback: None,
-            foreground: None,
-            background: None,
-            font: None,
-            title: None,
         }
-    }
-
-    /// Set the number of rows.
-    #[must_use]
-    pub fn rows(mut self, rows: u16) -> Self {
-        self.rows = rows;
-        self
-    }
-
-    /// Set the number of columns.
-    #[must_use]
-    pub fn cols(mut self, cols: u16) -> Self {
-        self.cols = cols;
-        self
     }
 
     /// Set the terminal size (rows and cols).
@@ -102,15 +73,6 @@ impl TerminalBuilder {
     #[must_use]
     pub fn ring_buffer_size(mut self, size: usize) -> Self {
         self.ring_buffer_size = Some(size);
-        self
-    }
-
-    /// Set the tiered scrollback storage.
-    ///
-    /// If not set, the terminal will not have tiered scrollback.
-    #[must_use]
-    pub fn scrollback(mut self, scrollback: Scrollback) -> Self {
-        self.scrollback = Some(scrollback);
         self
     }
 
@@ -148,34 +110,6 @@ impl TerminalBuilder {
         self
     }
 
-    /// Set the default foreground color.
-    #[must_use]
-    pub fn foreground(mut self, color: Rgb) -> Self {
-        self.foreground = Some(color);
-        self
-    }
-
-    /// Set the default background color.
-    #[must_use]
-    pub fn background(mut self, color: Rgb) -> Self {
-        self.background = Some(color);
-        self
-    }
-
-    /// Set the initial font descriptor.
-    #[must_use]
-    pub fn font(mut self, font: FontDescriptor) -> Self {
-        self.font = Some(font);
-        self
-    }
-
-    /// Set the initial window title.
-    #[must_use]
-    pub fn title(mut self, title: impl Into<Arc<str>>) -> Self {
-        self.title = Some(title.into());
-        self
-    }
-
     /// Build the terminal with the configured options.
     #[must_use]
     pub fn build(self) -> Terminal {
@@ -198,59 +132,6 @@ impl TerminalBuilder {
         };
 
         // Use Terminal::with_grid for consistent field initialization (#1648)
-        let mut terminal = Terminal::with_grid(grid);
-
-        // Apply builder-specific customizations
-        if let Some(title) = self.title {
-            // Defense-in-depth: enforce MAX_TITLE_BYTES even for programmatic API
-            let boundary = title.floor_char_boundary(super::MAX_TITLE_BYTES);
-            terminal.title.window = if boundary < title.len() {
-                Arc::from(&title[..boundary])
-            } else {
-                title
-            };
-        }
-        if let Some(fg) = self.foreground {
-            terminal.set_default_foreground(fg);
-        }
-        if let Some(bg) = self.background {
-            terminal.set_default_background(bg);
-        }
-        if let Some(font) = self.font {
-            terminal.font = font;
-        }
-
-        terminal
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configured_colors_survive_dynamic_color_set_and_reset() {
-        let foreground = Rgb::new(0x11, 0x22, 0x33);
-        let background = Rgb::new(0x44, 0x55, 0x66);
-        let mut terminal = TerminalBuilder::new()
-            .foreground(foreground)
-            .background(background)
-            .build();
-
-        terminal.process(b"\x1b]10;rgb:aa/bb/cc\x07\x1b]11;rgb:77/88/99\x07");
-        assert_ne!(terminal.default_foreground(), foreground);
-        assert_ne!(terminal.default_background(), background);
-
-        terminal.process(b"\x1b]110\x07\x1b]111\x07");
-        assert_eq!(
-            terminal.default_foreground(),
-            foreground,
-            "OSC 110 restores the builder-configured foreground"
-        );
-        assert_eq!(
-            terminal.default_background(),
-            background,
-            "OSC 111 restores the builder-configured background"
-        );
+        Terminal::with_grid(grid)
     }
 }

@@ -23,9 +23,9 @@ use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 /// Create a standard 24x80 terminal for testing.
 ///
 /// Opts into `allow_palette_reconfigure` (#7937) and `allow_osc52_set`
-/// (#7782) for parity with `crate::testing::default_terminal` — OSC 4 /
-/// OSC 21 palette-SET and OSC 52 clipboard-SET are now fail-closed by
-/// default and pre-existing tests expect the opted-in posture.
+/// (#7782) — OSC 4 / OSC 21 palette-SET and OSC 52 clipboard-SET are
+/// fail-closed by default and pre-existing tests expect the opted-in
+/// posture.
 pub fn default_terminal() -> Terminal {
     let mut term = Terminal::new(24, 80);
     term.modes_mut().allow_palette_reconfigure = true;
@@ -52,7 +52,7 @@ impl TestLogger {
 }
 
 impl Log for TestLogger {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+    fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= Level::Warn
     }
 

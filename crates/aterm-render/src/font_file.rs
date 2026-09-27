@@ -248,9 +248,8 @@ pub fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
 /// download directory named in the config — keeps the bounded copy, because
 /// `cp new.ttf ~/Library/Fonts/Font.ttf` truncates and rewrites the SAME
 /// inode while a terminal may hold it, and a face reachable through
-/// `fallback_fonts` / `$ATERM_FALLBACK_FONT` / `$ATERM_SYMBOL_FONT` /
-/// `$ATERM_EMOJI_FONT` can live exactly there. [`maps_in_place`] is the one
-/// definition of the rule.
+/// `fallback_fonts` / `symbol_font` / `emoji_font` can live exactly there.
+/// [`maps_in_place`] is the one definition of the rule.
 ///
 /// The bytes are validated exactly as a copy would be: same `open_regular`
 /// (regular file, `O_NOFOLLOW`, `O_NONBLOCK`), same `fstat` size bound

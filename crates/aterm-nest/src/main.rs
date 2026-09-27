@@ -218,19 +218,34 @@ fn socket_from_line(line: &str) -> Option<String> {
 /// `cfg` is the per-run scratch `XDG_CONFIG_HOME` from [`seed_config_dir`]; passing
 /// it is what keeps the stack off the caller's real `aterm.toml` (see that
 /// function's doc for why a nested level could otherwise WRITE it).
-fn spawn_root(gui: &Path, cfg: &Path) -> io::Result<(std::process::Child, String)> {
-    // Headless via the FLAG — the canonical arming ($ATERM_HEADLESS is an exact
-    // equivalent). The launch announces the mode on stderr, on the line before
-    // the "listening at" line this function scans for.
-    let mut child = Command::new(gui)
-        .arg("--headless")
-        .env("ATERM_LINES", "40")
-        .env("ATERM_COLUMNS", "120")
+///
+/// `lifeline`, when given, is the run's private directory: level 0 is armed with a
+/// LIFELINE there ([`aterm_uds::lifeline`]) — this process holds the one writer of a
+/// FIFO level 0 reads as its stdin — so a run killed any way at all, even a SIGKILL
+/// that runs no teardown, takes the whole stack with it: level 0 quits the ordinary
+/// way and hangs up its shell, whose SIGHUP ends the level below it, and so on down.
+/// `None` under `--keep`, whose stack is meant to outlive this process.
+fn spawn_root(
+    gui: &Path,
+    cfg: &Path,
+    lifeline: Option<&Path>,
+) -> io::Result<(std::process::Child, String, Option<Lifeline>)> {
+    // Headless and the grid are launch FLAGS — the one spelling. The launch
+    // announces the mode on stderr, on the line before the "listening at" line
+    // this function scans for.
+    let mut command = Command::new(gui);
+    command
+        .args(["--headless", "--lines", "40", "--columns", "120"])
         .env("XDG_CONFIG_HOME", cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // After `.stdin(..)`: the lifeline's far end replaces it.
+    let held = match lifeline {
+        Some(dir) => Some(arm_lifeline(&mut command, dir)?),
+        None => None,
+    };
+    let mut child = command.spawn()?;
     // stderr is always Some here (we set `Stdio::piped()` above and this is the
     // first `take()`); the guard replaces an `expect` so the verifier sees a
     // panic-free path instead of an unprovable `expect` precondition.
@@ -280,7 +295,7 @@ fn spawn_root(gui: &Path, cfg: &Path) -> io::Result<(std::process::Child, String
     // parked inside `read_line`. Every failure path kills the child (a
     // timed-out gui would otherwise outlive us as an orphan).
     match rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok(sock)) => Ok((child, sock)),
+        Ok(Ok(sock)) => Ok((child, sock, held)),
         Ok(Err(e)) => {
             let _ = child.kill();
             Err(e)
@@ -292,6 +307,25 @@ fn spawn_root(gui: &Path, cfg: &Path) -> io::Result<(std::process::Child, String
             ))
         }
     }
+}
+
+/// The launcher's end of level 0's lifeline: held until this process ends.
+#[cfg(unix)]
+type Lifeline = aterm_uds::lifeline::Lifeline;
+/// No lifeline off unix: level 0 ends with the teardown alone, as before.
+#[cfg(not(unix))]
+type Lifeline = ();
+
+/// Arm `command` with a lifeline in `dir` ([`aterm_uds::lifeline::Lifeline::arm`]).
+#[cfg(unix)]
+fn arm_lifeline(command: &mut Command, dir: &Path) -> io::Result<Lifeline> {
+    aterm_uds::lifeline::Lifeline::arm(command, dir)
+}
+
+/// See the unix body.
+#[cfg(not(unix))]
+fn arm_lifeline(_command: &mut Command, _dir: &Path) -> io::Result<Lifeline> {
+    Ok(())
 }
 
 /// POSIX single-quote a string for safe interpolation into a `sh -c` command
@@ -339,9 +373,8 @@ fn sh_quote(s: &str) -> String {
 ///
 /// `cfg` (the scratch `XDG_CONFIG_HOME`) is re-stated on this line even though the
 /// level above already exports it and `aterm-pty` forwards its environment to the
-/// shell: the same belt-and-braces `ATERM_LINES`/`ATERM_COLUMNS` get, and here it
-/// is load-bearing — if inheritance ever stopped carrying the variable, the
-/// SILENT failure is a nested level writing the caller's real settings.
+/// shell: it is load-bearing — if inheritance ever stopped carrying the variable,
+/// the SILENT failure is a nested level writing the caller's real settings.
 fn spawn_child(parent_sock: &str, gui: &Path, errfile: &str, cfg: &Path) -> io::Result<String> {
     let _ = std::fs::remove_file(errfile);
     type_line(parent_sock, &launch_line(gui, errfile, cfg))?;
@@ -377,12 +410,11 @@ fn launch_line(gui: &Path, errfile: &str, cfg: &Path) -> String {
     let mut launch = String::new();
     launch.push_str("XDG_CONFIG_HOME=");
     launch.push_str(&sh_quote(&c));
-    launch.push_str(" ATERM_LINES=40 ATERM_COLUMNS=120 ");
+    launch.push(' ');
     launch.push_str(&sh_quote(&g));
-    // Headless via the FLAG (see `spawn_root`): the inner instance must never
-    // depend on the outer's environment, which CONSUMED `ATERM_HEADLESS` at its
-    // own boot precisely so a nested aterm is not a surprise headless engine.
-    launch.push_str(" --headless 2>");
+    // Launch FLAGS (see `spawn_root`): nothing the outer instance was launched
+    // with reaches the inner one through the environment.
+    launch.push_str(" --headless --lines 40 --columns 120 2>");
     launch.push_str(&sh_quote(errfile));
     launch
 }
@@ -704,7 +736,14 @@ fn run(args: &Args) -> io::Result<i32> {
             return Err(e);
         }
     };
-    let (mut root, root_sock) = match spawn_root(&args.gui, &cfg) {
+    // Held to the end of this function — and past a `std::process::exit`, which the
+    // kernel answers by closing it — so the stack ends with this process.
+    let lifeline_dir = if args.keep {
+        None
+    } else {
+        Some(rundir.as_path())
+    };
+    let (mut root, root_sock, _lifeline) = match spawn_root(&args.gui, &cfg, lifeline_dir) {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&rundir);
@@ -1056,8 +1095,9 @@ mod tests {
         );
         assert_eq!(
             line,
-            "XDG_CONFIG_HOME='/run/x/cfg dir' ATERM_LINES=40 ATERM_COLUMNS=120 \
-             '/opt/my gui/aterm-gui' --headless 2>'/run/x/aterm-nest-L1.err'"
+            "XDG_CONFIG_HOME='/run/x/cfg dir' \
+             '/opt/my gui/aterm-gui' --headless --lines 40 --columns 120 \
+             2>'/run/x/aterm-nest-L1.err'"
         );
         // The env assignment must PRECEDE the binary, or `sh` reads it as an
         // argument and the level below inherits the caller's config after all.

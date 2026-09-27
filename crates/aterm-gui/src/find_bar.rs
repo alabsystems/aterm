@@ -44,6 +44,14 @@
 //!   the number is a past census and can be wrong in EITHER direction; it
 //!   refreshes on the next edit or ⌘S/⌘R. Spelled out as `(stale)`.
 //!
+//! While a width change's rewrap holds the history AWAY (design ruling 237), a
+//! zero-match is not a miss — the text may be there, and the search runs again by
+//! itself at the re-attach — so no width says `no matches`: the ladder is `none
+//! yet, history rewrapping` › `none yet (rewrapping)` › `rewrapping history` ›
+//! `rewrapping` › `rewrap`, in the label tone, and the query is not tinted as a
+//! failure. Below 49 columns the status zone is dropped for the field (for every
+//! result), and the band's `Rewrapping scrollback` row carries the wait.
+//!
 //! Pure + themed like the paste banner and the link caption (it reuses
 //! [`crate::settings::blank_row`]/[`crate::settings::write_str`] +
 //! [`crate::chrome_band::band_colors`]), so the band builder unit-tests with no window
@@ -136,6 +144,11 @@ pub(crate) struct FindBarView {
     /// many", a floor; `…` says "this many, as of before the last output" and
     /// can be wrong in EITHER direction. Both can hold at once (`1/6+…`).
     pub stale: bool,
+    /// The search ran while a rewrap held the session's history detached (design
+    /// ruling 237). The text may be there; the history is away. So a zero-match
+    /// is `none yet`/`rewrapping`, never `no matches`, at EVERY width, and the
+    /// query is not tinted as a failure. Implies [`Self::truncated`].
+    pub history_away: bool,
 }
 
 impl FindBarView {
@@ -232,6 +245,36 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
         (
             vec!["bad regex".to_string(), "re!".to_string()],
             c.warn,
+            true,
+        )
+    } else if v.history_away && v.total == 0 {
+        // RULING 237: the history is away for a rewrap, so nothing found is NOT
+        // a miss — the search runs again by itself at the re-attach. No form
+        // says `no matches`; the plain word `rewrapping` survives down to the
+        // narrowest status zone that shows anything, and the long form where it
+        // fits. Not the warn tone: nothing failed. (No `…`: that mark is the
+        // bar's word for "stale", and a result that re-runs itself is moot.)
+        (
+            vec![
+                crate::app_search::HISTORY_AWAY_NONE.to_string(),
+                "none yet (rewrapping)".to_string(),
+                "rewrapping history".to_string(),
+                "rewrapping".to_string(),
+                "rewrap".to_string(),
+            ],
+            c.label,
+            false,
+        )
+    } else if v.history_away {
+        // Hits on the screen while the rest of the history is away: a floor,
+        // with its `+`, and the reason where it fits.
+        (
+            vec![
+                format!("{}/{}{mark} (rewrapping)", v.idx, v.total),
+                format!("{}/{}{mark}", v.idx, v.total),
+                format!("{}{mark}", v.total),
+            ],
+            c.value,
             true,
         )
     } else if v.total == 0 {
@@ -445,7 +488,9 @@ fn paint_well(
     }
     let chars: Vec<char> = v.query.chars().collect();
     let cursor = v.cursor_chars().min(chars.len());
-    let ink = if !chars.is_empty() && (v.regex_error || v.total == 0) {
+    // A search that ran while the history was away found nothing YET — not a
+    // failure, so not the failure tint (ruling 237).
+    let ink = if !chars.is_empty() && (v.regex_error || (v.total == 0 && !v.history_away)) {
         c.warn
     } else {
         c.value
@@ -582,6 +627,7 @@ mod tests {
             regex_error: false,
             truncated: false,
             stale: false,
+            history_away: false,
         }
     }
 
@@ -1088,6 +1134,82 @@ mod tests {
             90,
         ));
         assert!(s.contains("bad regex"), "{s}");
+    }
+
+    /// THE HISTORY IS AWAY, NOT EMPTY (ruling 237): while a rewrap holds the
+    /// history detached, a search that found nothing on the screen says so in
+    /// words that never read `no matches` — at EVERY width from 40 columns up —
+    /// and the query keeps its ordinary ink (nothing failed; the search runs
+    /// again at the re-attach). The long form where it fits, the plain word
+    /// where it does not; below the narrowest status zone the bar says nothing
+    /// rather than the opposite of the truth.
+    #[test]
+    fn a_search_while_the_history_is_away_never_says_no_matches() {
+        let c = chrome_band::band_colors(Theme::default());
+        let away = |stale: bool| FindBarView {
+            truncated: true,
+            history_away: true,
+            stale,
+            ..view("needle")
+        };
+        let field_row = |v: &FindBarView, cols: usize| {
+            let p = paint(v, cols);
+            let row = text(&p.rows[p.field_row]);
+            let ink = p.rows[p.field_row][p.field_cols.start].fg;
+            (row, ink)
+        };
+        for (cols, want) in [
+            (40, None),
+            (60, Some("rewrapping")),
+            (80, Some("rewrapping")),
+            (120, Some("rewrapping history")),
+            (168, Some("none yet, history rewrapping")),
+        ] {
+            for stale in [false, true] {
+                let (row, ink) = field_row(&away(stale), cols);
+                assert!(!row.contains("no matches"), "{cols} cols: {row}");
+                assert!(!row.contains("0 hits"), "{cols} cols: {row}");
+                assert_ne!(ink, c.warn, "{cols} cols: the query is not a failure");
+                match want {
+                    Some(want) => assert!(row.contains(want), "{cols} cols: {row}"),
+                    // 40 columns: the field keeps its minimum, the status zone
+                    // goes, and the bar says nothing at all.
+                    None => assert!(!row.contains("rewrap"), "{cols} cols: {row}"),
+                }
+            }
+        }
+        // Every width in between: never the opposite of the truth.
+        for cols in 40..=220 {
+            let (row, ink) = field_row(&away(false), cols);
+            assert!(
+                !row.contains("no matches") && !row.contains("0 hits"),
+                "{cols}: {row}"
+            );
+            assert_ne!(ink, c.warn, "{cols}");
+        }
+        // The ordinary miss is still a miss, tinted as one.
+        let (row, ink) = field_row(&view("needle"), 80);
+        assert!(row.contains("no matches"), "{row}");
+        assert_eq!(ink, c.warn);
+        // Hits on the screen while the rest is away: a floor, and why.
+        let (row, _) = field_row(
+            &FindBarView {
+                idx: 1,
+                total: 3,
+                ..away(false)
+            },
+            168,
+        );
+        assert!(row.contains("1/3+ (rewrapping)"), "{row}");
+        let (row, _) = field_row(
+            &FindBarView {
+                idx: 1,
+                total: 3,
+                ..away(false)
+            },
+            60,
+        );
+        assert!(row.contains("1/3+"), "{row}");
     }
 
     /// A count is painted BARE only when it is an exact census of the present

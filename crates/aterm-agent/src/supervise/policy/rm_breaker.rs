@@ -8,11 +8,11 @@
 //! **Why a resolver of its own.** The vendor draws that box in a
 //! bypass-permissions session because an `rm` operand holds a `$VAR` it cannot
 //! prove non-empty. In bypass the rest of the line would run unasked anyway,
-//! so the one question is where each `rm` operand POINTS. `harness::rm_policy`
-//! answers a different question (is every other segment a read?) and abstains
-//! on every `$` by design, so it cannot answer this box; its critical-path
-//! deny table and its flag table are reused here (`rm_policy::denied`,
-//! `rm_policy::is_known_flag`).
+//! so the one question is where each `rm` operand POINTS — never whether the
+//! rest of the line is a read (the hook-era `rm_policy`, which asked that
+//! and abstained on every `$`, was deleted 2026-09-25 with the hook bridge;
+//! its critical-path table and its flag table live on here as
+//! [`critical_path`] and [`is_known_flag`]).
 //!
 //! **What resolves.** The line is read left to right as straight-line shell,
 //! with a variable table filled by literal assignments only:
@@ -45,18 +45,17 @@
 //! **Where an operand may point.** Strictly inside a [`ScratchRoot`] (never
 //! the root itself), with no glob at or above the first component under the
 //! root, no `..`, no `.git`, not the cwd or an ancestor of it, and past every
-//! default `rm_policy` deny pattern (the filesystem root, the home directory
-//! and its ancestors, `/Users/<x>`, a glob in the first component). An operand
+//! [`critical_path`] (the filesystem root, the home directory and its
+//! ancestors, `/Users/<x>`, a glob in the first component). An operand
 //! built on a `$(mktemp …)` variable may not glob at all: were `mktemp` to
 //! fail, the variable is empty and `"$D"/*` is `/*`.
 //!
-//! Lexical, like `rm_policy`: nothing touches the filesystem, so a symlink
+//! Lexical: nothing touches the filesystem, so a symlink
 //! inside a scratch root is not followed.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::harness::rm_policy::{self, RmPolicy, has_glob, is_known_flag};
 use crate::supervise::classify::glob_match;
 
 /// The stand-in for the unique name `mktemp` makes: a component no deny rule
@@ -104,7 +103,8 @@ impl ScratchRoot {
     }
 
     /// The pattern as written (`/private/tmp/*`), for a reason or a ledger row.
-    pub fn label(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn label(&self) -> &str {
         &self.label
     }
 
@@ -144,8 +144,9 @@ pub struct RmScope<'a> {
     pub cwd: &'a Path,
     /// The owner's home directory, for the deny table.
     pub home: Option<&'a Path>,
-    /// The worker's `$TMPDIR`, for `$TMPDIR` and `$(mktemp -d)`; `None` leaves
-    /// both unresolved.
+    /// The SUPERVISOR's own process `$TMPDIR` (`ApprovalEnv::of_process`),
+    /// which the worker's Bash shell normally inherits, for `$TMPDIR` and
+    /// `$(mktemp -d)`; `None` leaves both unresolved.
     pub tmpdir: Option<&'a Path>,
     /// Where an operand may point.
     pub roots: &'a [ScratchRoot],
@@ -705,7 +706,7 @@ impl Eval<'_> {
                 if !head && mentions_rm(text) {
                     return Err(format!(
                         "an rm this resolver cannot see run (in `{}`)",
-                        clip(text)
+                        clip(text, 60)
                     ));
                 }
             }
@@ -956,7 +957,7 @@ impl Eval<'_> {
             return Err(format!(
                 "a relative rm operand ({}; the Bash tool's working directory is not known \
                  to the supervisor)",
-                clip(text)
+                clip(text, 60)
             ));
         }
         let mut comps = Vec::new();
@@ -975,12 +976,8 @@ impl Eval<'_> {
             .scope
             .home
             .and_then(|h| abs_components(&h.to_string_lossy()));
-        for pattern in &RmPolicy::default().deny_patterns {
-            if let Some(name) =
-                rm_policy::denied(pattern, &comps, &shown, text, None, home.as_deref())
-            {
-                return Err(format!("{shown}: {name}"));
-            }
+        if let Some(name) = critical_path(&comps, home.as_deref()) {
+            return Err(format!("{shown}: {name}"));
         }
         // ASCII-case-insensitively: the default macOS volume is, and a
         // differently-cased spelling of the cwd is the cwd.
@@ -1068,12 +1065,78 @@ pub(crate) fn abs_components(path: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// BSD and GNU `rm` flags that only change HOW the named operands are
+/// removed. `-W` (BSD undelete) and `--help`/`--version` are not deletions and
+/// are left unrecognised, and `--no-preserve-root` is refused by name before
+/// this is asked.
+fn is_known_flag(word: &str) -> bool {
+    if let Some(long) = word.strip_prefix("--") {
+        return matches!(
+            long,
+            "force"
+                | "recursive"
+                | "dir"
+                | "verbose"
+                | "one-file-system"
+                | "preserve-root"
+                | "preserve-root=all"
+                | "interactive"
+                | "interactive=never"
+                | "interactive=once"
+                | "interactive=always"
+        );
+    }
+    match word.strip_prefix('-') {
+        Some(cluster) if !cluster.is_empty() => cluster.chars().all(|c| "dfiIPrRvx".contains(c)),
+        _ => false,
+    }
+}
+
+fn has_glob(s: &str) -> bool {
+    s.contains(['*', '?', '['])
+}
+
+/// The paths no operand may name whatever root holds it, compared
+/// ASCII-case-insensitively (the default macOS volume is): `Some(its name)`
+/// for the filesystem root, the home directory, an ancestor of it or a glob
+/// directly inside it, `/Users` or `/home` or a direct child of either
+/// (somebody's home), a glob in the first component (`/*`, `/u*/x`), and any
+/// `.git` component.
+fn critical_path(comps: &[String], home: Option<&[String]>) -> Option<&'static str> {
+    let prefix_of = |a: &[String], b: &[String]| {
+        a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    };
+    if comps.is_empty() {
+        Some("filesystem root")
+    } else if home.is_some_and(|h| {
+        prefix_of(comps, h)
+            || (comps.len() == h.len() + 1
+                && prefix_of(h, comps)
+                && comps.last().is_some_and(|c| has_glob(c)))
+    }) {
+        Some("home")
+    } else if comps.len() <= 2
+        && (comps[0].eq_ignore_ascii_case("Users") || comps[0].eq_ignore_ascii_case("home"))
+    {
+        Some("/Users")
+    } else if has_glob(&comps[0]) {
+        Some("glob at root")
+    } else if comps.iter().any(|c| c.eq_ignore_ascii_case(".git")) {
+        Some("component .git")
+    } else {
+        None
+    }
+}
+
 fn join(comps: &[String]) -> String {
     format!("/{}", comps.join("/"))
 }
 
-fn clip(s: &str) -> String {
-    let t: String = s.chars().take(60).collect();
+/// `s` cut to its first `n` characters, `…` where it was cut: the policy's
+/// one clip — an operand quoted in a reason (60), and a decline's reason, its
+/// quoted invocation and a refusal's label ([`super::approval`]).
+pub(super) fn clip(s: &str, n: usize) -> String {
+    let t: String = s.chars().take(n).collect();
     if t.len() < s.len() {
         format!("{t}…")
     } else {

@@ -229,7 +229,8 @@ pub fn cursor_cat_color_key(
 /// latch — because those come back, and a resident that forgot itself on every
 /// blur would return as a different cat.
 ///
-/// [`retire_pet_without_owner`] is the consumer that matters: it is the switch.
+/// The consumer that matters is the switch in [`CompanionOwner::sense`]: an
+/// unowned pet is retired outright before the tick.
 #[inline]
 #[must_use]
 pub fn resident_pet_owner_present(
@@ -284,6 +285,7 @@ pub fn resident_pet_presentation_enabled(
 /// [`crate::kitty_pet::PetBrain::retire_unowned`] no-ops on an already-retired
 /// brain, so "off" costs one predicate per frame.
 #[inline]
+#[cfg(test)]
 pub fn retire_pet_without_owner(
     pet_mode: bool,
     cursor_trail_enabled: bool,
@@ -556,6 +558,7 @@ pub fn cursor_companion_duty(
 /// lifecycle running while history is visible, but never project the flying
 /// body or resident pet over retained rows.
 #[must_use]
+#[cfg(test)]
 pub fn cursor_companion_presentable(decoration_presentable: bool, live_viewport: bool) -> bool {
     decoration_presentable && live_viewport
 }
@@ -586,6 +589,7 @@ pub fn resident_pet_surface_presentable(
 /// admitted while the envelope is finite and above zero.
 #[inline]
 #[must_use]
+#[cfg(test)]
 pub fn shed_companion_presentable(base_presentable: bool, envelope: f32) -> bool {
     base_presentable && envelope.is_finite() && envelope > 0.0
 }
@@ -609,6 +613,7 @@ pub fn shed_companion_alpha(alpha: u8, envelope: f32) -> u8 {
 /// must start from that exact-zero edge and stops only at full amplitude.
 #[inline]
 #[must_use]
+#[cfg(test)]
 pub fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
     if !envelope.is_finite() {
         return false;
@@ -622,6 +627,7 @@ pub fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
 
 /// Suppress the flying companion's exit flourish on a pet-mode frame copy.
 /// The resident keeps custody even when the hidden flying episode winds down.
+#[cfg(test)]
 pub fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
     if pet_mode {
         frame.exit = crate::kitty_cursor::CatExit::Plain;
@@ -748,7 +754,7 @@ pub struct CompanionOwner {
     /// The grid the last `sense` resolved against — what `emit` bakes with.
     geom: EffectGeom,
     /// The pair and mapped arrival the last `emit` synced — the hello seam's
-    /// inputs, kept so the host can ask [`Self::commit_hello_due`].
+    /// inputs, kept so the host can ask `Self::commit_hello_due`.
     last_sync: Option<((u8, u8), PetArrival)>,
 }
 
@@ -778,6 +784,7 @@ impl Default for CompanionOwner {
 impl CompanionOwner {
     /// [`resident_pet_owner_present`] — the ownership law, one copy.
     #[must_use]
+    #[cfg(test)]
     pub fn owner_present(pet_mode: bool, trail_master: bool, style: GlowStyle) -> bool {
         resident_pet_owner_present(pet_mode, trail_master, style)
     }
@@ -800,6 +807,7 @@ impl CompanionOwner {
     /// The NATIVE verdict dresses the pet until Phase 5: the pair the
     /// precedence law chose, the tenure gate's authorised arrival, and the
     /// rung that won (only `Program` may carry a ceremony).
+    #[cfg(test)]
     pub fn set_look(&mut self, pair: (u8, u8), arrival: PetArrival, rung: CompanionRung) {
         self.pair = pair;
         self.arrival = arrival;
@@ -808,6 +816,7 @@ impl CompanionOwner {
 
     /// The pinned favourite — the precedence law's top rung, always quiet.
     /// `None` unpins and the pet falls back to the verdict in hand.
+    #[cfg(test)]
     pub fn set_favourite(&mut self, look: Option<KittyLook>) {
         self.favourite = look.map(KittyLook::normalized);
     }
@@ -1099,7 +1108,7 @@ impl CompanionOwner {
     /// `free` via `decos.pet_cursor`.
     ///
     /// Returns the fingerprint fold and the sync outcome; the host's tenure
-    /// bookkeeping asks [`Self::commit_hello_due`] whether a hello was spent.
+    /// bookkeeping asks `Self::commit_hello_due` whether a hello was spent.
     /// Draws nothing and syncs nothing unless the frame put the pet on glass.
     pub fn emit(
         &mut self,
@@ -1179,6 +1188,7 @@ impl CompanionOwner {
     /// next `set_look` carries it), so the next present frame maps to Quiet
     /// and cannot commit again.
     #[must_use]
+    #[cfg(test)]
     pub fn commit_hello_due(&self, present: bool, outcome: SyncLookOutcome) -> bool {
         present
             && self.last_sync.is_some_and(|(pair, arrival)| {
@@ -1200,6 +1210,7 @@ impl CompanionOwner {
     /// should ask for the frame that runs one, exactly as for [`Self::press`].
     /// A typed word never summons — with no resident on glass the latch is
     /// dropped by the brain's own no-audience rule.
+    #[cfg(test)]
     pub fn note_trick(&mut self, now: Instant, trick: aterm_lexicon::Trick, confirmed: bool) {
         self.pet.note_trick(now, trick, confirmed);
     }
@@ -1207,12 +1218,14 @@ impl CompanionOwner {
     /// The typed line turned into prose, or was aborted: take back a
     /// tentative kitty command that has not been performed. Idempotent — the
     /// listener may report a revoke when nothing tentative is pending here.
+    #[cfg(test)]
     pub fn revoke_trick(&mut self) {
         self.pet.revoke_trick();
     }
 
     /// The whole submitted line was pet talk (`sit` + Enter at a shell): the
     /// brain does not grieve the fast `command not found` that follows.
+    #[cfg(test)]
     pub fn note_trick_submit(&mut self, now: Instant) {
         self.pet.note_trick_submit(now);
     }
@@ -1351,19 +1364,15 @@ impl CompanionOwner {
 
     /// The animal currently being drawn.
     #[must_use]
+    #[cfg(test)]
     pub fn species(&self) -> PetSpecies {
         self.species
-    }
-
-    /// The RAW style string named a pet at the last `sense`.
-    #[must_use]
-    pub fn style_named(&self) -> bool {
-        self.style_named
     }
 
     /// Read-only access to the brain, for the host's projections (the Tier-1
     /// lifecycle bind reads `is_active`/`needs_frames`/`species` here).
     #[must_use]
+    #[cfg(test)]
     pub fn brain(&self) -> &PetBrain {
         &self.pet
     }
@@ -2323,7 +2332,7 @@ mod owner_tests {
     //! The driver itself: the seed door, the latches, the unconditional tick,
     //! the press seam, the pointer shadow, the emitter.
     use super::*;
-    use crate::host::{ChromeGeom, FrameGeom};
+    use crate::host::FrameGeom;
     use aterm_time::Duration;
 
     /// Every fallback black — the emitter tests that care about the sync
@@ -2349,10 +2358,8 @@ mod owner_tests {
             reduced_motion: false,
             serious: false,
             shed_envelope: 1.0,
-            chrome: ChromeGeom::default(),
             pointer_px: None,
             capture: CaptureMode::Present,
-            sound_allowed: false,
             geometry: GRID,
         }
     }

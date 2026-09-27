@@ -13,6 +13,12 @@ use super::*;
 /// close preflight. Install-on-clean-quit is a policy bit over the same apply
 /// transition, never a second application path. Mutants stage a stale completion
 /// or re-exec twice for one accepted artifact.
+///
+/// `SingleFlight` bounds a flag: the real service holds its work as ONE
+/// `Option<UpdaterWorkTicket>` (projected `active.is_some()`), so a second worker
+/// is unrepresentable rather than refused. The single-flight law itself — a
+/// request while work is in flight joins the live ticket and moves nothing — is
+/// bound at Tier-1 on `request_check`'s real `CheckStart::Joined`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_updater_model() -> Model {
@@ -30,7 +36,6 @@ pub fn native_updater_model() -> Model {
             var stale_completion_pending = 0;
             var verified = 0;
             var close_preflight = 0;
-            var install_on_clean_quit = 0;
             var reexec_count = 0;
             var stale_staged = 0;
             action StartCheck when (
@@ -99,9 +104,6 @@ pub fn native_updater_model() -> Model {
             action MarkCloseReady when (phase == 4) {
                 close_preflight = 1;
             }
-            action InstallOnCleanQuit when (phase == 4) {
-                install_on_clean_quit = 1;
-            }
             action Apply when (
                 phase == if reexec_count == 0 { 4 } else { 5 } &&
                 reexec_count <= if Buggy == 1 { 1 } else { 0 } &&
@@ -119,7 +121,6 @@ pub fn native_updater_model() -> Model {
             ) {
                 phase = 4;
                 close_preflight = 0;
-                install_on_clean_quit = 0;
                 reexec_count = 0;
             }
             invariant SingleFlight: active_work <= 1;
@@ -139,7 +140,6 @@ pub fn native_updater_model() -> Model {
                 };
             invariant OneLiveApplyAuthority: reexec_count <= 1;
             invariant GenerationBounded: request_generation <= MaxGeneration;
-            invariant QuitPolicyDoesNotApply: install_on_clean_quit <= 1;
         }
     }
 }
@@ -153,7 +153,18 @@ pub fn native_updater_model() -> Model {
 /// object. Asset upload starts only after the immutable draft object converges.
 ///
 /// `Buggy=1` weakens both the persist-before-POST guard and the one-shot bound,
-/// reproducing an unjournaled request or a duplicate retry after crash/resume.
+/// reproducing an unjournaled request or a duplicate retry after crash/resume. It
+/// also TRUSTS A POST'S OWN ANSWER in the three places the shipping code refuses
+/// to: the draft converges, its assets are journaled against it, and an asset
+/// converges, each on the strength of a landed POST rather than the re-listed
+/// object. `step_draft` binds (and journals) the release ID the POST answered
+/// FIRST, but reports the draft converged — returns `Ok`, so the step is
+/// journaled done and the upload may begin — only after `release_object_by_id`
+/// re-reads that ID and `validate_release_object_capability` accepts it; and
+/// `upload_release_asset_by_id` returns only after
+/// `release_asset_identity_for_release_id_optional` sees the asset — "returned
+/// success but no asset is visible" is its own refusal. The mutants are that
+/// re-read skipped.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_durable_post_intent_model() -> Model {
@@ -197,12 +208,14 @@ pub fn release_durable_post_intent_model() -> Model {
                 create_visible = 1;
             }
             action ConvergeCreatedDraft when (
-                attached == 1 && create_visible == 1 && create_converged == 0
+                attached == 1 && create_converged == 0 &&
+                (create_visible == 1 || (Buggy == 1 && create_posts > 0))
             ) {
                 create_converged = 1;
             }
             action PersistUploadIntent when (
-                attached == 1 && create_converged == 1 &&
+                attached == 1 &&
+                (create_converged == 1 || (Buggy == 1 && create_posts > 0)) &&
                 upload_intent == 0 && upload_visible == 0
             ) {
                 upload_intent = 1;
@@ -222,7 +235,8 @@ pub fn release_durable_post_intent_model() -> Model {
                 upload_visible = 1;
             }
             action ConvergeUploadedAsset when (
-                attached == 1 && upload_visible == 1 && upload_converged == 0
+                attached == 1 && upload_converged == 0 &&
+                (upload_visible == 1 || (Buggy == 1 && upload_posts > 0))
             ) {
                 upload_converged = 1;
             }
@@ -303,11 +317,16 @@ pub fn release_durable_post_intent_model() -> Model {
 /// either promotion, and recovery moves every predecessor/target mixture forward.
 /// Read-only acquisition reports a redo record without replaying it.
 ///
-/// `Buggy=1` exposes the three regressions this protocol exists to prevent: retiring
-/// a body-only pair, overwriting unrelated bytes during replay, and mutating from the
-/// check-only lane. Tier-1 (`crates/atpkg-keys/tests/roster_redo_model.rs`) binds the
-/// real `lock_roster` / `lock_roster_read_only` / `commit_roster_pair` /
-/// `publish_roster_locked` filesystem operations to these decisions.
+/// `Buggy=1` exposes the regressions this protocol exists to prevent: retiring a
+/// body-only pair, overwriting unrelated bytes during replay, mutating from the
+/// check-only lane, promoting the body with no redo record (`publish_roster` before
+/// 8dbc4e967 — "promote the document, and on an *error* between the renames roll
+/// the document back"; a process death runs no error path and leaves the new body
+/// beside the old signature), and a per-half CAS that promotes the body on its own
+/// premise before finding the signature stale. Tier-1
+/// (`crates/atpkg-keys/tests/roster_redo_model.rs`) binds the real `lock_roster` /
+/// `lock_roster_read_only` / `commit_roster_pair` / `publish_roster_locked`
+/// filesystem operations to these decisions, and replays the pre-redo torn pair.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn roster_pair_redo_model() -> Model {
@@ -484,6 +503,27 @@ pub fn roster_pair_redo_model() -> Model {
                 readonly_checked = 1;
                 readonly_writes = 2;
             }
+            // The pre-redo publisher: the body is renamed into place with no
+            // committed redo record, and the process dies before the signature.
+            action BuggyPromoteBodyWithoutRedo when (
+                Buggy > 0 && result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
+                redo == 0 && body == 0 && signature == 0 && crashes == 0
+            ) {
+                body = 1;
+                writer_lock = 0;
+                crashes = 1;
+                writer_writes = 1;
+            }
+            // A CAS checked per half at each rename: the body's premise holds, so
+            // the body is promoted, and only then is the signature found stale.
+            action BuggyPromoteBeforeSignatureCas when (
+                Buggy > 0 && result == 0 && writer_lock == 1 && redo == 0 &&
+                snapshot_checked == 0 && body == 0 && signature == 2
+            ) {
+                body = 1;
+                writer_writes = 1;
+                result = 2;
+            }
             action Done when (result > 0 && writer_lock == 0) {
                 result = result;
             }
@@ -531,12 +571,22 @@ pub fn roster_pair_redo_model() -> Model {
 /// lease → revalidate → publish → archive/verify → unlock lifecycle rather than
 /// testing the arithmetic decisions in isolation.
 ///
-/// `Buggy=1` enables four independent non-vacuity controls:
+/// `Buggy=1` enables independent non-vacuity controls:
 /// `ResolveOperatorOnly` drops the observed channel input (the retired
 /// operator-only policy), `PublishUnchecked` skips late revalidation,
 /// `BypassLeaseAdvance` lets the channel change after a covered verdict despite
 /// lease ownership, and `UnlockBeforeVerification` drops the owner before
-/// downstream release steps complete. Tier-1 binds the resolver, journal,
+/// downstream release steps complete. Six more are the slips each remaining law
+/// exists to refuse, one apiece: `ResolveUncheckedCarryForward` validates only the
+/// operator's request against the claim, so a channel floor above the build is
+/// carried forward (`effective_min_build` validates the MAXIMUM);
+/// `ResumeFromOperatorRequest` rebuilds the resumed floor from the resume
+/// command's request instead of `journal.min_build`; `ConfirmCoveredWithoutLease`
+/// is the floor check run without the owner check `publish_checked` pairs it
+/// with; `CompleteWithoutUnlock` journals completion over a refused CAS delete;
+/// `RejectAdvancedReleasingLease` drops the remote lease on the late guard's
+/// error path; and `AbandonIgnoringFailedCas` marks an abandon done whose CAS
+/// delete never landed. Tier-1 binds the resolver, journal,
 /// `PublishChecked`, exact-owner acquire/resume, and CAS unlock production seams.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -700,6 +750,47 @@ pub fn release_channel_floor_model() -> Model {
                 latest_floor = latest_floor + 1;
                 lease_bypassed = 1;
             }
+            action ResolveUncheckedCarryForward when (
+                Buggy == 1 && phase == 0 && operator_floor <= claimed_build &&
+                observed_floor > claimed_build
+            ) {
+                phase = 1;
+                frozen_floor = observed_floor;
+                journal_floor = observed_floor;
+            }
+            action ResumeFromOperatorRequest when (Buggy == 1 && phase == 5) {
+                phase = 1;
+                frozen_floor = operator_floor;
+                resumed = 1;
+            }
+            action ConfirmCoveredWithoutLease when (
+                Buggy == 1 && phase == 1 && lease_owned == 0 &&
+                latest_floor <= frozen_floor
+            ) {
+                phase = 2;
+                late_checked = 1;
+            }
+            action CompleteWithoutUnlock when (
+                Buggy == 1 && phase == 7 && lease_owned == 1 &&
+                archive_done == 1 && verify_done == 1
+            ) {
+                phase = 8;
+            }
+            action RejectAdvancedReleasingLease when (
+                Buggy == 1 && phase == 1 && lease_owned == 1 &&
+                latest_floor > frozen_floor
+            ) {
+                phase = 4;
+                late_checked = 1;
+                advanced_rejected = 1;
+                lease_owned = 0;
+            }
+            action AbandonIgnoringFailedCas when (
+                Buggy == 1 && phase == 4 && lease_owned == 1 &&
+                advanced_rejected == 1 && abandon_done == 0
+            ) {
+                abandon_done = 1;
+            }
 
             invariant FrozenCoversInitialInputs:
                 if phase > 0 && phase <= 3 {
@@ -805,7 +896,10 @@ pub fn release_channel_floor_model() -> Model {
 ///
 /// Four abstract steps represent lock, previsibility preparation, visible-channel
 /// convergence, and final verify/unlock. `Buggy=1` admits a gapped/unknown/duplicate
-/// or bad-identity journal and can skip preparation after resume.
+/// or bad-identity journal, can skip preparation after resume, and can complete the
+/// cut with its final verify/unlock step unjournaled — the cut reported DONE (and
+/// its journal retired) over a last step that failed, so nothing is left to resume
+/// the unlock from.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_journal_prefix_model() -> Model {
@@ -976,6 +1070,15 @@ pub fn release_journal_prefix_model() -> Model {
                 attached = 1;
                 corruption_bypassed = 1;
             }
+            action CompleteBeforeUnlockJournaled when (
+                Buggy == 1 && phase == 1 && attached == 1 && resume_cursor == 3 &&
+                done_lock == 1 && done_prepare == 1 && done_visible == 1 &&
+                done_unlock == 0
+            ) {
+                phase = 2;
+                resume_cursor = 4;
+                attached = 0;
+            }
             action SkipPreparationAfterResume when (
                 Buggy == 1 && phase == 1 && attached == 1 &&
                 done_lock == 1 && done_prepare == 0 && done_visible == 0 &&
@@ -1044,7 +1147,11 @@ pub fn release_journal_prefix_model() -> Model {
 /// uncertain response remains untouched.
 ///
 /// `Buggy=1` exposes independent stale mutation, stale delete/rotation,
-/// stopped-proof reuse, lease-loss mutation, and ambiguity bypass controls. Tier-1
+/// stopped-proof reuse, lease-loss mutation, and ambiguity bypass controls, plus
+/// the opposite failure: `RefuseWellFormedFence` refuses a coherent, unambiguous
+/// fence — the parser slip that counts the annotated ref's own `^{}` peel row as
+/// an extra row (`publisher_fence` requires exactly those two), which wedges every
+/// resume behind a refusal no fault explains. Tier-1
 /// (`publisher_fence_model.rs`) drives the real annotated ref, create/rotation CAS,
 /// session assertion, stale exact-token cleanup, ordinary release, and atomic final
 /// owner+token delete against a bare Git remote.
@@ -1305,6 +1412,12 @@ pub fn release_publisher_fence_model() -> Model {
             ) {
                 incoherent_accepted = 1;
             }
+            action RefuseWellFormedFence when (
+                Buggy == 1 && refused == 0 && remote_token > 0 &&
+                ambiguous_remote == 0 && incoherent_remote == 0
+            ) {
+                refused = 1;
+            }
             action RotateLiveAtoB when (
                 Buggy == 1 && remote_token == 1 && local_a_token == 1 &&
                 local_b_token == 0 && lease_owner == 1 &&
@@ -1359,202 +1472,36 @@ pub fn release_publisher_fence_model() -> Model {
     }
 }
 
-/// One-time lost-update-key epoch transition for v0.55.
-///
-/// The retired historical fingerprint is preserved in a committed one-shot record
-/// together with the newly generated canonical public key/fingerprint and exact
-/// target version. The shipped v0.55 binary must embed that same key and its
-/// manifest must be validly signed by it before publication. Closing the epoch
-/// consumes the only transition; there is deliberately no generic rotation flag.
-///
-/// `Buggy=1` exposes retirement without replacement, a wrong embedded/signing key,
-/// an unsigned publication, and a second silent rotation after the epoch closes.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn release_key_epoch_transition_model() -> Model {
-    crate::ty_model! {
-        ReleaseKeyEpochTransition {
-            const Buggy = 0;
-            const OldFingerprint = 1;
-            const NewKey = 2;
-            const WrongKey = 3;
-            // phase: 0 OldKeyLost, 1 ExplicitlyAuthorized, 2 RecordPersisted,
-            // 3 BinaryPinned, 4 ManifestSigned, 5 Published, 6 EpochClosed.
-            var phase = 0;
-            var observed_old_fingerprint = 1;
-            var retired_old_fingerprint = 0;
-            var retired_evidence = 0;
-            var repo_current_key = 0;
-            var repo_current_fingerprint = 0;
-            var target_v055 = 0;
-            var transition_count = 0;
-            var binary_pin = 0;
-            var actual_signing_key = 0;
-            var manifest_signing_key = 0;
-            var signature_valid = 0;
-            var epoch_consumed = 0;
-            var retirement_bypassed = 0;
-            var silent_key_change = 0;
-            var unsigned_bypassed = 0;
-            var generic_rotation_bypassed = 0;
-            var evidence_erased = 0;
-
-            action AuthorizeLostKeyEpoch when (
-                phase == 0 && transition_count == 0 && epoch_consumed == 0
-            ) {
-                phase = 1;
-                transition_count = 1;
-                target_v055 = 1;
-            }
-            action PersistOneShotEpochRecord when (
-                phase == 1 && target_v055 == 1 && transition_count == 1
-            ) {
-                phase = 2;
-                retired_old_fingerprint = OldFingerprint;
-                retired_evidence = 1;
-                repo_current_key = NewKey;
-                repo_current_fingerprint = NewKey;
-            }
-            action BuildV055WithPersistedPin when (
-                phase == 2 && repo_current_key == NewKey &&
-                repo_current_fingerprint == NewKey && target_v055 == 1
-            ) {
-                phase = 3;
-                binary_pin = NewKey;
-            }
-            action SignV055Manifest when (
-                phase == 3 && binary_pin == repo_current_key
-            ) {
-                phase = 4;
-                actual_signing_key = NewKey;
-                manifest_signing_key = NewKey;
-                signature_valid = 1;
-            }
-            action PublishV055Epoch when (
-                phase == 4 && retired_old_fingerprint == OldFingerprint &&
-                repo_current_key == NewKey && repo_current_fingerprint == NewKey &&
-                binary_pin == NewKey && actual_signing_key == NewKey &&
-                manifest_signing_key == NewKey && signature_valid == 1 &&
-                target_v055 == 1 && transition_count == 1
-            ) {
-                phase = 5;
-            }
-            action CloseOneShotEpoch when (phase == 5) {
-                phase = 6;
-                epoch_consumed = 1;
-            }
-
-            action RetireOldWithoutReplacement when (
-                Buggy == 1 && phase == 0
-            ) {
-                phase = 2;
-                retired_old_fingerprint = OldFingerprint;
-                retirement_bypassed = 1;
-            }
-            action BuildV055WithWrongPin when (
-                Buggy == 1 && phase == 2
-            ) {
-                phase = 3;
-                binary_pin = WrongKey;
-                silent_key_change = 1;
-            }
-            action SignWithSubstitutedKey when (
-                Buggy == 1 && phase == 3
-            ) {
-                phase = 4;
-                actual_signing_key = WrongKey;
-                manifest_signing_key = WrongKey;
-                signature_valid = 1;
-                silent_key_change = 1;
-            }
-            action PublishUnsignedV055 when (
-                Buggy == 1 && phase == 3
-            ) {
-                phase = 5;
-                unsigned_bypassed = 1;
-            }
-            action GenericRotateAfterClose when (
-                Buggy == 1 && phase == 6
-            ) {
-                repo_current_key = WrongKey;
-                repo_current_fingerprint = WrongKey;
-                transition_count = 2;
-                generic_rotation_bypassed = 1;
-            }
-            action EraseRetiredKeyEvidence when (
-                Buggy == 1 && phase > 1 && retired_evidence == 1 &&
-                evidence_erased == 0
-            ) {
-                observed_old_fingerprint = 0;
-                retired_old_fingerprint = 0;
-                retired_evidence = 0;
-                evidence_erased = 1;
-            }
-
-            invariant OldFingerprintIsNeverErased:
-                observed_old_fingerprint == OldFingerprint;
-            invariant PersistedEpochRetainsRetiredEvidence:
-                if phase > 1 {
-                    retired_old_fingerprint == OldFingerprint &&
-                    retired_evidence == 1
-                } else {
-                    retired_evidence == 0
-                };
-            invariant RetirementIsAtomicWithReplacement:
-                if retired_old_fingerprint == OldFingerprint {
-                    repo_current_key == NewKey &&
-                    repo_current_fingerprint == NewKey && target_v055 == 1
-                } else {
-                    retired_old_fingerprint == 0
-                };
-            invariant PublishedEpochUsesOneExactKey:
-                if phase > 4 {
-                    repo_current_key == NewKey &&
-                    repo_current_fingerprint == NewKey &&
-                    binary_pin == NewKey && actual_signing_key == NewKey &&
-                    manifest_signing_key == NewKey && signature_valid == 1 &&
-                    target_v055 == 1 && transition_count == 1
-                } else {
-                    phase <= 4
-                };
-            invariant EpochIsOneShot: transition_count <= 1;
-            invariant ConsumedEpochIsClosed:
-                if epoch_consumed == 1 { phase == 6 } else { epoch_consumed == 0 };
-            invariant RetirementCannotBeBypassed: retirement_bypassed == 0;
-            invariant KeyIdentityCannotChangeSilently: silent_key_change == 0;
-            invariant UnsignedEpochCannotPublish: unsigned_bypassed == 0;
-            invariant GenericRotationDoesNotExist:
-                generic_rotation_bypassed == 0;
-            invariant HistoricalEvidenceCannotBeErased: evidence_erased == 0;
-            invariant KeyEpochBounds:
-                phase <= 6 && observed_old_fingerprint <= WrongKey &&
-                retired_old_fingerprint <= WrongKey && repo_current_key <= WrongKey &&
-                retired_evidence <= 1 && repo_current_fingerprint <= WrongKey &&
-                target_v055 <= 1 &&
-                transition_count <= 2 && binary_pin <= WrongKey &&
-                actual_signing_key <= WrongKey && manifest_signing_key <= WrongKey &&
-                signature_valid <= 1 && epoch_consumed <= 1 &&
-                retirement_bypassed <= 1 && silent_key_change <= 1 &&
-                unsigned_bypassed <= 1 && generic_rotation_bypassed <= 1 &&
-                evidence_erased <= 1;
-        }
-    }
-}
-
 /// Historical release recovery is not historical publication.
 ///
 /// A stranded pre-activation owner may converge in exactly two ways: delete an
-/// exact observed draft (or abandon when a current journal proves no POST was
-/// issued), or finish bookkeeping for an exact release that was already published.
-/// Unknown/issued intent plus an absent listing retains the owner because a
-/// delayed draft may still appear. A signed historical release is verified with the
-/// retired public key; the explicit unsigned bootstrap remains unsigned. Neither
-/// branch rebuilds, uploads, tags, or flips the retired version.
+/// exact observed draft (or abandon when no POST was issued), or finish
+/// bookkeeping for an exact release that was already published. Unknown/issued
+/// intent plus an absent listing retains the owner because a delayed draft may
+/// still appear. A signed historical release is verified with the retired public
+/// key; the explicit unsigned bootstrap remains unsigned. Neither branch rebuilds,
+/// uploads, tags, or flips the retired version.
 ///
-/// `Buggy=1` exposes five independent prohibited controls: publishing during
+/// A LOST JOURNAL IS ANSWERED IN TWO WAYS (728af7315), both modeled: a visible
+/// draft whose target is the recovery claim's commit (`draft_bound`, the shipping
+/// `claim_bound`) is provably this claim's, so the remote's binding stands for
+/// issued intent (`LearnIssuedIntentFromClaimBinding`, knowledge 2); and with
+/// nothing visible, the operator's `--no-draft-was-posted` stands for a no-POST
+/// journal (`AbandonOnOperatorNoPostAnswer`). A journal that proves a POST was
+/// issued is never overridable. Every delete also needs the draft bound to the
+/// claim: `delete_owned_draft_release` runs `validate_release_object_capability`
+/// against the claim commit before it deletes, whatever the journal said.
+///
+/// `Buggy=1` exposes seven independent prohibited controls: publishing during
 /// recovery, accepting the current key for a signed retired-epoch release,
-/// unlocking on unknown or issued-but-absent visibility, and deleting a draft
-/// without durable issued intent.
+/// unlocking on unknown visibility without the operator's separate answer (the
+/// answer folded into `--old-publisher-stopped`), the operator's answer overriding
+/// a journal that proves a POST, deleting an UNBOUND draft on a lost journal (the
+/// lost-journal row with its `claim_bound` conjunct dropped), deleting an issued
+/// but unbound draft (the capability check skipped), and releasing the owner
+/// before recovery has finished — `release_completed_publisher_session` run ahead
+/// of `delete_owned_release_tag`, so a failed tag delete returns with the lease
+/// already free for a successor to find our half-cleaned tag.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_historical_recovery_model() -> Model {
@@ -1571,10 +1518,13 @@ pub fn release_historical_recovery_model() -> Model {
             var selected_key = 0;
             var publication_mutation = 0;
             var wrong_key_bypassed = 0;
-            // 0 unknown/lost journal, 1 current journal proves no POST,
-            // 2 durable create intent issued.
+            // 0 unknown/lost journal, 1 no POST (a current journal proves it),
+            // 2 durable create intent issued (a current journal, or the remote's
+            // claim binding of a visible draft).
             var create_knowledge = 0;
             var draft_observed = 0;
+            // The observed draft targets the recovery claim's commit.
+            var draft_bound = 0;
             var draft_deleted = 0;
             var unsafe_absent_unlock = 0;
             var orphan_draft = 0;
@@ -1593,10 +1543,24 @@ pub fn release_historical_recovery_model() -> Model {
                 phase == 0 && owner_held == 1 && draft_observed == 0
             ) {
                 draft_observed = 1;
+                draft_bound = 1;
+            }
+            // Someone else's object under this tag: visible, but not this claim's.
+            action ObserveUnboundDraft when (
+                phase == 0 && owner_held == 1 && draft_observed == 0
+            ) {
+                draft_observed = 1;
+                draft_bound = 0;
+            }
+            action LearnIssuedIntentFromClaimBinding when (
+                phase == 0 && owner_held == 1 && create_knowledge == 0 &&
+                draft_observed == 1 && draft_bound == 1
+            ) {
+                create_knowledge = 2;
             }
             action DeleteExactDraft when (
                 phase == 0 && owner_held == 1 && draft_observed == 1 &&
-                draft_deleted == 0 && create_knowledge == 2
+                draft_bound == 1 && draft_deleted == 0 && create_knowledge == 2
             ) {
                 draft_deleted = 1;
             }
@@ -1606,6 +1570,14 @@ pub fn release_historical_recovery_model() -> Model {
             ) {
                 phase = 2;
                 owner_held = 0;
+            }
+            action AbandonOnOperatorNoPostAnswer when (
+                phase == 0 && owner_held == 1 && create_knowledge == 0 &&
+                draft_observed == 0
+            ) {
+                phase = 2;
+                owner_held = 0;
+                create_knowledge = 1;
             }
             action AbandonDeletedIssuedDraft when (
                 phase == 0 && owner_held == 1 && create_knowledge == 2 &&
@@ -1679,9 +1651,23 @@ pub fn release_historical_recovery_model() -> Model {
             action DeleteUnknownDraft when (
                 Buggy == 1 && phase == 0 && owner_held == 1 &&
                 create_knowledge == 0 && draft_observed == 1 &&
-                draft_deleted == 0
+                draft_bound == 0 && draft_deleted == 0
             ) {
                 draft_deleted = 1;
+            }
+            action DeleteIssuedDraftWithoutCapabilityCheck when (
+                Buggy == 1 && phase == 0 && owner_held == 1 &&
+                create_knowledge == 2 && draft_observed == 1 &&
+                draft_bound == 0 && draft_deleted == 0
+            ) {
+                draft_deleted = 1;
+            }
+
+            action ReleaseOwnerBeforeTagCleanup when (
+                Buggy == 1 && phase == 0 && owner_held == 1 &&
+                create_knowledge == 2 && draft_deleted == 1
+            ) {
+                owner_held = 0;
             }
 
             invariant RecoveryNeverPublishesRetiredEpoch:
@@ -1703,13 +1689,19 @@ pub fn release_historical_recovery_model() -> Model {
                 } else {
                     draft_deleted == 0
                 };
+            invariant DeletedDraftTargetsTheClaim:
+                if draft_deleted == 1 {
+                    draft_observed == 1 && draft_bound == 1
+                } else {
+                    draft_deleted == 0
+                };
             invariant CompletionReleasesOwner:
                 if phase > 1 { owner_held == 0 } else { owner_held == 1 };
             invariant HistoricalRecoveryBounds:
                 phase <= 3 && owner_held <= 1 && signature_required <= 1 &&
                 selected_key <= CurrentKey && publication_mutation <= 1 &&
                 wrong_key_bypassed <= 1 && create_knowledge <= 2 &&
-                draft_observed <= 1 && draft_deleted <= 1 &&
+                draft_observed <= 1 && draft_bound <= 1 && draft_deleted <= 1 &&
                 unsafe_absent_unlock <= 1 && orphan_draft <= 1;
         }
     }
@@ -1859,9 +1851,10 @@ pub fn release_published_identity_model() -> Model {
 /// release disappear, and clean completion atomically releases both session refs.
 ///
 /// `Buggy=1` exposes delete-before-successor, weak-floor cleanup, wrong-identity
-/// cleanup, cleanup after lease/fence loss, premature session release, and the
+/// cleanup, cleanup after lease/fence loss, premature session release, the
 /// release-first crash cut that strands a tag after destroying the only remotely
-/// discoverable receipt.
+/// discoverable receipt, and a convergence probe that reads only the tag: cleanup
+/// declared complete once the tag is gone while the bad release is still listed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_yank_successor_first_model() -> Model {
@@ -2122,6 +2115,14 @@ pub fn release_yank_successor_first_model() -> Model {
                 bad_tag_present = 0;
                 cleanup_session_bypassed = 1;
             }
+            action ConvergeOnTagAbsenceOnly when (
+                Buggy == 1 && bad_tag_present == 0 && bad_release_present == 1 &&
+                cleanup_complete == 0 && successor_order > BadOrder &&
+                successor_build > BadBuild && RequiredFloor <= successor_floor &&
+                successor_signature_valid == 1 && successor_artifact_valid == 1
+            ) {
+                cleanup_complete = 1;
+            }
             action ReleaseCleanupSessionEarly when (
                 Buggy == 1 && cleanup_complete == 0 &&
                 cleanup_lease_owned == 1 && cleanup_fence_owned == 1 &&
@@ -2244,9 +2245,13 @@ pub fn release_yank_successor_first_model() -> Model {
 ///
 /// `Buggy=1` exposes independent controls for premature finalization, stale-build and
 /// wrong-tag resume, bypassing the exact observed-build or signature gates, a competing
-/// owner entering or advancing during archive, and live-head regression. The
-/// invariants prove each class is observable as well as preserving every historical
-/// object across crash/resume.
+/// owner entering or advancing during archive, and live-head regression. It also
+/// archives by DELETING a historical manifest or signature instead of renaming it —
+/// the object `prove_renames_preserved_assets` refuses as "vanished instead of being
+/// metadata-renamed" — and lets a nominal crash release the remote exact-commit
+/// lease, as a `Drop` on the lease guard that CAS-deleted its ref on unwind would
+/// (`ReleaseLeaseGuard` deliberately has none). The invariants prove each class is
+/// observable as well as preserving every historical object across crash/resume.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_channel_single_head_model() -> Model {
@@ -2529,6 +2534,35 @@ pub fn release_channel_single_head_model() -> Model {
                 old_archived_signature = old_archived_signature + 1;
                 preserved_signature_ids = preserved_signature_ids - 1;
                 replacement_signature_ids = replacement_signature_ids + 1;
+            }
+            // One deletion apiece, of the first object the archive reaches, keeps
+            // the Buggy=1 space well inside the interpreter's bound; a single
+            // vanished object is the whole defect.
+            action ArchiveByDeletingHistoricalManifest when (
+                Buggy == 1 && phase == 2 && owner == 1 && guard_attached == 1 &&
+                old_exact_manifest > 0 && old_archived_manifest == 0 &&
+                preserved_manifest_ids == OldHeads
+            ) {
+                old_exact_manifest = old_exact_manifest - 1;
+                preserved_manifest_ids = preserved_manifest_ids - 1;
+            }
+            action ArchiveByDeletingHistoricalSignature when (
+                Buggy == 1 && phase == 2 && owner == 1 && guard_attached == 1 &&
+                old_exact_signature > 0 && old_archived_signature == 0 &&
+                preserved_signature_ids == OldHeads
+            ) {
+                old_exact_signature = old_exact_signature - 1;
+                preserved_signature_ids = preserved_signature_ids - 1;
+            }
+            action CrashReleasingRemoteLease when (
+                Buggy == 1 && phase == 2 && owner == 1 && guard_attached == 1 &&
+                resumed == 0 && old_archived_manifest == 0 &&
+                old_archived_signature == 0
+            ) {
+                phase = 1;
+                resumed = 1;
+                guard_attached = 0;
+                owner = 0;
             }
             // A crash preserves the remote exact-commit lease and every renamed
             // asset, but drops the process-local guard. Resume re-observes that same
@@ -2939,7 +2973,7 @@ pub fn release_channel_single_head_model() -> Model {
 /// claimed-unpublished version is classified fresh, then aborted as "cut elsewhere"
 /// on its own claim, and a published one is claimed again.
 ///
-/// Tier-1: crates/aterm-release/tests/claim_landing_model.rs drives the real claim,
+/// Tier-1: crates/aterm-release/tests/it/claim_landing_model.rs drives the real claim,
 /// claim_changelogs and real_cut_version against real git and checks every
 /// transition here, replaying the source-changelog reader and an R-tree landing as
 /// its negative controls.
